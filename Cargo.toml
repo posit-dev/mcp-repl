@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 ctor = "0.6.3"
 base64 = "0.22.1"
+anyhow = "1"
+async-trait = "0.1.89"
+codex-network-proxy = { git = "https://github.com/openai/codex.git", rev = "ffd726a656403b69b75130025587d5e0a0d6b7d1", package = "codex-network-proxy" }
 harp = { git = "https://github.com/t-kalinowski/ark" }
 htmd = "0.5"
 libc = "0.2"

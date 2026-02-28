@@ -8,6 +8,7 @@ mod install;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux_proxy_routing;
+mod managed_network_proxy;
 mod output_capture;
 mod output_stream;
 mod pager;

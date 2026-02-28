@@ -25,6 +25,7 @@ use crate::ipc::{
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
+use crate::managed_network_proxy::ManagedNetworkProxy;
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTimeline,
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
@@ -2465,6 +2466,7 @@ struct WorkerProcess {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    _managed_network_proxy: Option<ManagedNetworkProxy>,
     ipc: IpcHandle,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
@@ -2492,6 +2494,7 @@ struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    _managed_network_proxy: Option<ManagedNetworkProxy>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -2595,6 +2598,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match backend {
@@ -2649,6 +2653,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy,
             ipc,
             expected_exit: false,
             exit_status: None,
@@ -2669,9 +2674,10 @@ impl WorkerProcess {
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let prepared =
+        let mut prepared =
             prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
                 .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        let managed_network_proxy = prepared.managed_network_proxy.take();
         let session_tmpdir = prepared
             .env
             .get(R_SESSION_TMPDIR_ENV)
@@ -2748,6 +2754,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy: managed_network_proxy,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -2781,9 +2788,10 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         {
             let python_program = Self::resolve_python_program();
-            let prepared =
+            let mut prepared =
                 prepare_worker_command(&python_program, Self::python_command_args(), sandbox_state)
                     .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+            let managed_network_proxy = prepared.managed_network_proxy.take();
             let session_tmpdir = prepared
                 .env
                 .get(R_SESSION_TMPDIR_ENV)
@@ -2856,6 +2864,7 @@ impl WorkerProcess {
                 child,
                 stdin_tx,
                 session_tmpdir,
+                _managed_network_proxy: managed_network_proxy,
                 #[cfg(target_os = "macos")]
                 denial_logger,
             })

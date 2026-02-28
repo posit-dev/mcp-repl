@@ -14,6 +14,7 @@ use url::Url;
 
 #[cfg(target_os = "linux")]
 use crate::linux_proxy_routing::{activate_proxy_routes_in_netns, prepare_host_proxy_route_spec};
+use crate::managed_network_proxy::ManagedNetworkProxy;
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
@@ -37,6 +38,9 @@ pub const LINUX_BWRAP_NO_PROC_ENV: &str = "MCP_CONSOLE_LINUX_BWRAP_NO_PROC";
 #[derive(Debug, Clone)]
 pub enum SandboxError {
     SessionTempDir(String),
+    #[cfg(target_os = "linux")]
+    InvalidConfiguration(String),
+    ManagedNetworkProxy(String),
     #[cfg(target_os = "macos")]
     SeatbeltMissing,
     #[cfg(target_os = "windows")]
@@ -48,6 +52,13 @@ impl std::fmt::Display for SandboxError {
         match self {
             SandboxError::SessionTempDir(message) => {
                 write!(f, "failed to create session temp dir: {message}")
+            }
+            #[cfg(target_os = "linux")]
+            SandboxError::InvalidConfiguration(message) => {
+                write!(f, "invalid sandbox configuration: {message}")
+            }
+            SandboxError::ManagedNetworkProxy(message) => {
+                write!(f, "failed to start managed network proxy: {message}")
             }
             #[cfg(target_os = "macos")]
             SandboxError::SeatbeltMissing => {
@@ -72,12 +83,8 @@ pub struct ManagedNetworkPolicy {
 }
 
 impl ManagedNetworkPolicy {
-    pub fn has_domain_restrictions(&self) -> bool {
-        !self.allowed_domains.is_empty() || !self.denied_domains.is_empty()
-    }
-
     pub fn is_enabled(&self) -> bool {
-        self.enabled || self.has_domain_restrictions()
+        self.enabled
     }
 }
 
@@ -461,6 +468,7 @@ pub struct PreparedCommand {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub arg0: Option<String>,
+    pub managed_network_proxy: Option<ManagedNetworkProxy>,
     #[cfg(target_os = "macos")]
     pub denial_logger: Option<DenialLogger>,
 }
@@ -470,6 +478,16 @@ pub fn prepare_worker_command(
     args: Vec<String>,
     state: &SandboxState,
 ) -> Result<PreparedCommand, SandboxError> {
+    #[cfg(target_os = "linux")]
+    if state.sandbox_policy.has_full_network_access()
+        && state.managed_network_policy.is_enabled()
+        && !state.use_linux_sandbox_bwrap
+    {
+        return Err(SandboxError::InvalidConfiguration(
+            "managed network requires --use-bwrap-sandbox on Linux".to_string(),
+        ));
+    }
+
     let mut env = HashMap::new();
     if !state.sandbox_policy.has_full_network_access() {
         env.insert(
@@ -521,6 +539,8 @@ pub fn prepare_worker_command(
             );
         }
     }
+    let managed_network_proxy = ManagedNetworkProxy::start_for_state(state, &mut env)
+        .map_err(SandboxError::ManagedNetworkProxy)?;
 
     if !state.sandbox_policy.requires_sandbox() {
         return Ok(PreparedCommand {
@@ -528,6 +548,7 @@ pub fn prepare_worker_command(
             args,
             env,
             arg0: None,
+            managed_network_proxy,
             #[cfg(target_os = "macos")]
             denial_logger: None,
         });
@@ -546,6 +567,11 @@ pub fn prepare_worker_command(
             MANAGED_ALLOWED_DOMAINS_ENV_KEY,
             MANAGED_DENIED_DOMAINS_ENV_KEY,
         ] {
+            if let Some(value) = env.get(key) {
+                network_env.insert(key.to_string(), value.clone());
+            }
+        }
+        for key in PROXY_URL_ENV_KEYS {
             if let Some(value) = env.get(key) {
                 network_env.insert(key.to_string(), value.clone());
             }
@@ -569,6 +595,7 @@ pub fn prepare_worker_command(
             args: full_command[1..].to_vec(),
             env,
             arg0: None,
+            managed_network_proxy,
             denial_logger,
         })
     }
@@ -626,6 +653,7 @@ pub fn prepare_worker_command(
             args: sandbox_args,
             env,
             arg0: Some("codex-linux-sandbox".to_string()),
+            managed_network_proxy,
         })
     }
 
@@ -643,6 +671,7 @@ pub fn prepare_worker_command(
             args: sandbox_args,
             env,
             arg0: None,
+            managed_network_proxy,
         })
     }
 
@@ -653,6 +682,7 @@ pub fn prepare_worker_command(
             args,
             env,
             arg0: None,
+            managed_network_proxy,
         })
     }
 }
@@ -1068,8 +1098,7 @@ fn create_seatbelt_command_args(
 
     let proxy = proxy_policy_inputs_from_env(network_env);
     let allow_local_binding = managed_network_policy.allow_local_binding;
-    let enforce_managed_network =
-        managed_network_enabled(network_env) || managed_network_policy.has_domain_restrictions();
+    let enforce_managed_network = managed_network_enabled(network_env);
     let network_policy = dynamic_network_policy(
         sandbox_policy,
         enforce_managed_network,
@@ -1119,7 +1148,11 @@ struct LinuxSandboxArgs {
 #[cfg(target_os = "linux")]
 fn linux_sandbox_main_impl() -> Result<(), String> {
     let args = linux_sandbox_parse_args()?;
-    linux_validate_inner_stage_mode(args.apply_seccomp_then_exec, args.use_bwrap_sandbox)?;
+    linux_validate_inner_stage_mode(
+        args.apply_seccomp_then_exec,
+        args.use_bwrap_sandbox,
+        args.allow_network_for_proxy,
+    )?;
     if args.apply_seccomp_then_exec {
         if args.allow_network_for_proxy {
             let spec = args
@@ -1156,7 +1189,11 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
 fn linux_validate_inner_stage_mode(
     apply_seccomp_then_exec: bool,
     use_bwrap_sandbox: bool,
+    allow_network_for_proxy: bool,
 ) -> Result<(), String> {
+    if allow_network_for_proxy && !use_bwrap_sandbox {
+        return Err("--allow-network-for-proxy requires --use-bwrap-sandbox".to_string());
+    }
     if apply_seccomp_then_exec && !use_bwrap_sandbox {
         return Err("--apply-seccomp-then-exec requires --use-bwrap-sandbox".to_string());
     }
@@ -2350,6 +2387,13 @@ mod tests {
                     "unexpected error message: {message}"
                 );
             }
+            #[cfg(target_os = "linux")]
+            SandboxError::InvalidConfiguration(message) => {
+                panic!("unexpected error: {message}")
+            }
+            SandboxError::ManagedNetworkProxy(message) => {
+                panic!("unexpected error: {message}")
+            }
             #[cfg(target_os = "macos")]
             SandboxError::SeatbeltMissing => {
                 panic!("unexpected error: SeatbeltMissing")
@@ -2530,6 +2574,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_network_policy_enabled_flag_is_authoritative() {
+        let policy = ManagedNetworkPolicy {
+            enabled: false,
+            allowed_domains: vec!["pypi.org".to_string()],
+            denied_domains: vec!["blocked.example".to_string()],
+            allow_local_binding: false,
+        };
+
+        assert!(
+            !policy.is_enabled(),
+            "enabled=false should disable managed mode even when domain lists are present"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_enables_proxy_mode_when_managed_network_env_is_true() {
@@ -2575,6 +2634,64 @@ mod tests {
                 .args
                 .contains(&"--allow-network-for-proxy".to_string()),
             "managed-network mode should enable proxy-routed Linux networking even without domain lists"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_rejects_managed_network_without_bwrap() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        state.managed_network_policy.enabled = true;
+        state.use_linux_sandbox_bwrap = false;
+
+        let err = prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+            .expect_err("managed network without bwrap should fail");
+
+        assert!(
+            err.to_string()
+                .contains("managed network requires --use-bwrap-sandbox on Linux"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_keeps_managed_mode_disabled_with_domain_lists() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        state.managed_network_policy.enabled = false;
+        state.managed_network_policy.allowed_domains = vec!["pypi.org".to_string()];
+        state.managed_network_policy.denied_domains = vec!["blocked.example".to_string()];
+        state.use_linux_sandbox_bwrap = true;
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_NETWORK_ENV_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "explicit enabled=false should keep managed mode disabled even with domain lists"
+        );
+        assert!(
+            !prepared
+                .args
+                .contains(&"--allow-network-for-proxy".to_string()),
+            "managed proxy flag should stay disabled when enabled=false"
         );
     }
 
@@ -2674,11 +2791,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_validate_inner_stage_mode_rejects_apply_seccomp_without_bwrap() {
-        let err =
-            linux_validate_inner_stage_mode(true, false).expect_err("expected validation err");
+        let err = linux_validate_inner_stage_mode(true, false, false)
+            .expect_err("expected validation err");
         assert_eq!(
             err,
             "--apply-seccomp-then-exec requires --use-bwrap-sandbox"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_validate_inner_stage_mode_rejects_proxy_mode_without_bwrap() {
+        let err = linux_validate_inner_stage_mode(false, false, true)
+            .expect_err("expected validation err");
+        assert_eq!(
+            err,
+            "--allow-network-for-proxy requires --use-bwrap-sandbox"
         );
     }
 
