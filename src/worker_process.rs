@@ -3648,7 +3648,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_sandbox_update_does_not_commit_inherited_state() {
+    fn workspace_write_overrides_are_noop_for_non_workspace_inherited_state() {
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
         let initial = serde_json::json!({
@@ -3681,7 +3681,7 @@ mod tests {
             .clone()
             .expect("inherited state should be present");
 
-        let err = manager
+        let changed = manager
             .update_sandbox_state(
                 SandboxStateUpdate {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
@@ -3691,15 +3691,23 @@ mod tests {
                 },
                 Duration::from_millis(1),
             )
-            .expect_err("danger-full-access should fail workspace-write-only config");
+            .expect("danger-full-access should succeed; workspace-write-only override is no-op");
         assert!(
-            matches!(err, WorkerError::Sandbox(ref msg) if msg.contains("requires workspace-write mode")),
-            "unexpected error: {err}"
+            changed,
+            "sandbox state should change after inherited update"
         );
         assert_eq!(
             manager.inherited_sandbox_state,
-            Some(inherited_before),
-            "failed updates must not mutate inherited sandbox baseline"
+            Some(SandboxState {
+                sandbox_policy: SandboxPolicy::DangerFullAccess,
+                ..inherited_before.clone()
+            }),
+            "inherited sandbox baseline should commit successful updates"
+        );
+        assert_eq!(
+            manager.sandbox_state.sandbox_policy,
+            SandboxPolicy::DangerFullAccess,
+            "workspace-write-only override should be ignored for non-workspace policy"
         );
 
         match original_initial {

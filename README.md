@@ -97,7 +97,12 @@ mcp-repl install --client codex --interpreter r
 `install --client codex` writes `--sandbox inherit` by default. That sentinel means `mcp-repl` should
 inherit sandbox policy updates from Codex for the session.
 
-Example `R` REPL Codex config (paths vary by OS/user):
+For `r_repl`, install now also tries to discover the R cache root at install time and appends it
+as an extra writable root. This uses:
+- `dirname(tools::R_user_dir("mcp_repl_install_probe", which = "cache"))`
+- If the probe fails, no extra writable root is added.
+
+Example `R` REPL Codex config (paths vary by OS/user and platform):
 
 ```toml
 [mcp_servers.r_repl]
@@ -109,10 +114,9 @@ tool_timeout_sec = 1800
 args = [
   "--sandbox", "inherit",
   "--interpreter", "r",
+  "--add-writable-root", "/Users/alice/Library/Caches/org.R-project.R/R",
 ]
 ```
-
-### TODO: bring back writeable root discovery for common R cache dirs
 
 Example `Python` REPL Codex config:
 
@@ -137,7 +141,7 @@ propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "r", "--add-writable-root", "/Users/alice/Library/Caches/org.R-project.R/R"]
     },
     "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
@@ -150,6 +154,31 @@ propagate sandbox state updates to MCP servers:
 By default install creates one entry per supported interpreter:
 - `r_repl`
 - `py_repl`
+
+To include additional domain allowlist entries in generated client config, pass repeatable install args:
+
+```sh
+mcp-repl install --client codex --interpreter python \
+  --arg=--sandbox --arg=workspace-write \
+  --arg=--config --arg='sandbox_workspace_write.network_access=true' \
+  --arg=--add-allowed-domain --arg=pypi.org \
+  --arg=--add-allowed-domain --arg=files.pythonhosted.org
+```
+
+Equivalent manual `~/.codex/config.toml` example:
+
+```toml
+[mcp_servers.py_repl]
+command = "/Users/alice/.cargo/bin/mcp-repl"
+tool_timeout_sec = 1800
+args = [
+  "--sandbox", "workspace-write",
+  "--config", "sandbox_workspace_write.network_access=true",
+  "--add-allowed-domain", "pypi.org",
+  "--add-allowed-domain", "files.pythonhosted.org",
+  "--interpreter", "python",
+]
+```
 
 ## Runtime discovery
 
@@ -179,7 +208,9 @@ Default sandbox policy is `workspace-write` with network disabled.
 Write access includes the working area and temp paths required by the worker (exact roots vary by OS/policy).
 On Windows, sandbox enforcement is still under active development and is not yet fully functional/reliable across environments.
 
-See `docs/sandbox.md` for precise behavior, runtime updates, and OS-specific details.
+See:
+- `docs/sandbox.md` for a quick reference.
+- `docs/sandbox-config.md` for detailed semantics, preset behavior, platform-specific behavior, and allowed-domain interactions.
 
 ## MCP surface
 
@@ -208,6 +239,7 @@ Tool behavior and usage guidance:
 
 Additional references:
 - Sandbox behavior and configuration: `docs/sandbox.md`
+- Detailed sandbox semantics and platform matrix: `docs/sandbox-config.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 
 ## License

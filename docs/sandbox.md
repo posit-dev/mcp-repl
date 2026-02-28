@@ -3,6 +3,9 @@
 `mcp-repl` applies an OS sandbox to worker processes unless the sandbox policy is
 `danger-full-access` (or `external-sandbox`).
 
+For a full configuration model (ordering semantics, preset install behavior, domain restrictions,
+and OS/platform intersections), see `docs/sandbox-config.md`.
+
 ## Default policy
 
 When no CLI sandbox mode is provided, the default is:
@@ -32,6 +35,10 @@ The worker also gets a per-session temp directory, exported as:
 
 Operations are applied strictly in CLI argument order. Later operations win.
 `--sandbox ...` resets the base policy at the point where it appears.
+Workspace-write-only options are accepted in any mode, but are no-ops unless effective mode is
+`workspace-write`.
+`--add-allowed-domain` updates managed-network policy only; it does not by itself enable network
+access in `workspace-write`.
 
 ## macOS behavior
 

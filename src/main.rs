@@ -480,7 +480,9 @@ If no target is specified for `install`, all existing agent homes are used:\n\
 - codex: $CODEX_HOME or ~/.codex\n\
 - claude: ~/.claude\n\
 Missing homes are not created.\n\
-If no --interpreter is specified, install uses the full interpreter grid for each selected client."
+If no --interpreter is specified, install uses the full interpreter grid for each selected client.\n\
+Use repeated --arg values to include extra sandbox/network settings in generated client config entries,\n\
+for example: --arg=--add-allowed-domain --arg=pypi.org"
     );
 }
 
@@ -670,6 +672,58 @@ mod tests {
             SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn add_writable_root_is_noop_when_mode_is_not_workspace_write() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::ReadOnly),
+                SandboxCliOperation::AddWritableRoot(PathBuf::from("/tmp/ignored")),
+            ],
+        };
+        let inherited = SandboxState::default();
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        assert_eq!(resolved.sandbox_policy, SandboxPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn workspace_write_config_is_noop_when_mode_is_not_workspace_write() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::DangerFullAccess),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override("sandbox_workspace_write.network_access=true")
+                        .expect("config override"),
+                ),
+            ],
+        };
+
+        let inherited = SandboxState::default();
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);
+    }
+
+    #[test]
+    fn workspace_write_config_is_noop_for_inherited_non_workspace_policy() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override(
+                        "sandbox_workspace_write.writable_roots=[\"/tmp/ignored\"]",
+                    )
+                    .expect("config override"),
+                ),
+            ],
+        };
+        let mut inherited = SandboxState::default();
+        inherited.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);
     }
 
     #[test]
