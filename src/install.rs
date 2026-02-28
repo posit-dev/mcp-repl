@@ -277,8 +277,15 @@ fn has_sandbox_config_arg(args: &[String]) -> bool {
     while let Some(arg) = iter.next() {
         if matches!(
             arg.as_str(),
-            "--sandbox" | "--add-writable-root" | "--add-writeable-root" | "--add-allowed-domain"
+            "--sandbox"
+                | "--network-mode"
+                | "--network"
+                | "--add-writable-root"
+                | "--add-writeable-root"
+                | "--add-allowed-domain"
         ) || arg.starts_with("--sandbox=")
+            || arg.starts_with("--network-mode=")
+            || arg.starts_with("--network=")
             || arg.starts_with("--add-writable-root=")
             || arg.starts_with("--add-writeable-root=")
             || arg.starts_with("--add-allowed-domain=")
@@ -310,6 +317,8 @@ fn is_sandbox_config_override(raw: &str) -> bool {
     matches!(
         key.trim(),
         "sandbox_mode"
+            | "network.mode"
+            | "network_mode"
             | "sandbox_workspace_write.network_access"
             | "sandbox_workspace_write.writable_roots"
             | "sandbox_workspace_write.exclude_tmpdir_env_var"
@@ -1008,6 +1017,29 @@ name="demo"
     fn install_args_preserve_explicit_sandbox_config_via_config_equals() {
         let base = vec![
             "--config=sandbox_workspace_write.network_access=true".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_network_mode_flag() {
+        let base = vec![
+            "--network-mode".to_string(),
+            "managed".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_network_mode_key() {
+        let base = vec![
+            "--config=network.mode=managed".to_string(),
             "--interpreter".to_string(),
             "python".to_string(),
         ];

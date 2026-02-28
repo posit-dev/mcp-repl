@@ -28,7 +28,8 @@ use std::path::PathBuf;
 
 use crate::backend::{Backend, backend_from_env};
 use crate::sandbox_cli::{
-    SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
+    NetworkModeArg, SandboxCliOperation, SandboxCliPlan, SandboxModeArg,
+    parse_sandbox_config_override,
 };
 
 enum CliCommand {
@@ -146,6 +147,25 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                     .plan
                     .operations
                     .push(SandboxCliOperation::SetMode(mode));
+            }
+            "--network-mode" | "--network" => {
+                let value = parser.next_value("--network-mode")?;
+                let mode = NetworkModeArg::parse(&value).map_err(|err| err.to_string())?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::SetNetworkMode(mode));
+            }
+            _ if arg.starts_with("--network-mode=") || arg.starts_with("--network=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.is_empty() {
+                    return Err("missing value for --network-mode".into());
+                }
+                let mode = NetworkModeArg::parse(value).map_err(|err| err.to_string())?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::SetNetworkMode(mode));
             }
             "--add-writable-root" | "--add-writeable-root" => {
                 let value = parser.next_value("--add-writable-root")?;
@@ -457,13 +477,14 @@ fn parse_writable_root(raw: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--network-mode <off|direct|managed>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
 --backend: compatibility alias for --interpreter\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
+--network-mode / --network: high-level network mode (off/direct/managed)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
@@ -618,6 +639,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_network_mode_accepts_managed() {
+        let mode = NetworkModeArg::parse("managed").expect("network mode");
+        assert!(matches!(mode, NetworkModeArg::Managed));
+    }
+
+    #[test]
     fn parse_config_override_supports_codex_bwrap_alias() {
         let op =
             parse_sandbox_config_override("use_linux_sandbox_bwrap=true").expect("config override");
@@ -646,6 +673,15 @@ mod tests {
         assert!(matches!(
             op,
             SandboxConfigOperation::SetManagedNetworkEnabled(true)
+        ));
+    }
+
+    #[test]
+    fn parse_config_override_supports_network_mode_alias() {
+        let op = parse_sandbox_config_override("network_mode=managed").expect("config");
+        assert!(matches!(
+            op,
+            SandboxConfigOperation::SetNetworkMode(NetworkModeArg::Managed)
         ));
     }
 
@@ -686,6 +722,45 @@ mod tests {
         let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
             .expect("effective sandbox state");
         assert_eq!(resolved.sandbox_policy, SandboxPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn network_mode_direct_enables_workspace_network_and_clears_domains() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+                SandboxCliOperation::AddAllowedDomain("pypi.org".to_string()),
+                SandboxCliOperation::SetNetworkMode(NetworkModeArg::Direct),
+            ],
+        };
+        let inherited = SandboxState::default();
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        match resolved.sandbox_policy {
+            SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
+            other => panic!("expected workspace-write policy, got {other:?}"),
+        }
+        assert!(!resolved.managed_network_policy.enabled);
+        assert!(resolved.managed_network_policy.allowed_domains.is_empty());
+        assert!(resolved.managed_network_policy.denied_domains.is_empty());
+    }
+
+    #[test]
+    fn network_mode_managed_enables_workspace_network_and_managed_mode() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+                SandboxCliOperation::SetNetworkMode(NetworkModeArg::Managed),
+            ],
+        };
+        let inherited = SandboxState::default();
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        match resolved.sandbox_policy {
+            SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
+            other => panic!("expected workspace-write policy, got {other:?}"),
+        }
+        assert!(resolved.managed_network_policy.enabled);
     }
 
     #[test]

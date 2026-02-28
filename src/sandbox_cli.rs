@@ -24,10 +24,31 @@ impl SandboxModeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkModeArg {
+    Off,
+    Direct,
+    Managed,
+}
+
+impl NetworkModeArg {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "off" => Ok(Self::Off),
+            "direct" => Ok(Self::Direct),
+            "managed" => Ok(Self::Managed),
+            _ => Err(format!(
+                "invalid network mode: {value} (expected off|direct|managed)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum SandboxConfigOperation {
     SetMode(SandboxModeArg),
+    SetNetworkMode(NetworkModeArg),
     SetWorkspaceNetworkAccess(bool),
     SetWorkspaceWritableRoots(Vec<PathBuf>),
     SetWorkspaceExcludeTmpdirEnvVar(bool),
@@ -42,6 +63,7 @@ pub enum SandboxConfigOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxCliOperation {
     SetMode(SandboxModeArg),
+    SetNetworkMode(NetworkModeArg),
     AddWritableRoot(PathBuf),
     AddAllowedDomain(String),
     Config(SandboxConfigOperation),
@@ -65,6 +87,9 @@ pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation
         "sandbox_mode" => Ok(SandboxConfigOperation::SetMode(SandboxModeArg::parse(
             &parse_string_value(value),
         )?)),
+        "network.mode" => Ok(SandboxConfigOperation::SetNetworkMode(
+            NetworkModeArg::parse(&parse_string_value(value))?,
+        )),
         "sandbox_workspace_write.network_access" => Ok(
             SandboxConfigOperation::SetWorkspaceNetworkAccess(parse_bool_value(value)?),
         ),
@@ -111,10 +136,10 @@ pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation
 }
 
 fn canonicalize_config_key(key: &str) -> String {
-    if key == "use_linux_sandbox_bwrap" {
-        "features.use_linux_sandbox_bwrap".to_string()
-    } else {
-        key.to_string()
+    match key {
+        "use_linux_sandbox_bwrap" => "features.use_linux_sandbox_bwrap".to_string(),
+        "network_mode" => "network.mode".to_string(),
+        _ => key.to_string(),
     }
 }
 
@@ -172,6 +197,7 @@ pub fn resolve_effective_sandbox_state_with_defaults(
             SandboxCliOperation::SetMode(mode) => {
                 apply_mode(&mut state, *mode, inherited, defaults)?
             }
+            SandboxCliOperation::SetNetworkMode(mode) => apply_network_mode(&mut state, *mode),
             SandboxCliOperation::AddWritableRoot(path) => {
                 if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } =
                     &mut state.sandbox_policy
@@ -247,6 +273,10 @@ fn apply_config_op(
 ) -> Result<(), String> {
     match op {
         SandboxConfigOperation::SetMode(mode) => apply_mode(state, *mode, inherited, defaults),
+        SandboxConfigOperation::SetNetworkMode(mode) => {
+            apply_network_mode(state, *mode);
+            Ok(())
+        }
         SandboxConfigOperation::SetWorkspaceNetworkAccess(network_access) => {
             if let SandboxPolicy::WorkspaceWrite {
                 network_access: current,
@@ -305,6 +335,36 @@ fn apply_config_op(
         SandboxConfigOperation::SetUseLinuxSandboxBwrap(value) => {
             state.use_linux_sandbox_bwrap = *value;
             Ok(())
+        }
+    }
+}
+
+fn apply_network_mode(state: &mut SandboxState, mode: NetworkModeArg) {
+    match mode {
+        NetworkModeArg::Off => {
+            if let SandboxPolicy::WorkspaceWrite { network_access, .. } = &mut state.sandbox_policy
+            {
+                *network_access = false;
+            }
+            state.managed_network_policy.enabled = false;
+            state.managed_network_policy.allowed_domains.clear();
+            state.managed_network_policy.denied_domains.clear();
+        }
+        NetworkModeArg::Direct => {
+            if let SandboxPolicy::WorkspaceWrite { network_access, .. } = &mut state.sandbox_policy
+            {
+                *network_access = true;
+            }
+            state.managed_network_policy.enabled = false;
+            state.managed_network_policy.allowed_domains.clear();
+            state.managed_network_policy.denied_domains.clear();
+        }
+        NetworkModeArg::Managed => {
+            if let SandboxPolicy::WorkspaceWrite { network_access, .. } = &mut state.sandbox_policy
+            {
+                *network_access = true;
+            }
+            state.managed_network_policy.enabled = true;
         }
     }
 }

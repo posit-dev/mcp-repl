@@ -141,11 +141,18 @@ propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "r", "--add-writable-root", "/Users/alice/Library/Caches/org.R-project.R/R"]
+      "args": [
+        "--sandbox", "workspace-write",
+        "--interpreter", "r",
+        "--add-writable-root", "/Users/alice/Library/Caches/org.R-project.R/R"
+      ]
     },
     "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
+      "args": [
+        "--sandbox", "workspace-write",
+        "--interpreter", "python"
+      ]
     }
   }
 }
@@ -160,7 +167,7 @@ To include additional domain allowlist entries in generated client config, pass 
 ```sh
 mcp-repl install --client codex --interpreter python \
   --arg=--sandbox --arg=workspace-write \
-  --arg=--config --arg='sandbox_workspace_write.network_access=true' \
+  --arg=--network-mode --arg=managed \
   --arg=--add-allowed-domain --arg=pypi.org \
   --arg=--add-allowed-domain --arg=files.pythonhosted.org
 ```
@@ -173,7 +180,7 @@ command = "/Users/alice/.cargo/bin/mcp-repl"
 tool_timeout_sec = 1800
 args = [
   "--sandbox", "workspace-write",
-  "--config", "sandbox_workspace_write.network_access=true",
+  "--network-mode", "managed",
   "--add-allowed-domain", "pypi.org",
   "--add-allowed-domain", "files.pythonhosted.org",
   "--interpreter", "python",
@@ -205,8 +212,19 @@ Notes:
 ## Sandbox
 
 Default sandbox policy is `workspace-write` with network disabled.
+Default network mode is `off`.
 Write access includes the working area and temp paths required by the worker (exact roots vary by OS/policy).
 On Windows, sandbox enforcement is still under active development and is not yet fully functional/reliable across environments.
+
+High-level network mode flag:
+- `--network-mode off`: network disabled (default)
+- `--network-mode direct`: direct outbound network (no managed-domain routing)
+- `--network-mode managed`: network enabled + managed routing/domain policy enabled
+
+Proxy ownership:
+- `mcp-repl` does not run its own domain-enforcing proxy.
+- With Codex, managed mode uses Codex's managed proxy path.
+- With other clients (for example Claude), managed mode only works if the client/environment also provides a compatible loopback proxy setup; otherwise behavior is fail-closed (no usable network path).
 
 See:
 - `docs/sandbox.md` for a quick reference.

@@ -16,6 +16,7 @@ This document describes how `mcp-repl` builds effective sandbox behavior from CL
 Operations are applied in argument order.
 
 - `--sandbox ...` sets the base mode at that point in the sequence
+- `--network-mode ...` applies a high-level network profile (`off`, `direct`, or `managed`)
 - `--add-writable-root` mutates the current `workspace-write` roots
 - `--add-allowed-domain` appends to managed `allowed_domains`
 - `--config key=value` applies one structured mutation
@@ -39,11 +40,39 @@ policy is `workspace-write`:
 - `sandbox_workspace_write.exclude_tmpdir_env_var`
 - `sandbox_workspace_write.exclude_slash_tmp`
 
+## Tri-Modal Network API
+
+To simplify common setups, `mcp-repl` exposes a high-level network mode:
+
+- CLI: `--network-mode off|direct|managed` (alias: `--network`)
+- Config override: `network.mode=off|direct|managed` (alias: `network_mode=...`)
+
+Semantics:
+
+- `off`:
+  - disables managed mode (`permissions.network.enabled=false`)
+  - clears configured `allowed_domains` and `denied_domains`
+  - disables network when the effective policy is `workspace-write`
+- `direct`:
+  - disables managed mode
+  - clears configured `allowed_domains` and `denied_domains`
+  - enables network when the effective policy is `workspace-write`
+- `managed`:
+  - enables managed mode (`permissions.network.enabled=true`)
+  - enables network when the effective policy is `workspace-write`
+
+Mode-specific caveats:
+
+- In `read-only`, network remains disabled regardless of `--network-mode`.
+- In `danger-full-access`, network is intrinsically full-access; `off` cannot force a no-network
+  runtime because the filesystem/sandbox mode itself grants full access.
+
 ## Presets and Defaults
 
 Server default (no sandbox flags):
 
 - `sandbox_policy = workspace-write`
+- `network.mode = off`
 - `sandbox_workspace_write.network_access = false`
 - writable roots start empty and are expanded by runtime defaults (cwd/temp/session temp)
 
@@ -71,10 +100,18 @@ How to set them:
 
 Key behavior:
 
-- Domain lists do not enable network by themselves.
-  You still need a sandbox mode with network enabled (`workspace-write` + `sandbox_workspace_write.network_access=true`, or full-access modes).
+- Domain lists do not enable network by themselves unless `managed` mode is active.
+  Recommended path: `--network-mode managed` plus explicit allow/deny entries.
 - Domain entries are passed through as strings; `mcp-repl` does not parse wildcard/domain syntax.
 - Domain restrictions are meaningful only when managed proxy routing is active and the proxy honors them.
+
+Proxy ownership and client compatibility:
+
+- `mcp-repl` does not run a domain-filtering proxy process.
+- With Codex, managed mode integrates with Codex managed network.
+- With non-Codex clients (for example Claude), managed mode only works if the client/runtime
+  provides a compatible loopback proxy environment. Without that, managed mode is fail-closed
+  (no usable network route).
 
 ## Platform Matrix
 
@@ -121,7 +158,7 @@ Network behavior:
 Enforcement:
 
 - `read-only` and `workspace-write` use the Windows sandbox runner.
-- `danger-full-access` bypasses built-in sandbox enforcement.
+- `danger-full-access` bypasses built-in sandbox enforcement. Use this when isolation is provided externally (for example, running inside a Docker container).
 - Python backend is currently unavailable on Windows in this project.
 
 Managed network and domains:
@@ -133,6 +170,8 @@ Managed network and domains:
 ## Intersections and Gotchas
 
 - `--add-allowed-domain` with default `workspace-write` still yields no network unless you also enable network access.
+- `--network-mode direct` or `--network-mode off` clears configured allow/deny domains by design,
+  so domain policy does not silently remain active.
 - `--sandbox inherit` + `--add-writable-root` is portable across inherited policies; if inherited mode is not `workspace-write`, the writable-root addition is a no-op.
 - `danger-full-access` ignores sandbox enforcement, so domain controls are not enforced locally by `mcp-repl`.
 - Managed-network behavior is proxy-driven; if there is no managed proxy path, domain controls may not be effective.
@@ -146,6 +185,7 @@ Minimal network-restricted default:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 args = [
   "--sandbox", "workspace-write",
+  "--network-mode", "off",
   "--interpreter", "r",
 ]
 ```
@@ -157,7 +197,7 @@ Enable managed-domain network for Python:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 args = [
   "--sandbox", "workspace-write",
-  "--config", "sandbox_workspace_write.network_access=true",
+  "--network-mode", "managed",
   "--add-allowed-domain", "pypi.org",
   "--add-allowed-domain", "files.pythonhosted.org",
   "--interpreter", "python",
@@ -169,7 +209,7 @@ Install with the same domain settings:
 ```sh
 mcp-repl install --client codex --interpreter python \
   --arg=--sandbox --arg=workspace-write \
-  --arg=--config --arg='sandbox_workspace_write.network_access=true' \
+  --arg=--network-mode --arg=managed \
   --arg=--add-allowed-domain --arg=pypi.org \
   --arg=--add-allowed-domain --arg=files.pythonhosted.org
 ```

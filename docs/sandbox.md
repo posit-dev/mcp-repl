@@ -24,6 +24,7 @@ The worker also gets a per-session temp directory, exported as:
 ## Configure sandbox policy
 
 - Base mode: `mcp-repl --sandbox inherit|read-only|workspace-write|danger-full-access`
+- Network mode: `mcp-repl --network-mode off|direct|managed` (alias: `--network`)
 - Add writable roots (workspace-write only, repeatable):
   `mcp-repl --add-writable-root /absolute/path`
 - Add allowed domains (repeatable):
@@ -35,10 +36,23 @@ The worker also gets a per-session temp directory, exported as:
 
 Operations are applied strictly in CLI argument order. Later operations win.
 `--sandbox ...` resets the base policy at the point where it appears.
+`--network-mode` applies a high-level network profile:
+
+- `off`: disable managed mode and keep network disabled where sandbox policy allows toggling
+- `direct`: disable managed mode and request direct network access
+- `managed`: enable managed mode and request network access in `workspace-write`
+
 Workspace-write-only options are accepted in any mode, but are no-ops unless effective mode is
 `workspace-write`.
 `--add-allowed-domain` updates managed-network policy only; it does not by itself enable network
 access in `workspace-write`.
+
+Managed-proxy ownership:
+
+- `mcp-repl` does not run a domain-filtering proxy process.
+- In Codex sessions, managed mode relies on Codex's managed proxy path.
+- In non-Codex clients, managed mode requires a compatible proxy environment to be provided by the
+  host/client; otherwise managed routing has no usable network path (fail closed).
 
 ## macOS behavior
 
@@ -95,5 +109,5 @@ Managed-network behavior on Linux:
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
 - Python backend is currently unavailable on Windows (it requires a Unix PTY).
 - `read-only` and `workspace-write` are enforced by the Windows sandbox runner.
-- `danger-full-access` runs without built-in sandbox enforcement.
+- `danger-full-access` runs without built-in sandbox enforcement. Use this when isolation is provided externally (for example, running inside a Docker container).
 - Some Windows environments may not support the restricted-token setup required by sandboxed modes.
