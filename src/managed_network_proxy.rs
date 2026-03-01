@@ -54,7 +54,7 @@ impl ManagedNetworkProxy {
             .block_on(async {
                 NetworkProxy::builder()
                     .state(Arc::new(state))
-                    .managed_by_codex(false)
+                    .managed_by_codex(true)
                     .build()
                     .await
             })
@@ -122,6 +122,7 @@ mod tests {
     use crate::sandbox::{ManagedNetworkPolicy, SandboxPolicy, SandboxState};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use url::Url;
 
     fn managed_state(network_access: bool) -> SandboxState {
         SandboxState {
@@ -203,5 +204,47 @@ mod tests {
             result.is_ok(),
             "dropping managed proxy inside a tokio runtime should not panic"
         );
+    }
+
+    #[test]
+    fn start_for_state_uses_distinct_http_proxy_ports_per_session() {
+        let state = managed_state(true);
+        let mut env_a = HashMap::new();
+        let proxy_a = match ManagedNetworkProxy::start_for_state(&state, &mut env_a) {
+            Ok(Some(proxy)) => proxy,
+            Ok(None) => panic!("expected managed proxy to start"),
+            Err(err) if err.contains("Operation not permitted") => return,
+            Err(err) => panic!("start_for_state should succeed: {err}"),
+        };
+        let mut env_b = HashMap::new();
+        let proxy_b = match ManagedNetworkProxy::start_for_state(&state, &mut env_b) {
+            Ok(Some(proxy)) => proxy,
+            Ok(None) => panic!("expected managed proxy to start"),
+            Err(err) if err.contains("Operation not permitted") => return,
+            Err(err) => panic!("start_for_state should succeed: {err}"),
+        };
+
+        let proxy_a_url = env_a
+            .get("HTTP_PROXY")
+            .expect("managed proxy should set HTTP_PROXY");
+        let proxy_b_url = env_b
+            .get("HTTP_PROXY")
+            .expect("managed proxy should set HTTP_PROXY");
+        let port_a = Url::parse(proxy_a_url)
+            .expect("HTTP_PROXY should be a valid URL")
+            .port()
+            .expect("HTTP_PROXY should contain a port");
+        let port_b = Url::parse(proxy_b_url)
+            .expect("HTTP_PROXY should be a valid URL")
+            .port()
+            .expect("HTTP_PROXY should contain a port");
+
+        assert_ne!(
+            port_a, port_b,
+            "managed sessions should not share fixed HTTP proxy ports"
+        );
+
+        drop(proxy_a);
+        drop(proxy_b);
     }
 }
