@@ -386,7 +386,7 @@ fn apply_install_time_r_writable_root(
     let Some(root) = r_cache_root else {
         return args;
     };
-    if !root.is_absolute() {
+    if !root.is_absolute() || !root.is_dir() {
         return args;
     }
     let root = root.to_string_lossy().to_string();
@@ -1176,11 +1176,14 @@ name="demo"
 
     #[test]
     fn apply_install_time_r_writable_root_adds_root_for_r() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let cache_root = temp.path().join("r-cache");
+        std::fs::create_dir_all(&cache_root).expect("cache root should create");
         let args = apply_install_time_r_writable_root(
             &["--sandbox".to_string(), "inherit".to_string()],
             InstallInterpreter::R,
             false,
-            Some(Path::new("/tmp/r-cache")),
+            Some(cache_root.as_path()),
         );
         assert_eq!(
             args,
@@ -1190,7 +1193,28 @@ name="demo"
                 "--interpreter".to_string(),
                 "r".to_string(),
                 "--add-writable-root".to_string(),
-                "/tmp/r-cache".to_string(),
+                cache_root.to_string_lossy().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_install_time_r_writable_root_skips_missing_root_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let missing_root = temp.path().join("missing-r-cache");
+        let args = apply_install_time_r_writable_root(
+            &["--sandbox".to_string(), "inherit".to_string()],
+            InstallInterpreter::R,
+            false,
+            Some(missing_root.as_path()),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--interpreter".to_string(),
+                "r".to_string(),
             ]
         );
     }

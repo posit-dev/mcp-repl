@@ -14,7 +14,7 @@ use codex_network_proxy::NetworkProxyState;
 use codex_network_proxy::build_config_state;
 
 pub struct ManagedNetworkProxy {
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     handle: Option<NetworkProxyHandle>,
 }
 
@@ -67,7 +67,7 @@ impl ManagedNetworkProxy {
         proxy.apply_to_env(env);
 
         Ok(Some(Self {
-            runtime,
+            runtime: Some(runtime),
             handle: Some(handle),
         }))
     }
@@ -75,8 +75,23 @@ impl ManagedNetworkProxy {
 
 impl Drop for ManagedNetworkProxy {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = self.runtime.block_on(async { handle.shutdown().await });
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+
+        let shutdown = move || {
+            let _ = runtime.block_on(async { handle.shutdown().await });
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("mcp-managed-network-proxy-shutdown".to_string())
+                .spawn(shutdown);
+        } else {
+            shutdown();
         }
     }
 }
@@ -160,6 +175,33 @@ mod tests {
         assert!(
             env.contains_key("NO_PROXY"),
             "managed proxy should set NO_PROXY"
+        );
+    }
+
+    #[test]
+    fn drop_inside_tokio_runtime_does_not_panic() {
+        let mut env = HashMap::new();
+        let state = managed_state(true);
+        let proxy = match ManagedNetworkProxy::start_for_state(&state, &mut env) {
+            Ok(Some(proxy)) => proxy,
+            Ok(None) => panic!("expected managed proxy to start"),
+            Err(err) if err.contains("Operation not permitted") => return,
+            Err(err) => panic!("start_for_state should succeed: {err}"),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+                drop(proxy);
+            });
+        }));
+
+        assert!(
+            result.is_ok(),
+            "dropping managed proxy inside a tokio runtime should not panic"
         );
     }
 }
