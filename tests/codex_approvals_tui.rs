@@ -9,6 +9,7 @@ mod unix_impl {
     use serde_json::Value;
     use std::io::{ErrorKind, Read, Write};
     use std::net::SocketAddr;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -60,8 +61,7 @@ mod unix_impl {
         let env = create_isolated_codex_env(&mcp_console)?;
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
-            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args), true)
-                .await?;
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
 
         let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
         let mode_flag = match mode {
@@ -145,13 +145,9 @@ mod unix_impl {
 
         let workspace_args = tool_args_for_code(&sandbox_run_code());
         let full_access_probe_args = tool_args_for_code(&outside_workspace_probe_code()?);
-        let mock_server = MockResponsesServer::start(
-            tool_name(),
-            workspace_args,
-            Some(full_access_probe_args),
-            false,
-        )
-        .await?;
+        let mock_server =
+            MockResponsesServer::start(tool_name(), workspace_args, Some(full_access_probe_args))
+                .await?;
 
         let mut driver = CodexPtyDriver::spawn(
             &env.codex_home,
@@ -204,6 +200,42 @@ mod unix_impl {
         assert!(
             outputs.iter().any(|out| out.contains("WRITE_OK")),
             "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
+        );
+        Ok(())
+    }
+
+    pub(super) async fn run_mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        let tool_args = tool_args_for_code(&sandbox_run_code());
+        let mock_server =
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
+
+        let mut stream = TcpStream::connect(mock_server.addr).await?;
+        let payload = b"not-json";
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.write_all(payload).await?;
+        stream.shutdown().await?;
+
+        let mut response_bytes = Vec::new();
+        stream.read_to_end(&mut response_bytes).await?;
+        let response = String::from_utf8(response_bytes)
+            .map_err(|err| format!("malformed-response test got non-UTF8 bytes: {err}"))?;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 for malformed /responses payload, got:\n{response}"
+        );
+
+        let last_request = mock_server.last_request().await;
+        assert!(
+            last_request
+                .as_ref()
+                .and_then(|request| request.get("parse_error"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "expected parse_error marker in mock request log, got: {last_request:?}"
         );
         Ok(())
     }
@@ -262,6 +294,7 @@ mod unix_impl {
     ) -> TestResult<std::process::Output> {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.process_group(0);
         let mut child = cmd.spawn()?;
         let mut stdout_reader = child
             .stdout
@@ -291,6 +324,11 @@ mod unix_impl {
                 break status;
             }
             if Instant::now() >= deadline {
+                let pid = child.id() as i32;
+                // Ensure the timeout path tears down the whole subtree (shell + codex + children).
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!(
@@ -1106,7 +1144,6 @@ tryCatch({
         tool_name: String,
         workspace_write_tool_args: String,
         full_access_tool_args: Option<String>,
-        allow_unparsed_exec_fallback: bool,
         requests: Vec<Value>,
         request_paths: Vec<String>,
         next_call_ordinal: usize,
@@ -1119,7 +1156,6 @@ tryCatch({
             tool_name: String,
             workspace_write_tool_args: String,
             full_access_tool_args: Option<String>,
-            allow_unparsed_exec_fallback: bool,
         ) -> TestResult<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
@@ -1127,7 +1163,6 @@ tryCatch({
                 tool_name,
                 workspace_write_tool_args,
                 full_access_tool_args,
-                allow_unparsed_exec_fallback,
                 requests: Vec::new(),
                 request_paths: Vec::new(),
                 next_call_ordinal: 1,
@@ -1248,11 +1283,30 @@ tryCatch({
         let response_body = if method == "GET" && path.contains("/models") {
             models_response()
         } else if method == "POST" && path.contains("/responses") {
-            let body_json = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-            {
-                let mut locked = state.lock().await;
-                locked.requests.push(body_json.clone());
-                response_for_request(&body_json, &mut locked)
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(body_json) => {
+                    let mut locked = state.lock().await;
+                    locked.requests.push(body_json.clone());
+                    response_for_request(&body_json, &mut locked)
+                }
+                Err(err) => {
+                    let mut locked = state.lock().await;
+                    locked.requests.push(serde_json::json!({
+                        "parse_error": err.to_string(),
+                    }));
+                    let body = serde_json::json!({
+                        "error": format!("invalid /responses payload: {err}"),
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let stream = reader.get_mut();
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
             }
         } else {
             r#"{"error":"unsupported"}"#.to_string()
@@ -1310,18 +1364,6 @@ tryCatch({
     }
 
     fn response_for_request(body: &Value, state: &mut MockState) -> String {
-        if body.is_null() && state.allow_unparsed_exec_fallback {
-            if state.pending_call_id.is_some() {
-                let ordinal = state.pending_call_ordinal.take().unwrap_or_default();
-                state.pending_call_id = None;
-                return response_body_with_items(
-                    vec![message_item(&format!("Tool call {ordinal} completed"))],
-                    &format!("resp-tool-{ordinal}"),
-                );
-            }
-            return queue_tool_call(state, state.workspace_write_tool_args.clone());
-        }
-
         if has_user_marker(body, WARMUP_MARKER) {
             return response_body_with_items(vec![message_item("Warmup complete")], "resp-warmup");
         }
@@ -1483,6 +1525,11 @@ mod linux {
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        super::unix_impl::run_mock_rejects_malformed_responses_payload().await
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1512,6 +1559,11 @@ mod macos {
     #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        super::unix_impl::run_mock_rejects_malformed_responses_payload().await
     }
 }
 
