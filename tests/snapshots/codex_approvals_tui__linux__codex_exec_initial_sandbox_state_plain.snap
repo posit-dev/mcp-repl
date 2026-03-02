@@ -1,0 +1,39 @@
+---
+source: tests/codex_approvals_tui.rs
+expression: snapshot
+---
+$ codex exec --sandbox workspace-write --skip-git-repo-check --cd <WORKSPACE> "SANDBOX_TEST_1: run the sandbox write test"
+OpenAI Codex vN.NN.N (research preview)
+--------
+workdir: <WORKSPACE>
+model: gpt-5.3-codex
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: none
+session id: <SESSION_ID>
+--------
+user
+SANDBOX_TEST_1: run the sandbox write test
+mcp: r starting
+tool r.repl({"input":"target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"})
+mcp: r ready
+mcp startup: ready: r
+r.repl({"input":"target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"}) success in Nms:
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console] echoed input elided: 8 lines (206 bytes); head: > target <- tempfile(\"mcp-console-codex\"); tail: + })\nWRITE_OK\n"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ],
+  "isError": false
+}
+codex
+Tool call 1 completed
+Tool call 1 completed

@@ -9,7 +9,9 @@ mod unix_impl {
     use serde_json::Value;
     use std::io::{ErrorKind, Read, Write};
     use std::net::SocketAddr;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -22,72 +24,100 @@ mod unix_impl {
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
-    pub(super) async fn run_codex_tui_initial_sandbox_state() -> TestResult<Vec<Step>> {
+    struct IsolatedCodexEnv {
+        _temp_dir: tempfile::TempDir,
+        workspace: PathBuf,
+        codex_home: PathBuf,
+        sandbox_log: PathBuf,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExecSnapshotMode {
+        Json,
+        Plain,
+    }
+
+    pub(super) async fn run_codex_exec_initial_sandbox_state() -> TestResult<String> {
+        run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Json).await
+    }
+
+    pub(super) async fn run_codex_exec_initial_sandbox_state_plain() -> TestResult<String> {
+        run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Plain).await
+    }
+
+    async fn run_codex_exec_initial_sandbox_state_for_mode(
+        mode: ExecSnapshotMode,
+    ) -> TestResult<String> {
         if !codex_available() {
             eprintln!("codex not found on PATH; skipping");
-            return Ok(Vec::new());
-        }
-        if !common::sandbox_exec_available() {
-            eprintln!("sandbox-exec unavailable; skipping");
-            return Ok(Vec::new());
+            return Ok(String::new());
         }
         if !loopback_bind_available().await {
             eprintln!("loopback TCP bind unavailable; skipping");
-            return Ok(Vec::new());
+            return Ok(String::new());
         }
 
-        let repo_root = std::env::current_dir()?;
         let mcp_console = resolve_mcp_console_path()?;
-        let temp_dir = tempfile::tempdir()?;
-        let codex_home = temp_dir.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
-        let sandbox_log_dir = tempfile::tempdir_in(&repo_root)?;
-        let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
+        let env = create_isolated_codex_env(&mcp_console)?;
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
-        let config = codex_config(&mcp_console, &repo_root);
-        std::fs::write(codex_home.join("config.toml"), config)?;
-        let mut driver = CodexPtyDriver::spawn(
-            &codex_home,
-            &repo_root,
-            &mock_server.base_url(),
-            &sandbox_log,
-        )?;
-        driver.drain(Duration::from_millis(800));
-        driver.ensure_running("after startup")?;
-        let mut steps = Vec::new();
-        driver.wait_for_warmup(Duration::from_secs(10))?;
-        steps.push(Step::new("warmup", driver.snapshot_screen()));
-        wait_for_log_contains(&sandbox_log, "workspace-write", Duration::from_secs(10))?;
 
-        driver.send_line(&format!(
-            "{WORKSPACE_WRITE_MARKER}: run the sandbox write test"
-        ))?;
-        if let Err(err) = driver.wait_for_contains("WRITE_OK", Duration::from_secs(20)) {
-            let request_count = mock_server.request_count().await;
-            let last_request = mock_server.last_request().await;
+        let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
+        let mode_flag = match mode {
+            ExecSnapshotMode::Json => "--json ",
+            ExecSnapshotMode::Plain => "",
+        };
+        let shell_script = format!(
+            "codex exec {mode_flag}--sandbox workspace-write --skip-git-repo-check --cd {} {} 2>&1",
+            sh_single_quote(&env.workspace.display().to_string()),
+            sh_single_quote(&prompt),
+        );
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
+        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
+        cmd.env("OPENAI_BASE_URL", mock_server.base_url());
+        cmd.env(
+            "MCP_CONSOLE_SANDBOX_STATE_LOG",
+            env.sandbox_log.display().to_string(),
+        );
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "C");
+        cmd.arg("-c");
+        cmd.arg(shell_script);
+        cmd.current_dir(&env.workspace);
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        if !output.status.success() {
             let request_paths = mock_server.request_paths().await;
-            let _ = driver.kill();
+            let last_request = mock_server.last_request().await;
             return Err(format!(
-                "{err}\nrequests: {request_count}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}"
+                "codex exec failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
             )
             .into());
         }
-        driver.wait_for_contains("Tool call 1 completed", Duration::from_secs(20))?;
-        steps.push(Step::new(
-            "after workspace-write call",
-            driver.snapshot_screen(),
-        ));
 
-        driver.kill()?;
+        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
         let outputs = mock_server.function_call_outputs().await;
-        assert!(
-            outputs.iter().any(|out| out.contains("WRITE_OK")),
-            "expected workspace-write call to succeed, outputs: {outputs:?}"
-        );
+        let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"))
+            || stdout.contains("WRITE_OK")
+            || stderr.contains("WRITE_OK");
+        if !saw_write_ok {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected workspace-write call to succeed\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
 
-        Ok(steps)
+        render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
     }
 
     pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
@@ -110,13 +140,8 @@ mod unix_impl {
             return Ok(());
         }
 
-        let repo_root = std::env::current_dir()?;
         let mcp_console = resolve_mcp_console_path()?;
-        let temp_dir = tempfile::tempdir()?;
-        let codex_home = temp_dir.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
-        let sandbox_log_dir = tempfile::tempdir_in(&repo_root)?;
-        let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
+        let env = create_isolated_codex_env(&mcp_console)?;
 
         let workspace_args = tool_args_for_code(&sandbox_run_code());
         let full_access_probe_args = tool_args_for_code(&outside_workspace_probe_code()?);
@@ -124,19 +149,16 @@ mod unix_impl {
             MockResponsesServer::start(tool_name(), workspace_args, Some(full_access_probe_args))
                 .await?;
 
-        let config = codex_config(&mcp_console, &repo_root);
-        std::fs::write(codex_home.join("config.toml"), config)?;
-
         let mut driver = CodexPtyDriver::spawn(
-            &codex_home,
-            &repo_root,
+            &env.codex_home,
+            &env.workspace,
             &mock_server.base_url(),
-            &sandbox_log,
+            &env.sandbox_log,
         )?;
         driver.drain(Duration::from_millis(800));
         driver.ensure_running("after startup")?;
         driver.wait_for_warmup(Duration::from_secs(10))?;
-        wait_for_log_contains(&sandbox_log, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
@@ -152,9 +174,13 @@ mod unix_impl {
             Duration::from_secs(15),
         )?;
 
-        wait_for_log_contains(&sandbox_log, "danger-full-access", Duration::from_secs(20))?;
         wait_for_log_contains(
-            &sandbox_log,
+            &env.sandbox_log,
+            "danger-full-access",
+            Duration::from_secs(20),
+        )?;
+        wait_for_log_contains(
+            &env.sandbox_log,
             "codex/sandbox-state/update",
             Duration::from_secs(20),
         )?;
@@ -178,6 +204,42 @@ mod unix_impl {
         Ok(())
     }
 
+    pub(super) async fn run_mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        let tool_args = tool_args_for_code(&sandbox_run_code());
+        let mock_server =
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
+
+        let mut stream = TcpStream::connect(mock_server.addr).await?;
+        let payload = b"not-json";
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.write_all(payload).await?;
+        stream.shutdown().await?;
+
+        let mut response_bytes = Vec::new();
+        stream.read_to_end(&mut response_bytes).await?;
+        let response = String::from_utf8(response_bytes)
+            .map_err(|err| format!("malformed-response test got non-UTF8 bytes: {err}"))?;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 for malformed /responses payload, got:\n{response}"
+        );
+
+        let last_request = mock_server.last_request().await;
+        assert!(
+            last_request
+                .as_ref()
+                .and_then(|request| request.get("parse_error"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "expected parse_error marker in mock request log, got: {last_request:?}"
+        );
+        Ok(())
+    }
+
     fn full_access_test_enabled() -> bool {
         std::env::var_os(FULL_ACCESS_TEST_ENV).is_some()
     }
@@ -191,6 +253,273 @@ mod unix_impl {
             .arg("--version")
             .output()
             .is_ok()
+    }
+
+    fn create_isolated_codex_env(mcp_console: &Path) -> TestResult<IsolatedCodexEnv> {
+        let temp_dir = tempfile::tempdir()?;
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let git_status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&workspace)
+            .status()?;
+        if !git_status.success() {
+            return Err(
+                format!("failed to initialize temp workspace git repo: {git_status}").into(),
+            );
+        }
+
+        let codex_home = temp_dir.path().join("codex-home");
+        std::fs::create_dir_all(codex_home.join("shell_snapshots"))?;
+
+        let sandbox_log_dir = temp_dir.path().join("sandbox-log");
+        std::fs::create_dir_all(&sandbox_log_dir)?;
+        let sandbox_log = sandbox_log_dir.join("sandbox-state.log");
+
+        let config = codex_config(mcp_console, &workspace);
+        std::fs::write(codex_home.join("config.toml"), config)?;
+
+        Ok(IsolatedCodexEnv {
+            _temp_dir: temp_dir,
+            workspace,
+            codex_home,
+            sandbox_log,
+        })
+    }
+
+    fn run_command_with_timeout(
+        mut cmd: std::process::Command,
+        timeout: Duration,
+    ) -> TestResult<std::process::Output> {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.process_group(0);
+        let mut child = cmd.spawn()?;
+        let mut stdout_reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture codex exec stdout".to_string())?;
+        let mut stderr_reader = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture codex exec stderr".to_string())?;
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_reader.read_to_end(&mut buf);
+            let _ = stdout_tx.send(buf);
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_reader.read_to_end(&mut buf);
+            let _ = stderr_tx.send(buf);
+        });
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let pid = child.id() as i32;
+                // Ensure the timeout path tears down the whole subtree (shell + codex + children).
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "timed out waiting for codex exec to finish after {}s",
+                    timeout.as_secs()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let stdout = stdout_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "timed out collecting codex exec stdout".to_string())?;
+        let stderr = stderr_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "timed out collecting codex exec stderr".to_string())?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn render_exec_snapshot(
+        mode: ExecSnapshotMode,
+        stdout: &str,
+        stderr: &str,
+        workspace: &Path,
+        codex_home: &Path,
+    ) -> TestResult<String> {
+        let mut out = String::new();
+        out.push_str(match mode {
+            ExecSnapshotMode::Json => {
+                "$ codex exec --json --sandbox workspace-write --skip-git-repo-check --cd <WORKSPACE> \"SANDBOX_TEST_1: run the sandbox write test\"\n"
+            }
+            ExecSnapshotMode::Plain => {
+                "$ codex exec --sandbox workspace-write --skip-git-repo-check --cd <WORKSPACE> \"SANDBOX_TEST_1: run the sandbox write test\"\n"
+            }
+        });
+
+        for line in stdout.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = normalize_exec_text(trimmed, workspace, codex_home);
+            if normalized.is_empty() {
+                continue;
+            }
+            out.push_str(&normalized);
+            out.push('\n');
+        }
+
+        for line in stderr.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = normalize_exec_text(trimmed, workspace, codex_home);
+            if normalized.is_empty() {
+                continue;
+            }
+            out.push_str(&normalized);
+            out.push('\n');
+        }
+
+        Ok(out.trim_end().to_string())
+    }
+
+    fn normalize_exec_text(text: &str, workspace: &Path, codex_home: &Path) -> String {
+        if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
+            return String::new();
+        }
+        let workspace_display = workspace.display().to_string();
+        let codex_home_display = codex_home.display().to_string();
+        let workspace_private = format!("/private{workspace_display}");
+        let codex_home_private = format!("/private{codex_home_display}");
+
+        let mut text = text.to_string();
+        for (needle, replacement) in [
+            (&workspace_private, "<WORKSPACE>"),
+            (&workspace_display, "<WORKSPACE>"),
+            (&codex_home_private, "<CODEX_HOME>"),
+            (&codex_home_display, "<CODEX_HOME>"),
+        ] {
+            text = text.replace(needle, replacement);
+        }
+
+        let mut text = normalize_temp_paths(&normalize_codex_home_path(&text));
+        text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
+        text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
+        text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
+        text = normalize_json_number_field(&text, "output_tokens", "\"<N>\"");
+        text = normalize_ms_duration(&text);
+        if text.starts_with("OpenAI Codex v") {
+            text = "OpenAI Codex vN.NN.N (research preview)".to_string();
+        }
+        if text.starts_with("session id: ") {
+            text = "session id: <SESSION_ID>".to_string();
+        }
+        if text.starts_with("workdir: ") {
+            text = "workdir: <WORKSPACE>".to_string();
+        }
+        if text.chars().all(|ch| ch.is_ascii_digit() || ch == ',') {
+            text = "<N>".to_string();
+        }
+        if let Some(rest) = text.strip_prefix("202")
+            && rest.contains(" WARN ")
+        {
+            text = format!("<TIMESTAMP>{}", &text[text.find(" WARN ").unwrap_or(0)..]);
+        }
+        text
+    }
+
+    fn normalize_ms_duration(text: &str) -> String {
+        let marker = " in ";
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+        while let Some(pos) = text[idx..].find(marker) {
+            let abs = idx + pos;
+            out.push_str(&text[idx..abs + marker.len()]);
+            let mut end = abs + marker.len();
+            while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > abs + marker.len() && text[end..].starts_with("ms") {
+                out.push_str("N");
+                idx = end;
+            } else {
+                idx = abs + marker.len();
+            }
+        }
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    fn sh_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn normalize_json_string_field(text: &str, key: &str, replacement: &str) -> String {
+        let marker = format!("\"{key}\":\"");
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+
+        while let Some(pos) = text[idx..].find(&marker) {
+            let start = idx + pos;
+            out.push_str(&text[idx..start + marker.len()]);
+            let mut end = start + marker.len();
+            while end < text.len() {
+                if text.as_bytes()[end] == b'"' {
+                    break;
+                }
+                end += 1;
+            }
+            out.push_str(replacement);
+            if end < text.len() {
+                out.push('"');
+                idx = end + 1;
+            } else {
+                idx = end;
+            }
+        }
+
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    fn normalize_json_number_field(text: &str, key: &str, replacement: &str) -> String {
+        let marker = format!("\"{key}\":");
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+
+        while let Some(pos) = text[idx..].find(&marker) {
+            let start = idx + pos;
+            out.push_str(&text[idx..start + marker.len()]);
+            let mut end = start + marker.len();
+            while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start + marker.len() {
+                out.push_str(replacement);
+                idx = end;
+            } else {
+                idx = start + marker.len();
+            }
+        }
+
+        out.push_str(&text[idx..]);
+        out
     }
 
     fn resolve_mcp_console_path() -> TestResult<PathBuf> {
@@ -225,9 +554,9 @@ mod unix_impl {
         let mcp_console = toml_escape(&mcp_console.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         format!(
-            r#"model_provider = "ollama"
-model = "gpt-5.1-codex-mini"
+            r#"model_provider = "openai"
 disable_paste_burst = true
+project_doc_max_bytes = 0
 
 [notice]
 hide_full_access_warning = true
@@ -246,7 +575,7 @@ command = "{mcp_console}"
 env_vars = ["MCP_CONSOLE_SANDBOX_STATE_LOG"]
 [projects."{repo_root}"]
 trust_level = "trusted"
-"#
+"#,
         )
     }
 
@@ -282,33 +611,6 @@ tryCatch({
             "input": format!("{r_code}\n"),
         })
         .to_string()
-    }
-
-    pub(super) struct Step {
-        label: String,
-        screen: String,
-    }
-
-    impl Step {
-        fn new(label: &str, screen: String) -> Self {
-            Self {
-                label: label.to_string(),
-                screen,
-            }
-        }
-    }
-
-    pub(super) fn render_steps(steps: &[Step]) -> String {
-        let mut out = String::new();
-        for (index, step) in steps.iter().enumerate() {
-            if index > 0 {
-                out.push('\n');
-            }
-            out.push_str(&format!("== {} ==\n", step.label));
-            out.push_str(&normalize_screen(&step.screen));
-            out.push('\n');
-        }
-        out.trim_end().to_string()
     }
 
     fn normalize_screen(screen: &str) -> String {
@@ -633,7 +935,7 @@ tryCatch({
     impl CodexPtyDriver {
         fn spawn(
             codex_home: &Path,
-            repo_root: &Path,
+            workspace: &Path,
             base_url: &str,
             sandbox_log: &Path,
         ) -> TestResult<Self> {
@@ -647,24 +949,18 @@ tryCatch({
                 })
                 .map_err(|err| format!("openpty failed: {err}"))?;
 
-            let mut cmd = CommandBuilder::new("codex");
-            cmd.arg("--sandbox");
-            cmd.arg("workspace-write");
-            cmd.arg("--ask-for-approval");
-            cmd.arg("on-request");
-            cmd.arg("--cd");
-            cmd.arg(repo_root);
-            cmd.arg(WARMUP_MARKER);
-            cmd.env("CODEX_HOME", codex_home);
-            cmd.env("TERM", "xterm-256color");
-            cmd.env("CODEX_OSS_BASE_URL", base_url);
-            cmd.env("MCP_CONSOLE_SANDBOX_STATE_LOG", sandbox_log);
-            if let Ok(path) = std::env::var("PATH") {
-                cmd.env("PATH", path);
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                cmd.env("HOME", home);
-            }
+            let mut cmd = CommandBuilder::new("sh");
+            let shell_script = format!(
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                sh_single_quote(&codex_home.display().to_string()),
+                sh_single_quote(base_url),
+                sh_single_quote(base_url),
+                sh_single_quote(&sandbox_log.display().to_string()),
+                sh_single_quote(&workspace.display().to_string()),
+                sh_single_quote(WARMUP_MARKER),
+            );
+            cmd.arg("-c");
+            cmd.arg(shell_script);
 
             let child = pair
                 .slave
@@ -894,11 +1190,6 @@ tryCatch({
             format!("http://{}/v1", self.addr)
         }
 
-        async fn request_count(&self) -> usize {
-            let state = self.state.lock().await;
-            state.request_paths.len()
-        }
-
         async fn last_request(&self) -> Option<Value> {
             let state = self.state.lock().await;
             state.requests.last().cloned()
@@ -930,6 +1221,7 @@ tryCatch({
         let path = parts.next().unwrap_or("");
 
         let mut content_length = 0usize;
+        let mut transfer_chunked = false;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).await?;
@@ -942,10 +1234,44 @@ tryCatch({
             {
                 content_length = value.trim().parse::<usize>().unwrap_or(0);
             }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("transfer-encoding")
+            {
+                transfer_chunked = value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+            }
         }
 
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
+        let mut body = Vec::new();
+        if transfer_chunked {
+            loop {
+                let mut size_line = String::new();
+                reader.read_line(&mut size_line).await?;
+                let size_line = size_line.trim_end();
+                if size_line.is_empty() {
+                    continue;
+                }
+                let size_hex = size_line.split(';').next().unwrap_or("0");
+                let chunk_size = usize::from_str_radix(size_hex, 16).unwrap_or(0);
+                if chunk_size == 0 {
+                    loop {
+                        let mut trailer = String::new();
+                        reader.read_line(&mut trailer).await?;
+                        if trailer.trim_end().is_empty() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                let mut chunk = vec![0u8; chunk_size];
+                reader.read_exact(&mut chunk).await?;
+                body.extend_from_slice(&chunk);
+                let mut crlf = [0u8; 2];
+                reader.read_exact(&mut crlf).await?;
+            }
+        } else if content_length > 0 {
+            body.resize(content_length, 0u8);
             reader.read_exact(&mut body).await?;
         }
 
@@ -957,11 +1283,30 @@ tryCatch({
         let response_body = if method == "GET" && path.contains("/models") {
             models_response()
         } else if method == "POST" && path.contains("/responses") {
-            let body_json = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-            {
-                let mut locked = state.lock().await;
-                locked.requests.push(body_json.clone());
-                response_for_request(&body_json, &mut locked)
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(body_json) => {
+                    let mut locked = state.lock().await;
+                    locked.requests.push(body_json.clone());
+                    response_for_request(&body_json, &mut locked)
+                }
+                Err(err) => {
+                    let mut locked = state.lock().await;
+                    locked.requests.push(serde_json::json!({
+                        "parse_error": err.to_string(),
+                    }));
+                    let body = serde_json::json!({
+                        "error": format!("invalid /responses payload: {err}"),
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let stream = reader.get_mut();
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
             }
         } else {
             r#"{"error":"unsupported"}"#.to_string()
@@ -1157,21 +1502,33 @@ mod linux {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn codex_tui_initial_sandbox_state() -> TestResult<()> {
-        let steps = super::unix_impl::run_codex_tui_initial_sandbox_state().await?;
-        if steps.is_empty() {
+    async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
+        if snapshot.is_empty() {
             return Ok(());
         }
-        insta::assert_snapshot!(
-            "codex_tui_initial_sandbox_state",
-            super::unix_impl::render_steps(&steps)
-        );
+        insta::assert_snapshot!("codex_exec_initial_sandbox_state", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_initial_sandbox_state_plain", snapshot);
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        super::unix_impl::run_mock_rejects_malformed_responses_payload().await
     }
 }
 
@@ -1180,15 +1537,22 @@ mod macos {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn codex_tui_initial_sandbox_state() -> TestResult<()> {
-        let steps = super::unix_impl::run_codex_tui_initial_sandbox_state().await?;
-        if steps.is_empty() {
+    async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
+        if snapshot.is_empty() {
             return Ok(());
         }
-        insta::assert_snapshot!(
-            "codex_tui_initial_sandbox_state",
-            super::unix_impl::render_steps(&steps)
-        );
+        insta::assert_snapshot!("codex_exec_initial_sandbox_state", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_initial_sandbox_state_plain", snapshot);
         Ok(())
     }
 
@@ -1196,11 +1560,16 @@ mod macos {
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        super::unix_impl::run_mock_rejects_malformed_responses_payload().await
+    }
 }
 
 #[cfg(target_os = "windows")]
 #[test]
-fn codex_tui_initial_sandbox_state_windows_stub() -> TestResult<()> {
-    eprintln!("codex TUI sandbox state test is not implemented on Windows; skipping");
+fn codex_exec_initial_sandbox_state_windows_stub() -> TestResult<()> {
+    eprintln!("codex exec sandbox state test is not implemented on Windows; skipping");
     Ok(())
 }
