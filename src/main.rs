@@ -784,14 +784,16 @@ mod tests {
 
     #[test]
     fn workspace_write_config_is_noop_for_inherited_non_workspace_policy() {
+        let ignored_root = std::env::temp_dir().join("mcp-repl-ignored");
+        let writable_roots =
+            serde_json::to_string(&vec![ignored_root.to_string_lossy().to_string()])
+                .expect("writable_roots json");
+        let config_override = format!("sandbox_workspace_write.writable_roots={writable_roots}");
         let plan = SandboxCliPlan {
             operations: vec![
                 SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
                 SandboxCliOperation::Config(
-                    parse_sandbox_config_override(
-                        "sandbox_workspace_write.writable_roots=[\"/tmp/ignored\"]",
-                    )
-                    .expect("config override"),
+                    parse_sandbox_config_override(&config_override).expect("config override"),
                 ),
             ],
         };

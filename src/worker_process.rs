@@ -1495,9 +1495,11 @@ impl WorkerManager {
 
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
+            self.guardrail.busy.store(false, Ordering::Relaxed);
+            self.process = Some(self.spawn_process()?);
+        } else {
+            self.guardrail.busy.store(false, Ordering::Relaxed);
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.process = Some(self.spawn_process()?);
         Ok(true)
     }
 

@@ -59,6 +59,7 @@ blake3 = "1.8.3"
 insta = { version = "1.46.3", features = ["yaml"] }
 portable-pty = "0.9.0"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+url = "2.5.8"
 vt100 = "0.16.2"
 
 [features]

@@ -1168,10 +1168,13 @@ name="demo"
 
     #[test]
     fn parse_r_cache_root_probe_output_extracts_absolute_path() {
-        let root = parse_r_cache_root_probe_output(
-            "noise\nMCP_REPL_INSTALL_R_CACHE_ROOT=relative/path\nMCP_REPL_INSTALL_R_CACHE_ROOT=/tmp/r-cache\n",
+        let expected = std::env::temp_dir().join("mcp-repl-r-cache");
+        let probe_output = format!(
+            "noise\nMCP_REPL_INSTALL_R_CACHE_ROOT=relative/path\nMCP_REPL_INSTALL_R_CACHE_ROOT={}\n",
+            expected.display()
         );
-        assert_eq!(root, Some(PathBuf::from("/tmp/r-cache")));
+        let root = parse_r_cache_root_probe_output(&probe_output);
+        assert_eq!(root, Some(expected));
     }
 
     #[test]
