@@ -71,13 +71,6 @@ impl SharedServer {
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        crate::event_log::log_lazy("tool_call_begin", || {
-            json!({
-                "tool": "repl",
-                "input": input.clone(),
-                "timeout_ms": timeout.as_millis(),
-            })
-        });
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         let result = self
@@ -85,28 +78,7 @@ impl SharedServer {
                 worker.write_stdin(input, worker_timeout, server_timeout, None, false)
             })
             .await?;
-        let tool_result = worker_result_to_call_tool_result(result);
-        match &tool_result {
-            Ok(result) => {
-                crate::event_log::log_lazy("tool_call_end", || {
-                    let serialized = serde_json::to_value(result)
-                        .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-                    json!({
-                        "tool": "repl",
-                        "result": serialized,
-                    })
-                });
-            }
-            Err(err) => {
-                crate::event_log::log_lazy("tool_call_error", || {
-                    json!({
-                        "tool": "repl",
-                        "error": err.to_string(),
-                    })
-                });
-            }
-        }
-        tool_result
+        worker_result_to_call_tool_result(result)
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -258,6 +230,66 @@ fn server_info() -> ServerInfo {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LoggedToolRouter<'a, S> {
+    inner: &'a ToolRouter<S>,
+}
+
+impl<'a, S> LoggedToolRouter<'a, S>
+where
+    S: Send + Sync + 'static,
+{
+    fn new(inner: &'a ToolRouter<S>) -> Self {
+        Self { inner }
+    }
+
+    async fn call(
+        &self,
+        context: rmcp::handler::server::tool::ToolCallContext<'_, S>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = context.name.clone();
+        crate::event_log::log_lazy("tool_call_begin", || {
+            let arguments = context.arguments.clone().unwrap_or_default();
+            let task = context.task.clone();
+            json!({
+                "tool": tool.as_ref(),
+                "arguments": arguments,
+                "task": task,
+            })
+        });
+        let result = self.inner.call(context).await;
+        match &result {
+            Ok(result) => {
+                crate::event_log::log_lazy("tool_call_end", || {
+                    let serialized = serde_json::to_value(result)
+                        .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
+                    json!({
+                        "tool": tool.as_ref(),
+                        "result": serialized,
+                    })
+                });
+            }
+            Err(err) => {
+                crate::event_log::log_lazy("tool_call_error", || {
+                    json!({
+                        "tool": tool.as_ref(),
+                        "error": err.to_string(),
+                    })
+                });
+            }
+        }
+        result
+    }
+
+    fn list_all(&self) -> Vec<rmcp::model::Tool> {
+        self.inner.list_all()
+    }
+
+    fn get(&self, name: &str) -> Option<&rmcp::model::Tool> {
+        self.inner.get(name)
+    }
+}
+
 macro_rules! define_backend_tool_server {
     ($server_ty:ident, $repl_doc_path:literal) => {
         #[derive(Clone)]
@@ -279,6 +311,10 @@ macro_rules! define_backend_tool_server {
                 server_info()
             }
 
+            fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
+                LoggedToolRouter::new(&self.tool_router)
+            }
+
             #[doc = include_str!($repl_doc_path)]
             #[tool(name = "repl")]
             async fn repl(&self, params: Parameters<ReplArgs>) -> Result<CallToolResult, McpError> {
@@ -293,43 +329,17 @@ macro_rules! define_backend_tool_server {
                 &self,
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
-                crate::event_log::log_lazy("tool_call_begin", || {
-                    json!({
-                        "tool": "repl_reset",
-                    })
-                });
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
                     .shared
                     .run_worker(move |worker| worker.restart(worker_timeout))
                     .await?;
-                let tool_result = worker_result_to_call_tool_result(result);
-                match &tool_result {
-                    Ok(result) => {
-                        crate::event_log::log_lazy("tool_call_end", || {
-                            let serialized = serde_json::to_value(result)
-                                .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-                            json!({
-                                "tool": "repl_reset",
-                                "result": serialized,
-                            })
-                        });
-                    }
-                    Err(err) => {
-                        crate::event_log::log_lazy("tool_call_error", || {
-                            json!({
-                                "tool": "repl_reset",
-                                "error": err.to_string(),
-                            })
-                        });
-                    }
-                }
-                tool_result
+                worker_result_to_call_tool_result(result)
             }
         }
 
-        #[tool_handler]
+        #[tool_handler(router = self.logged_tool_router())]
         impl ServerHandler for $server_ty {
             fn get_info(&self) -> ServerInfo {
                 $server_ty::get_info(self)
