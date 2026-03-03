@@ -85,7 +85,7 @@ mcp-repl install --client claude
 mcp-repl install --client codex --interpreter r
 ```
 
-`install --client codex` writes `--sandbox-state inherit` by default. That sentinel means `mcp-repl` should
+`install --client codex` writes `--sandbox inherit` by default. That sentinel means `mcp-repl` should
 inherit sandbox policy updates from Codex for the session.
 
 Example `R` REPL Codex config (paths vary by OS/user):
@@ -95,10 +95,10 @@ Example `R` REPL Codex config (paths vary by OS/user):
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl falls back to its internal default policy.
+# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl exits with an error.
 args = [
-  "--sandbox-state", "inherit",
+  "--sandbox", "inherit",
   "--interpreter", "r",
 ]
 ```
@@ -110,10 +110,10 @@ Example `Python` REPL Codex config:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl falls back to its internal default policy.
+# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl exits with an error.
 args = [
-  "--sandbox-state", "inherit",
+  "--sandbox", "inherit",
   "--interpreter", "python",
 ]
 ```
@@ -126,11 +126,11 @@ propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
     },
     "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
     }
   }
 }
@@ -220,9 +220,12 @@ Tool guides:
 
 ## Docs
 
-- Tool behavior and usage guidance:
+Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_tool_r.md`
 - `docs/tool-descriptions/repl_tool_python.md`
+- `docs/tool-descriptions/repl_reset_tool.md`
+
+Additional references:
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 
