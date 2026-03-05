@@ -10,7 +10,7 @@ expression: snapshot.render_transcript()
 2) r_repl timeout_ms=1000
 >>> 1+1
 <<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
-<<< [mcp-console] input discarded while worker busy
+<<< [repl] input discarded while worker busy
 
 3) r_repl timeout_ms=10000
 >>> 1+1

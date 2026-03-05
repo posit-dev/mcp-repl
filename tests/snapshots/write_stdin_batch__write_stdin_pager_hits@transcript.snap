@@ -10,7 +10,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :hits line0150
-<<< [mcp-console:pager] elided output (already shown): @210..31290
+<<< [pager] elided output (already shown): @210..31290
 <<< #1 @31290 root
 <<<   > line0150 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
 <<< --More-- (35p, 75.0%, @31290..31500/42000)

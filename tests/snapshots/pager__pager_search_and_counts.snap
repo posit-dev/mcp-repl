@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @210..20790"
+      "text": "[pager] elided output (already shown): @210..20790"
     },
     {
       "type": "text",
@@ -123,7 +123,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @21630..41580"
+      "text": "[pager] elided output (already shown): @21630..41580"
     },
     {
       "type": "text",

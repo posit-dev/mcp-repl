@@ -82,17 +82,17 @@ enum MatchSearchResult {
 
 fn all_matches_shown_message(pattern: &str) -> String {
     format!(
-        "[mcp-console:pager] all matches already shown (pager does not repeat output): {}",
+        "[pager] all matches already shown (pager does not repeat output): {}",
         pattern
     )
 }
 
 fn pattern_not_found_message(pattern: &str, start_offset: u64) -> String {
     if start_offset == 0 {
-        format!("[mcp-console:pager] pattern not found: {pattern}")
+        format!("[pager] pattern not found: {pattern}")
     } else {
         format!(
-            "[mcp-console:pager] pattern not found (search is forward-only over unseen output; use `:matches -n all {pattern}` to locate offsets, then `:seek @OFFSET` to jump)"
+            "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all {pattern}` to locate offsets, then `:seek @OFFSET` to jump)"
         )
     }
 }
@@ -154,7 +154,7 @@ pub(super) fn where_in_buffer(
     let start_offset = buffer.current_offset();
     let end_offset = buffer.len();
     if start_offset >= end_offset {
-        return "[mcp-console:pager] no remaining output".to_string();
+        return "[pager] no remaining output".to_string();
     }
 
     let line_start = match find_next_unseen_match_line(buffer, start_offset, pattern, seen) {
@@ -190,10 +190,10 @@ pub(super) fn where_in_buffer(
     };
 
     if pages_to_skip == 0 {
-        format!("[mcp-console:pager] match is on the current/next page: use {search_cmd}")
+        format!("[pager] match is on the current/next page: use {search_cmd}")
     } else {
         format!(
-            "[mcp-console:pager] next match is ~{pages_to_skip} page(s) ahead: use {search_cmd} or `skip {pages_to_skip}`"
+            "[pager] next match is ~{pages_to_skip} page(s) ahead: use {search_cmd} or `skip {pages_to_skip}`"
         )
     }
 }
@@ -372,14 +372,11 @@ fn match_header(matches: usize, limit: usize, more_available: bool) -> String {
     let hint = match_limit_hint(limit);
     if more_available {
         format!(
-            "[mcp-console:pager] matches: {} shown (limit {}), more available; {}",
+            "[pager] matches: {} shown (limit {}), more available; {}",
             matches, limit, hint
         )
     } else {
-        format!(
-            "[mcp-console:pager] matches: {} (limit {}); {}",
-            matches, limit, hint
-        )
+        format!("[pager] matches: {} (limit {}); {}", matches, limit, hint)
     }
 }
 

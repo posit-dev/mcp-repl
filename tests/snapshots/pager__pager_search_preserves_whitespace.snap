@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] next match is ~23 page(s) ahead: use / r or `skip 23`"
+      "text": "[pager] next match is ~23 page(s) ahead: use / r or `skip 23`"
     },
     {
       "type": "text",
@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @210..5040"
+      "text": "[pager] elided output (already shown): @210..5040"
     },
     {
       "type": "text",
@@ -95,7 +95,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] next match is ~49 page(s) ahead: use /r or `skip 49`"
+      "text": "[pager] next match is ~49 page(s) ahead: use /r or `skip 49`"
     },
     {
       "type": "text",
@@ -119,7 +119,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @5252..15542"
+      "text": "[pager] elided output (already shown): @5252..15542"
     },
     {
       "type": "text",

@@ -423,10 +423,7 @@ impl PagerBuffer {
     fn append_range(&mut self, range: OutputRange) {
         if range.start_offset > self.source_end {
             let gap = range.start_offset.saturating_sub(self.source_end);
-            let notice = format!(
-                "[mcp-console:pager] output gap detected ({} bytes skipped)\n",
-                gap
-            );
+            let notice = format!("[pager] output gap detected ({} bytes skipped)\n", gap);
             self.append_bytes(notice.as_bytes());
             self.source_end = range.start_offset;
         }
@@ -801,9 +798,7 @@ impl Pager {
                     next
                 });
             if state.seen_images.contains(&image_id) {
-                *content = WorkerContent::stderr(format!(
-                    "[mcp-console:pager] image #{num} already shown\n"
-                ));
+                *content = WorkerContent::stderr(format!("[pager] image #{num} already shown\n"));
             } else {
                 state.seen_images.insert(image_id);
             }
@@ -849,7 +844,7 @@ impl Pager {
     pub(crate) fn handle_command(&mut self, input: &str) -> WorkerReply {
         if self.state.is_none() {
             return pager_reply(
-                vec![WorkerContent::stderr("[mcp-console:pager] no pager active")],
+                vec![WorkerContent::stderr("[pager] no pager active")],
                 true,
                 None,
             );
@@ -983,7 +978,7 @@ impl Pager {
                         take_line_range(buffer, start, end, &mut state.seen_ranges);
                     if contents.is_empty() {
                         contents.push(WorkerContent::stderr(
-                            "[mcp-console:pager] no remaining output in range".to_string(),
+                            "[pager] no remaining output in range".to_string(),
                         ));
                     }
                     CommandOutcome::new(
@@ -1001,10 +996,7 @@ impl Pager {
                         ),
                         SeekSpec::Line(line) => match buffer.line_start_offset(line) {
                             Some(offset) => (Some(offset), None),
-                            None => (
-                                None,
-                                Some(format!("[mcp-console:pager] line out of range: {line}")),
-                            ),
+                            None => (None, Some(format!("[pager] line out of range: {line}"))),
                         },
                     };
 
@@ -1608,7 +1600,7 @@ pub(crate) fn build_input_echo(input: &str) -> Option<String> {
     }
 
     // Avoid a `> ` prefix here: it is indistinguishable from the backend prompt in transcripts.
-    let prefix = "[mcp-console] input: ";
+    let prefix = "[repl] input: ";
     let mut echo = String::with_capacity(prefix.len() + summary.len() + 1);
     echo.push_str(prefix);
     echo.push_str(&summary);
@@ -1634,7 +1626,7 @@ fn take_line_range(
     let Some((start_offset, end_offset)) = buffer.line_range_offsets(start_line, end_line) else {
         return (
             vec![WorkerContent::stderr(
-                "[mcp-console:pager] line range out of bounds".to_string(),
+                "[pager] line range out of bounds".to_string(),
             )],
             RangeSpan::default(),
         );

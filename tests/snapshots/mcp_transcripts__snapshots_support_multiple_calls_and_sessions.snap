@@ -62,7 +62,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] new session started"
+      "text": "[repl] new session started"
     }
   ]
 }

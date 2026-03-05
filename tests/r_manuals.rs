@@ -54,7 +54,7 @@ async fn r_show_doc_prints_manual_html_in_console() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("[mcp-console] browseURL file:") && text.contains("R-exts.html"),
+        text.contains("[repl] browseURL file:") && text.contains("R-exts.html"),
         "expected RShowDoc() to print HTML file contents, got: {text:?}"
     );
     assert!(
@@ -89,7 +89,7 @@ async fn r_show_doc_accepts_text_type_alias() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("[mcp-console] browseURL file:") && text.contains("R-exts.html"),
+        text.contains("[repl] browseURL file:") && text.contains("R-exts.html"),
         "expected RShowDoc() to fall back to HTML output, got: {text:?}"
     );
     assert!(
@@ -152,7 +152,7 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("[mcp-console] browseURL file:") && text.contains("R-exts.html"),
+        text.contains("[repl] browseURL file:") && text.contains("R-exts.html"),
         "expected RShowDoc() to render HTML in console, got: {text:?}"
     );
     assert!(

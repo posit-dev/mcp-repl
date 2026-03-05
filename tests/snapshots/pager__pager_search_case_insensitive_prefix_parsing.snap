@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`"
+      "text": "[pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`"
     },
     {
       "type": "text",
@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @210..20790"
+      "text": "[pager] elided output (already shown): @210..20790"
     },
     {
       "type": "text",
@@ -95,7 +95,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)"
+      "text": "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)"
     },
     {
       "type": "text",

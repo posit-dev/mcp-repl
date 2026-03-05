@@ -12,7 +12,7 @@ expression: snapshot.render_transcript()
 
 3) r_repl
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 == session: session_2 ==
 1) r_repl timeout_ms=10000

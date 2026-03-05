@@ -50,7 +50,7 @@ pub fn startup_log(message: impl AsRef<str>) {
     if let Ok(mut guard) = file.lock() {
         let _ = writeln!(
             *guard,
-            "[mcp-console][startup +{:>6}ms] {}",
+            "[repl][startup +{:>6}ms] {}",
             elapsed_ms(elapsed),
             message.as_ref()
         );

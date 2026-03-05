@@ -628,7 +628,7 @@ fn normalize_snapshot_content(content: &SnapshotContent) -> SnapshotContent {
 }
 
 fn normalize_snapshot_text(text: &str) -> String {
-    if text.starts_with("\n[mcp-console] session ended") {
+    if text.starts_with("\n[repl] session ended") {
         return text.trim_start_matches('\n').to_string();
     }
     let text = normalize_busy_timeout_elapsed_ms(&normalize_pager_elision(text));
@@ -700,7 +700,7 @@ fn normalize_busy_timeout_elapsed_ms(text: &str) -> String {
 }
 
 fn normalize_pager_elision(text: &str) -> String {
-    let marker = "[mcp-console:pager] elided output: @";
+    let marker = "[pager] elided output: @";
     let mut out = String::with_capacity(text.len());
     let mut idx = 0;
     while let Some(pos) = text[idx..].find(marker) {

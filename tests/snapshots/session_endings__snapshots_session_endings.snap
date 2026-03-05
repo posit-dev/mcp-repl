@@ -39,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] new session started"
+      "text": "[repl] new session started"
     }
   ]
 }
@@ -105,7 +105,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] new session started"
+      "text": "[repl] new session started"
     }
   ]
 }
@@ -151,7 +151,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] new session started"
+      "text": "[repl] new session started"
     }
   ]
 }
@@ -243,7 +243,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"no\")\n[mcp-console] session ended"
+      "text": "> quit(\"no\")\n[repl] session ended"
     }
   ]
 }
@@ -309,7 +309,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit()\n[mcp-console] session ended"
+      "text": "> quit()\n[repl] session ended"
     }
   ]
 }
@@ -375,7 +375,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"yes\")\n[mcp-console] session ended"
+      "text": "> quit(\"yes\")\n[repl] session ended"
     }
   ]
 }

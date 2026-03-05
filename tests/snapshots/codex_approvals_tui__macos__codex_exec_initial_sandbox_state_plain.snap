@@ -25,7 +25,7 @@ r.repl({"input":"target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeL
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] echoed input elided: 8 lines (206 bytes); head: > target <- tempfile(\"mcp-console-codex\"); tail: + })\nWRITE_OK\n"
+      "text": "[repl] echoed input elided: 8 lines (206 bytes); head: > target <- tempfile(\"mcp-console-codex\"); tail: + })\nWRITE_OK\n"
     },
     {
       "type": "text",

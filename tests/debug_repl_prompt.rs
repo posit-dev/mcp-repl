@@ -140,7 +140,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
         || err_output
             .contains("worker protocol error: ipc disconnected while waiting for backend info")
         || err_output.contains("worker exited with status")
-        || err_output.contains("[mcp-console] error");
+        || err_output.contains("[repl] error");
     if !((saw_prompt && output.contains("> "))
         || (saw_idle && output.contains("<<console status: idle>>")))
         && backend_unavailable

@@ -182,9 +182,9 @@ fn render_reply(
             ..
         } => {
             if let Some(code) = error_code {
-                writeln!(stderr, "[mcp-console] error: {code:?}")?;
+                writeln!(stderr, "[repl] error: {code:?}")?;
             } else if is_error {
-                writeln!(stderr, "[mcp-console] error")?;
+                writeln!(stderr, "[repl] error")?;
             }
             for content in contents {
                 match content {
@@ -203,7 +203,7 @@ fn render_reply(
                         } else {
                             writeln!(
                                 stderr,
-                                "[mcp-console] image id={id} mime={mime_type} bytes={} new={is_new}",
+                                "[repl] image id={id} mime={mime_type} bytes={} new={is_new}",
                                 data.len()
                             )?;
                         }

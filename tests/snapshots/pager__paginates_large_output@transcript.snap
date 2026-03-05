@@ -10,7 +10,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=10000
 >>> 1+1
-<<< [mcp-console:pager] input blocked while pager is active: 1+1 (use :q to exit pager)
+<<< [pager] input blocked while pager is active: 1+1 (use :q to exit pager)
 <<< --More-- (140p, 0.5%, @0..210/42000)
 
 3) r_repl timeout_ms=30000
@@ -20,7 +20,7 @@ expression: snapshot.render_transcript()
 
 4) r_repl timeout_ms=30000
 >>> :tail
-<<< [mcp-console:pager] elided output (already shown): @420..41580
+<<< [pager] elided output (already shown): @420..41580
 <<< line0199 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line0200 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< (END, 100.0%, @41580..42000/42000)

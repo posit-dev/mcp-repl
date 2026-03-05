@@ -507,7 +507,7 @@ impl OutputRing {
         extra_bytes: usize,
     ) {
         let notice_kind = OutputEventKind::Text {
-            text: "[mcp-console] output truncated (older output dropped)\n".to_string(),
+            text: "[repl] output truncated (older output dropped)\n".to_string(),
             is_stderr: false,
         };
         let notice_bytes = event_size_bytes(&notice_kind);

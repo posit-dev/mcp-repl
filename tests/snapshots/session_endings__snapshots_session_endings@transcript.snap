@@ -8,7 +8,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=0
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 3) r_repl timeout_ms=10000
 >>> print(exists("x"))
@@ -20,7 +20,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 3) r_repl timeout_ms=10000
 >>> print(exists("x"))
@@ -29,7 +29,7 @@ expression: snapshot.render_transcript()
 == session: eof_input ==
 1) r_repl timeout_ms=10000
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 2) r_repl timeout_ms=10000
 >>> 1+1
@@ -47,7 +47,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=10000
 >>> quit("no")
-<<< [mcp-console] session ended
+<<< [repl] session ended
 
 3) r_repl timeout_ms=10000
 >>> 1+1
@@ -59,7 +59,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=10000
 >>> quit()
-<<< [mcp-console] session ended
+<<< [repl] session ended
 
 3) r_repl timeout_ms=10000
 >>> 1+1
@@ -71,7 +71,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=10000
 >>> quit("yes")
-<<< [mcp-console] session ended
+<<< [repl] session ended
 
 3) r_repl timeout_ms=10000
 >>> 1+1

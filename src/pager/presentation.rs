@@ -9,7 +9,7 @@ pub(super) fn footer_min(pages_left: u64) -> String {
 }
 
 pub(super) fn pager_help_text() -> String {
-    r#"[mcp-console:pager] core commands:
+    r#"[pager] core commands:
   <empty>                      next page(s)
   :/pattern                    search forward (use ':/i pattern' for ASCII ignore-case)
   :n [N]                       next page containing last `:/...` pattern
@@ -17,7 +17,7 @@ pub(super) fn pager_help_text() -> String {
   :q                           quit pager
   :help                        show this help
 
-[mcp-console:pager] advanced navigation:
+[pager] advanced navigation:
   :seek OFFSET | PCT% | line N  (OFFSET is UTF-8 character index; supports k/m suffixes)
   :skip N                      advance without printing
   :where [-i] PATTERN          show how far to next match (no cursor move)
@@ -34,16 +34,12 @@ Backend input is blocked while pager is active. Use `:q` first.
 pub(super) fn non_command_input_message(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return "[mcp-console:pager] empty command".to_string();
+        return "[pager] empty command".to_string();
     }
     if trimmed.starts_with(':') {
-        return format!(
-            "[mcp-console:pager] unrecognized command: {trimmed} (use :help for pager commands)"
-        );
+        return format!("[pager] unrecognized command: {trimmed} (use :help for pager commands)");
     }
-    format!(
-        "[mcp-console:pager] input blocked while pager is active: {trimmed} (use :q to exit pager)"
-    )
+    format!("[pager] input blocked while pager is active: {trimmed} (use :q to exit pager)")
 }
 
 pub(super) fn position_marker(
@@ -71,7 +67,7 @@ pub(super) fn elision_marker(start: u64, end: u64) -> WorkerContent {
     // Always include the range: without it, multiple elisions in one page are ambiguous for the
     // MCP consumer to stitch back into a consistent view of the underlying output.
     WorkerContent::stderr(format!(
-        "[mcp-console:pager] elided output (already shown): @{start}..{end}\n"
+        "[pager] elided output (already shown): @{start}..{end}\n"
     ))
 }
 
@@ -105,4 +101,18 @@ pub(super) fn truncate_with_ellipsis(text: &str, max_bytes: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pager_meta_messages_use_neutral_prefixes() {
+        let help = pager_help_text();
+        assert!(help.contains("[pager]"));
+
+        let blocked = non_command_input_message("foo");
+        assert!(blocked.starts_with("[pager]"));
+    }
 }

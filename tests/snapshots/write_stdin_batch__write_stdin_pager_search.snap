@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] elided output (already shown): @210..10290"
+      "text": "[pager] elided output (already shown): @210..10290"
     },
     {
       "type": "text",
@@ -71,7 +71,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] pattern not found (search is forward-only over unseen output; use `:matches -n all line0050` to locate offsets, then `:seek @OFFSET` to jump)"
+      "text": "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all line0050` to locate offsets, then `:seek @OFFSET` to jump)"
     },
     {
       "type": "text",

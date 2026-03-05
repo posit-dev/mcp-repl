@@ -10,18 +10,18 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :where -i LINE01
-<<< [mcp-console:pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`
+<<< [pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`
 <<< --More-- (140p, 0.5%, @210/42000)
 
 3) r_repl timeout_ms=30000
 >>> :/i LINE01
-<<< [mcp-console:pager] elided output (already shown): @210..20790
+<<< [pager] elided output (already shown): @210..20790
 <<< line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (70p, 50.0%, @20790..21000/42000)
 
 4) r_repl timeout_ms=30000
 >>> :/iLINE01
-<<< [mcp-console:pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)
+<<< [pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)
 <<< --More-- (70p, 50.0%, @21000/42000)
 
 5) r_repl timeout_ms=30000

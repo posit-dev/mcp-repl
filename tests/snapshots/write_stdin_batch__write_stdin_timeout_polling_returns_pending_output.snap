@@ -51,7 +51,7 @@ response:
     },
     {
       "type": "text",
-      "text": "[mcp-console] input discarded while worker busy"
+      "text": "[repl] input discarded while worker busy"
     }
   ]
 }

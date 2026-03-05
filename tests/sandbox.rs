@@ -81,8 +81,8 @@ fn collect_text(result: &CallToolResult) -> String {
             !(trimmed.starts_with("> ")
                 || trimmed.starts_with("+ ")
                 || trimmed == ">"
-                || trimmed.starts_with("[mcp-console] input:")
-                || trimmed.starts_with("[mcp-console] echoed input"))
+                || trimmed.starts_with("[repl] input:")
+                || trimmed.starts_with("[repl] echoed input"))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -749,9 +749,9 @@ async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
 
     let code = r#"
 if (!requireNamespace("reticulate", quietly = TRUE)) {
-  cat("[mcp-console] reticulate not installed\n")
+  cat("[repl] reticulate not installed\n")
 } else if (!requireNamespace("keras3", quietly = TRUE)) {
-  cat("[mcp-console] keras3 not installed\n")
+  cat("[repl] keras3 not installed\n")
 } else {
   library(reticulate)
   library(keras3)
@@ -760,13 +760,13 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
   tryCatch({
     use_backend("jax")
     import("sys")
-    cat("[mcp-console] keras-reticulate-ok\n")
+    cat("[repl] keras-reticulate-ok\n")
   }, error = function(e) {
     ok <<- FALSE
     msg <<- conditionMessage(e)
   })
   if (!ok) {
-    cat("[mcp-console] keras-reticulate-error:", msg, "\n", sep = "")
+    cat("[repl] keras-reticulate-error:", msg, "\n", sep = "")
   }
 }
 "#;
@@ -778,21 +778,20 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
         return Ok(());
     }
 
-    if text.contains("[mcp-console] reticulate not installed")
-        || text.contains("[mcp-console] keras3 not installed")
-        || text
-            .contains("[mcp-console] keras-reticulate-error:Python specified in RETICULATE_PYTHON")
+    if text.contains("[repl] reticulate not installed")
+        || text.contains("[repl] keras3 not installed")
+        || text.contains("[repl] keras-reticulate-error:Python specified in RETICULATE_PYTHON")
     {
         session.cancel().await?;
         return Ok(());
     }
 
     assert!(
-        !text.contains("[mcp-console] keras-reticulate-error:"),
+        !text.contains("[repl] keras-reticulate-error:"),
         "reticulate/keras sandbox run failed: {text}"
     );
     assert!(
-        text.contains("[mcp-console] keras-reticulate-ok"),
+        text.contains("[repl] keras-reticulate-ok"),
         "expected keras/reticulate success marker, got: {text}"
     );
 

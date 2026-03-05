@@ -221,7 +221,7 @@ local({
 
     if (file.exists(path)) {
       shown <- if (nzchar(fragment)) paste0(path, "#", fragment) else path
-      cat(sprintf("[mcp-console] browseURL file: %s\n\n", shown))
+      cat(sprintf("[repl] browseURL file: %s\n\n", shown))
 
       if (grepl("\\.html?$", path, ignore.case = TRUE)) {
         if (nzchar(fragment)) {
@@ -265,7 +265,7 @@ local({
       return(invisible(0))
     }
 
-    cat(sprintf("[mcp-console] browseURL blocked: %s\n", url))
+    cat(sprintf("[repl] browseURL blocked: %s\n", url))
     invisible(0)
   })
 })
@@ -399,13 +399,13 @@ local({
     package <- if (is.null(x$Package)) "" else as.character(x$Package)
     title <- if (is.null(x$Title)) "" else as.character(x$Title)
 
-    cat(sprintf("[mcp-console] vignette: %s (package: %s)\n", topic, package))
+    cat(sprintf("[repl] vignette: %s (package: %s)\n", topic, package))
     if (nzchar(title)) {
       cat(sprintf("Title: %s\n", title))
     }
 
     if (is.null(x$Dir) || !nzchar(x$Dir)) {
-      cat("[mcp-console] vignette directory not found\n")
+      cat("[repl] vignette directory not found\n")
       return(invisible(x))
     }
 
@@ -458,24 +458,24 @@ local({
       }
       if (ext == "pdf") {
         cat(sprintf("Rendered: %s\n", path_rendered))
-        cat("[mcp-console] PDF vignettes can't be displayed as text yet.\n")
+        cat("[repl] PDF vignettes can't be displayed as text yet.\n")
         return(invisible(x))
       }
     }
 
-    cat("[mcp-console] no readable vignette file found\n")
+    cat("[repl] no readable vignette file found\n")
     invisible(x)
   }
 
   browse_vignettes_method <- function(x, ...) {
     if (length(x) == 0L) {
-      cat("[mcp-console] no vignettes found\n")
+      cat("[repl] no vignettes found\n")
       return(invisible(x))
     }
 
     call <- attr(x, "call")
     if (!is.null(call)) {
-      cat(sprintf("[mcp-console] browseVignettes: %s\n\n", deparse(call)))
+      cat(sprintf("[repl] browseVignettes: %s\n\n", deparse(call)))
     }
 
     for (pkg in names(x)) {

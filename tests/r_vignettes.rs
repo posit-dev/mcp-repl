@@ -54,7 +54,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("[mcp-console] vignette: grid (package: grid)"),
+        text.contains("[repl] vignette: grid (package: grid)"),
         "expected vignette info in console, got: {text:?}"
     );
     assert!(
@@ -93,7 +93,7 @@ async fn browse_vignettes_prints_text_listing() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("[mcp-console] browseVignettes:"),
+        text.contains("[repl] browseVignettes:"),
         "expected browseVignettes text output, got: {text:?}"
     );
     assert!(

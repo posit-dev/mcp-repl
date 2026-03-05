@@ -44,7 +44,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] echoed input elided: 3 lines (49 bytes); head: > ; tail: > cat(\"plots_done\\n\")\nplots_done"
+      "text": "[repl] echoed input elided: 3 lines (49 bytes); head: > ; tail: > cat(\"plots_done\\n\")\nplots_done"
     },
     {
       "type": "image",
@@ -72,7 +72,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] new session started"
+      "text": "[repl] new session started"
     }
   ]
 }

@@ -12,5 +12,5 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=10000
 >>> tail 8k
-<<< [mcp-console:pager] input blocked while pager is active: tail 8k (use :q to exit pager)
+<<< [pager] input blocked while pager is active: tail 8k (use :q to exit pager)
 <<< --More-- (6978p, 0.0%, @0..300/2093526)

@@ -24,13 +24,13 @@ async fn reticulate_py_help_is_paged_or_skipped() -> TestResult<()> {
             r#"
 {
   if (!requireNamespace("reticulate", quietly = TRUE)) {
-    cat("[mcp-console] reticulate not installed\n")
+    cat("[repl] reticulate not installed\n")
     invisible(NULL)
   } else {
     ok <- TRUE
     tryCatch({ reticulate::py_config() }, error = function(e) { ok <<- FALSE })
     if (!ok) {
-      cat("[mcp-console] reticulate python unavailable\n")
+      cat("[repl] reticulate python unavailable\n")
       invisible(NULL)
     } else {
       builtins <- reticulate::import_builtins()
@@ -45,8 +45,8 @@ async fn reticulate_py_help_is_paged_or_skipped() -> TestResult<()> {
         .await?;
     let text = result_text(&result);
 
-    if text.contains("[mcp-console] reticulate not installed")
-        || text.contains("[mcp-console] reticulate python unavailable")
+    if text.contains("[repl] reticulate not installed")
+        || text.contains("[repl] reticulate python unavailable")
     {
         session.cancel().await?;
         return Ok(());

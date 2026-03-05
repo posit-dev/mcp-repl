@@ -656,7 +656,7 @@ impl WorkerManager {
                 ..
             } = &mut reply.reply;
             contents.push(WorkerContent::stderr(
-                "[mcp-console] input discarded while worker busy",
+                "[repl] input discarded while worker busy",
             ));
             *is_error = true;
             if error_code.is_none() {
@@ -708,7 +708,7 @@ impl WorkerManager {
             self.remember_prompt(resolved_prompt.clone());
             if resolved_prompt.is_none() {
                 contents.push(WorkerContent::stderr(
-                    "[mcp-console] protocol error: missing prompt after pager dismiss",
+                    "[repl] protocol error: missing prompt after pager dismiss",
                 ));
             }
             append_prompt_if_missing(contents, resolved_prompt.clone());
@@ -1250,7 +1250,7 @@ impl WorkerManager {
                     }
                     self.output_timeline.append_text(message.as_bytes(), true);
                 } else {
-                    let message = "[mcp-console] session ended\n".to_string();
+                    let message = "[repl] session ended\n".to_string();
                     self.output_timeline.append_text(message.as_bytes(), false);
                 }
             }
@@ -1778,7 +1778,7 @@ impl WorkerManager {
         }
 
         if !meta.is_empty() {
-            contents.push(WorkerContent::stderr(format!("[mcp-console] {meta}")));
+            contents.push(WorkerContent::stderr(format!("[repl] {meta}")));
         }
 
         pager::maybe_activate_and_append_footer(
@@ -2001,7 +2001,7 @@ fn append_image_groups_after_page(
         }
         if offset > last_offset {
             contents.push(WorkerContent::stderr(format!(
-                "[mcp-console:pager] elided output: @{last_offset}..{offset}\n"
+                "[pager] elided output: @{last_offset}..{offset}\n"
             )));
         }
         contents.push(content);
@@ -2170,7 +2170,7 @@ fn collapse_echo_with_attribution(
             let head_snip = summarize_echo_line_for_marker(head);
             let tail_snip = summarize_echo_line_for_marker(tail);
             let marker = format!(
-                "[mcp-console] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
+                "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
                 pending.lines, pending.bytes, head_snip, tail_snip
             );
             out_bytes.extend_from_slice(marker.as_bytes());
@@ -3241,16 +3241,16 @@ fn start_memory_guardrail(
             let limit_mb = limit_kb / 1024;
             let total_mb = total_kb / 1024;
             let mut message = format!(
-                "[mcp-console] worker killed by memory guardrail: rss={}MB limit={}MB ({}% of host {}MB)\n",
+                "[repl] worker killed by memory guardrail: rss={}MB limit={}MB ({}% of host {}MB)\n",
                 used_mb,
                 limit_mb,
                 (WORKER_MEM_GUARDRAIL_RATIO * 100.0).round() as u64,
                 total_mb
             );
             if busy {
-                message.push_str("[mcp-console] previous request aborted; retry your last input\n");
+                message.push_str("[repl] previous request aborted; retry your last input\n");
             } else {
-                message.push_str("[mcp-console] worker was idle; new session started\n");
+                message.push_str("[repl] worker was idle; new session started\n");
             }
 
             {
@@ -3511,11 +3511,11 @@ fn set_command_arg0(_command: &mut Command, _arg0: &str) {}
 fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
     #[cfg(target_family = "unix")]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
-        return format!("[mcp-console] worker exited with signal {signal}");
+        return format!("[repl] worker exited with signal {signal}");
     }
     match status.code() {
-        Some(code) => format!("[mcp-console] worker exited with status {code}"),
-        None => "[mcp-console] worker exited with unknown status".to_string(),
+        Some(code) => format!("[repl] worker exited with status {code}"),
+        None => "[repl] worker exited with unknown status".to_string(),
     }
 }
 

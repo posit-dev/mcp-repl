@@ -17,7 +17,7 @@ expression: snapshot.render_transcript()
 
 3) r_repl timeout_ms=30000
 >>> :seek 0
-<<< [mcp-console:pager] elided output (already shown): @0..512
+<<< [pager] elided output (already shown): @0..512
 <<< line05 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (15p, 15.0%, @512..768/5120)

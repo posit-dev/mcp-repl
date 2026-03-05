@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_transcripts.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: tempdir_session ==
 1) r_repl timeout_ms=10000
@@ -32,14 +32,14 @@ expression: snapshot.render_transcript()
 >>>   message("ROOT_MARKER_ERROR:", conditionMessage(e))
 >>> })
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
-<<< [mcp-console] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
+<<< [repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
 <<< TMPDIR_SET=TRUE
 <<< TMPDIR_MATCH=TRUE
-<<< --More-- (3p, 24.8%, @0..279/1125)
+<<< --More-- (3p, 24.9%, @0..272/1090)
 
 2) r_repl
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 3) r_repl timeout_ms=10000
 >>> 
@@ -47,13 +47,13 @@ expression: snapshot.render_transcript()
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 >>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 >>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
-<<< [mcp-console] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+<<< [repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
 
 4) r_repl
 >>> 
-<<< [mcp-console] new session started
+<<< [repl] new session started
 
 5) r_repl timeout_ms=10000
 >>> 
@@ -61,6 +61,6 @@ expression: snapshot.render_transcript()
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 >>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 >>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
-<<< [mcp-console] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+<<< [repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=

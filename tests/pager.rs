@@ -42,7 +42,7 @@ fn backend_unavailable(text: &str) -> bool {
         )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
-        || text.contains("[mcp-console] protocol error: missing prompt after pager dismiss")
+        || text.contains("[repl] protocol error: missing prompt after pager dismiss")
 }
 
 #[cfg(not(windows))]

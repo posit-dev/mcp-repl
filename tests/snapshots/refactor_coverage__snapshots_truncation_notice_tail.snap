@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] input blocked while pager is active: tail 8k (use :q to exit pager)"
+      "text": "[pager] input blocked while pager is active: tail 8k (use :q to exit pager)"
     },
     {
       "type": "text",

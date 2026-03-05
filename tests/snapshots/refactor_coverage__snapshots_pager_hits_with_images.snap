@@ -1,6 +1,6 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: pager_hits_images ==
 -- step 1 --
@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console] echoed input elided: 3 lines (36 bytes); head: > ; tail: > cat(\"# Title\\n\")\n# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11"
+      "text": "[repl] echoed input elided: 3 lines (36 bytes); head: > ; tail: > cat(\"# Title\\n\")\n# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.3%, @0..299/2882)"
+      "text": "--More-- (14p, 10.2%, @0..292/2861)"
     }
   ]
 }
@@ -43,11 +43,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] input blocked while pager is active: hits alpha (use :q to exit pager)"
+      "text": "[pager] input blocked while pager is active: hits alpha (use :q to exit pager)"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.3%, @0..299/2882)"
+      "text": "--More-- (14p, 10.2%, @0..292/2861)"
     }
   ]
 }
@@ -67,11 +67,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] input blocked while pager is active: seek 0 (use :q to exit pager)"
+      "text": "[pager] input blocked while pager is active: seek 0 (use :q to exit pager)"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.3%, @0..299/2882)"
+      "text": "--More-- (14p, 10.2%, @0..292/2861)"
     }
   ]
 }
@@ -91,11 +91,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[mcp-console:pager] input blocked while pager is active: hits beta (use :q to exit pager)"
+      "text": "[pager] input blocked while pager is active: hits beta (use :q to exit pager)"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.3%, @0..299/2882)"
+      "text": "--More-- (14p, 10.2%, @0..292/2861)"
     }
   ]
 }

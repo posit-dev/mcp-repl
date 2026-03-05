@@ -11,4 +11,4 @@ expression: snapshot.render_transcript()
 2) r_repl timeout_ms=2000
 >>> 
 <<< end
-<<< [mcp-console] input discarded while worker busy
+<<< [repl] input discarded while worker busy
