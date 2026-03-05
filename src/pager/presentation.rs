@@ -9,25 +9,29 @@ pub(super) fn footer_min(pages_left: u64) -> String {
 }
 
 pub(super) fn pager_help_text() -> String {
-    r#"[pager] core commands:
-  <empty>                      next page(s)
-  :/pattern                    search forward (use ':/i pattern' for ASCII ignore-case)
-  :n [N]                       next page containing last `:/...` pattern
-  :a                           show all remaining (deduped)
+    r#"[pager] quick rules:
+  - Pager commands must start with `:`.
+  - Empty input shows next page.
+  - Non-`:` input exits pager and runs in backend.
+
+[pager] core:
   :q                           quit pager
   :help                        show this help
+  :/PATTERN                    set search pattern and jump to next match
+  :n [N]                       jump to next page with last `:/...` pattern (N times)
 
-[pager] advanced navigation:
-  :seek OFFSET | PCT% | line N  (OFFSET is UTF-8 character index; supports k/m suffixes)
-  :skip N                      advance without printing
-  :where [-i] PATTERN          show how far to next match (no cursor move)
+[pager] navigation:
+  :skip N                      skip N pages, then show next page
+  :seek OFFSET | PCT% | line N jump to location
+                               OFFSET is UTF-8 char offset; suffixes: k=1024, m=1024^2, b=bytes
+  :tail [N|8k|20l]             jump near end (N lines, or bytes with k/m/b) and exit pager
+  :range START END             show line range (1-based)
+  :a                           show all remaining (deduped)
+
+[pager] search tools:
+  :where [-i] PATTERN          show distance to next match (no cursor move)
   :matches [-i] [-n N|all] [-C N] PATTERN
   :hits [-i] [-C N] [--count N] PATTERN
-  :range START END             show line range (1-based)
-  :tail [N|8k]                 go to end (and exit pager)
-
-Non-`:` input auto-dismisses pager and is sent to the backend.
-Invalid `:` commands stay in pager; use `:help` for pager commands.
 "#
     .to_string()
 }
