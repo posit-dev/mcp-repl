@@ -32,7 +32,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "hits alpha\n",
+    "input": ":hits alpha\n",
     "timeout_ms": 10000
   }
 }
@@ -43,11 +43,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] input blocked while pager is active: hits alpha (use :q to exit pager)"
+      "text": "#1 @292 Title\n  > alpha line 12"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.2%, @0..292/2861)"
+      "text": "--More-- (14p, 10.6%, @292..306/2861)"
     }
   ]
 }
@@ -56,7 +56,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "seek 0\n",
+    "input": ":seek 0\n",
     "timeout_ms": 10000
   }
 }
@@ -67,11 +67,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] input blocked while pager is active: seek 0 (use :q to exit pager)"
+      "text": "[pager] elided output (already shown): @0..306"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.2%, @0..292/2861)"
+      "text": "alpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17\nalpha line 18\nalpha line 19\nalpha line 20\nalpha line 21\nalpha line 22\nalpha line 23\nalpha line 24\nalpha line 25\nalpha line 26\nalpha line 27\nalpha line 28\nalpha line 29\nalpha line 30\nalpha line 31\nalpha line 32\nalpha line 33"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (13p, 20.9%, @306..600/2861)"
     }
   ]
 }
@@ -80,7 +84,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "hits beta\n",
+    "input": ":hits beta\n",
     "timeout_ms": 10000
   }
 }
@@ -91,11 +95,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] input blocked while pager is active: hits beta (use :q to exit pager)"
+      "text": "[pager] elided output (already shown): @600..978"
     },
     {
       "type": "text",
-      "text": "--More-- (14p, 10.2%, @0..292/2861)"
+      "text": "#1 @978 Title\n  > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = \"l\"); tail: > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (12p, 39.0%, @978..1118/2861)"
     }
   ]
 }

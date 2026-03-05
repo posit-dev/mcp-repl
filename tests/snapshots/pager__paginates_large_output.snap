@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: default ==
 -- step 1 --
@@ -43,7 +43,31 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] input blocked while pager is active: 1+1 (use :q to exit pager)"
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "r_repl",
+  "arguments": {
+    "input": "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))\n",
+    "timeout_ms": 30000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "type": "text",
@@ -51,7 +75,7 @@ response:
     }
   ]
 }
--- step 3 --
+-- step 4 --
 call:
 {
   "tool": "r_repl",
@@ -75,7 +99,7 @@ response:
     }
   ]
 }
--- step 4 --
+-- step 5 --
 call:
 {
   "tool": "r_repl",
@@ -107,7 +131,7 @@ response:
     }
   ]
 }
--- step 5 --
+-- step 6 --
 call:
 {
   "tool": "r_repl",

@@ -68,6 +68,7 @@ async fn paginates_large_output() -> TestResult<()> {
         .session("default", mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin("1+1", timeout = 10.0);
+            write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":next", timeout = 30.0);
             write_stdin(":tail", timeout = 30.0);
             write_stdin("1+1", timeout = 10.0);

@@ -177,6 +177,66 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_auto_dismisses_pager_for_backend_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let activate = session
+        .write_stdin_raw_with(
+            "line <- paste(rep('x', 200), collapse = ''); for (i in 1:120) cat(sprintf('line%04d %s\\n', i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let activate_text = result_text(&activate);
+    if backend_unavailable(&activate_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        activate_text.contains("--More--"),
+        "expected pager activation, got: {activate_text:?}"
+    );
+
+    let run_backend = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
+    let run_backend_text = result_text(&run_backend);
+    assert!(
+        run_backend_text.contains("[1] 2"),
+        "expected backend command to run after auto-dismiss, got: {run_backend_text:?}"
+    );
+    assert!(
+        !run_backend_text.contains("input blocked while pager is active"),
+        "did not expect pager block message, got: {run_backend_text:?}"
+    );
+
+    let reactivate = session
+        .write_stdin_raw_with(
+            "line <- paste(rep('x', 200), collapse = ''); for (i in 1:120) cat(sprintf('line%04d %s\\n', i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let reactivate_text = result_text(&reactivate);
+    assert!(
+        reactivate_text.contains("--More--"),
+        "expected pager re-activation, got: {reactivate_text:?}"
+    );
+
+    let invalid_pager = session.write_stdin_raw_with(":wat", Some(10.0)).await?;
+    let invalid_pager_text = result_text(&invalid_pager);
+    assert!(
+        invalid_pager_text.contains("[pager] unrecognized command: :wat"),
+        "expected unrecognized pager command message, got: {invalid_pager_text:?}"
+    );
+    assert!(
+        invalid_pager_text.contains("--More--"),
+        "expected pager to remain active after invalid pager command, got: {invalid_pager_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[test]
 fn lock_mutex_handles_poisoned_mutex() {
     let mutex = Mutex::new(());

@@ -97,7 +97,7 @@ cat("\nEND\n")
             "truncation_tail",
             mcp_script! {
                 write_stdin(big_output, timeout = 20.0);
-                write_stdin("tail 8k", timeout = 10.0);
+                write_stdin(":tail 8k", timeout = 10.0);
             },
         )
         .await?;
@@ -127,9 +127,9 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
             "pager_hits_images",
             mcp_script! {
                 write_stdin(output, timeout = 10.0);
-                write_stdin("hits alpha", timeout = 10.0);
-                write_stdin("seek 0", timeout = 10.0);
-                write_stdin("hits beta", timeout = 10.0);
+                write_stdin(":hits alpha", timeout = 10.0);
+                write_stdin(":seek 0", timeout = 10.0);
+                write_stdin(":hits beta", timeout = 10.0);
             },
         )
         .await?;

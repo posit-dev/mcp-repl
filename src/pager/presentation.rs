@@ -26,7 +26,8 @@ pub(super) fn pager_help_text() -> String {
   :range START END             show line range (1-based)
   :tail [N|8k]                 go to end (and exit pager)
 
-Backend input is blocked while pager is active. Use `:q` first.
+Non-`:` input auto-dismisses pager and is sent to the backend.
+Invalid `:` commands stay in pager; use `:help` for pager commands.
 "#
     .to_string()
 }

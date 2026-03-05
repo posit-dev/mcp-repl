@@ -8,7 +8,7 @@ Arguments:
 Python REPL affordances:
 - Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
 - While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
-- Pager mode activates on large output. While active, backend input is blocked; use pager commands (for example `:q`, `:/pattern`, `:n`, empty input for next page).
+- Pager mode activates on large output. All pager commands start with `:` (for example `:q`, `:/pattern`, `:n`; empty input also advances); any input not prefixed with `:` automatically dismisses pager and is sent to the backend.
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).
 - Debugging workflows are supported (`breakpoint()`, `pdb.set_trace()`).

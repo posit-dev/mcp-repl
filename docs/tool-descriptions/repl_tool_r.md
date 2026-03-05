@@ -9,7 +9,7 @@ Behavior:
 - Uses the user's R installation and library paths.
 
 - Plots (ggplot2 and base R) are captured and returned as images. Adjust sizing with `options(console.plot.width, console.plot.height, console.plot.units, console.plot.dpi)`.
-- Pager mode activates on large output. Use pager commands (for example `:q`, `:/pattern`, `:n`, to navigate, search, or dismiss).
+- Pager mode activates on large output. All pager commands start with `:` (for example `:q`, `:/pattern`, `:n`); any input not prefixed with `:` automatically dismisses pager and is sent to the backend.
 - Help via `?topic` or `help()` opens a pager. Use `:q` to exit, `:n` for next page, `:/pattern` to search.
 - Debugging: `browser()`, `debug()`, `trace()`.
 - Control: `\u0003` in input interrupts; `\u0004` resets session then runs remaining input.

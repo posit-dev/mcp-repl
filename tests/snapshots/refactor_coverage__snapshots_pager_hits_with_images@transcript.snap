@@ -28,16 +28,40 @@ expression: transcript
 <<< --More-- (14p, 10.2%, @0..292/2861)
 
 2) r_repl timeout_ms=10000
->>> hits alpha
-<<< [pager] input blocked while pager is active: hits alpha (use :q to exit pager)
-<<< --More-- (14p, 10.2%, @0..292/2861)
+>>> :hits alpha
+<<< #1 @292 Title
+<<<   > alpha line 12
+<<< --More-- (14p, 10.6%, @292..306/2861)
 
 3) r_repl timeout_ms=10000
->>> seek 0
-<<< [pager] input blocked while pager is active: seek 0 (use :q to exit pager)
-<<< --More-- (14p, 10.2%, @0..292/2861)
+>>> :seek 0
+<<< [pager] elided output (already shown): @0..306
+<<< alpha line 13
+<<< alpha line 14
+<<< alpha line 15
+<<< alpha line 16
+<<< alpha line 17
+<<< alpha line 18
+<<< alpha line 19
+<<< alpha line 20
+<<< alpha line 21
+<<< alpha line 22
+<<< alpha line 23
+<<< alpha line 24
+<<< alpha line 25
+<<< alpha line 26
+<<< alpha line 27
+<<< alpha line 28
+<<< alpha line 29
+<<< alpha line 30
+<<< alpha line 31
+<<< alpha line 32
+<<< alpha line 33
+<<< --More-- (13p, 20.9%, @306..600/2861)
 
 4) r_repl timeout_ms=10000
->>> hits beta
-<<< [pager] input blocked while pager is active: hits beta (use :q to exit pager)
-<<< --More-- (14p, 10.2%, @0..292/2861)
+>>> :hits beta
+<<< [pager] elided output (already shown): @600..978
+<<< #1 @978 Title
+<<<   > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = "l"); tail: > for (i in 1:60) cat("beta line ", i, "\n", sep = "")
+<<< --More-- (12p, 39.0%, @978..1118/2861)
