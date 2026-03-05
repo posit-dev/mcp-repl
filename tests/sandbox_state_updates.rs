@@ -273,3 +273,33 @@ async fn sandbox_state_capability_advertised() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let mut session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
+    let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "expected missing sandbox-state error, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}

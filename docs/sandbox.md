@@ -10,8 +10,9 @@ When no CLI sandbox mode is provided, the default is:
 - `workspace-write`
 - `network_access: false`
 
-When `--sandbox inherit` is used, startup requires a client sandbox update
-(`codex/sandbox-state/update`). If no update is provided, startup fails fast.
+When `--sandbox inherit` is used, the client must send a sandbox update
+(`codex/sandbox-state/update`) before the first worker start/tool call.
+If no update is provided, the first tool call fails fast.
 
 The worker also gets a per-session temp directory, exported as:
 

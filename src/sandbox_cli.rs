@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use crate::sandbox::{SandboxPolicy, SandboxState};
 
+pub const MISSING_INHERITED_SANDBOX_STATE_MESSAGE: &str =
+    "--sandbox inherit requested but no client sandbox state was provided";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxModeArg {
     Inherit,
@@ -49,6 +52,22 @@ pub enum SandboxCliOperation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxCliPlan {
     pub operations: Vec<SandboxCliOperation>,
+}
+
+pub fn sandbox_plan_requests_inherited_state(plan: &SandboxCliPlan) -> bool {
+    plan.operations.iter().any(|op| {
+        matches!(
+            op,
+            SandboxCliOperation::SetMode(SandboxModeArg::Inherit)
+                | SandboxCliOperation::Config(SandboxConfigOperation::SetMode(
+                    SandboxModeArg::Inherit
+                ))
+        )
+    })
+}
+
+pub fn is_missing_inherited_sandbox_state_error(message: &str) -> bool {
+    message == MISSING_INHERITED_SANDBOX_STATE_MESSAGE
 }
 
 pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation, String> {
@@ -214,9 +233,8 @@ fn apply_mode(
 ) -> Result<(), String> {
     match mode {
         SandboxModeArg::Inherit => {
-            let inherited = inherited.ok_or_else(|| {
-                "--sandbox inherit requested but no client sandbox state was provided".to_string()
-            })?;
+            let inherited =
+                inherited.ok_or_else(|| MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string())?;
             *state = inherited.clone();
         }
         SandboxModeArg::ReadOnly => {

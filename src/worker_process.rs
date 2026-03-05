@@ -33,7 +33,11 @@ use crate::pager::{self, Pager};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
 };
-use crate::sandbox_cli::{SandboxCliPlan, resolve_effective_sandbox_state_with_defaults};
+use crate::sandbox_cli::{
+    MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
+    is_missing_inherited_sandbox_state_error, resolve_effective_sandbox_state_with_defaults,
+    sandbox_plan_requests_inherited_state,
+};
 use crate::worker_protocol::{
     TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
@@ -464,6 +468,7 @@ pub struct WorkerManager {
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
+    awaiting_initial_sandbox_state_update: bool,
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
@@ -499,12 +504,23 @@ impl WorkerManager {
         } else {
             None
         };
-        let sandbox_state = resolve_effective_sandbox_state_with_defaults(
-            &sandbox_plan,
-            inherited,
-            &sandbox_defaults,
-        )
-        .map_err(WorkerError::Sandbox)?;
+        let (sandbox_state, awaiting_initial_sandbox_state_update) =
+            match resolve_effective_sandbox_state_with_defaults(
+                &sandbox_plan,
+                inherited,
+                &sandbox_defaults,
+            ) {
+                Ok(state) => (state, false),
+                Err(err)
+                    if sandbox_plan_requests_inherited_state(&sandbox_plan)
+                        && is_missing_inherited_sandbox_state_error(&err) =>
+                {
+                    // Allow MCP initialize to complete; first tool call will fail fast
+                    // unless the client sends codex/sandbox-state/update.
+                    (sandbox_defaults.clone(), true)
+                }
+                Err(err) => return Err(WorkerError::Sandbox(err)),
+            };
         crate::event_log::log_lazy("worker_manager_created", || {
             worker_context_event_payload(backend, &sandbox_state, None)
         });
@@ -517,6 +533,7 @@ impl WorkerManager {
             backend,
             process: None,
             sandbox_plan,
+            awaiting_initial_sandbox_state_update,
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,
@@ -542,6 +559,9 @@ impl WorkerManager {
     }
 
     pub fn warm_start(&mut self) -> Result<(), WorkerError> {
+        if self.awaiting_initial_sandbox_state_update {
+            return Ok(());
+        }
         self.ensure_process()
     }
 
@@ -1409,6 +1429,11 @@ impl WorkerManager {
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
+        if self.awaiting_initial_sandbox_state_update {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        }
         let needs_spawn = match self.process.as_mut() {
             Some(process) => !process.is_running()?,
             None => true,
@@ -1430,6 +1455,11 @@ impl WorkerManager {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        if self.awaiting_initial_sandbox_state_update {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        }
         self.process = Some(self.spawn_process()?);
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
         Ok(())
@@ -1446,6 +1476,11 @@ impl WorkerManager {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        if self.awaiting_initial_sandbox_state_update {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        }
         self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
         crate::event_log::log(
             "worker_reset_with_pager_end",
@@ -1476,6 +1511,8 @@ impl WorkerManager {
             &self.sandbox_defaults,
         )
         .map_err(WorkerError::Sandbox)?;
+        let awaiting_before = self.awaiting_initial_sandbox_state_update;
+        self.awaiting_initial_sandbox_state_update = false;
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
         self.sandbox_state = resolved_state;
@@ -1488,6 +1525,11 @@ impl WorkerManager {
             }),
         );
         if !changed {
+            if awaiting_before && self.process.is_none() {
+                self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.process = Some(self.spawn_process()?);
+                return Ok(true);
+            }
             return Ok(false);
         }
 
