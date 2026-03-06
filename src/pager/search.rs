@@ -362,9 +362,9 @@ fn heading_breadcrumb(headings: &[Heading]) -> String {
 
 fn match_limit_hint(limit: usize) -> &'static str {
     if limit < MAX_MATCH_LIMIT {
-        "use `matches -n all` or `seek @OFFSET` to jump"
+        "use `:matches -n all` or `:seek @OFFSET` to jump"
     } else {
-        "use `seek @OFFSET` to jump"
+        "use `:seek @OFFSET` to jump"
     }
 }
 

@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump"
+      "text": "[pager] matches: 25 (limit 50); use `:matches -n all` or `:seek @OFFSET` to jump"
     },
     {
       "type": "text",
@@ -71,7 +71,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump"
+      "text": "[pager] matches: 25 (limit 50); use `:matches -n all` or `:seek @OFFSET` to jump"
     },
     {
       "type": "text",

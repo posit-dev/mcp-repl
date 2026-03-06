@@ -5,6 +5,7 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use tokio::time::{Duration, Instant, sleep};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -42,6 +43,32 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+async fn wait_until_not_busy(
+    session: &mut common::McpTestSession,
+    initial: rmcp::model::CallToolResult,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<console status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(100)).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<console status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
 async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
@@ -188,6 +215,7 @@ async fn write_stdin_auto_dismisses_pager_for_backend_input() -> TestResult<()> 
             Some(30.0),
         )
         .await?;
+    let activate = wait_until_not_busy(&mut session, activate).await?;
     let activate_text = result_text(&activate);
     if backend_unavailable(&activate_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -216,6 +244,7 @@ async fn write_stdin_auto_dismisses_pager_for_backend_input() -> TestResult<()> 
             Some(30.0),
         )
         .await?;
+    let reactivate = wait_until_not_busy(&mut session, reactivate).await?;
     let reactivate_text = result_text(&reactivate);
     assert!(
         reactivate_text.contains("--More--"),
