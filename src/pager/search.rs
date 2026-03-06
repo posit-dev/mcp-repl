@@ -398,7 +398,7 @@ pub(super) fn take_matches(
     buffer: &PagerBuffer,
     spec: &MatchSpec,
     session: &SearchSession,
-) -> (Vec<WorkerContent>, RangeSpan) {
+) -> (Vec<WorkerContent>, RangeSpan, Vec<(u64, u64)>) {
     if session.hits.is_empty() {
         return (
             vec![WorkerContent::stderr(pattern_not_found_message(
@@ -406,6 +406,7 @@ pub(super) fn take_matches(
                 buffer.current_offset(),
             ))],
             RangeSpan::default(),
+            Vec::new(),
         );
     }
 
@@ -414,6 +415,7 @@ pub(super) fn take_matches(
     let total_lines = line_count(buffer);
     let mut output = String::new();
     let mut span = RangeSpan::default();
+    let mut view_ranges = Vec::new();
 
     for (idx, entry) in entries.enumerate() {
         let label = idx + 1;
@@ -424,7 +426,9 @@ pub(super) fn take_matches(
                 "#{label} @{} {} | {snippet}\n",
                 entry.match_start, entry.breadcrumb
             ));
-            span.record(Some((entry.line_start, entry.line_end)));
+            let range = (entry.line_start, entry.line_end);
+            span.record(Some(range));
+            view_ranges.push(range);
             continue;
         }
 
@@ -435,13 +439,21 @@ pub(super) fn take_matches(
 
         let start_idx = entry.line_idx.saturating_sub(spec.context);
         let end_idx = (entry.line_idx + spec.context).min(total_lines.saturating_sub(1));
+        let mut entry_first = None;
+        let mut entry_last = None;
         for line_idx in start_idx..=end_idx {
             let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
             let line = read_line_text(buffer, line_idx);
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
             let marker = if line_idx == entry.line_idx { ">" } else { " " };
             output.push_str(&format!("  {marker} {snippet}\n"));
-            span.record(Some((line_start, line_end)));
+            let range = (line_start, line_end);
+            span.record(Some(range));
+            entry_first.get_or_insert(range.0);
+            entry_last = Some(range.1);
+        }
+        if let (Some(start), Some(end)) = (entry_first, entry_last) {
+            view_ranges.push((start, end));
         }
     }
 
@@ -455,6 +467,7 @@ pub(super) fn take_matches(
             WorkerContent::stdout(output),
         ],
         span,
+        view_ranges,
     )
 }
 
@@ -754,14 +767,20 @@ pub(super) fn take_hits_next(
     page_bytes: u64,
     count: u64,
     seen: &mut RangeSet,
-) -> (Vec<WorkerContent>, u64, RangeSpan) {
+) -> (Vec<WorkerContent>, u64, RangeSpan, Vec<(u64, u64)>) {
     let count = count.clamp(1, MAX_MATCH_LIMIT as u64);
     let mut output = String::new();
     let mut span = RangeSpan::default();
+    let mut view_ranges = Vec::new();
     for _ in 0..count {
         match take_next_hit(buffer, hit_state, seen) {
             HitTakeResult::Found(hit_output) => {
                 span.record(hit_output.last_range);
+                if let (Some((start, _)), Some((_, end))) =
+                    (hit_output.first_range, hit_output.last_range)
+                {
+                    view_ranges.push((start, end));
+                }
                 output.push_str(&hit_output.text);
             }
             HitTakeResult::SeenOnly => {
@@ -773,9 +792,15 @@ pub(super) fn take_hits_next(
                         ))],
                         pages_left_now,
                         RangeSpan::default(),
+                        Vec::new(),
                     );
                 }
-                return (vec![WorkerContent::stdout(output)], pages_left_now, span);
+                return (
+                    vec![WorkerContent::stdout(output)],
+                    pages_left_now,
+                    span,
+                    view_ranges,
+                );
             }
             HitTakeResult::NotFound => {
                 let pages_left_now = pages_left_for_buffer(buffer, page_bytes);
@@ -788,23 +813,35 @@ pub(super) fn take_hits_next(
                         ))],
                         pages_left_now,
                         RangeSpan::default(),
+                        Vec::new(),
                     );
                 }
-                return (vec![WorkerContent::stdout(output)], pages_left_now, span);
+                return (
+                    vec![WorkerContent::stdout(output)],
+                    pages_left_now,
+                    span,
+                    view_ranges,
+                );
             }
         }
     }
 
     let pages_left_now = pages_left_for_buffer(buffer, page_bytes);
     if output.is_empty() {
-        (Vec::new(), pages_left_now, RangeSpan::default())
+        (Vec::new(), pages_left_now, RangeSpan::default(), Vec::new())
     } else {
-        (vec![WorkerContent::stdout(output)], pages_left_now, span)
+        (
+            vec![WorkerContent::stdout(output)],
+            pages_left_now,
+            span,
+            view_ranges,
+        )
     }
 }
 
 struct HitOutput {
     text: String,
+    first_range: Option<(u64, u64)>,
     last_range: Option<(u64, u64)>,
 }
 
@@ -867,11 +904,13 @@ fn take_next_hit(
         }
         return HitTakeResult::Found(HitOutput {
             text: output,
+            first_range: None,
             last_range: None,
         });
     }
 
     let mut last_output_line = None;
+    let mut first_range = None;
     let mut last_range = None;
     for idx in start_idx..=end_idx {
         let (line_start, line_end) = line_bounds_for_index(buffer, idx);
@@ -884,6 +923,7 @@ fn take_next_hit(
         output.push_str(&format!("  {marker} {snippet}\n"));
         seen.insert(line_start, line_end);
         last_output_line = Some(idx);
+        first_range.get_or_insert((line_start, line_end));
         last_range = Some((line_start, line_end));
     }
 
@@ -900,6 +940,7 @@ fn take_next_hit(
 
     HitTakeResult::Found(HitOutput {
         text: output,
+        first_range,
         last_range,
     })
 }

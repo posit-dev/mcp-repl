@@ -642,6 +642,7 @@ struct CommandOutcome {
     update_range: bool,
     first_range: Option<(u64, u64)>,
     last_range: Option<(u64, u64)>,
+    view_ranges: Vec<(u64, u64)>,
 }
 
 impl CommandOutcome {
@@ -663,7 +664,16 @@ impl CommandOutcome {
             update_range,
             first_range,
             last_range,
+            view_ranges: match (first_range, last_range) {
+                (Some((start, _)), Some((_, end))) => vec![(start, end)],
+                _ => Vec::new(),
+            },
         }
+    }
+
+    fn with_view_ranges(mut self, view_ranges: Vec<(u64, u64)>) -> Self {
+        self.view_ranges = view_ranges;
+        self
     }
 
     fn page(
@@ -964,6 +974,7 @@ impl Pager {
             is_error,
             first_range,
             last_range,
+            view_ranges,
             ..
         } = {
             let state = self.state.as_mut().expect("pager state disappeared");
@@ -1009,7 +1020,6 @@ impl Pager {
                     )
                 }
                 PagerCommand::Search { pattern } => {
-                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     if Self::ensure_search_session_from_pattern(
                         state,
                         &pattern,
@@ -1022,16 +1032,21 @@ impl Pager {
                             .expect("search session missing after build");
                         let (contents, range) =
                             render_search_card(&state.buffer, session, &state.view_history);
+                        if let Some((_, end)) = range {
+                            state.buffer.advance_offset_to(end);
+                        }
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         CommandOutcome::new(
                             contents,
                             pages_left,
                             is_error,
-                            false,
+                            true,
                             range,
                             range,
                             Some(false),
                         )
                     } else {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(format!(
                             "[pager] pattern not found: {}",
                             pattern.pattern
@@ -1064,7 +1079,8 @@ impl Pager {
                             let session = state.search_session.as_mut();
                             let session = session.expect("search session missing");
                             session.current_index = 0;
-                            let (contents, span) = take_matches(&state.buffer, &spec, session);
+                            let (contents, span, view_ranges) =
+                                take_matches(&state.buffer, &spec, session);
                             CommandOutcome::new(
                                 contents,
                                 pages_left,
@@ -1074,6 +1090,7 @@ impl Pager {
                                 span.last,
                                 Some(false),
                             )
+                            .with_view_ranges(view_ranges)
                         }
                     } else if Self::ensure_search_session_fresh(state)
                         && Self::ensure_search_session_complete(state)
@@ -1083,7 +1100,8 @@ impl Pager {
                             .as_mut()
                             .expect("search session missing");
                         session.current_index = 0;
-                        let (contents, span) = take_matches(&state.buffer, &spec, session);
+                        let (contents, span, view_ranges) =
+                            take_matches(&state.buffer, &spec, session);
                         CommandOutcome::new(
                             contents,
                             pages_left,
@@ -1093,6 +1111,7 @@ impl Pager {
                             span.last,
                             Some(false),
                         )
+                        .with_view_ranges(view_ranges)
                     } else {
                         let contents = vec![WorkerContent::stderr(
                             "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
@@ -1103,7 +1122,7 @@ impl Pager {
                 }
                 PagerCommand::Hits { spec } => {
                     let mut hit_state = HitState::new(spec.pattern.clone(), spec.context);
-                    let (contents, pages_left, span) = take_hits_next(
+                    let (contents, pages_left, span, view_ranges) = take_hits_next(
                         &mut state.buffer,
                         &mut hit_state,
                         page_bytes,
@@ -1111,10 +1130,10 @@ impl Pager {
                         &mut state.seen_ranges,
                     );
                     CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                        .with_view_ranges(view_ranges)
                 }
                 PagerCommand::SearchNext { count } => {
                     if Self::ensure_search_session_fresh(state) {
-                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let session = state
                             .search_session
                             .as_mut()
@@ -1128,15 +1147,20 @@ impl Pager {
                             let contents = vec![WorkerContent::stderr(search_boundary_message(
                                 session, true,
                             ))];
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
                             let (contents, range) =
                                 render_search_card(&state.buffer, session, &state.view_history);
+                            if let Some((_, end)) = range {
+                                state.buffer.advance_offset_to(end);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
                                 contents,
                                 pages_left,
                                 is_error,
-                                false,
+                                true,
                                 range,
                                 range,
                                 Some(false),
@@ -1155,7 +1179,6 @@ impl Pager {
                     }
                 }
                 PagerCommand::SearchPrev { count } => {
-                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     if Self::ensure_search_session_fresh(state)
                         && Self::ensure_search_session_complete(state)
                     {
@@ -1168,21 +1191,27 @@ impl Pager {
                             let contents = vec![WorkerContent::stderr(search_boundary_message(
                                 session, false,
                             ))];
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
                             let (contents, range) =
                                 render_search_card(&state.buffer, session, &state.view_history);
+                            if let Some((_, end)) = range {
+                                state.buffer.advance_offset_to(end);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
                                 contents,
                                 pages_left,
                                 is_error,
-                                false,
+                                true,
                                 range,
                                 range,
                                 Some(false),
                             )
                         }
                     } else {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
@@ -1190,7 +1219,6 @@ impl Pager {
                     }
                 }
                 PagerCommand::Goto { index } => {
-                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     if Self::ensure_search_session_fresh(state)
                         && Self::ensure_search_session_complete(state)
                     {
@@ -1201,22 +1229,28 @@ impl Pager {
                         if goto_search_hit(session, index) {
                             let (contents, range) =
                                 render_search_card(&state.buffer, session, &state.view_history);
+                            if let Some((_, end)) = range {
+                                state.buffer.advance_offset_to(end);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
                                 contents,
                                 pages_left,
                                 is_error,
-                                false,
+                                true,
                                 range,
                                 range,
                                 Some(false),
                             )
                         } else {
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             let contents = vec![WorkerContent::stderr(format!(
                                 "[pager] search hit out of range: {index}"
                             ))];
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         }
                     } else {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
@@ -1283,8 +1317,8 @@ impl Pager {
             if let Some(marker) = gap_marker_if_needed(state.last_emitted, first_range) {
                 contents.insert(0, marker);
             }
-            if let (Some((start, _)), Some((_, end))) = (first_range, last_range) {
-                state.view_history.push((start, end));
+            for range in view_ranges {
+                state.view_history.push(range);
             }
             if let Some(last) = last_range {
                 state.last_emitted = Some(last);
@@ -2241,6 +2275,26 @@ mod tests {
     }
 
     #[test]
+    fn slash_search_advances_pager_cursor_to_search_hit() {
+        let text = (0..200)
+            .map(|i| format!("line-{i:04}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let _ = pager.handle_command(":/line-0100\n");
+        let next = text_from_reply(pager.handle_command(":next\n"));
+
+        assert!(
+            next.contains("line-0101"),
+            "expected paging to continue after the search hit, got: {next}"
+        );
+        assert!(
+            !next.contains("line-0001"),
+            "expected search to move the pager forward, got: {next}"
+        );
+    }
+
+    #[test]
     fn slash_search_starts_from_later_same_line_match_when_cursor_is_mid_line() {
         let text = format!(
             "prefix {} foo {} foo suffix\n",
@@ -2418,6 +2472,20 @@ mod tests {
         assert!(
             listed.contains("ctx before"),
             "expected leading context line, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn matches_history_keeps_disjoint_hits_separate() {
+        let text = "alpha foo\nbetween token\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":matches -n 2 foo\n");
+        let found = text_from_reply(pager.handle_command(":/token\n"));
+
+        assert!(
+            !found.contains("[pager] shown earlier @"),
+            "expected unseen gap content not to be marked as shown, got: {found}"
         );
     }
 }

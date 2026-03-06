@@ -17,19 +17,19 @@ expression: transcript
 >>> :/ r
 <<< [pager] elided output (already shown): @210..5040
 <<< [pager] search for ` r` @5249
-<<< --More-- (140p, 0.4%, @210/42004)
+<<< --More-- (123p, 12.5%, @5040..5252/42004)
 
 4) r_repl timeout_ms=30000
 >>> :where r 
-<<< [pager] next match is ~23 page(s) ahead: use :/r or `:skip 23`
-<<< --More-- (140p, 0.4%, @210/42004)
+<<< [pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`
+<<< --More-- (123p, 12.5%, @5252/42004)
 
 5) r_repl timeout_ms=30000
 >>> :/r 
-<<< [pager] search for `r` @5250
-<<< [pager] shown earlier @5040..5252
-<<< --More-- (140p, 0.4%, @210/42004)
+<<< [pager] elided output (already shown): @5252..15542
+<<< [pager] search for `r` @15751
+<<< --More-- (88p, 37.5%, @15542..15754/42004)
 
 6) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 0.4%, @210/42004)
+<<< (END, 37.5%, @15542..15754/42004)

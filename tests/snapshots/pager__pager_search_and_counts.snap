@@ -55,7 +55,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.5%, @0..210/42000)"
+      "text": "--More-- (70p, 50.0%, @20790..21000/42000)"
     }
   ]
 }
@@ -83,7 +83,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.5%, @0..210/42000)"
+      "text": "--More-- (70p, 50.5%, @21000..21210/42000)"
     }
   ]
 }
@@ -103,15 +103,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "line0002 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "text": "line0102 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "type": "text",
-      "text": "line0003 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "text": "line0103 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "type": "text",
-      "text": "--More-- (138p, 1.5%, @420..630/42000)"
+      "text": "--More-- (68p, 51.5%, @21420..21630/42000)"
     }
   ]
 }
@@ -131,7 +131,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @630..41580"
+      "text": "[pager] elided output (already shown): @21630..41580"
     },
     {
       "type": "text",

@@ -79,7 +79,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.4%, @210/42004)"
+      "text": "--More-- (123p, 12.5%, @5040..5252/42004)"
     }
   ]
 }
@@ -99,11 +99,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~23 page(s) ahead: use :/r or `:skip 23`"
+      "text": "[pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`"
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.4%, @210/42004)"
+      "text": "--More-- (123p, 12.5%, @5252/42004)"
     }
   ]
 }
@@ -123,19 +123,19 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search for `r` @5250"
+      "text": "[pager] elided output (already shown): @5252..15542"
     },
     {
       "type": "text",
-      "text": "[pager] shown earlier @5040..5252"
+      "text": "[pager] search for `r` @15751"
     },
     {
       "type": "text",
-      "text": "> line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+      "text": "> line0075 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.4%, @210/42004)"
+      "text": "--More-- (88p, 37.5%, @15542..15754/42004)"
     }
   ]
 }
@@ -155,7 +155,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 0.4%, @210/42004)"
+      "text": "(END, 37.5%, @15542..15754/42004)"
     },
     {
       "type": "text",
