@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`"
+      "text": "[pager] next match is ~98 page(s) ahead: use :/i LINE01 or `:skip 98`"
     },
     {
       "type": "text",

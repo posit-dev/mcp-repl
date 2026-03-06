@@ -10,7 +10,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :where -i LINE01
-<<< [pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`
+<<< [pager] next match is ~98 page(s) ahead: use :/i LINE01 or `:skip 98`
 <<< --More-- (140p, 0.5%, @210/42000)
 
 3) r_repl timeout_ms=30000

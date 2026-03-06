@@ -10,7 +10,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :where  r
-<<< [pager] next match is ~23 page(s) ahead: use / r or `skip 23`
+<<< [pager] next match is ~23 page(s) ahead: use :/ r or `:skip 23`
 <<< --More-- (140p, 0.4%, @210/42004)
 
 3) r_repl timeout_ms=30000
@@ -21,7 +21,7 @@ expression: snapshot.render_transcript()
 
 4) r_repl timeout_ms=30000
 >>> :where r 
-<<< [pager] next match is ~49 page(s) ahead: use /r or `skip 49`
+<<< [pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`
 <<< --More-- (123p, 12.5%, @5252/42004)
 
 5) r_repl timeout_ms=30000

@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~23 page(s) ahead: use / r or `skip 23`"
+      "text": "[pager] next match is ~23 page(s) ahead: use :/ r or `:skip 23`"
     },
     {
       "type": "text",
@@ -95,7 +95,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~49 page(s) ahead: use /r or `skip 49`"
+      "text": "[pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`"
     },
     {
       "type": "text",
