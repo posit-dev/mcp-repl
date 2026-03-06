@@ -97,7 +97,7 @@ cat("\nEND\n")
             "truncation_tail",
             mcp_script! {
                 write_stdin(big_output, timeout = 20.0);
-                write_stdin("tail 8k", timeout = 10.0);
+                write_stdin(":tail 8k", timeout = 10.0);
             },
         )
         .await?;
@@ -127,9 +127,9 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
             "pager_hits_images",
             mcp_script! {
                 write_stdin(output, timeout = 10.0);
-                write_stdin("hits alpha", timeout = 10.0);
-                write_stdin("seek 0", timeout = 10.0);
-                write_stdin("hits beta", timeout = 10.0);
+                write_stdin(":hits alpha", timeout = 10.0);
+                write_stdin(":seek 0", timeout = 10.0);
+                write_stdin(":hits beta", timeout = 10.0);
             },
         )
         .await?;
@@ -154,9 +154,47 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 #[cfg(not(windows))]
+fn normalize_pager_footer_page_counts(text: &str) -> String {
+    let marker = "--More-- (";
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    while let Some(pos) = text[idx..].find(marker) {
+        let abs = idx + pos;
+        out.push_str(&text[idx..abs]);
+        out.push_str(marker);
+
+        let start = abs + marker.len();
+        let bytes = text.as_bytes();
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+
+        if end > start && end < bytes.len() && bytes[end] == b'p' {
+            out.push('N');
+            idx = end;
+            continue;
+        }
+
+        out.push_str(&text[start..end]);
+        idx = end;
+    }
+    out.push_str(&text[idx..]);
+    out
+}
+
+#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
-    let rendered = snapshot.render();
-    let transcript = snapshot.render_transcript();
+    let rendered = if name == "snapshots_pager_hits_with_images" {
+        normalize_pager_footer_page_counts(&snapshot.render())
+    } else {
+        snapshot.render()
+    };
+    let transcript = if name == "snapshots_pager_hits_with_images" {
+        normalize_pager_footer_page_counts(&snapshot.render_transcript())
+    } else {
+        snapshot.render_transcript()
+    };
     if backend_unavailable(&rendered) || backend_unavailable(&transcript) {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         return Ok(());

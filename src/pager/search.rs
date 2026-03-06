@@ -184,16 +184,16 @@ pub(super) fn where_in_buffer(
     }
 
     let search_cmd = if pattern.case_insensitive_ascii {
-        format!("/i {}", pattern.pattern)
+        format!(":/i {}", pattern.pattern)
     } else {
-        format!("/{}", pattern.pattern)
+        format!(":/{}", pattern.pattern)
     };
 
     if pages_to_skip == 0 {
         format!("[pager] match is on the current/next page: use {search_cmd}")
     } else {
         format!(
-            "[pager] next match is ~{pages_to_skip} page(s) ahead: use {search_cmd} or `skip {pages_to_skip}`"
+            "[pager] next match is ~{pages_to_skip} page(s) ahead: use {search_cmd} or `:skip {pages_to_skip}`"
         )
     }
 }
@@ -362,9 +362,9 @@ fn heading_breadcrumb(headings: &[Heading]) -> String {
 
 fn match_limit_hint(limit: usize) -> &'static str {
     if limit < MAX_MATCH_LIMIT {
-        "use `matches -n all` or `seek @OFFSET` to jump"
+        "use `:matches -n all` or `:seek @OFFSET` to jump"
     } else {
-        "use `seek @OFFSET` to jump"
+        "use `:seek @OFFSET` to jump"
     }
 }
 

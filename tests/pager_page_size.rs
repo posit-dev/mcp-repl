@@ -65,7 +65,9 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             sleep(Duration::from_millis(100)).await;
-            let next = session.write_stdin_raw_with("", Some(2.0)).await?;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
             let text = result_text(&next);
             if backend_unavailable(&text) {
                 eprintln!("pager_page_size backend unavailable in this environment; skipping");
@@ -130,7 +132,9 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             sleep(Duration::from_millis(100)).await;
-            let next = session.write_stdin_raw_with("", Some(2.0)).await?;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
             let text = result_text(&next);
             if backend_unavailable(&text) {
                 eprintln!("pager_page_size backend unavailable in this environment; skipping");

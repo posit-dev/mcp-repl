@@ -27,7 +27,7 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :matches foo
-<<< [pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
+<<< [pager] matches: 25 (limit 50); use `:matches -n all` or `:seek @OFFSET` to jump
 <<< #1 @288 Title > Alpha | alpha line 16 foo
 <<< #2 @306 Title > Alpha | alpha line 17 foo
 <<< #3 @324 Title > Alpha | alpha line 18 foo
@@ -57,7 +57,7 @@ expression: snapshot.render_transcript()
 
 3) r_repl timeout_ms=30000
 >>> :matches -C 1 foo
-<<< [pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
+<<< [pager] matches: 25 (limit 50); use `:matches -n all` or `:seek @OFFSET` to jump
 <<< #1 @288 Title > Alpha
 <<<   > alpha line 16 foo
 <<<     alpha line 17 foo

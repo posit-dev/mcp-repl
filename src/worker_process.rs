@@ -613,12 +613,19 @@ impl WorkerManager {
         }
 
         if self.pager.is_active() {
-            // While pager is active, all input is routed to the pager command parser. Backend
-            // code execution is blocked until the client explicitly exits pager mode with `:q`.
-            if let Some(reply) = self.handle_pager_command(&text) {
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
-                return Ok(reply);
+            let trimmed = text.trim();
+            // While pager is active:
+            // - empty input and `:`-prefixed input are pager commands
+            // - other input auto-dismisses pager and is sent to the backend
+            if trimmed.is_empty() || trimmed.starts_with(':') {
+                if let Some(reply) = self.handle_pager_command(&text) {
+                    let reply = self.finalize_reply(reply);
+                    self.maybe_reset_after_session_end();
+                    return Ok(reply);
+                }
+            } else {
+                self.pager.dismiss();
+                self.pager_prompt = None;
             }
         }
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
