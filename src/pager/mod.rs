@@ -885,6 +885,21 @@ impl Pager {
         state.search_session.is_some()
     }
 
+    fn build_matches_session(
+        buffer: &PagerBuffer,
+        pattern: &SearchPattern,
+        limit: usize,
+    ) -> Option<SearchSession> {
+        if limit >= MAX_MATCH_LIMIT {
+            return build_full_search_session(buffer, pattern, 0);
+        }
+
+        let needed_hits = limit.saturating_add(1);
+        let mut session = build_forward_search_session(buffer, pattern, 0)?;
+        extend_search_session_forward(buffer, &mut session, needed_hits);
+        Some(session)
+    }
+
     fn ensure_search_session_fresh(state: &mut PagerState) -> bool {
         let Some(existing) = state.search_session.as_ref() else {
             return false;
@@ -1068,17 +1083,15 @@ impl Pager {
                 PagerCommand::Matches { spec } => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     if let Some(pattern) = spec.pattern.as_ref() {
-                        if !Self::ensure_search_session_from_pattern(state, pattern, 0, true) {
-                            let contents = vec![WorkerContent::stderr(format!(
-                                "[pager] pattern not found: {}",
-                                pattern.pattern
-                            ))];
-                            state.search_session = None;
-                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
-                        } else {
-                            let session = state.search_session.as_mut();
-                            let session = session.expect("search session missing");
+                        if let Some(mut session) =
+                            Self::build_matches_session(&state.buffer, pattern, spec.limit)
+                        {
                             session.current_index = 0;
+                            state.search_session = Some(session);
+                            let session = state
+                                .search_session
+                                .as_ref()
+                                .expect("search session missing");
                             let (contents, span, view_ranges) =
                                 take_matches(&state.buffer, &spec, session);
                             CommandOutcome::new(
@@ -1091,6 +1104,12 @@ impl Pager {
                                 Some(false),
                             )
                             .with_view_ranges(view_ranges)
+                        } else {
+                            let contents = vec![WorkerContent::stderr(format!(
+                                "[pager] pattern not found: {}",
+                                pattern.pattern
+                            ))];
+                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         }
                     } else if Self::ensure_search_session_fresh(state)
                         && Self::ensure_search_session_complete(state)
@@ -2377,6 +2396,20 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_card_includes_match_after_non_ascii_prefix() {
+        let text = format!("{} token-at-tail suffix\n", "ż".repeat(260));
+        let mut pager = activate_pager_with_text(&text);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text after non-ASCII prefix, got: {reply}"
+        );
+    }
+
+    #[test]
     fn search_navigation_is_bidirectional_and_reuses_refs() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
@@ -2532,6 +2565,25 @@ mod tests {
         assert!(
             !listed.contains("#3 @"),
             "expected no duplicate third hit from same line, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn matches_miss_preserves_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let miss = text_from_reply(pager.handle_command(":matches bar\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: bar"),
+            "expected miss message, got: {miss}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":goto 2\n"));
+        assert!(
+            next.contains("[pager] search #2/2") && next.contains("beta foo"),
+            "expected prior foo search session to survive :matches miss, got: {next}"
         );
     }
 }

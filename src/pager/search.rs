@@ -758,7 +758,9 @@ pub(super) fn render_search_card(
     }
 
     let line = read_line_text(buffer, hit.line_idx);
-    let match_start_in_line = hit.match_start.saturating_sub(hit.line_start) as usize;
+    let line_start_byte = buffer.byte_index_for_char_offset(hit.line_start);
+    let match_start_byte = buffer.byte_index_for_char_offset(hit.match_start);
+    let match_start_in_line = match_start_byte.saturating_sub(line_start_byte);
     let snippet = snippet_around_match(&line, match_start_in_line, &session.pattern.pattern);
     let body = if hit.breadcrumb == "root" {
         format!("> {snippet}\n")
