@@ -817,7 +817,11 @@ pub(super) fn move_search_session(
     let last = session.hits.len().saturating_sub(1);
     let old = session.current_index;
     session.current_index = if forward {
-        session.current_index.saturating_add(count).min(last)
+        if session.current_index >= session.hits.len() {
+            session.current_index
+        } else {
+            session.current_index.saturating_add(count).min(last)
+        }
     } else if session.current_index >= session.hits.len() {
         session.hits.len().saturating_sub(count)
     } else {

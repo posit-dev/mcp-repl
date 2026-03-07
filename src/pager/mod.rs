@@ -902,10 +902,6 @@ impl Pager {
         pattern: &SearchPattern,
         limit: usize,
     ) -> Option<SearchSession> {
-        if limit >= MAX_MATCH_LIMIT {
-            return build_full_search_session(buffer, pattern, 0);
-        }
-
         let needed_hits = limit.saturating_add(1);
         let mut session = build_forward_search_session(buffer, pattern, 0)?;
         extend_search_session_forward(buffer, &mut session, needed_hits);
@@ -2393,6 +2389,12 @@ mod tests {
             "expected forward miss message, got: {miss}"
         );
 
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("[pager] already at the last search hit #2/2 for `foo`"),
+            "expected :n to stay at the boundary after the miss, got: {next}"
+        );
+
         let previous = text_from_reply(pager.handle_command(":p\n"));
         assert!(
             previous.contains("beta foo"),
@@ -2403,6 +2405,32 @@ mod tests {
         assert!(
             listed.contains("#1 @12") && listed.contains("#2 @28"),
             "expected full search session to remain available after the miss, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn matches_all_keeps_search_session_bounded_to_limit_plus_probe() {
+        let text = (0..(MAX_MATCH_LIMIT + 25))
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let matches = text_from_reply(pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            matches.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches header, got: {matches}"
+        );
+
+        let session = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after :matches -n all");
+        assert_eq!(
+            session.hits.len(),
+            MAX_MATCH_LIMIT + 1,
+            "expected bounded search session, got {} hits",
+            session.hits.len()
         );
     }
 
