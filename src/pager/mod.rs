@@ -920,11 +920,7 @@ impl Pager {
         if existing.buffer_len == buffer_len {
             return true;
         }
-        let anchor = existing
-            .hits
-            .get(existing.current_index)
-            .map(|hit| hit.match_start)
-            .unwrap_or_else(|| state.buffer.current_offset());
+        let anchor = existing.anchor_offset;
         let pattern = existing.pattern.clone();
         state.search_session =
             if session_is_complete(existing) || session_is_indexed_from_start(existing) {
@@ -1104,7 +1100,7 @@ impl Pager {
                         if let Some(mut session) =
                             Self::build_matches_session(&state.buffer, pattern, spec.limit)
                         {
-                            session.current_index = 0;
+                            let _ = goto_search_hit(&mut session, 1);
                             state.search_session = Some(session);
                             let session = state
                                 .search_session
@@ -1137,7 +1133,7 @@ impl Pager {
                             .search_session
                             .as_mut()
                             .expect("search session missing");
-                        session.current_index = 0;
+                        let _ = goto_search_hit(session, 1);
                         let (contents, span, view_ranges) =
                             take_matches(&state.buffer, &spec, session);
                         CommandOutcome::new(
@@ -2399,8 +2395,8 @@ mod tests {
 
         let previous = text_from_reply(pager.handle_command(":p\n"));
         assert!(
-            previous.contains("alpha foo"),
-            "expected :p to recover an earlier hit after the miss, got: {previous}"
+            previous.contains("beta foo"),
+            "expected :p to recover the last hit after the miss, got: {previous}"
         );
 
         let listed = text_from_reply(pager.handle_command(":matches\n"));

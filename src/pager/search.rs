@@ -10,6 +10,7 @@ pub(super) struct SearchSession {
     pub(super) pattern: SearchPattern,
     pub(super) hits: Vec<SearchHit>,
     pub(super) current_index: usize,
+    pub(super) anchor_offset: u64,
     pub(super) buffer_len: u64,
     next_search_offset: u64,
     complete: bool,
@@ -479,10 +480,10 @@ fn clean_breadcrumb(breadcrumb: &str) -> String {
         .to_string()
 }
 
-fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> {
+fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> usize {
     hits.iter()
         .position(|hit| hit.match_start >= offset)
-        .or_else(|| hits.len().checked_sub(1))
+        .unwrap_or(hits.len())
 }
 
 fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
@@ -635,11 +636,12 @@ pub(super) fn build_full_search_session(
         return None;
     }
 
-    let current_index = first_hit_index_for_offset(&hits, start_offset)?;
+    let current_index = first_hit_index_for_offset(&hits, start_offset);
 
     Some(SearchSession {
         pattern: pattern.clone(),
         current_index,
+        anchor_offset: start_offset,
         hits,
         buffer_len: buffer.len(),
         next_search_offset: end_offset,
@@ -676,6 +678,7 @@ pub(super) fn build_forward_search_session(
         pattern: pattern.clone(),
         hits: vec![hit],
         current_index: 0,
+        anchor_offset: match_offset,
         buffer_len: buffer.len(),
         next_search_offset,
         complete: false,
@@ -693,10 +696,7 @@ pub(super) fn session_is_indexed_from_start(session: &SearchSession) -> bool {
 }
 
 pub(super) fn current_search_anchor(session: &SearchSession) -> Option<u64> {
-    session
-        .hits
-        .get(session.current_index)
-        .map(|hit| hit.match_start)
+    (!session.hits.is_empty()).then_some(session.anchor_offset)
 }
 
 pub(super) fn extend_search_session_forward(
@@ -818,12 +818,15 @@ pub(super) fn move_search_session(
     let old = session.current_index;
     session.current_index = if forward {
         session.current_index.saturating_add(count).min(last)
+    } else if session.current_index >= session.hits.len() {
+        session.hits.len().saturating_sub(count)
     } else {
         session.current_index.saturating_sub(count)
     };
     if session.current_index == old {
         SearchStepOutcome::Boundary
     } else {
+        session.anchor_offset = session.hits[session.current_index].match_start;
         SearchStepOutcome::Moved
     }
 }
@@ -833,23 +836,29 @@ pub(super) fn goto_search_hit(session: &mut SearchSession, index: usize) -> bool
         return false;
     }
     session.current_index = index - 1;
+    session.anchor_offset = session.hits[session.current_index].match_start;
     true
 }
 
 pub(super) fn search_boundary_message(session: &SearchSession, forward: bool) -> String {
     let edge = if forward { "last" } else { "first" };
+    let display_index = session
+        .hits
+        .len()
+        .checked_sub(1)
+        .map(|last| session.current_index.min(last) + 1)
+        .unwrap_or(0);
     if session.indexed_from_start && session.complete {
         format!(
             "[pager] already at the {edge} search hit #{}/{} for `{}`",
-            session.current_index + 1,
+            display_index,
             session.hits.len(),
             session.pattern.pattern
         )
     } else if session.indexed_from_start {
         format!(
             "[pager] already at the {edge} known search hit #{} for `{}`",
-            session.current_index + 1,
-            session.pattern.pattern
+            display_index, session.pattern.pattern
         )
     } else {
         format!(
