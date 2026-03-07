@@ -480,12 +480,6 @@ fn clean_breadcrumb(breadcrumb: &str) -> String {
 }
 
 fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> {
-    if let Some(index) = hits
-        .iter()
-        .position(|hit| hit.line_start <= offset && offset < hit.line_end)
-    {
-        return Some(index);
-    }
     hits.iter()
         .position(|hit| hit.match_start >= offset)
         .or_else(|| hits.len().checked_sub(1))

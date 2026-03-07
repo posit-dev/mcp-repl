@@ -2411,6 +2411,30 @@ mod tests {
     }
 
     #[test]
+    fn slash_search_miss_after_same_line_hit_anchors_previous_match() {
+        let text = "alpha foo suffix\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(12);
+
+        let miss = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: foo"),
+            "expected miss message after moving past the same-line hit, got: {miss}"
+        );
+
+        let previous = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            previous.contains("alpha foo suffix"),
+            "expected :p to recover the earlier same-line hit, got: {previous}"
+        );
+    }
+
+    #[test]
     fn slash_search_returns_compact_card_and_match_count() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\noutro\n";
         let mut pager = activate_pager_with_text(text);
