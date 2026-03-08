@@ -12,16 +12,17 @@ expression: transcript
 >>> :/line01
 <<< [pager] elided output (already shown): @210..20790
 <<< [pager] search for `line01` @20790
-<<< --More-- (70p, 50.0%, @20790..21000/42000)
+<<< --More-- (71p, 49.5%, @20790..20796/42000)
 
 3) r_repl timeout_ms=30000
 >>> :n
+<<< [pager] elided output (already shown): @20796..21000
 <<< [pager] search for `line01` @21000
-<<< --More-- (70p, 50.0%, @21000/42000)
+<<< --More-- (70p, 50.0%, @21000..21006/42000)
 
 4) r_repl timeout_ms=30000
 >>> :next 2
-<<< line0101 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 01 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line0102 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (69p, 51.0%, @21210..21420/42000)
 

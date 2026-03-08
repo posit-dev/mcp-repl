@@ -55,7 +55,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.0%, @20790..21000/42000)"
+      "text": "--More-- (71p, 49.5%, @20790..20796/42000)"
     }
   ]
 }
@@ -75,6 +75,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "[pager] elided output (already shown): @20796..21000"
+    },
+    {
+      "type": "text",
       "text": "[pager] search for `line01` @21000"
     },
     {
@@ -83,7 +87,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.0%, @21000/42000)"
+      "text": "--More-- (70p, 50.0%, @21000..21006/42000)"
     }
   ]
 }
@@ -103,7 +107,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "line0101 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "text": "01 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "type": "text",

@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..5040"
+      "text": "[pager] elided output (already shown): @210..5249"
     },
     {
       "type": "text",
@@ -79,7 +79,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5040..5252/42004)"
+      "text": "--More-- (123p, 12.5%, @5249..5251/42004)"
     }
   ]
 }
@@ -103,7 +103,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5252/42004)"
+      "text": "--More-- (123p, 12.5%, @5251/42004)"
     }
   ]
 }
@@ -123,7 +123,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @5252..15542"
+      "text": "[pager] elided output (already shown): @5251..15751"
     },
     {
       "type": "text",
@@ -135,7 +135,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (88p, 37.5%, @15542..15754/42004)"
+      "text": "--More-- (88p, 37.5%, @15751..15752/42004)"
     }
   ]
 }
@@ -155,7 +155,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 37.5%, @15542..15754/42004)"
+      "text": "(END, 37.5%, @15751..15752/42004)"
     },
     {
       "type": "text",

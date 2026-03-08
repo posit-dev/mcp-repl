@@ -913,7 +913,11 @@ impl Pager {
         let anchor = existing.anchor_offset;
         let pattern = existing.pattern.clone();
         let mut session = if let Some(limit) = session_max_indexed_hits(existing) {
-            build_bounded_search_session(buffer, &pattern, anchor, limit)
+            if existing.hits.len() > limit {
+                build_full_search_session(buffer, &pattern, anchor)
+            } else {
+                build_bounded_search_session(buffer, &pattern, anchor, limit)
+            }
         } else if session_is_complete(existing) || session_is_indexed_from_start(existing) {
             build_full_search_session(buffer, &pattern, anchor)
         } else {
@@ -2722,6 +2726,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_on_long_later_line_keeps_unseen_tail_pageable() {
+        let text = format!(
+            "intro\n{} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(1200),
+            "b".repeat(200),
+            "c".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("foo"),
+            "expected compact search card for the long later line, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("TAIL-MARKER"),
+            "expected paging to continue through the unseen tail after a compact long-line hit, got: {next_page}"
+        );
+    }
+
+    #[test]
     fn compact_search_card_includes_match_from_long_line_tail() {
         let text = format!("{} token-at-tail suffix\n", "x".repeat(260));
         let mut pager = activate_pager_with_text(&text);
@@ -2988,6 +3015,37 @@ mod tests {
             pager.state.as_ref().expect("pager active").last_emitted,
             Some((0, 6)),
             "expected :matches to leave sequential emission marker unchanged"
+        );
+    }
+
+    #[test]
+    fn refreshed_extended_matches_session_keeps_discovered_position() {
+        let text = (0..80)
+            .map(|i| format!("entry-{i:03} foo\n"))
+            .collect::<String>();
+        let mut fixture = activate_pager_from_output(&text);
+
+        let listed = text_from_reply(fixture.pager.handle_command(":matches -n 2 foo\n"));
+        assert!(
+            listed.contains("entry-000 foo") && listed.contains("entry-001 foo"),
+            "expected limited matches output, got: {listed}"
+        );
+
+        for expected in 1..=5 {
+            let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+            assert!(
+                next.contains(&format!("entry-{expected:03} foo")),
+                "expected to advance to discovered hit {expected}, got: {next}"
+            );
+        }
+
+        fixture.timeline.append_text(b"entry-080 foo\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("entry-006 foo"),
+            "expected refresh to preserve the extended search position, got: {next}"
         );
     }
 }

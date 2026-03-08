@@ -17,13 +17,13 @@ expression: transcript
 >>> :/i LINE01
 <<< [pager] elided output (already shown): @210..20790
 <<< [pager] search for `LINE01` @20790
-<<< --More-- (70p, 50.0%, @20790..21000/42000)
+<<< --More-- (71p, 49.5%, @20790..20796/42000)
 
 4) r_repl timeout_ms=30000
 >>> :/iLINE01
 <<< [pager] pattern not found: iLINE01
-<<< --More-- (70p, 50.0%, @20790..21000/42000)
+<<< --More-- (71p, 49.5%, @20790..20796/42000)
 
 5) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 50.0%, @20790..21000/42000)
+<<< (END, 49.5%, @20790..20796/42000)

@@ -842,10 +842,15 @@ pub(super) fn render_search_card(
     };
     contents.push(WorkerContent::stdout(body));
     let current_offset = buffer.current_offset();
+    let match_char_len = session.pattern.pattern.chars().count().max(1) as u64;
+    let match_end = hit
+        .match_start
+        .saturating_add(match_char_len)
+        .min(hit.line_end);
     let range = if hit.line_start <= current_offset && current_offset < hit.line_end {
         None
     } else {
-        Some((hit.line_start, hit.line_end))
+        Some((hit.match_start, match_end))
     };
     (contents, range)
 }

@@ -12,13 +12,13 @@ expression: transcript
 >>> :/line0050
 <<< [pager] elided output (already shown): @210..10290
 <<< [pager] search for `line0050` @10290
-<<< --More-- (105p, 25.0%, @10290..10500/42000)
+<<< --More-- (106p, 24.5%, @10290..10298/42000)
 
 3) r_repl timeout_ms=30000
 >>> :n
 <<< [pager] already at the last known search hit for `line0050`
-<<< --More-- (105p, 25.0%, @10290..10500/42000)
+<<< --More-- (106p, 24.5%, @10290..10298/42000)
 
 4) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 25.0%, @10290..10500/42000)
+<<< (END, 24.5%, @10290..10298/42000)
