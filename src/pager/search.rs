@@ -259,6 +259,12 @@ fn read_line_text(buffer: &PagerBuffer, idx: usize) -> String {
     text.trim_end_matches(&['\n', '\r'][..]).to_string()
 }
 
+fn decoded_match_start_in_line(buffer: &PagerBuffer, line_start: u64, match_start: u64) -> usize {
+    let line_start_byte = buffer.byte_index_for_char_offset(line_start);
+    let match_start_byte = buffer.byte_index_for_char_offset(match_start);
+    String::from_utf8_lossy(&buffer.bytes[line_start_byte..match_start_byte]).len()
+}
+
 fn strip_trailing_anchor_link(text: &str) -> &str {
     let trimmed = text.trim_end();
     let Some(open_idx) = trimmed.rfind('[') else {
@@ -832,9 +838,7 @@ pub(super) fn render_search_card(
     }
 
     let line = read_line_text(buffer, hit.line_idx);
-    let line_start_byte = buffer.byte_index_for_char_offset(hit.line_start);
-    let match_start_byte = buffer.byte_index_for_char_offset(hit.match_start);
-    let match_start_in_line = match_start_byte.saturating_sub(line_start_byte);
+    let match_start_in_line = decoded_match_start_in_line(buffer, hit.line_start, hit.match_start);
     let snippet = snippet_around_match(&line, match_start_in_line, &session.pattern.pattern);
     let body = if hit.breadcrumb == "root" {
         format!("> {snippet}\n")

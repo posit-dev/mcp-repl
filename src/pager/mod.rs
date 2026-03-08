@@ -2040,6 +2040,19 @@ mod tests {
         pager
     }
 
+    fn activate_pager_with_bytes(bytes: Vec<u8>) -> Pager {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+        };
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+        pager
+    }
+
     fn output_ring_test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -2783,6 +2796,21 @@ mod tests {
         assert!(
             body_match_count >= 2,
             "expected compact card body to include matched text after non-ASCII prefix, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn compact_search_card_includes_match_after_invalid_utf8_prefix() {
+        let mut bytes = vec![0xff; 260];
+        bytes.extend_from_slice(b" token-at-tail suffix\n");
+        let mut pager = activate_pager_with_bytes(bytes);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text after invalid UTF-8 prefix, got: {reply}"
         );
     }
 
