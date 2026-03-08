@@ -913,11 +913,8 @@ impl Pager {
         let anchor = existing.anchor_offset;
         let pattern = existing.pattern.clone();
         let mut session = if let Some(limit) = session_max_indexed_hits(existing) {
-            if existing.hits.len() > limit {
-                build_full_search_session(buffer, &pattern, anchor)
-            } else {
-                build_bounded_search_session(buffer, &pattern, anchor, limit)
-            }
+            let rebuilt_limit = existing.hits.len().max(limit);
+            build_bounded_search_session(buffer, &pattern, anchor, rebuilt_limit)
         } else if session_is_complete(existing) || session_is_indexed_from_start(existing) {
             build_full_search_session(buffer, &pattern, anchor)
         } else {
@@ -3084,6 +3081,19 @@ mod tests {
         assert!(
             next.contains("entry-006 foo"),
             "expected refresh to preserve the extended search position, got: {next}"
+        );
+
+        let refreshed_session = fixture
+            .pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after refresh");
+        assert_eq!(
+            refreshed_session.hits.len(),
+            7,
+            "expected post-refresh navigation to preserve a bounded discovered window, got {} indexed hits",
+            refreshed_session.hits.len()
         );
     }
 }
