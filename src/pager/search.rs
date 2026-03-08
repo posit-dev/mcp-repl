@@ -841,7 +841,13 @@ pub(super) fn render_search_card(
         format!("{}\n> {snippet}\n", hit.breadcrumb)
     };
     contents.push(WorkerContent::stdout(body));
-    (contents, Some((hit.line_start, hit.line_end)))
+    let current_offset = buffer.current_offset();
+    let range = if hit.line_start <= current_offset && current_offset < hit.match_start {
+        None
+    } else {
+        Some((hit.line_start, hit.line_end))
+    };
+    (contents, range)
 }
 
 pub(super) fn move_search_session(

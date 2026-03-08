@@ -947,13 +947,9 @@ impl Pager {
         let Some(_anchor) = current_search_anchor(existing) else {
             return false;
         };
+        let pattern = existing.pattern.clone();
         state.search_session =
-            if session_max_indexed_hits(existing) == Some(MAX_MATCH_LIMIT.saturating_add(1)) {
-                Self::rebuild_search_session(&state.buffer, existing)
-            } else {
-                let pattern = existing.pattern.clone();
-                build_full_search_session(&state.buffer, &pattern, existing.anchor_offset)
-            };
+            build_full_search_session(&state.buffer, &pattern, existing.anchor_offset);
         state.search_session.is_some()
     }
 
@@ -2515,6 +2511,26 @@ mod tests {
     }
 
     #[test]
+    fn matches_all_session_completes_before_goto() {
+        let text = (0..700)
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            listed.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 600\n"));
+        assert!(
+            jumped.contains("[pager] search #600/700") && jumped.contains("foo line 599"),
+            "expected goto to rebuild a full search session after :matches -n all, got: {jumped}"
+        );
+    }
+
+    #[test]
     fn default_matches_session_completes_before_goto() {
         let text = (0..80)
             .map(|idx| format!("foo line {idx}\n"))
@@ -2552,7 +2568,11 @@ mod tests {
             .append_text(b"foo line refresh-a\nfoo line refresh-b\n", false);
         fixture.pager.refresh_from_output(&fixture.output);
 
-        let _refreshed = text_from_reply(fixture.pager.handle_command(":matches\n"));
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo line 1"),
+            "expected non-random-access refresh navigation to keep working, got: {next}"
+        );
 
         let session = fixture
             .pager
@@ -2638,6 +2658,35 @@ mod tests {
         assert!(
             !reply.contains("middle\nbeta foo"),
             "expected compact card instead of full page, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn compact_same_line_search_keeps_unseen_text_pageable() {
+        let text = format!(
+            "{}{}{} target foo suffix\nomega\n",
+            "a".repeat(1200),
+            "UNSEEN-MARKER ",
+            "b".repeat(1800)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(1000);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("target foo"),
+            "expected compact search card for the later same-line hit, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("UNSEEN-MARKER"),
+            "expected paging to continue through unseen same-line text, got: {next_page}"
         );
     }
 
