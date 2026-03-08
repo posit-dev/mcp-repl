@@ -79,7 +79,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5249..5251/42004)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -99,11 +99,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`"
+      "text": "[pager] match is on the current/next page: use :/r"
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5251/42004)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -123,19 +123,19 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @5251..15751"
+      "text": "[pager] search for `r` @5250"
     },
     {
       "type": "text",
-      "text": "[pager] search for `r` @15751"
+      "text": "[pager] shown earlier @5249..5251"
     },
     {
       "type": "text",
-      "text": "> ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxr"
+      "text": "> ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r"
     },
     {
       "type": "text",
-      "text": "--More-- (88p, 37.5%, @15751..15752/42004)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -155,7 +155,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 37.5%, @15751..15752/42004)"
+      "text": "(END, 11.9%, @5040/42004)"
     },
     {
       "type": "text",

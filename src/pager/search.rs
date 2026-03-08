@@ -793,13 +793,14 @@ pub(super) fn render_search_card(
     buffer: &PagerBuffer,
     session: &SearchSession,
     view_history: &[(u64, u64)],
-) -> (Vec<WorkerContent>, Option<(u64, u64)>) {
+) -> (Vec<WorkerContent>, Option<(u64, u64)>, Option<u64>) {
     let Some(hit) = session.hits.get(session.current_index) else {
         return (
             vec![WorkerContent::stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
+            None,
             None,
         );
     };
@@ -847,12 +848,13 @@ pub(super) fn render_search_card(
         .match_start
         .saturating_add(match_char_len)
         .min(hit.line_end);
-    let range = if hit.line_start <= current_offset && current_offset < hit.line_end {
-        None
-    } else {
-        Some((hit.match_start, match_end))
-    };
-    (contents, range)
+    let (range, resume_offset) =
+        if hit.line_start <= current_offset && current_offset < hit.line_end {
+            (None, None)
+        } else {
+            (Some((hit.match_start, match_end)), Some(hit.line_start))
+        };
+    (contents, range, resume_offset)
 }
 
 pub(super) fn move_search_session(

@@ -1065,10 +1065,10 @@ impl Pager {
                             .search_session
                             .as_ref()
                             .expect("search session missing after build");
-                        let (contents, range) =
+                        let (contents, range, resume_offset) =
                             render_search_card(&state.buffer, session, &state.view_history);
-                        if let Some((_, end)) = range {
-                            state.buffer.advance_offset_to(end);
+                        if let Some(offset) = resume_offset {
+                            state.buffer.advance_offset_to(offset);
                         }
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         CommandOutcome::new(
@@ -1096,10 +1096,10 @@ impl Pager {
                             SearchStepOutcome::Moved,
                             "full search session should have an earlier hit after a forward miss"
                         );
-                        let (contents, range) =
+                        let (contents, range, resume_offset) =
                             render_search_card(&state.buffer, session, &state.view_history);
-                        if let Some((_, end)) = range {
-                            state.buffer.advance_offset_to(end);
+                        if let Some(offset) = resume_offset {
+                            state.buffer.advance_offset_to(offset);
                         }
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         CommandOutcome::new(
@@ -1112,6 +1112,7 @@ impl Pager {
                             Some(false),
                         )
                     } else {
+                        state.search_session = None;
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(format!(
                             "[pager] pattern not found: {}",
@@ -1156,6 +1157,7 @@ impl Pager {
                             .with_view_ranges(view_ranges)
                             .without_last_emitted_update()
                         } else {
+                            state.search_session = None;
                             let contents = vec![WorkerContent::stderr(format!(
                                 "[pager] pattern not found: {}",
                                 pattern.pattern
@@ -1221,10 +1223,10 @@ impl Pager {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
-                            let (contents, range) =
+                            let (contents, range, resume_offset) =
                                 render_search_card(&state.buffer, session, &state.view_history);
-                            if let Some((_, end)) = range {
-                                state.buffer.advance_offset_to(end);
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
                             }
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
@@ -1265,10 +1267,10 @@ impl Pager {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
-                            let (contents, range) =
+                            let (contents, range, resume_offset) =
                                 render_search_card(&state.buffer, session, &state.view_history);
-                            if let Some((_, end)) = range {
-                                state.buffer.advance_offset_to(end);
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
                             }
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
@@ -1298,10 +1300,10 @@ impl Pager {
                             .as_mut()
                             .expect("search session missing after refresh");
                         if goto_search_hit(session, index) {
-                            let (contents, range) =
+                            let (contents, range, resume_offset) =
                                 render_search_card(&state.buffer, session, &state.view_history);
-                            if let Some((_, end)) = range {
-                                state.buffer.advance_offset_to(end);
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
                             }
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::new(
@@ -2400,8 +2402,16 @@ mod tests {
             "expected paging to continue after the search hit, got: {next}"
         );
         assert!(
+            next.contains("line-0100"),
+            "expected paging to resume from the full hit line, got: {next}"
+        );
+        assert!(
             !next.contains("line-0001"),
             "expected search to move the pager forward, got: {next}"
+        );
+        assert!(
+            !next.contains("\n0100"),
+            "expected search paging to avoid truncated mid-line fragments, got: {next}"
         );
     }
 
@@ -2966,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_miss_preserves_active_search_session() {
+    fn matches_miss_clears_active_search_session() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
 
@@ -2979,13 +2989,13 @@ mod tests {
 
         let next = text_from_reply(pager.handle_command(":goto 2\n"));
         assert!(
-            next.contains("[pager] search #2/2") && next.contains("beta foo"),
-            "expected prior foo search session to survive :matches miss, got: {next}"
+            next.contains("[pager] no active search; use `:/PATTERN` first"),
+            "expected :matches miss to clear the previous search session, got: {next}"
         );
     }
 
     #[test]
-    fn slash_search_miss_preserves_active_search_session() {
+    fn slash_search_miss_clears_active_search_session() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
 
@@ -2998,8 +3008,8 @@ mod tests {
 
         let next = text_from_reply(pager.handle_command(":goto 2\n"));
         assert!(
-            next.contains("[pager] search #2/2") && next.contains("beta foo"),
-            "expected prior foo search session to survive slash-search miss, got: {next}"
+            next.contains("[pager] no active search; use `:/PATTERN` first"),
+            "expected slash-search miss to clear the previous search session, got: {next}"
         );
     }
 
