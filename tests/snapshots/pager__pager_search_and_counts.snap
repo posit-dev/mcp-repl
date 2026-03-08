@@ -83,7 +83,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.5%, @21000..21210/42000)"
+      "text": "--More-- (70p, 50.0%, @21000/42000)"
     }
   ]
 }
@@ -103,15 +103,15 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "line0101 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "type": "text",
       "text": "line0102 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "type": "text",
-      "text": "line0103 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    },
-    {
-      "type": "text",
-      "text": "--More-- (68p, 51.5%, @21420..21630/42000)"
+      "text": "--More-- (69p, 51.0%, @21210..21420/42000)"
     }
   ]
 }
@@ -131,7 +131,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @21630..41580"
+      "text": "[pager] elided output (already shown): @21420..41580"
     },
     {
       "type": "text",

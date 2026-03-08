@@ -2691,6 +2691,37 @@ mod tests {
     }
 
     #[test]
+    fn compact_same_line_backward_hit_keeps_unseen_tail_pageable() {
+        let text = format!(
+            "{} foo {} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(1200),
+            "b".repeat(900),
+            "c".repeat(200),
+            "d".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        let cursor = text.find("TAIL-MARKER").expect("tail marker offset");
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(cursor as u64);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("foo"),
+            "expected compact search card for the earlier same-line hit, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("TAIL-MARKER"),
+            "expected paging to continue through the unseen tail after same-line backward hit, got: {next_page}"
+        );
+    }
+
+    #[test]
     fn compact_search_card_includes_match_from_long_line_tail() {
         let text = format!("{} token-at-tail suffix\n", "x".repeat(260));
         let mut pager = activate_pager_with_text(&text);

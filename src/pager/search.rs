@@ -842,7 +842,7 @@ pub(super) fn render_search_card(
     };
     contents.push(WorkerContent::stdout(body));
     let current_offset = buffer.current_offset();
-    let range = if hit.line_start <= current_offset && current_offset < hit.match_start {
+    let range = if hit.line_start <= current_offset && current_offset < hit.line_end {
         None
     } else {
         Some((hit.line_start, hit.line_end))
