@@ -718,11 +718,13 @@ impl CommandOutcome {
             update_last_emitted: true,
             first_range,
             last_range,
-            view_ranges: match (first_range, last_range) {
-                (Some((start, _)), Some((_, end))) => vec![(start, end)],
-                _ => Vec::new(),
-            },
+            view_ranges: Vec::new(),
         }
+    }
+
+    fn with_single_view_range(mut self, range: Option<(u64, u64)>) -> Self {
+        self.view_ranges = range.into_iter().collect();
+        self
     }
 
     fn with_view_ranges(mut self, view_ranges: Vec<(u64, u64)>) -> Self {
@@ -739,54 +741,48 @@ impl CommandOutcome {
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
-            contents,
-            pages_left,
-            is_error,
-            true,
-            first_range,
-            last_range,
-            None,
+            contents, pages_left, is_error, true, span.first, span.last, None,
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn page_keep(
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
             contents,
             pages_left,
             is_error,
             true,
-            first_range,
-            last_range,
+            span.first,
+            span.last,
             Some(false),
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn page_dismiss(
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
             contents,
             pages_left,
             is_error,
             true,
-            first_range,
-            last_range,
+            span.first,
+            span.last,
             Some(true),
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn no_range(contents: Vec<WorkerContent>, pages_left: u64, is_error: bool) -> Self {
@@ -1071,7 +1067,7 @@ impl Pager {
                         count,
                         &mut state.seen_ranges,
                     );
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Skip { count } => {
                     let (contents, pages_left, span) = skip_pages_and_take_next(
@@ -1080,12 +1076,12 @@ impl Pager {
                         count,
                         &mut state.seen_ranges,
                     );
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::All => {
                     let (contents, pages_left, span) =
                         take_all(&mut state.buffer, page_bytes, &mut state.seen_ranges);
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Tail { spec } => {
                     let (contents, pages_left, span) = match spec {
@@ -1099,9 +1095,7 @@ impl Pager {
                             take_tail_lines(&mut state.buffer, lines, &mut state.seen_ranges)
                         }
                     };
-                    CommandOutcome::page_dismiss(
-                        contents, pages_left, is_error, span.first, span.last,
-                    )
+                    CommandOutcome::page_dismiss(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Search { pattern } => {
                     if Self::ensure_search_session_from_pattern(
@@ -1137,6 +1131,7 @@ impl Pager {
                             range,
                             Some(false),
                         )
+                        .with_single_view_range(range)
                         .without_last_emitted_update()
                     } else if Self::ensure_search_session_from_pattern(
                         state,
@@ -1177,6 +1172,7 @@ impl Pager {
                             range,
                             Some(false),
                         )
+                        .with_single_view_range(range)
                         .without_last_emitted_update()
                     } else {
                         state.search_session = None;
@@ -1268,7 +1264,7 @@ impl Pager {
                         spec.count,
                         &mut state.seen_ranges,
                     );
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    CommandOutcome::page_keep(contents, pages_left, is_error, span)
                         .with_view_ranges(view_ranges)
                 }
                 PagerCommand::SearchNext { count } => {
@@ -1312,6 +1308,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .with_single_view_range(range)
                             .without_last_emitted_update()
                         }
                     } else {
@@ -1321,9 +1318,7 @@ impl Pager {
                             count,
                             &mut state.seen_ranges,
                         );
-                        CommandOutcome::page_keep(
-                            contents, pages_left, is_error, span.first, span.last,
-                        )
+                        CommandOutcome::page_keep(contents, pages_left, is_error, span)
                     }
                 }
                 PagerCommand::SearchPrev { count } => {
@@ -1365,6 +1360,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .with_single_view_range(range)
                             .without_last_emitted_update()
                         }
                     } else {
@@ -1407,6 +1403,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .with_single_view_range(range)
                             .without_last_emitted_update()
                         } else {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
@@ -1435,6 +1432,7 @@ impl Pager {
                     CommandOutcome::new(
                         contents, pages_left, is_error, false, span.first, span.last, None,
                     )
+                    .with_view_ranges(span.ranges)
                 }
                 PagerCommand::Seek { spec } => {
                     let end_offset = state.buffer.len();
@@ -1459,7 +1457,7 @@ impl Pager {
                         state.buffer.advance_offset_to(desired_offset);
                         let (contents, pages_left, span) =
                             take_next_page(&mut state.buffer, page_bytes, &mut state.seen_ranges);
-                        CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                        CommandOutcome::page(contents, pages_left, is_error, span)
                     }
                 }
                 PagerCommand::Help => {
@@ -1793,8 +1791,7 @@ fn take_next_pages(
             break;
         }
         contents.extend(page_contents);
-        span.record(range.first);
-        span.record(range.last);
+        span.extend(&range);
         if pages_left == 0 {
             break;
         }
@@ -3043,6 +3040,32 @@ mod tests {
     }
 
     #[test]
+    fn range_with_elided_gap_does_not_mark_hidden_text_as_shown() {
+        let text = "alpha foo\nmiddle token\nbeta foo\n";
+        let mut pager = activate_pager_with_text(text);
+        let middle_start = "alpha foo\n".len() as u64;
+        let middle_end = middle_start + "middle token\n".len() as u64;
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .seen_ranges
+            .insert(middle_start, middle_end);
+
+        let ranged = text_from_reply(pager.handle_command(":range 1 3\n"));
+        assert!(
+            ranged.contains("[pager] elided output"),
+            "expected elision marker for the seen middle line, got: {ranged}"
+        );
+
+        let found = text_from_reply(pager.handle_command(":/token\n"));
+        assert!(
+            !found.contains("[pager] shown earlier @"),
+            "expected elided middle text not to be marked as shown, got: {found}"
+        );
+    }
+
+    #[test]
     fn search_sessions_index_each_matching_line_once() {
         let text = "alpha foo foo\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
@@ -3387,6 +3410,26 @@ mod tests {
         assert!(
             !first.contains("[pager] shown earlier @"),
             "expected truncated :matches row not to mark hidden long-line match as shown, got: {first}"
+        );
+    }
+
+    #[test]
+    fn matches_without_context_do_not_mark_hidden_long_line_tail_as_shown() {
+        let hidden_term = "tailterm";
+        let long_middle = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("foo {long_middle}{hidden_term}\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @0"),
+            "expected visible-prefix match to appear in list output, got: {listed}"
+        );
+
+        let hidden = text_from_reply(pager.handle_command(":/tailterm\n"));
+        assert!(
+            !hidden.contains("[pager] shown earlier @"),
+            "expected hidden tail term to remain unviewed after truncated :matches row, got: {hidden}"
         );
     }
 

@@ -288,17 +288,47 @@ fn decoded_match_stream(
     }
 }
 
+fn visible_prefix_end_byte(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return text.len();
+    }
+    if max_bytes <= 3 {
+        return 0;
+    }
+
+    let keep_bytes = max_bytes.saturating_sub(3);
+    let mut end = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if idx >= keep_bytes {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    end
+}
+
+fn visible_prefix_range(line_start: u64, line_end: u64, line: &str) -> Option<(u64, u64)> {
+    let trimmed = line.trim_end();
+    let visible_end_byte = visible_prefix_end_byte(trimmed, MATCH_LINE_MAX_BYTES);
+    if visible_end_byte == 0 {
+        return None;
+    }
+    let visible_chars = trimmed[..visible_end_byte].chars().count() as u64;
+    let visible_end = line_start.saturating_add(visible_chars).min(line_end);
+    (visible_end > line_start).then_some((line_start, visible_end))
+}
+
 fn prefix_snippet_shows_match(line: &str, match_start_in_line: usize, pattern: &str) -> bool {
     let trimmed = line.trim_end();
-    if trimmed.len() <= MATCH_LINE_MAX_BYTES {
+    let visible_end_byte = visible_prefix_end_byte(trimmed, MATCH_LINE_MAX_BYTES);
+    if visible_end_byte >= trimmed.len() {
         return true;
     }
 
-    let visible_prefix_bytes = MATCH_LINE_MAX_BYTES.saturating_sub(3);
     match_start_in_line
         .saturating_add(pattern.len())
         .min(trimmed.len())
-        <= visible_prefix_bytes
+        <= visible_end_byte
 }
 
 fn strip_trailing_anchor_link(text: &str) -> &str {
@@ -474,8 +504,11 @@ pub(super) fn take_matches(
             ));
             let range = (entry.line_start, entry.line_end);
             span.record(Some(range));
-            if prefix_snippet_shows_match(&line, match_start_in_line, &session.pattern.pattern) {
-                view_ranges.push(range);
+            if prefix_snippet_shows_match(&line, match_start_in_line, &session.pattern.pattern)
+                && let Some(visible_range) =
+                    visible_prefix_range(entry.line_start, entry.line_end, &line)
+            {
+                view_ranges.push(visible_range);
             }
             continue;
         }
@@ -495,8 +528,8 @@ pub(super) fn take_matches(
             output.push_str(&format!("  {marker} {snippet}\n"));
             let range = (line_start, line_end);
             span.record(Some(range));
-            if line.trim_end().len() <= MATCH_LINE_MAX_BYTES {
-                view_ranges.push(range);
+            if let Some(visible_range) = visible_prefix_range(line_start, line_end, &line) {
+                view_ranges.push(visible_range);
             }
         }
     }

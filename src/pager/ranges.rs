@@ -48,10 +48,11 @@ impl RangeSet {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct RangeSpan {
     pub(super) first: Option<(u64, u64)>,
     pub(super) last: Option<(u64, u64)>,
+    pub(super) ranges: Vec<(u64, u64)>,
 }
 
 impl RangeSpan {
@@ -63,5 +64,18 @@ impl RangeSpan {
             self.first = Some(range);
         }
         self.last = Some(range);
+        if let Some((_, last_end)) = self.ranges.last_mut()
+            && range.0 <= *last_end
+        {
+            *last_end = (*last_end).max(range.1);
+            return;
+        }
+        self.ranges.push(range);
+    }
+
+    pub(super) fn extend(&mut self, other: &RangeSpan) {
+        for range in &other.ranges {
+            self.record(Some(*range));
+        }
     }
 }
