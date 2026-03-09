@@ -3358,6 +3358,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_cards_use_non_prompt_match_prefix() {
+        let mut pager = activate_pager_with_text("alpha foo\n");
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let body = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, .. } if text.contains("alpha foo") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+
+        assert!(
+            body.contains("[match] alpha foo"),
+            "expected compact search body to use a neutral match prefix, got: {body}"
+        );
+        assert!(
+            !body.starts_with("> ") && !body.contains("\n> "),
+            "expected compact search body to avoid prompt-looking prefixes, got: {body}"
+        );
+    }
+
+    #[test]
     fn compact_search_cards_keep_stdout_in_mixed_stream_sessions() {
         let text = "stderr: warning one\nalpha foo\nstderr: warning two\n";
         let bytes = text.as_bytes().to_vec();

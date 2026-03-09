@@ -136,3 +136,14 @@ fn normalize_plot_id(raw: &str) -> String {
         raw.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_error_prompt;
+
+    #[test]
+    fn compact_search_cards_do_not_trigger_error_prompt_normalization() {
+        let text = "[pager] search for `Error` @10\n[match] Error: boom\n".to_string();
+        assert_eq!(normalize_error_prompt(text.clone(), true), text);
+    }
+}

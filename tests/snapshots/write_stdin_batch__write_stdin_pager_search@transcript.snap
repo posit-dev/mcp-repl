@@ -12,6 +12,7 @@ expression: transcript
 >>> :/line0050
 <<< [pager] elided output (already shown): @210..10290
 <<< [pager] search for `line0050` @10290
+<<< [match] line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
 <<< --More-- (106p, 24.5%, @10290/42000)
 
 3) r_repl timeout_ms=30000

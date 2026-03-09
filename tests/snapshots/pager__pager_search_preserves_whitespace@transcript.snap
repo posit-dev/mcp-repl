@@ -17,6 +17,7 @@ expression: transcript
 >>> :/ r
 <<< [pager] elided output (already shown): @210..5249
 <<< [pager] search for ` r` @5249
+<<< [match] ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< --More-- (124p, 11.9%, @5040/42004)
 
 4) r_repl timeout_ms=30000
@@ -28,6 +29,7 @@ expression: transcript
 >>> :/r 
 <<< [pager] search for `r` @5250
 <<< [pager] shown earlier @5249..5251
+<<< [match] ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< --More-- (124p, 11.9%, @5040/42004)
 
 6) r_repl timeout_ms=30000

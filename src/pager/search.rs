@@ -911,9 +911,9 @@ pub(super) fn render_search_card(
     let match_start_in_line = decoded_match_start_in_line(buffer, hit.line_start, hit.match_start);
     let snippet = snippet_around_match(&line, match_start_in_line, &session.pattern.pattern);
     let body = if hit.breadcrumb == "root" {
-        format!("> {snippet}\n")
+        format!("[match] {snippet}\n")
     } else {
-        format!("{}\n> {snippet}\n", hit.breadcrumb)
+        format!("{}\n[match] {snippet}\n", hit.breadcrumb)
     };
     let stream = decoded_match_stream(buffer, hit.match_start, &line, default_stream);
     contents.push(WorkerContent::ContentText { text: body, stream });
