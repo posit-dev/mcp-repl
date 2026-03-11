@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::reply_overflow::ReplyOverflowSettings;
 use serde::{Deserialize, Serialize};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{
@@ -95,6 +96,9 @@ pub enum WorkerToServerIpcMessage {
         data: String,
         is_new: bool,
     },
+    ReplyOverflowSettings {
+        settings: ReplyOverflowSettings,
+    },
     RequestEnd,
     SessionEnd,
 }
@@ -108,6 +112,7 @@ struct ServerIpcInbox {
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
+    reply_overflow_settings: Option<ReplyOverflowSettings>,
     session_end: bool,
     disconnected: bool,
 }
@@ -271,6 +276,11 @@ impl ServerIpcConnection {
                                 reader_cvar.notify_all();
                             }
                         }
+                        WorkerToServerIpcMessage::ReplyOverflowSettings { settings } => {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard.reply_overflow_settings = Some(settings);
+                            reader_cvar.notify_all();
+                        }
                         other => {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.queue.push_back(other);
@@ -341,6 +351,38 @@ impl ServerIpcConnection {
     pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
         let mut guard = self.inbox.lock().unwrap();
         guard.echo_events.drain(..).collect()
+    }
+
+    pub fn take_reply_overflow_settings(&self) -> Option<ReplyOverflowSettings> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.reply_overflow_settings.take()
+    }
+
+    pub fn wait_for_reply_overflow_settings(
+        &self,
+        timeout: Duration,
+    ) -> Option<ReplyOverflowSettings> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(settings) = guard.reply_overflow_settings.take() {
+                return Some(settings);
+            }
+            if guard.disconnected || guard.session_end {
+                return None;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return guard.reply_overflow_settings.take();
+            }
+        }
     }
 
     pub fn wait_for_request_end(&self, timeout: Duration) -> Result<(), IpcWaitError> {
@@ -1232,6 +1274,12 @@ pub fn emit_backend_info(language: &str, supports_images: bool) {
             language: language.to_string(),
             supports_images,
         });
+    }
+}
+
+pub fn emit_reply_overflow_settings(settings: ReplyOverflowSettings) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReplyOverflowSettings { settings });
     }
 }
 

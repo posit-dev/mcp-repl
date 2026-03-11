@@ -9,7 +9,7 @@ Session state persists across calls, so agents can iterate in place, inspect int
 ## Why use it
 
 - Stateful REPL execution in one long-lived process.
-- LLM-oriented output handling: prompt/echo cleanup and built-in pager mode.
+- LLM-oriented output handling: prompt/echo cleanup, files-based overflow previews by default, and an opt-in pager.
 - In-band docs for common help flows (`?`, `help()`, `vignette()`, `RShowDoc()`).
 - Plot images returned as MCP image content.
 - OS-level sandboxing by default, plus a memory resource guardrail.
@@ -23,12 +23,41 @@ Like a shell, R and Python are powerful. Without guardrails, an LLM can do real 
 `mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
 - There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
 - Echoed inputs are automatically pruned or elided so output is easy to attribute.
-- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
+- Large replies stay non-modal by default: `mcp-repl` keeps a bounded inline preview and writes overflow to per-reply files.
+- An opt-in pager remains available for workflows that benefit from modal navigation and search.
 - Documentation receives special handling. Built-in entry points like `?`, `help`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band, replacing the usual HTML browser flow.
 
-### Pager
+### Reply overflow
 
-The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
+By default, oversized replies stay non-modal:
+- The reply keeps a bounded inline preview.
+- Full text and omitted images are written to a per-reply directory under the session temp area.
+- The reply includes plain-text annotations with the saved paths.
+
+This keeps polling and normal input semantics unchanged even when output is large.
+
+You can opt back into the pager with launch config:
+
+```sh
+mcp-repl --config reply_overflow.behavior=pager
+```
+
+In the R backend, the same session-scoped settings are also available at runtime through `options()`:
+
+```r
+options(
+  mcp.reply_overflow.behavior = "files",
+  mcp.reply_overflow.text.preview_bytes = 12000L,
+  mcp.reply_overflow.text.spill_bytes = 12000L,
+  mcp.reply_overflow.images.preview_count = 2L,
+  mcp.reply_overflow.images.spill_count = 2L,
+  mcp.reply_overflow.retention.max_dirs = 30L
+)
+```
+
+These runtime changes are session-scoped. `repl_reset` restores the launch defaults for the current server session.
+
+When `reply_overflow.behavior = "pager"`, the pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
 
 Internally, the pager is backed by a bounded ring buffer with an event timeline, not a naive "dump and slice" stream. That gives it predictable memory usage while still supporting strong navigation semantics:
 - Output is tracked with stable offsets, so commands like `:seek` (offset/percent/line) and `:range` can jump deterministically.

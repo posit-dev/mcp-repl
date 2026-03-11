@@ -61,11 +61,12 @@ pub(crate) fn reset_last_reply_marker_offset() {
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,
+    archive: Arc<OutputArchive>,
 }
 
 impl OutputTimeline {
-    pub(crate) fn new(ring: Arc<OutputRing>) -> Self {
-        Self { ring }
+    pub(crate) fn new(ring: Arc<OutputRing>, archive: Arc<OutputArchive>) -> Self {
+        Self { ring, archive }
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool) {
@@ -74,6 +75,7 @@ impl OutputTimeline {
         }
         if !is_stderr {
             self.ring.append_bytes(bytes, false);
+            self.archive.append_bytes(bytes, false);
             return;
         }
 
@@ -91,11 +93,21 @@ impl OutputTimeline {
         payload.extend_from_slice(STDERR_PREFIX);
         payload.extend_from_slice(bytes);
         self.ring.append_bytes(&payload, true);
+        self.archive.append_bytes(&payload, true);
     }
 
     pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
         let offset = self.ring.end_offset();
         self.ring.append_event(
+            offset,
+            OutputEventKind::Image {
+                id: id.clone(),
+                data: data.clone(),
+                mime_type: mime_type.clone(),
+                is_new,
+            },
+        );
+        self.archive.append_event(
             offset,
             OutputEventKind::Image {
                 id,
@@ -104,6 +116,136 @@ impl OutputTimeline {
                 is_new,
             },
         );
+    }
+
+    pub(crate) fn reset_archive(&self) {
+        self.archive.reset();
+    }
+
+    pub(crate) fn consume_archive_to(&self, offset: u64) {
+        self.archive.consume_to(offset);
+    }
+
+    pub(crate) fn read_archive_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
+        self.archive.read_range(start_offset, end_offset)
+    }
+
+    pub(crate) fn archive_saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
+        self.archive.saw_stderr_in_range(start_offset, end_offset)
+    }
+}
+
+pub(crate) struct OutputArchive {
+    inner: Mutex<OutputArchiveInner>,
+}
+
+struct OutputArchiveInner {
+    chunks: VecDeque<OutputChunk>,
+    line_ends: VecDeque<u64>,
+    events: VecDeque<OutputEvent>,
+    start_offset: u64,
+    end_offset: u64,
+}
+
+impl OutputArchive {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(OutputArchiveInner {
+                chunks: VecDeque::new(),
+                line_ends: VecDeque::new(),
+                events: VecDeque::new(),
+                start_offset: 0,
+                end_offset: 0,
+            }),
+        }
+    }
+
+    pub(crate) fn append_bytes(&self, bytes: &[u8], is_stderr: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        let newline_indices: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx))
+            .collect();
+        let bytes: Arc<[u8]> = bytes.to_vec().into();
+        let bytes_len = bytes.len();
+
+        let mut guard = self.inner.lock().unwrap();
+        let start_offset = guard.end_offset;
+        guard.end_offset = guard
+            .end_offset
+            .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
+        for idx in newline_indices {
+            let offset = start_offset.saturating_add((idx + 1) as u64);
+            guard.line_ends.push_back(offset);
+        }
+        guard.chunks.push_back(OutputChunk {
+            start_offset,
+            bytes,
+            range: 0..bytes_len,
+            is_stderr,
+        });
+    }
+
+    pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
+        let mut guard = self.inner.lock().unwrap();
+        let event_offset = offset.max(guard.start_offset);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
+        build_output_range(self.collect_range(start_offset, Some(end_offset)))
+    }
+
+    pub(crate) fn saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
+        let guard = self.inner.lock().unwrap();
+        saw_stderr_in_range_chunks(&guard.chunks, guard.end_offset, start_offset, end_offset)
+    }
+
+    pub(crate) fn consume_to(&self, offset: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        let OutputArchiveInner {
+            chunks,
+            line_ends,
+            events,
+            start_offset,
+            end_offset,
+        } = &mut *guard;
+        let current_end_offset = *end_offset;
+        trim_chunks_and_events(
+            chunks,
+            line_ends,
+            events,
+            start_offset,
+            current_end_offset,
+            offset,
+        );
+    }
+
+    pub(crate) fn reset(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.chunks.clear();
+        guard.line_ends.clear();
+        guard.events.clear();
+        guard.start_offset = 0;
+        guard.end_offset = 0;
+    }
+
+    fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
+        let guard = self.inner.lock().unwrap();
+        collect_range_from_chunks(
+            &guard.chunks,
+            &guard.events,
+            guard.start_offset,
+            guard.end_offset,
+            start_offset,
+            end_offset,
+        )
     }
 }
 
@@ -281,6 +423,187 @@ struct CollectedRange {
     end_offset: u64,
 }
 
+fn build_output_range(collected: CollectedRange) -> OutputRange {
+    let bytes = assemble_bytes(&collected.slices);
+    let mut text_spans: Vec<OutputTextSpan> = Vec::new();
+    let mut cursor = 0usize;
+    for slice in &collected.slices {
+        let slice_len = slice.range.len();
+        if slice_len == 0 {
+            continue;
+        }
+        let start_byte = cursor;
+        let end_byte = start_byte.saturating_add(slice_len);
+        if let Some(last) = text_spans.last_mut()
+            && last.is_stderr == slice.is_stderr
+            && last.end_byte == start_byte
+        {
+            last.end_byte = end_byte;
+        } else {
+            text_spans.push(OutputTextSpan {
+                start_byte,
+                end_byte,
+                is_stderr: slice.is_stderr,
+            });
+        }
+        cursor = end_byte;
+    }
+    OutputRange {
+        start_offset: collected.start_offset,
+        end_offset: collected.end_offset,
+        bytes,
+        events: collected.events,
+        text_spans,
+    }
+}
+
+fn saw_stderr_in_range_chunks(
+    chunks: &VecDeque<OutputChunk>,
+    total_end_offset: u64,
+    start_offset: u64,
+    end_offset: u64,
+) -> bool {
+    let end_offset = end_offset.min(total_end_offset);
+    if start_offset >= end_offset {
+        return false;
+    }
+
+    for chunk in chunks.iter() {
+        if chunk.start_offset >= end_offset {
+            break;
+        }
+        let chunk_len: u64 = chunk.range.len().try_into().unwrap_or(u64::MAX);
+        let chunk_end = chunk.start_offset.saturating_add(chunk_len);
+        if chunk_end <= start_offset {
+            continue;
+        }
+        if chunk.is_stderr {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_range_from_chunks(
+    chunks: &VecDeque<OutputChunk>,
+    events_deque: &VecDeque<OutputEvent>,
+    start_offset_base: u64,
+    end_offset_base: u64,
+    start_offset: u64,
+    end_offset: Option<u64>,
+) -> CollectedRange {
+    let end_offset = end_offset.unwrap_or(end_offset_base).min(end_offset_base);
+    let effective_start = start_offset.max(start_offset_base);
+
+    let mut slices = Vec::new();
+    if effective_start < end_offset {
+        for chunk in chunks.iter() {
+            if chunk.start_offset >= end_offset {
+                break;
+            }
+            let chunk_len: u64 = chunk.range.len().try_into().unwrap_or(u64::MAX);
+            let chunk_end = chunk.start_offset.saturating_add(chunk_len);
+            if chunk_end <= effective_start {
+                continue;
+            }
+
+            let slice_start_offset = effective_start.saturating_sub(chunk.start_offset) as usize;
+            let slice_end_offset =
+                end_offset.saturating_sub(chunk.start_offset).min(chunk_len) as usize;
+
+            if slice_start_offset >= slice_end_offset {
+                continue;
+            }
+
+            let chunk_start = chunk.range.start;
+            let slice_start = chunk_start.saturating_add(slice_start_offset);
+            let slice_end = chunk_start.saturating_add(slice_end_offset);
+            if slice_start >= slice_end || slice_end > chunk.range.end {
+                continue;
+            }
+
+            slices.push(OutputSlice {
+                bytes: chunk.bytes.clone(),
+                range: slice_start..slice_end,
+                is_stderr: chunk.is_stderr,
+            });
+        }
+    }
+
+    let mut events = Vec::new();
+    if effective_start <= end_offset {
+        for event in events_deque.iter() {
+            if event.offset < effective_start {
+                continue;
+            }
+            if event.offset > end_offset {
+                break;
+            }
+            events.push(event.clone());
+        }
+    }
+
+    CollectedRange {
+        slices,
+        events,
+        start_offset: effective_start,
+        end_offset,
+    }
+}
+
+fn trim_chunks_and_events(
+    chunks: &mut VecDeque<OutputChunk>,
+    line_ends: &mut VecDeque<u64>,
+    events: &mut VecDeque<OutputEvent>,
+    start_offset: &mut u64,
+    end_offset: u64,
+    offset: u64,
+) {
+    let offset = offset.min(end_offset);
+    if offset <= *start_offset {
+        return;
+    }
+
+    while let Some(front) = chunks.front_mut() {
+        let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
+        let front_end = front.start_offset.saturating_add(front_len);
+
+        if front_end <= offset {
+            chunks.pop_front();
+            *start_offset = front_end;
+        } else if front.start_offset < offset {
+            let delta_u64 = offset.saturating_sub(front.start_offset);
+            let delta: usize = (delta_u64 as usize).min(front.range.len());
+            front.start_offset = front.start_offset.saturating_add(delta as u64);
+            front.range.start = front.range.start.saturating_add(delta);
+            *start_offset = offset;
+        } else {
+            *start_offset = offset;
+        }
+
+        while matches!(line_ends.front(), Some(line_end) if *line_end <= *start_offset) {
+            let _ = line_ends.pop_front();
+        }
+        while matches!(events.front(), Some(event) if event.offset <= *start_offset) {
+            let _ = events.pop_front();
+        }
+
+        if *start_offset >= offset {
+            break;
+        }
+    }
+
+    if chunks.is_empty() {
+        *start_offset = offset;
+        while matches!(line_ends.front(), Some(line_end) if *line_end <= *start_offset) {
+            let _ = line_ends.pop_front();
+        }
+        while matches!(events.front(), Some(event) if event.offset <= *start_offset) {
+            let _ = events.pop_front();
+        }
+    }
+}
+
 impl OutputRing {
     fn new(capacity_bytes: usize) -> Self {
         Self {
@@ -384,62 +707,17 @@ impl OutputRing {
     }
 
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
-        let collected = self.collect_range(start_offset, Some(end_offset));
-        let bytes = assemble_bytes(&collected.slices);
-        let mut text_spans: Vec<OutputTextSpan> = Vec::new();
-        let mut cursor = 0usize;
-        for slice in &collected.slices {
-            let slice_len = slice.range.len();
-            if slice_len == 0 {
-                continue;
-            }
-            let start_byte = cursor;
-            let end_byte = start_byte.saturating_add(slice_len);
-            if let Some(last) = text_spans.last_mut()
-                && last.is_stderr == slice.is_stderr
-                && last.end_byte == start_byte
-            {
-                last.end_byte = end_byte;
-            } else {
-                text_spans.push(OutputTextSpan {
-                    start_byte,
-                    end_byte,
-                    is_stderr: slice.is_stderr,
-                });
-            }
-            cursor = end_byte;
-        }
-        OutputRange {
-            start_offset: collected.start_offset,
-            end_offset: collected.end_offset,
-            bytes,
-            events: collected.events,
-            text_spans,
-        }
+        build_output_range(self.collect_range(start_offset, Some(end_offset)))
     }
 
     pub(crate) fn saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
         let guard = self.inner.lock().unwrap();
-        let end_offset = end_offset.min(guard.end_offset);
-        if start_offset >= end_offset {
-            return false;
-        }
-
-        let effective_start = start_offset.max(guard.start_offset);
-        for chunk in guard.chunks.iter() {
-            if chunk.start_offset >= end_offset {
-                break;
-            }
-            let chunk_len: u64 = chunk.range.len().try_into().unwrap_or(u64::MAX);
-            let chunk_end = chunk.start_offset.saturating_add(chunk_len);
-            if chunk_end <= effective_start {
-                continue;
-            }
-            if chunk.is_stderr {
-                return true;
-            }
-        }
-        false
+        saw_stderr_in_range_chunks(
+            &guard.chunks,
+            guard.end_offset,
+            start_offset.max(guard.start_offset),
+            end_offset,
+        )
     }
 
     fn has_events_at_or_after(&self, offset: u64) -> bool {
@@ -469,65 +747,14 @@ impl OutputRing {
 
     fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
         let guard = self.inner.lock().unwrap();
-        let end_offset = end_offset.unwrap_or(guard.end_offset).min(guard.end_offset);
-
-        let effective_start = start_offset.max(guard.start_offset);
-
-        let mut slices = Vec::new();
-        if effective_start < end_offset {
-            for chunk in guard.chunks.iter() {
-                if chunk.start_offset >= end_offset {
-                    break;
-                }
-                let chunk_len: u64 = chunk.range.len().try_into().unwrap_or(u64::MAX);
-                let chunk_end = chunk.start_offset.saturating_add(chunk_len);
-                if chunk_end <= effective_start {
-                    continue;
-                }
-
-                let slice_start_offset =
-                    effective_start.saturating_sub(chunk.start_offset) as usize;
-                let slice_end_offset =
-                    end_offset.saturating_sub(chunk.start_offset).min(chunk_len) as usize;
-
-                if slice_start_offset >= slice_end_offset {
-                    continue;
-                }
-
-                let chunk_start = chunk.range.start;
-                let slice_start = chunk_start.saturating_add(slice_start_offset);
-                let slice_end = chunk_start.saturating_add(slice_end_offset);
-                if slice_start >= slice_end || slice_end > chunk.range.end {
-                    continue;
-                }
-
-                slices.push(OutputSlice {
-                    bytes: chunk.bytes.clone(),
-                    range: slice_start..slice_end,
-                    is_stderr: chunk.is_stderr,
-                });
-            }
-        }
-
-        let mut events = Vec::new();
-        if effective_start <= end_offset {
-            for event in guard.events.iter() {
-                if event.offset < effective_start {
-                    continue;
-                }
-                if event.offset > end_offset {
-                    break;
-                }
-                events.push(event.clone());
-            }
-        }
-
-        CollectedRange {
-            slices,
-            events,
-            start_offset: effective_start,
+        collect_range_from_chunks(
+            &guard.chunks,
+            &guard.events,
+            guard.start_offset,
+            guard.end_offset,
+            start_offset,
             end_offset,
-        }
+        )
     }
 
     fn append_truncation_notice(&self, offset: u64, extra_bytes: usize) {

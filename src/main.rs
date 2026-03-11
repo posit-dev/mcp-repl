@@ -13,6 +13,7 @@ mod r_controls;
 mod r_graphics;
 mod r_htmd;
 mod r_session;
+mod reply_overflow;
 mod sandbox;
 mod sandbox_cli;
 mod server;
@@ -25,9 +26,8 @@ mod worker_protocol;
 use std::path::PathBuf;
 
 use crate::backend::{Backend, backend_from_env};
-use crate::sandbox_cli::{
-    SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
-};
+use crate::reply_overflow::{AppConfigOperation, ReplyOverflowSettings, parse_app_config_override};
+use crate::sandbox_cli::{SandboxCliOperation, SandboxCliPlan, SandboxModeArg};
 
 enum CliCommand {
     RunServer(CliOptions),
@@ -37,6 +37,7 @@ enum CliCommand {
 #[derive(Debug, Clone)]
 struct CliOptions {
     sandbox_plan: SandboxCliPlan,
+    reply_overflow: ReplyOverflowSettings,
     debug_repl: bool,
     backend: Backend,
     debug_events_dir: Option<PathBuf>,
@@ -90,10 +91,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             if options.debug_repl {
                 crate::diagnostics::startup_log("main: debug repl mode");
-                return debug_repl::run(options.backend, options.sandbox_plan);
+                return debug_repl::run(
+                    options.backend,
+                    options.sandbox_plan,
+                    options.reply_overflow,
+                );
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend, options.sandbox_plan).await
+            server::run(
+                options.backend,
+                options.sandbox_plan,
+                options.reply_overflow,
+            )
+            .await
         }
         CliCommand::Install(options) => install::run(options),
     }
@@ -117,6 +127,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
+    let mut reply_overflow = ReplyOverflowSettings::default();
     let mut debug_repl = false;
     let mut debug_events_dir = None;
     let mut backend = backend_from_env()?;
@@ -193,23 +204,14 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
             }
             "--config" => {
                 let value = parser.next_value("--config")?;
-                let parsed =
-                    parse_sandbox_config_override(&value).map_err(|err| err.to_string())?;
-                sandbox_args
-                    .plan
-                    .operations
-                    .push(SandboxCliOperation::Config(parsed));
+                apply_config_override(&value, &mut sandbox_args.plan, &mut reply_overflow)?;
             }
             _ if arg.starts_with("--config=") => {
                 let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
                 if value.trim().is_empty() {
                     return Err("missing value for --config".into());
                 }
-                let parsed = parse_sandbox_config_override(value).map_err(|err| err.to_string())?;
-                sandbox_args
-                    .plan
-                    .operations
-                    .push(SandboxCliOperation::Config(parsed));
+                apply_config_override(value, &mut sandbox_args.plan, &mut reply_overflow)?;
             }
             "--debug-repl" => {
                 debug_repl = true;
@@ -237,10 +239,31 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
 
     Ok(CliCommand::RunServer(CliOptions {
         sandbox_plan: sandbox_args.plan,
+        reply_overflow,
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
         debug_events_dir,
     }))
+}
+
+fn apply_config_override(
+    raw: &str,
+    sandbox_plan: &mut SandboxCliPlan,
+    reply_overflow: &mut ReplyOverflowSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match parse_app_config_override(raw).map_err(|err| err.to_string())? {
+        AppConfigOperation::Sandbox(parsed) => {
+            sandbox_plan
+                .operations
+                .push(SandboxCliOperation::Config(parsed));
+        }
+        AppConfigOperation::ReplyOverflow(parsed) => {
+            reply_overflow
+                .apply(&parsed)
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_backend_arg(
@@ -464,7 +487,7 @@ mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
---config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
+--config: apply advanced ordered config override (sandbox/network or reply_overflow.*)\n\
 install: update MCP config for codex (~/.codex/config.toml) and claude (~/.claude.json)\n\
 install defaults to the full interpreter grid for each selected client (currently r + python)"
     );
@@ -486,7 +509,9 @@ If no --interpreter is specified, install uses the full interpreter grid for eac
 mod tests {
     use super::*;
     use crate::sandbox::{SandboxPolicy, SandboxState};
-    use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
+    use crate::sandbox_cli::{
+        SandboxConfigOperation, parse_sandbox_config_override, resolve_effective_sandbox_state,
+    };
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {

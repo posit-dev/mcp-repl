@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat(\"TMPDIR_SET=\", nzchar(Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTMPDIR_SET=TRUE\n> cat(\"TMPDIR_MATCH=\", Sys.getenv(\"TMPDIR\") == Sys.getenv(\"MCP_CONSOLE_R_SESSION_TMPDIR\"), \"\\n\", sep = \"\")\nTMPDIR_MATCH=TRUE"
+      "text": "[repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat(\"TMPDIR_SET=\", nzchar(Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTMPDIR_SET=TRUE\n> cat(\"TMPDIR_MATCH=\", Sys.getenv(\"TMPDIR\") == Sys.getenv(\"MCP_CONSOLE_R_SESSION_TMPDIR\"), \"\\n\", sep = \"\")\nTMPDIR_MATCH=TRUE\n> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE\n[repl] echoed input elided: 7 lines (225 bytes); head: > marker <- file.path(tempdir(), \"mcp-console-snapshot.txt\"); tail: + })\nTEMPDIR_MARKER_OK\n[repl] echoed input elided: 7 lines (167 bytes); head: > tf <- tempfile(); tail: + })\nTEMPFILE_OK\n[repl] echoed input elided: 2 lines (98 bytes); head: > unlink(tf); tail: > cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=mcp-console-snapshot.txt\n[repl] echoed input elided: 7 lines (246 bytes); head: > root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-console-snapshot-root.txt\"); tail: + })\nROOT_MARKER_OK\n> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=TRUE"
     },
     {
       "type": "text",
-      "text": "--More-- (3p, 24.9%, @0..272/1090)"
+      "text": "> "
     }
   ]
 }
@@ -62,7 +62,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=\n> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE"
     },
     {
       "type": "text",
@@ -105,7 +105,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=\n> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE"
     },
     {
       "type": "text",

@@ -1572,7 +1572,7 @@ pub(crate) fn maybe_activate_and_append_footer(
     contents.push(WorkerContent::stderr(pager.footer(pages_left)));
 }
 
-fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
     if range.bytes.is_empty() && range.events.is_empty() {
         return Vec::new();
     }
@@ -2133,11 +2133,11 @@ fn take_line_range(
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
-        ensure_output_ring, reset_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputArchive, OutputBuffer, OutputEvent, OutputTextSpan,
+        OutputTimeline, ensure_output_ring, reset_output_ring,
     };
     use crate::worker_protocol::TextStream;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     struct OutputPagerFixture {
         _guard: MutexGuard<'static, ()>,
@@ -2197,7 +2197,7 @@ mod tests {
         let guard = output_ring_test_guard();
         reset_output_ring();
         let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        let timeline = OutputTimeline::new(ring);
+        let timeline = OutputTimeline::new(ring, Arc::new(OutputArchive::new()));
         let output = OutputBuffer::default();
         output.start_capture();
         timeline.append_text(text.as_bytes(), false);
@@ -3454,7 +3454,7 @@ mod tests {
         let guard = output_ring_test_guard();
         reset_output_ring();
         let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        let timeline = OutputTimeline::new(ring);
+        let timeline = OutputTimeline::new(ring, Arc::new(OutputArchive::new()));
         let output = OutputBuffer::default();
         output.start_capture();
         timeline.append_text(b"warning foo details\n", true);

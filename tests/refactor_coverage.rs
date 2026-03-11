@@ -93,8 +93,9 @@ cat("\nEND\n")
 "#;
 
     snapshot
-        .session(
+        .session_with_pager_page_chars(
             "truncation_tail",
+            300,
             mcp_script! {
                 write_stdin(big_output, timeout = 20.0);
                 write_stdin(":tail 8k", timeout = 10.0);
@@ -123,8 +124,9 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
 "##;
 
     snapshot
-        .session(
+        .session_with_pager_page_chars(
             "pager_hits_images",
+            300,
             mcp_script! {
                 write_stdin(output, timeout = 10.0);
                 write_stdin(":hits alpha", timeout = 10.0);

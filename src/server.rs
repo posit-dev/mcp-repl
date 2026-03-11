@@ -24,6 +24,7 @@ use self::timeouts::{
 };
 
 use crate::backend::Backend;
+use crate::reply_overflow::ReplyOverflowSettings;
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -42,9 +43,17 @@ struct SharedServer {
 }
 
 impl SharedServer {
-    fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    fn new(
+        backend: Backend,
+        sandbox_plan: SandboxCliPlan,
+        reply_overflow: ReplyOverflowSettings,
+    ) -> Result<Self, WorkerError> {
         Ok(Self {
-            worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            worker: Arc::new(Mutex::new(WorkerManager::new(
+                backend,
+                sandbox_plan,
+                reply_overflow,
+            )?)),
         })
     }
 
@@ -300,9 +309,13 @@ macro_rules! define_backend_tool_server {
 
         #[tool_router]
         impl $server_ty {
-            fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+            fn new(
+                backend: Backend,
+                sandbox_plan: SandboxCliPlan,
+                reply_overflow: ReplyOverflowSettings,
+            ) -> Result<Self, WorkerError> {
                 Ok(Self {
-                    shared: SharedServer::new(backend, sandbox_plan)?,
+                    shared: SharedServer::new(backend, sandbox_plan, reply_overflow)?,
                     tool_router: Self::tool_router(),
                 })
             }
@@ -475,6 +488,7 @@ where
 pub async fn run(
     backend: Backend,
     sandbox_plan: SandboxCliPlan,
+    reply_overflow: ReplyOverflowSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
     crate::event_log::log(
@@ -485,11 +499,11 @@ pub async fn run(
     );
     match backend {
         Backend::R => {
-            let service = RToolServer::new(backend, sandbox_plan)?;
+            let service = RToolServer::new(backend, sandbox_plan, reply_overflow.clone())?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
         Backend::Python => {
-            let service = PythonToolServer::new(backend, sandbox_plan)?;
+            let service = PythonToolServer::new(backend, sandbox_plan, reply_overflow)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
     }

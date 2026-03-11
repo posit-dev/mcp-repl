@@ -514,6 +514,27 @@ impl McpSnapshot {
         Ok(())
     }
 
+    pub async fn session_with_pager_page_chars<F>(
+        &mut self,
+        name: impl Into<String>,
+        page_bytes: u64,
+        f: F,
+    ) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_server_with_pager_page_chars(page_bytes).await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
     pub fn render(&self) -> String {
         self.render_json()
     }
@@ -901,7 +922,7 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
 }
 
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_pager_page_chars(TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(Vec::new(), Vec::new()).await
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
@@ -911,12 +932,11 @@ pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<M
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), env_vars, TEST_PAGER_PAGE_CHARS)
-        .await
+    spawn_server_with_args_env(Vec::new(), env_vars).await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(args, Vec::new(), TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(args, Vec::new()).await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
@@ -963,10 +983,29 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    let mut args = args;
+    args.push("--config".to_string());
+    args.push("reply_overflow.behavior=pager".to_string());
+    spawn_server_with_args_env_and_page_chars(args, env_vars, page_bytes).await
+}
+
+async fn spawn_server_with_args_env_and_page_chars(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    page_bytes: u64,
+) -> TestResult<McpTestSession> {
+    let mut env_vars = env_vars;
+    env_vars.push((PAGER_PAGE_CHARS_ENV.to_string(), page_bytes.to_string()));
+    spawn_server_with_args_env(args, env_vars).await
+}
+
+pub async fn spawn_server_with_args_env(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
-    let env_vars = env_vars.clone();
     let backend = parse_backend_from_args(&args);
-    let mut args = args.clone();
+    let mut args = args;
     if !sandbox_exec_available()
         && !args
             .iter()
@@ -981,7 +1020,6 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_CONSOLE_UPDATE_PLOT_IMAGES");
-        cmd.env(PAGER_PAGE_CHARS_ENV, page_bytes.to_string());
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);

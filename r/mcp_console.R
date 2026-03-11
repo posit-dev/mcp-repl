@@ -11,6 +11,186 @@ if (nzchar(Sys.getenv("CODEX_SANDBOX_NETWORK_DISABLED"))) {
   Sys.setenv(UV_OFFLINE = "1")
 }
 
+.mcp_console_env_integer <- function(name, default) {
+  raw <- Sys.getenv(name, "")
+  if (!nzchar(raw)) {
+    return(as.integer(default))
+  }
+  value <- suppressWarnings(as.integer(raw))
+  if (is.na(value) || value < 0L) {
+    return(as.integer(default))
+  }
+  value
+}
+
+.mcp_console_reply_overflow_option_names <- c(
+  "mcp.reply_overflow.behavior",
+  "mcp.reply_overflow.text.preview_bytes",
+  "mcp.reply_overflow.text.spill_bytes",
+  "mcp.reply_overflow.images.preview_count",
+  "mcp.reply_overflow.images.spill_count",
+  "mcp.reply_overflow.retention.max_dirs"
+)
+
+.mcp_console_get_reply_overflow_settings <- function() {
+  list(
+    "mcp.reply_overflow.behavior" = getOption(
+      "mcp.reply_overflow.behavior",
+      "files"
+    ),
+    "mcp.reply_overflow.text.preview_bytes" = getOption(
+      "mcp.reply_overflow.text.preview_bytes",
+      3500L
+    ),
+    "mcp.reply_overflow.text.spill_bytes" = getOption(
+      "mcp.reply_overflow.text.spill_bytes",
+      3500L
+    ),
+    "mcp.reply_overflow.images.preview_count" = getOption(
+      "mcp.reply_overflow.images.preview_count",
+      2L
+    ),
+    "mcp.reply_overflow.images.spill_count" = getOption(
+      "mcp.reply_overflow.images.spill_count",
+      2L
+    ),
+    "mcp.reply_overflow.retention.max_dirs" = getOption(
+      "mcp.reply_overflow.retention.max_dirs",
+      30L
+    )
+  )
+}
+
+.mcp_console_validate_reply_overflow_settings <- function(settings) {
+  behavior <- as.character(settings[["mcp.reply_overflow.behavior"]])[[1L]]
+  if (!identical(behavior, "files") && !identical(behavior, "pager")) {
+    stop("mcp.reply_overflow.behavior must be 'files' or 'pager'")
+  }
+
+  validate_count <- function(name) {
+    value <- settings[[name]]
+    if (
+      length(value) != 1L || !is.numeric(value) || is.na(value) ||
+        !is.finite(value) || value < 0 || value != floor(value)
+    ) {
+      stop(sprintf("%s must be a non-negative integer", name))
+    }
+    as.integer(value)
+  }
+
+  text_preview <- validate_count("mcp.reply_overflow.text.preview_bytes")
+  text_spill <- validate_count("mcp.reply_overflow.text.spill_bytes")
+  image_preview <- validate_count("mcp.reply_overflow.images.preview_count")
+  image_spill <- validate_count("mcp.reply_overflow.images.spill_count")
+  max_dirs <- validate_count("mcp.reply_overflow.retention.max_dirs")
+
+  if (text_preview > text_spill) {
+    stop("mcp.reply_overflow.text.preview_bytes must be <= spill_bytes")
+  }
+  if (image_preview > image_spill) {
+    stop("mcp.reply_overflow.images.preview_count must be <= spill_count")
+  }
+  if (max_dirs < 1L) {
+    stop("mcp.reply_overflow.retention.max_dirs must be >= 1")
+  }
+
+  invisible(TRUE)
+}
+
+.mcp_console_collect_reply_overflow_args <- function(args) {
+  named <- list()
+  arg_names <- names(args)
+  first_is_unnamed <- is.null(arg_names) ||
+    length(arg_names) < 1L ||
+    !is.character(arg_names[[1L]]) ||
+    !nzchar(arg_names[[1L]])
+  if (length(args) >= 1L && is.list(args[[1L]]) && first_is_unnamed) {
+    first <- args[[1L]]
+    if (!is.null(names(first))) {
+      named[names(first)] <- first
+    }
+  }
+
+  if (length(arg_names)) {
+    for (i in seq_along(args)) {
+      name <- arg_names[[i]]
+      if (is.character(name) && nzchar(name)) {
+        named[[name]] <- args[[i]]
+      }
+    }
+  }
+
+  monitored <- named[intersect(names(named), .mcp_console_reply_overflow_option_names)]
+  if (length(monitored) == 0L) {
+    return(NULL)
+  }
+  monitored
+}
+
+.mcp_console_emit_reply_overflow_settings_from_options <- function() {
+  settings <- .mcp_console_get_reply_overflow_settings()
+  .Call(
+    "mcp_console_reply_overflow_update",
+    settings[["mcp.reply_overflow.behavior"]],
+    settings[["mcp.reply_overflow.text.preview_bytes"]],
+    settings[["mcp.reply_overflow.text.spill_bytes"]],
+    settings[["mcp.reply_overflow.images.preview_count"]],
+    settings[["mcp.reply_overflow.images.spill_count"]],
+    settings[["mcp.reply_overflow.retention.max_dirs"]]
+  )
+  invisible(NULL)
+}
+
+base::options(
+  mcp.reply_overflow.behavior = Sys.getenv(
+    "MCP_CONSOLE_REPLY_OVERFLOW_BEHAVIOR",
+    "files"
+  ),
+  mcp.reply_overflow.text.preview_bytes = .mcp_console_env_integer(
+    "MCP_CONSOLE_REPLY_OVERFLOW_TEXT_PREVIEW_BYTES",
+    3500L
+  ),
+  mcp.reply_overflow.text.spill_bytes = .mcp_console_env_integer(
+    "MCP_CONSOLE_REPLY_OVERFLOW_TEXT_SPILL_BYTES",
+    3500L
+  ),
+  mcp.reply_overflow.images.preview_count = .mcp_console_env_integer(
+    "MCP_CONSOLE_REPLY_OVERFLOW_IMAGES_PREVIEW_COUNT",
+    2L
+  ),
+  mcp.reply_overflow.images.spill_count = .mcp_console_env_integer(
+    "MCP_CONSOLE_REPLY_OVERFLOW_IMAGES_SPILL_COUNT",
+    2L
+  ),
+  mcp.reply_overflow.retention.max_dirs = .mcp_console_env_integer(
+    "MCP_CONSOLE_REPLY_OVERFLOW_RETENTION_MAX_DIRS",
+    30L
+  )
+)
+.mcp_console_validate_reply_overflow_settings(
+  .mcp_console_get_reply_overflow_settings()
+)
+
+options <- local({
+  .mcp_console_base_options <- base::options
+
+  function(...) {
+    args <- list(...)
+    monitored <- .mcp_console_collect_reply_overflow_args(args)
+    if (is.null(monitored)) {
+      return(.mcp_console_base_options(...))
+    }
+
+    next_settings <- .mcp_console_get_reply_overflow_settings()
+    next_settings[names(monitored)] <- monitored
+    .mcp_console_validate_reply_overflow_settings(next_settings)
+
+    result <- .mcp_console_base_options(...)
+    .mcp_console_emit_reply_overflow_settings_from_options()
+    result
+  }
+})
+
 .mcp_console_is_print_env_mode <- function() {
   args <- commandArgs(trailingOnly = TRUE)
   length(args) >= 1L && identical(args[[1L]], "--mcp-console-print-env")

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_family = "unix")]
@@ -26,10 +27,12 @@ use crate::ipc::{
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTextSpan,
-    OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputArchive, OutputBuffer, OutputEventKind, OutputRange,
+    OutputTextSpan, OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset,
+    reset_output_ring,
 };
 use crate::pager::{self, Pager};
+use crate::reply_overflow::{ReplyOverflowBehavior, ReplyOverflowSettings};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
 };
@@ -41,6 +44,7 @@ use crate::sandbox_cli::{
 use crate::worker_protocol::{
     TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
+use base64::Engine as _;
 
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -67,6 +71,9 @@ const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+const REPLY_OVERFLOW_IPC_SETTLE_WAIT: Duration = Duration::from_millis(10);
+static REPLY_FILES_ROOT_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -474,6 +481,11 @@ pub struct WorkerManager {
     sandbox_state: SandboxState,
     output: OutputBuffer,
     pager: Pager,
+    reply_overflow_defaults: ReplyOverflowSettings,
+    reply_overflow: ReplyOverflowSettings,
+    reply_files_root: PathBuf,
+    reply_file_sequence: u64,
+    reply_file_dirs: VecDeque<PathBuf>,
     output_timeline: OutputTimeline,
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
@@ -490,7 +502,11 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    pub fn new(
+        backend: Backend,
+        sandbox_plan: SandboxCliPlan,
+        reply_overflow_defaults: ReplyOverflowSettings,
+    ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let mut inherited_state = sandbox_defaults.clone();
@@ -525,9 +541,11 @@ impl WorkerManager {
             worker_context_event_payload(backend, &sandbox_state, None)
         });
         let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let output_archive = Arc::new(OutputArchive::new());
         reset_output_ring();
         reset_last_reply_marker_offset();
-        let output_timeline = OutputTimeline::new(output_ring);
+        let output_timeline = OutputTimeline::new(output_ring, output_archive);
+        let reply_files_root = build_reply_files_root()?;
         Ok(Self {
             exe_path,
             backend,
@@ -539,6 +557,11 @@ impl WorkerManager {
             sandbox_state,
             output: OutputBuffer::default(),
             pager: Pager::default(),
+            reply_overflow: reply_overflow_defaults.clone(),
+            reply_overflow_defaults,
+            reply_files_root,
+            reply_file_sequence: 0,
+            reply_file_dirs: VecDeque::new(),
             output_timeline,
             driver: match backend {
                 Backend::R => Box::new(RBackendDriver::new()),
@@ -573,6 +596,14 @@ impl WorkerManager {
         page_bytes_override: Option<u64>,
         echo_input: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
+        if matches!(self.reply_overflow.behavior, ReplyOverflowBehavior::Files)
+            && self.pager.is_active()
+        {
+            self.pager.dismiss();
+            self.pager_prompt = None;
+        }
+
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
             let control_reply = match control {
@@ -777,8 +808,7 @@ impl WorkerManager {
         }
 
         let (saw_stderr, snapshot) = if completed_request {
-            let completed = snapshot_after_completion(
-                &self.output,
+            let completed = self.snapshot_after_completion_for_reply(
                 start_offset,
                 end_offset,
                 page_bytes,
@@ -786,10 +816,8 @@ impl WorkerManager {
             );
             (completed.saw_stderr, completed.snapshot)
         } else {
-            let saw_stderr = self
-                .output
-                .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-            let snapshot = snapshot_page_with_images(&self.output, end_offset, page_bytes);
+            let saw_stderr = self.saw_stderr_for_reply_range(start_offset, end_offset);
+            let snapshot = self.snapshot_page_for_reply(end_offset, page_bytes);
             (saw_stderr, snapshot)
         };
         let is_error = saw_stderr;
@@ -940,7 +968,7 @@ impl WorkerManager {
             pages_left,
             buffer,
             last_range,
-        } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
+        } = self.snapshot_page_for_reply(end_offset, first_page_budget);
         contents.append(&mut page_contents);
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
@@ -987,8 +1015,7 @@ impl WorkerManager {
                 if let Some(echo) = context.input_echo {
                     contents.push(WorkerContent::stdout(echo));
                 }
-                let completion_snapshot = snapshot_after_completion(
-                    &self.output,
+                let completion_snapshot = self.snapshot_after_completion_for_reply(
                     context.start_offset,
                     end_offset,
                     first_page_budget,
@@ -1071,14 +1098,12 @@ impl WorkerManager {
                     pages_left,
                     buffer,
                     last_range,
-                } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
+                } = self.snapshot_page_for_reply(end_offset, first_page_budget);
                 contents.append(&mut page_contents);
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
-                let saw_stderr = self
-                    .output
-                    .saw_stderr_in_range(context.start_offset.min(end_offset), end_offset);
+                let saw_stderr = self.saw_stderr_for_reply_range(context.start_offset, end_offset);
                 let is_error = context.prefix_is_error || saw_stderr;
 
                 pager::maybe_activate_and_append_footer(
@@ -1242,6 +1267,7 @@ impl WorkerManager {
 
     fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
         crate::output_capture::set_last_reply_marker_offset(reply.end_offset);
+        self.output_timeline.consume_archive_to(reply.end_offset);
         reply.reply
     }
 
@@ -1344,9 +1370,7 @@ impl WorkerManager {
             end_offset = start_offset;
         }
 
-        let is_error = self
-            .output
-            .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+        let is_error = self.saw_stderr_for_reply_range(start_offset, end_offset);
         let page_is_error = is_error;
 
         let SnapshotWithImages {
@@ -1354,7 +1378,7 @@ impl WorkerManager {
             pages_left,
             buffer,
             last_range,
-        } = snapshot_page_with_images(&self.output, end_offset, page_bytes);
+        } = self.snapshot_page_for_reply(end_offset, page_bytes);
 
         if timed_out {
             contents.push(timeout_status_content(timeout));
@@ -1424,6 +1448,8 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        self.clear_reply_files();
+        self.reset_reply_overflow_defaults();
 
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply(page_bytes, "new session started");
@@ -1438,6 +1464,8 @@ impl WorkerManager {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        self.clear_reply_files();
+        let _ = std::fs::remove_dir_all(&self.reply_files_root);
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
@@ -1556,6 +1584,7 @@ impl WorkerManager {
     fn reset_output_state(&mut self, preserve_pager: bool) {
         reset_output_ring();
         reset_last_reply_marker_offset();
+        self.output_timeline.reset_archive();
         self.output = OutputBuffer::default();
         if !preserve_pager {
             self.pager = Pager::default();
@@ -1566,6 +1595,160 @@ impl WorkerManager {
         self.pager_prompt = None;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn refresh_reply_overflow_settings_from_ipc(&mut self, wait: Duration) {
+        let Some(ipc) = self.process.as_ref().and_then(|process| process.ipc.get()) else {
+            return;
+        };
+        let mut latest = None;
+        while let Some(settings) = ipc.take_reply_overflow_settings() {
+            latest = Some(settings);
+        }
+        if latest.is_none() && !wait.is_zero() {
+            latest = ipc.wait_for_reply_overflow_settings(wait);
+            while let Some(settings) = ipc.take_reply_overflow_settings() {
+                latest = Some(settings);
+            }
+        }
+        if let Some(settings) = latest
+            && settings.validate().is_ok()
+        {
+            self.reply_overflow = settings;
+            self.prune_reply_files();
+        }
+    }
+
+    fn reset_reply_overflow_defaults(&mut self) {
+        self.reply_overflow = self.reply_overflow_defaults.clone();
+        self.prune_reply_files();
+    }
+
+    fn clear_reply_files(&mut self) {
+        while let Some(path) = self.reply_file_dirs.pop_front() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        self.reply_file_sequence = 0;
+    }
+
+    fn prune_reply_files(&mut self) {
+        while self.reply_file_dirs.len() > self.reply_overflow.retention.max_dirs {
+            if let Some(path) = self.reply_file_dirs.pop_front() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    fn snapshot_page_for_reply(
+        &mut self,
+        end_offset: u64,
+        target_bytes: u64,
+    ) -> SnapshotWithImages {
+        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
+        match self.reply_overflow.behavior {
+            ReplyOverflowBehavior::Pager => {
+                snapshot_page_with_images(&self.output, end_offset, target_bytes)
+            }
+            ReplyOverflowBehavior::Files => {
+                let start_offset = self.output.current_offset().unwrap_or(end_offset);
+                let range = self
+                    .output_timeline
+                    .read_archive_range(start_offset, end_offset);
+                self.output.advance_offset_to(end_offset);
+                self.render_files_snapshot_from_range(range, None)
+            }
+        }
+    }
+
+    fn saw_stderr_for_reply_range(&mut self, start_offset: u64, end_offset: u64) -> bool {
+        self.refresh_reply_overflow_settings_from_ipc(Duration::from_millis(0));
+        match self.reply_overflow.behavior {
+            ReplyOverflowBehavior::Pager => self
+                .output
+                .saw_stderr_in_range(start_offset.min(end_offset), end_offset),
+            ReplyOverflowBehavior::Files => self
+                .output_timeline
+                .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset),
+        }
+    }
+
+    fn snapshot_after_completion_for_reply(
+        &mut self,
+        start_offset: u64,
+        end_offset: u64,
+        target_bytes: u64,
+        completion: &CompletionInfo,
+    ) -> CompletionSnapshot {
+        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
+        match self.reply_overflow.behavior {
+            ReplyOverflowBehavior::Pager => snapshot_after_completion(
+                &self.output,
+                start_offset,
+                end_offset,
+                target_bytes,
+                completion,
+            ),
+            ReplyOverflowBehavior::Files => {
+                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+                if !trim_enabled {
+                    let saw_stderr = self
+                        .output_timeline
+                        .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+                    let range = self
+                        .output_timeline
+                        .read_archive_range(start_offset, end_offset);
+                    self.output.advance_offset_to(end_offset);
+                    let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
+                    let (bytes, events, text_spans) = collapse_echo_with_attribution(
+                        range,
+                        &completion.echo_events,
+                        &prompt_variants,
+                    );
+                    let snapshot = self.render_files_snapshot_from_range(
+                        output_range_from_collapsed(bytes, events, text_spans),
+                        completion.prompt.as_deref(),
+                    );
+                    return CompletionSnapshot {
+                        snapshot,
+                        saw_stderr,
+                    };
+                }
+
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+                if let Some(echo) = echo_transcript.as_deref() {
+                    let _ = drop_echo_only_output(&self.output, start_offset, end_offset, echo);
+                }
+
+                let _ = trim_echo_prefix_in_output(
+                    &self.output,
+                    echo_transcript.as_deref(),
+                    trim_enabled,
+                );
+                let effective_start = self.output.current_offset().unwrap_or(start_offset);
+                let saw_stderr = self
+                    .output_timeline
+                    .archive_saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+                let range = self
+                    .output_timeline
+                    .read_archive_range(effective_start, end_offset);
+                self.output.advance_offset_to(end_offset);
+                let mut snapshot =
+                    self.render_files_snapshot_from_range(range, completion.prompt.as_deref());
+                maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
+                CompletionSnapshot {
+                    snapshot,
+                    saw_stderr,
+                }
+            }
+        }
+    }
+
+    fn render_files_snapshot_from_range(
+        &mut self,
+        range: OutputRange,
+        prompt_to_strip: Option<&str>,
+    ) -> SnapshotWithImages {
+        render_files_snapshot_from_range(self, range, prompt_to_strip)
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
@@ -1610,6 +1793,7 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            &self.reply_overflow,
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1652,6 +1836,7 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            &self.reply_overflow,
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1770,7 +1955,7 @@ impl WorkerManager {
             pages_left,
             buffer,
             last_range,
-        } = snapshot_page_with_images(&self.output, end_offset, page_bytes);
+        } = self.snapshot_page_for_reply(end_offset, page_bytes);
 
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
@@ -1779,9 +1964,7 @@ impl WorkerManager {
 
         if !contents.is_empty() {
             let start_offset = self.output.current_offset().unwrap_or(end_offset);
-            is_error = self
-                .output
-                .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+            is_error = self.saw_stderr_for_reply_range(start_offset, end_offset);
         }
 
         if !meta.is_empty() {
@@ -1807,6 +1990,420 @@ impl WorkerManager {
             },
             end_offset,
         }
+    }
+}
+
+struct TextPreview {
+    text: String,
+    shown_summary: String,
+}
+
+fn render_files_snapshot_from_range(
+    manager: &mut WorkerManager,
+    range: OutputRange,
+    prompt_to_strip: Option<&str>,
+) -> SnapshotWithImages {
+    let mut full_contents = collapse_image_updates(pager::contents_from_output_range(range));
+    if let Some(prompt) = prompt_to_strip {
+        strip_prompt_from_contents(&mut full_contents, prompt);
+    }
+    let text_budget =
+        usize::try_from(manager.reply_overflow.text.preview_bytes).unwrap_or(usize::MAX);
+    let text_spill_threshold =
+        usize::try_from(manager.reply_overflow.text.spill_bytes).unwrap_or(usize::MAX);
+    let mut full_text = String::new();
+    let mut images = Vec::new();
+    for content in &full_contents {
+        match content {
+            WorkerContent::ContentText { text, .. } => full_text.push_str(text),
+            WorkerContent::ContentImage { .. } => images.push(content.clone()),
+        }
+    }
+
+    let text_spills = full_text.len() > text_spill_threshold;
+    let image_spills = images.len() > manager.reply_overflow.images.spill_count;
+    if !text_spills && !image_spills {
+        return SnapshotWithImages {
+            contents: full_contents,
+            pages_left: 0,
+            buffer: None,
+            last_range: None,
+        };
+    }
+
+    let mut contents = Vec::new();
+    let inline_image_limit = if image_spills {
+        manager
+            .reply_overflow
+            .images
+            .preview_count
+            .min(images.len())
+    } else {
+        images.len()
+    };
+
+    if text_spills {
+        let preview = build_text_preview(&full_text, text_budget.max(1));
+        if !preview.text.is_empty() {
+            contents.push(WorkerContent::stdout(preview.text));
+        }
+        for image in images.iter().take(inline_image_limit) {
+            contents.push(image.clone());
+        }
+        let annotations = write_reply_files(
+            manager,
+            text_spills.then_some(full_text.as_str()),
+            image_spills.then(|| {
+                images
+                    .iter()
+                    .skip(inline_image_limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }),
+            Some(preview.shown_summary),
+            inline_image_limit,
+            images.len(),
+        );
+        if !annotations.is_empty() {
+            contents.push(WorkerContent::stderr(annotations));
+        }
+    } else {
+        let mut seen_images = 0usize;
+        for content in &full_contents {
+            match content {
+                WorkerContent::ContentText { .. } => contents.push(content.clone()),
+                WorkerContent::ContentImage { .. } => {
+                    if seen_images < inline_image_limit {
+                        contents.push(content.clone());
+                    }
+                    seen_images = seen_images.saturating_add(1);
+                }
+            }
+        }
+        let annotations = write_reply_files(
+            manager,
+            None,
+            image_spills.then(|| {
+                images
+                    .iter()
+                    .skip(inline_image_limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }),
+            None,
+            inline_image_limit,
+            images.len(),
+        );
+        if !annotations.is_empty() {
+            contents.push(WorkerContent::stderr(annotations));
+        }
+    }
+
+    SnapshotWithImages {
+        contents,
+        pages_left: 0,
+        buffer: None,
+        last_range: None,
+    }
+}
+
+fn write_reply_files(
+    manager: &mut WorkerManager,
+    full_text: Option<&str>,
+    omitted_images: Option<Vec<WorkerContent>>,
+    shown_summary: Option<String>,
+    inline_images: usize,
+    total_images: usize,
+) -> String {
+    let need_text = full_text.is_some();
+    let need_images = omitted_images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty());
+    if !need_text && !need_images {
+        return String::new();
+    }
+
+    let dir = match next_reply_files_dir(manager) {
+        Ok(path) => path,
+        Err(err) => {
+            return format!("[repl] failed to write reply files: {err}\n");
+        }
+    };
+
+    let mut lines = vec![format!("[reply files: {}]", dir.display())];
+
+    if let Some(text) = full_text {
+        let text_path = dir.join("text.txt");
+        match std::fs::write(&text_path, text) {
+            Ok(()) => {
+                lines.push(format!("[full text saved to {}]", text_path.display()));
+                if let Some(shown_summary) = shown_summary {
+                    lines.push(shown_summary);
+                }
+            }
+            Err(err) => {
+                lines.push(format!(
+                    "[repl] failed to write full text file {}: {err}]",
+                    text_path.display()
+                ));
+            }
+        }
+    }
+
+    if let Some(images) = omitted_images
+        && !images.is_empty()
+    {
+        lines.push(format!(
+            "[inline images={}, saved images={}]",
+            inline_images,
+            total_images.saturating_sub(inline_images)
+        ));
+        for (idx, image) in images.into_iter().enumerate() {
+            let WorkerContent::ContentImage {
+                data, mime_type, ..
+            } = image
+            else {
+                continue;
+            };
+            let extension = image_extension(&mime_type);
+            let path = dir.join(format!("image-{:04}.{}", idx + 1, extension));
+            match base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
+                Ok(bytes) => match std::fs::write(&path, bytes) {
+                    Ok(()) => lines.push(format!("[saved image: {}]", path.display())),
+                    Err(err) => lines.push(format!(
+                        "[repl] failed to write image file {}: {err}]",
+                        path.display()
+                    )),
+                },
+                Err(err) => lines.push(format!(
+                    "[repl] failed to decode image for {}: {err}]",
+                    path.display()
+                )),
+            }
+        }
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn build_reply_files_root() -> Result<PathBuf, WorkerError> {
+    let parent = std::env::temp_dir();
+    for _ in 0..128 {
+        let sequence = REPLY_FILES_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            "mcp-repl-reply-files-{}-{}",
+            std::process::id(),
+            sequence
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(WorkerError::Io(err)),
+        }
+    }
+    Err(WorkerError::Protocol(
+        "failed to allocate reply files root".to_string(),
+    ))
+}
+
+fn next_reply_files_dir(manager: &mut WorkerManager) -> std::io::Result<PathBuf> {
+    manager.reply_file_sequence = manager.reply_file_sequence.saturating_add(1);
+    let dir = manager
+        .reply_files_root
+        .join(format!("reply-files-{:04}", manager.reply_file_sequence));
+    std::fs::create_dir_all(&dir)?;
+    manager.reply_file_dirs.push_back(dir.clone());
+    manager.prune_reply_files();
+    Ok(dir)
+}
+
+fn output_range_from_collapsed(
+    bytes: Vec<u8>,
+    events: Vec<(u64, OutputEventKind)>,
+    text_spans: Vec<OutputTextSpan>,
+) -> OutputRange {
+    OutputRange {
+        start_offset: 0,
+        end_offset: bytes.len().try_into().unwrap_or(u64::MAX),
+        bytes,
+        events: events
+            .into_iter()
+            .map(|(offset, kind)| crate::output_capture::OutputEvent { offset, kind })
+            .collect(),
+        text_spans,
+    }
+}
+
+fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
+    let mut group_for_index: Vec<Option<usize>> = vec![None; contents.len()];
+    let mut last_in_group: Vec<usize> = Vec::new();
+    let mut current_group: Option<usize> = None;
+
+    for (idx, content) in contents.iter().enumerate() {
+        if let WorkerContent::ContentImage { is_new, .. } = content {
+            if *is_new || current_group.is_none() {
+                current_group = Some(last_in_group.len());
+                last_in_group.push(idx);
+            }
+            let group = current_group.expect("image group should be set");
+            group_for_index[idx] = Some(group);
+            last_in_group[group] = idx;
+        }
+    }
+
+    contents
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, content)| match &content {
+            WorkerContent::ContentImage { .. } => match group_for_index[idx] {
+                Some(group) if last_in_group.get(group).copied() == Some(idx) => Some(content),
+                _ => None,
+            },
+            _ => Some(content),
+        })
+        .collect()
+}
+
+fn build_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
+    if text.contains('\n') {
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        if lines.len() > 1 {
+            return build_line_text_preview(&lines, preview_bytes.max(1));
+        }
+    }
+    build_byte_text_preview(text, preview_bytes.max(1))
+}
+
+fn build_line_text_preview(lines: &[&str], preview_bytes: usize) -> TextPreview {
+    let total_lines = lines.len();
+    let head_budget = ((preview_bytes * 2) / 3).max(1);
+    let tail_budget = preview_bytes.saturating_sub(head_budget).max(1);
+
+    let mut head_count = 0usize;
+    let mut head_bytes = 0usize;
+    while head_count < total_lines {
+        let next = head_bytes.saturating_add(lines[head_count].len());
+        if head_count > 0 && next > head_budget {
+            break;
+        }
+        head_count += 1;
+        head_bytes = next;
+        if head_bytes >= head_budget {
+            break;
+        }
+    }
+    if head_count == 0 {
+        head_count = 1;
+    }
+
+    let mut tail_count = 0usize;
+    let mut tail_bytes = 0usize;
+    while tail_count < total_lines.saturating_sub(head_count) {
+        let line = lines[total_lines - 1 - tail_count];
+        let next = tail_bytes.saturating_add(line.len());
+        if tail_count > 0 && next > tail_budget {
+            break;
+        }
+        tail_count += 1;
+        tail_bytes = next;
+        if tail_bytes >= tail_budget {
+            break;
+        }
+    }
+    if tail_count == 0 && head_count < total_lines {
+        tail_count = 1;
+    }
+    while head_count + tail_count > total_lines && head_count > 1 {
+        head_count -= 1;
+    }
+
+    let tail_start = total_lines.saturating_sub(tail_count).saturating_add(1);
+    let head_text = lines[..head_count].concat();
+    let tail_text = lines[total_lines - tail_count..].concat();
+    let mut text = head_text;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "...[middle truncated, total {} lines]...\n",
+        total_lines
+    ));
+    text.push_str(&tail_text);
+    TextPreview {
+        text,
+        shown_summary: format!(
+            "[shown lines=1..{},{}..{} of {}]",
+            head_count, tail_start, total_lines, total_lines
+        ),
+    }
+}
+
+fn build_byte_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
+    let total_bytes = text.len();
+    let head_budget = ((preview_bytes * 2) / 3).max(1);
+    let tail_budget = preview_bytes.saturating_sub(head_budget).max(1);
+    let head = take_prefix_chars(text, head_budget);
+    let tail = take_suffix_chars(text, tail_budget);
+    let head_bytes = head.len();
+    let tail_bytes = tail.len();
+    let tail_start = total_bytes.saturating_sub(tail_bytes);
+    let mut preview = String::new();
+    preview.push_str(&head);
+    if !preview.ends_with('\n') {
+        preview.push('\n');
+    }
+    preview.push_str(&format!(
+        "...[middle truncated, total {} bytes]...\n",
+        total_bytes
+    ));
+    preview.push_str(&tail);
+    TextPreview {
+        text: preview,
+        shown_summary: format!(
+            "[shown bytes=0..{},{}..{} of {}]",
+            head_bytes, tail_start, total_bytes, total_bytes
+        ),
+    }
+}
+
+fn take_prefix_chars(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for (idx, ch) in text.char_indices() {
+        if idx >= max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn take_suffix_chars(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    text[start..].to_string()
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+fn apply_reply_overflow_env(command: &mut Command, reply_overflow: &ReplyOverflowSettings) {
+    for (key, value) in reply_overflow.env_pairs() {
+        command.env(key, value);
     }
 }
 
@@ -2750,6 +3347,7 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        reply_overflow: &ReplyOverflowSettings,
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
     ) -> Result<Self, WorkerError> {
@@ -2767,12 +3365,16 @@ impl WorkerProcess {
             Backend::R => Self::spawn_r_worker(
                 exe_path,
                 sandbox_state,
+                reply_overflow,
                 output_timeline.clone(),
                 &mut ipc_server,
             )?,
-            Backend::Python => {
-                Self::spawn_python_worker(sandbox_state, output_timeline.clone(), &mut ipc_server)?
-            }
+            Backend::Python => Self::spawn_python_worker(
+                sandbox_state,
+                reply_overflow,
+                output_timeline.clone(),
+                &mut ipc_server,
+            )?,
         };
         #[allow(unused_mut)]
         let mut child = child;
@@ -2832,6 +3434,7 @@ impl WorkerProcess {
     fn spawn_r_worker(
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        reply_overflow: &ReplyOverflowSettings,
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
@@ -2850,6 +3453,7 @@ impl WorkerProcess {
         }
         command.args(&prepared.args);
         command.envs(prepared.env.iter());
+        apply_reply_overflow_env(&mut command, reply_overflow);
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -2932,12 +3536,14 @@ impl WorkerProcess {
 
     fn spawn_python_worker(
         sandbox_state: &SandboxState,
+        reply_overflow: &ReplyOverflowSettings,
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = sandbox_state;
+            let _ = reply_overflow;
             let _ = output_timeline;
             let _ = ipc_server;
             Err(WorkerError::Protocol(
@@ -2962,6 +3568,7 @@ impl WorkerProcess {
             }
             command.args(&prepared.args);
             command.envs(prepared.env.iter());
+            apply_reply_overflow_env(&mut command, reply_overflow);
             // Python 3.13 defaults to the new _pyrepl UI, which emits terminal control sequences
             // and bypasses readline hooks we use for prompt/request accounting.
             command.env("PYTHON_BASIC_REPL", "1");
@@ -3798,7 +4405,11 @@ mod tests {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
         }
         let result = std::panic::catch_unwind(|| {
-            WorkerManager::new(Backend::Python, SandboxCliPlan::default())
+            WorkerManager::new(
+                Backend::Python,
+                SandboxCliPlan::default(),
+                ReplyOverflowSettings::default(),
+            )
         });
 
         match original_tmpdir {
@@ -3841,7 +4452,9 @@ mod tests {
                 ),
             ],
         };
-        let mut manager = WorkerManager::new(Backend::Python, plan).expect("worker manager");
+        let mut manager =
+            WorkerManager::new(Backend::Python, plan, ReplyOverflowSettings::default())
+                .expect("worker manager");
         let inherited_before = manager
             .inherited_sandbox_state
             .clone()

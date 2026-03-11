@@ -35,7 +35,16 @@ expression: transcript
 <<< [repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
 <<< TMPDIR_SET=TRUE
 <<< TMPDIR_MATCH=TRUE
-<<< --More-- (3p, 24.9%, @0..272/1090)
+<<< TEMPDIR_UNDER_TMPDIR=TRUE
+<<< [repl] echoed input elided: 7 lines (225 bytes); head: > marker <- file.path(tempdir(), "mcp-console-snapshot.txt"); tail: + })
+<<< TEMPDIR_MARKER_OK
+<<< [repl] echoed input elided: 7 lines (167 bytes); head: > tf <- tempfile(); tail: + })
+<<< TEMPFILE_OK
+<<< [repl] echoed input elided: 2 lines (98 bytes); head: > unlink(tf); tail: > cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
+<<< TEMPDIR_LIST=mcp-console-snapshot.txt
+<<< [repl] echoed input elided: 7 lines (246 bytes); head: > root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt"); tail: + })
+<<< ROOT_MARKER_OK
+<<< ROOT_MARKER_EXISTS=TRUE
 
 2) r_repl
 >>> 
@@ -50,6 +59,7 @@ expression: transcript
 <<< [repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
+<<< TEMPDIR_UNDER_TMPDIR=TRUE
 
 4) r_repl
 >>> 
@@ -64,3 +74,4 @@ expression: transcript
 <<< [repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
+<<< TEMPDIR_UNDER_TMPDIR=TRUE

@@ -58,6 +58,10 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 - `{ "type": "plot_image", "id": <string>, "mime_type": <string>, "data": <base64>, "is_new": <bool> }`
 - Image payload for plot updates.
 
+`reply_overflow_settings`
+- `{ "type": "reply_overflow_settings", "settings": { "behavior": <"files"|"pager">, "text": { "preview_bytes": <u64>, "spill_bytes": <u64> }, "images": { "preview_count": <usize>, "spill_count": <usize> }, "retention": { "max_dirs": <usize> } } }`
+- Sent when the worker updates session-scoped reply overflow settings (currently the R backend emits this after `options(mcp.reply_overflow.* = ...)` changes).
+
 `session_end`
 - `{ "type": "session_end" }`
 - Indicates the worker session is terminating.
