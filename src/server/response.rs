@@ -123,8 +123,8 @@ pub(crate) fn finalize_batch(
     overflow_store: &OverflowFileStore,
     overflow_metadata: OverflowMetadata,
 ) -> CallToolResult {
-    contents = maybe_overflow_text_contents(contents, overflow_store, &overflow_metadata);
     contents = maybe_overflow_image_contents(contents, overflow_store, &overflow_metadata);
+    contents = maybe_overflow_text_contents(contents, overflow_store, &overflow_metadata);
     ensure_nonempty_contents(&mut contents);
     // Preserve backend error detection (for prompt normalization, paging decisions, etc.) but
     // do not map it to MCP tool errors.
@@ -161,29 +161,43 @@ fn maybe_overflow_text_contents(
 
     let full_text = collect_text_contents(&contents);
     let overflow_path = overflow_store.overflow_path(overflow_metadata);
-    let replacement_text = match write_text_file(&overflow_path, &full_text) {
-        Ok(()) => overflow_notice_with_preview(&full_text, Some(&overflow_path)),
+    let overflow_notice = match write_text_file(&overflow_path, &full_text) {
+        Ok(()) => overflow_notice_prefix(Some(&overflow_path)),
         Err(err) => {
             log_overflow_write_failure(overflow_store.root_path(), overflow_metadata, &err);
-            overflow_notice_with_preview(&full_text, None)
+            overflow_notice_prefix(None)
         }
     };
+    let overflow_notice =
+        utf8_prefix_by_bytes(&overflow_notice, INLINE_TEXT_LIMIT_BYTES).to_string();
+    let mut preview_budget = INLINE_TEXT_LIMIT_BYTES.saturating_sub(overflow_notice.len());
 
-    let mut replacement = Some(Content::text(replacement_text));
     let mut rewritten = Vec::with_capacity(contents.len());
+    let mut inserted_notice = false;
     for (idx, content) in contents.into_iter().enumerate() {
-        let is_text = matches!(&content.raw, RawContent::Text(_));
-        if is_text {
-            if idx == first_text_idx
-                && let Some(content) = replacement.take()
-            {
-                rewritten.push(content);
-            }
+        let Some(text) = content_text(&content) else {
+            rewritten.push(content);
             continue;
+        };
+
+        let mut replacement = String::new();
+        if idx == first_text_idx {
+            replacement.push_str(&overflow_notice);
+            inserted_notice = true;
         }
-        rewritten.push(content);
+        if preview_budget > 0 {
+            let preview = utf8_prefix_by_bytes(text, preview_budget);
+            if !preview.is_empty() {
+                replacement.push_str(preview);
+                preview_budget = preview_budget.saturating_sub(preview.len());
+            }
+        }
+        if !replacement.is_empty() {
+            rewritten.push(Content::text(replacement));
+        }
     }
 
+    debug_assert!(inserted_notice);
     rewritten
 }
 
@@ -296,27 +310,18 @@ fn raw_image(content: &Content) -> Option<&rmcp::model::RawImageContent> {
     }
 }
 
-fn overflow_notice_with_preview(full_text: &str, overflow_path: Option<&Path>) -> String {
-    let mut out = match overflow_path {
+fn overflow_notice_prefix(overflow_path: Option<&Path>) -> String {
+    match overflow_path {
         Some(path) => format!(
-            "[repl] output truncated; full response at {}\n",
+            "[repl] output truncated; full response at {}\n\n",
             path.display()
         ),
-        None => "[repl] output truncated; full response could not be persisted by the server\n"
-            .to_string(),
-    };
-
-    if out.len() >= INLINE_TEXT_LIMIT_BYTES {
-        return utf8_prefix_by_bytes(&out, INLINE_TEXT_LIMIT_BYTES).to_string();
+        None => {
+            "[repl] output truncated; full response could not be persisted by the server\n"
+                .to_string()
+                + "\n"
+        }
     }
-
-    let preview_budget = INLINE_TEXT_LIMIT_BYTES.saturating_sub(out.len() + 1);
-    let preview = utf8_prefix_by_bytes(full_text, preview_budget);
-    if !preview.is_empty() {
-        out.push('\n');
-        out.push_str(preview);
-    }
-    out
 }
 
 fn utf8_prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
@@ -745,6 +750,39 @@ mod tests {
     }
 
     #[test]
+    fn text_overflow_preserves_interleaved_image_order() {
+        let store = OverflowFileStore::new().expect("overflow store");
+        let trailing_text = "tail".repeat((INLINE_TEXT_LIMIT_BYTES / 2) + 64);
+        let result = finalize_batch(
+            vec![
+                rmcp::model::Content::text("head\n".to_string()),
+                image_content(1),
+                rmcp::model::Content::text(trailing_text),
+            ],
+            false,
+            &store,
+            overflow_metadata("repl", 4, "call_mixed"),
+        );
+
+        assert!(matches!(result.content[0].raw, RawContent::Text(_)));
+        assert!(matches!(result.content[1].raw, RawContent::Image(_)));
+        assert!(matches!(result.content[2].raw, RawContent::Text(_)));
+
+        let leading_text = match &result.content[0].raw {
+            RawContent::Text(text) => text.text.as_str(),
+            _ => unreachable!("expected text"),
+        };
+        assert!(leading_text.contains("output truncated"));
+        assert!(leading_text.contains("head"));
+
+        let trailing_text = match &result.content[2].raw {
+            RawContent::Text(text) => text.text.as_str(),
+            _ => unreachable!("expected text"),
+        };
+        assert!(trailing_text.starts_with("tail"));
+    }
+
+    #[test]
     fn image_overflow_keeps_first_four_inline_and_writes_remaining_files() {
         let store = OverflowFileStore::new().expect("overflow store");
         let contents = (1..=6).map(image_content).collect();
@@ -801,6 +839,39 @@ mod tests {
             .count();
         assert_eq!(inline_image_count, 5);
         assert!(!result_text(&result).contains("full image at "));
+    }
+
+    #[test]
+    fn image_overflow_notices_are_capped_by_text_overflow_guard() {
+        let store = OverflowFileStore::new().expect("overflow store");
+        let total_images = INLINE_IMAGE_LIMIT + 240;
+        let contents = (0..total_images)
+            .map(|idx| image_content((idx % (u8::MAX as usize)) as u8))
+            .collect();
+        let result = finalize_batch(
+            contents,
+            false,
+            &store,
+            overflow_metadata("repl", 10, "call_many_images"),
+        );
+
+        let inline_image_count = result
+            .content
+            .iter()
+            .filter(|content| matches!(content.raw, RawContent::Image(_)))
+            .count();
+        assert_eq!(inline_image_count, INLINE_IMAGE_LIMIT);
+
+        let text = result_text(&result);
+        assert!(text.contains("output truncated"));
+        assert!(text.len() <= INLINE_TEXT_LIMIT_BYTES);
+
+        let path = extract_overflow_path(&text).expect("overflow path");
+        let overflow_text = fs::read_to_string(path).expect("overflow file");
+        assert!(overflow_text.contains("image 5 omitted from inline response"));
+        assert!(overflow_text.contains(&format!(
+            "image {total_images} omitted from inline response"
+        )));
     }
 
     #[test]
