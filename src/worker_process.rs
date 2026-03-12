@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_family = "unix")]
@@ -44,8 +43,6 @@ use crate::sandbox_cli::{
 use crate::worker_protocol::{
     TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
-use base64::Engine as _;
-
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_family = "unix")]
@@ -72,8 +69,6 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const REPLY_OVERFLOW_IPC_SETTLE_WAIT: Duration = Duration::from_millis(10);
-static REPLY_FILES_ROOT_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -483,9 +478,6 @@ pub struct WorkerManager {
     pager: Pager,
     reply_overflow_defaults: ReplyOverflowSettings,
     reply_overflow: ReplyOverflowSettings,
-    reply_files_root: PathBuf,
-    reply_file_sequence: u64,
-    reply_file_dirs: VecDeque<PathBuf>,
     output_timeline: OutputTimeline,
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
@@ -545,7 +537,6 @@ impl WorkerManager {
         reset_output_ring();
         reset_last_reply_marker_offset();
         let output_timeline = OutputTimeline::new(output_ring, output_archive);
-        let reply_files_root = build_reply_files_root()?;
         Ok(Self {
             exe_path,
             backend,
@@ -559,9 +550,6 @@ impl WorkerManager {
             pager: Pager::default(),
             reply_overflow: reply_overflow_defaults.clone(),
             reply_overflow_defaults,
-            reply_files_root,
-            reply_file_sequence: 0,
-            reply_file_dirs: VecDeque::new(),
             output_timeline,
             driver: match backend {
                 Backend::R => Box::new(RBackendDriver::new()),
@@ -586,6 +574,10 @@ impl WorkerManager {
             return Ok(());
         }
         self.ensure_process()
+    }
+
+    pub(crate) fn reply_overflow_settings(&self) -> ReplyOverflowSettings {
+        self.reply_overflow.clone()
     }
 
     pub fn write_stdin(
@@ -1448,7 +1440,6 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.clear_reply_files();
         self.reset_reply_overflow_defaults();
 
         let page_bytes = pager::resolve_page_bytes(None);
@@ -1464,8 +1455,6 @@ impl WorkerManager {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.clear_reply_files();
-        let _ = std::fs::remove_dir_all(&self.reply_files_root);
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
@@ -1615,28 +1604,11 @@ impl WorkerManager {
             && settings.validate().is_ok()
         {
             self.reply_overflow = settings;
-            self.prune_reply_files();
         }
     }
 
     fn reset_reply_overflow_defaults(&mut self) {
         self.reply_overflow = self.reply_overflow_defaults.clone();
-        self.prune_reply_files();
-    }
-
-    fn clear_reply_files(&mut self) {
-        while let Some(path) = self.reply_file_dirs.pop_front() {
-            let _ = std::fs::remove_dir_all(path);
-        }
-        self.reply_file_sequence = 0;
-    }
-
-    fn prune_reply_files(&mut self) {
-        while self.reply_file_dirs.len() > self.reply_overflow.retention.max_dirs {
-            if let Some(path) = self.reply_file_dirs.pop_front() {
-                let _ = std::fs::remove_dir_all(path);
-            }
-        }
     }
 
     fn snapshot_page_for_reply(
@@ -1993,25 +1965,8 @@ impl WorkerManager {
     }
 }
 
-struct TextPreview {
-    text: String,
-    total_lines: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TextPreviewSummary {
-    total_lines: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SavedImageRange {
-    extension: String,
-    start_index: usize,
-    end_index: usize,
-}
-
 fn render_files_snapshot_from_range(
-    manager: &mut WorkerManager,
+    _manager: &mut WorkerManager,
     range: OutputRange,
     prompt_to_strip: Option<&str>,
 ) -> SnapshotWithImages {
@@ -2019,236 +1974,12 @@ fn render_files_snapshot_from_range(
     if let Some(prompt) = prompt_to_strip {
         strip_prompt_from_contents(&mut full_contents, prompt);
     }
-    let text_budget =
-        usize::try_from(manager.reply_overflow.text.preview_bytes).unwrap_or(usize::MAX);
-    let text_spill_threshold =
-        usize::try_from(manager.reply_overflow.text.spill_bytes).unwrap_or(usize::MAX);
-    let mut full_text = String::new();
-    let mut images = Vec::new();
-    for content in &full_contents {
-        match content {
-            WorkerContent::ContentText { text, .. } => full_text.push_str(text),
-            WorkerContent::ContentImage { .. } => images.push(content.clone()),
-        }
-    }
-
-    let text_spills = full_text.len() > text_spill_threshold;
-    let image_spills = images.len() > manager.reply_overflow.images.spill_count;
-    if !text_spills && !image_spills {
-        return SnapshotWithImages {
-            contents: full_contents,
-            pages_left: 0,
-            buffer: None,
-            last_range: None,
-        };
-    }
-
-    let mut contents = Vec::new();
-    let inline_image_limit = if image_spills {
-        manager
-            .reply_overflow
-            .images
-            .preview_count
-            .min(images.len())
-    } else {
-        images.len()
-    };
-
-    if text_spills {
-        let preview = build_text_preview(&full_text, text_budget);
-        let preview_summary = TextPreviewSummary {
-            total_lines: preview.total_lines,
-        };
-        let preview_text = preview.text;
-        let has_preview = !preview_text.is_empty();
-        let preview_ends_with_newline =
-            preview_text.ends_with('\n') || preview_text.ends_with('\r');
-        if !preview_text.is_empty() {
-            contents.push(WorkerContent::stdout(preview_text));
-        }
-        for image in images.iter().take(inline_image_limit) {
-            contents.push(image.clone());
-        }
-        let mut annotations = write_reply_files(
-            manager,
-            text_spills.then_some(full_text.as_str()),
-            image_spills.then(|| {
-                images
-                    .iter()
-                    .skip(inline_image_limit)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            }),
-            Some(preview_summary),
-            inline_image_limit,
-            images.len(),
-        );
-        if has_preview && !annotations.is_empty() {
-            if preview_ends_with_newline {
-                annotations.insert(0, '\n');
-            } else {
-                annotations.insert_str(0, "\n\n");
-            }
-        }
-        if !annotations.is_empty() {
-            contents.push(WorkerContent::stderr(annotations));
-        }
-    } else {
-        let mut seen_images = 0usize;
-        for content in &full_contents {
-            match content {
-                WorkerContent::ContentText { .. } => contents.push(content.clone()),
-                WorkerContent::ContentImage { .. } => {
-                    if seen_images < inline_image_limit {
-                        contents.push(content.clone());
-                    }
-                    seen_images = seen_images.saturating_add(1);
-                }
-            }
-        }
-        let annotations = write_reply_files(
-            manager,
-            None,
-            image_spills.then(|| {
-                images
-                    .iter()
-                    .skip(inline_image_limit)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            }),
-            None,
-            inline_image_limit,
-            images.len(),
-        );
-        if !annotations.is_empty() {
-            contents.push(WorkerContent::stderr(annotations));
-        }
-    }
-
     SnapshotWithImages {
-        contents,
+        contents: full_contents,
         pages_left: 0,
         buffer: None,
         last_range: None,
     }
-}
-
-fn write_reply_files(
-    manager: &mut WorkerManager,
-    full_text: Option<&str>,
-    omitted_images: Option<Vec<WorkerContent>>,
-    text_preview: Option<TextPreviewSummary>,
-    inline_images: usize,
-    total_images: usize,
-) -> String {
-    let need_text = full_text.is_some();
-    let need_images = omitted_images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty());
-    if !need_text && !need_images {
-        return String::new();
-    }
-
-    let dir = match next_reply_files_dir(manager) {
-        Ok(path) => path,
-        Err(err) => {
-            return format!("[repl] failed to write reply files: {err}\n");
-        }
-    };
-
-    let mut lines = Vec::new();
-
-    if let Some(text) = full_text {
-        let text_path = dir.join("output.log");
-        match std::fs::write(&text_path, text) {
-            Ok(()) => {
-                let summary =
-                    text_preview.expect("text preview should be present when text spills");
-                lines.push(format!(
-                    "[full output ({} {}) written to {}]",
-                    summary.total_lines,
-                    pluralize(summary.total_lines, "line", "lines"),
-                    text_path.display()
-                ));
-            }
-            Err(err) => {
-                lines.push(format!(
-                    "[repl] failed to write full text file {}: {err}]",
-                    text_path.display()
-                ));
-            }
-        }
-    }
-
-    if let Some(images) = omitted_images
-        && !images.is_empty()
-    {
-        lines.push(format!(
-            "[inline images={}, saved images={}]",
-            inline_images,
-            total_images.saturating_sub(inline_images)
-        ));
-        let mut saved_ranges = Vec::new();
-        for (idx, image) in images.into_iter().enumerate() {
-            let WorkerContent::ContentImage {
-                data, mime_type, ..
-            } = image
-            else {
-                continue;
-            };
-            let extension = image_extension(&mime_type);
-            let path = dir.join(format!("image-{:04}.{}", idx + 1, extension));
-            match base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
-                Ok(bytes) => match std::fs::write(&path, bytes) {
-                    Ok(()) => push_saved_image_range(&mut saved_ranges, idx + 1, extension),
-                    Err(err) => lines.push(format!(
-                        "[repl] failed to write image file {}: {err}]",
-                        path.display()
-                    )),
-                },
-                Err(err) => lines.push(format!(
-                    "[repl] failed to decode image for {}: {err}]",
-                    path.display()
-                )),
-            }
-        }
-        for range in saved_ranges {
-            lines.push(format_saved_image_range_line(&dir, &range));
-        }
-    }
-
-    format!("{}\n", lines.join("\n"))
-}
-
-fn build_reply_files_root() -> Result<PathBuf, WorkerError> {
-    let parent = std::env::temp_dir();
-    for _ in 0..128 {
-        let sequence = REPLY_FILES_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            "mcp-repl-reply-files-{}-{}",
-            std::process::id(),
-            sequence
-        ));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(WorkerError::Io(err)),
-        }
-    }
-    Err(WorkerError::Protocol(
-        "failed to allocate reply files root".to_string(),
-    ))
-}
-
-fn next_reply_files_dir(manager: &mut WorkerManager) -> std::io::Result<PathBuf> {
-    manager.reply_file_sequence = manager.reply_file_sequence.saturating_add(1);
-    let dir = manager
-        .reply_files_root
-        .join(format!("reply-files-{:04}", manager.reply_file_sequence));
-    std::fs::create_dir_all(&dir)?;
-    manager.reply_file_dirs.push_back(dir.clone());
-    manager.prune_reply_files();
-    Ok(dir)
 }
 
 fn output_range_from_collapsed(
@@ -2296,103 +2027,6 @@ fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
             _ => Some(content),
         })
         .collect()
-}
-
-fn build_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
-    build_byte_text_preview(text, preview_bytes)
-}
-
-fn build_byte_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
-    let total_chars = text.chars().count();
-    let total_lines = count_text_lines(text);
-    if preview_bytes == 0 {
-        return TextPreview {
-            text: String::new(),
-            total_lines,
-        };
-    }
-    let mut preview = take_prefix_chars(text, preview_bytes);
-    if total_chars > preview.chars().count() {
-        if preview.ends_with('\n') {
-            while preview.ends_with('\n') || preview.ends_with('\r') {
-                preview.pop();
-            }
-        }
-        preview.push_str(&format!("...[truncated, total {total_chars} chars]"));
-    };
-    TextPreview {
-        text: preview,
-        total_lines,
-    }
-}
-
-fn count_text_lines(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
-    if text.ends_with('\n') {
-        newline_count
-    } else {
-        newline_count.saturating_add(1)
-    }
-}
-
-fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
-}
-
-fn push_saved_image_range(ranges: &mut Vec<SavedImageRange>, index: usize, extension: &str) {
-    if let Some(last) = ranges.last_mut()
-        && last.extension == extension
-        && last.end_index.saturating_add(1) == index
-    {
-        last.end_index = index;
-        return;
-    }
-    ranges.push(SavedImageRange {
-        extension: extension.to_string(),
-        start_index: index,
-        end_index: index,
-    });
-}
-
-fn format_saved_image_range_line(dir: &Path, range: &SavedImageRange) -> String {
-    let pattern = dir.join(format!("image-NNNN.{}", range.extension));
-    let numbers = if range.start_index == range.end_index {
-        format!("{:04}", range.start_index)
-    } else {
-        format!("{:04}..{:04}", range.start_index, range.end_index)
-    };
-    format!(
-        "[saved images: {} where NNNN={}]",
-        pattern.display(),
-        numbers
-    )
-}
-
-fn take_prefix_chars(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for (idx, ch) in text.char_indices() {
-        if idx >= max_bytes {
-            break;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn image_extension(mime_type: &str) -> &'static str {
-    match mime_type.trim().to_ascii_lowercase().as_str() {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
-    }
 }
 
 fn apply_reply_overflow_env(command: &mut Command, reply_overflow: &ReplyOverflowSettings) {
@@ -4306,64 +3940,6 @@ mod tests {
             _ => "",
         };
         assert_eq!(text, "stderr: boom\n");
-    }
-
-    #[test]
-    fn byte_preview_caps_large_multiline_output() {
-        let text = format!("{}\nOK\n", "x".repeat(8_192));
-        let preview = build_text_preview(&text, 64);
-        assert!(preview.text.len() < 256, "preview was too large");
-        assert!(preview.text.contains("[truncated, total 8196 chars]"));
-        assert_eq!(preview.total_lines, 2);
-    }
-
-    #[test]
-    fn zero_byte_preview_shows_only_file_annotation_summary() {
-        let preview = build_text_preview("abcdef", 0);
-        assert!(preview.text.is_empty());
-        assert_eq!(preview.total_lines, 1);
-    }
-
-    #[test]
-    fn count_text_lines_handles_trailing_newline() {
-        assert_eq!(count_text_lines(""), 0);
-        assert_eq!(count_text_lines("abc"), 1);
-        assert_eq!(count_text_lines("abc\n"), 1);
-        assert_eq!(count_text_lines("a\nb\n"), 2);
-    }
-
-    #[test]
-    fn saved_image_ranges_are_reported_compactly() {
-        let dir = Path::new("/tmp/reply-files");
-        let mut ranges = Vec::new();
-        push_saved_image_range(&mut ranges, 1, "png");
-        push_saved_image_range(&mut ranges, 2, "png");
-        push_saved_image_range(&mut ranges, 4, "png");
-        push_saved_image_range(&mut ranges, 5, "jpg");
-        assert_eq!(
-            ranges,
-            vec![
-                SavedImageRange {
-                    extension: "png".to_string(),
-                    start_index: 1,
-                    end_index: 2,
-                },
-                SavedImageRange {
-                    extension: "png".to_string(),
-                    start_index: 4,
-                    end_index: 4,
-                },
-                SavedImageRange {
-                    extension: "jpg".to_string(),
-                    start_index: 5,
-                    end_index: 5,
-                },
-            ]
-        );
-        assert_eq!(
-            format_saved_image_range_line(dir, &ranges[0]),
-            "[saved images: /tmp/reply-files/image-NNNN.png where NNNN=0001..0002]"
-        );
     }
 
     #[test]

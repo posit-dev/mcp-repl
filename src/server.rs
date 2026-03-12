@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+pub(crate) mod overflow;
 mod response;
 #[cfg(test)]
 mod tests;
 mod timeouts;
 
+use self::overflow::ReplyFilesManager;
 use self::response::{finalize_batch, worker_reply_to_contents};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
@@ -40,6 +42,7 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 #[derive(Clone)]
 struct SharedServer {
     worker: Arc<Mutex<WorkerManager>>,
+    reply_files: Arc<Mutex<ReplyFilesManager>>,
 }
 
 impl SharedServer {
@@ -54,6 +57,7 @@ impl SharedServer {
                 sandbox_plan,
                 reply_overflow,
             )?)),
+            reply_files: Arc::new(Mutex::new(ReplyFilesManager::new()?)),
         })
     }
 
@@ -82,12 +86,50 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let result = self
+        let (result, reply_overflow) = self
             .run_worker(move |worker| {
-                worker.write_stdin(input, worker_timeout, server_timeout, None, false)
+                let result = worker.write_stdin(input, worker_timeout, server_timeout, None, false);
+                let reply_overflow = worker.reply_overflow_settings();
+                (result, reply_overflow)
             })
             .await?;
-        worker_result_to_call_tool_result(result)
+        self.worker_result_to_call_tool_result(result, reply_overflow)
+    }
+
+    fn worker_result_to_call_tool_result(
+        &self,
+        result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+        reply_overflow: ReplyOverflowSettings,
+    ) -> Result<CallToolResult, McpError> {
+        let mut contents = Vec::new();
+        let mut is_error = false;
+        match result {
+            Ok(reply) => {
+                let reply = self
+                    .reply_files
+                    .lock()
+                    .unwrap()
+                    .apply_to_reply(reply, &reply_overflow);
+                let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
+                is_error |= reply_error;
+                contents.append(&mut reply_contents);
+                Ok(finalize_batch(contents, is_error))
+            }
+            Err(err) => {
+                eprintln!("worker write stdin error: {err}");
+                contents.push(Content::text(format!("worker error: {err}")));
+                is_error = true;
+                Ok(finalize_batch(contents, is_error))
+            }
+        }
+    }
+
+    fn clear_reply_files(&self) -> Result<(), McpError> {
+        self.reply_files
+            .lock()
+            .unwrap()
+            .clear()
+            .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -344,11 +386,17 @@ macro_rules! define_backend_tool_server {
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
-                let result = self
+                let (result, reply_overflow) = self
                     .shared
-                    .run_worker(move |worker| worker.restart(worker_timeout))
+                    .run_worker(move |worker| {
+                        let result = worker.restart(worker_timeout);
+                        let reply_overflow = worker.reply_overflow_settings();
+                        (result, reply_overflow)
+                    })
                     .await?;
-                worker_result_to_call_tool_result(result)
+                self.shared.clear_reply_files()?;
+                self.shared
+                    .worker_result_to_call_tool_result(result, reply_overflow)
             }
         }
 
@@ -402,27 +450,6 @@ fn resolve_timeout_ms(
 ) -> Result<Duration, McpError> {
     let timeout_secs = timeout_ms.map(|value| Duration::from_millis(value).as_secs_f64());
     parse_timeout(timeout_secs, tool_name, allow_zero)
-}
-
-fn worker_result_to_call_tool_result(
-    result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
-) -> Result<CallToolResult, McpError> {
-    let mut contents = Vec::new();
-    let mut is_error = false;
-    match result {
-        Ok(reply) => {
-            let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
-            is_error |= reply_error;
-            contents.append(&mut reply_contents);
-            Ok(finalize_batch(contents, is_error))
-        }
-        Err(err) => {
-            eprintln!("worker write stdin error: {err}");
-            contents.push(Content::text(format!("worker error: {err}")));
-            is_error = true;
-            Ok(finalize_batch(contents, is_error))
-        }
-    }
 }
 
 fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
