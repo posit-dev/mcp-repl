@@ -199,6 +199,111 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
 }
 
 #[test]
+fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let exe = resolve_exe()?;
+    let old_command = "/opt/repltool";
+    let new_command = "/opt/repltool-v2";
+
+    let first_status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg(old_command)
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        first_status.success(),
+        "initial install --client claude failed with status {first_status}"
+    );
+
+    let second_status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg(new_command)
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        second_status.success(),
+        "reinstall --client claude failed with status {second_status}"
+    );
+
+    let settings_path = temp.path().join(".claude/settings.json");
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+
+    let session_start = settings_root["hooks"]["SessionStart"]
+        .as_array()
+        .expect("expected SessionStart hooks array");
+    for matcher in ["startup", "resume"] {
+        let entry = session_start
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some(matcher))
+            .expect("expected SessionStart matcher entry");
+        let hooks = entry["hooks"].as_array().expect("expected hooks array");
+        let commands: Vec<&str> = hooks
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .filter(|command| command.contains("claude-hook session-start"))
+            .collect();
+        let expected = format!("{new_command} claude-hook session-start");
+        assert_eq!(
+            commands,
+            vec![expected.as_str()],
+            "expected one updated SessionStart command for matcher {matcher}"
+        );
+    }
+
+    let session_end = settings_root["hooks"]["SessionEnd"]
+        .as_array()
+        .expect("expected SessionEnd hooks array");
+    let clear_entry = session_end
+        .iter()
+        .find(|entry| entry["matcher"].as_str() == Some("clear"))
+        .expect("expected SessionEnd clear matcher entry");
+    let clear_hooks = clear_entry["hooks"]
+        .as_array()
+        .expect("expected clear hooks array");
+    let clear_commands: Vec<&str> = clear_hooks
+        .iter()
+        .filter_map(|hook| hook["command"].as_str())
+        .filter(|command| command.contains("claude-hook session-end"))
+        .collect();
+    let expected_clear = format!("{new_command} claude-hook session-end");
+    assert_eq!(
+        clear_commands,
+        vec![expected_clear.as_str()],
+        "expected one updated SessionEnd command"
+    );
+
+    let stale_session_start = format!("{old_command} claude-hook session-start");
+    let stale_session_end = format!("{old_command} claude-hook session-end");
+    let all_commands: Vec<&str> = settings_root["hooks"]
+        .as_object()
+        .expect("expected hooks object")
+        .values()
+        .filter_map(JsonValue::as_array)
+        .flatten()
+        .filter_map(|entry| entry["hooks"].as_array())
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    assert!(
+        !all_commands.contains(&stale_session_start.as_str()),
+        "expected stale SessionStart command to be removed"
+    );
+    assert!(
+        !all_commands.contains(&stale_session_end.as_str()),
+        "expected stale SessionEnd command to be removed"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

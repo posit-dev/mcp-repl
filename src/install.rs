@@ -654,7 +654,7 @@ fn upsert_claude_hook_command(
         .iter_mut()
         .find(|entry| hook_entry_matches(entry, matcher))
     {
-        replace_mcp_repl_hook_command(existing, command)?;
+        replace_claude_hook_command(existing, command)?;
         return Ok(());
     }
 
@@ -691,7 +691,7 @@ fn hook_entry_has_command(entry: &JsonValue, command: &str) -> bool {
     })
 }
 
-fn replace_mcp_repl_hook_command(
+fn replace_claude_hook_command(
     entry: &mut JsonValue,
     command: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -724,7 +724,7 @@ fn replace_mcp_repl_hook_command(
             command_present = true;
             return true;
         }
-        !is_stale_mcp_repl_hook_command(existing_command, target_subcommand)
+        !is_stale_claude_hook_command(existing_command, target_subcommand)
     });
 
     if !command_present {
@@ -743,15 +743,12 @@ fn claude_hook_subcommand(command: &str) -> Option<&'static str> {
     None
 }
 
-fn is_stale_mcp_repl_hook_command(existing_command: &str, target_subcommand: Option<&str>) -> bool {
-    if !existing_command.contains("mcp-repl") || !existing_command.contains("claude-hook") {
-        return false;
-    }
+fn is_stale_claude_hook_command(existing_command: &str, target_subcommand: Option<&str>) -> bool {
     match target_subcommand {
         Some("session-start") => existing_command.contains("claude-hook session-start"),
         Some("session-end") => existing_command.contains("claude-hook session-end"),
         Some(_) => false,
-        None => true,
+        None => existing_command.contains("claude-hook"),
     }
 }
 
