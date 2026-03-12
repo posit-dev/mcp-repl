@@ -120,7 +120,7 @@ pub(crate) fn worker_reply_to_contents(reply: WorkerReply) -> (Vec<Content>, boo
 pub(crate) fn finalize_batch(
     mut contents: Vec<Content>,
     is_error: bool,
-    overflow_store: &OverflowFileStore,
+    overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: OverflowMetadata,
 ) -> CallToolResult {
     contents = maybe_overflow_image_contents(contents, overflow_store, &overflow_metadata);
@@ -140,7 +140,7 @@ fn ensure_nonempty_contents(contents: &mut Vec<Content>) {
 
 fn maybe_overflow_text_contents(
     contents: Vec<Content>,
-    overflow_store: &OverflowFileStore,
+    overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: &OverflowMetadata,
 ) -> Vec<Content> {
     let total_text_bytes: usize = contents
@@ -160,13 +160,18 @@ fn maybe_overflow_text_contents(
     };
 
     let full_text = collect_text_contents(&contents);
-    let overflow_path = overflow_store.overflow_path(overflow_metadata);
-    let overflow_notice = match write_text_file(&overflow_path, &full_text) {
-        Ok(()) => overflow_notice_prefix(Some(&overflow_path)),
-        Err(err) => {
-            log_overflow_write_failure(overflow_store.root_path(), overflow_metadata, &err);
-            overflow_notice_prefix(None)
+    let overflow_notice = match overflow_store {
+        Some(store) => {
+            let overflow_path = store.overflow_path(overflow_metadata);
+            match write_text_file(&overflow_path, &full_text) {
+                Ok(()) => overflow_notice_prefix(Some(&overflow_path)),
+                Err(err) => {
+                    log_overflow_write_failure(Some(store.root_path()), overflow_metadata, &err);
+                    overflow_notice_prefix(None)
+                }
+            }
         }
+        None => overflow_notice_prefix(None),
     };
     let overflow_notice =
         utf8_prefix_by_bytes(&overflow_notice, INLINE_TEXT_LIMIT_BYTES).to_string();
@@ -203,20 +208,20 @@ fn maybe_overflow_text_contents(
 
 fn maybe_overflow_image_contents(
     contents: Vec<Content>,
-    overflow_store: &OverflowFileStore,
+    overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: &OverflowMetadata,
 ) -> Vec<Content> {
     let total_images = contents
         .iter()
         .filter(|content| matches!(&content.raw, RawContent::Image(_)))
         .count();
-    if total_images <= INLINE_IMAGE_LIMIT {
+    if total_images <= INLINE_IMAGE_LIMIT || overflow_store.is_none() {
         return contents;
     }
 
-    let mut rewritten = Vec::with_capacity(contents.len() + 1);
+    let overflow_store = overflow_store.expect("checked above");
+    let mut rewritten = Vec::with_capacity(contents.len());
     let mut inline_images_seen = 0usize;
-    let mut overflow_lines = Vec::new();
 
     for content in contents {
         let Some(image) = raw_image(&content) else {
@@ -231,13 +236,13 @@ fn maybe_overflow_image_contents(
         }
 
         match write_image_file(overflow_store, overflow_metadata, inline_images_seen, image) {
-            Ok(path) => overflow_lines.push(format!(
-                "[repl] image {inline_images_seen} omitted from inline response; full image at {}",
-                path.display()
-            )),
+            Ok(path) => rewritten.push(Content::text(image_overflow_notice(
+                inline_images_seen,
+                &path,
+            ))),
             Err(err) => {
                 log_overflow_image_write_failure(
-                    overflow_store.root_path(),
+                    Some(overflow_store.root_path()),
                     overflow_metadata,
                     inline_images_seen,
                     &err,
@@ -245,10 +250,6 @@ fn maybe_overflow_image_contents(
                 rewritten.push(content);
             }
         }
-    }
-
-    if !overflow_lines.is_empty() {
-        rewritten.push(Content::text(format!("{}\n", overflow_lines.join("\n"))));
     }
 
     rewritten
@@ -322,6 +323,13 @@ fn overflow_notice_prefix(overflow_path: Option<&Path>) -> String {
                 + "\n"
         }
     }
+}
+
+fn image_overflow_notice(image_index: usize, path: &Path) -> String {
+    format!(
+        "[repl] image {image_index} omitted from inline response; full image at {}\n",
+        path.display()
+    )
 }
 
 fn utf8_prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
@@ -441,11 +449,15 @@ fn fallback_overflow_root() -> PathBuf {
     root
 }
 
-fn log_overflow_write_failure(root_path: &Path, metadata: &OverflowMetadata, err: &io::Error) {
+fn log_overflow_write_failure(
+    root_path: Option<&Path>,
+    metadata: &OverflowMetadata,
+    err: &io::Error,
+) {
     crate::event_log::log(
         "tool_response_overflow_write_failed",
         json!({
-            "root_path": root_path.to_string_lossy().to_string(),
+            "root_path": root_path.map(|path| path.to_string_lossy().to_string()),
             "tool_name": metadata.tool_name,
             "turn_number": metadata.turn_number,
             "request_id": metadata.request_id,
@@ -455,7 +467,7 @@ fn log_overflow_write_failure(root_path: &Path, metadata: &OverflowMetadata, err
 }
 
 fn log_overflow_image_write_failure(
-    root_path: &Path,
+    root_path: Option<&Path>,
     metadata: &OverflowMetadata,
     image_index: usize,
     err: &io::Error,
@@ -463,7 +475,7 @@ fn log_overflow_image_write_failure(
     crate::event_log::log(
         "tool_response_image_overflow_write_failed",
         json!({
-            "root_path": root_path.to_string_lossy().to_string(),
+            "root_path": root_path.map(|path| path.to_string_lossy().to_string()),
             "tool_name": metadata.tool_name,
             "turn_number": metadata.turn_number,
             "request_id": metadata.request_id,
@@ -639,7 +651,7 @@ mod tests {
         let result = finalize_batch(
             vec![rmcp::model::Content::text("ok\n".to_string())],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 1, "call_123"),
         );
         assert_eq!(result_text(&result), "ok\n");
@@ -652,7 +664,7 @@ mod tests {
         let result = finalize_batch(
             vec![rmcp::model::Content::text(full_text.clone())],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 1, "call_123"),
         );
 
@@ -708,7 +720,7 @@ mod tests {
         let result = finalize_batch(
             vec![rmcp::model::Content::text(full_text.clone())],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 2, "call_utf8"),
         );
 
@@ -736,7 +748,7 @@ mod tests {
                 ),
             ],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 3, "call_image"),
         );
 
@@ -760,7 +772,7 @@ mod tests {
                 rmcp::model::Content::text(trailing_text),
             ],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 4, "call_mixed"),
         );
 
@@ -789,7 +801,7 @@ mod tests {
         let result = finalize_batch(
             contents,
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 8, "call_images"),
         );
 
@@ -819,6 +831,48 @@ mod tests {
     }
 
     #[test]
+    fn image_overflow_notice_stays_in_original_order() {
+        let store = OverflowFileStore::new().expect("overflow store");
+        let result = finalize_batch(
+            vec![
+                rmcp::model::Content::text("before\n".to_string()),
+                image_content(1),
+                image_content(2),
+                image_content(3),
+                image_content(4),
+                rmcp::model::Content::text("between\n".to_string()),
+                image_content(5),
+                rmcp::model::Content::text("after\n".to_string()),
+            ],
+            false,
+            Some(&store),
+            overflow_metadata("repl", 9, "call_order"),
+        );
+
+        assert!(matches!(result.content[0].raw, RawContent::Text(_)));
+        assert!(matches!(result.content[1].raw, RawContent::Image(_)));
+        assert!(matches!(result.content[2].raw, RawContent::Image(_)));
+        assert!(matches!(result.content[3].raw, RawContent::Image(_)));
+        assert!(matches!(result.content[4].raw, RawContent::Image(_)));
+        assert!(matches!(result.content[5].raw, RawContent::Text(_)));
+        assert!(matches!(result.content[6].raw, RawContent::Text(_)));
+        assert!(matches!(result.content[7].raw, RawContent::Text(_)));
+
+        let notice = match &result.content[6].raw {
+            RawContent::Text(text) => text.text.as_str(),
+            _ => unreachable!("expected text"),
+        };
+        assert!(notice.contains("image 5 omitted from inline response"));
+        assert!(notice.contains("full image at "));
+
+        let trailing_text = match &result.content[7].raw {
+            RawContent::Text(text) => text.text.as_str(),
+            _ => unreachable!("expected text"),
+        };
+        assert_eq!(trailing_text, "after\n");
+    }
+
+    #[test]
     fn image_overflow_falls_back_to_inline_images_when_write_fails() {
         let temp = tempdir().expect("tempdir");
         let blocked_root = temp.path().join("not-a-directory");
@@ -828,8 +882,8 @@ mod tests {
         let result = finalize_batch(
             contents,
             false,
-            &store,
-            overflow_metadata("repl", 9, "call_image_fail"),
+            Some(&store),
+            overflow_metadata("repl", 10, "call_image_fail"),
         );
 
         let inline_image_count = result
@@ -851,8 +905,8 @@ mod tests {
         let result = finalize_batch(
             contents,
             false,
-            &store,
-            overflow_metadata("repl", 10, "call_many_images"),
+            Some(&store),
+            overflow_metadata("repl", 11, "call_many_images"),
         );
 
         let inline_image_count = result
@@ -885,8 +939,26 @@ mod tests {
                 "x".repeat(INLINE_TEXT_LIMIT_BYTES + 128),
             )],
             false,
-            &store,
+            Some(&store),
             overflow_metadata("repl", 4, "call_fail"),
+        );
+
+        let text = result_text(&result);
+        assert!(text.contains("output truncated"));
+        assert!(text.contains("could not be persisted"));
+        assert!(!text.contains("full response at "));
+        assert!(text.len() <= INLINE_TEXT_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn overflow_without_store_keeps_server_response_usable() {
+        let result = finalize_batch(
+            vec![rmcp::model::Content::text(
+                "x".repeat(INLINE_TEXT_LIMIT_BYTES + 128),
+            )],
+            false,
+            None,
+            overflow_metadata("repl", 12, "call_no_store"),
         );
 
         let text = result_text(&result);

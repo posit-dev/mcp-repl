@@ -43,15 +43,27 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 #[derive(Clone)]
 struct SharedServer {
     worker: Arc<Mutex<WorkerManager>>,
-    overflow_store: OverflowFileStore,
+    overflow_store: Option<OverflowFileStore>,
     tool_turn_counter: Arc<AtomicU64>,
 }
 
 impl SharedServer {
     fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+        let overflow_store = match OverflowFileStore::new() {
+            Ok(store) => Some(store),
+            Err(err) => {
+                crate::event_log::log(
+                    "overflow_store_init_failed",
+                    json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                None
+            }
+        };
         Ok(Self {
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
-            overflow_store: OverflowFileStore::new()?,
+            overflow_store,
             tool_turn_counter: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -102,7 +114,7 @@ impl SharedServer {
             turn_number: self.tool_turn_counter.fetch_add(1, Ordering::Relaxed) + 1,
             request_id,
         };
-        worker_result_to_call_tool_result(result, &self.overflow_store, overflow_metadata)
+        worker_result_to_call_tool_result(result, self.overflow_store.as_ref(), overflow_metadata)
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -428,7 +440,7 @@ fn resolve_timeout_ms(
 
 fn worker_result_to_call_tool_result(
     result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
-    overflow_store: &OverflowFileStore,
+    overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: OverflowMetadata,
 ) -> Result<CallToolResult, McpError> {
     let mut contents = Vec::new();
