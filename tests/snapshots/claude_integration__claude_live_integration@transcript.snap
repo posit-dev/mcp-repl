@@ -1,0 +1,21 @@
+---
+source: tests/claude_integration.rs
+expression: transcript
+---
+$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json --tools ""
+stdin:
+Use the mcp__r__repl tool exactly once. Send this exact R code: cat("CLAUDE_MCP_OK\n") Then answer with exactly DONE, with no punctuation or extra text.
+
+init:
+cwd: <WORKSPACE>
+tools: mcp__r__repl, mcp__r__repl_reset
+mcp_server: r (connected)
+model: haiku
+permission_mode: dontAsk
+
+1) mcp__r__repl
+>>> cat("CLAUDE_MCP_OK\n")
+<<< CLAUDE_MCP_OK
+
+2) DONE
+result: DONE (end_turn)
