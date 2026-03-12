@@ -650,18 +650,11 @@ fn upsert_claude_hook_command(
         return Err(format!("claude settings `hooks.{event}` must be an array").into());
     };
 
-    if entries_arr
-        .iter()
-        .any(|entry| hook_entry_matches(entry, matcher) && hook_entry_has_command(entry, command))
-    {
-        return Ok(());
-    }
-
     if let Some(existing) = entries_arr
         .iter_mut()
         .find(|entry| hook_entry_matches(entry, matcher))
     {
-        append_hook_command(existing, command)?;
+        replace_mcp_repl_hook_command(existing, command)?;
         return Ok(());
     }
 
@@ -679,6 +672,7 @@ fn hook_entry_matches(entry: &JsonValue, matcher: Option<&str>) -> bool {
     }
 }
 
+#[cfg(test)]
 fn hook_entry_has_command(entry: &JsonValue, command: &str) -> bool {
     let Some(obj) = entry.as_object() else {
         return false;
@@ -697,7 +691,7 @@ fn hook_entry_has_command(entry: &JsonValue, command: &str) -> bool {
     })
 }
 
-fn append_hook_command(
+fn replace_mcp_repl_hook_command(
     entry: &mut JsonValue,
     command: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -710,8 +704,55 @@ fn append_hook_command(
     let Some(hooks_arr) = hooks.as_array_mut() else {
         return Err("claude hook entry `hooks` must be an array".into());
     };
-    hooks_arr.push(new_hook_command(command));
+
+    let target_subcommand = claude_hook_subcommand(command);
+    let mut command_present = false;
+    hooks_arr.retain(|hook| {
+        let Some(hook_obj) = hook.as_object() else {
+            return true;
+        };
+        if hook_obj.get("type").and_then(JsonValue::as_str) != Some("command") {
+            return true;
+        }
+        let Some(existing_command) = hook_obj.get("command").and_then(JsonValue::as_str) else {
+            return true;
+        };
+        if existing_command == command {
+            if command_present {
+                return false;
+            }
+            command_present = true;
+            return true;
+        }
+        !is_stale_mcp_repl_hook_command(existing_command, target_subcommand)
+    });
+
+    if !command_present {
+        hooks_arr.push(new_hook_command(command));
+    }
     Ok(())
+}
+
+fn claude_hook_subcommand(command: &str) -> Option<&'static str> {
+    if command.contains("claude-hook session-start") {
+        return Some("session-start");
+    }
+    if command.contains("claude-hook session-end") {
+        return Some("session-end");
+    }
+    None
+}
+
+fn is_stale_mcp_repl_hook_command(existing_command: &str, target_subcommand: Option<&str>) -> bool {
+    if !existing_command.contains("mcp-repl") || !existing_command.contains("claude-hook") {
+        return false;
+    }
+    match target_subcommand {
+        Some("session-start") => existing_command.contains("claude-hook session-start"),
+        Some("session-end") => existing_command.contains("claude-hook session-end"),
+        Some(_) => false,
+        None => true,
+    }
 }
 
 fn new_hook_entry(matcher: Option<&str>, command: &str) -> JsonValue {
@@ -1465,6 +1506,62 @@ name="demo"
             })
             .count();
         assert_eq!(startup_count, 1, "expected one startup hook");
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_replaces_existing_mcp_repl_command_for_matcher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+
+        let stale = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            {"type": "command", "command": "/opt/old/mcp-repl claude-hook session-start"},
+                            {"type": "command", "command": "echo keep-me"}
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &settings,
+            serde_json::to_string_pretty(&stale).expect("serialize stale settings"),
+        )
+        .expect("write stale settings");
+
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("upsert hooks");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let session_start = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array");
+        let startup = session_start
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some("startup"))
+            .expect("startup matcher entry");
+        let hooks = startup["hooks"].as_array().expect("hooks array");
+
+        let mcp_repl_commands: Vec<&str> = hooks
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .filter(|command| command.contains("mcp-repl claude-hook session-start"))
+            .collect();
+        assert_eq!(
+            mcp_repl_commands,
+            vec!["/usr/local/bin/mcp-repl claude-hook session-start"],
+            "expected stale mcp-repl command to be replaced"
+        );
+        assert!(
+            hooks
+                .iter()
+                .any(|hook| hook["command"].as_str() == Some("echo keep-me")),
+            "expected unrelated command to remain"
+        );
     }
 
     #[test]

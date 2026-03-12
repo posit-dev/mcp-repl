@@ -123,8 +123,8 @@ fn parse_cli_args_with_parser(
             Vec::new(),
         )?));
     }
-    if let Some(idx) = parser.args.iter().position(|arg| arg == "claude-hook") {
-        parser.index = idx + 1;
+    if parser.args.len() >= 2 && parser.args[parser.args.len() - 2] == "claude-hook" {
+        parser.index = parser.args.len() - 1;
         return Ok(CliCommand::ClaudeHook(parse_claude_hook_args(&mut parser)?));
     }
 
@@ -545,6 +545,21 @@ mod tests {
             parsed,
             CliCommand::ClaudeHook(crate::claude::HookCommand::SessionEnd)
         ));
+    }
+
+    #[test]
+    fn parse_cli_args_does_not_treat_non_trailing_claude_hook_token_as_hook_mode() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec!["--debug-events-dir".to_string(), "claude-hook".to_string()],
+            index: 0,
+        })
+        .expect("parse cli args");
+        match parsed {
+            CliCommand::RunServer(options) => {
+                assert_eq!(options.debug_events_dir, Some(PathBuf::from("claude-hook")));
+            }
+            _ => panic!("expected RunServer"),
+        }
     }
 
     #[test]
