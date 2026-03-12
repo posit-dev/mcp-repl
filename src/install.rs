@@ -14,6 +14,8 @@ const CODEX_TOOL_TIMEOUT_COMMENT: &str =
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl exits with an error.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
+const CLAUDE_HOOK_SESSION_START_MATCHERS: &[&str] = &["startup", "resume", "clear", "compact"];
+const CLAUDE_HOOK_SESSION_END_MATCHER: &str = "clear";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -127,17 +129,18 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 let config_path = root.join(".claude.json");
                 let settings_dir = root.join(".claude");
                 let settings_path = settings_dir.join("settings.json");
+                if !settings_dir.is_dir() {
+                    fs::create_dir_all(&settings_dir)?;
+                }
                 for (server_name, interpreter) in &server_specs {
                     let server_args = with_interpreter_arg(&claude_args, *interpreter);
                     upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
-                    // Ensure ~/.claude directory exists for settings.json
-                    if !settings_dir.is_dir() {
-                        fs::create_dir_all(&settings_dir)?;
-                    }
                     upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
+                upsert_claude_settings_hooks(&settings_path, &command)?;
                 println!("Updated claude MCP config: {}", config_path.display());
                 println!("Updated claude permissions: {}", settings_path.display());
+                println!("Updated claude hooks: {}", settings_path.display());
             }
         }
     }
@@ -583,6 +586,177 @@ fn upsert_claude_settings_permission(
     let serialized = serde_json::to_string_pretty(&root)?;
     atomic_write(settings_path, &format!("{serialized}\n"))?;
     Ok(())
+}
+
+fn upsert_claude_settings_hooks(
+    settings_path: &Path,
+    command: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = if settings_path.is_file() {
+        let raw = fs::read_to_string(settings_path)?;
+        serde_json::from_str::<JsonValue>(&raw).map_err(|err| {
+            format!(
+                "failed to parse JSON claude settings {}: {err}",
+                settings_path.display()
+            )
+        })?
+    } else {
+        JsonValue::Object(JsonMap::new())
+    };
+
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err("claude settings root must be a JSON object".into());
+    };
+    let hooks = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let Some(hooks_obj) = hooks.as_object_mut() else {
+        return Err("claude settings `hooks` must be a JSON object".into());
+    };
+
+    let session_start_command = claude_hook_command(command, "session-start");
+    let session_end_command = claude_hook_command(command, "session-end");
+    for matcher in CLAUDE_HOOK_SESSION_START_MATCHERS {
+        upsert_claude_hook_command(
+            hooks_obj,
+            "SessionStart",
+            Some(matcher),
+            &session_start_command,
+        )?;
+    }
+    upsert_claude_hook_command(
+        hooks_obj,
+        "SessionEnd",
+        Some(CLAUDE_HOOK_SESSION_END_MATCHER),
+        &session_end_command,
+    )?;
+
+    let serialized = serde_json::to_string_pretty(&root)?;
+    atomic_write(settings_path, &format!("{serialized}\n"))?;
+    Ok(())
+}
+
+fn upsert_claude_hook_command(
+    hooks_obj: &mut JsonMap<String, JsonValue>,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(entries_arr) = entries.as_array_mut() else {
+        return Err(format!("claude settings `hooks.{event}` must be an array").into());
+    };
+
+    if entries_arr
+        .iter()
+        .any(|entry| hook_entry_matches(entry, matcher) && hook_entry_has_command(entry, command))
+    {
+        return Ok(());
+    }
+
+    if let Some(existing) = entries_arr
+        .iter_mut()
+        .find(|entry| hook_entry_matches(entry, matcher))
+    {
+        append_hook_command(existing, command)?;
+        return Ok(());
+    }
+
+    entries_arr.push(new_hook_entry(matcher, command));
+    Ok(())
+}
+
+fn hook_entry_matches(entry: &JsonValue, matcher: Option<&str>) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return false;
+    };
+    match matcher {
+        Some(expected) => obj.get("matcher").and_then(JsonValue::as_str) == Some(expected),
+        None => !obj.contains_key("matcher"),
+    }
+}
+
+fn hook_entry_has_command(entry: &JsonValue, command: &str) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return false;
+    };
+    let Some(hooks) = obj.get("hooks").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    hooks.iter().any(|hook| {
+        hook.as_object()
+            .and_then(|hook| hook.get("type").and_then(JsonValue::as_str))
+            == Some("command")
+            && hook
+                .as_object()
+                .and_then(|hook| hook.get("command").and_then(JsonValue::as_str))
+                == Some(command)
+    })
+}
+
+fn append_hook_command(
+    entry: &mut JsonValue,
+    command: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(obj) = entry.as_object_mut() else {
+        return Err("claude hook entry must be an object".into());
+    };
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(hooks_arr) = hooks.as_array_mut() else {
+        return Err("claude hook entry `hooks` must be an array".into());
+    };
+    hooks_arr.push(new_hook_command(command));
+    Ok(())
+}
+
+fn new_hook_entry(matcher: Option<&str>, command: &str) -> JsonValue {
+    let mut object = JsonMap::new();
+    if let Some(matcher) = matcher {
+        object.insert(
+            "matcher".to_string(),
+            JsonValue::String(matcher.to_string()),
+        );
+    }
+    object.insert(
+        "hooks".to_string(),
+        JsonValue::Array(vec![new_hook_command(command)]),
+    );
+    JsonValue::Object(object)
+}
+
+fn new_hook_command(command: &str) -> JsonValue {
+    JsonValue::Object(JsonMap::from_iter([
+        ("type".to_string(), JsonValue::String("command".to_string())),
+        (
+            "command".to_string(),
+            JsonValue::String(command.to_string()),
+        ),
+    ]))
+}
+
+fn claude_hook_command(command: &str, hook: &str) -> String {
+    [command, "claude-hook", hook]
+        .iter()
+        .map(|part| shell_escape(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_escape(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    if raw
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':'))
+    {
+        return raw.to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn serialize_json_pretty_with_paired_args(
@@ -1223,5 +1397,68 @@ name="demo"
         )
         .expect("home dir");
         assert_eq!(resolved, PathBuf::from(r"D:\C:\Users\example_user"));
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_adds_session_start_and_clear_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("upsert hooks");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let session_start = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array");
+        assert!(
+            session_start.iter().any(|entry| {
+                entry["matcher"].as_str() == Some("startup")
+                    && hook_entry_has_command(
+                        entry,
+                        "/usr/local/bin/mcp-repl claude-hook session-start",
+                    )
+            }),
+            "expected startup SessionStart hook"
+        );
+        let session_end = root["hooks"]["SessionEnd"]
+            .as_array()
+            .expect("session end hooks array");
+        assert!(
+            session_end.iter().any(|entry| {
+                entry["matcher"].as_str() == Some("clear")
+                    && hook_entry_has_command(
+                        entry,
+                        "/usr/local/bin/mcp-repl claude-hook session-end",
+                    )
+            }),
+            "expected clear SessionEnd hook"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_does_not_duplicate_existing_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("first upsert");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("second upsert");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let session_start = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array");
+        let startup_count = session_start
+            .iter()
+            .filter(|entry| {
+                entry["matcher"].as_str() == Some("startup")
+                    && hook_entry_has_command(
+                        entry,
+                        "/usr/local/bin/mcp-repl claude-hook session-start",
+                    )
+            })
+            .count();
+        assert_eq!(startup_count, 1, "expected one startup hook");
     }
 }

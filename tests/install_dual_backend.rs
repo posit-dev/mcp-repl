@@ -159,6 +159,42 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         "expected python args to include python interpreter selection"
     );
 
+    let settings_path = temp.path().join(".claude/settings.json");
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let session_start = settings_root["hooks"]["SessionStart"]
+        .as_array()
+        .expect("expected SessionStart hooks array");
+    assert!(
+        session_start.iter().any(|entry| {
+            entry["matcher"].as_str() == Some("startup")
+                && entry["hooks"].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook["type"].as_str() == Some("command")
+                            && hook["command"].as_str()
+                                == Some("/usr/local/bin/mcp-repl claude-hook session-start")
+                    })
+                })
+        }),
+        "expected startup SessionStart hook"
+    );
+    let session_end = settings_root["hooks"]["SessionEnd"]
+        .as_array()
+        .expect("expected SessionEnd hooks array");
+    assert!(
+        session_end.iter().any(|entry| {
+            entry["matcher"].as_str() == Some("clear")
+                && entry["hooks"].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook["type"].as_str() == Some("command")
+                            && hook["command"].as_str()
+                                == Some("/usr/local/bin/mcp-repl claude-hook session-end")
+                    })
+                })
+        }),
+        "expected clear SessionEnd hook"
+    );
+
     Ok(())
 }
 
