@@ -4,11 +4,13 @@ use rmcp::model::{
     CallToolResult, Content, CustomNotification, CustomRequest, CustomResult, ErrorCode,
     ErrorData as McpError, JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
+use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,7 +20,9 @@ mod response;
 mod tests;
 mod timeouts;
 
-use self::response::{finalize_batch, worker_reply_to_contents};
+use self::response::{
+    OverflowFileStore, OverflowMetadata, finalize_batch, worker_reply_to_contents,
+};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
@@ -39,12 +43,16 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 #[derive(Clone)]
 struct SharedServer {
     worker: Arc<Mutex<WorkerManager>>,
+    overflow_store: OverflowFileStore,
+    tool_turn_counter: Arc<AtomicU64>,
 }
 
 impl SharedServer {
     fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
         Ok(Self {
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            overflow_store: OverflowFileStore::new()?,
+            tool_turn_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -70,6 +78,8 @@ impl SharedServer {
         &self,
         input: String,
         timeout: Duration,
+        tool_name: &'static str,
+        request_id: String,
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
@@ -78,7 +88,21 @@ impl SharedServer {
                 worker.write_stdin(input, worker_timeout, server_timeout, false)
             })
             .await?;
-        worker_result_to_call_tool_result(result)
+        self.finalize_tool_result(tool_name, request_id, result)
+    }
+
+    fn finalize_tool_result(
+        &self,
+        tool_name: &'static str,
+        request_id: String,
+        result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+    ) -> Result<CallToolResult, McpError> {
+        let overflow_metadata = OverflowMetadata {
+            tool_name: tool_name.to_string(),
+            turn_number: self.tool_turn_counter.fetch_add(1, Ordering::Relaxed) + 1,
+            request_id,
+        };
+        worker_result_to_call_tool_result(result, &self.overflow_store, overflow_metadata)
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -317,10 +341,16 @@ macro_rules! define_backend_tool_server {
 
             #[doc = include_str!($repl_doc_path)]
             #[tool(name = "repl")]
-            async fn repl(&self, params: Parameters<ReplArgs>) -> Result<CallToolResult, McpError> {
+            async fn repl(
+                &self,
+                params: Parameters<ReplArgs>,
+                request_context: RequestContext<RoleServer>,
+            ) -> Result<CallToolResult, McpError> {
                 let ReplArgs { input, timeout_ms } = params.0;
                 let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
-                self.shared.run_write_input(input, timeout).await
+                self.shared
+                    .run_write_input(input, timeout, "repl", request_context.id.to_string())
+                    .await
             }
 
             #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
@@ -328,6 +358,7 @@ macro_rules! define_backend_tool_server {
             async fn repl_reset(
                 &self,
                 _params: Parameters<ReplResetArgs>,
+                request_context: RequestContext<RoleServer>,
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
@@ -335,7 +366,11 @@ macro_rules! define_backend_tool_server {
                     .shared
                     .run_worker(move |worker| worker.restart(worker_timeout))
                     .await?;
-                worker_result_to_call_tool_result(result)
+                self.shared.finalize_tool_result(
+                    "repl_reset",
+                    request_context.id.to_string(),
+                    result,
+                )
             }
         }
 
@@ -393,6 +428,8 @@ fn resolve_timeout_ms(
 
 fn worker_result_to_call_tool_result(
     result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+    overflow_store: &OverflowFileStore,
+    overflow_metadata: OverflowMetadata,
 ) -> Result<CallToolResult, McpError> {
     let mut contents = Vec::new();
     let mut is_error = false;
@@ -401,13 +438,23 @@ fn worker_result_to_call_tool_result(
             let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
             is_error |= reply_error;
             contents.append(&mut reply_contents);
-            Ok(finalize_batch(contents, is_error))
+            Ok(finalize_batch(
+                contents,
+                is_error,
+                overflow_store,
+                overflow_metadata,
+            ))
         }
         Err(err) => {
             eprintln!("worker write stdin error: {err}");
             contents.push(Content::text(format!("worker error: {err}")));
             is_error = true;
-            Ok(finalize_batch(contents, is_error))
+            Ok(finalize_batch(
+                contents,
+                is_error,
+                overflow_store,
+                overflow_metadata,
+            ))
         }
     }
 }
