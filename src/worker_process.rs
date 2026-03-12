@@ -30,8 +30,8 @@ use crate::output_capture::{
     OutputTextSpan, OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset,
     reset_output_ring,
 };
-use crate::pager::{self, Pager};
-use crate::reply_overflow::{ReplyOverflowBehavior, ReplyOverflowSettings};
+use crate::pager;
+use crate::reply_overflow::ReplyOverflowSettings;
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
 };
@@ -68,7 +68,6 @@ const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
-const REPLY_OVERFLOW_IPC_SETTLE_WAIT: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -387,9 +386,6 @@ struct RequestState {
 
 struct SnapshotWithImages {
     contents: Vec<WorkerContent>,
-    pages_left: u64,
-    buffer: Option<pager::PagerBuffer>,
-    last_range: Option<(u64, u64)>,
 }
 
 struct CompletionSnapshot {
@@ -475,18 +471,12 @@ pub struct WorkerManager {
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
     output: OutputBuffer,
-    pager: Pager,
     reply_overflow_defaults: ReplyOverflowSettings,
-    reply_overflow: ReplyOverflowSettings,
     output_timeline: OutputTimeline,
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
     session_end_seen: bool,
-    // Prompt captured when pager is activated. We suppress REPL prompts while paging, but once
-    // paging is dismissed we still want to surface the prompt that was actually emitted by the
-    // backend for that turn (without inventing a prompt).
-    pager_prompt: Option<String>,
     last_prompt: Option<String>,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
@@ -547,8 +537,6 @@ impl WorkerManager {
             sandbox_defaults,
             sandbox_state,
             output: OutputBuffer::default(),
-            pager: Pager::default(),
-            reply_overflow: reply_overflow_defaults.clone(),
             reply_overflow_defaults,
             output_timeline,
             driver: match backend {
@@ -558,7 +546,6 @@ impl WorkerManager {
             pending_request: false,
             pending_request_started_at: None,
             session_end_seen: false,
-            pager_prompt: None,
             last_prompt: None,
             last_spawn: None,
             spawn_count: 0,
@@ -577,7 +564,7 @@ impl WorkerManager {
     }
 
     pub(crate) fn reply_overflow_settings(&self) -> ReplyOverflowSettings {
-        self.reply_overflow.clone()
+        self.reply_overflow_defaults.clone()
     }
 
     pub fn write_stdin(
@@ -588,14 +575,6 @@ impl WorkerManager {
         page_bytes_override: Option<u64>,
         echo_input: bool,
     ) -> Result<WorkerReply, WorkerError> {
-        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
-        if matches!(self.reply_overflow.behavior, ReplyOverflowBehavior::Files)
-            && self.pager.is_active()
-        {
-            self.pager.dismiss();
-            self.pager_prompt = None;
-        }
-
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
             let control_reply = match control {
@@ -628,28 +607,10 @@ impl WorkerManager {
             let input_context = self.prepare_input_context(&text, echo_input);
             let err = WorkerError::Guardrail(event.message);
             let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
-            let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager(preserve_pager);
+            let _ = self.reset();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
-        }
-
-        if self.pager.is_active() {
-            let trimmed = text.trim();
-            // While pager is active:
-            // - empty input and `:`-prefixed input are pager commands
-            // - other input auto-dismisses pager and is sent to the backend
-            if trimmed.is_empty() || trimmed.starts_with(':') {
-                if let Some(reply) = self.handle_pager_command(&text) {
-                    let reply = self.finalize_reply(reply);
-                    self.maybe_reset_after_session_end();
-                    return Ok(reply);
-                }
-            } else {
-                self.pager.dismiss();
-                self.pager_prompt = None;
-            }
         }
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
         if let Err(err) = self.ensure_process() {
@@ -704,8 +665,7 @@ impl WorkerManager {
             Err(err) => {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
-                let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset();
                 return Ok(self.finalize_reply(reply));
             }
         };
@@ -713,39 +673,6 @@ impl WorkerManager {
         let reply = self.finalize_reply(reply);
         self.maybe_reset_after_session_end();
         Ok(reply)
-    }
-
-    fn handle_pager_command(&mut self, text: &str) -> Option<ReplyWithOffset> {
-        if !self.pager.is_active() {
-            return None;
-        }
-        self.pager.refresh_from_output(&self.output);
-        let mut reply = self.pager.handle_command(text);
-        // `handle_command()` may dismiss the pager (e.g. `q`, `tail`, reaching end). Only emit
-        // the backend prompt once the pager is no longer active.
-        let pager_active = self.pager.is_active();
-        let WorkerReply::Output {
-            contents, prompt, ..
-        } = &mut reply;
-        let resolved_prompt = if pager_active {
-            None
-        } else {
-            self.pager_prompt.take()
-        };
-        if pager_active {
-            *prompt = None;
-        } else {
-            self.remember_prompt(resolved_prompt.clone());
-            if resolved_prompt.is_none() {
-                contents.push(WorkerContent::stderr(
-                    "[repl] protocol error: missing prompt after pager dismiss",
-                ));
-            }
-            append_prompt_if_missing(contents, resolved_prompt.clone());
-            *prompt = resolved_prompt;
-        }
-        let end_offset = self.output.end_offset().unwrap_or(0);
-        Some(ReplyWithOffset { reply, end_offset })
     }
 
     fn poll_pending_output(
@@ -813,13 +740,7 @@ impl WorkerManager {
             (saw_stderr, snapshot)
         };
         let is_error = saw_stderr;
-        let page_is_error = saw_stderr;
-        let SnapshotWithImages {
-            mut contents,
-            pages_left,
-            buffer,
-            last_range,
-        } = snapshot;
+        let SnapshotWithImages { mut contents, .. } = snapshot;
 
         if timed_out {
             let elapsed = self
@@ -829,15 +750,6 @@ impl WorkerManager {
             contents.push(timeout_status_content(elapsed));
         }
 
-        pager::maybe_activate_and_append_footer(
-            &mut self.pager,
-            &mut contents,
-            pages_left,
-            page_is_error,
-            buffer,
-            last_range,
-        );
-
         let session_end = completion.session_end_seen;
         let resolved_prompt = normalize_prompt(completion.prompt.clone());
         let resolved_prompt = if session_end || timed_out {
@@ -846,16 +758,11 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        if self.pager.is_active() && !session_end {
-            self.pager_prompt = resolved_prompt.clone();
-        }
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
             }
-            if !self.pager.is_active() {
-                append_prompt_if_missing(&mut contents, resolved_prompt.clone());
-            }
+            append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
 
         Ok(ReplyWithOffset {
@@ -863,9 +770,7 @@ impl WorkerManager {
                 contents,
                 is_error,
                 error_code: timed_out.then_some(WorkerErrorCode::Timeout),
-                prompt: (!self.pager.is_active() && !session_end)
-                    .then_some(())
-                    .and(resolved_prompt),
+                prompt: (!session_end).then_some(()).and(resolved_prompt),
                 prompt_variants: completion.prompt_variants.clone(),
             },
             end_offset,
@@ -895,9 +800,13 @@ impl WorkerManager {
             let pending_bytes = pending_end.saturating_sub(pending_start);
 
             prefix_is_error = self
-                .output
-                .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
-            prefix_contents = pager::take_range_from_ring(&self.output, pending_end);
+                .output_timeline
+                .archive_saw_stderr_in_range(pending_start.min(pending_end), pending_end);
+            prefix_contents = pager::contents_from_output_range(
+                self.output_timeline
+                    .read_archive_range(pending_start, pending_end),
+            );
+            self.output.advance_offset_to(pending_end);
             prefix_bytes = pending_bytes;
         }
 
@@ -957,19 +866,9 @@ impl WorkerManager {
         }
         let SnapshotWithImages {
             contents: mut page_contents,
-            pages_left,
-            buffer,
-            last_range,
+            ..
         } = self.snapshot_page_for_reply(end_offset, first_page_budget);
         contents.append(&mut page_contents);
-        pager::maybe_activate_and_append_footer(
-            &mut self.pager,
-            &mut contents,
-            pages_left,
-            true,
-            buffer,
-            last_range,
-        );
         contents.push(WorkerContent::stderr(format!("worker error: {err}")));
         ReplyWithOffset {
             reply: WorkerReply::Output {
@@ -1015,38 +914,22 @@ impl WorkerManager {
                 );
                 let saw_stderr = completion_snapshot.saw_stderr;
                 let is_error = context.prefix_is_error || saw_stderr;
-                let page_is_error = is_error;
                 let SnapshotWithImages {
                     contents: mut page_contents,
-                    pages_left,
-                    buffer,
-                    last_range,
+                    ..
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
-                pager::maybe_activate_and_append_footer(
-                    &mut self.pager,
-                    &mut contents,
-                    pages_left,
-                    page_is_error,
-                    buffer,
-                    last_range,
-                );
                 let resolved_prompt = if session_end {
                     None
                 } else {
                     normalize_prompt(completion.prompt.clone())
                 };
                 self.remember_prompt(resolved_prompt.clone());
-                if self.pager.is_active() && !session_end {
-                    self.pager_prompt = resolved_prompt.clone();
-                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
                     }
-                    if !self.pager.is_active() {
-                        append_prompt_if_missing(&mut contents, resolved_prompt.clone());
-                    }
+                    append_prompt_if_missing(&mut contents, resolved_prompt.clone());
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 Ok(ReplyWithOffset {
@@ -1054,9 +937,7 @@ impl WorkerManager {
                         contents,
                         is_error,
                         error_code: None,
-                        prompt: (!self.pager.is_active() && !session_end)
-                            .then_some(())
-                            .and(resolved_prompt),
+                        prompt: (!session_end).then_some(()).and(resolved_prompt),
                         prompt_variants: completion.prompt_variants.clone(),
                     },
                     end_offset,
@@ -1087,9 +968,7 @@ impl WorkerManager {
                 }
                 let SnapshotWithImages {
                     contents: mut page_contents,
-                    pages_left,
-                    buffer,
-                    last_range,
+                    ..
                 } = self.snapshot_page_for_reply(end_offset, first_page_budget);
                 contents.append(&mut page_contents);
 
@@ -1097,15 +976,6 @@ impl WorkerManager {
 
                 let saw_stderr = self.saw_stderr_for_reply_range(context.start_offset, end_offset);
                 let is_error = context.prefix_is_error || saw_stderr;
-
-                pager::maybe_activate_and_append_footer(
-                    &mut self.pager,
-                    &mut contents,
-                    pages_left,
-                    is_error,
-                    buffer,
-                    last_range,
-                );
 
                 Ok(ReplyWithOffset {
                     reply: WorkerReply::Output {
@@ -1120,8 +990,7 @@ impl WorkerManager {
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error(&err, context, page_bytes);
-                let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset();
                 Ok(reply)
             }
         }
@@ -1284,8 +1153,7 @@ impl WorkerManager {
 
     fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
-            let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager(preserve_pager);
+            let _ = self.reset();
             self.session_end_seen = false;
         }
     }
@@ -1315,20 +1183,7 @@ impl WorkerManager {
 
         let page_bytes = pager::resolve_page_bytes(None);
         if self.pending_request {
-            let mut reply = self.poll_pending_output(timeout, page_bytes)?;
-            let pager_active = self.pager.is_active();
-            let prompt = match &reply.reply {
-                WorkerReply::Output { prompt, .. } => prompt.clone(),
-            };
-            let WorkerReply::Output { contents, .. } = &mut reply.reply;
-            if !pager_active {
-                if let Some(prompt) = prompt.as_deref() {
-                    strip_trailing_prompt(contents, prompt);
-                }
-                if let Some(prompt) = prompt {
-                    append_prompt_if_missing(contents, Some(prompt));
-                }
-            }
+            let reply = self.poll_pending_output(timeout, page_bytes)?;
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -1363,27 +1218,12 @@ impl WorkerManager {
         }
 
         let is_error = self.saw_stderr_for_reply_range(start_offset, end_offset);
-        let page_is_error = is_error;
-
-        let SnapshotWithImages {
-            mut contents,
-            pages_left,
-            buffer,
-            last_range,
-        } = self.snapshot_page_for_reply(end_offset, page_bytes);
+        let SnapshotWithImages { mut contents, .. } =
+            self.snapshot_page_for_reply(end_offset, page_bytes);
 
         if timed_out {
             contents.push(timeout_status_content(timeout));
         }
-
-        pager::maybe_activate_and_append_footer(
-            &mut self.pager,
-            &mut contents,
-            pages_left,
-            page_is_error,
-            buffer,
-            last_range,
-        );
 
         let session_end = self.session_end_seen;
         let resolved_prompt = normalize_prompt(prompt.clone());
@@ -1393,14 +1233,11 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        if self.pager.is_active() && !session_end {
-            self.pager_prompt = resolved_prompt.clone();
-        }
         if !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
-                strip_trailing_prompt(&mut contents, prompt_text);
+                strip_prompt_from_contents(&mut contents, prompt_text);
             }
-            if !timed_out && !self.pager.is_active() {
+            if !timed_out {
                 append_prompt_if_missing(&mut contents, resolved_prompt.clone());
             }
         }
@@ -1409,9 +1246,7 @@ impl WorkerManager {
             contents,
             is_error,
             error_code: timed_out.then_some(WorkerErrorCode::Timeout),
-            prompt: (!self.pager.is_active() && !session_end)
-                .then_some(())
-                .and(resolved_prompt),
+            prompt: (!session_end).then_some(()).and(resolved_prompt),
             prompt_variants: None,
         };
         crate::event_log::log(
@@ -1440,11 +1275,9 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.reset_reply_overflow_defaults();
-
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply(page_bytes, "new session started");
-        self.reset_output_state(false);
+        self.reset_output_state();
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -1491,33 +1324,6 @@ impl WorkerManager {
         }
         self.process = Some(self.spawn_process()?);
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
-        Ok(())
-    }
-
-    fn reset_with_pager(&mut self, preserve_pager: bool) -> Result<(), WorkerError> {
-        crate::event_log::log(
-            "worker_reset_with_pager_begin",
-            serde_json::json!({
-                "preserve_pager": preserve_pager,
-            }),
-        );
-        if let Some(process) = self.process.take() {
-            let _ = process.kill();
-        }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-        if self.awaiting_initial_sandbox_state_update {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
-        self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
-        crate::event_log::log(
-            "worker_reset_with_pager_end",
-            serde_json::json!({
-                "status": "ok",
-                "preserve_pager": preserve_pager,
-            }),
-        );
         Ok(())
     }
 
@@ -1570,26 +1376,26 @@ impl WorkerManager {
         Ok(true)
     }
 
-    fn reset_output_state(&mut self, preserve_pager: bool) {
+    fn reset_output_state(&mut self) {
         reset_output_ring();
         reset_last_reply_marker_offset();
         self.output_timeline.reset_archive();
         self.output = OutputBuffer::default();
-        if !preserve_pager {
-            self.pager = Pager::default();
-        }
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
-        self.pager_prompt = None;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
-    fn refresh_reply_overflow_settings_from_ipc(&mut self, wait: Duration) {
-        let Some(ipc) = self.process.as_ref().and_then(|process| process.ipc.get()) else {
-            return;
-        };
+    pub(crate) fn take_latest_reply_overflow_settings(
+        &mut self,
+        wait: Duration,
+    ) -> Option<ReplyOverflowSettings> {
+        let ipc = self
+            .process
+            .as_ref()
+            .and_then(|process| process.ipc.get())?;
         let mut latest = None;
         while let Some(settings) = ipc.take_reply_overflow_settings() {
             latest = Some(settings);
@@ -1600,118 +1406,76 @@ impl WorkerManager {
                 latest = Some(settings);
             }
         }
-        if let Some(settings) = latest
-            && settings.validate().is_ok()
-        {
-            self.reply_overflow = settings;
-        }
-    }
-
-    fn reset_reply_overflow_defaults(&mut self) {
-        self.reply_overflow = self.reply_overflow_defaults.clone();
+        latest.filter(|settings| settings.validate().is_ok())
     }
 
     fn snapshot_page_for_reply(
         &mut self,
         end_offset: u64,
-        target_bytes: u64,
+        _target_bytes: u64,
     ) -> SnapshotWithImages {
-        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
-        match self.reply_overflow.behavior {
-            ReplyOverflowBehavior::Pager => {
-                snapshot_page_with_images(&self.output, end_offset, target_bytes)
-            }
-            ReplyOverflowBehavior::Files => {
-                let start_offset = self.output.current_offset().unwrap_or(end_offset);
-                let range = self
-                    .output_timeline
-                    .read_archive_range(start_offset, end_offset);
-                self.output.advance_offset_to(end_offset);
-                self.render_files_snapshot_from_range(range, None)
-            }
-        }
+        let start_offset = self.output.current_offset().unwrap_or(end_offset);
+        let range = self
+            .output_timeline
+            .read_archive_range(start_offset, end_offset);
+        self.output.advance_offset_to(end_offset);
+        self.render_files_snapshot_from_range(range, None)
     }
 
     fn saw_stderr_for_reply_range(&mut self, start_offset: u64, end_offset: u64) -> bool {
-        self.refresh_reply_overflow_settings_from_ipc(Duration::from_millis(0));
-        match self.reply_overflow.behavior {
-            ReplyOverflowBehavior::Pager => self
-                .output
-                .saw_stderr_in_range(start_offset.min(end_offset), end_offset),
-            ReplyOverflowBehavior::Files => self
-                .output_timeline
-                .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset),
-        }
+        self.output_timeline
+            .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset)
     }
 
     fn snapshot_after_completion_for_reply(
         &mut self,
         start_offset: u64,
         end_offset: u64,
-        target_bytes: u64,
+        _target_bytes: u64,
         completion: &CompletionInfo,
     ) -> CompletionSnapshot {
-        self.refresh_reply_overflow_settings_from_ipc(REPLY_OVERFLOW_IPC_SETTLE_WAIT);
-        match self.reply_overflow.behavior {
-            ReplyOverflowBehavior::Pager => snapshot_after_completion(
-                &self.output,
-                start_offset,
-                end_offset,
-                target_bytes,
-                completion,
-            ),
-            ReplyOverflowBehavior::Files => {
-                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-                if !trim_enabled {
-                    let saw_stderr = self
-                        .output_timeline
-                        .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-                    let range = self
-                        .output_timeline
-                        .read_archive_range(start_offset, end_offset);
-                    self.output.advance_offset_to(end_offset);
-                    let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-                    let (bytes, events, text_spans) = collapse_echo_with_attribution(
-                        range,
-                        &completion.echo_events,
-                        &prompt_variants,
-                    );
-                    let snapshot = self.render_files_snapshot_from_range(
-                        output_range_from_collapsed(bytes, events, text_spans),
-                        completion.prompt.as_deref(),
-                    );
-                    return CompletionSnapshot {
-                        snapshot,
-                        saw_stderr,
-                    };
-                }
+        let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+        if !trim_enabled {
+            let saw_stderr = self
+                .output_timeline
+                .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+            let range = self
+                .output_timeline
+                .read_archive_range(start_offset, end_offset);
+            self.output.advance_offset_to(end_offset);
+            let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
+            let (bytes, events, text_spans) =
+                collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+            let snapshot = self.render_files_snapshot_from_range(
+                output_range_from_collapsed(bytes, events, text_spans),
+                completion.prompt.as_deref(),
+            );
+            return CompletionSnapshot {
+                snapshot,
+                saw_stderr,
+            };
+        }
 
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-                if let Some(echo) = echo_transcript.as_deref() {
-                    let _ = drop_echo_only_output(&self.output, start_offset, end_offset, echo);
-                }
+        let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+        if let Some(echo) = echo_transcript.as_deref() {
+            let _ = drop_echo_only_output(&self.output, start_offset, end_offset, echo);
+        }
 
-                let _ = trim_echo_prefix_in_output(
-                    &self.output,
-                    echo_transcript.as_deref(),
-                    trim_enabled,
-                );
-                let effective_start = self.output.current_offset().unwrap_or(start_offset);
-                let saw_stderr = self
-                    .output_timeline
-                    .archive_saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-                let range = self
-                    .output_timeline
-                    .read_archive_range(effective_start, end_offset);
-                self.output.advance_offset_to(end_offset);
-                let mut snapshot =
-                    self.render_files_snapshot_from_range(range, completion.prompt.as_deref());
-                maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
-                CompletionSnapshot {
-                    snapshot,
-                    saw_stderr,
-                }
-            }
+        let _ = trim_echo_prefix_in_output(&self.output, echo_transcript.as_deref(), trim_enabled);
+        let effective_start = self.output.current_offset().unwrap_or(start_offset);
+        let saw_stderr = self
+            .output_timeline
+            .archive_saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+        let range = self
+            .output_timeline
+            .read_archive_range(effective_start, end_offset);
+        self.output.advance_offset_to(end_offset);
+        let mut snapshot =
+            self.render_files_snapshot_from_range(range, completion.prompt.as_deref());
+        maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
+        CompletionSnapshot {
+            snapshot,
+            saw_stderr,
         }
     }
 
@@ -1757,7 +1521,7 @@ impl WorkerManager {
     }
 
     fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state(false);
+        self.reset_output_state();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state, Some(false))
         });
@@ -1765,7 +1529,7 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
-            &self.reply_overflow,
+            &self.reply_overflow_defaults,
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1791,50 +1555,6 @@ impl WorkerManager {
             serde_json::json!({
                 "backend": format!("{:?}", self.backend),
                 "spawn_count": self.spawn_count,
-            }),
-        );
-        Ok(process)
-    }
-
-    fn spawn_process_with_pager(
-        &mut self,
-        preserve_pager: bool,
-    ) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state(preserve_pager);
-        crate::event_log::log_lazy("worker_spawn_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state, Some(preserve_pager))
-        });
-        let process = WorkerProcess::spawn(
-            self.backend,
-            &self.exe_path,
-            &self.sandbox_state,
-            &self.reply_overflow,
-            self.output_timeline.clone(),
-            self.guardrail.clone(),
-        )?;
-        let ipc = process
-            .ipc
-            .get()
-            .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
-            let _ = process.kill();
-            crate::event_log::log(
-                "worker_spawn_error",
-                serde_json::json!({
-                    "error": err.to_string(),
-                    "backend": format!("{:?}", self.backend),
-                }),
-            );
-            return Err(err);
-        }
-        self.seed_last_prompt_from_process(&process);
-        self.record_spawn();
-        crate::event_log::log(
-            "worker_spawn_end",
-            serde_json::json!({
-                "backend": format!("{:?}", self.backend),
-                "spawn_count": self.spawn_count,
-                "preserve_pager": preserve_pager,
             }),
         );
         Ok(process)
@@ -1922,12 +1642,8 @@ impl WorkerManager {
         let end_offset = self.output.end_offset().unwrap_or(0);
         let mut is_error = false;
 
-        let SnapshotWithImages {
-            mut contents,
-            pages_left,
-            buffer,
-            last_range,
-        } = self.snapshot_page_for_reply(end_offset, page_bytes);
+        let SnapshotWithImages { mut contents, .. } =
+            self.snapshot_page_for_reply(end_offset, page_bytes);
 
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
@@ -1942,15 +1658,6 @@ impl WorkerManager {
         if !meta.is_empty() {
             contents.push(WorkerContent::stderr(format!("[repl] {meta}")));
         }
-
-        pager::maybe_activate_and_append_footer(
-            &mut self.pager,
-            &mut contents,
-            pages_left,
-            is_error,
-            buffer,
-            last_range,
-        );
 
         ReplyWithOffset {
             reply: WorkerReply::Output {
@@ -1976,9 +1683,6 @@ fn render_files_snapshot_from_range(
     }
     SnapshotWithImages {
         contents: full_contents,
-        pages_left: 0,
-        buffer: None,
-        last_range: None,
     }
 }
 
@@ -2032,219 +1736,6 @@ fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
 fn apply_reply_overflow_env(command: &mut Command, reply_overflow: &ReplyOverflowSettings) {
     for (key, value) in reply_overflow.env_pairs() {
         command.env(key, value);
-    }
-}
-
-fn snapshot_page_with_images(
-    output: &OutputBuffer,
-    end_offset: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let start_offset = output.current_offset().unwrap_or(end_offset);
-    let image_groups = collect_image_groups(output, start_offset, end_offset);
-    let pager::SnapshotPage {
-        mut contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte,
-    } = pager::take_snapshot_page_from_ring(output, end_offset, target_bytes);
-    if pages_left == 0
-        && pager::MAX_IMAGES_PER_PAGE > 0
-        && contents
-            .iter()
-            .all(|content| !matches!(content, WorkerContent::ContentImage { .. }))
-        && !image_groups.is_empty()
-    {
-        // The pager snapshot may exclude image events when the text page is tiny (e.g. just a
-        // prompt). Ensure we still surface the final images for this capture range.
-        let max = pager::MAX_IMAGES_PER_PAGE.min(image_groups.len());
-        for (_, image) in image_groups.into_iter().take(max) {
-            contents.push(image);
-        }
-        return SnapshotWithImages {
-            contents,
-            pages_left,
-            buffer,
-            last_range,
-        };
-    }
-    let page_end = page_end_offset(start_offset, end_offset, pages_left, last_range_end_byte);
-    let mut remaining_images = pager::MAX_IMAGES_PER_PAGE;
-    if remaining_images > 0 {
-        let already = contents
-            .iter()
-            .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
-            .count();
-        remaining_images = remaining_images.saturating_sub(already);
-    }
-    if remaining_images > 0 && page_end < end_offset {
-        append_image_groups_after_page(&mut contents, page_end, image_groups, remaining_images);
-    }
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-fn snapshot_page_with_images_from_collapsed(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<OutputTextSpan>,
-    source_end: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    let pager::SnapshotPage {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte: _,
-    } = pager::take_snapshot_page_from_buffer(buffer, target_bytes);
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-fn snapshot_after_completion(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    target_bytes: u64,
-    completion: &CompletionInfo,
-) -> CompletionSnapshot {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    if !trim_enabled {
-        // Multi-expression inputs can produce huge echoed transcripts even when most lines are
-        // silent. Collapse echoed input aggressively (while preserving attribution to the
-        // relevant expression) so we don't page/hang on pure echo.
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let (bytes, events, text_spans) =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-        let snapshot = snapshot_page_with_images_from_collapsed(
-            bytes,
-            events,
-            text_spans,
-            end_offset,
-            target_bytes,
-        );
-        return CompletionSnapshot {
-            snapshot,
-            saw_stderr,
-        };
-    }
-
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-    if let Some(echo) = echo_transcript.as_deref() {
-        // Large multi-line inputs can be echoed back line-by-line by the backend, which can trip
-        // the pager and waste tokens even when the input is silent. If the turn's captured output
-        // is exactly the echoed bytes, drop it entirely.
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-
-    let mut snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
-    maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
-    CompletionSnapshot {
-        snapshot,
-        saw_stderr,
-    }
-}
-
-fn page_end_offset(
-    start_offset: u64,
-    end_offset: u64,
-    pages_left: u64,
-    last_range_end_byte: Option<u64>,
-) -> u64 {
-    if pages_left == 0 {
-        return end_offset;
-    }
-    if let Some(end_byte) = last_range_end_byte {
-        return start_offset.saturating_add(end_byte);
-    }
-    start_offset
-}
-
-fn collect_image_groups(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-) -> Vec<(u64, WorkerContent)> {
-    let range = output.read_range(start_offset, end_offset);
-    let mut groups: Vec<(u64, WorkerContent)> = Vec::new();
-    let mut current: Option<(u64, WorkerContent)> = None;
-
-    for event in range.events.iter() {
-        let (is_new, content) = match &event.kind {
-            OutputEventKind::Image {
-                data,
-                mime_type,
-                id,
-                is_new,
-            } => (
-                *is_new,
-                WorkerContent::ContentImage {
-                    data: data.clone(),
-                    mime_type: mime_type.clone(),
-                    id: id.clone(),
-                    is_new: *is_new,
-                },
-            ),
-            _ => continue,
-        };
-
-        if is_new || current.is_none() {
-            if let Some(prev) = current.take() {
-                groups.push(prev);
-            }
-            current = Some((event.offset, content));
-        } else {
-            current = Some((event.offset, content));
-        }
-    }
-    if let Some(prev) = current.take() {
-        groups.push(prev);
-    }
-
-    groups
-}
-
-fn append_image_groups_after_page(
-    contents: &mut Vec<WorkerContent>,
-    page_end_offset: u64,
-    groups: Vec<(u64, WorkerContent)>,
-    max_images: usize,
-) {
-    let mut appended = 0usize;
-    let mut last_offset = page_end_offset;
-    for (offset, content) in groups {
-        if offset <= page_end_offset {
-            continue;
-        }
-        if appended >= max_images {
-            break;
-        }
-        if offset > last_offset {
-            contents.push(WorkerContent::stderr(format!(
-                "[pager] elided output: @{last_offset}..{offset}\n"
-            )));
-        }
-        contents.push(content);
-        appended = appended.saturating_add(1);
-        last_offset = offset;
     }
 }
 
@@ -2789,32 +2280,6 @@ fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<St
         return;
     }
     contents.push(WorkerContent::stdout(prompt));
-}
-
-fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
-    if prompt.is_empty() {
-        return;
-    }
-    let idx = contents
-        .iter()
-        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }));
-    let Some(idx) = idx else {
-        return;
-    };
-    let WorkerContent::ContentText { text, stream } = &contents[idx] else {
-        return;
-    };
-    let Some(prefix) = text.strip_suffix(prompt) else {
-        return;
-    };
-    if prefix.is_empty() {
-        contents.remove(idx);
-    } else {
-        contents[idx] = WorkerContent::ContentText {
-            text: prefix.to_string(),
-            stream: *stream,
-        };
-    }
 }
 
 fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {

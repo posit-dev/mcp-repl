@@ -8,7 +8,7 @@ use crate::backend::Backend;
 use crate::pager;
 use crate::reply_overflow::ReplyOverflowSettings;
 use crate::sandbox_cli::SandboxCliPlan;
-use crate::server::overflow::ReplyFilesManager;
+use crate::server::overflow::ReplyPresentation;
 use crate::worker_process::{WorkerError, WorkerManager};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
 
@@ -37,11 +37,12 @@ pub(crate) fn run(
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
     let mut worker = WorkerManager::new(backend, sandbox_plan, reply_overflow)?;
-    let mut reply_files = ReplyFilesManager::new()?;
+    let mut presentation = ReplyPresentation::new(worker.reply_overflow_settings())?;
     worker.warm_start()?;
     let mut last_prompt = None;
     let initial_reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
-    let reply = apply_reply_overflow(&mut worker, &mut reply_files, initial_reply);
+    refresh_reply_presentation(&mut worker, &mut presentation);
+    let reply = presentation.present_reply(initial_reply);
     render_reply(
         reply,
         &mut stdout,
@@ -58,9 +59,21 @@ pub(crate) fn run(
             break;
         };
 
+        if let Some(reply) = presentation.handle_input(&line) {
+            render_reply(
+                reply,
+                &mut stdout,
+                &mut stderr,
+                image_support,
+                &mut last_prompt,
+            )?;
+            continue;
+        }
+
         if is_exact_command(&line, "INTERRUPT") {
             let interrupt_reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            let reply = apply_reply_overflow(&mut worker, &mut reply_files, interrupt_reply);
+            refresh_reply_presentation(&mut worker, &mut presentation);
+            let reply = presentation.present_reply(interrupt_reply);
             render_reply(
                 reply,
                 &mut stdout,
@@ -72,8 +85,9 @@ pub(crate) fn run(
         }
         if is_exact_command(&line, "RESTART") {
             let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            reply_files.clear()?;
-            let reply = apply_reply_overflow(&mut worker, &mut reply_files, reply);
+            presentation.reset_to_defaults()?;
+            refresh_reply_presentation(&mut worker, &mut presentation);
+            let reply = presentation.present_reply(reply);
             render_reply(
                 reply,
                 &mut stdout,
@@ -91,7 +105,8 @@ pub(crate) fn run(
                 None,
                 false,
             )?;
-            let reply = apply_reply_overflow(&mut worker, &mut reply_files, reply);
+            refresh_reply_presentation(&mut worker, &mut presentation);
+            let reply = presentation.present_reply(reply);
             render_reply(
                 reply,
                 &mut stdout,
@@ -124,7 +139,8 @@ pub(crate) fn run(
             None,
             false,
         )?;
-        let reply = apply_reply_overflow(&mut worker, &mut reply_files, reply);
+        refresh_reply_presentation(&mut worker, &mut presentation);
+        let reply = presentation.present_reply(reply);
         render_reply(
             reply,
             &mut stdout,
@@ -137,13 +153,9 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn apply_reply_overflow(
-    worker: &mut WorkerManager,
-    reply_files: &mut ReplyFilesManager,
-    reply: WorkerReply,
-) -> WorkerReply {
-    let settings = worker.reply_overflow_settings();
-    reply_files.apply_to_reply(reply, &settings)
+fn refresh_reply_presentation(worker: &mut WorkerManager, presentation: &mut ReplyPresentation) {
+    let latest = worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
+    presentation.update_settings(latest);
 }
 
 fn wait_for_initial_prompt(

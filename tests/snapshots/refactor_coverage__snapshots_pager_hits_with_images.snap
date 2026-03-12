@@ -22,6 +22,16 @@ response:
       "text": "> cat(\"# Title\\n\")\n# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16"
     },
     {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
       "type": "text",
       "text": "--More-- (Np, 11.3%, @0..298/2627)"
     }

@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
-use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
+use crate::output_capture::{
+    OutputBuffer, OutputEvent, OutputEventKind, OutputRange, OutputTextSpan,
+};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 mod command;
@@ -50,6 +52,7 @@ pub(crate) struct PagerBuffer {
     cursor: u64,
     events: Vec<PagerEvent>,
     text_spans: Vec<PagerTextSpan>,
+    #[allow(dead_code)]
     source_end: u64,
 }
 
@@ -81,6 +84,7 @@ pub(crate) struct SnapshotPage {
     pub(crate) pages_left: u64,
     pub(crate) buffer: Option<PagerBuffer>,
     pub(crate) last_range: Option<(u64, u64)>,
+    #[allow(dead_code)]
     pub(crate) last_range_end_byte: Option<u64>,
 }
 
@@ -137,6 +141,7 @@ impl PagerBuffer {
     ///
     /// `source_end` tracks the worker output ring offset consumed for this buffer, so the pager
     /// can later append any new output that arrives while pager mode is active.
+    #[allow(dead_code)]
     pub(crate) fn from_bytes_and_events(
         bytes: Vec<u8>,
         events: Vec<(u64, OutputEventKind)>,
@@ -457,10 +462,12 @@ impl PagerBuffer {
         Some((start_offset, end_offset))
     }
 
+    #[allow(dead_code)]
     fn source_end_offset(&self) -> u64 {
         self.source_end
     }
 
+    #[allow(dead_code)]
     fn append_range(&mut self, range: OutputRange) {
         if range.start_offset > self.source_end {
             let gap = range.start_offset.saturating_sub(self.source_end);
@@ -508,6 +515,7 @@ impl PagerBuffer {
         self.source_end = range.end_offset.max(self.source_end);
     }
 
+    #[allow(dead_code)]
     fn append_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -631,6 +639,7 @@ fn build_char_index(bytes: &[u8]) -> Vec<usize> {
     index
 }
 
+#[allow(dead_code)]
 fn extend_char_index(target: &mut Vec<usize>, appended: &[usize], base_byte: usize) {
     if target.is_empty() {
         target.push(0);
@@ -827,6 +836,7 @@ impl Pager {
         self.state.is_some()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn refresh_from_output(&mut self, output: &OutputBuffer) {
         let Some(state) = self.state.as_mut() else {
             return;
@@ -1608,6 +1618,7 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
     let start_offset = output.current_offset().unwrap_or(end_offset);
     let range = output.read_range(start_offset, end_offset);
@@ -1615,6 +1626,7 @@ pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Ve
     contents_from_output_range(range)
 }
 
+#[allow(dead_code)]
 pub(crate) fn take_snapshot_page_from_ring(
     output: &OutputBuffer,
     end_offset: u64,
@@ -1660,6 +1672,68 @@ pub(crate) fn take_snapshot_page_from_buffer(
     }
 }
 
+pub(crate) fn snapshot_page_from_contents(
+    contents: Vec<WorkerContent>,
+    target_bytes: u64,
+) -> SnapshotPage {
+    take_snapshot_page_from_buffer(pager_buffer_from_contents(contents), target_bytes)
+}
+
+fn pager_buffer_from_contents(contents: Vec<WorkerContent>) -> PagerBuffer {
+    let mut bytes = Vec::new();
+    let mut events = Vec::new();
+    let mut text_spans: Vec<OutputTextSpan> = Vec::new();
+
+    for content in contents {
+        match content {
+            WorkerContent::ContentText { text, stream } => {
+                if text.is_empty() {
+                    continue;
+                }
+                let start_byte = bytes.len();
+                bytes.extend_from_slice(text.as_bytes());
+                let end_byte = bytes.len();
+                let is_stderr = matches!(stream, TextStream::Stderr);
+                if let Some(last) = text_spans.last_mut()
+                    && last.is_stderr == is_stderr
+                    && last.end_byte == start_byte
+                {
+                    last.end_byte = end_byte;
+                } else {
+                    text_spans.push(OutputTextSpan {
+                        start_byte,
+                        end_byte,
+                        is_stderr,
+                    });
+                }
+            }
+            WorkerContent::ContentImage {
+                data,
+                mime_type,
+                id,
+                is_new,
+            } => events.push(OutputEvent {
+                offset: bytes.len() as u64,
+                kind: OutputEventKind::Image {
+                    id,
+                    data,
+                    mime_type,
+                    is_new,
+                },
+            }),
+        }
+    }
+
+    PagerBuffer::from_range(OutputRange {
+        start_offset: 0,
+        end_offset: bytes.len() as u64,
+        bytes,
+        events,
+        text_spans,
+    })
+}
+
+#[allow(dead_code)]
 fn snapshot_from_ring(output: &OutputBuffer, end_offset: u64) -> Option<OutputRange> {
     output.start_capture();
     let start_offset = output.current_offset().unwrap_or(end_offset);

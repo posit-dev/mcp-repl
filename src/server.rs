@@ -1,7 +1,7 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, CustomNotification, CustomRequest, CustomResult, ErrorCode,
+    CallToolResult, CustomNotification, CustomRequest, CustomResult, ErrorCode,
     ErrorData as McpError, JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -19,7 +19,7 @@ mod response;
 mod tests;
 mod timeouts;
 
-use self::overflow::ReplyFilesManager;
+use self::overflow::ReplyPresentation;
 use self::response::{finalize_batch, worker_reply_to_contents};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
@@ -42,7 +42,7 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 #[derive(Clone)]
 struct SharedServer {
     worker: Arc<Mutex<WorkerManager>>,
-    reply_files: Arc<Mutex<ReplyFilesManager>>,
+    presentation: Arc<Mutex<ReplyPresentation>>,
 }
 
 impl SharedServer {
@@ -55,9 +55,9 @@ impl SharedServer {
             worker: Arc::new(Mutex::new(WorkerManager::new(
                 backend,
                 sandbox_plan,
-                reply_overflow,
+                reply_overflow.clone(),
             )?)),
-            reply_files: Arc::new(Mutex::new(ReplyFilesManager::new()?)),
+            presentation: Arc::new(Mutex::new(ReplyPresentation::new(reply_overflow)?)),
         })
     }
 
@@ -84,51 +84,67 @@ impl SharedServer {
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(reply) = self.presentation.lock().unwrap().handle_input(&input) {
+            return self.reply_to_call_tool_result(reply);
+        }
+
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let (result, reply_overflow) = self
+        let (result, latest_settings) = self
             .run_worker(move |worker| {
                 let result = worker.write_stdin(input, worker_timeout, server_timeout, None, false);
-                let reply_overflow = worker.reply_overflow_settings();
-                (result, reply_overflow)
+                let latest_settings =
+                    worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
+                (result, latest_settings)
             })
             .await?;
-        self.worker_result_to_call_tool_result(result, reply_overflow)
+        {
+            let mut presentation = self.presentation.lock().unwrap();
+            presentation.update_settings(latest_settings);
+        }
+        self.worker_result_to_call_tool_result(result)
     }
 
     fn worker_result_to_call_tool_result(
         &self,
         result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
-        reply_overflow: ReplyOverflowSettings,
     ) -> Result<CallToolResult, McpError> {
-        let mut contents = Vec::new();
-        let mut is_error = false;
         match result {
             Ok(reply) => {
-                let reply = self
-                    .reply_files
-                    .lock()
-                    .unwrap()
-                    .apply_to_reply(reply, &reply_overflow);
-                let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
-                is_error |= reply_error;
-                contents.append(&mut reply_contents);
-                Ok(finalize_batch(contents, is_error))
+                let reply = self.presentation.lock().unwrap().present_reply(reply);
+                self.reply_to_call_tool_result(reply)
             }
             Err(err) => {
-                eprintln!("worker write stdin error: {err}");
-                contents.push(Content::text(format!("worker error: {err}")));
-                is_error = true;
-                Ok(finalize_batch(contents, is_error))
+                self.reply_to_call_tool_result(crate::worker_protocol::WorkerReply::Output {
+                    contents: vec![crate::worker_protocol::WorkerContent::stderr(format!(
+                        "worker error: {err}"
+                    ))],
+                    is_error: true,
+                    error_code: None,
+                    prompt: None,
+                    prompt_variants: None,
+                })
             }
         }
     }
 
-    fn clear_reply_files(&self) -> Result<(), McpError> {
-        self.reply_files
+    fn reply_to_call_tool_result(
+        &self,
+        reply: crate::worker_protocol::WorkerReply,
+    ) -> Result<CallToolResult, McpError> {
+        let mut contents = Vec::new();
+        let mut is_error = false;
+        let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
+        is_error |= reply_error;
+        contents.append(&mut reply_contents);
+        Ok(finalize_batch(contents, is_error))
+    }
+
+    fn reset_presentation(&self) -> Result<(), McpError> {
+        self.presentation
             .lock()
             .unwrap()
-            .clear()
+            .reset_to_defaults()
             .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
@@ -386,17 +402,22 @@ macro_rules! define_backend_tool_server {
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
-                let (result, reply_overflow) = self
+                let (result, latest_settings) = self
                     .shared
                     .run_worker(move |worker| {
                         let result = worker.restart(worker_timeout);
-                        let reply_overflow = worker.reply_overflow_settings();
-                        (result, reply_overflow)
+                        let latest_settings =
+                            worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
+                        (result, latest_settings)
                     })
                     .await?;
-                self.shared.clear_reply_files()?;
+                self.shared.reset_presentation()?;
                 self.shared
-                    .worker_result_to_call_tool_result(result, reply_overflow)
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .update_settings(latest_settings);
+                self.shared.worker_result_to_call_tool_result(result)
             }
         }
 

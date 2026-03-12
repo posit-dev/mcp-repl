@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 
+use crate::output_capture::OUTPUT_RING_CAPACITY_BYTES;
+use crate::pager::{self, Pager};
 use crate::reply_overflow::{ReplyOverflowBehavior, ReplyOverflowSettings};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
 
@@ -83,6 +85,150 @@ impl ReplyFilesManager {
             }
         }
         Ok(dir)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplyPresentation {
+    defaults: ReplyOverflowSettings,
+    current: ReplyOverflowSettings,
+    pager: Pager,
+    pager_prompt: Option<String>,
+    files: ReplyFilesManager,
+}
+
+impl ReplyPresentation {
+    pub(crate) fn new(defaults: ReplyOverflowSettings) -> std::io::Result<Self> {
+        Ok(Self {
+            current: defaults.clone(),
+            defaults,
+            pager: Pager::default(),
+            pager_prompt: None,
+            files: ReplyFilesManager::new()?,
+        })
+    }
+
+    pub(crate) fn update_settings(&mut self, latest: Option<ReplyOverflowSettings>) {
+        if let Some(settings) = latest {
+            self.current = settings;
+            if self.current.behavior != ReplyOverflowBehavior::Pager {
+                self.pager.dismiss();
+                self.pager_prompt = None;
+            }
+        }
+    }
+
+    pub(crate) fn reset_to_defaults(&mut self) -> std::io::Result<()> {
+        self.current = self.defaults.clone();
+        self.pager.dismiss();
+        self.pager_prompt = None;
+        self.files.clear()
+    }
+
+    pub(crate) fn handle_input(&mut self, input: &str) -> Option<WorkerReply> {
+        if !self.pager.is_active() {
+            return None;
+        }
+        if self.current.behavior != ReplyOverflowBehavior::Pager {
+            self.pager.dismiss();
+            self.pager_prompt = None;
+            return None;
+        }
+        let trimmed = input.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with(':') {
+            self.pager.dismiss();
+            self.pager_prompt = None;
+            return None;
+        }
+
+        let mut reply = self.pager.handle_command(input);
+        let pager_active = self.pager.is_active();
+        let WorkerReply::Output {
+            contents, prompt, ..
+        } = &mut reply;
+        let resolved_prompt = if pager_active {
+            None
+        } else {
+            self.pager_prompt.take()
+        };
+        if pager_active {
+            *prompt = None;
+        } else {
+            if resolved_prompt.is_none() {
+                contents.push(WorkerContent::stderr(
+                    "[repl] protocol error: missing prompt after pager dismiss",
+                ));
+            }
+            append_prompt_if_missing(contents, resolved_prompt.clone());
+            *prompt = resolved_prompt;
+        }
+        Some(reply)
+    }
+
+    pub(crate) fn present_reply(&mut self, reply: WorkerReply) -> WorkerReply {
+        match self.current.behavior {
+            ReplyOverflowBehavior::Files => {
+                self.pager.dismiss();
+                self.pager_prompt = None;
+                self.files.apply_to_reply(reply, &self.current)
+            }
+            ReplyOverflowBehavior::Pager => self.apply_pager(reply),
+        }
+    }
+
+    fn apply_pager(&mut self, reply: WorkerReply) -> WorkerReply {
+        let page_bytes = pager::resolve_page_bytes(None);
+        match reply {
+            WorkerReply::Output {
+                mut contents,
+                is_error,
+                error_code,
+                prompt,
+                prompt_variants,
+            } => {
+                contents = collapse_image_updates(contents);
+                let prompt = prompt.filter(|value| !value.is_empty());
+                if let Some(prompt_text) = prompt.as_deref() {
+                    strip_prompt_from_contents(&mut contents, prompt_text);
+                }
+                let pager_source = truncate_contents_for_pager(contents);
+                let original_images = pager_source
+                    .iter()
+                    .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let snapshot = pager::snapshot_page_from_contents(pager_source, page_bytes);
+                let mut contents = snapshot.contents;
+                ensure_paged_reply_includes_images(&mut contents, &original_images);
+                if snapshot.pages_left > 0 {
+                    pager::maybe_activate_and_append_footer(
+                        &mut self.pager,
+                        &mut contents,
+                        snapshot.pages_left,
+                        is_error,
+                        snapshot.buffer,
+                        snapshot.last_range,
+                    );
+                    self.pager_prompt = prompt;
+                    WorkerReply::Output {
+                        contents,
+                        is_error,
+                        error_code,
+                        prompt: None,
+                        prompt_variants,
+                    }
+                } else {
+                    append_prompt_if_missing(&mut contents, prompt.clone());
+                    WorkerReply::Output {
+                        contents,
+                        is_error,
+                        error_code,
+                        prompt,
+                        prompt_variants,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -255,6 +401,132 @@ fn reattach_prompt(
         contents.push(prompt_chunk);
     }
     contents
+}
+
+fn truncate_contents_for_pager(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
+    let total_text_bytes = contents
+        .iter()
+        .filter_map(|content| match content {
+            WorkerContent::ContentText { text, .. } => Some(text.len()),
+            WorkerContent::ContentImage { .. } => None,
+        })
+        .sum::<usize>();
+    if total_text_bytes <= OUTPUT_RING_CAPACITY_BYTES {
+        return contents;
+    }
+
+    let mut kept_rev = Vec::new();
+    let mut remaining = OUTPUT_RING_CAPACITY_BYTES;
+    for content in contents.into_iter().rev() {
+        match content {
+            WorkerContent::ContentText { text, stream } => {
+                if remaining == 0 {
+                    continue;
+                }
+                if text.len() <= remaining {
+                    remaining = remaining.saturating_sub(text.len());
+                    kept_rev.push(WorkerContent::ContentText { text, stream });
+                } else {
+                    kept_rev.push(WorkerContent::ContentText {
+                        text: take_suffix_chars(&text, remaining),
+                        stream,
+                    });
+                    remaining = 0;
+                }
+            }
+            WorkerContent::ContentImage { .. } => kept_rev.push(content),
+        }
+    }
+    kept_rev.reverse();
+    let mut out = vec![WorkerContent::stdout(
+        "[repl] output truncated (older output dropped)\n",
+    )];
+    out.extend(kept_rev);
+    out
+}
+
+fn ensure_paged_reply_includes_images(
+    contents: &mut Vec<WorkerContent>,
+    original_images: &[WorkerContent],
+) {
+    if contents
+        .iter()
+        .any(|content| matches!(content, WorkerContent::ContentImage { .. }))
+        || original_images.is_empty()
+    {
+        return;
+    }
+    let count = pager::MAX_IMAGES_PER_PAGE.min(original_images.len());
+    contents.extend(
+        original_images[original_images.len().saturating_sub(count)..]
+            .iter()
+            .cloned(),
+    );
+}
+
+fn take_suffix_chars(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    text[start..].to_string()
+}
+
+fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
+    let Some(prompt) = prompt else {
+        return;
+    };
+    if prompt.is_empty() {
+        return;
+    }
+    if let Some(WorkerContent::ContentText { text, .. }) = contents
+        .iter()
+        .rev()
+        .find(|content| matches!(content, WorkerContent::ContentText { .. }))
+        && text.ends_with(&prompt)
+    {
+        return;
+    }
+    contents.push(WorkerContent::stdout(prompt));
+}
+
+fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
+    if prompt.is_empty() {
+        return;
+    }
+    let mut idx = 0usize;
+    while idx < contents.len() {
+        let remove = match &contents[idx] {
+            WorkerContent::ContentText { text, stream } => {
+                if !matches!(stream, TextStream::Stdout) {
+                    false
+                } else if text == prompt {
+                    true
+                } else if let Some(prefix) = text.strip_suffix(prompt) {
+                    if prefix.is_empty() {
+                        true
+                    } else {
+                        contents[idx] = WorkerContent::ContentText {
+                            text: prefix.to_string(),
+                            stream: *stream,
+                        };
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if remove {
+            contents.remove(idx);
+        } else {
+            idx = idx.saturating_add(1);
+        }
+    }
 }
 
 struct TextPreview {

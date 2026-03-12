@@ -29,6 +29,8 @@ expression: transcript
 <<< alpha line 14
 <<< alpha line 15
 <<< alpha line 16
+<<< [image/png len=0]
+<<< [image/png len=0]
 <<< --More-- (Np, 11.3%, @0..298/2627)
 
 2) r_repl timeout_ms=10000

@@ -202,6 +202,7 @@ impl OutputArchive {
         build_output_range(self.collect_range(start_offset, Some(end_offset)))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
         let guard = self.inner.lock().unwrap();
         saw_stderr_in_range_chunks(&guard.chunks, guard.end_offset, start_offset, end_offset)
@@ -269,6 +270,7 @@ impl OutputBuffer {
         output_ring_opt().map(|ring| ring.end_offset())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
         let Some(ring) = output_ring_opt() else {
             return false;
