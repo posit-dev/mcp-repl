@@ -26,7 +26,7 @@ pub(crate) fn run(
     ensure_debug_repl_page_size();
     let image_support = detect_image_support();
     eprintln!(
-        "debug repl: write_stdin timeout={:.1}s | end input with END | commands: INTERRUPT, RESTART | Ctrl-D to exit | images={}",
+        "debug repl: write_stdin timeout={:.1}s | end input with END | commands: INTERRUPT, RESTART | Ctrl-D to exit | images={}\n",
         DEFAULT_WRITE_STDIN_TIMEOUT.as_secs_f64(),
         if image_support { "kitty" } else { "off" }
     );

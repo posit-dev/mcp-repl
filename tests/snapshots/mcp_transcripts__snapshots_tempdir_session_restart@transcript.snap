@@ -32,7 +32,6 @@ expression: transcript
 >>>   message("ROOT_MARKER_ERROR:", conditionMessage(e))
 >>> })
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
-<<< [repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
 <<< TMPDIR_SET=TRUE
 <<< TMPDIR_MATCH=TRUE
 <<< TEMPDIR_UNDER_TMPDIR=TRUE
@@ -40,7 +39,6 @@ expression: transcript
 <<< TEMPDIR_MARKER_OK
 <<< [repl] echoed input elided: 7 lines (167 bytes); head: > tf <- tempfile(); tail: + })
 <<< TEMPFILE_OK
-<<< [repl] echoed input elided: 2 lines (98 bytes); head: > unlink(tf); tail: > cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 <<< TEMPDIR_LIST=mcp-console-snapshot.txt
 <<< [repl] echoed input elided: 7 lines (246 bytes); head: > root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt"); tail: + })
 <<< ROOT_MARKER_OK

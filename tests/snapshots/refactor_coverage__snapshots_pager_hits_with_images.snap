@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (36 bytes); head: > ; tail: > cat(\"# Title\\n\")\n# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11"
+      "text": "> cat(\"# Title\\n\")\n# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 10.2%, @0..292/2861)"
+      "text": "--More-- (Np, 11.3%, @0..298/2627)"
     }
   ]
 }
@@ -43,11 +43,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "#1 @292 Title\n  > alpha line 12"
+      "text": "#1 @298 Title\n  > alpha line 17"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 10.6%, @292..306/2861)"
+      "text": "--More-- (Np, 11.8%, @298..312/2627)"
     }
   ]
 }
@@ -67,15 +67,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @0..306"
+      "text": "[pager] elided output (already shown): @0..312"
     },
     {
       "type": "text",
-      "text": "alpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17\nalpha line 18\nalpha line 19\nalpha line 20\nalpha line 21\nalpha line 22\nalpha line 23\nalpha line 24\nalpha line 25\nalpha line 26\nalpha line 27\nalpha line 28\nalpha line 29\nalpha line 30\nalpha line 31\nalpha line 32\nalpha line 33"
+      "text": "alpha line 18\nalpha line 19\nalpha line 20\nalpha line 21\nalpha line 22\nalpha line 23\nalpha line 24\nalpha line 25\nalpha line 26\nalpha line 27\nalpha line 28\nalpha line 29\nalpha line 30\nalpha line 31\nalpha line 32\nalpha line 33\nalpha line 34\nalpha line 35\nalpha line 36\nalpha line 37\nalpha line 38"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 20.9%, @306..600/2861)"
+      "text": "--More-- (Np, 23.0%, @312..606/2627)"
     }
   ]
 }
@@ -95,11 +95,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "#1 @978 Title\n  > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = \"l\"); tail: > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
+      "text": "#1 @914 Title\n  > > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 39.0%, @978..1118/2861)"
+      "text": "--More-- (Np, 36.8%, @914..969/2627)"
     }
   ]
 }

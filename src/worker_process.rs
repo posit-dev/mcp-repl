@@ -2718,13 +2718,30 @@ fn summarize_echo_line_for_output(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn render_pending_echo_run(pending: PendingEchoRun) -> Vec<u8> {
+    const ECHO_MARKER_MIN_BYTES: usize = 512;
+
+    let head = pending.head.as_deref().unwrap_or_default();
+    let tail = pending.tail.as_deref().unwrap_or_default();
+    if pending.lines >= 2 || pending.bytes >= ECHO_MARKER_MIN_BYTES {
+        let head_snip = summarize_echo_line_for_marker(head);
+        let tail_snip = summarize_echo_line_for_marker(tail);
+        let marker = format!(
+            "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
+            pending.lines, pending.bytes, head_snip, tail_snip
+        );
+        if marker.len() < pending.bytes {
+            return marker.into_bytes();
+        }
+    }
+    summarize_echo_line_for_output(tail)
+}
+
 fn collapse_echo_with_attribution(
     range: OutputRange,
     echo_events: &[IpcEchoEvent],
     prompt_variants: &[String],
 ) -> (Vec<u8>, Vec<(u64, OutputEventKind)>, Vec<OutputTextSpan>) {
-    const ECHO_MARKER_MIN_BYTES: usize = 512;
-
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_events: Vec<(u64, OutputEventKind)> = Vec::new();
     let mut out_text_spans: Vec<OutputTextSpan> = Vec::new();
@@ -2759,24 +2776,8 @@ fn collapse_echo_with_attribution(
             return;
         }
         let pending = pending.take();
-        let head = pending.head.as_deref().unwrap_or_default();
-        let tail = pending.tail.as_deref().unwrap_or_default();
-        if pending.lines >= 2 || pending.bytes >= ECHO_MARKER_MIN_BYTES {
-            let head_snip = summarize_echo_line_for_marker(head);
-            let tail_snip = summarize_echo_line_for_marker(tail);
-            let marker = format!(
-                "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
-                pending.lines, pending.bytes, head_snip, tail_snip
-            );
-            append_text_with_span(out_bytes, out_text_spans, marker.as_bytes(), false);
-        } else {
-            append_text_with_span(
-                out_bytes,
-                out_text_spans,
-                &summarize_echo_line_for_output(tail),
-                false,
-            );
-        }
+        let rendered = render_pending_echo_run(pending);
+        append_text_with_span(out_bytes, out_text_spans, &rendered, false);
     };
 
     let mut cursor = 0usize;
@@ -4342,6 +4343,32 @@ mod tests {
             format_saved_image_range_line(dir, &ranges[0]),
             "[saved images: /tmp/reply-files/image-NNNN.png where NNNN=0001..0002]"
         );
+    }
+
+    #[test]
+    fn short_two_line_echo_uses_compact_output_instead_of_elision_marker() {
+        let rendered = render_pending_echo_run(PendingEchoRun {
+            lines: 2,
+            bytes: 9,
+            head: Some(b"> \n".to_vec()),
+            tail: Some(b"> 1+1\n".to_vec()),
+        });
+        assert_eq!(rendered, b"> 1+1\n");
+    }
+
+    #[test]
+    fn huge_echo_run_uses_elision_marker_when_it_is_smaller() {
+        let long_line = format!("> {}\n", "x".repeat(2_000)).into_bytes();
+        let rendered = render_pending_echo_run(PendingEchoRun {
+            lines: 2,
+            bytes: long_line.len() * 2,
+            head: Some(long_line.clone()),
+            tail: Some(long_line),
+        });
+        let text = String::from_utf8(rendered).expect("utf8");
+        assert!(text.contains("echoed input elided"));
+        assert!(text.contains("head:"));
+        assert!(text.contains("tail:"));
     }
 
     #[test]
