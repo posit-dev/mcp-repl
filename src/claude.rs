@@ -54,6 +54,7 @@ struct ClaudeClearBindingInner {
     control_path: PathBuf,
     env_file_path: Option<PathBuf>,
     current_session_id: Mutex<String>,
+    previous_session_id: Mutex<Option<String>>,
     last_control_seq: Mutex<u64>,
     record_template: InstanceRecordTemplate,
 }
@@ -69,6 +70,8 @@ struct InstanceRecordTemplate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InstanceRecord {
     claude_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_claude_session_id: Option<String>,
     backend: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +117,7 @@ impl ClaudeClearBinding {
                 control_path,
                 env_file_path,
                 current_session_id: Mutex::new(session_id.clone()),
+                previous_session_id: Mutex::new(None),
                 last_control_seq: Mutex::new(0),
                 record_template: InstanceRecordTemplate {
                     backend: backend_label.to_string(),
@@ -134,23 +138,14 @@ impl ClaudeClearBinding {
             },
         )
         .map_err(WorkerError::Io)?;
-        binding.write_record(&session_id).map_err(WorkerError::Io)?;
+        binding
+            .write_record(&session_id, None)
+            .map_err(WorkerError::Io)?;
         Ok(Some(binding))
     }
 
     pub fn sync(&self, worker: &mut WorkerManager) -> Result<(), WorkerError> {
-        if let Some(session_id) = self.resolve_current_session_id() {
-            let mut current = self
-                .inner
-                .current_session_id
-                .lock()
-                .expect("claude session id mutex poisoned");
-            if *current != session_id {
-                self.write_record(&session_id).map_err(WorkerError::Io)?;
-                *current = session_id;
-            }
-        }
-
+        let mut restart_observed = false;
         let next_seq = read_control_request(&self.inner.control_path)
             .map(|request| request.seq)
             .unwrap_or(0);
@@ -162,6 +157,38 @@ impl ClaudeClearBinding {
         if next_seq > *last_seq {
             *last_seq = next_seq;
             let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
+            restart_observed = true;
+        }
+        drop(last_seq);
+
+        if let Some(session_id) = self.resolve_current_session_id() {
+            let mut current = self
+                .inner
+                .current_session_id
+                .lock()
+                .expect("claude session id mutex poisoned");
+            let mut previous = self
+                .inner
+                .previous_session_id
+                .lock()
+                .expect("claude previous session id mutex poisoned");
+            if *current != session_id {
+                let previous_session_id = if restart_observed {
+                    None
+                } else {
+                    // `/clear` can deliver SessionStart for the new Claude session before the old
+                    // SessionEnd hook has scanned instance records. Keep the old session id in the
+                    // record during that handoff so the clear-triggered restart still finds us.
+                    Some(current.clone())
+                };
+                self.write_record(&session_id, previous_session_id.as_deref())
+                    .map_err(WorkerError::Io)?;
+                *previous = previous_session_id;
+                *current = session_id;
+            } else if restart_observed && previous.take().is_some() {
+                self.write_record(&session_id, None)
+                    .map_err(WorkerError::Io)?;
+            }
         }
         Ok(())
     }
@@ -170,9 +197,10 @@ impl ClaudeClearBinding {
         current_claude_session_id_from_sources(self.inner.env_file_path.as_deref())
     }
 
-    fn write_record(&self, session_id: &str) -> io::Result<()> {
+    fn write_record(&self, session_id: &str, previous_session_id: Option<&str>) -> io::Result<()> {
         let record = InstanceRecord {
             claude_session_id: session_id.to_string(),
+            previous_claude_session_id: previous_session_id.map(str::to_string),
             backend: self.inner.record_template.backend.clone(),
             pid: self.inner.record_template.pid,
             cwd: self.inner.record_template.cwd.clone(),
@@ -318,7 +346,9 @@ fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<Instanc
         let Ok(record) = serde_json::from_str::<InstanceRecord>(&raw) else {
             continue;
         };
-        if record.claude_session_id == session_id {
+        if record.claude_session_id == session_id
+            || record.previous_claude_session_id.as_deref() == Some(session_id)
+        {
             out.push(record);
         }
     }
@@ -455,6 +485,59 @@ mod tests {
             &instances_dir.join("r-1.json"),
             &InstanceRecord {
                 claude_session_id: "sess-old".to_string(),
+                previous_claude_session_id: None,
+                backend: "r".to_string(),
+                pid: 1,
+                cwd: None,
+                control_path: control_path.to_string_lossy().to_string(),
+                started_unix_ms: 1,
+            },
+        )
+        .expect("write instance record");
+
+        handle_session_end(&HookInput {
+            hook_event_name: Some("SessionEnd".to_string()),
+            session_id: "sess-old".to_string(),
+            reason: Some("clear".to_string()),
+        })
+        .expect("handle session end");
+
+        let request = read_control_request(&control_path).expect("control request");
+        assert_eq!(request.seq, 1);
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    #[test]
+    fn session_end_hook_matches_previous_session_id_during_rebind() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+        }
+        let state_root = claude_clear_state_dir().expect("state root");
+        let instances_dir = state_root.join("instances");
+        let controls_dir = state_root.join("controls");
+        fs::create_dir_all(&instances_dir).expect("create instances dir");
+        fs::create_dir_all(&controls_dir).expect("create controls dir");
+
+        let control_path = controls_dir.join("r-1.json");
+        write_control_request(
+            &control_path,
+            &ControlRequest {
+                seq: 0,
+                op: "restart".to_string(),
+                requested_unix_ms: 1,
+            },
+        )
+        .expect("seed control request");
+        write_json_atomic(
+            &instances_dir.join("r-1.json"),
+            &InstanceRecord {
+                claude_session_id: "sess-new".to_string(),
+                previous_claude_session_id: Some("sess-old".to_string()),
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,

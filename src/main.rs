@@ -110,7 +110,12 @@ fn ignore_sigpipe() {
 }
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
-    let mut parser = ArgParser::new();
+    parse_cli_args_with_parser(ArgParser::new())
+}
+
+fn parse_cli_args_with_parser(
+    mut parser: ArgParser,
+) -> Result<CliCommand, Box<dyn std::error::Error>> {
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(
@@ -118,8 +123,8 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
             Vec::new(),
         )?));
     }
-    if parser.peek() == Some("claude-hook") {
-        parser.next();
+    if let Some(idx) = parser.args.iter().position(|arg| arg == "claude-hook") {
+        parser.index = idx + 1;
         return Ok(CliCommand::ClaudeHook(parse_claude_hook_args(&mut parser)?));
     }
 
@@ -522,6 +527,24 @@ mod tests {
         };
         let parsed = parse_claude_hook_args(&mut parser).expect("parse claude hook args");
         assert_eq!(parsed, crate::claude::HookCommand::SessionStart);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_claude_hook_after_passthrough_args() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "claude-hook".to_string(),
+                "session-end".to_string(),
+            ],
+            index: 0,
+        })
+        .expect("parse cli args");
+        assert!(matches!(
+            parsed,
+            CliCommand::ClaudeHook(crate::claude::HookCommand::SessionEnd)
+        ));
     }
 
     #[test]

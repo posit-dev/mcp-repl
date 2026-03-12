@@ -137,7 +137,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                     upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
                     upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
-                upsert_claude_settings_hooks(&settings_path, &command)?;
+                upsert_claude_settings_hooks(&settings_path, &command, &options.args)?;
                 println!("Updated claude MCP config: {}", config_path.display());
                 println!("Updated claude permissions: {}", settings_path.display());
                 println!("Updated claude hooks: {}", settings_path.display());
@@ -591,6 +591,7 @@ fn upsert_claude_settings_permission(
 fn upsert_claude_settings_hooks(
     settings_path: &Path,
     command: &str,
+    args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut root = if settings_path.is_file() {
         let raw = fs::read_to_string(settings_path)?;
@@ -614,8 +615,8 @@ fn upsert_claude_settings_hooks(
         return Err("claude settings `hooks` must be a JSON object".into());
     };
 
-    let session_start_command = claude_hook_command(command, "session-start");
-    let session_end_command = claude_hook_command(command, "session-end");
+    let session_start_command = claude_hook_command(command, args, "session-start");
+    let session_end_command = claude_hook_command(command, args, "session-end");
     for matcher in CLAUDE_HOOK_SESSION_START_MATCHERS {
         upsert_claude_hook_command(
             hooks_obj,
@@ -738,10 +739,11 @@ fn new_hook_command(command: &str) -> JsonValue {
     ]))
 }
 
-fn claude_hook_command(command: &str, hook: &str) -> String {
-    [command, "claude-hook", hook]
-        .iter()
-        .map(|part| shell_escape(part))
+fn claude_hook_command(command: &str, args: &[String], hook: &str) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .chain(["claude-hook", hook])
+        .map(shell_escape)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1404,7 +1406,8 @@ name="demo"
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
 
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("upsert hooks");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("upsert hooks");
 
         let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
@@ -1441,8 +1444,10 @@ name="demo"
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
 
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("first upsert");
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl").expect("second upsert");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("first upsert");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("second upsert");
 
         let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
@@ -1460,5 +1465,23 @@ name="demo"
             })
             .count();
         assert_eq!(startup_count, 1, "expected one startup hook");
+    }
+
+    #[test]
+    fn claude_hook_command_preserves_wrapper_args() {
+        let command = claude_hook_command(
+            "cargo",
+            &[
+                "run".to_string(),
+                "--bin".to_string(),
+                "mcp-repl".to_string(),
+                "--".to_string(),
+            ],
+            "session-start",
+        );
+        assert_eq!(
+            command,
+            "cargo run --bin mcp-repl -- claude-hook session-start"
+        );
     }
 }
