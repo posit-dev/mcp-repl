@@ -955,6 +955,151 @@ async fn claude_clear_shared_env_file_does_not_reset_another_live_session() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_stale_inherited_env_session_id_does_not_steal_live_server() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir_a = temp.path().join("project-a");
+    let project_dir_b = temp.path().join("project-b");
+    let env_file_a = temp.path().join("claude-a.env");
+    let env_file_b = temp.path().join("claude-b.env");
+    fs::create_dir_all(&project_dir_a)?;
+    fs::create_dir_all(&project_dir_b)?;
+    let exe = resolve_exe()?;
+    fs::write(&env_file_a, "export MCP_REPL_CLAUDE_SESSION_ID=sess-a\n")?;
+
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file_a.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_PROJECT_DIR".to_string(),
+                project_dir_a.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file_a.to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir_a.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before stale inherited env-id clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file_b.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_PROJECT_DIR".to_string(),
+                project_dir_b.to_string_lossy().to_string(),
+            ),
+            (
+                "MCP_REPL_CLAUDE_SESSION_ID".to_string(),
+                "sess-a".to_string(),
+            ),
+        ],
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file_b.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_PROJECT_DIR".to_string(),
+                project_dir_b.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after stale inherited env-id clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after stale inherited env-id clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("TRUE"),
+        "expected stale inherited env session id not to reset another live server, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_same_project_request_stays_pinned_to_live_session() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempfile::tempdir()?;
@@ -1063,6 +1208,133 @@ async fn claude_clear_same_project_request_stays_pinned_to_live_session() -> Tes
     assert!(
         after_clear_text.contains("TRUE"),
         "expected later request in session A to stay pinned after session B clear, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_project_handoff_skips_inactive_sessions_without_records() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before intermediate project handoff; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a",
+            "reason": "other"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "other"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-c"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-c",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after intermediate project handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after intermediate project handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("FALSE"),
+        "expected project handoff to skip inactive sessions without records, got: {after_clear_text:?}"
     );
     Ok(())
 }

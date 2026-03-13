@@ -74,6 +74,7 @@ struct InstanceRecordTemplate {
     backend: String,
     pid: u32,
     cwd: Option<String>,
+    project_dir: Option<String>,
     started_unix_ms: u128,
 }
 
@@ -84,6 +85,8 @@ struct InstanceRecord {
     previous_claude_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     env_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_dir: Option<String>,
     backend: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +151,8 @@ impl ClaudeClearBinding {
                     pid,
                     cwd: env::current_dir()
                         .ok()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    project_dir: current_project_dir()
                         .map(|path| path.to_string_lossy().to_string()),
                     started_unix_ms,
                 },
@@ -269,6 +274,7 @@ impl ClaudeClearBinding {
             env_file_path: env_file_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
+            project_dir: self.inner.record_template.project_dir.clone(),
             backend: self.inner.record_template.backend.clone(),
             pid: self.inner.record_template.pid,
             cwd: self.inner.record_template.cwd.clone(),
@@ -318,9 +324,6 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
             &previous_session_id,
             session_id,
             env_file_path.as_deref(),
-            project_session_state
-                .as_ref()
-                .map(|(_, session_dir)| session_dir.as_path()),
             source,
         )?;
     }
@@ -514,17 +517,32 @@ fn read_current_session_id_from_project_state(path: Option<&Path>) -> Option<Str
 }
 
 fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
-    load_project_session_records(path)
+    let mut records: Vec<ProjectSessionRecord> = load_project_session_records(path)
         .into_iter()
         .filter(|record| !record.active)
-        .max_by_key(|record| record.updated_unix_ms)
-        .map(|record| record.claude_session_id)
+        .collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_unix_ms));
+    records.into_iter().find_map(|record| {
+        project_session_has_instance_record(path, &record.claude_session_id)
+            .then_some(record.claude_session_id)
+    })
 }
 
 fn project_session_is_active(path: Option<&Path>, session_id: &str) -> bool {
     load_project_session_records(path)
         .into_iter()
         .any(|record| record.active && record.claude_session_id == session_id)
+}
+
+fn project_session_has_instance_record(path: Option<&Path>, session_id: &str) -> bool {
+    load_instance_records()
+        .map(|records| {
+            records.into_iter().any(|record| {
+                instance_record_matches_session(&record, session_id)
+                    && record_project_session_dir(&record).as_deref() == path
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -587,6 +605,16 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
 
 fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<InstanceRecord>> {
     let mut out = Vec::new();
+    for record in load_instance_records()? {
+        if instance_record_matches_session(&record, session_id) {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+fn load_instance_records() -> io::Result<Vec<InstanceRecord>> {
+    let mut out = Vec::new();
     let instances_dir = claude_clear_state_dir()?.join("instances");
     if !instances_dir.is_dir() {
         return Ok(out);
@@ -603,20 +631,25 @@ fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<Instanc
         let Ok(record) = serde_json::from_str::<InstanceRecord>(&raw) else {
             continue;
         };
-        if record.claude_session_id == session_id
-            || record.previous_claude_session_id.as_deref() == Some(session_id)
-        {
-            out.push(record);
-        }
+        out.push(record);
     }
     Ok(out)
+}
+
+fn instance_record_matches_session(record: &InstanceRecord, session_id: &str) -> bool {
+    record.claude_session_id == session_id
+        || record.previous_claude_session_id.as_deref() == Some(session_id)
+}
+
+fn record_project_session_dir(record: &InstanceRecord) -> Option<PathBuf> {
+    let project_dir = record.project_dir.as_deref()?;
+    project_session_dir_for_dir(Path::new(project_dir)).ok()
 }
 
 fn rebind_instance_records_for_session(
     previous_session_id: &str,
     session_id: &str,
     env_file_path: Option<&Path>,
-    project_session_dir: Option<&Path>,
     source: HandoffSource,
 ) -> io::Result<()> {
     let instances_dir = claude_clear_state_dir()?.join("instances");
@@ -635,12 +668,13 @@ fn rebind_instance_records_for_session(
         let Ok(mut record) = serde_json::from_str::<InstanceRecord>(&raw) else {
             continue;
         };
-        if record.claude_session_id != previous_session_id
-            && record.previous_claude_session_id.as_deref() != Some(previous_session_id)
-        {
+        if !instance_record_matches_session(&record, previous_session_id) {
             continue;
         }
-        if project_session_is_active(project_session_dir, previous_session_id) {
+        if project_session_is_active(
+            record_project_session_dir(&record).as_deref(),
+            previous_session_id,
+        ) {
             continue;
         }
         match source {
@@ -839,6 +873,7 @@ mod tests {
                 claude_session_id: "sess-old".to_string(),
                 previous_claude_session_id: None,
                 env_file_path: None,
+                project_dir: None,
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,
@@ -892,6 +927,7 @@ mod tests {
                 claude_session_id: "sess-new".to_string(),
                 previous_claude_session_id: Some("sess-old".to_string()),
                 env_file_path: None,
+                project_dir: None,
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,
