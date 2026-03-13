@@ -397,8 +397,7 @@ async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> Te
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
     let temp = tempfile::tempdir()?;
-    let project_dir = temp.path().join("project");
-    std::fs::create_dir_all(&project_dir)?;
+    let env_file = temp.path().join("claude.env");
     let exe = resolve_exe()?;
     let env_vars = vec![
         (
@@ -406,8 +405,8 @@ async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> Te
             temp.path().to_string_lossy().to_string(),
         ),
         (
-            "CLAUDE_PROJECT_DIR".to_string(),
-            project_dir.to_string_lossy().to_string(),
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
         ),
     ];
     let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
