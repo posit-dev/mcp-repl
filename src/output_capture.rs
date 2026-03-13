@@ -117,6 +117,7 @@ pub(crate) struct OutputBuffer {
 #[derive(Default)]
 struct OutputCursor {
     offset: Option<u64>,
+    older_output_dropped: bool,
 }
 
 impl OutputBuffer {
@@ -140,7 +141,12 @@ impl OutputBuffer {
         let Some(ring) = output_ring_opt() else {
             return OutputRange::empty(start_offset, end_offset);
         };
-        ring.read_range(start_offset, end_offset)
+        let mut range = ring.read_range(start_offset, end_offset);
+        let guard = self.cursor.lock().unwrap();
+        if guard.offset == Some(start_offset) && guard.older_output_dropped {
+            range.older_output_dropped = true;
+        }
+        range
     }
 
     pub(crate) fn start_capture(&self) {
@@ -155,10 +161,12 @@ impl OutputBuffer {
             return;
         };
         let start_offset = ring.start_offset();
+        let older_output_dropped = ring.capture_starts_after_truncation(start_offset);
 
         let mut guard = self.cursor.lock().unwrap();
         if guard.offset.is_none() {
             guard.offset = Some(start_offset);
+            guard.older_output_dropped = older_output_dropped;
         }
     }
 
@@ -174,6 +182,7 @@ impl OutputBuffer {
     pub(crate) fn advance_offset_to(&self, offset: u64) {
         let mut guard = self.cursor.lock().unwrap();
         guard.offset = Some(offset);
+        guard.older_output_dropped = false;
         drop(guard);
         if let Some(ring) = output_ring_opt() {
             ring.consume_to(offset);
@@ -214,6 +223,7 @@ struct OutputRingInner {
     end_offset: u64,
     buffered_bytes: usize,
     buffered_event_bytes: usize,
+    max_truncated_event_offset: Option<u64>,
 }
 
 struct OutputChunk {
@@ -297,6 +307,7 @@ impl OutputRing {
                 end_offset: 0,
                 buffered_bytes: 0,
                 buffered_event_bytes: 0,
+                max_truncated_event_offset: None,
             }),
         }
     }
@@ -308,6 +319,14 @@ impl OutputRing {
 
     fn start_offset(&self) -> u64 {
         self.inner.lock().unwrap().start_offset
+    }
+
+    fn capture_starts_after_truncation(&self, start_offset: u64) -> bool {
+        let guard = self.inner.lock().unwrap();
+        start_offset > 0
+            || guard
+                .max_truncated_event_offset
+                .is_some_and(|offset| start_offset <= offset)
     }
 
     pub(crate) fn append_bytes(&self, bytes: &[u8], is_stderr: bool) {
@@ -470,6 +489,7 @@ impl OutputRing {
         guard.end_offset = 0;
         guard.buffered_bytes = 0;
         guard.buffered_event_bytes = 0;
+        guard.max_truncated_event_offset = None;
     }
 
     fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
@@ -573,14 +593,14 @@ impl OutputRingInner {
             .saturating_add(self.buffered_event_bytes)
     }
 
-    fn pop_front_event(&mut self) -> bool {
+    fn pop_front_event(&mut self) -> Option<OutputEvent> {
         if let Some(event) = self.events.pop_front() {
             self.buffered_event_bytes = self
                 .buffered_event_bytes
                 .saturating_sub(event_size_bytes(&event.kind));
-            return true;
+            return Some(event);
         }
-        false
+        None
     }
 
     fn make_room_for(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
@@ -589,6 +609,12 @@ impl OutputRingInner {
             // If a single chunk consumes the full capacity, drop everything else.
             dropped.dropped_bytes = self.end_offset.saturating_sub(self.start_offset);
             dropped.dropped_events = self.events.len();
+            if let Some(last_event) = self.events.back() {
+                self.max_truncated_event_offset = Some(
+                    self.max_truncated_event_offset
+                        .map_or(last_event.offset, |current| current.max(last_event.offset)),
+                );
+            }
             self.chunks.clear();
             self.line_ends.clear();
             self.events.clear();
@@ -615,8 +641,12 @@ impl OutputRingInner {
             }
 
             if !self.events.is_empty() {
-                if self.pop_front_event() {
+                if let Some(event) = self.pop_front_event() {
                     dropped.dropped_events = dropped.dropped_events.saturating_add(1);
+                    self.max_truncated_event_offset = Some(
+                        self.max_truncated_event_offset
+                            .map_or(event.offset, |current| current.max(event.offset)),
+                    );
                 }
                 continue;
             }
@@ -671,7 +701,7 @@ impl OutputRingInner {
             let _ = self.line_ends.pop_front();
         }
         while matches!(self.events.front(), Some(event) if event.offset <= self.start_offset) {
-            if self.pop_front_event() {
+            if self.pop_front_event().is_some() {
                 // Dropping due to consumer progress; not tracked as truncation.
             }
         }

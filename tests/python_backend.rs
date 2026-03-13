@@ -225,6 +225,64 @@ print("started")
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_startup_overflow_disables_full_response_overflow_file() -> TestResult<()> {
+    if !require_python() {
+        return Ok(());
+    }
+
+    let startup_dir = tempfile::tempdir()?;
+    std::fs::write(
+        startup_dir.path().join("sitecustomize.py"),
+        "import sys\nsys.stdout.write(('startup-' + ('x' * 4096) + '\\n') * 2000)\nsys.stdout.flush()\n",
+    )?;
+
+    let mut session = common::spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![(
+            "PYTHONPATH".to_string(),
+            startup_dir.path().display().to_string(),
+        )],
+    )
+    .await?;
+
+    let result = session
+        .write_stdin_raw_with("print('y' * 12000)", Some(20.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_startup_overflow remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("worker io error: Permission denied")
+        || text.contains("python backend requires a unix-style pty")
+    {
+        eprintln!("python backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        text.contains(
+            "full response unavailable because older output was already dropped by the worker"
+        ),
+        "expected overflowed startup output to disable persisted full-response overflow files, got: {text:?}"
+    );
+    assert!(
+        overflow_path(&text).is_none(),
+        "expected no persisted full-response path once startup output had already overflowed before capture began, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_stderr_merged_into_output() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
