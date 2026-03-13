@@ -280,6 +280,7 @@ Rules:
 
 - if the batch fits inline limits, return it inline
 - if the batch exceeds inline limits, return an inline head-and-tail preview plus an overflow file containing the complete drained batch for this reply
+- overflow decisions and preview sizing must be based on one total inline-size budget for the whole reply preview, measured in characters or bytes chosen during planning, not on line count
 - image ordering must be preserved
 - current prompt cleanup behavior must be preserved
 - current input-echo behavior must be preserved
@@ -287,14 +288,16 @@ Rules:
 - the inline preview must consist of two non-overlapping slices from the drained batch: a head slice and a tail slice
 - the inline preview must insert a single synthetic truncation notice between those slices, and that notice must make it explicit that the middle of the current reply was omitted from inline presentation by the REPL
 - synthetic truncation notices must use the REPL's own marker style so they are distinguishable from real program output
-- the preview must cut at stable item boundaries rather than in the middle of a text line or image-path notice
+- the preview should prefer stable item boundaries such as complete text lines and complete image-path notices when that fits within the budget
+- if no such boundary fits because a single text line is itself too large, the preview must still honor the total inline-size budget by cutting within that text line rather than expanding the reply
+- partial image-path notices must never be shown inline; if an image-path notice does not fit as a whole, omit it from the preview and leave it available only in the full reply artifact
 - the overflow file must be self-contained and include the same head and tail content that appeared in the preview
 
 The wording should refer to the current reply, not to the full job. For example:
 
 `[repl] middle of this reply omitted from inline preview; full reply at ...`
 
-The exact head-vs-tail budget split can be chosen during planning, but the default should favor the head slightly while always leaving room for a meaningful tail.
+The exact head-vs-tail budget split can be chosen during planning, but the default should favor the head slightly while always leaving room for a meaningful tail. That split still operates within one total inline-size budget rather than a line-count quota.
 
 ### 6. Overflow Artifact Retention
 
@@ -458,7 +461,12 @@ Required coverage:
 - latched `CaptureFailed` behavior when spill promotion fails without an active request in flight
 - oversized drained batch creating a self-contained overflow artifact for that reply only
 - oversized drained batch preview showing both a non-overlapping head slice and tail slice with one explicit middle-omission notice
-- preview truncation preserving complete lines and complete image-path notices rather than cutting through them
+- overflow decisions being driven by total inline-size budget rather than line count
+- very long single-line text still overflowing and previewing correctly within the total inline-size budget
+- many short lines overflowing based on total size rather than number of lines
+- preview truncation preferring complete lines and complete image-path notices when they fit
+- preview truncation cutting within a single oversized text line when needed to stay within budget
+- preview truncation never exposing a partial image-path notice
 - overflow artifact write failure returning the normal bounded inline response plus a short write-failure notice
 - multiple oversized polls producing separate overflow artifacts with no overlap
 - retention window eviction for old overflow artifacts
