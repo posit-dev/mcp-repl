@@ -861,6 +861,13 @@ fn shell_escape_windows(raw: &str) -> String {
                 escaped.push('"');
                 backslashes = 0;
             }
+            '%' => {
+                if backslashes > 0 {
+                    escaped.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                escaped.push_str("%%");
+            }
             _ => {
                 if backslashes > 0 {
                     escaped.push_str(&"\\".repeat(backslashes));
@@ -1677,6 +1684,20 @@ name="demo"
     }
 
     #[test]
+    fn claude_hook_command_windows_shell_escapes_percent_signs() {
+        let command = claude_hook_command_for_shell(
+            r"%USERPROFILE%\repltool.exe",
+            &[r"--config=%APPDATA%\mcp-repl".to_string()],
+            "session-start",
+            HookCommandShell::Windows,
+        );
+        assert_eq!(
+            command,
+            "\"%%USERPROFILE%%\\repltool.exe\" \"--config=%%APPDATA%%\\mcp-repl\" claude-hook session-start"
+        );
+    }
+
+    #[test]
     fn shell_escape_windows_escapes_embedded_quotes_and_trailing_backslashes() {
         assert_eq!(
             shell_escape_windows("say \"hi\""),
@@ -1696,7 +1717,7 @@ name="demo"
         );
         assert_eq!(
             shell_escape_windows("value%USERPROFILE%"),
-            "\"value%USERPROFILE%\"".to_string()
+            "\"value%%USERPROFILE%%\"".to_string()
         );
     }
 }

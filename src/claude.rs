@@ -25,6 +25,13 @@ pub enum HookCommand {
     SessionEnd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffSource {
+    EnvVar,
+    EnvFile,
+    ProjectState,
+}
+
 impl HookCommand {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
@@ -55,7 +62,6 @@ pub struct ClaudeClearBinding {
 struct ClaudeClearBindingInner {
     record_path: PathBuf,
     control_path: PathBuf,
-    project_session_dir: Option<PathBuf>,
     env_file_path: Mutex<Option<PathBuf>>,
     current_session_id: Mutex<String>,
     previous_session_id: Mutex<Option<String>>,
@@ -133,7 +139,6 @@ impl ClaudeClearBinding {
             inner: Arc::new(ClaudeClearBindingInner {
                 record_path,
                 control_path,
-                project_session_dir,
                 env_file_path: Mutex::new(env_file_path),
                 current_session_id: Mutex::new(session_id.clone()),
                 previous_session_id: Mutex::new(None),
@@ -227,34 +232,27 @@ impl ClaudeClearBinding {
     }
 
     fn resolve_current_session_state(&self) -> Option<(String, Option<String>)> {
-        let record = read_instance_record(&self.inner.record_path);
-        if let Some(record) = record.as_ref() {
+        if let Some(record) = read_instance_record(&self.inner.record_path) {
             let mut env_file_path = self
                 .inner
                 .env_file_path
                 .lock()
                 .expect("claude env file path mutex poisoned");
             *env_file_path = record.env_file_path.as_deref().map(PathBuf::from);
+            return Some((record.claude_session_id, record.previous_claude_session_id));
         }
-        let env_file_path = self
+        let session_id = self
             .inner
-            .env_file_path
+            .current_session_id
             .lock()
-            .expect("claude env file path mutex poisoned")
+            .expect("claude session id mutex poisoned")
             .clone();
-        let session_id = current_claude_session_id_from_sources(
-            self.inner.project_session_dir.as_deref(),
-            env_file_path.as_deref(),
-        )
-        .or_else(|| {
-            record
-                .as_ref()
-                .map(|record| record.claude_session_id.clone())
-        })?;
-        let previous_session_id = record
-            .as_ref()
-            .filter(|record| record.claude_session_id == session_id)
-            .and_then(|record| record.previous_claude_session_id.clone());
+        let previous_session_id = self
+            .inner
+            .previous_session_id
+            .lock()
+            .expect("claude previous session id mutex poisoned")
+            .clone();
         Some((session_id, previous_session_id))
     }
 
@@ -309,7 +307,7 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     }
     let project_session_state = current_project_session_state();
     let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
-    if let Some(previous_session_id) = previous_claude_session_id_for_handoff(
+    if let Some((previous_session_id, source)) = previous_claude_session_id_for_handoff(
         project_session_state
             .as_ref()
             .map(|(_, session_dir)| session_dir.as_path()),
@@ -320,6 +318,10 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
             &previous_session_id,
             session_id,
             env_file_path.as_deref(),
+            project_session_state
+                .as_ref()
+                .map(|(_, session_dir)| session_dir.as_path()),
+            source,
         )?;
     }
     if let Some((project_dir, _)) = project_session_state {
@@ -380,13 +382,25 @@ fn previous_claude_session_id_for_handoff(
     project_session_dir: Option<&Path>,
     env_file_path: Option<&Path>,
     current_session_id: &str,
-) -> Option<String> {
-    env::var(CLAUDE_SESSION_ID_ENV)
-        .ok()
-        .or_else(|| read_session_id_from_env_file(env_file_path))
-        .or_else(|| read_latest_inactive_session_id_from_project_state(project_session_dir))
+) -> Option<(String, HandoffSource)> {
+    if env_file_path.is_some()
+        && let Ok(value) = env::var(CLAUDE_SESSION_ID_ENV)
+    {
+        let value = value.trim().to_string();
+        if !value.is_empty() && value != current_session_id {
+            return Some((value, HandoffSource::EnvVar));
+        }
+    }
+    if let Some(value) = read_session_id_from_env_file(env_file_path) {
+        let value = value.trim().to_string();
+        if !value.is_empty() && value != current_session_id {
+            return Some((value, HandoffSource::EnvFile));
+        }
+    }
+    read_latest_inactive_session_id_from_project_state(project_session_dir)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && value != current_session_id)
+        .map(|value| (value, HandoffSource::ProjectState))
 }
 
 fn current_project_session_state() -> Option<(PathBuf, PathBuf)> {
@@ -507,6 +521,12 @@ fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Op
         .map(|record| record.claude_session_id)
 }
 
+fn project_session_is_active(path: Option<&Path>, session_id: &str) -> bool {
+    load_project_session_records(path)
+        .into_iter()
+        .any(|record| record.active && record.claude_session_id == session_id)
+}
+
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let raw = fs::read_to_string(path).ok()?;
@@ -596,6 +616,8 @@ fn rebind_instance_records_for_session(
     previous_session_id: &str,
     session_id: &str,
     env_file_path: Option<&Path>,
+    project_session_dir: Option<&Path>,
+    source: HandoffSource,
 ) -> io::Result<()> {
     let instances_dir = claude_clear_state_dir()?.join("instances");
     if !instances_dir.is_dir() {
@@ -617,6 +639,20 @@ fn rebind_instance_records_for_session(
             && record.previous_claude_session_id.as_deref() != Some(previous_session_id)
         {
             continue;
+        }
+        if project_session_is_active(project_session_dir, previous_session_id) {
+            continue;
+        }
+        match source {
+            HandoffSource::ProjectState => {}
+            HandoffSource::EnvVar | HandoffSource::EnvFile => {
+                let Some(current_env_file_path) = env_file_path else {
+                    continue;
+                };
+                if record.env_file_path.as_deref().map(Path::new) == Some(current_env_file_path) {
+                    continue;
+                }
+            }
         }
         record.claude_session_id = session_id.to_string();
         record.previous_claude_session_id = Some(previous_session_id.to_string());
