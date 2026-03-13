@@ -419,8 +419,30 @@ fn current_claude_session_id_from_sources(
     project_session_dir: Option<&Path>,
     env_file_path: Option<&Path>,
 ) -> Option<String> {
-    read_session_id_from_env_file(env_file_path)
-        .or_else(|| read_current_session_id_from_project_state(project_session_dir))
+    let env_file_session = read_session_id_from_env_file(env_file_path)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(env_session_id) = env_file_session.as_ref()
+        && env_file_session_activity(
+            env_file_path
+                .map(env_file_session_dir_for_path)
+                .transpose()
+                .ok()
+                .flatten()
+                .as_deref(),
+            env_session_id,
+        )
+        .is_some_and(|record| record.active)
+    {
+        return Some(env_session_id.clone());
+    }
+    if let Some(project_session_id) = read_current_project_session_record(project_session_dir)
+        .map(|record| record.claude_session_id.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(project_session_id);
+    }
+    env_file_session
         .or_else(|| env::var(CLAUDE_SESSION_ID_ENV).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -647,12 +669,11 @@ fn load_env_file_session_records(path: Option<&Path>) -> Vec<EnvFileSessionRecor
     records
 }
 
-fn read_current_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
+fn read_current_project_session_record(path: Option<&Path>) -> Option<ProjectSessionRecord> {
     load_project_session_records(path)
         .into_iter()
         .filter(|record| record.active)
         .max_by_key(|record| record.updated_unix_ms)
-        .map(|record| record.claude_session_id)
 }
 
 fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
@@ -901,6 +922,11 @@ fn rebind_instance_records_for_session(
                     continue;
                 };
                 if record.project_dir.as_deref().map(Path::new) != current_project_dir {
+                    continue;
+                }
+                if current_project_dir.is_some()
+                    && record.env_file_path.as_deref().map(Path::new) != Some(current_env_file_path)
+                {
                     continue;
                 }
                 if record.env_file_path.as_deref().map(Path::new) == Some(current_env_file_path) {
