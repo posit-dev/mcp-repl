@@ -5,9 +5,9 @@ Status: Proposed
 
 ## Summary
 
-Replace the current ring-buffer and post-hoc overflow reconstruction logic with a per-job unread-output sink.
+Replace the current ring-buffer and post-hoc overflow reconstruction logic with a per-session unread-output sink.
 
-The server will continue draining worker stdout and stderr eagerly at all times using the existing dedicated reader threads. Instead of retaining a replayable transcript and inferring truncation or lifecycle state later, the server will keep only unread output for the active job. Each `repl(...)` call will wait until the REPL becomes idle or the timeout expires, then drain the unread batch exactly once and format that drained batch for the MCP client.
+The server will continue draining worker stdout and stderr eagerly at all times using the existing dedicated reader threads. Instead of retaining a replayable transcript and inferring truncation or lifecycle state later, the server will keep only unread session output. Each `repl(...)` call will wait until the REPL becomes idle or the timeout expires, then drain the unread batch exactly once and format that drained batch for the MCP client.
 
 Small drained batches will be returned inline. Oversized drained batches will return an inline preview plus a retained overflow file containing the complete batch for that one reply. That overflow file is a convenience artifact and not part of live unread-output storage.
 
@@ -36,7 +36,7 @@ The core issue is architectural. The implementation currently reconstructs persi
 - Make each `repl(...)` return a self-contained, non-overlapping output batch.
 - Keep small and quick replies purely in memory.
 - Support long-running jobs with repeated polling via `repl("")`.
-- Keep `^C`, `^D`, `^Ccode`, and `^Dcode` as valid input forms.
+- Keep interrupt/restart control-byte prefixes and their compound forms as valid input forms.
 - Make overflow files self-contained and meaningful for one returned reply only.
 - Retain recent overflow files as a convenience for roughly the last 10-20 replies.
 
@@ -49,9 +49,9 @@ The core issue is architectural. The implementation currently reconstructs persi
 
 ## Chosen Approach
 
-Use one unread-only `PendingOutput` owner per active job.
+Use one unread-only `PendingOutput` owner per session.
 
-`PendingOutput` starts in memory. If unread output grows too large before the next drain, it promotes once to an internal spill representation on disk. When a `repl(...)` call returns, it drains all unread output exactly once and removes it from in-memory or on-disk storage. If the drained batch itself is oversized for inline presentation, the server creates a separate retained overflow artifact for that returned reply.
+`PendingOutput` starts in memory and stays active for the whole session, even while no tool call is currently pending. If unread output grows too large before the next drain, it promotes once to an internal spill representation on disk. When a `repl(...)` call returns, it drains all unread output exactly once and removes it from in-memory or on-disk storage. If the drained batch itself is oversized for inline presentation, the server creates a separate retained overflow artifact for that returned reply.
 
 This keeps capture, unread state, and drain semantics in one place while keeping reply overflow retention as a separate convenience layer.
 
@@ -59,37 +59,52 @@ This keeps capture, unread state, and drain semantics in one place while keeping
 
 ### Session Model
 
-Each REPL session has exactly one worker and one execution state:
+Each REPL session has exactly one worker, one session-owned unread-output sink, and one execution state:
 
-- `Idle`
-- `Busy(job)`
+- `IdleNoUnread`
+- `IdleWithUnread`
+- `Busy`
+- `CaptureFailed`
 
-There is no input queue. Non-empty input submitted while `Busy(job)` is active is rejected unless the input begins with a control prefix that explicitly interrupts or restarts the session.
+`PendingOutput` belongs to the session, not to the currently running tool call. This is required because the worker or a child process may continue writing to stdout/stderr after a previous tool call has already returned and the session is otherwise idle.
+
+There is no input queue. Plain non-empty input submitted while `Busy` is active is rejected unless the input begins with a control prefix that explicitly interrupts or restarts the session.
+
+Requests for one session are serialized by the server. At most one `repl` or `repl_reset` request may be actively waiting or draining for a session at a time.
 
 ### Input Forms
 
 The server parses each request into:
 
-- optional control action: none / interrupt (`^C`) / restart (`^D`)
+- optional control action: none / interrupt / restart
 - optional code payload
+
+The exact control-byte contract remains the existing one already documented in the `repl` tool descriptions:
+
+- `\u0003` in input interrupts
+- `\u0004` in input resets the session and then runs the remaining input
+
+Those escape sequences are documentation notation for the control bytes. This spec does not redefine them.
 
 Valid examples:
 
 - `1 + 1`
 - `""`
-- `^C`
-- `^D`
-- `^C1 + 1`
-- `^D1 + 1`
+- `\u0003`
+- `\u0004`
+- `\u00031 + 1`
+- `\u00041 + 1`
 
 ### Request Semantics
 
 #### `repl(code, timeout=T)` with plain non-empty `code`
 
-- If the session is `Idle`, start executing `code`.
-- If the session is `Busy(job)`, reject the request.
+- If the session is `Busy`, reject the request.
+- If the session is `IdleNoUnread` or `IdleWithUnread`, start executing `code`.
 - Wait until the session becomes idle or until `timeout` expires.
 - Drain unread output once and return that drained batch.
+
+If unread session output already exists before the new command starts, that unread prefix is preserved and included in the returned batch before the echoed input and the new command output. This preserves the current repo behavior where background output that arrived between tool calls is surfaced on the next call.
 
 #### `repl("", timeout=T)`
 
@@ -98,17 +113,20 @@ Valid examples:
 - Drain unread output once and return that drained batch.
 
 This is the only supported read path for a timed-out or still-running job.
-If the session is already idle and there is no unread output, return an empty batch immediately.
 
-#### `repl("^C", timeout=T)`
+If the session is already idle and there is unread output, return it immediately.
 
-- Interrupt the active job if one exists.
+If the session is already idle and there is no unread output, preserve the current poll behavior by returning the existing idle-status marker and prompt hint rather than inventing a new meta protocol.
+
+#### `repl("\u0003", timeout=T)`
+
+- Interrupt the current busy execution if one exists.
 - Wait until the session becomes idle or until `timeout` expires.
 - Drain unread output once and return that drained batch.
 
 Unread output produced before the interrupt is preserved and included.
 
-#### `repl("^D", timeout=T)`
+#### `repl("\u0004", timeout=T)`
 
 - Restart the session.
 - Wait until the session becomes idle or until `timeout` expires.
@@ -116,7 +134,7 @@ Unread output produced before the interrupt is preserved and included.
 
 Unread output produced before the restart is preserved and included.
 
-#### `repl("^Ccode", timeout=T)` and `repl("^Dcode", timeout=T)`
+#### `repl("\u0003" + code, timeout=T)` and `repl("\u0004" + code, timeout=T)`
 
 These are compound turns:
 
@@ -140,6 +158,38 @@ If the control-action phase does not reach idle before the deadline expires, the
 
 `timeout=0` does not need a separate implementation path. It is just an already-expired deadline.
 
+### Reply Outcome Signaling
+
+This redesign does not add a new machine-readable MCP status field. It preserves the current repo-visible reply markers:
+
+- timed-out but still-busy replies include `<<console status: busy, ...>>`
+- idle poll replies with no unread output include `<<console status: idle>>`
+- restart replies continue to include `[repl] new session started`
+
+These markers remain part of the returned batch content so existing transcript-style clients keep working during the redesign.
+
+## Compatibility Decisions
+
+The redesign preserves these current public behaviors:
+
+- background output collected between tool calls is surfaced as a prefix in the next returned batch
+- explicit input echo behavior when prefix/background output needs attribution
+- timeout status marker text
+- idle poll status marker text
+- restart notice text
+- prompt stripping and prompt re-append behavior
+- current internal `promptVariants`-driven prompt cleanup behavior
+- plot/image update collapsing within one returned batch
+- the separate `repl_reset` tool
+
+The redesign intentionally changes or retires these behaviors:
+
+- unread output ownership is session-level rather than tied to an active request
+- there is no replayable full-job transcript in normal operation
+- overflow artifacts represent one returned reply batch only, never a whole job transcript
+- `overflowResponseToken` will stop being emitted
+- `codex/overflow-response-consumed` remains accepted as a no-op compatibility notification during the transition and can be removed later
+
 ## Architecture
 
 ### 1. Worker Output Readers
@@ -147,31 +197,29 @@ If the control-action phase does not reach idle before the deadline expires, the
 Keep the existing dedicated reader threads for worker stdout and stderr. These threads continue to:
 
 - block on reading worker output
-- forward text chunks into the active job output sink immediately
+- forward text chunks into the session-owned unread-output sink immediately
 
 Image events continue to be forwarded into the same sink through the existing server-side integration point.
 
 This layer should not know anything about timeout policy, reply paging, or overflow retention.
 
-### 2. Active Job
+### 2. Active Execution State
 
-Introduce an explicit `ActiveJob` owner for the current busy execution.
+Introduce an explicit execution-state owner for whether the session is currently busy.
 
 Responsibilities:
 
-- own the current `PendingOutput`
-- receive text and image events in order
 - expose `wait_until_idle_or_deadline(deadline)`
-- expose `drain_unread_batch()`
-- expose completion / interrupted / restarted status to the request handler
+- expose whether the session is currently `Busy`
+- expose whether capture has entered the latched `CaptureFailed` state
 
-There is at most one `ActiveJob` per session.
+This unit does not own unread output. It only owns execution/busy state.
 
 ### 3. PendingOutput
 
-`PendingOutput` is the canonical unread-output store for the active job.
+`PendingOutput` is the canonical unread-output store for the session.
 
-It contains only output that has been captured from the worker but not yet shown to the MCP client.
+It contains only output that has been captured from the worker or its descendants and not yet shown to the MCP client.
 
 Once output has been returned to the client, it is removed from `PendingOutput` and is no longer kept in memory or spill storage.
 
@@ -180,7 +228,7 @@ Once output has been returned to the client, it is removed from `PendingOutput` 
 - `InMemory`
 - `SpilledToDisk`
 
-Promotion is one-way for the life of a job. Once a job spills to disk, unread output for that job continues to use the spill representation until the job ends.
+Promotion is one-way for the life of the session until unread output has been fully drained and the spill representation can be cleared. Spill state is about unread output volume, not about whether a specific tool call is active.
 
 #### Stored Items
 
@@ -192,6 +240,8 @@ Unread output is stored as ordered items:
 
 Ordering is the order in which the server received the events from the worker integration points.
 
+Before reply formatting, superseded plot/image updates inside the same drained batch continue to be collapsed using the repo's current `is_new` grouping behavior. The unread sink stores raw ordered image events; the batch formatter preserves current public behavior by applying the collapse step just before presentation.
+
 ### 4. Internal Spill Storage
 
 Internal spill storage is for unread output only. It is not user-facing and is not retained after the unread batch has been drained.
@@ -200,7 +250,7 @@ This spill layer exists only to support a running job that produces more unread 
 
 Recommended shape:
 
-- one per-job temporary directory
+- one per-session temporary directory
 - one append-only text file for unread text
 - image files for unread image items
 - a small ordered metadata index if needed to reconstruct text/image ordering during drain
@@ -222,6 +272,9 @@ Rules:
 - if the batch fits inline limits, return it inline
 - if the batch exceeds inline limits, return an inline preview plus an overflow file containing the complete drained batch for this reply
 - image ordering must be preserved
+- current prompt cleanup behavior must be preserved
+- current input-echo behavior must be preserved
+- current timeout / idle / restart marker text must be preserved
 - the overflow file must be self-contained and include the same head that appeared in the preview
 
 The wording should refer to the current reply, not to the full job. For example:
@@ -259,6 +312,15 @@ Each retained reply artifact must be self-contained:
 
 No files are created.
 
+### Background Output While Idle
+
+1. a command returns and the session becomes idle
+2. later, the worker process or one of its children emits more stdout/stderr
+3. reader threads append that output into session-owned `PendingOutput`
+4. a later `repl("")` or plain `repl(code, ...)` drains that unread prefix exactly once
+
+This is a required behavior of the redesign, not an edge-case fallback.
+
 ### Long-Running Job With Polls
 
 1. request starts a command and times out before idle
@@ -293,17 +355,31 @@ That overflow artifact is for this reply only. It is not a full transcript for t
 
 ### Busy Rejection
 
-Plain non-empty input while `Busy(job)` is active is rejected immediately.
+Plain non-empty input while `Busy` is active is rejected immediately.
 
 ### Interrupt / Restart
 
 Interrupt and restart are explicit control actions. They do not discard unread output from the prior job.
 
+### `repl_reset`
+
+The separate `repl_reset` tool is preserved. It is semantically equivalent to a standalone leading `EOT` request with no trailing code payload:
+
+- preserve unread prefix output
+- restart the session
+- wait for idle or timeout
+- drain one reply batch
+
 ### Internal Spill Failure
 
-If promotion to internal spill storage fails, fail the current request path clearly rather than silently dropping output.
+If promotion to internal spill storage fails, the session enters a latched `CaptureFailed` state clearly rather than silently dropping output.
 
-Implementation should prefer a small number of explicit failures over hidden fallback chains. The exact user-facing message can be specified during implementation planning, but the invariant is:
+In `CaptureFailed`:
+
+- the next plain `repl(code, ...)` or `repl("", ...)` request returns a deterministic error batch describing the capture failure and does not execute new user code
+- explicit restart (`repl_reset` or a leading `EOT` request) is still allowed and is the recovery path
+
+Implementation should prefer a small number of explicit failures over hidden fallback chains. The invariant is:
 
 - do not advertise output as complete if spill/persistence failed
 
@@ -320,17 +396,25 @@ Test through the public `repl(...)` API and transport behavior.
 Required coverage:
 
 - small inline reply from idle command
+- background output arriving while no tool call is active
+- plain input while idle with unread prefix output
 - timed-out command followed by `repl("")` poll
 - repeated polls that return non-overlapping batches
 - `repl("", timeout=T)` waiting until idle rather than returning early due to already-buffered unread output
-- `^C` preserving unread pre-interrupt output
-- `^D` preserving unread pre-restart output
-- `^Ccode` and `^Dcode` returning one combined batch across both phases
+- leading `\u0003` preserving unread pre-interrupt output
+- leading `\u0004` preserving unread pre-restart output
+- `\u0003 + code` and `\u0004 + code` returning one combined batch across both phases
+- `\u0003 + code` and `\u0004 + code` skipping the new code payload if phase 1 never reaches idle before the deadline
+- idle poll with no unread output still returning the current idle marker behavior
+- `repl_reset` matching standalone restart semantics
+- plot/image update collapsing within one returned batch
 - internal spill promotion for long-running unread output
+- latched `CaptureFailed` behavior when spill promotion fails without an active request in flight
 - oversized drained batch creating a self-contained overflow artifact for that reply only
 - multiple oversized polls producing separate overflow artifacts with no overlap
 - retention window eviction for old overflow artifacts
 - missing older overflow files simply disappearing after eviction
+- legacy `codex/overflow-response-consumed` notification being accepted as a no-op during compatibility
 
 Regression tests should avoid asserting internal capture implementation details such as ring offsets or transport-hook bookkeeping, because those are intentionally being removed.
 
@@ -347,9 +431,9 @@ Expected simplifications:
 
 The implementation plan should prefer a small number of well-bounded units:
 
-- request parser for control prefixes
-- active job / wait state controller
-- pending unread-output sink
+- request parser for control-byte prefixes
+- session execution-state controller
+- session-owned pending unread-output sink
 - reply batch formatter
 - overflow artifact retention manager
 
