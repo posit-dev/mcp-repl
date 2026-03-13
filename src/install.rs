@@ -15,7 +15,7 @@ const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox 
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 const CLAUDE_HOOK_SESSION_START_MATCHERS: &[&str] = &["startup", "resume", "clear", "compact"];
-const CLAUDE_HOOK_SESSION_END_MATCHER: &str = "clear";
+const CLAUDE_HOOK_SESSION_END_MATCHERS: &[&str] = &["clear", "prompt_input_exit", "other"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -625,12 +625,9 @@ fn upsert_claude_settings_hooks(
             &session_start_command,
         )?;
     }
-    upsert_claude_hook_command(
-        hooks_obj,
-        "SessionEnd",
-        Some(CLAUDE_HOOK_SESSION_END_MATCHER),
-        &session_end_command,
-    )?;
+    for matcher in CLAUDE_HOOK_SESSION_END_MATCHERS {
+        upsert_claude_hook_command(hooks_obj, "SessionEnd", Some(matcher), &session_end_command)?;
+    }
 
     let serialized = serde_json::to_string_pretty(&root)?;
     atomic_write(settings_path, &format!("{serialized}\n"))?;
@@ -1521,7 +1518,7 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_settings_hooks_adds_session_start_and_clear_hooks() {
+    fn upsert_claude_settings_hooks_adds_session_start_and_session_end_hooks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
 
@@ -1546,16 +1543,18 @@ name="demo"
         let session_end = root["hooks"]["SessionEnd"]
             .as_array()
             .expect("session end hooks array");
-        assert!(
-            session_end.iter().any(|entry| {
-                entry["matcher"].as_str() == Some("clear")
-                    && hook_entry_has_command(
-                        entry,
-                        "/usr/local/bin/mcp-repl claude-hook session-end",
-                    )
-            }),
-            "expected clear SessionEnd hook"
-        );
+        for matcher in CLAUDE_HOOK_SESSION_END_MATCHERS {
+            assert!(
+                session_end.iter().any(|entry| {
+                    entry["matcher"].as_str() == Some(*matcher)
+                        && hook_entry_has_command(
+                            entry,
+                            "/usr/local/bin/mcp-repl claude-hook session-end",
+                        )
+                }),
+                "expected {matcher} SessionEnd hook"
+            );
+        }
     }
 
     #[test]

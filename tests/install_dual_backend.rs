@@ -7,6 +7,8 @@ use common::TestResult;
 use serde_json::Value as JsonValue;
 use toml_edit::DocumentMut;
 
+const CLAUDE_SESSION_END_MATCHERS: &[&str] = &["clear", "prompt_input_exit", "other"];
+
 fn resolve_exe() -> TestResult<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
         return Ok(PathBuf::from(path));
@@ -181,19 +183,21 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let session_end = settings_root["hooks"]["SessionEnd"]
         .as_array()
         .expect("expected SessionEnd hooks array");
-    assert!(
-        session_end.iter().any(|entry| {
-            entry["matcher"].as_str() == Some("clear")
-                && entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|hook| {
-                        hook["type"].as_str() == Some("command")
-                            && hook["command"].as_str()
-                                == Some("/usr/local/bin/mcp-repl claude-hook session-end")
+    for matcher in CLAUDE_SESSION_END_MATCHERS {
+        assert!(
+            session_end.iter().any(|entry| {
+                entry["matcher"].as_str() == Some(*matcher)
+                    && entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook["type"].as_str() == Some("command")
+                                && hook["command"].as_str()
+                                    == Some("/usr/local/bin/mcp-repl claude-hook session-end")
+                        })
                     })
-                })
-        }),
-        "expected clear SessionEnd hook"
-    );
+            }),
+            "expected {matcher} SessionEnd hook"
+        );
+    }
 
     Ok(())
 }
@@ -260,24 +264,26 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
     let session_end = settings_root["hooks"]["SessionEnd"]
         .as_array()
         .expect("expected SessionEnd hooks array");
-    let clear_entry = session_end
-        .iter()
-        .find(|entry| entry["matcher"].as_str() == Some("clear"))
-        .expect("expected SessionEnd clear matcher entry");
-    let clear_hooks = clear_entry["hooks"]
-        .as_array()
-        .expect("expected clear hooks array");
-    let clear_commands: Vec<&str> = clear_hooks
-        .iter()
-        .filter_map(|hook| hook["command"].as_str())
-        .filter(|command| command.contains("claude-hook session-end"))
-        .collect();
-    let expected_clear = format!("{new_command} claude-hook session-end");
-    assert_eq!(
-        clear_commands,
-        vec![expected_clear.as_str()],
-        "expected one updated SessionEnd command"
-    );
+    let expected_session_end = format!("{new_command} claude-hook session-end");
+    for matcher in CLAUDE_SESSION_END_MATCHERS {
+        let entry = session_end
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some(*matcher))
+            .expect("expected SessionEnd matcher entry");
+        let hooks = entry["hooks"]
+            .as_array()
+            .expect("expected SessionEnd hooks array");
+        let commands: Vec<&str> = hooks
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .filter(|command| command.contains("claude-hook session-end"))
+            .collect();
+        assert_eq!(
+            commands,
+            vec![expected_session_end.as_str()],
+            "expected one updated SessionEnd command for matcher {matcher}"
+        );
+    }
 
     let stale_session_start = format!("{old_command} claude-hook session-start");
     let stale_session_end = format!("{old_command} claude-hook session-end");
