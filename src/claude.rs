@@ -256,34 +256,47 @@ pub fn run_hook(command: HookCommand) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Error>> {
-    if input.session_id.trim().is_empty() {
+    let session_id = input.session_id.trim();
+    if session_id.is_empty() {
         return Ok(());
     }
     if input.hook_event_name.as_deref() != Some("SessionStart") {
         return Ok(());
     }
-    if let Some((project_dir, path)) = current_project_session_state() {
+    let project_session_state = current_project_session_state();
+    let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
+    if let Some(previous_session_id) = current_claude_session_id_from_sources(
+        project_session_state
+            .as_ref()
+            .map(|(_, path)| path.as_path()),
+        env_file_path.as_deref(),
+    )
+    .filter(|previous_session_id| previous_session_id != session_id)
+    {
+        rebind_instance_records_for_session(&previous_session_id, session_id)?;
+    }
+    if let Some((project_dir, path)) = project_session_state {
         write_json_atomic(
             &path,
             &ProjectSessionRecord {
-                claude_session_id: input.session_id.trim().to_string(),
+                claude_session_id: session_id.to_string(),
                 project_dir: project_dir.to_string_lossy().to_string(),
                 updated_unix_ms: unix_ms_now(),
             },
         )?;
     }
-    if let Some(path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) {
+    if let Some(path) = env_file_path {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
+        let needs_separator = env_file_needs_separator(&path)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(
-            file,
-            "export {CLAUDE_SESSION_ID_ENV}={}",
-            input.session_id.trim()
-        )?;
+        if needs_separator {
+            writeln!(file)?;
+        }
+        writeln!(file, "export {CLAUDE_SESSION_ID_ENV}={}", session_id)?;
     }
     Ok(())
 }
@@ -426,6 +439,13 @@ fn write_control_request(path: &Path, request: &ControlRequest) -> io::Result<()
     write_json_atomic(path, request)
 }
 
+fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
+    let Ok(raw) = fs::read(path) else {
+        return Ok(false);
+    };
+    Ok(!raw.is_empty() && !raw.ends_with(b"\n"))
+}
+
 fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<InstanceRecord>> {
     let mut out = Vec::new();
     let instances_dir = claude_clear_state_dir()?.join("instances");
@@ -451,6 +471,38 @@ fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<Instanc
         }
     }
     Ok(out)
+}
+
+fn rebind_instance_records_for_session(
+    previous_session_id: &str,
+    session_id: &str,
+) -> io::Result<()> {
+    let instances_dir = claude_clear_state_dir()?.join("instances");
+    if !instances_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(instances_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<InstanceRecord>(&raw) else {
+            continue;
+        };
+        if record.claude_session_id != previous_session_id
+            && record.previous_claude_session_id.as_deref() != Some(previous_session_id)
+        {
+            continue;
+        }
+        record.claude_session_id = session_id.to_string();
+        record.previous_claude_session_id = Some(previous_session_id.to_string());
+        write_json_atomic(&path, &record)?;
+    }
+    Ok(())
 }
 
 fn unique_instance_id(
