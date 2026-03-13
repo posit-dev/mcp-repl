@@ -9,7 +9,7 @@ Replace the current ring-buffer and post-hoc overflow reconstruction logic with 
 
 The server will continue draining worker stdout and stderr eagerly at all times using the existing dedicated reader threads. Instead of retaining a replayable transcript and inferring truncation or lifecycle state later, the server will keep only unread output that has not yet been shown. Each `repl(...)` call will wait until the REPL becomes idle or the timeout expires, then drain the unread batch exactly once and format that drained batch for the MCP client.
 
-Small drained batches will be returned inline. Oversized drained batches will return an inline preview plus a retained overflow file containing the complete batch for that one reply. That overflow file is a convenience artifact and not part of live unread-output storage.
+Small drained batches will be returned inline. Oversized drained batches will return an inline head-and-tail preview plus a retained overflow file containing the complete batch for that one reply. That overflow file is a convenience artifact and not part of live unread-output storage.
 
 ## Problem
 
@@ -279,16 +279,22 @@ This formatter decides only how to present the batch that was just drained. It d
 Rules:
 
 - if the batch fits inline limits, return it inline
-- if the batch exceeds inline limits, return an inline preview plus an overflow file containing the complete drained batch for this reply
+- if the batch exceeds inline limits, return an inline head-and-tail preview plus an overflow file containing the complete drained batch for this reply
 - image ordering must be preserved
 - current prompt cleanup behavior must be preserved
 - current input-echo behavior must be preserved
 - current timeout / idle / restart marker text must be preserved
-- the overflow file must be self-contained and include the same head that appeared in the preview
+- the inline preview must consist of two non-overlapping slices from the drained batch: a head slice and a tail slice
+- the inline preview must insert a single synthetic truncation notice between those slices, and that notice must make it explicit that the middle of the current reply was omitted from inline presentation by the REPL
+- synthetic truncation notices must use the REPL's own marker style so they are distinguishable from real program output
+- the preview must cut at stable item boundaries rather than in the middle of a text line or image-path notice
+- the overflow file must be self-contained and include the same head and tail content that appeared in the preview
 
 The wording should refer to the current reply, not to the full job. For example:
 
-`[repl] output for this reply truncated; full reply at ...`
+`[repl] middle of this reply omitted from inline preview; full reply at ...`
+
+The exact head-vs-tail budget split can be chosen during planning, but the default should favor the head slightly while always leaving room for a meaningful tail.
 
 ### 6. Overflow Artifact Retention
 
@@ -364,7 +370,7 @@ This spill representation is invisible to the MCP client.
 
 1. handler drains one unread batch
 2. formatter determines that the batch is too large for inline presentation
-3. formatter returns a preview inline
+3. formatter returns a head-and-tail preview inline
 4. formatter writes a retained overflow artifact containing the complete drained batch for this reply
 5. retention manager keeps that artifact around for recent replies
 
@@ -410,6 +416,7 @@ Required behavior:
 
 - the drained batch has already been removed from unread storage, so the server must not rely on re-reading it later
 - the server still returns only the normal bounded inline response for that reply, not the full drained batch
+- that bounded inline response continues to use the same head-and-tail preview shape
 - the bounded inline response must include a short notice that overflow persistence failed because the server could not write the artifact
 - any undisplayed tail from that drained batch is dropped
 
@@ -450,6 +457,8 @@ Required coverage:
 - internal spill promotion for long-running unread output
 - latched `CaptureFailed` behavior when spill promotion fails without an active request in flight
 - oversized drained batch creating a self-contained overflow artifact for that reply only
+- oversized drained batch preview showing both a non-overlapping head slice and tail slice with one explicit middle-omission notice
+- preview truncation preserving complete lines and complete image-path notices rather than cutting through them
 - overflow artifact write failure returning the normal bounded inline response plus a short write-failure notice
 - multiple oversized polls producing separate overflow artifacts with no overlap
 - retention window eviction for old overflow artifacts
