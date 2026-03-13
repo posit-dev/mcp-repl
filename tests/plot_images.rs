@@ -6,6 +6,8 @@ use base64::Engine as _;
 use common::{TestResult, spawn_server};
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -36,6 +38,25 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn overflow_path(text: &str) -> Option<PathBuf> {
+    let marker = "full response at ";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..]
+        .find('\n')
+        .map(|idx| start + idx)
+        .unwrap_or(text.len());
+    Some(PathBuf::from(text[start..end].trim()))
+}
+
+fn extract_all_paths(text: &str, marker: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            let start = line.find(marker)? + marker.len();
+            Some(PathBuf::from(line[start..].trim()))
+        })
+        .collect()
 }
 
 fn backend_unavailable(text: &str) -> bool {
@@ -517,6 +538,123 @@ async fn plots_emit_images_with_large_text_output() -> TestResult<()> {
         "expected large output to still include plot image content"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn text_overflow_file_preserves_inline_plot_positions() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = r#"
+cat(paste(rep("x", 12000), collapse = ""))
+cat("\nINLINE_OVERFLOW_BEFORE_PLOT\n")
+plot(1:10)
+cat("INLINE_OVERFLOW_AFTER_PLOT\n")
+"#;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "overflowing plot reported an error: {text}"
+    );
+
+    let images = extract_images(&result);
+    assert_eq!(images.len(), 1, "expected one inline plot image");
+    let image_content_idx = result
+        .content
+        .iter()
+        .position(|content| matches!(content.raw, RawContent::Image(_)))
+        .ok_or_else(|| "missing inline image content".to_string())?;
+    assert_eq!(
+        image_content_idx,
+        result.content.len() - 1,
+        "expected the inline image to remain the final content item"
+    );
+
+    let response_path = overflow_path(&text)
+        .ok_or_else(|| format!("expected overflow path in result text, got: {text:?}"))?;
+    let overflow_text = fs::read_to_string(&response_path)?;
+    let before_idx = overflow_text
+        .find("INLINE_OVERFLOW_BEFORE_PLOT")
+        .ok_or_else(|| format!("missing pre-plot marker in overflow file: {overflow_text:?}"))?;
+    let image_idx = overflow_text.find("image-01.png").ok_or_else(|| {
+        format!("missing persisted inline image path in overflow file: {overflow_text:?}")
+    })?;
+    let after_idx = overflow_text
+        .find("INLINE_OVERFLOW_AFTER_PLOT")
+        .ok_or_else(|| format!("missing post-plot marker in overflow file: {overflow_text:?}"))?;
+    assert!(
+        before_idx < after_idx && after_idx < image_idx,
+        "expected inline image reference to keep the same trailing position as the public response: {overflow_text:?}"
+    );
+
+    let image_path = extract_all_paths(&overflow_text, "full image at ")
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("missing persisted inline image file path: {overflow_text:?}"))?;
+    assert!(
+        image_path.exists(),
+        "expected persisted inline image file to exist: {image_path:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overflow_store_reenforces_cap_after_large_plot_batch_finishes() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 1:80) plot(i:(i + 9))";
+    let result = session.write_stdin_raw_with(input, Some(120.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "large plot batch reported an error: {text}"
+    );
+
+    let inline_images = extract_images(&result);
+    assert_eq!(inline_images.len(), 4, "expected four inline images");
+
+    let response_path = overflow_path(&text);
+    let overflow_paths = extract_all_paths(&text, "full image at ");
+    assert!(
+        response_path.is_some() || !overflow_paths.is_empty(),
+        "expected overflow artifacts in the response, got: {text:?}"
+    );
+
+    let overflow_root = response_path
+        .as_deref()
+        .or_else(|| overflow_paths.first().map(PathBuf::as_path))
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "missing overflow root for response_path={response_path:?} overflow_paths={overflow_paths:?}"
+            )
+        })?;
+    let retained_file_count = fs::read_dir(overflow_root)?.count();
+    assert_eq!(
+        retained_file_count, 64,
+        "expected overflow store to enforce the 64-file cap after the response finished"
+    );
+
+    session.cancel().await?;
     Ok(())
 }
 

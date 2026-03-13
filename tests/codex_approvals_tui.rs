@@ -205,6 +205,11 @@ mod unix_impl {
     }
 
     pub(super) async fn run_mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(());
+        }
+
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
