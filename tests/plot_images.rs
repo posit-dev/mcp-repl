@@ -1402,6 +1402,69 @@ for (i in 8:90) plot(i:(i + 9))";
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn raw_transport_keeps_all_unread_overflow_paths_live_across_later_requests() -> TestResult<()>
+{
+    let mut server = RawMcpServer::spawn().await?;
+    server.initialize().await?;
+
+    let first_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 1:7) plot(i:(i + 9))";
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 8:14) plot(i:(i + 9))";
+    let third_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 15:90) plot(i:(i + 9))";
+
+    server.call_tool(2, first_input, 120_000).await?;
+    sleep(Duration::from_millis(1200)).await;
+    server.call_tool(3, second_input, 120_000).await?;
+    sleep(Duration::from_millis(1200)).await;
+    server.call_tool(4, third_input, 120_000).await?;
+    sleep(Duration::from_millis(800)).await;
+
+    let first_result = server.read_call_tool_result(2).await?;
+    let second_result = server.read_call_tool_result(3).await?;
+    let first_text = result_text(&first_result);
+    let second_text = result_text(&second_result);
+    if any_backend_unavailable(&[&first_result, &second_result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        server.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first unread raw overflow batch reported an error: {first_text}"
+    );
+    assert_ne!(
+        second_result.is_error,
+        Some(true),
+        "second unread raw overflow batch reported an error: {second_text}"
+    );
+
+    for (label, text) in [("first", &first_text), ("second", &second_text)] {
+        let overflow_paths = extract_all_paths(text, "full image at ");
+        assert_eq!(
+            overflow_paths.len(),
+            3,
+            "expected three overflow image paths in the {label} unread raw reply, got: {text:?}"
+        );
+        for path in overflow_paths {
+            assert!(
+                path.exists(),
+                "expected raw transport to keep every unread reply's overflow path live across later requests: {path:?}"
+            );
+        }
+    }
+
+    server.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn truncated_preview_keeps_only_complete_overflow_image_paths() -> TestResult<()> {
     let mut session = spawn_server().await?;
 
@@ -1443,6 +1506,50 @@ async fn truncated_preview_keeps_only_complete_overflow_image_paths() -> TestRes
             );
         }
     }
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn user_printed_truncation_notice_still_persists_full_response() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = format!(
+        "cat({notice:?}); plot(1:10); cat(paste(rep('x', 12000), collapse = ''))",
+        notice = "[repl] output truncated (older output dropped)\n"
+    );
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "user-printed truncation notice scenario reported an error: {text}"
+    );
+    assert!(
+        !text.contains(
+            "full response unavailable because older output was already dropped by the worker"
+        ),
+        "user-visible truncation sentinel text must not disable overflow persistence: {text:?}"
+    );
+
+    let response_path = overflow_path(&text)
+        .ok_or_else(|| format!("expected persisted overflow path, got: {text:?}"))?;
+    assert!(
+        response_path.exists(),
+        "expected persisted overflow file to exist: {response_path:?}"
+    );
+    let overflow_text = fs::read_to_string(response_path)?;
+    assert!(
+        overflow_text.contains("[repl] output truncated (older output dropped)\n"),
+        "expected persisted overflow file to preserve the user-printed sentinel text: {overflow_text:?}"
+    );
 
     session.cancel().await?;
     Ok(())

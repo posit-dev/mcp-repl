@@ -242,6 +242,7 @@ pub(crate) struct OutputRange {
     pub bytes: Vec<u8>,
     pub events: Vec<OutputEvent>,
     pub text_spans: Vec<OutputTextSpan>,
+    pub older_output_dropped: bool,
 }
 
 impl OutputRange {
@@ -252,6 +253,7 @@ impl OutputRange {
             bytes: Vec::new(),
             events: Vec::new(),
             text_spans: Vec::new(),
+            older_output_dropped: false,
         }
     }
 }
@@ -417,6 +419,7 @@ impl OutputRing {
             bytes,
             events: collected.events,
             text_spans,
+            older_output_dropped: collected.start_offset > start_offset,
         }
     }
 

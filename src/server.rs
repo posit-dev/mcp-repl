@@ -488,16 +488,20 @@ fn worker_result_to_call_tool_result(
 ) -> Result<CallToolResult, McpError> {
     let mut contents = Vec::new();
     let mut is_error = false;
+    let mut older_output_dropped = false;
     match result {
         Ok(reply) => {
-            let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
+            let (mut reply_contents, reply_error, reply_older_output_dropped) =
+                worker_reply_to_contents(reply);
             is_error |= reply_error;
+            older_output_dropped |= reply_older_output_dropped;
             contents.append(&mut reply_contents);
             Ok(finalize_batch(
                 contents,
                 is_error,
                 overflow_store,
                 overflow_metadata,
+                older_output_dropped,
             ))
         }
         Err(err) => {
@@ -509,6 +513,7 @@ fn worker_result_to_call_tool_result(
                 is_error,
                 overflow_store,
                 overflow_metadata,
+                older_output_dropped,
             ))
         }
     }

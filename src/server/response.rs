@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::{Builder, TempDir};
 
-use crate::output_capture::OUTPUT_TRUNCATION_NOTICE;
 use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const INLINE_TEXT_LIMIT_BYTES: usize = 10 * 1024;
@@ -223,29 +222,8 @@ impl OverflowFileStore {
     }
 
     pub(crate) fn begin_request(&self) {
-        let sent_responses = {
-            let mut open_request_count = self.inner.open_request_count.lock().unwrap();
-            let sent_responses = if *open_request_count == 0 {
-                let mut sent_responses = self
-                    .inner
-                    .sent_responses_waiting_for_next_request
-                    .lock()
-                    .unwrap();
-                let newest_response = sent_responses.pop_back();
-                let stale_responses = sent_responses.drain(..).collect();
-                if let Some(response_key) = newest_response {
-                    sent_responses.push_back(response_key);
-                }
-                stale_responses
-            } else {
-                Vec::new()
-            };
-            *open_request_count += 1;
-            sent_responses
-        };
-        for response_key in sent_responses {
-            self.release_response(&response_key);
-        }
+        let mut open_request_count = self.inner.open_request_count.lock().unwrap();
+        *open_request_count += 1;
     }
 
     pub(crate) fn activate_response_send(&self, metadata: &OverflowMetadata) {
@@ -403,15 +381,16 @@ impl OverflowFileStore {
     }
 }
 
-pub(crate) fn worker_reply_to_contents(reply: WorkerReply) -> (Vec<Content>, bool) {
-    let (contents, is_error) = match reply {
+pub(crate) fn worker_reply_to_contents(reply: WorkerReply) -> (Vec<Content>, bool, bool) {
+    let (contents, is_error, older_output_dropped) = match reply {
         WorkerReply::Output {
             contents,
+            older_output_dropped,
             is_error,
             error_code: _,
             prompt: _,
             prompt_variants: _,
-        } => (contents, is_error),
+        } => (contents, is_error, older_output_dropped),
     };
     let contents = collapse_image_updates(contents);
     let contents = contents
@@ -429,7 +408,7 @@ pub(crate) fn worker_reply_to_contents(reply: WorkerReply) -> (Vec<Content>, boo
         })
         .collect();
 
-    (contents, is_error)
+    (contents, is_error, older_output_dropped)
 }
 
 pub(crate) fn finalize_batch(
@@ -437,11 +416,17 @@ pub(crate) fn finalize_batch(
     is_error: bool,
     overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: OverflowMetadata,
+    worker_output_was_truncated: bool,
 ) -> CallToolResult {
     let _active_response_guard =
         overflow_store.map(|store| store.activate_response(&overflow_metadata));
     contents = maybe_overflow_image_contents(contents, overflow_store, &overflow_metadata);
-    contents = maybe_overflow_text_contents(contents, overflow_store, &overflow_metadata);
+    contents = maybe_overflow_text_contents(
+        contents,
+        overflow_store,
+        &overflow_metadata,
+        worker_output_was_truncated,
+    );
     ensure_nonempty_contents(&mut contents);
     // Preserve backend error detection (for prompt normalization, paging decisions, etc.) but
     // do not map it to MCP tool errors.
@@ -459,6 +444,7 @@ fn maybe_overflow_text_contents(
     contents: Vec<Content>,
     overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: &OverflowMetadata,
+    worker_output_was_truncated: bool,
 ) -> Vec<Content> {
     let total_text_bytes: usize = contents
         .iter()
@@ -475,11 +461,6 @@ fn maybe_overflow_text_contents(
     else {
         return contents;
     };
-    let worker_output_was_truncated = contents
-        .iter()
-        .filter_map(content_text)
-        .any(|text| text == OUTPUT_TRUNCATION_NOTICE);
-
     let overflow_notice = if worker_output_was_truncated {
         overflow_notice_worker_truncated()
     } else {
@@ -1243,6 +1224,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 1, "call_123"),
+            false,
         );
         assert_eq!(result_text(&result), "ok\n");
     }
@@ -1256,6 +1238,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 1, "call_123"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1312,6 +1295,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 2, "call_utf8"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1340,6 +1324,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 3, "call_image"),
+            false,
         );
 
         let image_count = result
@@ -1364,6 +1349,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 4, "call_mixed"),
+            false,
         );
 
         assert!(matches!(result.content[0].raw, RawContent::Text(_)));
@@ -1393,6 +1379,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 8, "call_images"),
+            false,
         );
 
         let inline_image_count = result
@@ -1430,6 +1417,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 13, "call_many_images"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1458,6 +1446,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 14, "call_mixed_many"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1514,6 +1503,7 @@ mod tests {
                 false,
                 Some(&store_for_a),
                 overflow_metadata("repl", 21, "call_a"),
+                false,
             );
             result_text(&result)
         });
@@ -1527,6 +1517,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 22, "call_b"),
+            false,
         );
 
         release_a_tx
@@ -1560,6 +1551,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 9, "call_order"),
+            false,
         );
 
         assert!(matches!(result.content[0].raw, RawContent::Text(_)));
@@ -1597,6 +1589,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 10, "call_image_fail"),
+            false,
         );
 
         let inline_image_count = result
@@ -1620,6 +1613,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 11, "call_many_images"),
+            false,
         );
 
         let inline_image_count = result
@@ -1654,6 +1648,7 @@ mod tests {
             false,
             Some(&store),
             overflow_metadata("repl", 4, "call_fail"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1672,6 +1667,7 @@ mod tests {
             false,
             None,
             overflow_metadata("repl", 12, "call_no_store"),
+            false,
         );
 
         let text = result_text(&result);
@@ -1729,6 +1725,7 @@ mod tests {
                 false,
                 Some(&store),
                 overflow_metadata("repl", turn, &format!("call_{turn}")),
+                false,
             );
             let path = extract_overflow_path(&result_text(&result)).expect("overflow path");
             paths.push(path);

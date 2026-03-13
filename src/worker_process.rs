@@ -386,6 +386,7 @@ struct RequestState {
 
 struct SnapshotContents {
     contents: Vec<WorkerContent>,
+    older_output_dropped: bool,
 }
 
 struct CompletionSnapshot {
@@ -709,7 +710,10 @@ impl WorkerManager {
             (saw_stderr, snapshot)
         };
         let is_error = saw_stderr;
-        let SnapshotContents { mut contents } = snapshot;
+        let SnapshotContents {
+            mut contents,
+            older_output_dropped,
+        } = snapshot;
 
         if timed_out {
             let elapsed = self
@@ -737,6 +741,7 @@ impl WorkerManager {
         Ok(ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
+                older_output_dropped,
                 is_error,
                 error_code: timed_out.then_some(WorkerErrorCode::Timeout),
                 prompt: (!session_end).then_some(()).and(resolved_prompt),
@@ -769,7 +774,7 @@ impl WorkerManager {
             prefix_is_error = self
                 .output
                 .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
-            prefix_contents = take_range_from_ring(&self.output, pending_end);
+            prefix_contents = take_range_from_ring(&self.output, pending_end).contents;
         }
 
         let start_offset = self.output.end_offset().unwrap_or(0);
@@ -825,12 +830,14 @@ impl WorkerManager {
         }
         let SnapshotContents {
             contents: mut page_contents,
+            older_output_dropped,
         } = snapshot_all_output(&self.output, end_offset);
         contents.append(&mut page_contents);
         contents.push(WorkerContent::stderr(format!("worker error: {err}")));
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
+                older_output_dropped,
                 is_error: true,
                 error_code: worker_error_code(err),
                 prompt: None,
@@ -872,6 +879,7 @@ impl WorkerManager {
                 let is_error = context.prefix_is_error || saw_stderr;
                 let SnapshotContents {
                     contents: mut page_contents,
+                    older_output_dropped,
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
                 let resolved_prompt = if session_end {
@@ -890,6 +898,7 @@ impl WorkerManager {
                 Ok(ReplyWithOffset {
                     reply: WorkerReply::Output {
                         contents,
+                        older_output_dropped,
                         is_error,
                         error_code: None,
                         prompt: (!session_end).then_some(()).and(resolved_prompt),
@@ -922,6 +931,7 @@ impl WorkerManager {
                 }
                 let SnapshotContents {
                     contents: mut page_contents,
+                    older_output_dropped,
                 } = snapshot_all_output(&self.output, end_offset);
                 contents.append(&mut page_contents);
 
@@ -935,6 +945,7 @@ impl WorkerManager {
                 Ok(ReplyWithOffset {
                     reply: WorkerReply::Output {
                         contents,
+                        older_output_dropped,
                         is_error,
                         error_code: Some(WorkerErrorCode::Timeout),
                         prompt: None,
@@ -1183,7 +1194,10 @@ impl WorkerManager {
         let is_error = self
             .output
             .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let SnapshotContents { mut contents } = snapshot_all_output(&self.output, end_offset);
+        let SnapshotContents {
+            mut contents,
+            older_output_dropped,
+        } = snapshot_all_output(&self.output, end_offset);
 
         if timed_out {
             contents.push(timeout_status_content(timeout));
@@ -1208,6 +1222,7 @@ impl WorkerManager {
 
         let reply = WorkerReply::Output {
             contents,
+            older_output_dropped,
             is_error,
             error_code: timed_out.then_some(WorkerErrorCode::Timeout),
             prompt: (!session_end).then_some(()).and(resolved_prompt),
@@ -1375,6 +1390,7 @@ impl WorkerManager {
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
+                older_output_dropped: false,
                 is_error: false,
                 error_code: None,
                 prompt,
@@ -1505,7 +1521,10 @@ impl WorkerManager {
         let end_offset = self.output.end_offset().unwrap_or(0);
         let mut is_error = false;
 
-        let SnapshotContents { mut contents } = snapshot_all_output(&self.output, end_offset);
+        let SnapshotContents {
+            mut contents,
+            older_output_dropped,
+        } = snapshot_all_output(&self.output, end_offset);
 
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
@@ -1526,6 +1545,7 @@ impl WorkerManager {
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
+                older_output_dropped,
                 is_error,
                 error_code: None,
                 prompt: None,
@@ -1537,12 +1557,10 @@ impl WorkerManager {
 }
 
 fn snapshot_all_output(output: &OutputBuffer, end_offset: u64) -> SnapshotContents {
-    SnapshotContents {
-        contents: take_range_from_ring(output, end_offset),
-    }
+    take_range_from_ring(output, end_offset)
 }
 
-fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
+fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> SnapshotContents {
     output.start_capture();
     let start_offset = output.current_offset().unwrap_or(end_offset);
     let range = output.read_range(start_offset, end_offset);
@@ -1550,9 +1568,12 @@ fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerCon
     contents_from_output_range(range)
 }
 
-fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+fn contents_from_output_range(range: OutputRange) -> SnapshotContents {
     if range.bytes.is_empty() && range.events.is_empty() {
-        return Vec::new();
+        return SnapshotContents {
+            contents: Vec::new(),
+            older_output_dropped: range.older_output_dropped,
+        };
     }
 
     let mut contents = Vec::new();
@@ -1589,7 +1610,10 @@ fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
         &mut contents,
     );
 
-    contents
+    SnapshotContents {
+        contents,
+        older_output_dropped: range.older_output_dropped,
+    }
 }
 
 fn append_text_contents(
@@ -1688,20 +1712,20 @@ fn snapshot_from_collapsed(
     events: Vec<(u64, OutputEventKind)>,
     text_spans: Vec<OutputTextSpan>,
     _source_end: u64,
+    older_output_dropped: bool,
 ) -> SnapshotContents {
     let events = events
         .into_iter()
         .map(|(offset, kind)| OutputEvent { offset, kind })
         .collect();
-    SnapshotContents {
-        contents: contents_from_output_range(OutputRange {
-            start_offset: 0,
-            end_offset: bytes.len() as u64,
-            bytes,
-            events,
-            text_spans,
-        }),
-    }
+    contents_from_output_range(OutputRange {
+        start_offset: 0,
+        end_offset: bytes.len() as u64,
+        bytes,
+        events,
+        text_spans,
+        older_output_dropped,
+    })
 }
 
 fn snapshot_after_completion(
@@ -1717,11 +1741,13 @@ fn snapshot_after_completion(
         // relevant expression) so we don't page/hang on pure echo.
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
+        let older_output_dropped = range.older_output_dropped;
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
         let (bytes, events, text_spans) =
             collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-        let snapshot = snapshot_from_collapsed(bytes, events, text_spans, end_offset);
+        let snapshot =
+            snapshot_from_collapsed(bytes, events, text_spans, end_offset, older_output_dropped);
         return CompletionSnapshot {
             snapshot,
             saw_stderr,

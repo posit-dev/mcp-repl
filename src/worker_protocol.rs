@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub const WORKER_MODE_ARG: &str = "worker";
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerErrorCode {
@@ -41,6 +45,12 @@ pub enum TextStream {
 pub enum WorkerReply {
     Output {
         contents: Vec<WorkerContent>,
+        #[serde(
+            rename = "olderOutputDropped",
+            default,
+            skip_serializing_if = "is_false"
+        )]
+        older_output_dropped: bool,
         #[serde(rename = "isError")]
         is_error: bool,
         #[serde(rename = "errorCode", default, skip_serializing_if = "Option::is_none")]
