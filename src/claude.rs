@@ -2,6 +2,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ pub const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
+static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookCommand {
@@ -309,7 +311,8 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
         return Ok(());
     }
     if input.reason.as_deref() != Some("clear") {
-        clear_project_session_if_matches(input.session_id.trim())?;
+        // Keep the last per-project session id so the next SessionStart can rebind any idle
+        // server records before a `/clear` arrives in the new Claude session.
         return Ok(());
     }
 
@@ -377,20 +380,6 @@ fn read_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
     let record = serde_json::from_str::<ProjectSessionRecord>(&raw).ok()?;
     let session_id = record.claude_session_id.trim();
     (!session_id.is_empty()).then(|| session_id.to_string())
-}
-
-fn clear_project_session_if_matches(session_id: &str) -> io::Result<()> {
-    let Some(path) = current_project_session_path() else {
-        return Ok(());
-    };
-    if read_session_id_from_project_state(Some(&path)).as_deref() != Some(session_id) {
-        return Ok(());
-    }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -556,18 +545,26 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         ));
     };
     fs::create_dir_all(parent)?;
-    let tmp_name = format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("state")
-    );
-    let tmp_path = parent.join(tmp_name);
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| io::Error::other(format!("failed to serialize json: {err}")))?;
-    fs::write(&tmp_path, bytes)?;
+    let tmp_path = unique_atomic_write_tmp_path(parent, path);
+    let mut tmp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(&bytes)?;
+    drop(tmp_file);
     replace_file_atomically(&tmp_path, path)?;
     Ok(())
+}
+
+fn unique_atomic_write_tmp_path(parent: &Path, path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    let id = NEXT_TMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{stem}.{}.{}.tmp", std::process::id(), id))
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -115,6 +115,26 @@ fn run_claude_hook_with_env(
     .into())
 }
 
+fn spawn_claude_hook_with_env(
+    exe: &Path,
+    env_vars: &[(String, String)],
+    subcommand: &str,
+) -> TestResult<std::process::Child> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("claude-hook")
+        .arg(subcommand)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .env_remove("CLAUDE_ENV_FILE")
+        .env_remove("MCP_REPL_CLAUDE_SESSION_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    Ok(cmd.spawn()?)
+}
+
 fn run_claude_hook(
     exe: &Path,
     state_home: &Path,
@@ -399,6 +419,174 @@ async fn claude_clear_reads_latest_session_from_env_file_without_trailing_newlin
     assert!(
         after_clear_text.contains("FALSE"),
         "expected env-file-based clear to clear x, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_preserves_project_state_across_non_clear_session_end() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before project-state handoff; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a",
+            "reason": "other"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after project-state handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after project-state handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("FALSE"),
+        "expected clear after non-clear session end handoff to clear x, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_clear_session_start_hooks_do_not_race_on_shared_project_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+    let env_vars = vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ];
+
+    let mut children = Vec::new();
+    for _ in 0..32 {
+        children.push(spawn_claude_hook_with_env(
+            &exe,
+            &env_vars,
+            "session-start",
+        )?);
+    }
+
+    for (index, child) in children.iter_mut().enumerate() {
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "failed to capture concurrent claude-hook stdin".to_string())?;
+            stdin.write_all(
+                serde_json::to_string(&json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": format!("sess-{index}")
+                }))?
+                .as_bytes(),
+            )?;
+        }
+    }
+    for child in &mut children {
+        let _ = child.stdin.take();
+    }
+
+    let mut failures = Vec::new();
+    for child in children {
+        let output = child.wait_with_output()?;
+        if output.status.success() {
+            continue;
+        }
+        failures.push(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "expected concurrent session-start hooks to succeed, got failures: {failures:?}"
     );
     Ok(())
 }
