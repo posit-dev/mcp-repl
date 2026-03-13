@@ -363,7 +363,7 @@ Interrupt and restart are explicit control actions. They do not discard unread o
 
 ### `repl_reset`
 
-The separate `repl_reset` tool is preserved. It is semantically equivalent to a standalone leading `EOT` request with no trailing code payload:
+The separate `repl_reset` tool is preserved. It is semantically equivalent to a standalone leading `\u0004` request with no trailing code payload:
 
 - preserve unread prefix output
 - restart the session
@@ -377,7 +377,7 @@ If promotion to internal spill storage fails, the session enters a latched `Capt
 In `CaptureFailed`:
 
 - the next plain `repl(code, ...)` or `repl("", ...)` request returns a deterministic error batch describing the capture failure and does not execute new user code
-- explicit restart (`repl_reset` or a leading `EOT` request) is still allowed and is the recovery path
+- explicit restart (`repl_reset` or a leading `\u0004` request) is still allowed and is the recovery path
 
 Implementation should prefer a small number of explicit failures over hidden fallback chains. The invariant is:
 
