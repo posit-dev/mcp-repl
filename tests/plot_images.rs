@@ -665,6 +665,64 @@ for (i in 1:80) plot(i:(i + 9))";
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn persisted_full_response_does_not_outlive_its_image_artifacts() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let first_input = "\
+cat(paste(rep('x', 12000), collapse = '')); \
+for (i in 1:7) plot(i:(i + 9))";
+    let first_result = session
+        .write_stdin_raw_with(first_input, Some(120.0))
+        .await?;
+    let first_text = result_text(&first_result);
+    if backend_unavailable(&first_text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let response_path = overflow_path(&first_text)
+        .ok_or_else(|| format!("expected overflow response path, got: {first_text:?}"))?;
+    assert!(
+        response_path.exists(),
+        "expected first overflow response file to exist: {response_path:?}"
+    );
+    let first_overflow_text = fs::read_to_string(&response_path)?;
+    let first_image_paths = extract_all_paths(&first_overflow_text, "full image at ");
+    assert!(
+        !first_image_paths.is_empty(),
+        "expected persisted overflow response to reference image artifacts: {first_overflow_text:?}"
+    );
+
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 8:71) plot(i:(i + 9))";
+    let second_result = session
+        .write_stdin_raw_with(second_input, Some(120.0))
+        .await?;
+    let second_text = result_text(&second_result);
+    assert_ne!(
+        second_result.is_error,
+        Some(true),
+        "follow-up plot batch reported an error: {second_text}"
+    );
+
+    if response_path.exists() {
+        let overflow_text = fs::read_to_string(&response_path)?;
+        let image_paths = extract_all_paths(&overflow_text, "full image at ");
+        for path in image_paths {
+            assert!(
+                path.exists(),
+                "expected persisted full response to keep only live image links, but {path:?} was already evicted while {response_path:?} still exists"
+            );
+        }
+    }
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn overflow_cleanup_retries_after_delete_failure() -> TestResult<()> {
     let mut session = spawn_server().await?;
 
@@ -727,10 +785,9 @@ for (i in 1:80) plot(i:(i + 9))";
         !blocked_path.exists(),
         "expected cleanup to retry and delete the previously blocked overflow path: {blocked_path:?}"
     );
-    assert_eq!(
-        fs::read_dir(overflow_root)?.count(),
-        64,
-        "expected retrying cleanup to restore the on-disk overflow file count to the configured cap"
+    assert!(
+        fs::read_dir(overflow_root)?.count() <= 64,
+        "expected retrying cleanup to bring the on-disk overflow file count back within the configured cap"
     );
 
     session.cancel().await?;

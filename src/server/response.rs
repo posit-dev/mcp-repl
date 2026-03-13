@@ -40,8 +40,42 @@ impl OverflowResponseKey {
 }
 
 struct RetainedOverflowFile {
-    path: PathBuf,
+    response_path: Option<PathBuf>,
+    artifact_paths: Vec<PathBuf>,
     response_key: OverflowResponseKey,
+}
+
+enum RetainedOverflowPathKind {
+    ResponseFile,
+    ArtifactFile,
+}
+
+impl RetainedOverflowFile {
+    fn new(response_key: OverflowResponseKey) -> Self {
+        Self {
+            response_path: None,
+            artifact_paths: Vec::new(),
+            response_key,
+        }
+    }
+
+    fn push_path(&mut self, path: PathBuf, kind: RetainedOverflowPathKind) {
+        match kind {
+            RetainedOverflowPathKind::ResponseFile => {
+                debug_assert!(self.response_path.is_none());
+                self.response_path = Some(path);
+            }
+            RetainedOverflowPathKind::ArtifactFile => self.artifact_paths.push(path),
+        }
+    }
+
+    fn retained_path_count(&self) -> usize {
+        self.response_path.iter().count() + self.artifact_paths.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.response_path.is_none() && self.artifact_paths.is_empty()
+    }
 }
 
 struct OverflowCleanupError {
@@ -203,16 +237,24 @@ impl OverflowFileStore {
         &self,
         path: PathBuf,
         metadata: &OverflowMetadata,
+        kind: RetainedOverflowPathKind,
     ) -> Result<(), OverflowCleanupError> {
         let protected_response = OverflowResponseKey::from_metadata(metadata);
         #[cfg(test)]
         let retained_path = path.clone();
         let active_responses = self.inner.active_responses.lock().unwrap();
         let mut retained = self.inner.retained_files.lock().unwrap();
-        retained.push_back(RetainedOverflowFile {
-            path,
-            response_key: protected_response.clone(),
-        });
+        match retained
+            .iter_mut()
+            .find(|entry| entry.response_key == protected_response)
+        {
+            Some(entry) => entry.push_path(path, kind),
+            None => {
+                let mut entry = RetainedOverflowFile::new(protected_response.clone());
+                entry.push_path(path, kind);
+                retained.push_back(entry);
+            }
+        }
         cleanup_retained_files(
             &mut retained,
             &active_responses,
@@ -316,7 +358,13 @@ fn maybe_overflow_text_contents(
                 Ok(mut persisted_image_paths) => {
                     persisted_image_paths.push(overflow_path.clone());
                     for path in persisted_image_paths {
-                        if let Err(err) = store.retain_written_file(path.clone(), overflow_metadata)
+                        let kind = if path == overflow_path {
+                            RetainedOverflowPathKind::ResponseFile
+                        } else {
+                            RetainedOverflowPathKind::ArtifactFile
+                        };
+                        if let Err(err) =
+                            store.retain_written_file(path.clone(), overflow_metadata, kind)
                         {
                             log_overflow_retention_failure(
                                 Some(store.root_path()),
@@ -400,9 +448,11 @@ fn maybe_overflow_image_contents(
 
         match write_image_file(overflow_store, overflow_metadata, inline_images_seen, image) {
             Ok(path) => {
-                if let Err(err) =
-                    overflow_store.retain_written_file(path.clone(), overflow_metadata)
-                {
+                if let Err(err) = overflow_store.retain_written_file(
+                    path.clone(),
+                    overflow_metadata,
+                    RetainedOverflowPathKind::ArtifactFile,
+                ) {
                     log_overflow_retention_failure(
                         Some(overflow_store.root_path()),
                         overflow_metadata,
@@ -676,26 +726,33 @@ fn cleanup_retained_files(
     max_overflow_files: usize,
     protected_response: Option<&OverflowResponseKey>,
 ) -> Result<(), OverflowCleanupError> {
-    let mut skipped_paths = HashSet::new();
+    let mut skipped_responses = HashSet::new();
     let mut first_err = None;
-    while retained.len() > max_overflow_files {
+    while total_retained_path_count(retained) > max_overflow_files {
         let Some(eviction_idx) = retained.iter().position(|entry| {
-            !is_protected_response(entry, active_responses, protected_response)
-                && !skipped_paths.contains(&entry.path)
+            !is_protected_response(&entry.response_key, active_responses, protected_response)
+                && !skipped_responses.contains(&entry.response_key)
         }) else {
             break;
         };
-        let path = retained[eviction_idx].path.clone();
-        match remove_retained_file(&path) {
+        let response_key = retained[eviction_idx].response_key.clone();
+        match evict_retained_response(&mut retained[eviction_idx]) {
             Ok(()) => {
-                retained
-                    .remove(eviction_idx)
-                    .expect("eviction index must exist");
+                if retained[eviction_idx].is_empty() {
+                    retained
+                        .remove(eviction_idx)
+                        .expect("eviction index must exist");
+                }
             }
             Err(err) => {
-                skipped_paths.insert(path.clone());
+                skipped_responses.insert(response_key);
+                if retained[eviction_idx].is_empty() {
+                    retained
+                        .remove(eviction_idx)
+                        .expect("eviction index must exist");
+                }
                 if first_err.is_none() {
-                    first_err = Some(OverflowCleanupError { path, err });
+                    first_err = Some(err);
                 }
             }
         }
@@ -707,14 +764,56 @@ fn cleanup_retained_files(
 }
 
 fn is_protected_response(
-    entry: &RetainedOverflowFile,
+    response_key: &OverflowResponseKey,
     active_responses: &HashMap<OverflowResponseKey, usize>,
     protected_response: Option<&OverflowResponseKey>,
 ) -> bool {
-    active_responses.contains_key(&entry.response_key)
+    active_responses.contains_key(response_key)
         || protected_response
-            .map(|response_key| response_key == &entry.response_key)
+            .map(|protected_response_key| protected_response_key == response_key)
             .unwrap_or(false)
+}
+
+fn total_retained_path_count(retained: &VecDeque<RetainedOverflowFile>) -> usize {
+    retained
+        .iter()
+        .map(RetainedOverflowFile::retained_path_count)
+        .sum()
+}
+
+fn evict_retained_response(
+    retained: &mut RetainedOverflowFile,
+) -> Result<(), OverflowCleanupError> {
+    if let Some(response_path) = retained.response_path.as_ref() {
+        remove_retained_file(response_path).map_err(|err| OverflowCleanupError {
+            path: response_path.clone(),
+            err,
+        })?;
+        retained.response_path = None;
+    }
+
+    let mut remaining_artifacts = Vec::new();
+    let mut first_err = None;
+    for path in retained.artifact_paths.drain(..) {
+        match remove_retained_file(&path) {
+            Ok(()) => {}
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(OverflowCleanupError {
+                        path: path.clone(),
+                        err,
+                    });
+                }
+                remaining_artifacts.push(path);
+            }
+        }
+    }
+    retained.artifact_paths = remaining_artifacts;
+
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn remove_retained_file(path: &Path) -> io::Result<()> {
