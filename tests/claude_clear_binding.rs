@@ -215,11 +215,31 @@ async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()>
             return Ok(());
         }
     };
+    assert!(
+        first_request.contains("TRUE"),
+        "expected first request after SessionStart binding to create startup-bound state, got: {first_request:?}"
+    );
+
+    run_session_end_clear(&exe, temp.path(), &env_file, "sess-startup")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"startup_bound\"))",
+        "after startup-session clear",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
 
     session.cancel().await?;
     assert!(
-        first_request.contains("TRUE"),
-        "expected first request after SessionStart binding to succeed, got: {first_request:?}"
+        after_clear.contains("FALSE"),
+        "expected clear for the startup-bound session to reset startup-bound state, got: {after_clear:?}"
     );
     Ok(())
 }
@@ -402,11 +422,12 @@ async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> Tes
     );
 
     run_session_start(&exe, temp.path(), &env_file, "sess-b")?;
+    run_session_end_clear(&exe, temp.path(), &env_file, "sess-b")?;
 
-    let after_later_start = match repl_text(
+    let after_session_b_clear = match repl_text(
         &mut session,
         "print(exists(\"x\"))",
-        "after later SessionStart",
+        "after later SessionStart and sess-b clear",
     )
     .await?
     {
@@ -419,8 +440,8 @@ async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> Tes
 
     session.cancel().await?;
     assert!(
-        after_later_start.contains("TRUE"),
-        "expected later SessionStart not to restart an already bound worker, got: {after_later_start:?}"
+        after_session_b_clear.contains("TRUE"),
+        "expected sess-b SessionStart plus clear not to reset sess-a state, got: {after_session_b_clear:?}"
     );
     Ok(())
 }
