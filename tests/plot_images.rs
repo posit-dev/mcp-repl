@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 struct ImageData {
@@ -1035,5 +1036,95 @@ plot(1:10)
         "expected plot image even after truncation"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_overflow_requests_keep_first_response_paths_live_until_delivery()
+-> TestResult<()> {
+    let session = spawn_server().await?;
+
+    let first_input = "\
+options(console.plot.width = 12, console.plot.height = 9, console.plot.dpi = 150); \
+Sys.sleep(0.5); \
+for (i in 1:7) plot(i:(i + 99))";
+    let second_input = |start: i32, end: i32| {
+        format!(
+            "options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); for (i in {start}:{end}) plot(i:(i + 9))"
+        )
+    };
+
+    let (first_result, second_result_a, second_result_b, second_result_c) = {
+        let first_request =
+            tokio::spawn(session.write_stdin_raw_owned_with(first_input, Some(120.0)));
+        sleep(Duration::from_millis(50)).await;
+        let second_request_a =
+            tokio::spawn(session.write_stdin_raw_owned_with(second_input(8, 74), Some(120.0)));
+        let second_request_b =
+            tokio::spawn(session.write_stdin_raw_owned_with(second_input(75, 141), Some(120.0)));
+        let second_request_c =
+            tokio::spawn(session.write_stdin_raw_owned_with(second_input(142, 208), Some(120.0)));
+        let first_result = first_request.await??;
+        let second_result_a = second_request_a.await??;
+        let second_result_b = second_request_b.await??;
+        let second_result_c = second_request_c.await??;
+        (
+            first_result,
+            second_result_a,
+            second_result_b,
+            second_result_c,
+        )
+    };
+
+    let first_text = result_text(&first_result);
+    let second_text_a = result_text(&second_result_a);
+    let second_text_b = result_text(&second_result_b);
+    let second_text_c = result_text(&second_result_c);
+    if any_backend_unavailable(&[
+        &first_result,
+        &second_result_a,
+        &second_result_b,
+        &second_result_c,
+    ]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first concurrent overflow batch reported an error: {first_text}"
+    );
+    assert_ne!(
+        second_result_a.is_error,
+        Some(true),
+        "second concurrent overflow batch A reported an error: {second_text_a}"
+    );
+    assert_ne!(
+        second_result_b.is_error,
+        Some(true),
+        "second concurrent overflow batch B reported an error: {second_text_b}"
+    );
+    assert_ne!(
+        second_result_c.is_error,
+        Some(true),
+        "second concurrent overflow batch C reported an error: {second_text_c}"
+    );
+
+    let advertised_paths = extract_all_paths(&first_text, "full image at ");
+    assert_eq!(
+        advertised_paths.len(),
+        3,
+        "expected three overflow image paths in the first result, got: {first_text:?}"
+    );
+    for path in advertised_paths {
+        assert!(
+            path.exists(),
+            "expected advertised overflow path from the first concurrent response to still exist when delivered: {path:?}"
+        );
+    }
+
+    session.cancel().await?;
     Ok(())
 }

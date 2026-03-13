@@ -391,6 +391,14 @@ impl McpTestSession {
         tool: impl Into<String>,
         arguments: Value,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.call_tool_raw_shared(tool, arguments).await
+    }
+
+    pub async fn call_tool_raw_shared(
+        &self,
+        tool: impl Into<String>,
+        arguments: Value,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let tool = tool.into();
         let request_tool = normalize_tool_name_for_request(&tool).to_string();
         let arguments = match arguments {
@@ -418,6 +426,14 @@ impl McpTestSession {
         input: impl Into<String>,
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_shared_with(input, timeout).await
+    }
+
+    pub async fn write_stdin_raw_shared_with(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
         if !input.ends_with('\n') {
             input.push('\n');
@@ -432,12 +448,55 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_shared(self.repl_tool_name(), Value::Object(args))
             .await
+    }
+
+    pub fn write_stdin_raw_owned_with(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResult, ServiceError>>
+    + Send
+    + 'static {
+        let mut input = input.into();
+        if !input.ends_with('\n') {
+            input.push('\n');
+        }
+        let timeout = normalized_test_timeout(timeout);
+        let tool_name = normalize_tool_name_for_request(self.repl_tool_name()).to_string();
+        let peer = self.service.peer().clone();
+
+        async move {
+            let mut args = serde_json::Map::new();
+            args.insert("input".to_string(), Value::String(input));
+            if let Some(timeout) = timeout {
+                args.insert(
+                    "timeout_ms".to_string(),
+                    json!((timeout * 1000.0).round() as i64),
+                );
+            }
+            peer.call_tool(CallToolRequestParams {
+                meta: None,
+                name: tool_name.into(),
+                arguments: Some(args.into_iter().collect()),
+                task: None,
+            })
+            .await
+        }
     }
 
     pub async fn write_stdin_raw_unterminated_with(
         &mut self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_unterminated_shared_with(input, timeout)
+            .await
+    }
+
+    pub async fn write_stdin_raw_unterminated_shared_with(
+        &self,
         input: impl Into<String>,
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
@@ -451,7 +510,7 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_shared(self.repl_tool_name(), Value::Object(args))
             .await
     }
 

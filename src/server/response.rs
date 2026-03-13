@@ -90,6 +90,9 @@ struct OverflowFileStoreInner {
     max_overflow_files: usize,
     retained_files: Mutex<VecDeque<RetainedOverflowFile>>,
     active_responses: Mutex<HashMap<OverflowResponseKey, usize>>,
+    open_request_count: Mutex<usize>,
+    pending_send_responses: Mutex<HashMap<String, OverflowResponseKey>>,
+    sent_responses_waiting_for_next_request: Mutex<Vec<OverflowResponseKey>>,
     #[cfg(test)]
     retain_hook: Mutex<Option<RetainHook>>,
     _temp_dir: Option<TempDir>,
@@ -136,6 +139,9 @@ impl OverflowFileStore {
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
+                        open_request_count: Mutex::new(0),
+                        pending_send_responses: Mutex::new(HashMap::new()),
+                        sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
                         _temp_dir: Some(temp_dir),
@@ -152,6 +158,9 @@ impl OverflowFileStore {
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
+                        open_request_count: Mutex::new(0),
+                        pending_send_responses: Mutex::new(HashMap::new()),
+                        sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
                         _temp_dir: None,
@@ -183,6 +192,9 @@ impl OverflowFileStore {
                 max_overflow_files: max_overflow_files.max(1),
                 retained_files: Mutex::new(VecDeque::new()),
                 active_responses: Mutex::new(HashMap::new()),
+                open_request_count: Mutex::new(0),
+                pending_send_responses: Mutex::new(HashMap::new()),
+                sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
                 retain_hook: Mutex::new(None),
                 _temp_dir: None,
             }),
@@ -199,14 +211,75 @@ impl OverflowFileStore {
 
     fn activate_response(&self, metadata: &OverflowMetadata) -> ActiveOverflowResponseGuard {
         let response_key = OverflowResponseKey::from_metadata(metadata);
-        let mut active_responses = self.inner.active_responses.lock().unwrap();
-        let count = active_responses.entry(response_key.clone()).or_insert(0);
-        *count += 1;
-        drop(active_responses);
+        self.increment_active_response(&response_key);
         ActiveOverflowResponseGuard {
             store: self.clone(),
             response_key,
         }
+    }
+
+    pub(crate) fn begin_request(&self) {
+        let sent_responses = {
+            let mut open_request_count = self.inner.open_request_count.lock().unwrap();
+            let sent_responses = if *open_request_count == 0 {
+                std::mem::take(
+                    &mut *self
+                        .inner
+                        .sent_responses_waiting_for_next_request
+                        .lock()
+                        .unwrap(),
+                )
+            } else {
+                Vec::new()
+            };
+            *open_request_count += 1;
+            sent_responses
+        };
+        for response_key in sent_responses {
+            self.deactivate_response(&response_key);
+        }
+    }
+
+    pub(crate) fn activate_response_send(&self, metadata: &OverflowMetadata) {
+        let response_key = OverflowResponseKey::from_metadata(metadata);
+        self.inner
+            .pending_send_responses
+            .lock()
+            .unwrap()
+            .insert(metadata.request_id.clone(), response_key.clone());
+        self.increment_active_response(&response_key);
+    }
+
+    pub(crate) fn finish_response_send(&self, request_id: &str) {
+        let Some(response_key) = self
+            .inner
+            .pending_send_responses
+            .lock()
+            .unwrap()
+            .remove(request_id)
+        else {
+            return;
+        };
+        let remaining_open_requests = {
+            let mut open_request_count = self.inner.open_request_count.lock().unwrap();
+            *open_request_count = open_request_count.saturating_sub(1);
+            *open_request_count
+        };
+        if remaining_open_requests == 0 {
+            self.deactivate_response(&response_key);
+            return;
+        }
+        self.inner
+            .sent_responses_waiting_for_next_request
+            .lock()
+            .unwrap()
+            .push(response_key);
+    }
+
+    fn increment_active_response(&self, response_key: &OverflowResponseKey) {
+        let mut active_responses = self.inner.active_responses.lock().unwrap();
+        let count = active_responses.entry(response_key.clone()).or_insert(0);
+        *count += 1;
     }
 
     fn deactivate_response(&self, response_key: &OverflowResponseKey) {

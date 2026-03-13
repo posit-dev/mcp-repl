@@ -93,6 +93,9 @@ impl SharedServer {
         tool_name: &'static str,
         request_id: String,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(overflow_store) = self.overflow_store.as_ref() {
+            overflow_store.begin_request();
+        }
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         let result = self
@@ -114,7 +117,16 @@ impl SharedServer {
             turn_number: self.tool_turn_counter.fetch_add(1, Ordering::Relaxed) + 1,
             request_id,
         };
+        if let Some(overflow_store) = self.overflow_store.as_ref() {
+            overflow_store.activate_response_send(&overflow_metadata);
+        }
         worker_result_to_call_tool_result(result, self.overflow_store.as_ref(), overflow_metadata)
+    }
+
+    fn on_response_sent(&self, request_id: &str) {
+        if let Some(overflow_store) = self.overflow_store.as_ref() {
+            overflow_store.finish_response_send(request_id);
+        }
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -372,6 +384,9 @@ macro_rules! define_backend_tool_server {
                 _params: Parameters<ReplResetArgs>,
                 request_context: RequestContext<RoleServer>,
             ) -> Result<CallToolResult, McpError> {
+                if let Some(overflow_store) = self.shared.overflow_store.as_ref() {
+                    overflow_store.begin_request();
+                }
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
@@ -390,6 +405,10 @@ macro_rules! define_backend_tool_server {
         impl ServerHandler for $server_ty {
             fn get_info(&self) -> ServerInfo {
                 $server_ty::get_info(self)
+            }
+
+            async fn on_response_sent(&self, request_id: rmcp::model::RequestId) {
+                self.shared.on_response_sent(&request_id.to_string());
             }
 
             async fn on_custom_request(
