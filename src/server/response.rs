@@ -92,7 +92,8 @@ struct OverflowFileStoreInner {
     active_responses: Mutex<HashMap<OverflowResponseKey, usize>>,
     open_request_count: Mutex<usize>,
     pending_send_responses: Mutex<HashMap<String, OverflowResponseKey>>,
-    sent_responses_waiting_for_next_request: Mutex<Vec<OverflowResponseKey>>,
+    consumed_response_ids: Mutex<HashSet<String>>,
+    sent_responses_waiting_for_next_request: Mutex<VecDeque<OverflowResponseKey>>,
     #[cfg(test)]
     retain_hook: Mutex<Option<RetainHook>>,
     _temp_dir: Option<TempDir>,
@@ -141,7 +142,8 @@ impl OverflowFileStore {
                         active_responses: Mutex::new(HashMap::new()),
                         open_request_count: Mutex::new(0),
                         pending_send_responses: Mutex::new(HashMap::new()),
-                        sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
+                        consumed_response_ids: Mutex::new(HashSet::new()),
+                        sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
                         _temp_dir: Some(temp_dir),
@@ -160,7 +162,8 @@ impl OverflowFileStore {
                         active_responses: Mutex::new(HashMap::new()),
                         open_request_count: Mutex::new(0),
                         pending_send_responses: Mutex::new(HashMap::new()),
-                        sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
+                        consumed_response_ids: Mutex::new(HashSet::new()),
+                        sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
                         _temp_dir: None,
@@ -194,7 +197,8 @@ impl OverflowFileStore {
                 active_responses: Mutex::new(HashMap::new()),
                 open_request_count: Mutex::new(0),
                 pending_send_responses: Mutex::new(HashMap::new()),
-                sent_responses_waiting_for_next_request: Mutex::new(Vec::new()),
+                consumed_response_ids: Mutex::new(HashSet::new()),
+                sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                 retain_hook: Mutex::new(None),
                 _temp_dir: None,
             }),
@@ -222,13 +226,17 @@ impl OverflowFileStore {
         let sent_responses = {
             let mut open_request_count = self.inner.open_request_count.lock().unwrap();
             let sent_responses = if *open_request_count == 0 {
-                std::mem::take(
-                    &mut *self
-                        .inner
-                        .sent_responses_waiting_for_next_request
-                        .lock()
-                        .unwrap(),
-                )
+                let mut sent_responses = self
+                    .inner
+                    .sent_responses_waiting_for_next_request
+                    .lock()
+                    .unwrap();
+                let newest_response = sent_responses.pop_back();
+                let stale_responses = sent_responses.drain(..).collect();
+                if let Some(response_key) = newest_response {
+                    sent_responses.push_back(response_key);
+                }
+                stale_responses
             } else {
                 Vec::new()
             };
@@ -236,7 +244,7 @@ impl OverflowFileStore {
             sent_responses
         };
         for response_key in sent_responses {
-            self.deactivate_response(&response_key);
+            self.release_response(&response_key);
         }
     }
 
@@ -260,20 +268,52 @@ impl OverflowFileStore {
         else {
             return;
         };
-        let remaining_open_requests = {
-            let mut open_request_count = self.inner.open_request_count.lock().unwrap();
-            *open_request_count = open_request_count.saturating_sub(1);
-            *open_request_count
-        };
-        if remaining_open_requests == 0 {
-            self.deactivate_response(&response_key);
+        let mut open_request_count = self.inner.open_request_count.lock().unwrap();
+        *open_request_count = open_request_count.saturating_sub(1);
+        drop(open_request_count);
+        let was_consumed = self
+            .inner
+            .consumed_response_ids
+            .lock()
+            .unwrap()
+            .remove(request_id);
+        if was_consumed {
+            self.release_response(&response_key);
             return;
         }
         self.inner
             .sent_responses_waiting_for_next_request
             .lock()
             .unwrap()
-            .push(response_key);
+            .push_back(response_key);
+    }
+
+    pub(crate) fn mark_response_consumed(&self, request_id: &str) {
+        if let Some(response_key) = remove_sent_response(
+            &mut self
+                .inner
+                .sent_responses_waiting_for_next_request
+                .lock()
+                .unwrap(),
+            request_id,
+        ) {
+            self.release_response(&response_key);
+            return;
+        }
+
+        let should_defer_release = self
+            .inner
+            .pending_send_responses
+            .lock()
+            .unwrap()
+            .contains_key(request_id);
+        if should_defer_release {
+            self.inner
+                .consumed_response_ids
+                .lock()
+                .unwrap()
+                .insert(request_id.to_string());
+        }
     }
 
     fn increment_active_response(&self, response_key: &OverflowResponseKey) {
@@ -283,6 +323,18 @@ impl OverflowFileStore {
     }
 
     fn deactivate_response(&self, response_key: &OverflowResponseKey) {
+        self.deactivate_response_with_cleanup(response_key, Some(response_key));
+    }
+
+    fn release_response(&self, response_key: &OverflowResponseKey) {
+        self.deactivate_response_with_cleanup(response_key, None);
+    }
+
+    fn deactivate_response_with_cleanup(
+        &self,
+        response_key: &OverflowResponseKey,
+        protected_response: Option<&OverflowResponseKey>,
+    ) {
         let mut active_responses = self.inner.active_responses.lock().unwrap();
         let Some(count) = active_responses.get_mut(response_key) else {
             return;
@@ -296,7 +348,7 @@ impl OverflowFileStore {
             &mut retained,
             &active_responses,
             self.inner.max_overflow_files,
-            Some(response_key),
+            protected_response,
         ) {
             drop(retained);
             drop(active_responses);
@@ -477,6 +529,7 @@ fn maybe_overflow_text_contents(
     let overflow_notice =
         utf8_prefix_by_bytes(&overflow_notice, INLINE_TEXT_LIMIT_BYTES).to_string();
     let mut preview_budget = INLINE_TEXT_LIMIT_BYTES.saturating_sub(overflow_notice.len());
+    let mut preview_exhausted = false;
 
     let mut rewritten = Vec::with_capacity(contents.len());
     let mut inserted_notice = false;
@@ -491,10 +544,15 @@ fn maybe_overflow_text_contents(
             replacement.push_str(&overflow_notice);
             inserted_notice = true;
         }
-        if preview_budget > 0 {
-            let preview = utf8_prefix_by_bytes(text, preview_budget);
+        if preview_budget > 0 && !preview_exhausted {
+            let (preview, was_truncated) = preview_text_prefix_by_bytes(text, preview_budget);
             if !preview.is_empty() {
                 replacement.push_str(preview);
+            }
+            if was_truncated {
+                preview_budget = 0;
+                preview_exhausted = true;
+            } else {
                 preview_budget = preview_budget.saturating_sub(preview.len());
             }
         }
@@ -709,6 +767,24 @@ fn utf8_prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+fn preview_text_prefix_by_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
+    let preview = utf8_prefix_by_bytes(text, max_bytes);
+    if preview.len() == text.len() {
+        return (preview, false);
+    }
+    (trim_partial_image_notice_line(preview), true)
+}
+
+fn trim_partial_image_notice_line(text: &str) -> &str {
+    let line_start = text.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let trailing_line = &text[line_start..];
+    if trailing_line.starts_with("[repl] image ") {
+        &text[..line_start]
+    } else {
+        text
+    }
+}
+
 fn overflow_filename(metadata: &OverflowMetadata) -> String {
     let tool_name = sanitize_filename_component(&metadata.tool_name, TOOL_NAME_COMPONENT_MAX_BYTES);
     let tool_name = if tool_name.is_empty() {
@@ -856,6 +932,16 @@ fn cleanup_retained_files(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+fn remove_sent_response(
+    sent_responses: &mut VecDeque<OverflowResponseKey>,
+    request_id: &str,
+) -> Option<OverflowResponseKey> {
+    let response_idx = sent_responses
+        .iter()
+        .position(|response_key| response_key.request_id == request_id)?;
+    sent_responses.remove(response_idx)
 }
 
 fn is_protected_response(

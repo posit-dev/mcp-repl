@@ -961,9 +961,10 @@ for (i in 1:80) plot(i:(i + 9))";
         !blocked_path.exists(),
         "expected cleanup to retry and delete the previously blocked overflow path: {blocked_path:?}"
     );
+    let retained_file_count = fs::read_dir(overflow_root)?.count();
     assert!(
-        fs::read_dir(overflow_root)?.count() <= 64,
-        "expected retrying cleanup to bring the on-disk overflow file count back within the configured cap"
+        retained_file_count <= 64,
+        "expected retrying cleanup to bring the on-disk overflow file count back within the configured cap, got {retained_file_count}"
     );
 
     session.cancel().await?;
@@ -1349,5 +1350,100 @@ for (i in 8:74) plot(i:(i + 9))";
     }
 
     server.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_transport_keeps_written_but_unread_overflow_paths_live() -> TestResult<()> {
+    let mut server = RawMcpServer::spawn().await?;
+    server.initialize().await?;
+
+    let first_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 1:7) plot(i:(i + 9))";
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 8:90) plot(i:(i + 9))";
+
+    server.call_tool(2, first_input, 120_000).await?;
+    sleep(Duration::from_millis(1500)).await;
+    server.call_tool(3, second_input, 120_000).await?;
+    sleep(Duration::from_millis(800)).await;
+
+    let first_result = server.read_call_tool_result(2).await?;
+    let first_text = result_text(&first_result);
+    if backend_unavailable(&first_text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        server.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first written-but-unread raw transport overflow batch reported an error: {first_text}"
+    );
+
+    let overflow_paths = extract_all_paths(&first_text, "full image at ");
+    assert_eq!(
+        overflow_paths.len(),
+        3,
+        "expected three overflow image paths in the first raw reply, got: {first_text:?}"
+    );
+    for path in overflow_paths {
+        assert!(
+            path.exists(),
+            "expected raw transport to keep a written-but-unread reply's overflow path live: {path:?}"
+        );
+    }
+
+    server.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_preview_keeps_only_complete_overflow_image_paths() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    for plot_count in 120..=128 {
+        let input = format!(
+            "options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); for (i in 1:{plot_count}) plot(i:(i + 9))"
+        );
+        let result = session.write_stdin_raw_with(input, Some(120.0)).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("plot_images backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "large plot batch for plot_count={plot_count} reported an error: {text}"
+        );
+        assert!(
+            text.contains("output truncated"),
+            "expected a truncated inline preview for plot_count={plot_count}, got: {text:?}"
+        );
+        assert!(
+            overflow_path(&text).is_some(),
+            "expected a persisted full response path for plot_count={plot_count}, got: {text:?}"
+        );
+
+        let visible_paths = extract_all_paths(&text, "full image at ");
+        assert!(
+            !visible_paths.is_empty(),
+            "expected visible overflow image notices for plot_count={plot_count}, got: {text:?}"
+        );
+        for path in visible_paths {
+            assert!(
+                path.exists(),
+                "expected every visible overflow image notice to point at a live file for plot_count={plot_count}, but got {path:?} from {text:?}"
+            );
+        }
+    }
+
+    session.cancel().await?;
     Ok(())
 }

@@ -32,6 +32,8 @@ use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStat
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
 
+const OVERFLOW_RESPONSE_CONSUMED_METHOD: &str = "codex/overflow-response-consumed";
+
 #[cfg(test)]
 fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
     match backend {
@@ -45,6 +47,11 @@ struct SharedServer {
     worker: Arc<Mutex<WorkerManager>>,
     overflow_store: Option<OverflowFileStore>,
     tool_turn_counter: Arc<AtomicU64>,
+}
+
+#[derive(Deserialize)]
+struct OverflowResponseConsumedNotification {
+    request_id: String,
 }
 
 impl SharedServer {
@@ -200,6 +207,23 @@ impl SharedServer {
             }),
         );
         crate::sandbox::log_sandbox_state_event(&notification.method, notification.params.as_ref());
+        if notification.method == OVERFLOW_RESPONSE_CONSUMED_METHOD {
+            let consumed = match notification.params_as::<OverflowResponseConsumedNotification>() {
+                Ok(Some(consumed)) => consumed,
+                Ok(None) => {
+                    eprintln!("overflow response consumed notification missing params");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("overflow response consumed parse error: {err}");
+                    return;
+                }
+            };
+            if let Some(overflow_store) = self.overflow_store.as_ref() {
+                overflow_store.mark_response_consumed(&consumed.request_id);
+            }
+            return;
+        }
         if notification.method != SANDBOX_STATE_METHOD {
             return;
         }

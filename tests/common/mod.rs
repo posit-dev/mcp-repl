@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
@@ -12,7 +13,7 @@ use rmcp::model::{
     CallToolRequestParams, ClientNotification, ClientRequest, CustomNotification, CustomRequest,
     RawContent,
 };
-use rmcp::service::ServiceError;
+use rmcp::service::{PeerRequestOptions, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -21,6 +22,7 @@ use tokio::process::Command;
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
+const OVERFLOW_RESPONSE_CONSUMED_METHOD: &str = "codex/overflow-response-consumed";
 
 #[cfg(target_os = "macos")]
 pub fn sandbox_exec_available() -> bool {
@@ -298,11 +300,28 @@ pub struct McpTestSession {
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
     backend: TestBackend,
+    last_consumed_request_id: Mutex<Option<String>>,
 }
 
 impl McpTestSession {
     pub fn server_info(&self) -> Option<&rmcp::model::ServerInfo> {
         self.service.peer_info()
+    }
+
+    async fn flush_consumed_response_notification(&self) {
+        let previous_request_id = self.last_consumed_request_id.lock().unwrap().take();
+        let Some(request_id) = previous_request_id else {
+            return;
+        };
+        let _ = self
+            .service
+            .send_notification(ClientNotification::CustomNotification(
+                CustomNotification::new(
+                    OVERFLOW_RESPONSE_CONSUMED_METHOD,
+                    Some(json!({ "request_id": request_id })),
+                ),
+            ))
+            .await;
     }
 
     #[allow(dead_code)]
@@ -399,6 +418,7 @@ impl McpTestSession {
         tool: impl Into<String>,
         arguments: Value,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.flush_consumed_response_notification().await;
         let tool = tool.into();
         let request_tool = normalize_tool_name_for_request(&tool).to_string();
         let arguments = match arguments {
@@ -411,14 +431,32 @@ impl McpTestSession {
                 )));
             }
         };
-        self.service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: request_tool.into(),
-                arguments,
-                task: None,
-            })
-            .await
+        let handle = self
+            .service
+            .send_request_with_option(
+                ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                    CallToolRequestParams {
+                        meta: None,
+                        name: request_tool.into(),
+                        arguments,
+                        task: None,
+                    },
+                )),
+                PeerRequestOptions::no_options(),
+            )
+            .await?;
+        let request_id = handle.id.to_string();
+        let result = match handle.await_response().await? {
+            rmcp::model::ServerResult::CallToolResult(result) => result,
+            other => {
+                return Err(ServiceError::McpError(rmcp::ErrorData::internal_error(
+                    format!("expected CallToolResult, got {other:?}"),
+                    None,
+                )));
+            }
+        };
+        *self.last_consumed_request_id.lock().unwrap() = Some(request_id);
+        Ok(result)
     }
 
     pub async fn write_stdin_raw_with(
@@ -1016,6 +1054,7 @@ pub async fn spawn_server_with_args_env(
         steps: Vec::new(),
         server_pid,
         backend,
+        last_consumed_request_id: Mutex::new(None),
     })
 }
 
