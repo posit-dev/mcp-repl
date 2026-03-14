@@ -4,7 +4,7 @@
 
 **Goal:** Replace ring-based unread tracking and transport-coupled overflow retention with server-owned unread batching, server-sealed reply batches, and per-reply overflow artifacts that match the redesign spec while keeping only the documented no-op compatibility acceptance for legacy overflow-consumed notifications.
 
-**Architecture:** Move unread capture ownership into a server-owned `PendingOutput` store that survives idle periods and `repl` lifecycle transitions such as timed-out requests, session-end respawn, and `\u0004` restart until the next `repl` tool response drains it. Treat `repl_reset` differently: it is an explicit clear boundary that discards previously unread output before returning its fresh-session reply. Make `PendingOutput` the single sink for every output producer: stdout/stderr reader threads, image events, and synthetic notices such as session-end, `\u0004` restart, guardrail, and capture-failure messages. The worker should stop assembling user-visible replies and instead return only low-level execution/completion metadata needed for the server to decide whether the request became idle, timed out, or ended the session. The server owns the public reply lifecycle: wait for idle or deadline, apply a short settle window after sideband-idle so final reader-thread writes can land, seal one drained batch, then format that batch into inline MCP content plus an optional retained per-reply artifact. Stop emitting overflow response tokens and remove transport-coupled retention, but keep `codex/overflow-response-consumed` accepted as a no-op compatibility notification during the transition.
+**Architecture:** Move unread capture ownership into a server-owned `PendingOutput` store that survives idle periods and `repl` lifecycle transitions such as timed-out requests, session-end respawn, and `\u0004` restart until the next `repl` tool response drains it. Treat `repl_reset` differently: it is an explicit clear boundary that discards previously unread output and any poisoned unread-store state before returning its fresh-session reply. Make `PendingOutput` the single sink for every output producer: stdout/stderr reader threads, image events, and synthetic notices such as session-end, `\u0004` restart, guardrail, and capture-failure messages. Reader-thread appends must be generation-scoped so a torn-down worker cannot append into a later session. The worker should stop assembling user-visible replies and instead return only low-level execution/completion metadata needed for the server to decide whether the request became idle, timed out, or ended the session. The server owns the public reply lifecycle under one turn-scoped gate: wait for idle or deadline, apply a short settle window after sideband-idle so final reader-thread writes can land, seal one drained batch, then format that batch into inline MCP content plus an optional retained per-reply artifact before allowing the next turn to start. Stop emitting overflow response tokens and remove transport-coupled retention, but keep `codex/overflow-response-consumed` accepted as a no-op compatibility notification during the transition.
 
 **Tech Stack:** Rust, Tokio, rmcp, tempfile, serde, integration tests in `tests/*.rs`, snapshot tests via insta
 
@@ -12,11 +12,11 @@
 
 ## File Map
 
-- Create: `src/pending_output.rs` — server-owned unread-output store, in-memory/spill states, destructive drain API, inline-policy support for privileged items, internal stale-reader guard, latched capture-failure state, and startup env parsing for unread-memory budget / unread spill root
+- Create: `src/pending_output.rs` — server-owned unread-output store, in-memory/spill states, destructive drain API, inline-policy support for privileged items, generation-scoped append handles that reject stale readers after teardown, latched capture-failure state, and startup env parsing for unread-memory budget / unread spill root
 - Create: `src/server/reply_batch.rs` — turn one server-sealed drained batch plus completion metadata into MCP content, head-and-tail preview builder, input echo and prompt cleanup integration, preserved echo-collapse behavior, and guaranteed inline handling for privileged items
 - Create: `src/server/overflow_artifacts.rs` — retained per-reply artifact writer, eviction policy, and startup env parsing for overflow root / retention caps
 - Modify: `src/main.rs` — register the new `pending_output` module and stop registering the deleted `output_capture` module
-- Modify: `src/server.rs` — own `PendingOutput` and overflow artifacts, own the wait/settle/seal lifecycle for `repl`, `\u0003`, and `\u0004`, make `repl_reset` explicitly clear unread output before its reset reply, and reduce the legacy overflow notification path to a no-op compatibility handler
+- Modify: `src/server.rs` — own `PendingOutput`, a turn-scoped seal/drain gate, and overflow artifacts; own the wait/settle/seal lifecycle for `repl`, `\u0003`, and `\u0004`; make `repl_reset` explicitly clear unread output before its reset reply; and reduce the legacy overflow notification path to a no-op compatibility handler
 - Modify: `src/debug_repl.rs` — keep the standalone debug REPL compiling if `WorkerManager::new(...)` or reply formatting ownership changes
 - Modify: `src/worker_process.rs` — route every output producer into `PendingOutput`, stop building user-visible reply batches, and return only the execution/completion metadata the server needs to settle and seal one batch
 - Modify: `src/worker_protocol.rs` — replace MCP-shaped worker replies with minimal server-consumed execution/completion outcomes and remove ring-truncation fields
@@ -47,6 +47,7 @@
 - Modify: `tests/write_stdin_behavior.rs`
 - Modify: `tests/interrupt.rs`
 - Modify: `tests/session_endings.rs`
+- Modify: `tests/manage_session_behavior.rs`
 - Modify: `tests/repl_surface.rs`
 - Modify: `tests/write_stdin_edge_cases.rs`
 - Modify: `tests/common/mod.rs`
@@ -130,11 +131,11 @@ async fn repl_reset_discards_unread_output_before_reply() -> TestResult<()> {
 
 Use `Rscript` rather than `/bin/sh` so the test stays portable across supported platforms. If the background-output assertion is flaky on slower CI, wrap the idle wait in a short deadline-based retry loop rather than relying on one narrow fixed sleep.
 
-Also add one public spill-failure regression using only the MCP surface. Start the server with `MCP_CONSOLE_PENDING_OUTPUT_MEMORY_BYTES` set tiny and `MCP_CONSOLE_PENDING_OUTPUT_SPILL_ROOT` pointed at an unwritable directory, then assert:
+Also add one public spill-failure regression using only the MCP surface. Drive a transient spill-promotion failure by starting the server with `MCP_CONSOLE_PENDING_OUTPUT_MEMORY_BYTES` set tiny, pointing `MCP_CONSOLE_PENDING_OUTPUT_SPILL_ROOT` at a directory that is made unwritable before the failing request and made writable again before reset, then assert:
 - the first plain `repl(...)` call after the spill failure returns a deterministic capture-failure batch and does not run the requested code
-- a second plain `repl(...)` call and an idle `repl("", ...)` poll both return the same deterministic capture-failure batch again
+- a second plain `repl(...)` call, an idle `repl("", ...)` poll, and a plain `\u0004` request all return the same deterministic capture-failure batch again because `\u0004` preserves unread state instead of clearing poisoned unread storage
 - `repl_reset` still succeeds and returns `[repl] new session started`
-- a later plain `repl(...)` call runs normally again after reset
+- a later plain `repl(...)` call runs normally again after `repl_reset`
 
 Also add one lifecycle-distinction regression that locks in the user-facing difference between the two reset paths:
 - `repl_reset` clears unread output before replying, so previously unread text is not returned in the `repl_reset` response and is not drainable afterward
@@ -148,6 +149,11 @@ Also add one public regression that locks in the server settle window. Drive a r
 - the first reply already contains that final chunk
 - the next poll does not repeat it
 - the assertion is phrased around one logical batch, not around an implementation-specific sleep
+
+Also add one public regression that locks in server-side turn sealing across overlapping requests:
+- if one `repl` call is still in its wait/settle/seal path while a later `repl` call begins, the earlier reply still drains only its own sealed unread batch
+- the later reply does not inherit unread output that was already sealed into the earlier reply
+- phrase the assertion in terms of distinct public replies, not internal mutex names
 
 Also update `tests/write_stdin_edge_cases.rs` so the edge contracts move with the redesign instead of being checked only at the end:
 - `timeout=0` still behaves like an already-expired deadline, and any unread tail from that request is drainable on the next poll exactly once
@@ -168,7 +174,7 @@ Run:
 cargo test --test write_stdin_batch write_stdin_background_output_while_idle_prefixes_next_reply -- --exact
 cargo test --test write_stdin_batch write_stdin_timeout_polling_waits_until_idle_and_drains_once -- --exact
 cargo test --test repl_surface capture_failure_blocks_plain_input_until_reset -- --exact
-cargo test --test repl_surface capture_failure_allows_ctrl_d_recovery -- --exact
+cargo test --test repl_surface capture_failure_persists_across_ctrl_d_until_reset -- --exact
 cargo test --test interrupt interrupt_then_run_returns_one_combined_batch -- --exact
 cargo test --test interrupt interrupt_prefix_timeout_skips_remaining_input -- --exact
 cargo test --test interrupt restart_prefix_timeout_skips_remaining_input -- --exact
@@ -178,6 +184,7 @@ cargo test --test repl_surface repl_reset_discards_unread_output_before_reply --
 cargo test --test write_stdin_edge_cases write_stdin_timeout_zero_is_non_blocking -- --exact
 cargo test --test write_stdin_edge_cases write_stdin_empty_returns_prompt -- --exact
 cargo test --test write_stdin_batch write_stdin_settles_final_output_before_draining -- --exact
+cargo test --test write_stdin_batch overlapping_repl_calls_seal_distinct_batches -- --exact
 ```
 
 Expected: FAIL because the current ring/poll logic still discards or splits these batches according to the old semantics. In particular, idle polls do not yet wait-until-idle and drain once, `repl_reset` does not yet act as an explicit unread-clear boundary distinct from `\u0004`, lifecycle requests do not yet consistently return all output collected since the previous tool response, and the control-byte prefix path does not yet pin the timeout branch that must skip the trailing payload.
@@ -185,7 +192,7 @@ Expected: FAIL because the current ring/poll logic still discards or splits thes
 - [ ] **Step 3: Commit the red tests**
 
 ```bash
-git add tests/write_stdin_batch.rs tests/write_stdin_behavior.rs tests/interrupt.rs tests/session_endings.rs tests/repl_surface.rs tests/write_stdin_edge_cases.rs tests/common/mod.rs
+git add tests/write_stdin_batch.rs tests/write_stdin_behavior.rs tests/interrupt.rs tests/session_endings.rs tests/manage_session_behavior.rs tests/repl_surface.rs tests/write_stdin_edge_cases.rs tests/common/mod.rs
 git commit -m "test: lock in unread-output redesign semantics"
 ```
 
@@ -243,11 +250,12 @@ Semantics to lock in here:
 - `PendingOutput::new()` owns the startup env parsing for unread storage, including `MCP_CONSOLE_PENDING_OUTPUT_MEMORY_BYTES` and `MCP_CONSOLE_PENDING_OUTPUT_SPILL_ROOT`; invalid values fail fast at startup
 - unread storage is server-owned and may spill instead of truncating
 - every output write path, including synthetic server notices, goes through `PendingOutput`
+- internally, `PendingOutput` hands out generation-scoped append handles so detached reader threads from an old worker cannot append into a later session after teardown or respawn
 - writers can mark items as `MustInline` so they are guaranteed to appear in the tool response rather than only in an overflow artifact
 - plain `repl(...)`, empty-input polls, session-end respawn, and `\u0004` restart do not clear unread output; the next `repl` response drains everything collected since the previous tool response
 - `repl_reset` is an explicit clear boundary: it discards unread output before returning `[repl] new session started`
-- spill-promotion failure latches a capture-failure state that survives `drain()` and every plain `repl(...)` / `repl("", ...)` call until explicit `\u0004` or `repl_reset` clears it
-- if an internal stale-reader guard is needed to avoid double-appends after teardown, keep it private to the implementation and do not make process identity part of the public drain semantics
+- spill-promotion failure poisons the unread store for plain `repl(...)`, `repl("", ...)`, and plain `\u0004` calls until explicit `repl_reset` clears and reinitializes unread state; `\u0004` must not clear that latch because it preserves unread output
+- the generation/stale-reader guard stays private to the implementation; do not make process identity part of the public drain semantics
 
 - [ ] **Step 2: Register the new module in the crate**
 
@@ -263,9 +271,9 @@ cargo check
 
 Expected: FAIL with unresolved imports or constructor/call-site mismatches until the server, debug REPL, and worker wiring is updated.
 
-- [ ] **Step 4: Make the server own the buffer**
+- [ ] **Step 4: Make the server own the buffer and the turn-seal gate**
 
-Modify `src/server.rs` so `SharedServer` owns `Arc<PendingOutput>` and passes it into `WorkerManager::new(...)`.
+Modify `src/server.rs` so `SharedServer` owns `Arc<PendingOutput>`, a turn-scoped gate (for example `Arc<tokio::sync::Mutex<()>>`), and passes the unread store into `WorkerManager::new(...)`. Hold that gate across execute / wait / settle / drain / format for every `repl` and `repl_reset` request so one reply cannot absorb another turn's unread output.
 
 - [ ] **Step 5: Update the other direct `WorkerManager` constructor callers**
 
@@ -277,7 +285,7 @@ Do not leave the debug REPL on a stale constructor shape while the server compil
 
 - [ ] **Step 6: Port every append path into `PendingOutput` and slim the worker outcome API**
 
-Modify `src/worker_process.rs` so the existing stdout/stderr/image reader path appends directly into `PendingOutput` instead of `OutputTimeline`/`OutputBuffer`. Preserve the existing always-on reader-thread behavior while the worker is idle. Then replace the direct synthetic append sites too: guardrail notices, session-end notices, `\u0004` restart notices, and future capture-failure notices must all use the same `PendingOutput` API with `InlinePolicy::MustInline` where the message must remain visible in the tool response. Keep `repl_reset` separate: it clears `PendingOutput` before its fresh-session notice is surfaced.
+Modify `src/worker_process.rs` so the existing stdout/stderr/image reader path appends directly into `PendingOutput` instead of `OutputTimeline`/`OutputBuffer`. Preserve the existing always-on reader-thread behavior while the worker is idle, but route those reader threads through generation-scoped append handles so late bytes from a torn-down worker are ignored rather than leaking into a later session. Then replace the direct synthetic append sites too: guardrail notices, session-end notices, `\u0004` restart notices, and future capture-failure notices must all use the same `PendingOutput` API with `InlinePolicy::MustInline` where the message must remain visible in the tool response. Keep `repl_reset` separate: it clears `PendingOutput` before its fresh-session notice is surfaced.
 
 At the same time, stop building user-visible `WorkerReply::Output` payloads in the worker. Replace that with a minimal worker-to-server outcome carrying only what the server needs to seal a batch correctly, for example:
 - whether the operation completed, timed out, was rejected as busy, or ended the session
@@ -285,7 +293,7 @@ At the same time, stop building user-visible `WorkerReply::Output` payloads in t
 - echo events needed for echo-only elision or collapse
 - any machine-readable error code the server still needs for public wording
 
-If you need an internal stale-reader guard to prevent duplicate appends after teardown, keep it as an implementation detail and do not let it drop output that should still be surfaced by the next tool response.
+The stale-reader guard is required here: keep it as an implementation detail, but make sure it rejects only writes from pre-reset generations and does not drop output from the live worker generation.
 
 - [ ] **Step 6a: Keep the debug REPL functional through the protocol cut-over**
 
@@ -309,9 +317,11 @@ Handle `repl_reset` on its own path:
 3. format a fresh reset reply that contains `[repl] new session started` but no pre-reset unread output
 
 Semantics to preserve while moving ownership:
+- the server holds the turn-scoped gate from the start of `repl` / `repl_reset` handling until the drained batch has been formatted, so a later request cannot append into or drain the same unread batch
 - `repl`, `repl("", ...)`, `\u0003`, `\u0004`, and compound control-byte forms still use one overall deadline
 - background prefix output is just unread content already sitting in `PendingOutput`
 - `repl_reset` is not an unread drain; it is an explicit unread clear
+- plain `\u0004` preserves unread output and must not clear a latched capture-failure state; only `repl_reset` is allowed to discard poisoned unread state and reopen normal execution
 - busy / timeout / lifecycle wording remains public-server behavior, not worker-side response assembly
 - if any ring-based helper must survive briefly during the refactor, limit it to private capture/echo support only; the returned public batch must be sealed by the server before this task is considered done
 - by the end of this step, the unread semantics tests from Task 1 should be exercising the real new path, not a mixed sink/source transitional state
@@ -342,10 +352,11 @@ cargo test --test write_stdin_edge_cases write_stdin_timeout_zero_is_non_blockin
 cargo test --test write_stdin_edge_cases write_stdin_empty_returns_prompt -- --exact
 cargo test --test write_stdin_behavior write_stdin_mixed_stdout_stderr -- --exact
 cargo test --test write_stdin_behavior write_stdin_discards_when_busy -- --exact
-cargo test --test repl_surface capture_failure_allows_ctrl_d_recovery -- --exact
+cargo test --test repl_surface capture_failure_persists_across_ctrl_d_until_reset -- --exact
 cargo test --test write_stdin_batch write_stdin_settles_final_output_before_draining -- --exact
 cargo test --test write_stdin_batch write_stdin_drops_huge_echo_only_inputs -- --exact
 cargo test --test write_stdin_batch write_stdin_collapses_huge_echo_with_output_attribution -- --exact
+cargo test --test write_stdin_batch overlapping_repl_calls_seal_distinct_batches -- --exact
 ```
 
 Expected: PASS for the unread-drain semantics and echo-focused regressions. Oversized-preview and artifact-retention tests may still fail later because reply formatting still uses the old overflow presentation.
@@ -397,7 +408,7 @@ In `src/server.rs` / `src/server/reply_batch.rs`:
 
 - [ ] **Step 3: Update the public truncation and capture-failure contracts**
 
-Because unread output is now server-owned and may spill instead of truncating, remove the public contract that says older unread output disables full-response artifacts. Replace it with a public assertion that oversized unread batches still produce a bounded inline preview plus a retained artifact when the server can spill/write successfully. At the same time, add the public assertion that spill-promotion failure latches a capture-failure state until explicit `\u0004` or `repl_reset`, with only `repl_reset` also clearing unread output.
+Because unread output is now server-owned and may spill instead of truncating, remove the public contract that says older unread output disables full-response artifacts. Replace it with a public assertion that oversized unread batches still produce a bounded inline preview plus a retained artifact when the server can spill/write successfully. At the same time, add the public assertion that spill-promotion failure latches a capture-failure state until explicit `repl_reset`; plain `\u0004` preserves unread output and therefore preserves the failure latch instead of clearing it.
 
 - [ ] **Step 4: Delete the dead ring machinery**
 
@@ -420,11 +431,12 @@ cargo test --test manage_session_behavior ctrl_d_preserves_unread_output_across_
 cargo test --test repl_surface repl_reset_clears_state -- --exact
 cargo test --test repl_surface repl_reset_discards_unread_output_before_reply -- --exact
 cargo test --test repl_surface capture_failure_blocks_plain_input_until_reset -- --exact
-cargo test --test repl_surface capture_failure_allows_ctrl_d_recovery -- --exact
+cargo test --test repl_surface capture_failure_persists_across_ctrl_d_until_reset -- --exact
 cargo test --test write_stdin_edge_cases write_stdin_timeout_zero_is_non_blocking -- --exact
 cargo test --test write_stdin_behavior write_stdin_mixed_stdout_stderr -- --exact
 cargo test --test python_backend python_truncated_pending_prefix_spills_to_server_owned_artifact -- --exact
 cargo test --test write_stdin_batch write_stdin_settles_final_output_before_draining -- --exact
+cargo test --test write_stdin_batch overlapping_repl_calls_seal_distinct_batches -- --exact
 ```
 
 Expected: PASS for the new semantics, including lifecycle consistency. Snapshots may still fail later because the formatter still uses the old overflow presentation.
@@ -689,7 +701,7 @@ Keep coverage in the integration tests for the new public contract:
 
 Before accepting snapshots:
 - rename/update the old truncation-contract test in `tests/python_backend.rs`
-- keep or add public assertions for huge echoed input handling, lifecycle-request consistency, non-overlapping idle-poll drains, retained-artifact behavior, privileged inline notices, and latched capture-failure recovery
+- keep or add public assertions for huge echoed input handling, lifecycle-request consistency, non-overlapping idle-poll drains, retained-artifact behavior, privileged inline notices, turn-sealed replies, and reset-only recovery from latched capture-failure
 - update `tests/r_file_show.rs` so it asserts the new preview / full-reply wording instead of the old `output truncated` contract
 - verify the docs describe server-owned unread batching rather than worker-side truncation/acknowledgement
 - update `docs/tool-descriptions/repl_reset_tool.md` so it explicitly states that `repl_reset` clears unread output, while `\u0004` within `repl` preserves unread output for later draining
