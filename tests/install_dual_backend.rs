@@ -627,6 +627,156 @@ fn install_claude_reinstall_replaces_old_explicit_workspace_write_hook_commands(
 }
 
 #[test]
+fn install_claude_reinstall_deduplicates_matching_hook_entries() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let claude_dir = temp.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    let config_path = temp.path().join(".claude.json");
+    let settings_path = claude_dir.join("settings.json");
+    let old_command = "/opt/old/mcp-repl";
+    let new_command = "/opt/new/mcp-repl";
+    let seeded_config = serde_json::json!({
+        "mcpServers": {
+            "r": {
+                "command": old_command,
+                "args": ["--interpreter", "r"]
+            },
+            "python": {
+                "command": old_command,
+                "args": ["--interpreter", "python"]
+            }
+        }
+    });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&seeded_config)?)?;
+    let stale_session_start = format!("{old_command} claude-hook session-start");
+    let stale_session_end = format!("{old_command} claude-hook session-end");
+    let seeded = serde_json::json!({
+        "SessionStart": [
+            {
+                "matcher": "startup",
+                "hooks": [
+                    {"type": "command", "command": stale_session_start},
+                    {"type": "command", "command": "echo keep-start-a"}
+                ]
+            },
+            {
+                "matcher": "startup",
+                "hooks": [
+                    {"type": "command", "command": stale_session_start},
+                    {"type": "command", "command": "echo keep-start-b"}
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "matcher": "clear",
+                "hooks": [
+                    {"type": "command", "command": stale_session_end},
+                    {"type": "command", "command": "echo keep-end-a"}
+                ]
+            },
+            {
+                "matcher": "clear",
+                "hooks": [
+                    {"type": "command", "command": stale_session_end},
+                    {"type": "command", "command": "echo keep-end-b"}
+                ]
+            }
+        ]
+    });
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
+
+    let exe = resolve_exe()?;
+    let status = Command::new(exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg(new_command)
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        status.success(),
+        "install --client claude failed with status {status}"
+    );
+
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let expected_session_start = format!("{new_command} claude-hook session-start");
+    let expected_session_end = format!("{new_command} claude-hook session-end");
+
+    let startup_entries: Vec<&JsonValue> = settings_root["SessionStart"]
+        .as_array()
+        .expect("expected SessionStart hooks array")
+        .iter()
+        .filter(|entry| entry["matcher"].as_str() == Some("startup"))
+        .collect();
+    assert_eq!(
+        startup_entries.len(),
+        1,
+        "expected duplicate startup entries to be merged"
+    );
+    let startup_commands: Vec<&str> = startup_entries[0]["hooks"]
+        .as_array()
+        .expect("expected startup hooks array")
+        .iter()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    assert!(
+        startup_commands.contains(&expected_session_start.as_str()),
+        "expected updated SessionStart command"
+    );
+    assert!(
+        startup_commands.contains(&"echo keep-start-a"),
+        "expected first duplicate's unrelated hook to remain"
+    );
+    assert!(
+        startup_commands.contains(&"echo keep-start-b"),
+        "expected second duplicate's unrelated hook to remain"
+    );
+    assert!(
+        !startup_commands.contains(&stale_session_start.as_str()),
+        "expected stale SessionStart command to be removed from merged entry"
+    );
+
+    let clear_entries: Vec<&JsonValue> = settings_root["SessionEnd"]
+        .as_array()
+        .expect("expected SessionEnd hooks array")
+        .iter()
+        .filter(|entry| entry["matcher"].as_str() == Some("clear"))
+        .collect();
+    assert_eq!(
+        clear_entries.len(),
+        1,
+        "expected duplicate clear entries to be merged"
+    );
+    let clear_commands: Vec<&str> = clear_entries[0]["hooks"]
+        .as_array()
+        .expect("expected clear hooks array")
+        .iter()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    assert!(
+        clear_commands.contains(&expected_session_end.as_str()),
+        "expected updated SessionEnd command"
+    );
+    assert!(
+        clear_commands.contains(&"echo keep-end-a"),
+        "expected first duplicate's unrelated SessionEnd hook to remain"
+    );
+    assert!(
+        clear_commands.contains(&"echo keep-end-b"),
+        "expected second duplicate's unrelated SessionEnd hook to remain"
+    );
+    assert!(
+        !clear_commands.contains(&stale_session_end.as_str()),
+        "expected stale SessionEnd command to be removed from merged entry"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

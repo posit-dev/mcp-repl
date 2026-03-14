@@ -657,15 +657,31 @@ fn upsert_claude_hook_command(
         return Err(format!("claude settings `{event}` must be an array").into());
     };
 
-    if let Some(existing) = entries_arr
-        .iter_mut()
-        .find(|entry| hook_entry_matches(entry, matcher))
-    {
-        replace_claude_hook_command(existing, command, stale_hook_commands)?;
-        return Ok(());
+    let mut rebuilt = Vec::with_capacity(entries_arr.len() + 1);
+    let mut merged_entry = None;
+    let mut insert_idx = None;
+    for entry in std::mem::take(entries_arr) {
+        if hook_entry_matches(&entry, matcher) {
+            if let Some(existing) = merged_entry.as_mut() {
+                merge_claude_hook_entries(existing, entry)?;
+            } else {
+                insert_idx = Some(rebuilt.len());
+                merged_entry = Some(entry);
+            }
+        } else {
+            rebuilt.push(entry);
+        }
     }
 
-    entries_arr.push(new_hook_entry(matcher, command));
+    let mut entry = merged_entry.unwrap_or_else(|| new_hook_entry(matcher, command));
+    replace_claude_hook_command(&mut entry, command, stale_hook_commands)?;
+    if let Some(idx) = insert_idx {
+        rebuilt.insert(idx, entry);
+    } else {
+        rebuilt.push(entry);
+    }
+
+    *entries_arr = rebuilt;
     Ok(())
 }
 
@@ -696,6 +712,41 @@ fn hook_entry_has_command(entry: &JsonValue, command: &str) -> bool {
                 .and_then(|hook| hook.get("command").and_then(JsonValue::as_str))
                 == Some(command)
     })
+}
+
+fn merge_claude_hook_entries(
+    entry: &mut JsonValue,
+    duplicate: JsonValue,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(duplicate_obj) = duplicate.as_object() else {
+        return Err("claude hook entry must be an object".into());
+    };
+    let Some(entry_obj) = entry.as_object_mut() else {
+        return Err("claude hook entry must be an object".into());
+    };
+
+    for (key, value) in duplicate_obj {
+        if key != "hooks" && !entry_obj.contains_key(key) {
+            entry_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    let Some(duplicate_hooks) = duplicate_obj.get("hooks") else {
+        return Ok(());
+    };
+    let Some(duplicate_hooks_arr) = duplicate_hooks.as_array() else {
+        return Err("claude hook entry `hooks` must be an array".into());
+    };
+
+    let entry_hooks = entry_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(entry_hooks_arr) = entry_hooks.as_array_mut() else {
+        return Err("claude hook entry `hooks` must be an array".into());
+    };
+    entry_hooks_arr.extend(duplicate_hooks_arr.iter().cloned());
+
+    Ok(())
 }
 
 fn replace_claude_hook_command(
