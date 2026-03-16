@@ -296,12 +296,15 @@ fn current_claude_session_from_env_file() -> Option<ClaudeSessionBinding> {
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let raw = fs::read_to_string(path).ok()?;
-    for line in raw.lines().rev() {
+    let lines: Vec<&str> = raw.lines().collect();
+    for (idx, line) in lines.iter().enumerate().rev() {
         let line = line.trim();
-        if let Some(session_id) = decode_session_id_marker(line) {
-            return Some(session_id);
-        }
         if line.is_empty() || line.starts_with('#') {
+            if let Some(session_id) = decode_session_id_marker(line)
+                && marker_belongs_to_multiline_export(&lines, idx)
+            {
+                return Some(session_id);
+            }
             continue;
         }
         let Some(line) = line.strip_prefix("export ") else {
@@ -313,12 +316,57 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
         if key.trim() != CLAUDE_SESSION_ID_ENV {
             continue;
         }
+        if let Some(session_id) = decode_session_id_marker(line) {
+            return Some(session_id);
+        }
         let value = value.trim().trim_matches('"').trim_matches('\'');
         if !value.is_empty() {
             return Some(value.to_string());
         }
     }
     None
+}
+
+fn marker_belongs_to_multiline_export(lines: &[&str], marker_idx: usize) -> bool {
+    let marker_line = lines[marker_idx].trim();
+    let Some(prefix_end) = marker_line.rfind(CLAUDE_SESSION_ID_MARKER_PREFIX) else {
+        return false;
+    };
+    let marker_prefix = &marker_line[..prefix_end];
+
+    for export_idx in (0..marker_idx).rev() {
+        let export_line = lines[export_idx].trim();
+        if export_line.is_empty() {
+            continue;
+        }
+        let Some(export_line) = export_line.strip_prefix("export ") else {
+            continue;
+        };
+        let Some((key, value_start)) = export_line.split_once('=') else {
+            return false;
+        };
+        if key.trim() != CLAUDE_SESSION_ID_ENV {
+            return false;
+        }
+
+        let mut assignment = String::from(value_start);
+        if !single_quotes_unbalanced(&assignment) {
+            return false;
+        }
+        for continuation in &lines[export_idx + 1..marker_idx] {
+            assignment.push('\n');
+            assignment.push_str(continuation);
+        }
+        assignment.push('\n');
+        assignment.push_str(marker_prefix);
+        return !single_quotes_unbalanced(&assignment);
+    }
+
+    false
+}
+
+fn single_quotes_unbalanced(text: &str) -> bool {
+    text.chars().filter(|ch| *ch == '\'').count() % 2 == 1
 }
 
 fn request_restart(path: &Path) -> io::Result<()> {

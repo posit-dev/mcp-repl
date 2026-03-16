@@ -843,6 +843,113 @@ fn install_claude_reinstall_replaces_old_explicit_workspace_write_hook_commands(
 }
 
 #[test]
+fn install_claude_reinstall_replaces_old_hook_commands_without_interpreter_args() -> TestResult<()>
+{
+    let temp = tempfile::tempdir()?;
+    let claude_dir = temp.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    let config_path = temp.path().join(".claude.json");
+    let settings_path = claude_dir.join("settings.json");
+    let old_command = "/opt/old/mcp-repl";
+    let new_command = "/opt/new/mcp-repl";
+    let seeded_config = serde_json::json!({
+        "mcpServers": {
+            "r": {
+                "command": old_command,
+                "args": ["--sandbox", "workspace-write"]
+            }
+        }
+    });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&seeded_config)?)?;
+    let stale_session_start =
+        format!("{old_command} --sandbox workspace-write claude-hook session-start");
+    let stale_session_end =
+        format!("{old_command} --sandbox workspace-write claude-hook session-end");
+    let seeded = serde_json::json!({
+        "SessionStart": [
+            {
+                "matcher": "startup",
+                "hooks": [
+                    {"type": "command", "command": stale_session_start}
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "matcher": "clear",
+                "hooks": [
+                    {"type": "command", "command": stale_session_end}
+                ]
+            }
+        ]
+    });
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
+
+    let exe = resolve_exe()?;
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg(new_command)
+        .arg("--arg")
+        .arg("--sandbox")
+        .arg("--arg")
+        .arg("workspace-write")
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        status.success(),
+        "install --client claude failed with status {status}"
+    );
+
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let expected_session_start =
+        format!("{new_command} --sandbox workspace-write claude-hook session-start");
+    let expected_session_end =
+        format!("{new_command} --sandbox workspace-write claude-hook session-end");
+
+    let startup = settings_root["SessionStart"]
+        .as_array()
+        .expect("expected SessionStart hooks array")
+        .iter()
+        .find(|entry| entry["matcher"].as_str() == Some("startup"))
+        .expect("expected startup SessionStart matcher");
+    let startup_commands: Vec<&str> = startup["hooks"]
+        .as_array()
+        .expect("expected SessionStart hooks array")
+        .iter()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    assert_eq!(
+        startup_commands,
+        vec![expected_session_start.as_str()],
+        "expected stale SessionStart hook without interpreter args to be replaced"
+    );
+
+    let clear = settings_root["SessionEnd"]
+        .as_array()
+        .expect("expected SessionEnd hooks array")
+        .iter()
+        .find(|entry| entry["matcher"].as_str() == Some("clear"))
+        .expect("expected clear SessionEnd matcher");
+    let clear_commands: Vec<&str> = clear["hooks"]
+        .as_array()
+        .expect("expected SessionEnd hooks array")
+        .iter()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    assert_eq!(
+        clear_commands,
+        vec![expected_session_end.as_str()],
+        "expected stale SessionEnd hook without interpreter args to be replaced"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_claude_reinstall_deduplicates_matching_hook_entries() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let claude_dir = temp.path().join(".claude");

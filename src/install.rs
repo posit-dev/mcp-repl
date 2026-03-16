@@ -857,9 +857,8 @@ fn existing_claude_hook_commands(
         else {
             continue;
         };
-        let Some(base_args) = strip_install_interpreter_arg(&existing_args) else {
-            continue;
-        };
+        let base_args =
+            strip_install_interpreter_arg(&existing_args).unwrap_or_else(|| existing_args.clone());
         for hook_args in candidate_claude_hook_args(&base_args) {
             out.insert(claude_hook_command(
                 existing_command,

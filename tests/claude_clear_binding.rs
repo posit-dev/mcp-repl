@@ -324,6 +324,65 @@ async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_ignores_marker_text_in_non_export_lines() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = resolve_exe()?;
+
+    run_session_start(&exe, temp.path(), &env_file, "sess-exported")?;
+    let stray_marker = "# stray marker # mcp-repl-session-id-b64=c2Vzcy1zdHJheQ==\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&env_file)?
+        .write_all(stray_marker.as_bytes())?;
+
+    let mut session =
+        common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
+
+    let bound = match repl_text(
+        &mut session,
+        "export_bound <- 1; print(exists(\"export_bound\"))",
+        "before clear with stray marker text",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        bound.contains("TRUE"),
+        "expected exported session to bind before clear, got: {bound:?}"
+    );
+
+    run_session_end_clear(&exe, temp.path(), &env_file, "sess-exported")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"export_bound\"))",
+        "after clear with stray marker text",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected stray non-export marker text not to change clear targeting, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_late_session_binding_restarts_prebound_worker_state() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempfile::tempdir()?;
