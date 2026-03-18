@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Backend;
+use crate::shell_escape;
 use crate::worker_process::{WorkerError, WorkerManager};
 
 pub const CLAUDE_SESSION_ID_ENV: &str = "MCP_REPL_CLAUDE_SESSION_ID";
@@ -249,7 +250,7 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     writeln!(
         file,
         "export {CLAUDE_SESSION_ID_ENV}={} {CLAUDE_SESSION_ID_MARKER_PREFIX}{encoded_session_id}",
-        shell_escape_posix(session_id)
+        shell_escape::posix(session_id)
     )?;
     Ok(())
 }
@@ -404,19 +405,6 @@ fn decode_session_id_marker(line: &str) -> Option<String> {
     let encoded = &line[start + CLAUDE_SESSION_ID_MARKER_PREFIX.len()..];
     let decoded = STANDARD.decode(encoded.trim()).ok()?;
     String::from_utf8(decoded).ok()
-}
-
-fn shell_escape_posix(raw: &str) -> String {
-    if raw.is_empty() {
-        return "''".to_string();
-    }
-    if raw
-        .bytes()
-        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':'))
-    {
-        return raw.to_string();
-    }
-    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn load_instance_records_for_binding(

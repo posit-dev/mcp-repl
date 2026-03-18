@@ -1,6 +1,5 @@
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use common::TestResult;
@@ -9,36 +8,12 @@ use toml_edit::DocumentMut;
 
 const CLAUDE_SESSION_END_MATCHERS: &[&str] = &["clear", "prompt_input_exit", "other"];
 
-fn resolve_exe() -> TestResult<PathBuf> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let mut path = std::env::current_exe()?;
-    path.pop();
-    path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
-        let mut candidate_path = path.clone();
-        candidate_path.push(candidate);
-        if cfg!(windows) {
-            candidate_path.set_extension("exe");
-        }
-        if candidate_path.exists() {
-            return Ok(candidate_path);
-        }
-    }
-    Err("unable to locate mcp-repl test binary".into())
-}
-
 #[test]
 fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home)?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     let status = Command::new(exe)
         .arg("install")
@@ -104,7 +79,7 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
 #[test]
 fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     let status = Command::new(exe)
         .arg("install")
@@ -209,7 +184,7 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
 #[test]
 fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let old_command = "/opt/repltool";
     let new_command = "/opt/repltool-v2";
 
@@ -360,7 +335,7 @@ fn install_claude_updates_existing_top_level_hook_commands() -> TestResult<()> {
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -468,7 +443,7 @@ fn install_claude_reinstall_replaces_old_hook_commands_when_server_names_change(
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -573,7 +548,7 @@ fn install_claude_migrates_wrapper_style_hook_settings() -> TestResult<()> {
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -680,7 +655,7 @@ fn install_claude_reinstall_preserves_unrelated_commands_that_only_mention_hook_
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -778,7 +753,7 @@ fn install_claude_reinstall_replaces_old_explicit_workspace_write_hook_commands(
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -885,7 +860,7 @@ fn install_claude_reinstall_replaces_old_hook_commands_without_interpreter_args(
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(&exe)
         .arg("install")
         .arg("--client")
@@ -1009,7 +984,7 @@ fn install_claude_reinstall_deduplicates_matching_hook_entries() -> TestResult<(
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&seeded)?)?;
 
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let status = Command::new(exe)
         .arg("install")
         .arg("--client")
@@ -1104,7 +1079,7 @@ fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home)?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     for cmd in ["install-codex", "install-claude"] {
         let status = Command::new(&exe)
@@ -1128,7 +1103,7 @@ fn install_rejects_empty_client_selector() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home)?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     let status = Command::new(&exe)
         .arg("install")
@@ -1153,7 +1128,7 @@ fn install_subcommands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home)?;
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     let codex_status = Command::new(&exe)
         .arg("install-codex")

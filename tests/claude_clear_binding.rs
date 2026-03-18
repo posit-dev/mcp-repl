@@ -1,119 +1,10 @@
 mod common;
 
 use common::{McpTestSession, TestResult};
-use rmcp::model::RawContent;
 use serde_json::json;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
-
-fn test_mutex() -> &'static Mutex<()> {
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_MUTEX.get_or_init(|| Mutex::new(()))
-}
-
-fn test_guard() -> MutexGuard<'static, ()> {
-    test_mutex().lock().unwrap_or_else(|err| err.into_inner())
-}
-
-fn resolve_exe() -> TestResult<PathBuf> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let mut path = std::env::current_exe()?;
-    path.pop();
-    path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
-        let mut candidate_path = path.clone();
-        candidate_path.push(candidate);
-        if cfg!(windows) {
-            candidate_path.set_extension("exe");
-        }
-        if candidate_path.exists() {
-            return Ok(candidate_path);
-        }
-    }
-
-    Err("unable to locate mcp-repl test binary".into())
-}
-
-fn result_text(result: &rmcp::model::CallToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|item| match &item.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with status")
-        || text.contains("worker exited with signal")
-        || text.contains("unable to initialize the JIT")
-        || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
-}
-
-fn busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
-        || text.contains("worker is busy")
-        || text.contains("request already running")
-        || text.contains("input discarded while worker busy")
-}
-
-fn run_claude_hook_with_env(
-    exe: &Path,
-    env_vars: &[(String, String)],
-    subcommand: &str,
-    input: serde_json::Value,
-) -> TestResult<()> {
-    let mut cmd = Command::new(exe);
-    cmd.arg("claude-hook")
-        .arg(subcommand)
-        .env_remove("CLAUDE_PROJECT_DIR")
-        .env_remove("CLAUDE_ENV_FILE")
-        .env_remove("MCP_REPL_CLAUDE_SESSION_ID")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-    let mut child = cmd.spawn()?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "failed to capture claude-hook stdin".to_string())?;
-        stdin.write_all(serde_json::to_string(&input)?.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "claude-hook {subcommand} failed with status {}\nstderr:\n{stderr}",
-        output.status
-    )
-    .into())
-}
+use std::path::Path;
+use std::process::Command;
 
 fn claude_env_vars(state_home: &Path, env_file: &Path) -> Vec<(String, String)> {
     vec![
@@ -152,7 +43,7 @@ fn run_session_start(
     session_id: &str,
 ) -> TestResult<()> {
     let env_vars = claude_env_vars(state_home, env_file);
-    run_claude_hook_with_env(
+    common::run_claude_hook(
         exe,
         &env_vars,
         "session-start",
@@ -170,7 +61,7 @@ fn run_session_end_clear(
     session_id: &str,
 ) -> TestResult<()> {
     let env_vars = claude_env_vars(state_home, env_file);
-    run_claude_hook_with_env(
+    common::run_claude_hook(
         exe,
         &env_vars,
         "session-end",
@@ -187,33 +78,16 @@ async fn repl_text(
     input: &str,
     context: &str,
 ) -> TestResult<Option<String>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
-        let text = result_text(&result);
-        if backend_unavailable(&text) {
-            eprintln!("claude_clear_binding backend unavailable {context}; skipping");
-            return Ok(None);
-        }
-        if !busy_response(&text) {
-            return Ok(Some(text));
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("claude_clear_binding worker remained busy {context}: {text:?}").into(),
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    common::write_stdin_until_ready(session, input, 10.0, context).await
 }
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_session_start_shell_escapes_special_session_ids() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let session_id = "sess $HOME; 'quoted'\n# mcp-repl-session-id-b64=literal";
 
     run_session_start(&exe, temp.path(), &env_file, session_id)?;
@@ -273,10 +147,10 @@ async fn claude_session_start_shell_escapes_special_session_ids() -> TestResult<
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_matches_multiline_session_ids_with_plaintext_continuations() -> TestResult<()>
 {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let session_id = "sess-first-line\ncontinued session text";
 
     run_session_start(&exe, temp.path(), &env_file, session_id)?;
@@ -336,10 +210,10 @@ async fn claude_clear_matches_multiline_session_ids_with_plaintext_continuations
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_matches_multiline_session_ids_with_export_like_continuations()
 -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let session_id = "sess-first-line\nexport FOO=bar\ncontinued tail";
 
     run_session_start(&exe, temp.path(), &env_file, session_id)?;
@@ -397,10 +271,10 @@ async fn claude_clear_matches_multiline_session_ids_with_export_like_continuatio
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     run_session_start(&exe, temp.path(), &env_file, "sess-startup")?;
 
@@ -451,10 +325,10 @@ async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_ignores_marker_text_in_non_export_lines() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     run_session_start(&exe, temp.path(), &env_file, "sess-exported")?;
     let stray_marker = "# stray marker # mcp-repl-session-id-b64=c2Vzcy1zdHJheQ==\n";
@@ -510,10 +384,10 @@ async fn claude_clear_ignores_marker_text_in_non_export_lines() -> TestResult<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_late_session_binding_restarts_prebound_worker_state() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     let mut session =
         common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
@@ -562,11 +436,11 @@ async fn claude_clear_late_session_binding_restarts_prebound_worker_state() -> T
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_matches_exact_env_file_and_session() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file_a = temp.path().join("claude-a.env");
     let env_file_b = temp.path().join("claude-b.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let session_id = "sess-shared";
 
     run_session_start(&exe, temp.path(), &env_file_a, session_id)?;
@@ -658,10 +532,10 @@ async fn claude_clear_matches_exact_env_file_and_session() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> TestResult<()> {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     run_session_start(&exe, temp.path(), &env_file, "sess-a")?;
     let mut session =
@@ -713,11 +587,11 @@ async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_concurrent_same_directory_sessions_do_not_reset_each_other() -> TestResult<()>
 {
-    let _guard = test_guard();
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file_a = temp.path().join("claude-a.env");
     let env_file_b = temp.path().join("claude-b.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
 
     run_session_start(&exe, temp.path(), &env_file_a, "sess-a")?;
     run_session_start(&exe, temp.path(), &env_file_b, "sess-b")?;

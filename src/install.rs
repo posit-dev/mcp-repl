@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
+use crate::shell_escape;
+
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
@@ -1001,22 +1003,9 @@ fn claude_hook_command_for_shell(
 
 fn shell_escape(raw: &str, shell: HookCommandShell) -> String {
     match shell {
-        HookCommandShell::Posix => shell_escape_posix(raw),
+        HookCommandShell::Posix => shell_escape::posix(raw),
         HookCommandShell::Windows => shell_escape_windows(raw),
     }
-}
-
-fn shell_escape_posix(raw: &str) -> String {
-    if raw.is_empty() {
-        return "''".to_string();
-    }
-    if raw
-        .bytes()
-        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':'))
-    {
-        return raw.to_string();
-    }
-    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn shell_escape_windows(raw: &str) -> String {

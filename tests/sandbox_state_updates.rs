@@ -3,39 +3,10 @@
 mod common;
 
 use common::{McpTestSession, TestResult};
-use rmcp::model::{CallToolResult, RawContent};
 use serde_json::json;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
-
-fn test_mutex() -> &'static Mutex<()> {
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_MUTEX.get_or_init(|| Mutex::new(()))
-}
-
-fn collect_text(result: &CallToolResult) -> String {
-    let text = result
-        .content
-        .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    text.lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !(trimmed.starts_with("> ") || trimmed.starts_with("+ ") || trimmed == ">")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 fn sandbox_update_params(network_access: bool) -> serde_json::Value {
     json!({
@@ -47,93 +18,6 @@ fn sandbox_update_params(network_access: bool) -> serde_json::Value {
             "exclude_slash_tmp": false
         }
     })
-}
-
-fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with signal")
-        || text.contains("worker exited with status")
-        || text.contains("worker io error: Broken pipe")
-        || text.contains("unable to initialize the JIT")
-        || text.contains("libR.so: cannot open shared object file")
-        || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
-}
-
-fn busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
-        || text.contains("worker is busy")
-        || text.contains("request already running")
-        || text.contains("input discarded while worker busy")
-}
-
-fn resolve_exe() -> TestResult<PathBuf> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let mut path = std::env::current_exe()?;
-    path.pop();
-    path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
-        let mut candidate_path = path.clone();
-        candidate_path.push(candidate);
-        if cfg!(windows) {
-            candidate_path.set_extension("exe");
-        }
-        if candidate_path.exists() {
-            return Ok(candidate_path);
-        }
-    }
-
-    Err("unable to locate mcp-repl test binary".into())
-}
-
-fn run_claude_hook(
-    exe: &Path,
-    env_vars: &[(String, String)],
-    subcommand: &str,
-    input: serde_json::Value,
-) -> TestResult<()> {
-    let mut cmd = Command::new(exe);
-    cmd.arg("claude-hook")
-        .arg(subcommand)
-        .env_remove("CLAUDE_PROJECT_DIR")
-        .env_remove("CLAUDE_ENV_FILE")
-        .env_remove("MCP_REPL_CLAUDE_SESSION_ID")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-    let mut child = cmd.spawn()?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "failed to capture claude-hook stdin".to_string())?;
-        stdin.write_all(serde_json::to_string(&input)?.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "claude-hook {subcommand} failed with status {}\nstderr:\n{stderr}",
-        output.status
-    )
-    .into())
 }
 
 async fn spawn_server_retry() -> TestResult<common::McpTestSession> {
@@ -177,14 +61,14 @@ async fn assert_session_reset(session: &mut McpTestSession) -> TestResult<bool> 
         let result = session
             .write_stdin_raw_with("x <- 42; print(exists(\"x\"))", Some(10.0))
             .await?;
-        last_text = collect_text(&result);
-        if backend_unavailable(&last_text) {
+        last_text = common::call_tool_text_without_prompts(&result);
+        if common::r_backend_unavailable(&last_text) {
             return Ok(false);
         }
         if last_text.contains("TRUE") {
             return Ok(true);
         }
-        if busy_response(&last_text) {
+        if common::worker_busy_response(&last_text) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
@@ -201,14 +85,14 @@ async fn assert_variable_cleared(session: &mut McpTestSession) -> TestResult<boo
         let result = session
             .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
             .await?;
-        last_text = collect_text(&result);
-        if backend_unavailable(&last_text) {
+        last_text = common::call_tool_text_without_prompts(&result);
+        if common::r_backend_unavailable(&last_text) {
             return Ok(false);
         }
         if last_text.contains("FALSE") {
             return Ok(true);
         }
-        if busy_response(&last_text) {
+        if common::worker_busy_response(&last_text) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
@@ -220,9 +104,7 @@ async fn assert_variable_cleared(session: &mut McpTestSession) -> TestResult<boo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_update_request_restarts_worker() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     if !common::sandbox_exec_available() {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
@@ -247,9 +129,7 @@ async fn sandbox_state_update_request_restarts_worker() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_update_notification_restarts_worker() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     if !common::sandbox_exec_available() {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
@@ -301,8 +181,8 @@ tryCatch({
 "#
     .replace("__TARGET__", &target_literal);
     let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
-    let text = collect_text(&result);
-    if backend_unavailable(&text) {
+    let text = common::call_tool_text_without_prompts(&result);
+    if common::r_backend_unavailable(&text) {
         eprintln!("sandbox_state_updates full_access backend unavailable; skipping");
         let _ = std::fs::remove_file(&target);
         session.cancel().await?;
@@ -323,9 +203,7 @@ tryCatch({
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_capability_advertised() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     let session = spawn_server_retry().await?;
     let info = session.server_info().ok_or_else(|| {
         let message = "missing server info from initialize".to_string();
@@ -345,9 +223,7 @@ async fn sandbox_state_capability_advertised() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     let session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
@@ -357,14 +233,12 @@ async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     let mut session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
     let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
-    let text = collect_text(&result);
+    let text = common::call_tool_text_without_prompts(&result);
     assert!(
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
         "expected missing sandbox-state error, got: {text}"
@@ -375,14 +249,12 @@ async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_without_state_update_errors_on_repl_reset() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     let mut session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
     let result = session.call_tool_raw("repl_reset", json!({})).await?;
-    let text = collect_text(&result);
+    let text = common::call_tool_text_without_prompts(&result);
     assert!(
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
         "expected missing sandbox-state error, got: {text}"
@@ -393,12 +265,10 @@ async fn sandbox_inherit_without_state_update_errors_on_repl_reset() -> TestResu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
-    let exe = resolve_exe()?;
+    let exe = common::resolve_test_binary()?;
     let env_vars = vec![
         (
             "XDG_STATE_HOME".to_string(),
@@ -416,7 +286,7 @@ async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> Te
     )
     .await?;
 
-    run_claude_hook(
+    common::run_claude_hook(
         &exe,
         &env_vars,
         "session-start",
@@ -431,8 +301,8 @@ async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> Te
         .await?;
 
     let result = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
-    let text = collect_text(&result);
-    if backend_unavailable(&text) {
+    let text = common::call_tool_text_without_prompts(&result);
+    if common::r_backend_unavailable(&text) {
         eprintln!("sandbox_state_updates late claude binding backend unavailable; skipping");
         session.cancel().await?;
         return Ok(());

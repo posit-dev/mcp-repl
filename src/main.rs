@@ -17,6 +17,7 @@ mod r_session;
 mod sandbox;
 mod sandbox_cli;
 mod server;
+mod shell_escape;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;

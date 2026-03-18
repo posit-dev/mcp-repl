@@ -1,16 +1,18 @@
 #![allow(dead_code)]
 
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard};
 
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientNotification, ClientRequest, CustomNotification, CustomRequest,
-    RawContent,
+    CallToolRequestParams, CallToolResult, ClientNotification, ClientRequest, CustomNotification,
+    CustomRequest, RawContent,
 };
 use rmcp::service::ServiceError;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -24,6 +26,19 @@ const TEST_PAGER_PAGE_CHARS: u64 = 300;
 const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
+const DEFAULT_BUSY_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_BUSY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+pub fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+pub fn lock_test_mutex() -> TestResult<MutexGuard<'static, ()>> {
+    test_mutex()
+        .lock()
+        .map_err(|_| "test mutex poisoned".into())
+}
 
 #[cfg(target_os = "macos")]
 pub fn sandbox_exec_available() -> bool {
@@ -996,6 +1011,137 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         server_pid,
         backend,
     })
+}
+
+pub fn resolve_test_binary() -> TestResult<PathBuf> {
+    resolve_server_path()
+}
+
+pub fn run_json_stdin_command(
+    exe: &std::path::Path,
+    args: &[&str],
+    env_vars: &[(String, String)],
+    cleared_env_vars: &[&str],
+    input: &Value,
+) -> TestResult<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for key in cleared_env_vars {
+        cmd.env_remove(key);
+    }
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to capture command stdin".to_string())?;
+        stdin.write_all(serde_json::to_string(input)?.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "command {:?} failed with status {}\nstderr:\n{stderr}",
+        args, output.status
+    )
+    .into())
+}
+
+pub fn run_claude_hook(
+    exe: &std::path::Path,
+    env_vars: &[(String, String)],
+    subcommand: &str,
+    input: Value,
+) -> TestResult<()> {
+    run_json_stdin_command(
+        exe,
+        &["claude-hook", subcommand],
+        env_vars,
+        &[
+            "CLAUDE_PROJECT_DIR",
+            "CLAUDE_ENV_FILE",
+            "MCP_REPL_CLAUDE_SESSION_ID",
+        ],
+        &input,
+    )
+}
+
+pub fn call_tool_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub fn call_tool_text_without_prompts(result: &CallToolResult) -> String {
+    let text = call_tool_text(result);
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("> ") || trimmed.starts_with("+ ") || trimmed == ">")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn r_backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with signal")
+        || text.contains("worker exited with status")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+        || text.contains("unable to initialize the JIT")
+        || text.contains("options(\"defaultPackages\") was not found")
+        || text.contains("libR.so: cannot open shared object file")
+        || text.contains("worker io error: Broken pipe")
+}
+
+pub fn worker_busy_response(text: &str) -> bool {
+    text.contains("<<console status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
+}
+
+pub async fn write_stdin_until_ready(
+    session: &mut McpTestSession,
+    input: &str,
+    timeout_secs: f64,
+    context: &str,
+) -> TestResult<Option<String>> {
+    let deadline = std::time::Instant::now() + DEFAULT_BUSY_POLL_TIMEOUT;
+    loop {
+        let result = session
+            .write_stdin_raw_with(input, Some(timeout_secs))
+            .await?;
+        let text = call_tool_text(&result);
+        if r_backend_unavailable(&text) {
+            eprintln!("backend unavailable {context}; skipping");
+            return Ok(None);
+        }
+        if !worker_busy_response(&text) {
+            return Ok(Some(text));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("worker remained busy {context}: {text:?}").into());
+        }
+        tokio::time::sleep(DEFAULT_BUSY_POLL_INTERVAL).await;
+    }
 }
 
 fn parse_backend_from_args(args: &[String]) -> TestBackend {
