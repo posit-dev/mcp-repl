@@ -1,10 +1,14 @@
 mod common;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{McpTestSession, TestResult};
 use serde_json::json;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+
+const SESSION_ID_TOKEN_PREFIX: &str = "mcp_repl_session_id_b64_";
 
 fn claude_env_vars(state_home: &Path, env_file: &Path) -> Vec<(String, String)> {
     vec![
@@ -33,7 +37,14 @@ fn source_session_id_from_env_file(env_file: &Path) -> TestResult<String> {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(String::from_utf8(output.stdout)?)
+    let raw = String::from_utf8(output.stdout)?;
+    let encoded = raw
+        .strip_prefix(SESSION_ID_TOKEN_PREFIX)
+        .ok_or_else(|| format!("expected session token prefix, got: {raw:?}"))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|err| format!("failed to decode session token: {err}"))?;
+    Ok(String::from_utf8(decoded)?)
 }
 
 fn run_session_start(
@@ -83,7 +94,7 @@ async fn repl_text(
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn claude_session_start_shell_escapes_special_session_ids() -> TestResult<()> {
+async fn claude_session_start_writes_shell_safe_session_token() -> TestResult<()> {
     let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");

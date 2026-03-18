@@ -7,11 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Backend;
-use crate::shell_escape;
 use crate::worker_process::{WorkerError, WorkerManager};
 
 pub const CLAUDE_SESSION_ID_ENV: &str = "MCP_REPL_CLAUDE_SESSION_ID";
@@ -19,7 +18,7 @@ pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
-const CLAUDE_SESSION_ID_MARKER_PREFIX: &str = "# mcp-repl-session-id-b64=";
+const CLAUDE_SESSION_ID_TOKEN_PREFIX: &str = "mcp_repl_session_id_b64_";
 static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,11 +245,10 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if needs_separator {
         writeln!(file)?;
     }
-    let encoded_session_id = STANDARD.encode(session_id);
+    let encoded_session_id = URL_SAFE_NO_PAD.encode(session_id);
     writeln!(
         file,
-        "export {CLAUDE_SESSION_ID_ENV}={} {CLAUDE_SESSION_ID_MARKER_PREFIX}{encoded_session_id}",
-        shell_escape::posix(session_id)
+        "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
     )?;
     Ok(())
 }
@@ -297,14 +295,8 @@ fn current_claude_session_from_env_file() -> Option<ClaudeSessionBinding> {
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let raw = fs::read_to_string(path).ok()?;
-    let lines: Vec<&str> = raw.lines().collect();
-    for (idx, line) in lines.iter().enumerate().rev() {
+    for line in raw.lines().rev() {
         let line = line.trim();
-        if let Some(session_id) = decode_session_id_marker(line)
-            && marker_belongs_to_multiline_export(&lines, idx)
-        {
-            return Some(session_id);
-        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -317,57 +309,17 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
         if key.trim() != CLAUDE_SESSION_ID_ENV {
             continue;
         }
-        if let Some(session_id) = decode_session_id_marker(line) {
+        if let Some(session_id) = decode_session_id_token(value.trim()) {
             return Some(session_id);
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if !value.is_empty() {
-            return Some(value.to_string());
         }
     }
     None
 }
 
-fn marker_belongs_to_multiline_export(lines: &[&str], marker_idx: usize) -> bool {
-    let marker_line = lines[marker_idx].trim();
-    let Some(prefix_end) = marker_line.rfind(CLAUDE_SESSION_ID_MARKER_PREFIX) else {
-        return false;
-    };
-    let marker_prefix = &marker_line[..prefix_end];
-
-    for export_idx in (0..marker_idx).rev() {
-        let export_line = lines[export_idx].trim();
-        if export_line.is_empty() {
-            continue;
-        }
-        let Some(export_line) = export_line.strip_prefix("export ") else {
-            continue;
-        };
-        let Some((key, value_start)) = export_line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != CLAUDE_SESSION_ID_ENV {
-            continue;
-        }
-
-        let mut assignment = String::from(value_start);
-        if !single_quotes_unbalanced(&assignment) {
-            return false;
-        }
-        for continuation in &lines[export_idx + 1..marker_idx] {
-            assignment.push('\n');
-            assignment.push_str(continuation);
-        }
-        assignment.push('\n');
-        assignment.push_str(marker_prefix);
-        return !single_quotes_unbalanced(&assignment);
-    }
-
-    false
-}
-
-fn single_quotes_unbalanced(text: &str) -> bool {
-    text.chars().filter(|ch| *ch == '\'').count() % 2 == 1
+fn decode_session_id_token(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix(CLAUDE_SESSION_ID_TOKEN_PREFIX)?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 fn request_restart(path: &Path) -> io::Result<()> {
@@ -398,13 +350,6 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     Ok(!raw.is_empty() && !raw.ends_with(b"\n"))
-}
-
-fn decode_session_id_marker(line: &str) -> Option<String> {
-    let start = line.rfind(CLAUDE_SESSION_ID_MARKER_PREFIX)?;
-    let encoded = &line[start + CLAUDE_SESSION_ID_MARKER_PREFIX.len()..];
-    let decoded = STANDARD.decode(encoded.trim()).ok()?;
-    String::from_utf8(decoded).ok()
 }
 
 fn load_instance_records_for_binding(
@@ -569,6 +514,13 @@ mod tests {
             .expect("tempdir")
     }
 
+    fn session_export_line(session_id: &str) -> String {
+        format!(
+            "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{}\n",
+            URL_SAFE_NO_PAD.encode(session_id)
+        )
+    }
+
     #[test]
     fn session_start_hook_appends_session_id_to_claude_env_file() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -586,11 +538,52 @@ mod tests {
         handle_session_start(&input).expect("handle session start");
 
         let raw = fs::read_to_string(&env_file).expect("read env file");
-        assert!(raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=sess-start"));
+        assert!(raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=mcp_repl_session_id_b64_"));
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
         }
+    }
+
+    #[test]
+    fn current_claude_session_id_reads_multiline_session_with_apostrophe_from_token() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-session-start-marker-");
+        let env_file = temp.path().join("claude.env");
+        unsafe {
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+        }
+
+        let input = HookInput {
+            hook_event_name: Some("SessionStart".to_string()),
+            session_id: "foo'bar\nbaz".to_string(),
+            reason: None,
+        };
+        handle_session_start(&input).expect("handle session start");
+
+        let binding_session =
+            current_claude_session_from_env_file_with_path(&env_file).expect("binding session");
+        assert_eq!(binding_session.session_id, "foo'bar\nbaz");
+
+        unsafe {
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn current_claude_session_id_rejects_non_token_export() {
+        let temp = test_tempdir("claude-invalid-session-export-");
+        let env_file = temp.path().join("claude.env");
+        fs::write(
+            &env_file,
+            "export MCP_REPL_CLAUDE_SESSION_ID='foo'\"'\"'bar\nbaz'\n",
+        )
+        .expect("write env file");
+
+        assert!(
+            current_claude_session_from_env_file_with_path(&env_file).is_none(),
+            "expected non-token export to fail closed"
+        );
     }
 
     #[test]
@@ -599,16 +592,8 @@ mod tests {
         let temp = test_tempdir("claude-session-end-");
         let env_file_a = temp.path().join("claude-a.env");
         let env_file_b = temp.path().join("claude-b.env");
-        fs::write(
-            &env_file_a,
-            "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n",
-        )
-        .expect("write env file a");
-        fs::write(
-            &env_file_b,
-            "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n",
-        )
-        .expect("write env file b");
+        fs::write(&env_file_a, session_export_line("sess-shared")).expect("write env file a");
+        fs::write(&env_file_b, session_export_line("sess-shared")).expect("write env file b");
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file_b);
@@ -697,7 +682,11 @@ mod tests {
         let env_file = temp.path().join("claude.env");
         fs::write(
             &env_file,
-            "export MCP_REPL_CLAUDE_SESSION_ID=sess-old\nexport MCP_REPL_CLAUDE_SESSION_ID=sess-latest\n",
+            format!(
+                "{}{}",
+                session_export_line("sess-old"),
+                session_export_line("sess-latest")
+            ),
         )
         .expect("write env file");
 
@@ -714,7 +703,7 @@ mod tests {
         let env_file = temp.path().join("claude.env");
         fs::write(
             &env_file,
-            "export MCP_REPL_CLAUDE_SESSION_ID=sess-valid\nsource ~/.profile\n",
+            format!("{}source ~/.profile\n", session_export_line("sess-valid")),
         )
         .expect("write env file");
 
@@ -781,11 +770,7 @@ mod tests {
             .tempdir_in(temp_root)
             .expect("tempdir");
         let env_file = temp.path().join("claude.env");
-        fs::write(
-            &env_file,
-            "export MCP_REPL_CLAUDE_SESSION_ID=sess-current\n",
-        )
-        .expect("write env file");
+        fs::write(&env_file, session_export_line("sess-current")).expect("write env file");
 
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
