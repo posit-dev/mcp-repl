@@ -852,3 +852,111 @@ async fn claude_clear_scope_binding_works_without_claude_env_file() -> TestResul
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_mixed_scope_and_env_file_bindings_restarts_both() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = common::resolve_test_binary()?;
+    let scope_env_vars = vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "MCP_REPL_CLAUDE_TEST_SCOPE_KEY".to_string(),
+            "scope-mixed".to_string(),
+        ),
+        (
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
+        ),
+    ];
+
+    run_session_start_with_env(&exe, &scope_env_vars, "sess-mixed")?;
+
+    let mut scope_session = common::spawn_server_with_env_vars(scope_env_vars.clone()).await?;
+    let mut env_session =
+        common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
+
+    let scope_ready = match repl_text(
+        &mut scope_session,
+        "scope_mixed_bound <- 1; print(exists(\"scope_mixed_bound\"))",
+        "before mixed clear on scope-bound session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            scope_session.cancel().await?;
+            env_session.cancel().await?;
+            return Ok(());
+        }
+    };
+    let env_ready = match repl_text(
+        &mut env_session,
+        "env_mixed_bound <- 1; print(exists(\"env_mixed_bound\"))",
+        "before mixed clear on env-file session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            scope_session.cancel().await?;
+            env_session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        scope_ready.contains("TRUE"),
+        "expected scope-bound mixed session state to exist before clear, got: {scope_ready:?}"
+    );
+    assert!(
+        env_ready.contains("TRUE"),
+        "expected env-file mixed session state to exist before clear, got: {env_ready:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &scope_env_vars, "sess-mixed")?;
+
+    let scope_after_clear = match repl_text(
+        &mut scope_session,
+        "print(exists(\"scope_mixed_bound\"))",
+        "after mixed clear on scope-bound session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            scope_session.cancel().await?;
+            env_session.cancel().await?;
+            return Ok(());
+        }
+    };
+    let env_after_clear = match repl_text(
+        &mut env_session,
+        "print(exists(\"env_mixed_bound\"))",
+        "after mixed clear on env-file session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            scope_session.cancel().await?;
+            env_session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    scope_session.cancel().await?;
+    env_session.cancel().await?;
+    assert!(
+        scope_after_clear.contains("FALSE"),
+        "expected mixed clear to reset scope-bound state, got: {scope_after_clear:?}"
+    );
+    assert!(
+        env_after_clear.contains("FALSE"),
+        "expected mixed clear to reset env-file state too, got: {env_after_clear:?}"
+    );
+    Ok(())
+}

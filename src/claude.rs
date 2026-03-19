@@ -335,26 +335,27 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     }
     prune_stale_claude_state()?;
 
-    let mut matched_any = false;
+    let mut restart_paths = HashSet::new();
     if let Some(scope_key) = current_claude_scope_key(None) {
         for record in load_instance_records_for_scope(&scope_key, session_id)? {
-            let path = PathBuf::from(record.control_path);
-            request_restart(&path)?;
-            matched_any = true;
+            restart_paths.insert(record.control_path);
         }
-    }
-    if matched_any {
-        return Ok(());
     }
 
     if let Some(env_file_path) = current_claude_env_file_path() {
         if fs::read_to_string(&env_file_path).is_err() {
+            for control_path in restart_paths {
+                request_restart(Path::new(&control_path))?;
+            }
             return Ok(());
         }
         for record in load_instance_records_for_env_file(&env_file_path, session_id)? {
-            let path = PathBuf::from(record.control_path);
-            request_restart(&path)?;
+            restart_paths.insert(record.control_path);
         }
+    }
+
+    for control_path in restart_paths {
+        request_restart(Path::new(&control_path))?;
     }
     Ok(())
 }

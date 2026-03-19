@@ -891,8 +891,10 @@ fn existing_claude_hook_commands(
             .and_then(|env| env.get(CLAUDE_ENV_FILE_ENV))
             .and_then(JsonValue::as_str)
             == Some(env_file.display().to_string().as_str());
+        let looks_like_renamed_managed_server = has_interpreter_config_arg(&existing_args)
+            && claude_hook_base_args_match(&base_args, managed_base_args);
         if !managed_server_names.contains(server_name)
-            && !claude_hook_base_args_match(&base_args, managed_base_args)
+            && !looks_like_renamed_managed_server
             && !matches_current_env_file
         {
             continue;
