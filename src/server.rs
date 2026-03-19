@@ -25,7 +25,9 @@ use self::timeouts::{
 };
 
 use crate::backend::Backend;
-use crate::claude::{ClaudeClearBinding, ClaudeClientContext};
+use crate::claude::{
+    CONTROL_REQUEST_TIMEOUT, ClaudeBindingRefresh, ClaudeClearBinding, ClaudeClientContext,
+};
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -79,11 +81,21 @@ impl SharedServer {
                 let mut claude_clear_binding = claude_clear_binding
                     .lock()
                     .expect("claude clear binding mutex poisoned");
+                let mut clear_stale_binding = false;
                 if let Some(binding) = claude_clear_binding.as_ref() {
-                    binding.refresh(claude_client_context)?;
+                    clear_stale_binding = matches!(
+                        binding.refresh(claude_client_context)?,
+                        ClaudeBindingRefresh::MissingCurrentSession
+                    );
                 } else {
                     *claude_clear_binding =
                         ClaudeClearBinding::maybe_register_late(backend, claude_client_context)?;
+                }
+                if clear_stale_binding {
+                    *claude_clear_binding = None;
+                    if !awaiting_initial_sandbox_state_update {
+                        let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
+                    }
                 }
                 if !awaiting_initial_sandbox_state_update
                     && let Some(binding) = claude_clear_binding.as_ref()

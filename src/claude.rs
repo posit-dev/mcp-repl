@@ -18,7 +18,7 @@ use crate::worker_process::{WorkerError, WorkerManager};
 pub const CLAUDE_SESSION_ID_ENV: &str = "MCP_REPL_CLAUDE_SESSION_ID";
 pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
 
-const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
 const CLAUDE_SESSION_ID_TOKEN_PREFIX: &str = "mcp_repl_session_id_b64_";
 const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
@@ -35,6 +35,13 @@ pub enum HookCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeClientContext {
     scope_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeBindingRefresh {
+    Unchanged,
+    Rebound,
+    MissingCurrentSession,
 }
 
 impl HookCommand {
@@ -200,9 +207,12 @@ impl ClaudeClearBinding {
         Ok(Some(binding))
     }
 
-    pub fn refresh(&self, context: &ClaudeClientContext) -> Result<(), WorkerError> {
+    pub fn refresh(
+        &self,
+        context: &ClaudeClientContext,
+    ) -> Result<ClaudeBindingRefresh, WorkerError> {
         let Some(binding_session) = current_claude_session_binding(context) else {
-            return Ok(());
+            return Ok(ClaudeBindingRefresh::MissingCurrentSession);
         };
         let mut current_binding = self
             .inner
@@ -210,14 +220,14 @@ impl ClaudeClearBinding {
             .lock()
             .expect("claude binding session mutex poisoned");
         if *current_binding == binding_session {
-            return Ok(());
+            return Ok(ClaudeBindingRefresh::Unchanged);
         }
 
         self.write_record(&binding_session, &self.inner.record_template)
             .map_err(WorkerError::Io)?;
         request_restart(&self.inner.control_path).map_err(WorkerError::Io)?;
         *current_binding = binding_session;
-        Ok(())
+        Ok(ClaudeBindingRefresh::Rebound)
     }
 
     pub fn sync(&self, worker: &mut WorkerManager) -> Result<(), WorkerError> {
@@ -421,6 +431,7 @@ fn current_claude_project_dir() -> Option<PathBuf> {
         .filter(|raw| !raw.is_empty())
         .map(PathBuf::from)
         .or_else(|| env::current_dir().ok())
+        .map(canonicalize_or_identity)
 }
 
 fn current_claude_process_pid() -> Option<u32> {
@@ -776,6 +787,10 @@ fn unix_ms_now() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+fn canonicalize_or_identity(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -1139,6 +1154,43 @@ mod tests {
         unsafe {
             env::remove_var("XDG_STATE_HOME");
             env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn current_claude_scope_key_normalizes_equivalent_project_paths() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-scope-key-");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let canonical = workspace.canonicalize().expect("canonical workspace");
+        let parent = canonical.parent().expect("workspace parent");
+        let noncanonical = parent.join(".").join(
+            canonical
+                .file_name()
+                .expect("workspace file name should exist"),
+        );
+
+        unsafe {
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+            env::set_var(CLAUDE_PROJECT_DIR_ENV, &canonical);
+        }
+        let canonical_key =
+            current_claude_scope_key(Some(42)).expect("scope key for canonical path");
+
+        unsafe {
+            env::set_var(CLAUDE_PROJECT_DIR_ENV, &noncanonical);
+        }
+        let noncanonical_key =
+            current_claude_scope_key(Some(42)).expect("scope key for noncanonical path");
+
+        assert_eq!(
+            canonical_key, noncanonical_key,
+            "expected equivalent project paths to produce the same scope key"
+        );
+
+        unsafe {
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
         }
     }
 

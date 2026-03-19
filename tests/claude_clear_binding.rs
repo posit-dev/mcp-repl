@@ -703,6 +703,59 @@ async fn claude_clear_rebinds_after_later_session_start() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_missing_current_session_marker_restarts_before_next_request() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = common::resolve_test_binary()?;
+
+    run_session_start(&exe, temp.path(), &env_file, "sess-a")?;
+    let mut session =
+        common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
+
+    let bound = match repl_text(
+        &mut session,
+        "x <- 1; print(exists(\"x\"))",
+        "before session marker disappears",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        bound.contains("TRUE"),
+        "expected bound session state before removing the session marker, got: {bound:?}"
+    );
+
+    std::fs::write(&env_file, "")?;
+
+    let after_marker_loss = match repl_text(
+        &mut session,
+        "print(exists(\"x\"))",
+        "after session marker disappears",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_marker_loss.contains("FALSE"),
+        "expected a missing current session marker to force a restart before the next request, got: {after_marker_loss:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_concurrent_same_directory_sessions_do_not_reset_each_other() -> TestResult<()>
 {
     let _guard = common::lock_test_mutex()?;
