@@ -67,6 +67,8 @@ pub struct ClaudeClearBinding {
 struct ClaudeClearBindingInner {
     record_path: PathBuf,
     control_path: PathBuf,
+    binding_session: Mutex<ClaudeSessionBinding>,
+    record_template: InstanceRecordTemplate,
     last_control_seq: Mutex<u64>,
 }
 
@@ -78,13 +80,13 @@ struct InstanceRecordTemplate {
     started_unix_ms: u128,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeSessionBinding {
     identity: ClaudeSessionIdentity,
     session_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaudeSessionIdentity {
     ScopeKey(String),
     EnvFile(PathBuf),
@@ -161,6 +163,14 @@ impl ClaudeClearBinding {
             Backend::R => "r",
             Backend::Python => "python",
         };
+        let record_template = InstanceRecordTemplate {
+            backend: backend_label.to_string(),
+            pid,
+            cwd: env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string()),
+            started_unix_ms,
+        };
         let instance_id = unique_instance_id(&instances_dir, backend_label, pid, started_unix_ms)
             .map_err(WorkerError::Io)?;
         let record_path = instances_dir.join(format!("{instance_id}.json"));
@@ -170,6 +180,8 @@ impl ClaudeClearBinding {
             inner: Arc::new(ClaudeClearBindingInner {
                 record_path,
                 control_path,
+                binding_session: Mutex::new(binding_session.clone()),
+                record_template,
                 last_control_seq: Mutex::new(0),
             }),
         };
@@ -183,19 +195,29 @@ impl ClaudeClearBinding {
         )
         .map_err(WorkerError::Io)?;
         binding
-            .write_record(
-                &binding_session,
-                &InstanceRecordTemplate {
-                    backend: backend_label.to_string(),
-                    pid,
-                    cwd: env::current_dir()
-                        .ok()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    started_unix_ms,
-                },
-            )
+            .write_record(&binding_session, &binding.inner.record_template)
             .map_err(WorkerError::Io)?;
         Ok(Some(binding))
+    }
+
+    pub fn refresh(&self, context: &ClaudeClientContext) -> Result<(), WorkerError> {
+        let Some(binding_session) = current_claude_session_binding(context) else {
+            return Ok(());
+        };
+        let mut current_binding = self
+            .inner
+            .binding_session
+            .lock()
+            .expect("claude binding session mutex poisoned");
+        if *current_binding == binding_session {
+            return Ok(());
+        }
+
+        self.write_record(&binding_session, &self.inner.record_template)
+            .map_err(WorkerError::Io)?;
+        request_restart(&self.inner.control_path).map_err(WorkerError::Io)?;
+        *current_binding = binding_session;
+        Ok(())
     }
 
     pub fn sync(&self, worker: &mut WorkerManager) -> Result<(), WorkerError> {

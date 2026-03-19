@@ -649,7 +649,7 @@ async fn claude_clear_matches_exact_env_file_and_session() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> TestResult<()> {
+async fn claude_clear_rebinds_after_later_session_start() -> TestResult<()> {
     let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
     let env_file = temp.path().join("claude.env");
@@ -696,8 +696,8 @@ async fn claude_clear_ignores_later_session_start_after_server_is_bound() -> Tes
 
     session.cancel().await?;
     assert!(
-        after_session_b_clear.contains("TRUE"),
-        "expected sess-b SessionStart plus clear not to reset sess-a state, got: {after_session_b_clear:?}"
+        after_session_b_clear.contains("FALSE"),
+        "expected a later SessionStart to retarget the binding so sess-b clear resets the session, got: {after_session_b_clear:?}"
     );
     Ok(())
 }
