@@ -865,6 +865,8 @@ fn existing_claude_hook_commands(
         return Err("claude config `mcpServers` must be a JSON object".into());
     };
 
+    let managed_commands =
+        managed_claude_server_commands(mcp_obj, managed_server_names, managed_base_args);
     let mut out = BTreeSet::new();
     for (server_name, server_obj) in mcp_obj {
         let Some(server_obj) = server_obj.as_object() else {
@@ -891,10 +893,9 @@ fn existing_claude_hook_commands(
             .and_then(|env| env.get(CLAUDE_ENV_FILE_ENV))
             .and_then(JsonValue::as_str)
             == Some(env_file.display().to_string().as_str());
-        let looks_like_renamed_managed_server = has_interpreter_config_arg(&existing_args)
-            && claude_hook_base_args_match(&base_args, managed_base_args);
+        let managed_by_command = managed_commands.contains(existing_command);
         if !managed_server_names.contains(server_name)
-            && !looks_like_renamed_managed_server
+            && !managed_by_command
             && !matches_current_env_file
         {
             continue;
@@ -920,6 +921,51 @@ fn existing_claude_hook_commands(
     }
 
     Ok(out.into_iter().collect())
+}
+
+fn managed_claude_server_commands(
+    mcp_obj: &JsonMap<String, JsonValue>,
+    managed_server_names: &BTreeSet<String>,
+    managed_base_args: &[String],
+) -> BTreeSet<String> {
+    let mut managed_commands = BTreeSet::new();
+    let mut compatible_commands = BTreeSet::new();
+
+    for (server_name, server_obj) in mcp_obj {
+        let Some(server_obj) = server_obj.as_object() else {
+            continue;
+        };
+        let Some(existing_command) = server_obj.get("command").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(existing_args) = server_obj
+            .get("args")
+            .and_then(JsonValue::as_array)
+            .and_then(|args| {
+                args.iter()
+                    .map(|value| value.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            continue;
+        };
+        let base_args =
+            strip_install_interpreter_arg(&existing_args).unwrap_or_else(|| existing_args.clone());
+        if managed_server_names.contains(server_name) {
+            managed_commands.insert(existing_command.to_string());
+        }
+        if has_interpreter_config_arg(&existing_args)
+            && claude_hook_base_args_match(&base_args, managed_base_args)
+        {
+            compatible_commands.insert(existing_command.to_string());
+        }
+    }
+
+    if managed_commands.is_empty() && compatible_commands.len() == 1 {
+        managed_commands.extend(compatible_commands);
+    }
+
+    managed_commands
 }
 
 fn claude_hook_base_args_match(

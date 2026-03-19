@@ -353,12 +353,6 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     }
 
     if let Some(env_file_path) = current_claude_env_file_path() {
-        if fs::read_to_string(&env_file_path).is_err() {
-            for control_path in restart_paths {
-                request_restart(Path::new(&control_path))?;
-            }
-            return Ok(());
-        }
         for record in load_instance_records_for_env_file(&env_file_path, session_id)? {
             restart_paths.insert(record.control_path);
         }
@@ -1003,6 +997,65 @@ mod tests {
         assert_eq!(
             request_b.seq, 1,
             "exact env file + session should queue restart"
+        );
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn session_end_hook_queues_restart_for_matching_env_file_even_if_file_is_missing() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-session-end-missing-env-file-");
+        let env_file = temp.path().join("claude-missing.env");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+        }
+        let state_root = claude_clear_state_dir().expect("state root");
+        let instances_dir = state_root.join("instances");
+        let controls_dir = state_root.join("controls");
+        fs::create_dir_all(&instances_dir).expect("create instances dir");
+        fs::create_dir_all(&controls_dir).expect("create controls dir");
+
+        let control = controls_dir.join("r-missing.json");
+        write_control_request(
+            &control,
+            &ControlRequest {
+                seq: 0,
+                op: "restart".to_string(),
+                requested_unix_ms: 1,
+            },
+        )
+        .expect("seed control");
+        write_json_atomic(
+            &instances_dir.join("r-missing.json"),
+            &InstanceRecord {
+                claude_session_id: "sess-missing".to_string(),
+                scope_key: None,
+                env_file_path: Some(env_file.to_string_lossy().to_string()),
+                backend: "r".to_string(),
+                pid: std::process::id(),
+                cwd: None,
+                control_path: control.to_string_lossy().to_string(),
+                started_unix_ms: 1,
+            },
+        )
+        .expect("write record");
+
+        handle_session_end(&HookInput {
+            hook_event_name: Some("SessionEnd".to_string()),
+            session_id: "sess-missing".to_string(),
+            reason: Some("clear".to_string()),
+        })
+        .expect("handle session end");
+
+        let request = read_control_request(&control).expect("read control");
+        assert_eq!(
+            request.seq, 1,
+            "missing env file should not stop matching env-file-bound sessions"
         );
 
         unsafe {
