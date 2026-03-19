@@ -31,7 +31,10 @@ fn installed_claude_hook_command(home: &Path, command: &str, args: &[&str], hook
         .map(posix_escape)
         .collect::<Vec<_>>()
         .join(" ");
-    format!("CLAUDE_ENV_FILE={} {base}", posix_escape(&claude_session_env_file(home)))
+    format!(
+        "CLAUDE_ENV_FILE={} {base}",
+        posix_escape(&claude_session_env_file(home))
+    )
 }
 
 fn all_claude_hook_commands(settings_root: &JsonValue) -> Vec<&str> {

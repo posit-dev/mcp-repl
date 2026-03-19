@@ -910,7 +910,7 @@ fn existing_claude_hook_commands(
             .and_then(JsonValue::as_str)
             == Some(env_file.display().to_string().as_str());
         if !managed_server_names.contains(server_name)
-            && base_args != managed_base_args
+            && !claude_hook_base_args_match(&base_args, managed_base_args)
             && !matches_current_env_file
         {
             continue;
@@ -936,6 +936,15 @@ fn existing_claude_hook_commands(
     }
 
     Ok(out.into_iter().collect())
+}
+
+fn claude_hook_base_args_match(
+    existing_base_args: &[String],
+    managed_base_args: &[String],
+) -> bool {
+    candidate_claude_hook_args(managed_base_args)
+        .iter()
+        .any(|candidate| candidate == existing_base_args)
 }
 
 fn strip_install_interpreter_arg(args: &[String]) -> Option<Vec<String>> {
@@ -1080,7 +1089,12 @@ fn claude_hook_command_for_shell(
     }
 }
 
-fn shell_prefix_env_assignment(name: &str, value: &str, command: &str, shell: HookCommandShell) -> String {
+fn shell_prefix_env_assignment(
+    name: &str,
+    value: &str,
+    command: &str,
+    shell: HookCommandShell,
+) -> String {
     match shell {
         HookCommandShell::Posix => {
             format!("{name}={} {command}", shell_escape(value, shell))
@@ -1829,10 +1843,18 @@ name="demo"
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
         let env_file = claude_session_env_file(dir.path());
-        let expected_session_start =
-            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", Some(&env_file));
-        let expected_session_end =
-            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-end", Some(&env_file));
+        let expected_session_start = claude_hook_command_with_env(
+            "/usr/local/bin/mcp-repl",
+            &[],
+            "session-start",
+            Some(&env_file),
+        );
+        let expected_session_end = claude_hook_command_with_env(
+            "/usr/local/bin/mcp-repl",
+            &[],
+            "session-end",
+            Some(&env_file),
+        );
 
         upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[], &env_file)
             .expect("upsert hooks");
@@ -1845,10 +1867,7 @@ name="demo"
         assert!(
             session_start.iter().any(|entry| {
                 entry["matcher"].as_str() == Some("startup")
-                    && hook_entry_has_command(
-                        entry,
-                        &expected_session_start,
-                    )
+                    && hook_entry_has_command(entry, &expected_session_start)
             }),
             "expected startup SessionStart hook"
         );
@@ -1859,10 +1878,7 @@ name="demo"
             assert!(
                 session_end.iter().any(|entry| {
                     entry["matcher"].as_str() == Some(*matcher)
-                        && hook_entry_has_command(
-                            entry,
-                            &expected_session_end,
-                        )
+                        && hook_entry_has_command(entry, &expected_session_end)
                 }),
                 "expected {matcher} SessionEnd hook"
             );
@@ -1874,8 +1890,12 @@ name="demo"
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
         let env_file = claude_session_env_file(dir.path());
-        let expected_session_start =
-            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", Some(&env_file));
+        let expected_session_start = claude_hook_command_with_env(
+            "/usr/local/bin/mcp-repl",
+            &[],
+            "session-start",
+            Some(&env_file),
+        );
 
         upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[], &env_file)
             .expect("first upsert");
@@ -1891,10 +1911,7 @@ name="demo"
             .iter()
             .filter(|entry| {
                 entry["matcher"].as_str() == Some("startup")
-                    && hook_entry_has_command(
-                        entry,
-                        &expected_session_start,
-                    )
+                    && hook_entry_has_command(entry, &expected_session_start)
             })
             .count();
         assert_eq!(startup_count, 1, "expected one startup hook");
@@ -1905,8 +1922,12 @@ name="demo"
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
         let env_file = claude_session_env_file(dir.path());
-        let expected_session_start =
-            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", Some(&env_file));
+        let expected_session_start = claude_hook_command_with_env(
+            "/usr/local/bin/mcp-repl",
+            &[],
+            "session-start",
+            Some(&env_file),
+        );
 
         let stale = serde_json::json!({
             "SessionStart": [

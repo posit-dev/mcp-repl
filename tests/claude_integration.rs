@@ -6,9 +6,9 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::ErrorKind;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -445,7 +445,10 @@ fn stage_installed_claude_env(mcp_console: &Path) -> TestResult<Option<StagedCla
         ),
         ("env".to_string(), JsonValue::Object(settings_env)),
     ]));
-    fs::write(&settings_path, serde_json::to_string_pretty(&seeded_settings)?)?;
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&seeded_settings)?,
+    )?;
     seed_claude_stats_cache(&claude_dir.join("stats-cache.json"), &workspace)?;
 
     let status = Command::new(mcp_console)
@@ -486,10 +489,7 @@ fn seed_claude_stats_cache(path: &Path, workspace: &Path) -> TestResult<()> {
             "disabledMcpjsonServers".to_string(),
             JsonValue::Array(Vec::new()),
         ),
-        (
-            "hasTrustDialogAccepted".to_string(),
-            JsonValue::Bool(true),
-        ),
+        ("hasTrustDialogAccepted".to_string(), JsonValue::Bool(true)),
         (
             "projectOnboardingSeenCount".to_string(),
             JsonValue::Number(1.into()),
