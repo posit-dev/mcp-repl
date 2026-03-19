@@ -392,7 +392,7 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
 }
 
 #[test]
-fn install_claude_rejects_top_level_hook_entries() -> TestResult<()> {
+fn install_claude_ignores_top_level_hook_entries() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let claude_dir = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
@@ -414,15 +414,26 @@ fn install_claude_rejects_top_level_hook_entries() -> TestResult<()> {
         .env("HOME", temp.path())
         .status()?;
     assert!(
-        !status.success(),
-        "install should fail when settings.json uses unsupported top-level hook keys"
+        status.success(),
+        "install should ignore top-level hook keys instead of failing"
+    );
+
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    assert!(
+        settings_root["SessionStart"].is_array(),
+        "expected top-level SessionStart entries to remain untouched"
+    );
+    assert!(
+        settings_root["hooks"]["SessionStart"].is_array(),
+        "expected canonical hooks.SessionStart entries to be written"
     );
 
     Ok(())
 }
 
 #[test]
-fn install_claude_rejects_duplicate_hook_matchers() -> TestResult<()> {
+fn install_claude_ignores_duplicate_hook_matchers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let claude_dir = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
@@ -432,8 +443,8 @@ fn install_claude_rejects_duplicate_hook_matchers() -> TestResult<()> {
         serde_json::to_string_pretty(&serde_json::json!({
             "hooks": {
                 "SessionStart": [
-                    {"matcher": "startup", "hooks": []},
-                    {"matcher": "startup", "hooks": []}
+                    {"matcher": "startup", "hooks": [{"type": "command", "command": "/opt/old/mcp-repl claude-hook session-start"}]},
+                    {"matcher": "startup", "hooks": [{"type": "command", "command": "echo keep-me"}]}
                 ]
             }
         }))?,
@@ -449,8 +460,39 @@ fn install_claude_rejects_duplicate_hook_matchers() -> TestResult<()> {
         .env("HOME", temp.path())
         .status()?;
     assert!(
-        !status.success(),
-        "install should fail when settings.json has duplicate hook matchers"
+        status.success(),
+        "install should ignore duplicate hook matchers instead of failing"
+    );
+
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let startup_entries: Vec<&JsonValue> = claude_hook_entries(&settings_root, "SessionStart")
+        .iter()
+        .filter(|entry| entry["matcher"].as_str() == Some("startup"))
+        .collect();
+    assert_eq!(
+        startup_entries.len(),
+        2,
+        "expected duplicate startup entries to remain in place"
+    );
+    let all_startup_commands: Vec<&str> = startup_entries
+        .iter()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+    let expected =
+        installed_claude_hook_command(temp.path(), "/usr/local/bin/mcp-repl", &[], "session-start");
+    assert!(
+        all_startup_commands.contains(&expected.as_str()),
+        "expected one startup entry to contain the current managed command"
+    );
+    assert!(
+        all_startup_commands.contains(&"echo keep-me"),
+        "expected unrelated duplicate-entry commands to remain"
+    );
+    assert!(
+        !all_startup_commands.contains(&"/opt/old/mcp-repl claude-hook session-start"),
+        "expected stale managed command to be removed even when duplicate entries remain"
     );
 
     Ok(())

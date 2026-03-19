@@ -641,15 +641,6 @@ fn upsert_claude_settings_hooks(
 fn claude_settings_hooks_root(
     root_obj: &mut JsonMap<String, JsonValue>,
 ) -> Result<&mut JsonMap<String, JsonValue>, Box<dyn std::error::Error>> {
-    for event in ["SessionStart", "SessionEnd"] {
-        if root_obj.contains_key(event) {
-            return Err(format!(
-                "claude settings top-level `{event}` entries are unsupported; use `hooks.{event}`"
-            )
-            .into());
-        }
-    }
-
     let hooks = root_obj
         .entry("hooks".to_string())
         .or_insert_with(|| JsonValue::Object(JsonMap::new()));
@@ -677,23 +668,20 @@ fn upsert_claude_hook_command(
         .enumerate()
         .filter_map(|(idx, entry)| hook_entry_matches(entry, matcher).then_some(idx))
         .collect::<Vec<_>>();
-    if matching_indexes.len() > 1 {
-        let matcher_desc = matcher.unwrap_or("<none>");
-        return Err(format!(
-            "claude settings `hooks.{event}` has duplicate entries for matcher `{matcher_desc}`"
-        )
-        .into());
-    }
 
-    let entry_idx = match matching_indexes.as_slice() {
-        [idx] => *idx,
+    let primary_idx = match matching_indexes.as_slice() {
+        [first, rest @ ..] => {
+            for idx in rest {
+                remove_managed_claude_hook_commands(&mut entries_arr[*idx], hook_subcommand)?;
+            }
+            *first
+        }
         [] => {
             entries_arr.push(new_hook_entry(matcher, command));
             entries_arr.len() - 1
         }
-        _ => unreachable!("duplicate matcher entries are rejected above"),
     };
-    replace_claude_hook_command(&mut entries_arr[entry_idx], command, hook_subcommand)?;
+    replace_claude_hook_command(&mut entries_arr[primary_idx], command, hook_subcommand)?;
     Ok(())
 }
 
@@ -746,6 +734,35 @@ fn replace_claude_hook_command(
     if !command_present {
         hooks_arr.push(new_hook_command(command));
     }
+    Ok(())
+}
+
+fn remove_managed_claude_hook_commands(
+    entry: &mut JsonValue,
+    hook_subcommand: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(obj) = entry.as_object_mut() else {
+        return Err("claude hook entry must be an object".into());
+    };
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(hooks_arr) = hooks.as_array_mut() else {
+        return Err("claude hook entry `hooks` must be an array".into());
+    };
+
+    hooks_arr.retain(|hook| {
+        let Some(hook_obj) = hook.as_object() else {
+            return true;
+        };
+        if hook_obj.get("type").and_then(JsonValue::as_str) != Some("command") {
+            return true;
+        }
+        let Some(existing_command) = hook_obj.get("command").and_then(JsonValue::as_str) else {
+            return true;
+        };
+        !is_managed_claude_hook_command(existing_command, hook_subcommand)
+    });
     Ok(())
 }
 
@@ -1655,7 +1672,7 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_settings_hooks_rejects_top_level_hook_entries() {
+    fn upsert_claude_settings_hooks_ignores_top_level_hook_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
         fs::write(
@@ -1667,17 +1684,22 @@ name="demo"
         )
         .expect("write settings");
 
-        let err = upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
-            .expect_err("top-level hook layout should fail");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("top-level hook layout should be ignored");
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
         assert!(
-            err.to_string()
-                .contains("top-level `SessionStart` entries are unsupported"),
-            "unexpected error: {err}"
+            root["SessionStart"].is_array(),
+            "expected top-level SessionStart entries to remain untouched"
+        );
+        assert!(
+            root["hooks"]["SessionStart"].is_array(),
+            "expected canonical hooks.SessionStart entries to be written"
         );
     }
 
     #[test]
-    fn upsert_claude_settings_hooks_rejects_duplicate_matcher_entries() {
+    fn upsert_claude_settings_hooks_ignores_duplicate_matcher_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
         fs::write(
@@ -1685,8 +1707,8 @@ name="demo"
             serde_json::to_string_pretty(&serde_json::json!({
                 "hooks": {
                     "SessionStart": [
-                        {"matcher": "startup", "hooks": []},
-                        {"matcher": "startup", "hooks": []}
+                        {"matcher": "startup", "hooks": [{"type": "command", "command": "/opt/old/mcp-repl claude-hook session-start"}]},
+                        {"matcher": "startup", "hooks": [{"type": "command", "command": "echo keep-me"}]}
                     ]
                 }
             }))
@@ -1694,12 +1716,37 @@ name="demo"
         )
         .expect("write settings");
 
-        let err = upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
-            .expect_err("duplicate matcher entries should fail");
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("duplicate matcher entries should be ignored");
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let startup_entries: Vec<&JsonValue> = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array")
+            .iter()
+            .filter(|entry| entry["matcher"].as_str() == Some("startup"))
+            .collect();
         assert!(
-            err.to_string()
-                .contains("duplicate entries for matcher `startup`"),
-            "unexpected error: {err}"
+            startup_entries.len() == 2,
+            "expected duplicate startup entries to remain in place"
+        );
+        let commands: Vec<&str> = startup_entries
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        let expected = claude_hook_command("/usr/local/bin/mcp-repl", &[], "session-start");
+        assert!(
+            commands.contains(&expected.as_str()),
+            "expected one startup entry to contain the current managed command"
+        );
+        assert!(
+            commands.contains(&"echo keep-me"),
+            "expected unrelated duplicate-entry commands to remain"
+        );
+        assert!(
+            !commands.contains(&"/opt/old/mcp-repl claude-hook session-start"),
+            "expected stale managed command to be removed even when duplicate entries remain"
         );
     }
 
