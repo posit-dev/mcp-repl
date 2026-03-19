@@ -181,7 +181,16 @@ impl ClaudeClearBinding {
             return Ok(None);
         };
 
-        let state_root = claude_clear_state_dir().map_err(WorkerError::Io)?;
+        let state_root = match claude_clear_state_dir() {
+            Ok(state_root) => state_root,
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    && matches!(binding_session.identity, ClaudeSessionIdentity::EnvFile(_)) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(WorkerError::Io(err)),
+        };
         let instances_dir = state_root.join("instances");
         fs::create_dir_all(&instances_dir)?;
         let instance_id = unique_instance_id(&instances_dir, backend_label, pid, started_unix_ms)
@@ -367,17 +376,20 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     if input.hook_event_name.as_deref() != Some("SessionEnd") {
         return Ok(());
     }
-    if input.reason.as_deref() != Some("clear") {
-        return Ok(());
-    }
+    let should_restart = input.reason.as_deref() == Some("clear");
     prune_stale_claude_state()?;
 
     let mut restart_paths = HashSet::new();
     if let Some(scope_key) = current_claude_scope_key(None) {
         remove_scope_session_state(&scope_key, session_id)?;
-        for record in load_instance_records_for_scope(&scope_key, session_id)? {
-            restart_paths.insert(record.path);
+        if should_restart {
+            for record in load_instance_records_for_scope(&scope_key, session_id)? {
+                restart_paths.insert(record.path);
+            }
         }
+    }
+    if !should_restart {
+        return Ok(());
     }
 
     if let Some(env_file_path) = current_claude_env_file_path() {
@@ -401,6 +413,18 @@ fn current_claude_session_binding(
     record_template: &InstanceRecordTemplate,
     current_binding: Option<(&Path, &ClaudeSessionBinding)>,
 ) -> Result<Option<ClaudeSessionBinding>, WorkerError> {
+    if let Some(env_file_path) = current_claude_env_file_path()
+        && let Some(session_id) = read_session_id_from_env_file(Some(&env_file_path))
+    {
+        let session_id = session_id.trim().to_string();
+        if !session_id.is_empty() {
+            return Ok(Some(ClaudeSessionBinding {
+                identity: ClaudeSessionIdentity::EnvFile(env_file_path),
+                session_id,
+            }));
+        }
+    }
+
     if let Some(scope_key) = current_claude_scope_key(context.scope_pid)
         && let Some(session_id) =
             resolve_scope_session_id(&scope_key, record_template, current_binding)?
@@ -411,20 +435,7 @@ fn current_claude_session_binding(
         }));
     }
 
-    let Some(env_file_path) = current_claude_env_file_path() else {
-        return Ok(None);
-    };
-    let Some(session_id) = read_session_id_from_env_file(Some(&env_file_path)) else {
-        return Ok(None);
-    };
-    let session_id = session_id.trim().to_string();
-    if session_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(ClaudeSessionBinding {
-        identity: ClaudeSessionIdentity::EnvFile(env_file_path),
-        session_id,
-    }))
+    Ok(None)
 }
 
 fn current_claude_env_file_path() -> Option<PathBuf> {
@@ -879,6 +890,13 @@ fn acquire_path_lock(path: &Path) -> io::Result<RecordLockGuard> {
         {
             Ok(_) => return Ok(RecordLockGuard { lock_path }),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if stale_record_lock(&lock_path)? {
+                    match fs::remove_file(&lock_path) {
+                        Ok(()) => continue,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -893,6 +911,19 @@ fn acquire_path_lock(path: &Path) -> io::Result<RecordLockGuard> {
             Err(err) => return Err(err),
         }
     }
+}
+
+fn stale_record_lock(lock_path: &Path) -> io::Result<bool> {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return Ok(false);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+    let Ok(age) = modified.elapsed() else {
+        return Ok(false);
+    };
+    Ok(age > CONTROL_REQUEST_TIMEOUT)
 }
 
 fn record_lock_path(path: &Path) -> PathBuf {
@@ -1363,6 +1394,171 @@ mod tests {
                 env::set_var("XDG_STATE_HOME", xdg_state_home);
             }
         }
+    }
+
+    #[test]
+    fn current_claude_session_binding_prefers_env_file_over_scope_state() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-env-file-over-scope-");
+        let env_file = temp.path().join("claude.env");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+            env::set_var(CLAUDE_TEST_SCOPE_KEY_ENV, "scope-env-file");
+        }
+        fs::write(&env_file, session_export_line("sess-new")).expect("write env file");
+        let scope_key = current_claude_scope_key(None).expect("scope key");
+        write_json_atomic(
+            &claude_session_state_path(&scope_key).expect("scope state path"),
+            &ClaudeSessionState {
+                sessions: vec![
+                    ClaudeScopeSessionState {
+                        session_id: "sess-old".to_string(),
+                        started_unix_ms: 1,
+                    },
+                    ClaudeScopeSessionState {
+                        session_id: "sess-new".to_string(),
+                        started_unix_ms: 2,
+                    },
+                ],
+                session_id: Some("sess-new".to_string()),
+                claude_pid: None,
+                cwd: None,
+                updated_unix_ms: 2,
+            },
+        )
+        .expect("write scope state");
+
+        let binding = current_claude_session_binding(
+            &ClaudeClientContext { scope_pid: None },
+            &InstanceRecordTemplate {
+                backend: "r".to_string(),
+                pid: std::process::id(),
+                cwd: None,
+                started_unix_ms: 1,
+            },
+            None,
+        )
+        .expect("current session binding")
+        .expect("binding");
+
+        assert_eq!(
+            binding,
+            ClaudeSessionBinding {
+                identity: ClaudeSessionIdentity::EnvFile(env_file.clone()),
+                session_id: "sess-new".to_string(),
+            },
+            "expected exact env-file session binding to override stale scope state"
+        );
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+        }
+    }
+
+    #[test]
+    fn maybe_register_env_file_binding_without_state_home_falls_back_to_none() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-register-no-state-home-");
+        let env_file = temp.path().join("claude.env");
+        fs::write(&env_file, session_export_line("sess-env-only")).expect("write env file");
+        let home = env::var_os("HOME");
+        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        unsafe {
+            env::remove_var("HOME");
+            env::remove_var("XDG_STATE_HOME");
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+        }
+
+        let context = detect_client_context().expect("claude context");
+        let binding =
+            ClaudeClearBinding::maybe_register(Backend::R, &context).expect("maybe register");
+        assert!(
+            binding.is_none(),
+            "expected env-file-only startup without HOME/XDG_STATE_HOME to skip Claude clear binding"
+        );
+
+        unsafe {
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+            if let Some(home) = home {
+                env::set_var("HOME", home);
+            }
+            if let Some(xdg_state_home) = xdg_state_home {
+                env::set_var("XDG_STATE_HOME", xdg_state_home);
+            }
+        }
+    }
+
+    #[test]
+    fn session_end_hook_prunes_scope_session_for_non_clear_reason_without_restarting() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-session-end-other-");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_TEST_SCOPE_KEY_ENV, "scope-end-other");
+        }
+        let scope_key = current_claude_scope_key(None).expect("scope key");
+        upsert_scope_session_state(&scope_key, "sess-other").expect("upsert scope session");
+        let state_root = claude_clear_state_dir().expect("state root");
+        let instances_dir = state_root.join("instances");
+        fs::create_dir_all(&instances_dir).expect("create instances dir");
+        let record_path = instances_dir.join("r-other.json");
+        write_json_atomic(
+            &record_path,
+            &InstanceRecord {
+                claude_session_id: "sess-other".to_string(),
+                scope_key: Some(scope_key.clone()),
+                env_file_path: None,
+                backend: "r".to_string(),
+                pid: std::process::id(),
+                cwd: None,
+                started_unix_ms: 1,
+                control_seq: 0,
+            },
+        )
+        .expect("write record");
+
+        handle_session_end(&HookInput {
+            hook_event_name: Some("SessionEnd".to_string()),
+            session_id: "sess-other".to_string(),
+            reason: Some("other".to_string()),
+        })
+        .expect("handle session end");
+
+        let state = read_session_state(&scope_key);
+        assert!(
+            state.as_ref().is_none_or(|state| state.sessions.is_empty()),
+            "expected non-clear SessionEnd to prune the scope session, got: {state:?}"
+        );
+        let record = read_full_instance_record(&record_path).expect("read record");
+        assert_eq!(
+            record.control_seq, 0,
+            "non-clear SessionEnd should not queue a restart"
+        );
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+        }
+    }
+
+    #[test]
+    fn acquire_path_lock_removes_stale_lock_file() {
+        let temp = test_tempdir("claude-stale-lock-");
+        let path = temp.path().join("record.json");
+        let lock_path = record_lock_path(&path);
+        fs::write(&lock_path, "").expect("write stale lock");
+        std::thread::sleep(CONTROL_REQUEST_TIMEOUT + Duration::from_millis(50));
+
+        let _guard = acquire_path_lock(&path).expect("acquire path lock");
+        assert!(
+            lock_path.exists(),
+            "expected lock acquisition to recreate the stale lock file"
+        );
     }
 
     #[test]
