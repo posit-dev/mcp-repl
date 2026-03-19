@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -73,7 +73,6 @@ pub struct ClaudeClearBinding {
 #[derive(Debug)]
 struct ClaudeClearBindingInner {
     record_path: PathBuf,
-    control_path: PathBuf,
     binding_session: Mutex<ClaudeSessionBinding>,
     record_template: InstanceRecordTemplate,
     last_control_seq: Mutex<u64>,
@@ -122,15 +121,14 @@ struct InstanceRecord {
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    control_path: String,
     started_unix_ms: u128,
+    control_seq: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ControlRequest {
-    seq: u64,
-    op: String,
-    requested_unix_ms: u128,
+#[derive(Debug, Clone)]
+struct LoadedInstanceRecord {
+    path: PathBuf,
+    record: InstanceRecord,
 }
 
 impl ClaudeClearBinding {
@@ -160,9 +158,7 @@ impl ClaudeClearBinding {
 
         let state_root = claude_clear_state_dir().map_err(WorkerError::Io)?;
         let instances_dir = state_root.join("instances");
-        let controls_dir = state_root.join("controls");
         fs::create_dir_all(&instances_dir)?;
-        fs::create_dir_all(&controls_dir)?;
 
         let pid = std::process::id();
         let started_unix_ms = unix_ms_now();
@@ -181,28 +177,21 @@ impl ClaudeClearBinding {
         let instance_id = unique_instance_id(&instances_dir, backend_label, pid, started_unix_ms)
             .map_err(WorkerError::Io)?;
         let record_path = instances_dir.join(format!("{instance_id}.json"));
-        let control_path = controls_dir.join(format!("{instance_id}.json"));
 
         let binding = Self {
             inner: Arc::new(ClaudeClearBindingInner {
                 record_path,
-                control_path,
                 binding_session: Mutex::new(binding_session.clone()),
                 record_template,
                 last_control_seq: Mutex::new(0),
             }),
         };
-        write_control_request(
-            &binding.inner.control_path,
-            &ControlRequest {
-                seq: initial_control_seq,
-                op: "restart".to_string(),
-                requested_unix_ms: started_unix_ms,
-            },
-        )
-        .map_err(WorkerError::Io)?;
         binding
-            .write_record(&binding_session, &binding.inner.record_template)
+            .write_initial_record(
+                &binding_session,
+                &binding.inner.record_template,
+                initial_control_seq,
+            )
             .map_err(WorkerError::Io)?;
         Ok(Some(binding))
     }
@@ -223,16 +212,15 @@ impl ClaudeClearBinding {
             return Ok(ClaudeBindingRefresh::Unchanged);
         }
 
-        self.write_record(&binding_session, &self.inner.record_template)
+        self.rebind_and_request_restart(&binding_session, &self.inner.record_template)
             .map_err(WorkerError::Io)?;
-        request_restart(&self.inner.control_path).map_err(WorkerError::Io)?;
         *current_binding = binding_session;
         Ok(ClaudeBindingRefresh::Rebound)
     }
 
     pub fn sync(&self, worker: &mut WorkerManager) -> Result<(), WorkerError> {
-        let next_seq = read_control_request(&self.inner.control_path)
-            .map(|request| request.seq)
+        let next_seq = read_full_instance_record(&self.inner.record_path)
+            .map(|record| record.control_seq)
             .unwrap_or(0);
         let should_restart = {
             let last_seq = self
@@ -262,24 +250,33 @@ impl ClaudeClearBinding {
         &self,
         binding_session: &ClaudeSessionBinding,
         template: &InstanceRecordTemplate,
+        control_seq: u64,
     ) -> io::Result<()> {
-        let (scope_key, env_file_path) = match &binding_session.identity {
-            ClaudeSessionIdentity::ScopeKey(scope_key) => (Some(scope_key.clone()), None),
-            ClaudeSessionIdentity::EnvFile(path) => {
-                (None, Some(path.to_string_lossy().to_string()))
-            }
-        };
-        let record = InstanceRecord {
-            claude_session_id: binding_session.session_id.clone(),
-            scope_key,
-            env_file_path,
-            backend: template.backend.clone(),
-            pid: template.pid,
-            cwd: template.cwd.clone(),
-            control_path: self.inner.control_path.to_string_lossy().to_string(),
-            started_unix_ms: template.started_unix_ms,
-        };
-        write_json_atomic(&self.inner.record_path, &record)
+        write_json_atomic(
+            &self.inner.record_path,
+            &instance_record(binding_session, template, control_seq),
+        )
+    }
+
+    fn write_initial_record(
+        &self,
+        binding_session: &ClaudeSessionBinding,
+        template: &InstanceRecordTemplate,
+        control_seq: u64,
+    ) -> io::Result<()> {
+        self.write_record(binding_session, template, control_seq)
+    }
+
+    fn rebind_and_request_restart(
+        &self,
+        binding_session: &ClaudeSessionBinding,
+        template: &InstanceRecordTemplate,
+    ) -> io::Result<()> {
+        update_instance_record(&self.inner.record_path, |record| {
+            let next_control_seq = record.control_seq.saturating_add(1);
+            *record = instance_record(binding_session, template, next_control_seq);
+            Ok(())
+        })
     }
 }
 
@@ -299,7 +296,6 @@ pub fn prune_stale_state() -> io::Result<()> {
 impl Drop for ClaudeClearBindingInner {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.record_path);
-        let _ = fs::remove_file(&self.control_path);
     }
 }
 
@@ -348,18 +344,18 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     let mut restart_paths = HashSet::new();
     if let Some(scope_key) = current_claude_scope_key(None) {
         for record in load_instance_records_for_scope(&scope_key, session_id)? {
-            restart_paths.insert(record.control_path);
+            restart_paths.insert(record.path);
         }
     }
 
     if let Some(env_file_path) = current_claude_env_file_path() {
         for record in load_instance_records_for_env_file(&env_file_path, session_id)? {
-            restart_paths.insert(record.control_path);
+            restart_paths.insert(record.path);
         }
     }
 
-    for control_path in restart_paths {
-        request_restart(Path::new(&control_path))?;
+    for record_path in restart_paths {
+        request_restart(&record_path)?;
     }
     Ok(())
 }
@@ -525,26 +521,13 @@ fn append_session_id_export(path: &Path, session_id: &str) -> io::Result<()> {
 }
 
 fn request_restart(path: &Path) -> io::Result<()> {
-    let next_seq = read_control_request(path)
-        .map(|request| request.seq.saturating_add(1))
-        .unwrap_or(1);
-    write_control_request(
-        path,
-        &ControlRequest {
-            seq: next_seq,
-            op: "restart".to_string(),
-            requested_unix_ms: unix_ms_now(),
-        },
-    )
-}
-
-fn read_control_request(path: &Path) -> Option<ControlRequest> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn write_control_request(path: &Path, request: &ControlRequest) -> io::Result<()> {
-    write_json_atomic(path, request)
+    match update_instance_record(path, |record| {
+        record.control_seq = record.control_seq.saturating_add(1);
+        Ok(())
+    }) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
@@ -557,10 +540,11 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
 fn load_instance_records_for_scope(
     scope_key: &str,
     session_id: &str,
-) -> io::Result<Vec<InstanceRecord>> {
+) -> io::Result<Vec<LoadedInstanceRecord>> {
     let mut out = Vec::new();
     for record in load_instance_records()? {
-        if record.claude_session_id == session_id && record.scope_key.as_deref() == Some(scope_key)
+        if record.record.claude_session_id == session_id
+            && record.record.scope_key.as_deref() == Some(scope_key)
         {
             out.push(record);
         }
@@ -571,12 +555,12 @@ fn load_instance_records_for_scope(
 fn load_instance_records_for_env_file(
     env_file_path: &Path,
     session_id: &str,
-) -> io::Result<Vec<InstanceRecord>> {
+) -> io::Result<Vec<LoadedInstanceRecord>> {
     let env_file_path = env_file_path.to_string_lossy().to_string();
     let mut out = Vec::new();
     for record in load_instance_records()? {
-        if record.claude_session_id == session_id
-            && record.env_file_path.as_deref() == Some(env_file_path.as_str())
+        if record.record.claude_session_id == session_id
+            && record.record.env_file_path.as_deref() == Some(env_file_path.as_str())
         {
             out.push(record);
         }
@@ -584,7 +568,7 @@ fn load_instance_records_for_env_file(
     Ok(out)
 }
 
-fn load_instance_records() -> io::Result<Vec<InstanceRecord>> {
+fn load_instance_records() -> io::Result<Vec<LoadedInstanceRecord>> {
     let mut out = Vec::new();
     let instances_dir = claude_clear_state_dir()?.join("instances");
     if !instances_dir.is_dir() {
@@ -602,7 +586,7 @@ fn load_instance_records() -> io::Result<Vec<InstanceRecord>> {
         let Ok(record) = serde_json::from_str::<InstanceRecord>(&raw) else {
             continue;
         };
-        out.push(record);
+        out.push(LoadedInstanceRecord { path, record });
     }
     Ok(out)
 }
@@ -662,9 +646,94 @@ fn prune_stale_claude_instance_records(live_pids: &HashSet<u32>) -> io::Result<(
             continue;
         }
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(PathBuf::from(record.control_path));
     }
     Ok(())
+}
+
+fn instance_record(
+    binding_session: &ClaudeSessionBinding,
+    template: &InstanceRecordTemplate,
+    control_seq: u64,
+) -> InstanceRecord {
+    let (scope_key, env_file_path) = match &binding_session.identity {
+        ClaudeSessionIdentity::ScopeKey(scope_key) => (Some(scope_key.clone()), None),
+        ClaudeSessionIdentity::EnvFile(path) => (None, Some(path.to_string_lossy().to_string())),
+    };
+    InstanceRecord {
+        claude_session_id: binding_session.session_id.clone(),
+        scope_key,
+        env_file_path,
+        backend: template.backend.clone(),
+        pid: template.pid,
+        cwd: template.cwd.clone(),
+        started_unix_ms: template.started_unix_ms,
+        control_seq,
+    }
+}
+
+fn read_full_instance_record(path: &Path) -> Option<InstanceRecord> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn update_instance_record(
+    path: &Path,
+    mut update: impl FnMut(&mut InstanceRecord) -> io::Result<()>,
+) -> io::Result<()> {
+    let _guard = acquire_record_lock(path)?;
+    let Some(mut record) = read_full_instance_record(path) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("instance record missing: {}", path.display()),
+        ));
+    };
+    update(&mut record)?;
+    write_json_atomic(path, &record)
+}
+
+fn acquire_record_lock(path: &Path) -> io::Result<RecordLockGuard> {
+    let lock_path = record_lock_path(path);
+    let deadline = Instant::now() + CONTROL_REQUEST_TIMEOUT;
+    loop {
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(RecordLockGuard { lock_path }),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out acquiring instance record lock: {}",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn record_lock_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("instance");
+    path.with_file_name(format!(".{stem}.lock"))
+}
+
+struct RecordLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for RecordLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
 }
 
 fn live_process_ids() -> HashSet<u32> {
@@ -927,33 +996,13 @@ mod tests {
         }
         let state_root = claude_clear_state_dir().expect("state root");
         let instances_dir = state_root.join("instances");
-        let controls_dir = state_root.join("controls");
         fs::create_dir_all(&instances_dir).expect("create instances dir");
-        fs::create_dir_all(&controls_dir).expect("create controls dir");
         let live_pid = std::process::id();
 
-        let control_a = controls_dir.join("r-a.json");
-        let control_b = controls_dir.join("r-b.json");
-        write_control_request(
-            &control_a,
-            &ControlRequest {
-                seq: 0,
-                op: "restart".to_string(),
-                requested_unix_ms: 1,
-            },
-        )
-        .expect("seed control a");
-        write_control_request(
-            &control_b,
-            &ControlRequest {
-                seq: 0,
-                op: "restart".to_string(),
-                requested_unix_ms: 1,
-            },
-        )
-        .expect("seed control b");
+        let record_a_path = instances_dir.join("r-a.json");
+        let record_b_path = instances_dir.join("r-b.json");
         write_json_atomic(
-            &instances_dir.join("r-a.json"),
+            &record_a_path,
             &InstanceRecord {
                 claude_session_id: "sess-shared".to_string(),
                 scope_key: None,
@@ -961,13 +1010,13 @@ mod tests {
                 backend: "r".to_string(),
                 pid: live_pid,
                 cwd: None,
-                control_path: control_a.to_string_lossy().to_string(),
                 started_unix_ms: 1,
+                control_seq: 0,
             },
         )
         .expect("write record a");
         write_json_atomic(
-            &instances_dir.join("r-b.json"),
+            &record_b_path,
             &InstanceRecord {
                 claude_session_id: "sess-shared".to_string(),
                 scope_key: None,
@@ -975,8 +1024,8 @@ mod tests {
                 backend: "r".to_string(),
                 pid: live_pid,
                 cwd: None,
-                control_path: control_b.to_string_lossy().to_string(),
                 started_unix_ms: 1,
+                control_seq: 0,
             },
         )
         .expect("write record b");
@@ -988,14 +1037,14 @@ mod tests {
         })
         .expect("handle session end");
 
-        let request_a = read_control_request(&control_a).expect("read control a");
-        let request_b = read_control_request(&control_b).expect("read control b");
+        let request_a = read_full_instance_record(&record_a_path).expect("read record a");
+        let request_b = read_full_instance_record(&record_b_path).expect("read record b");
         assert_eq!(
-            request_a.seq, 0,
+            request_a.control_seq, 0,
             "env file mismatch should not queue restart"
         );
         assert_eq!(
-            request_b.seq, 1,
+            request_b.control_seq, 1,
             "exact env file + session should queue restart"
         );
 
@@ -1016,22 +1065,11 @@ mod tests {
         }
         let state_root = claude_clear_state_dir().expect("state root");
         let instances_dir = state_root.join("instances");
-        let controls_dir = state_root.join("controls");
         fs::create_dir_all(&instances_dir).expect("create instances dir");
-        fs::create_dir_all(&controls_dir).expect("create controls dir");
 
-        let control = controls_dir.join("r-missing.json");
-        write_control_request(
-            &control,
-            &ControlRequest {
-                seq: 0,
-                op: "restart".to_string(),
-                requested_unix_ms: 1,
-            },
-        )
-        .expect("seed control");
+        let record_path = instances_dir.join("r-missing.json");
         write_json_atomic(
-            &instances_dir.join("r-missing.json"),
+            &record_path,
             &InstanceRecord {
                 claude_session_id: "sess-missing".to_string(),
                 scope_key: None,
@@ -1039,8 +1077,8 @@ mod tests {
                 backend: "r".to_string(),
                 pid: std::process::id(),
                 cwd: None,
-                control_path: control.to_string_lossy().to_string(),
                 started_unix_ms: 1,
+                control_seq: 0,
             },
         )
         .expect("write record");
@@ -1052,9 +1090,9 @@ mod tests {
         })
         .expect("handle session end");
 
-        let request = read_control_request(&control).expect("read control");
+        let request = read_full_instance_record(&record_path).expect("read record");
         assert_eq!(
-            request.seq, 1,
+            request.control_seq, 1,
             "missing env file should not stop matching env-file-bound sessions"
         );
 
@@ -1135,8 +1173,8 @@ mod tests {
   "backend": "r",
   "pid": 1,
   "cwd": null,
-  "control_path": "/tmp/control.json",
   "started_unix_ms": 1,
+  "control_seq": 0,
   "previous_claude_session_id": "sess-old"
 }"#,
         )
@@ -1172,7 +1210,7 @@ mod tests {
         let binding = ClaudeClearBinding::maybe_register(Backend::Python)
             .expect("maybe register")
             .expect("expected claude binding");
-        request_restart(&binding.inner.control_path).expect("queue restart request");
+        request_restart(&binding.inner.record_path).expect("queue restart request");
 
         let inherit_plan = SandboxCliPlan {
             operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
@@ -1267,25 +1305,35 @@ mod tests {
         let path = temp.path().join("state.json");
         write_json_atomic(
             &path,
-            &ControlRequest {
-                seq: 0,
-                op: "restart".to_string(),
-                requested_unix_ms: 1,
+            &InstanceRecord {
+                claude_session_id: "sess-a".to_string(),
+                scope_key: None,
+                env_file_path: Some("/tmp/env".to_string()),
+                backend: "r".to_string(),
+                pid: 1,
+                cwd: None,
+                started_unix_ms: 1,
+                control_seq: 0,
             },
         )
         .expect("write initial state");
         write_json_atomic(
             &path,
-            &ControlRequest {
-                seq: 1,
-                op: "restart".to_string(),
-                requested_unix_ms: 2,
+            &InstanceRecord {
+                claude_session_id: "sess-b".to_string(),
+                scope_key: Some("scope".to_string()),
+                env_file_path: None,
+                backend: "python".to_string(),
+                pid: 2,
+                cwd: Some("/tmp".to_string()),
+                started_unix_ms: 2,
+                control_seq: 1,
             },
         )
         .expect("replace existing state");
 
-        let request = read_control_request(&path).expect("read control request");
-        assert_eq!(request.seq, 1);
-        assert_eq!(request.requested_unix_ms, 2);
+        let record = read_full_instance_record(&path).expect("read instance record");
+        assert_eq!(record.control_seq, 1);
+        assert_eq!(record.started_unix_ms, 2);
     }
 }
