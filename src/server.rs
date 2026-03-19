@@ -51,11 +51,19 @@ struct SharedServer {
 
 impl SharedServer {
     fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+        let claude_client_context = crate::claude::detect_client_context();
+        let claude_clear_binding = Arc::new(Mutex::new(None));
+        if let Some(context) = claude_client_context.as_ref() {
+            *claude_clear_binding
+                .lock()
+                .expect("claude clear binding mutex poisoned") =
+                ClaudeClearBinding::maybe_register(backend, context)?;
+        }
         Ok(Self {
             backend,
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
-            claude_client_context: crate::claude::detect_client_context(),
-            claude_clear_binding: Arc::new(Mutex::new(None)),
+            claude_client_context,
+            claude_clear_binding,
             claude_prune_started: Arc::new(AtomicBool::new(false)),
         })
     }

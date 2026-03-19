@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use base64::Engine as _;
@@ -902,6 +904,101 @@ async fn claude_clear_scope_binding_works_without_claude_env_file() -> TestResul
     assert!(
         after_clear.contains("FALSE"),
         "expected scope-based clear to reset state without CLAUDE_ENV_FILE, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let env_vars_a = claude_scope_env_vars(temp.path(), "scope-concurrent");
+    let env_vars_b = claude_scope_env_vars(temp.path(), "scope-concurrent");
+
+    run_session_start_with_env(&exe, &env_vars_a, "sess-a")?;
+    run_session_start_with_env(&exe, &env_vars_b, "sess-b")?;
+
+    let mut session_a = common::spawn_server_with_env_vars(env_vars_a.clone()).await?;
+    let mut session_b = common::spawn_server_with_env_vars(env_vars_b.clone()).await?;
+
+    let a_ready = match repl_text(
+        &mut session_a,
+        "scope_a_state <- 1; print(exists(\"scope_a_state\"))",
+        "before scope-only clear on session A",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session_a.cancel().await?;
+            session_b.cancel().await?;
+            return Ok(());
+        }
+    };
+    let b_ready = match repl_text(
+        &mut session_b,
+        "scope_b_state <- 1; print(exists(\"scope_b_state\"))",
+        "before scope-only clear on session B",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session_a.cancel().await?;
+            session_b.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        a_ready.contains("TRUE"),
+        "expected scope-only session A state before clear, got: {a_ready:?}"
+    );
+    assert!(
+        b_ready.contains("TRUE"),
+        "expected scope-only session B state before clear, got: {b_ready:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars_a, "sess-a")?;
+
+    let a_after_clear = match repl_text(
+        &mut session_a,
+        "print(exists(\"scope_a_state\"))",
+        "after scope-only clear on session A",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session_a.cancel().await?;
+            session_b.cancel().await?;
+            return Ok(());
+        }
+    };
+    let b_after_a_clear = match repl_text(
+        &mut session_b,
+        "print(exists(\"scope_b_state\"))",
+        "after scope-only clear on session B",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session_a.cancel().await?;
+            session_b.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+    assert!(
+        a_after_clear.contains("FALSE"),
+        "expected scope-only clear for session A to reset A, got: {a_after_clear:?}"
+    );
+    assert!(
+        b_after_a_clear.contains("TRUE"),
+        "expected scope-only clear for session A not to reset concurrent session B, got: {b_after_a_clear:?}"
     );
     Ok(())
 }

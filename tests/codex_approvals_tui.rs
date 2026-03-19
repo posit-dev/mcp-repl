@@ -457,7 +457,7 @@ mod unix_impl {
                 end += 1;
             }
             if end > abs + marker.len() && text[end..].starts_with("ms") {
-                out.push_str("N");
+                out.push('N');
                 idx = end;
             } else {
                 idx = abs + marker.len();
