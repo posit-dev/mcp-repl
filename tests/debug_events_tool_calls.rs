@@ -8,9 +8,9 @@ use serde_json::Value;
 #[tokio::test]
 async fn debug_events_include_tool_call_arguments_and_results() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
-    let debug_dir = temp.path().join("events");
+    let debug_dir = temp.path().join("debug");
     let mut session = spawn_server_with_env_vars(vec![(
-        "MCP_REPL_DEBUG_EVENTS_DIR".to_string(),
+        "MCP_REPL_DEBUG_DIR".to_string(),
         debug_dir.to_string_lossy().to_string(),
     )])
     .await?;
@@ -21,14 +21,16 @@ async fn debug_events_include_tool_call_arguments_and_results() -> TestResult<()
         .await?;
     session.cancel().await?;
 
-    let mut files = fs::read_dir(&debug_dir)?
+    let mut sessions = fs::read_dir(&debug_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
-    files.sort();
-    let log_path = files
+    sessions.sort();
+    let session_dir = sessions
         .last()
         .cloned()
-        .ok_or("missing debug event log file")?;
+        .ok_or("missing debug session directory")?;
+    let log_path = session_dir.join("events.jsonl");
     let log_text = fs::read_to_string(log_path)?;
 
     let events = log_text

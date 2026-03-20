@@ -144,17 +144,20 @@ to limit which interpreters are installed.
 
 Optional: enable rich JSONL debug logs for each `mcp-repl` startup:
 
-- CLI arg: `--debug-events-dir /path/to/log-dir`
-- Environment: `MCP_REPL_DEBUG_EVENTS_DIR=/path/to/log-dir`
+- CLI arg: `--debug-dir /path/to/debug-root`
+- Environment: `MCP_REPL_DEBUG_DIR=/path/to/debug-root`
 
-When enabled, each startup writes a new `mcp-repl-*.jsonl` file containing startup
-metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state updates.
+When enabled, each startup writes a new session directory under that root containing
+`events.jsonl`, startup logs, and sandbox-state logs.
+
+See [docs/debugging.md](docs/debugging.md) for the full debugging guide, including
+startup logs, sandbox-state tracing, and the external wire-trace proxy.
 
 ### 3) Pick interpreter (optional)
 
 - Default interpreter: R
 - CLI: `mcp-repl --interpreter r|python`
-- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
+- Environment: `MCP_REPL_INTERPRETER=r|python`
 
 ## Runtime discovery
 
@@ -162,9 +165,7 @@ metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state upda
 
 `mcp-repl` chooses interpreter in this order:
 - `--interpreter <r|python>` (if provided)
-- compatibility CLI alias: `--backend <r|python>`
 - `MCP_REPL_INTERPRETER`
-- compatibility env alias: `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R interpreter: which R installation is used
@@ -225,6 +226,7 @@ Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_reset_tool.md`
 
 Additional references:
+- Debugging and tracing: `docs/debugging.md`
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 

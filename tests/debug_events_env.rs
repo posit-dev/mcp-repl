@@ -17,14 +17,11 @@ mod unix {
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
             return Ok(PathBuf::from(path));
         }
-        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-            return Ok(PathBuf::from(path));
-        }
 
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        for candidate in ["mcp-repl", "mcp-console"] {
+        for candidate in ["mcp-repl"] {
             let mut candidate_path = path.clone();
             candidate_path.push(candidate);
             if candidate_path.exists() {
@@ -44,9 +41,9 @@ mod unix {
         let output = time::timeout(
             Duration::from_secs(15),
             Command::new(exe)
-                .arg("--debug-events-dir")
+                .arg("--debug-dir")
                 .arg(&debug_dir)
-                .arg("--backend")
+                .arg("--interpreter")
                 .arg("python")
                 .env("MCP_REPL_UNRELATED_NON_UTF8", invalid_utf8)
                 .stdin(Stdio::null())
@@ -81,9 +78,9 @@ mod unix {
         let output = time::timeout(
             Duration::from_secs(15),
             Command::new(exe)
-                .arg("--debug-events-dir")
+                .arg("--debug-dir")
                 .arg(&debug_dir)
-                .arg("--backend")
+                .arg("--interpreter")
                 .arg("python")
                 .arg(invalid_arg)
                 .stdin(Stdio::null())

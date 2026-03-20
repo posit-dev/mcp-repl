@@ -1,4 +1,3 @@
-pub const BACKEND_ENV: &str = "MCP_REPL_BACKEND";
 pub const INTERPRETER_ENV: &str = "MCP_REPL_INTERPRETER";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,17 +19,14 @@ impl Backend {
 }
 
 pub fn backend_from_env() -> Result<Option<Backend>, String> {
-    for env_name in [INTERPRETER_ENV, BACKEND_ENV] {
-        let Ok(value) = std::env::var(env_name) else {
-            continue;
-        };
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Backend::parse(trimmed).map(Some);
+    let Ok(value) = std::env::var(INTERPRETER_ENV) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
-    Ok(None)
+    Backend::parse(trimmed).map(Some)
 }
 
 #[cfg(test)]
@@ -45,7 +41,6 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::remove_var(INTERPRETER_ENV);
-            std::env::remove_var(BACKEND_ENV);
             std::env::set_var(INTERPRETER_ENV, "python");
         }
         let parsed = backend_from_env().expect("parse env var");
@@ -56,34 +51,16 @@ mod tests {
     }
 
     #[test]
-    fn backend_from_env_falls_back_to_backend_env_var() {
+    fn backend_from_env_ignores_empty_interpreter_env_var() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::remove_var(INTERPRETER_ENV);
-            std::env::remove_var(BACKEND_ENV);
-            std::env::set_var(BACKEND_ENV, "python");
+            std::env::set_var(INTERPRETER_ENV, "   ");
         }
         let parsed = backend_from_env().expect("parse env var");
-        assert_eq!(parsed, Some(Backend::Python));
-        unsafe {
-            std::env::remove_var(BACKEND_ENV);
-        }
-    }
-
-    #[test]
-    fn backend_from_env_prefers_interpreter_env_var_when_both_are_set() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        assert_eq!(parsed, None);
         unsafe {
             std::env::remove_var(INTERPRETER_ENV);
-            std::env::remove_var(BACKEND_ENV);
-            std::env::set_var(INTERPRETER_ENV, "python");
-            std::env::set_var(BACKEND_ENV, "r");
-        }
-        let parsed = backend_from_env().expect("parse env var");
-        assert_eq!(parsed, Some(Backend::Python));
-        unsafe {
-            std::env::remove_var(INTERPRETER_ENV);
-            std::env::remove_var(BACKEND_ENV);
         }
     }
 }

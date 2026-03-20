@@ -305,8 +305,8 @@ fn python_plotting_available() -> bool {
 }
 
 fn python_plot_tests_enabled() -> bool {
-    if std::env::var_os("MCP_CONSOLE_PYTHON_PLOT_TESTS").is_none() {
-        eprintln!("python plot tests disabled; set MCP_CONSOLE_PYTHON_PLOT_TESTS=1 to enable");
+    if std::env::var_os("MCP_REPL_PYTHON_PLOT_TESTS").is_none() {
+        eprintln!("python plot tests disabled; set MCP_REPL_PYTHON_PLOT_TESTS=1 to enable");
         return false;
     }
     python_plotting_available()
@@ -317,7 +317,7 @@ async fn spawn_python_server_with_pager_page_chars(
 ) -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args_env_and_pager_page_chars(
         vec![
-            "--backend".to_string(),
+            "--interpreter".to_string(),
             "python".to_string(),
             "--sandbox".to_string(),
             "danger-full-access".to_string(),

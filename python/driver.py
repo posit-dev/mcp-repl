@@ -13,10 +13,10 @@ import threading
 
 os.environ.setdefault("MPLBACKEND", "agg")
 
-_read_fd_value = os.environ.get("MCP_CONSOLE_IPC_READ_FD")
-_write_fd_value = os.environ.get("MCP_CONSOLE_IPC_WRITE_FD")
+_read_fd_value = os.environ.get("MCP_REPL_IPC_READ_FD")
+_write_fd_value = os.environ.get("MCP_REPL_IPC_WRITE_FD")
 if not _read_fd_value or not _write_fd_value:
-    raise SystemExit("MCP_CONSOLE_IPC_READ_FD or MCP_CONSOLE_IPC_WRITE_FD missing")
+    raise SystemExit("MCP_REPL_IPC_READ_FD or MCP_REPL_IPC_WRITE_FD missing")
 
 _ipc_read = os.fdopen(int(_read_fd_value), "r", buffering=1)
 _ipc_write = os.fdopen(int(_write_fd_value), "w", buffering=1)

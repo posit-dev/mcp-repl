@@ -29,7 +29,7 @@ mod unix_impl {
         _temp_dir: tempfile::TempDir,
         workspace: PathBuf,
         codex_home: PathBuf,
-        sandbox_log: PathBuf,
+        debug_dir: PathBuf,
     }
 
     #[derive(Clone, Copy)]
@@ -61,8 +61,8 @@ mod unix_impl {
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console, &mock_server.base_url())?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
 
         let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
         let mode_flag = match mode {
@@ -78,10 +78,7 @@ mod unix_impl {
         let mut cmd = std::process::Command::new("sh");
         cmd.env("CODEX_HOME", env.codex_home.display().to_string());
         cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
-        cmd.env(
-            "MCP_CONSOLE_SANDBOX_STATE_LOG",
-            env.sandbox_log.display().to_string(),
-        );
+        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
         cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "C");
         cmd.arg("-c");
@@ -103,7 +100,7 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
         let outputs = mock_server.function_call_outputs().await;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"))
             || stdout.contains("WRITE_OK")
@@ -145,19 +142,19 @@ mod unix_impl {
         let mock_server =
             MockResponsesServer::start(tool_name(), workspace_args, Some(full_access_probe_args))
                 .await?;
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console, &mock_server.base_url())?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
 
         let mut driver = CodexPtyDriver::spawn(
             &env.codex_home,
             &env.workspace,
             &mock_server.base_url(),
-            &env.sandbox_log,
+            &env.debug_dir,
         )?;
         driver.drain(Duration::from_millis(800));
         driver.ensure_running("after startup")?;
         driver.wait_for_warmup(Duration::from_secs(10))?;
-        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
@@ -174,12 +171,12 @@ mod unix_impl {
         )?;
 
         wait_for_log_contains(
-            &env.sandbox_log,
+            &env.debug_dir,
             "danger-full-access",
             Duration::from_secs(20),
         )?;
         wait_for_log_contains(
-            &env.sandbox_log,
+            &env.debug_dir,
             "codex/sandbox-state/update",
             Duration::from_secs(20),
         )?;
@@ -255,7 +252,7 @@ mod unix_impl {
     }
 
     fn create_isolated_codex_env(
-        mcp_console: &Path,
+        mcp_repl: &Path,
         openai_base_url: &str,
     ) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
@@ -275,18 +272,17 @@ mod unix_impl {
         let codex_home = temp_dir.path().join("codex-home");
         std::fs::create_dir_all(codex_home.join("shell_snapshots"))?;
 
-        let sandbox_log_dir = temp_dir.path().join("sandbox-log");
-        std::fs::create_dir_all(&sandbox_log_dir)?;
-        let sandbox_log = sandbox_log_dir.join("sandbox-state.log");
+        let debug_dir = temp_dir.path().join("debug");
+        std::fs::create_dir_all(&debug_dir)?;
 
-        let config = codex_config(mcp_console, &workspace, openai_base_url);
+        let config = codex_config(mcp_repl, &workspace, openai_base_url);
         std::fs::write(codex_home.join("config.toml"), config)?;
 
         Ok(IsolatedCodexEnv {
             _temp_dir: temp_dir,
             workspace,
             codex_home,
-            sandbox_log,
+            debug_dir,
         })
     }
 
@@ -432,6 +428,7 @@ mod unix_impl {
         }
 
         let mut text = normalize_temp_paths(&normalize_codex_home_path(&text));
+        text = normalize_loopback_websocket_url(&text);
         text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
@@ -449,10 +446,12 @@ mod unix_impl {
         if text.chars().all(|ch| ch.is_ascii_digit() || ch == ',') {
             text = "<N>".to_string();
         }
-        if let Some(rest) = text.strip_prefix("202")
-            && rest.contains(" WARN ")
-        {
-            text = format!("<TIMESTAMP>{}", &text[text.find(" WARN ").unwrap_or(0)..]);
+        if text.starts_with("202") {
+            if let Some(pos) = text.find(" WARN ") {
+                text = format!("<TIMESTAMP>{}", &text[pos..]);
+            } else if let Some(pos) = text.find(" ERROR ") {
+                text = format!("<TIMESTAMP>{}", &text[pos..]);
+            }
         }
         text
     }
@@ -508,6 +507,29 @@ mod unix_impl {
                 idx = end;
             } else {
                 idx = abs + marker.len();
+            }
+        }
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    fn normalize_loopback_websocket_url(text: &str) -> String {
+        let marker = "ws://127.0.0.1:";
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+        while let Some(pos) = text[idx..].find(marker) {
+            let start = idx + pos;
+            out.push_str(&text[idx..start]);
+            let mut end = start + marker.len();
+            while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start + marker.len() && text[end..].starts_with("/v1/responses") {
+                out.push_str("<WS_URL>");
+                idx = end + "/v1/responses".len();
+            } else {
+                out.push_str(marker);
+                idx = start + marker.len();
             }
         }
         out.push_str(&text[idx..]);
@@ -570,18 +592,15 @@ mod unix_impl {
         out
     }
 
-    fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+    fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-            return Ok(PathBuf::from(path));
-        }
-        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
             return Ok(PathBuf::from(path));
         }
 
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        for candidate in ["mcp-repl", "mcp-console"] {
+        for candidate in ["mcp-repl"] {
             let mut candidate_path = path.clone();
             candidate_path.push(candidate);
             if cfg!(windows) {
@@ -598,8 +617,26 @@ mod unix_impl {
         "mcp__r__repl".to_string()
     }
 
-    fn codex_config(mcp_console: &Path, repo_root: &Path, openai_base_url: &str) -> String {
-        let mcp_console = toml_escape(&mcp_console.display().to_string());
+    #[test]
+    fn normalize_exec_text_drops_timestamped_websocket_error_lines() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let input = "2026-03-20T20:26:18.707303Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: ws://127.0.0.1:64598/v1/responses";
+        let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(normalized, "");
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_reconnect_json_lines() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let input = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: ws://127.0.0.1:64598/v1/responses)"}"#;
+        let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(normalized, "");
+    }
+
+    fn codex_config(mcp_repl: &Path, repo_root: &Path, openai_base_url: &str) -> String {
+        let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
         format!(
@@ -621,8 +658,8 @@ remote_models = true
 responses_websockets = false
 
 [mcp_servers.r]
-command = "{mcp_console}"
-env_vars = ["MCP_CONSOLE_SANDBOX_STATE_LOG"]
+command = "{mcp_repl}"
+env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
@@ -634,7 +671,7 @@ trust_level = "trusted"
     }
 
     fn sandbox_run_code() -> String {
-        "target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})"
+        "target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})"
             .to_string()
     }
 
@@ -642,7 +679,7 @@ trust_level = "trusted"
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        let target = std::env::temp_dir().join(format!("mcp-console-codex-probe-{nanos}.txt"));
+        let target = std::env::temp_dir().join(format!("mcp-repl-codex-probe-{nanos}.txt"));
         let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
             .map_err(|err| format!("failed to encode target path: {err}"))?;
         Ok(r#"target <- __TARGET__
@@ -779,7 +816,7 @@ tryCatch({
                 continue;
             }
             if trimmed.starts_with("⚠ MCP startup incomplete")
-                || trimmed.starts_with("⚠ MCP client for `mcp-console` failed to start")
+                || trimmed.starts_with("⚠ MCP client for `mcp-repl` failed to start")
             {
                 continue;
             }
@@ -929,16 +966,31 @@ tryCatch({
         out
     }
 
-    fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) -> TestResult<()> {
+    fn latest_sandbox_log_path(debug_dir: &Path) -> Option<PathBuf> {
+        let mut sessions = std::fs::read_dir(debug_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions
+            .last()
+            .map(|session| session.join("sandbox-state.jsonl"))
+    }
+
+    fn wait_for_log_contains(debug_dir: &Path, needle: &str, timeout: Duration) -> TestResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
+            if let Some(path) = latest_sandbox_log_path(debug_dir)
+                && let Ok(contents) = std::fs::read_to_string(&path)
                 && contents.contains(needle)
             {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let contents = std::fs::read_to_string(path)
+                let path = latest_sandbox_log_path(debug_dir)
+                    .unwrap_or_else(|| debug_dir.join("<missing>/sandbox-state.jsonl"));
+                let contents = std::fs::read_to_string(&path)
                     .map_err(|err| format!("sandbox log read failed: {err}"))
                     .unwrap_or_else(|err| err);
                 return Err(format!(
@@ -987,7 +1039,7 @@ tryCatch({
             codex_home: &Path,
             workspace: &Path,
             base_url: &str,
-            sandbox_log: &Path,
+            debug_dir: &Path,
         ) -> TestResult<Self> {
             let pty_system = native_pty_system();
             let pair = pty_system
@@ -1001,10 +1053,10 @@ tryCatch({
 
             let mut cmd = CommandBuilder::new("sh");
             let shell_script = format!(
-                "CODEX_HOME={} CODEX_OSS_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} MCP_REPL_DEBUG_DIR={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
                 sh_single_quote(&codex_home.display().to_string()),
                 sh_single_quote(base_url),
-                sh_single_quote(&sandbox_log.display().to_string()),
+                sh_single_quote(&debug_dir.display().to_string()),
                 sh_single_quote(&workspace.display().to_string()),
                 sh_single_quote(WARMUP_MARKER),
             );

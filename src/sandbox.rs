@@ -17,20 +17,19 @@ use tempfile::Builder;
 
 pub const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 pub const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
-pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_ALLOWED_DOMAINS";
-pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_DENIED_DOMAINS";
+pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_REPL_ALLOWED_DOMAINS";
+pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_REPL_DENIED_DOMAINS";
 #[cfg(target_os = "macos")]
 pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
 pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_DISABLED";
-pub const R_SESSION_TMPDIR_ENV: &str = "MCP_CONSOLE_R_SESSION_TMPDIR";
+pub const R_SESSION_TMPDIR_ENV: &str = "MCP_REPL_R_SESSION_TMPDIR";
 #[cfg(target_os = "macos")]
-pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_CONSOLE_SANDBOX_LOG_DENIALS";
-pub const SANDBOX_STATE_LOG_ENV: &str = "MCP_CONSOLE_SANDBOX_STATE_LOG";
-pub const INITIAL_SANDBOX_STATE_ENV: &str = "MCP_CONSOLE_INITIAL_SANDBOX_STATE";
+pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_REPL_SANDBOX_LOG_DENIALS";
+pub const INITIAL_SANDBOX_STATE_ENV: &str = "MCP_REPL_INITIAL_SANDBOX_STATE";
 #[cfg(target_os = "linux")]
-pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_CONSOLE_USE_LINUX_BWRAP";
+pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_REPL_USE_LINUX_BWRAP";
 #[cfg(target_os = "linux")]
-pub const LINUX_BWRAP_NO_PROC_ENV: &str = "MCP_CONSOLE_LINUX_BWRAP_NO_PROC";
+pub const LINUX_BWRAP_NO_PROC_ENV: &str = "MCP_REPL_LINUX_BWRAP_NO_PROC";
 
 #[derive(Debug, Clone)]
 pub enum SandboxError {
@@ -373,7 +372,7 @@ pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
             "policy": policy,
         }),
     );
-    let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
+    let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
         return;
     };
     let payload = serde_json::to_string(policy).unwrap_or_else(|_| format!("{policy:?}"));
@@ -394,7 +393,7 @@ pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>)
             "params": params,
         }),
     );
-    let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
+    let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
         return;
     };
     let payload = serde_json::json!({
@@ -759,7 +758,7 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
 
 fn build_session_temp_dir_path() -> PathBuf {
     Builder::new()
-        .prefix("mcp-console-session-")
+        .prefix("mcp-repl-session-")
         .tempdir()
         .map(|dir| dir.keep())
         .unwrap_or_else(|err| {
@@ -770,7 +769,7 @@ fn build_session_temp_dir_path() -> PathBuf {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            path.push(format!("mcp-console-session-{pid}-{nanos}"));
+            path.push(format!("mcp-repl-session-{pid}-{nanos}"));
             path
         })
 }
@@ -820,7 +819,7 @@ const PROXY_URL_ENV_KEYS: [&str; 6] = [
     "https_proxy",
     "all_proxy",
 ];
-const MANAGED_NETWORK_ENV_KEY: &str = "MCP_CONSOLE_MANAGED_NETWORK";
+const MANAGED_NETWORK_ENV_KEY: &str = "MCP_REPL_MANAGED_NETWORK";
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
 
 pub fn sandbox_state_defaults_with_environment() -> SandboxState {
@@ -2181,15 +2180,15 @@ mod tests {
         #[cfg(target_os = "windows")]
         let outside = {
             let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-            PathBuf::from(format!(r"{system_drive}\mcp-console-test"))
+            PathBuf::from(format!(r"{system_drive}\mcp-repl-test"))
         };
         #[cfg(not(target_os = "windows"))]
         let base_tmp = std::env::temp_dir();
         #[cfg(not(target_os = "windows"))]
         let outside = if base_tmp.starts_with("/tmp") {
-            PathBuf::from("/var/mcp-console-test")
+            PathBuf::from("/var/mcp-repl-test")
         } else {
-            PathBuf::from("/tmp/mcp-console-test")
+            PathBuf::from("/tmp/mcp-repl-test")
         };
         let err = prepare_session_temp_dir(&outside).expect_err("expected failure");
         match err {

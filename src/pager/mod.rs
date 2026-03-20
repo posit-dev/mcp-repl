@@ -26,8 +26,8 @@ use search::{
     session_max_indexed_hits, take_hits_next, take_matches, where_in_buffer,
 };
 
-pub(crate) const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
-const PAGER_PAGE_BYTES_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_BYTES";
+pub(crate) const PAGER_PAGE_CHARS_ENV: &str = "MCP_REPL_PAGER_PAGE_CHARS";
+const PAGER_PAGE_BYTES_ENV: &str = "MCP_REPL_PAGER_PAGE_BYTES";
 
 const DEFAULT_PAGER_PAGE_CHARS: u64 = 3_500;
 const MIN_PAGER_PAGE_CHARS: u64 = 64;

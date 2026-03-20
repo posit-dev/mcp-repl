@@ -33,7 +33,7 @@ use std::mem::MaybeUninit;
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
-const MCP_CONSOLE_R_SCRIPT: &str = include_str!("../r/mcp_console.R");
+const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
 
 #[derive(Debug)]
 pub struct SessionReply;
@@ -350,7 +350,7 @@ fn initialize_r() -> Result<(), String> {
 }
 
 fn configure_r_help_output() -> Result<(), String> {
-    eval_in_global_env(MCP_CONSOLE_R_SCRIPT)
+    eval_in_global_env(MCP_REPL_R_SCRIPT)
 }
 
 fn eval_in_global_env(code: &str) -> Result<(), String> {

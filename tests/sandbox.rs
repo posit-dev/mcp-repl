@@ -36,7 +36,7 @@ struct TempDirStatus {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-const SESSION_MARKER_FILE: &str = "mcp-console-session-marker.txt";
+const SESSION_MARKER_FILE: &str = "mcp-repl-session-marker.txt";
 const SANDBOX_PAGER_PAGE_CHARS: u64 = 2048;
 
 #[cfg(target_os = "macos")]
@@ -239,10 +239,10 @@ async fn fetch_tempdir_info(
     session: &mut common::McpTestSession,
 ) -> TestResult<Option<TempDirInfo>> {
     let code = r#"
-cat("MCP_TMPDIR=", Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
+cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 cat("TMPDIR=", Sys.getenv("TMPDIR"), "\n", sep = "")
 cat("R_TMPDIR=", tempdir(), "\n", sep = "")
-marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-session-marker.txt")
+marker <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-session-marker.txt")
 tryCatch({
   writeLines("marker", marker)
   cat("MARKER_OK\n")
@@ -300,7 +300,7 @@ async fn fetch_tempdir_status(
     let marker = r_string(marker_path);
     let code = format!(
         r#"
-cat("MCP_TMPDIR=", Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
+cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 cat("TMPDIR=", Sys.getenv("TMPDIR"), "\n", sep = "")
 cat("R_TMPDIR=", tempdir(), "\n", sep = "")
 cat("MARKER_EXISTS=", file.exists({marker}), "\n", sep = "")
@@ -402,7 +402,7 @@ fn unique_path(root: &Path, label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    root.join(format!("mcp-console-sandbox-{label}-{nanos}.txt"))
+    root.join(format!("mcp-repl-sandbox-{label}-{nanos}.txt"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -559,7 +559,7 @@ async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> Te
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let root = home.join(format!(".mcp-console-sandbox-r-cache-probe-{nanos}"));
+    let root = home.join(format!(".mcp-repl-sandbox-r-cache-probe-{nanos}"));
 
     let xdg_cache_home = root.join("xdg-cache");
     let r_package_cache_root = xdg_cache_home.join("R");
@@ -621,9 +621,7 @@ async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let root = home.join(format!(
-        ".mcp-console-sandbox-r-cache-probe-read-only-{nanos}"
-    ));
+    let root = home.join(format!(".mcp-repl-sandbox-r-cache-probe-read-only-{nanos}"));
 
     let xdg_cache_home = root.join("xdg-cache");
     let r_package_cache_root = xdg_cache_home.join("R");
@@ -883,7 +881,7 @@ async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let sentinel = format!("/tmp/mcp-console-preexisting-{nanos}");
+    let sentinel = format!("/tmp/mcp-repl-preexisting-{nanos}");
     let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
         Vec::new(),
         vec![("R_SESSION_TMPDIR".to_string(), sentinel.clone())],
@@ -894,7 +892,7 @@ async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
     let code = r#"
 cat("R_SESSION_TMPDIR=", Sys.getenv("R_SESSION_TMPDIR"), "\n", sep = "")
 cat("TMPDIR=", Sys.getenv("TMPDIR"), "\n", sep = "")
-cat("MCP_TMPDIR=", Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
+cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 "#;
     let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
     let text = collect_text(&result);
@@ -1063,7 +1061,7 @@ async fn sandbox_denials_linux() -> TestResult<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let forbidden = Path::new(&home).join(format!("mcp-console-denied-{nanos}.txt"));
+    let forbidden = Path::new(&home).join(format!("mcp-repl-denied-{nanos}.txt"));
     let forbidden = forbidden.to_string_lossy().to_string();
 
     let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
@@ -1110,12 +1108,12 @@ async fn sandbox_denials_linux_bwrap() -> TestResult<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let forbidden = Path::new(&home).join(format!("mcp-console-bwrap-denied-{nanos}.txt"));
+    let forbidden = Path::new(&home).join(format!("mcp-repl-bwrap-denied-{nanos}.txt"));
     let forbidden = forbidden.to_string_lossy().to_string();
 
     let mut session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
-        vec![("MCP_CONSOLE_USE_LINUX_BWRAP".to_string(), "1".to_string())],
+        vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
     .await?;
     let code = format!(
@@ -1160,14 +1158,14 @@ async fn sandbox_bwrap_protects_dot_git_codex_agents() -> TestResult<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let writable_root = repo_root.join(format!("mcp-console-bwrap-root-{nanos}"));
+    let writable_root = repo_root.join(format!("mcp-repl-bwrap-root-{nanos}"));
     std::fs::create_dir_all(writable_root.join(".git"))?;
     std::fs::create_dir_all(writable_root.join(".codex"))?;
     std::fs::create_dir_all(writable_root.join(".agents"))?;
 
     let mut session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
-        vec![("MCP_CONSOLE_USE_LINUX_BWRAP".to_string(), "1".to_string())],
+        vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
     .await?;
     let target_git = writable_root.join(".git/deny.txt");
@@ -1228,7 +1226,7 @@ async fn sandbox_workspace_write_blocks_network_access_bwrap() -> TestResult<()>
     };
     let mut session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
-        vec![("MCP_CONSOLE_USE_LINUX_BWRAP".to_string(), "1".to_string())],
+        vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
     .await?;
     let result = session
@@ -1262,11 +1260,8 @@ async fn sandbox_bwrap_no_proc_mode_starts_worker() -> TestResult<()> {
     let mut session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
         vec![
-            ("MCP_CONSOLE_USE_LINUX_BWRAP".to_string(), "1".to_string()),
-            (
-                "MCP_CONSOLE_LINUX_BWRAP_NO_PROC".to_string(),
-                "1".to_string(),
-            ),
+            ("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string()),
+            ("MCP_REPL_LINUX_BWRAP_NO_PROC".to_string(), "1".to_string()),
         ],
     )
     .await?;
@@ -1315,7 +1310,7 @@ async fn sandbox_denials_windows() -> TestResult<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let forbidden = home.join(format!("mcp-console-denied-{nanos}.txt"));
+    let forbidden = home.join(format!("mcp-repl-denied-{nanos}.txt"));
     let forbidden_r = r_string(&forbidden.to_string_lossy());
 
     let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;

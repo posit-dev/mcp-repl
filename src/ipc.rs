@@ -57,13 +57,13 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 #[cfg(target_family = "unix")]
-pub const IPC_READ_FD_ENV: &str = "MCP_CONSOLE_IPC_READ_FD";
+pub const IPC_READ_FD_ENV: &str = "MCP_REPL_IPC_READ_FD";
 #[cfg(target_family = "unix")]
-pub const IPC_WRITE_FD_ENV: &str = "MCP_CONSOLE_IPC_WRITE_FD";
+pub const IPC_WRITE_FD_ENV: &str = "MCP_REPL_IPC_WRITE_FD";
 #[cfg(target_family = "windows")]
-pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_CONSOLE_IPC_PIPE_TO_WORKER";
+pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
-pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_CONSOLE_IPC_PIPE_FROM_WORKER";
+pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,7 +769,7 @@ fn next_pipe_name() -> io::Result<String> {
     let nonce = PIPE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let random = random_pipe_suffix()?;
     Ok(format!(
-        r"\\.\pipe\mcp-console-ipc-{}-{nonce}-{random}",
+        r"\\.\pipe\mcp-repl-ipc-{}-{nonce}-{random}",
         std::process::id()
     ))
 }

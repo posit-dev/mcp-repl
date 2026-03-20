@@ -22,18 +22,15 @@ fn sandbox_exec_available() -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
         return Ok(PathBuf::from(path));
     }
 
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
+    for candidate in ["mcp-repl"] {
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {
@@ -48,7 +45,7 @@ fn resolve_mcp_console_path() -> TestResult<PathBuf> {
 
 #[test]
 fn debug_repl_prints_initial_prompt() -> TestResult<()> {
-    let exe = resolve_mcp_console_path()?;
+    let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl");
     #[cfg(target_os = "macos")]
@@ -56,8 +53,8 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
     let mut child = cmd
-        .env("MCP_CONSOLE_REPL_IMAGES", "0")
-        .env("MCP_CONSOLE_PAGER_PAGE_CHARS", "1000000")
+        .env("MCP_REPL_IMAGES", "0")
+        .env("MCP_REPL_PAGER_PAGE_CHARS", "1000000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -19,13 +19,13 @@ SANDBOX_TEST_1: run the sandbox write test
 mcp: r starting
 mcp: r ready
 mcp startup: ready: r
-tool r.repl({"input":"target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"})
-r.repl({"input":"target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"}) success in Nms:
+tool r.repl({"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"})
+r.repl({"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"}) success in Nms:
 {
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 8 lines (206 bytes); head: > target <- tempfile(\"mcp-console-codex\"); tail: + })\nWRITE_OK\n"
+      "text": "[repl] echoed input elided: 8 lines (203 bytes); head: > target <- tempfile(\"mcp-repl-codex\"); tail: + })\nWRITE_OK\n"
     },
     {
       "type": "text",

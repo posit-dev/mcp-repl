@@ -901,6 +901,7 @@ impl WorkerManager {
         worker_timeout: Duration,
         server_timeout: Duration,
     ) -> Result<RequestState, WorkerError> {
+        let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
         let ipc = self
             .process
@@ -2533,6 +2534,10 @@ fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
 
+fn normalize_input_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
@@ -3259,20 +3264,16 @@ impl WorkerProcess {
     }
 
     fn cleanup_session_tmpdir(&self) {
-        if std::env::var_os("MCP_CONSOLE_KEEP_SESSION_TMPDIR").is_some() {
-            return;
-        }
         let Some(path) = self.session_tmpdir.as_ref() else {
             return;
         };
         if !path.is_absolute() || path.as_path() == std::path::Path::new("/") {
             return;
         }
-        if let Err(err) = std::fs::remove_dir_all(path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("Failed to remove worker session temp dir: {err}");
-        }
+        cleanup_worker_session_tmpdir(
+            path,
+            crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3292,6 +3293,34 @@ impl WorkerProcess {
 
     #[cfg(not(target_os = "macos"))]
     fn report_denials(&mut self) {}
+}
+
+fn persist_worker_startup_log(session_tmpdir: &Path, destination: Option<PathBuf>) {
+    let Some(destination) = destination else {
+        return;
+    };
+    let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+    if !source.is_file() || source == destination {
+        return;
+    }
+    if let Err(err) = std::fs::copy(&source, &destination) {
+        eprintln!(
+            "Failed to persist worker startup log to {}: {err}",
+            destination.display()
+        );
+    }
+}
+
+fn cleanup_worker_session_tmpdir(session_tmpdir: &Path, worker_log_destination: Option<PathBuf>) {
+    persist_worker_startup_log(session_tmpdir, worker_log_destination);
+    if std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR").is_some() {
+        return;
+    }
+    if let Err(err) = std::fs::remove_dir_all(session_tmpdir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("Failed to remove worker session temp dir: {err}");
+    }
 }
 
 impl Drop for WorkerProcess {
@@ -3435,16 +3464,12 @@ fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
 }
 
 fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBuf>) {
-    if let Ok(value) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP") {
-        command.env("MCP_CONSOLE_DEBUG_STARTUP", value);
-        if let Some(tmpdir) = session_tmpdir {
-            let worker_log = tmpdir.join("mcp-console-worker-startup.log");
-            command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", worker_log);
-        } else if let Ok(path) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP_FILE") {
-            command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", path);
-        }
-    } else if let Ok(value) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP_FILE") {
-        command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", value);
+    crate::debug_logs::apply_child_env(command);
+    if let Some(tmpdir) = session_tmpdir {
+        command.env(
+            crate::diagnostics::STARTUP_LOG_PATH_ENV,
+            tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
+        );
     }
 }
 
@@ -3660,6 +3685,11 @@ mod tests {
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
+    fn env_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
@@ -3790,6 +3820,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
         let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
@@ -3815,6 +3846,7 @@ mod tests {
 
     #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
         let initial = serde_json::json!({
@@ -3876,6 +3908,177 @@ mod tests {
                 std::env::remove_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
             },
         }
+    }
+
+    #[test]
+    fn apply_debug_startup_env_uses_mcp_repl_vars() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+        let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        unsafe {
+            std::env::set_var(
+                crate::debug_logs::DEBUG_SESSION_DIR_ENV,
+                "/tmp/mcp-repl-debug-session",
+            );
+            std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        }
+
+        let mut command = Command::new("env");
+        apply_debug_startup_env(&mut command, None);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+            },
+        }
+        match original_startup_path {
+            Some(value) => unsafe {
+                std::env::set_var(crate::diagnostics::STARTUP_LOG_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+            },
+        }
+
+        assert_eq!(
+            envs.get(crate::debug_logs::DEBUG_SESSION_DIR_ENV),
+            Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
+        );
+        assert_eq!(envs.get(crate::diagnostics::STARTUP_LOG_PATH_ENV), None);
+    }
+
+    #[test]
+    fn normalize_input_newlines_canonicalizes_crlf_and_cr() {
+        assert_eq!(normalize_input_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn apply_debug_startup_env_uses_session_tmpdir_for_worker_log() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+        let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        unsafe {
+            std::env::set_var(
+                crate::debug_logs::DEBUG_SESSION_DIR_ENV,
+                "/tmp/mcp-repl-debug-session",
+            );
+            std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        }
+
+        let mut command = Command::new("env");
+        let session_tmpdir = PathBuf::from("/tmp/mcp-repl-session-tmp");
+        apply_debug_startup_env(&mut command, Some(&session_tmpdir));
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+            },
+        }
+        match original_startup_path {
+            Some(value) => unsafe {
+                std::env::set_var(crate::diagnostics::STARTUP_LOG_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+            },
+        }
+
+        assert_eq!(
+            envs.get(crate::debug_logs::DEBUG_SESSION_DIR_ENV),
+            Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
+        );
+        assert_eq!(
+            envs.get(crate::diagnostics::STARTUP_LOG_PATH_ENV),
+            Some(&Some(
+                session_tmpdir
+                    .join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME)
+                    .display()
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn persist_worker_startup_log_copies_into_debug_session_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        let debug_session_dir = temp.path().join("debug-session");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::create_dir_all(&debug_session_dir).expect("create debug session dir");
+
+        let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        let destination = debug_session_dir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        std::fs::write(&source, "worker startup log\n").expect("write source log");
+
+        persist_worker_startup_log(&session_tmpdir, Some(destination.clone()));
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read destination log"),
+            "worker startup log\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_worker_session_tmpdir_persists_log_when_keep_tmpdir_is_set() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        let debug_session_dir = temp.path().join("debug-session");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::create_dir_all(&debug_session_dir).expect("create debug session dir");
+
+        let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        let destination = debug_session_dir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        std::fs::write(&source, "worker startup log\n").expect("write source log");
+
+        let original_keep = std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR");
+        unsafe {
+            std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", "1");
+        }
+
+        cleanup_worker_session_tmpdir(&session_tmpdir, Some(destination.clone()));
+
+        match original_keep {
+            Some(value) => unsafe {
+                std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("MCP_REPL_KEEP_SESSION_TMPDIR");
+            },
+        }
+
+        assert!(
+            session_tmpdir.is_dir(),
+            "session tmpdir should be preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read destination log"),
+            "worker startup log\n"
+        );
     }
 
     #[cfg(target_family = "windows")]

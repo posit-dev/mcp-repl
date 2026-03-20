@@ -277,14 +277,27 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         break;
     }
 
-    let marker_result = session
-        .write_stdin_raw_with("globals().get('x_tail_marker', 'MISSING')", Some(5.0))
-        .await?;
-    let marker_text = result_text(&marker_result);
-    assert!(
-        marker_text.contains("'MISSING'"),
-        "expected buffered tail assignment to be discarded, got: {marker_text:?}"
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            return Err("worker stayed busy before tail-marker probe".into());
+        }
+
+        let marker_result = session
+            .write_stdin_raw_with("globals().get('x_tail_marker', 'MISSING')", Some(0.5))
+            .await?;
+        let marker_text = result_text(&marker_result);
+        if is_busy_response(&marker_text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        assert!(
+            marker_text.contains("'MISSING'"),
+            "expected buffered tail assignment to be discarded, got: {marker_text:?}"
+        );
+        break;
+    }
 
     session.cancel().await?;
     Ok(())

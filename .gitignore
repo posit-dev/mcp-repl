@@ -1,6 +1,6 @@
 /target
 /deps
-mcp-console-startup.log
+mcp-repl-startup.log
 .Rhistory
 .Rproj.user
 .venv

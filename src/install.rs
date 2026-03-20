@@ -296,18 +296,13 @@ fn has_interpreter_config_arg(args: &[String]) -> bool {
 fn has_interpreter_value(args: &[String], target: &str) -> bool {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--interpreter" || arg == "--backend" {
+        if arg == "--interpreter" {
             if iter.next().is_some_and(|value| value == target) {
                 return true;
             }
             continue;
         }
         if let Some(value) = arg.strip_prefix("--interpreter=")
-            && value == target
-        {
-            return true;
-        }
-        if let Some(value) = arg.strip_prefix("--backend=")
             && value == target
         {
             return true;
@@ -681,15 +676,15 @@ mod tests {
         upsert_codex_mcp_server(
             &config,
             "console",
-            "/usr/local/bin/mcp-console",
-            &["--backend".to_string(), "python".to_string()],
+            "/usr/local/bin/mcp-repl",
+            &["--interpreter".to_string(), "python".to_string()],
         )
         .expect("upsert codex");
         let text = fs::read_to_string(config).expect("read config");
         let doc = text.parse::<DocumentMut>().expect("parse generated config");
         assert_eq!(
             doc["mcp_servers"]["console"]["command"].as_str(),
-            Some("/usr/local/bin/mcp-console")
+            Some("/usr/local/bin/mcp-repl")
         );
         assert_eq!(
             doc["mcp_servers"]["console"]["tool_timeout_sec"].as_integer(),
@@ -699,14 +694,14 @@ mod tests {
             .as_array()
             .expect("args array");
         assert_eq!(args.len(), 2);
-        assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("--backend"));
+        assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("--interpreter"));
         assert_eq!(args.get(1).and_then(|v| v.as_str()), Some("python"));
         assert!(
             text.contains("args = [\n"),
             "expected args array to be multiline for readability"
         );
         assert!(
-            text.contains("\"--backend\", \"python\""),
+            text.contains("\"--interpreter\", \"python\""),
             "expected paired install args to share one line"
         );
         assert!(
@@ -722,7 +717,7 @@ mod tests {
         fs::write(
             &config,
             r#"[mcp_servers]
-repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
+repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--interpreter", "r"] }
 "#,
         )
         .expect("seed config");
@@ -766,7 +761,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
 
 [mcp_servers]
   # keep this note
-repl={command="/usr/local/bin/old-mcp-repl",args=["--backend","r"]}
+repl={command="/usr/local/bin/old-mcp-repl",args=["--interpreter","r"]}
 r = { command = "/usr/local/bin/legacy-repl" }
 
 [workspace]
@@ -779,7 +774,7 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--backend".to_string(), "r".to_string()],
+            &["--interpreter".to_string(), "r".to_string()],
         )
         .expect("upsert codex");
 
@@ -811,7 +806,7 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--backend".to_string(), "r".to_string()],
+            &["--interpreter".to_string(), "r".to_string()],
         )
         .expect("upsert codex");
 
