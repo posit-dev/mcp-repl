@@ -25,7 +25,6 @@ pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_
 pub const R_SESSION_TMPDIR_ENV: &str = "MCP_REPL_R_SESSION_TMPDIR";
 #[cfg(target_os = "macos")]
 pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_REPL_SANDBOX_LOG_DENIALS";
-pub const SANDBOX_STATE_LOG_ENV: &str = "MCP_REPL_SANDBOX_STATE_LOG";
 pub const INITIAL_SANDBOX_STATE_ENV: &str = "MCP_REPL_INITIAL_SANDBOX_STATE";
 #[cfg(target_os = "linux")]
 pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_REPL_USE_LINUX_BWRAP";
@@ -373,7 +372,7 @@ pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
             "policy": policy,
         }),
     );
-    let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
+    let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
         return;
     };
     let payload = serde_json::to_string(policy).unwrap_or_else(|_| format!("{policy:?}"));
@@ -394,7 +393,7 @@ pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>)
             "params": params,
         }),
     );
-    let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
+    let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
         return;
     };
     let payload = serde_json::json!({

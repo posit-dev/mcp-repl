@@ -1,4 +1,5 @@
 mod backend;
+mod debug_logs;
 mod debug_repl;
 mod diagnostics;
 mod event_log;
@@ -39,7 +40,7 @@ struct CliOptions {
     sandbox_plan: SandboxCliPlan,
     debug_repl: bool,
     backend: Backend,
-    debug_events_dir: Option<PathBuf>,
+    debug_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -72,8 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match parse_cli_args()? {
         CliCommand::RunServer(options) => {
+            debug_logs::initialize(options.debug_dir.clone())?;
             event_log::initialize(
-                options.debug_events_dir,
+                options.debug_dir.clone(),
                 event_log::StartupContext {
                     mode: if options.debug_repl {
                         "debug_repl".to_string()
@@ -118,7 +120,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
 
     let mut sandbox_args = SandboxCliArgs::default();
     let mut debug_repl = false;
-    let mut debug_events_dir = None;
+    let mut debug_dir = None;
     let mut backend = backend_from_env()?;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
@@ -214,19 +216,19 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
             "--debug-repl" => {
                 debug_repl = true;
             }
-            "--debug-events-dir" => {
-                let value = parser.next_value("--debug-events-dir")?;
+            "--debug-dir" => {
+                let value = parser.next_value("--debug-dir")?;
                 if value.trim().is_empty() {
-                    return Err("missing value for --debug-events-dir".into());
+                    return Err("missing value for --debug-dir".into());
                 }
-                debug_events_dir = Some(PathBuf::from(value));
+                debug_dir = Some(PathBuf::from(value));
             }
-            _ if arg.starts_with("--debug-events-dir=") => {
+            _ if arg.starts_with("--debug-dir=") => {
                 let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
                 if value.trim().is_empty() {
-                    return Err("missing value for --debug-events-dir".into());
+                    return Err("missing value for --debug-dir".into());
                 }
-                debug_events_dir = Some(PathBuf::from(value));
+                debug_dir = Some(PathBuf::from(value));
             }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
@@ -239,7 +241,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         sandbox_plan: sandbox_args.plan,
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
-        debug_events_dir,
+        debug_dir,
     }))
 }
 
@@ -448,7 +450,7 @@ fn print_usage() {
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
---debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
+--debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\

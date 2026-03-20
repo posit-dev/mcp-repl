@@ -12,51 +12,45 @@ Use the built-in logs when you want to understand what `mcp-repl` thinks happene
 
 Enable per-startup JSONL logs with either:
 
-- `mcp-repl --debug-events-dir /path/to/log-dir`
-- `MCP_REPL_DEBUG_EVENTS_DIR=/path/to/log-dir`
+- `mcp-repl --debug-dir /path/to/debug-root`
+- `MCP_REPL_DEBUG_DIR=/path/to/debug-root`
 
-Each startup writes a fresh `mcp-repl-*.jsonl` file. The log includes:
+Each startup creates a fresh session directory under that root. `mcp-repl` writes:
 
-- A `startup` record with cwd, argv, backend, and visible `CODEX_*` session hints
-- Server lifecycle events such as worker warm start and server listen start/end
-- Tool-call events such as `tool_call_begin`, `tool_call_end`, and `tool_call_error`
-- Sandbox custom request and notification events
+- `events.jsonl` with startup metadata, tool calls, and sandbox custom request events
+- `startup.log` for server-side startup trace lines
+- `worker-startup.log` for worker-side startup trace lines
+- `sandbox-state.jsonl` for sandbox policy and sandbox-state update payloads
 
 Example:
 
 ```sh
-mkdir -p /tmp/mcp-repl-events
-MCP_REPL_DEBUG_EVENTS_DIR=/tmp/mcp-repl-events mcp-repl --interpreter r
+mkdir -p /tmp/mcp-repl-debug
+MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --interpreter r
 ```
 
 ## Startup diagnostics
 
-Use startup diagnostics when the worker fails early or startup feels slow.
-
-- `MCP_REPL_DEBUG_STARTUP=1` enables startup logging with default paths
-- `MCP_REPL_DEBUG_STARTUP=/path/to/file.log` writes startup logs to a specific file
-
-If `MCP_REPL_DEBUG_STARTUP=1` is set, the server writes `mcp-repl-startup.log` in the current working directory. The worker writes `mcp-repl-worker-startup.log` and, when a session temp directory exists, places it there so you can inspect it alongside the rest of the session artifacts.
+Use `MCP_REPL_DEBUG_DIR` or `--debug-dir` when the worker fails early or startup feels slow. The startup trace lines go into `startup.log` and `worker-startup.log` inside the session directory.
 
 Example:
 
 ```sh
-MCP_REPL_DEBUG_STARTUP=1 mcp-repl --interpreter python
+MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --interpreter python
 ```
 
 ## MCP and sandbox tracing
 
 These switches are useful when the client is sending custom sandbox updates or when the sandbox policy is the thing you are debugging.
 
-- `MCP_REPL_SANDBOX_STATE_LOG=/path/to/file.jsonl` appends sandbox policy and sandbox-state update payloads as JSON lines
+- `MCP_REPL_DEBUG_DIR=/path/to/debug-root` writes `sandbox-state.jsonl` inside the session directory
 - `MCP_REPL_KEEP_SESSION_TMPDIR=1` keeps the worker session temp directory after exit so you can inspect it
 - macOS only: `MCP_REPL_SANDBOX_LOG_DENIALS=1` prints collected sandbox denials when the worker exits
 
 Example:
 
 ```sh
-MCP_REPL_SANDBOX_STATE_LOG=/tmp/mcp-repl-sandbox.jsonl \
-mcp-repl --sandbox inherit
+MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --sandbox inherit
 ```
 
 ## Interactive debug REPL
@@ -101,7 +95,7 @@ Each captured chunk includes:
 - UTF-8 text when the chunk decodes cleanly
 - Parsed JSON in `text_as_json` when the chunk is line-delimited JSON
 
-Set `MCP_REPL_TRACE_FORWARD_STDERR=1` if you also want the proxied server `stderr` mirrored to your terminal.
+Set `MCP_REPL_TRACE_FORWARD_STDERR=1` if you also want the proxied server `stderr` mirrored to your terminal. If `MCP_REPL_DEBUG_DIR` is set, the proxy writes `wire.jsonl` and `wire.pretty.json` into the same session directory and passes that directory to `mcp-repl`.
 
 Direct invocation:
 
@@ -118,8 +112,8 @@ Client-config pattern:
     "/absolute/path/to/mcp-repl",
     "--interpreter",
     "r",
-    "--debug-events-dir",
-    "/tmp/mcp-repl-events"
+    "--debug-dir",
+    "/tmp/mcp-repl-debug"
   ]
 }
 ```
@@ -127,7 +121,7 @@ Client-config pattern:
 That setup gives you two views at once:
 
 - The proxy log shows the exact client/server traffic
-- The debug-events log shows the internal `mcp-repl` interpretation of that traffic
+- The session directory shows the internal `mcp-repl` interpretation of that traffic
 
 ## Claude clear-hook worktree
 

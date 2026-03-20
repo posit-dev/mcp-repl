@@ -28,7 +28,7 @@ mod unix_impl {
         _temp_dir: tempfile::TempDir,
         workspace: PathBuf,
         codex_home: PathBuf,
-        sandbox_log: PathBuf,
+        debug_dir: PathBuf,
     }
 
     #[derive(Clone, Copy)]
@@ -78,10 +78,7 @@ mod unix_impl {
         cmd.env("CODEX_HOME", env.codex_home.display().to_string());
         cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
         cmd.env("OPENAI_BASE_URL", mock_server.base_url());
-        cmd.env(
-            "MCP_REPL_SANDBOX_STATE_LOG",
-            env.sandbox_log.display().to_string(),
-        );
+        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
         cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "C");
         cmd.arg("-c");
@@ -103,7 +100,7 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
         let outputs = mock_server.function_call_outputs().await;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"))
             || stdout.contains("WRITE_OK")
@@ -153,12 +150,12 @@ mod unix_impl {
             &env.codex_home,
             &env.workspace,
             &mock_server.base_url(),
-            &env.sandbox_log,
+            &env.debug_dir,
         )?;
         driver.drain(Duration::from_millis(800));
         driver.ensure_running("after startup")?;
         driver.wait_for_warmup(Duration::from_secs(10))?;
-        wait_for_log_contains(&env.sandbox_log, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
@@ -175,12 +172,12 @@ mod unix_impl {
         )?;
 
         wait_for_log_contains(
-            &env.sandbox_log,
+            &env.debug_dir,
             "danger-full-access",
             Duration::from_secs(20),
         )?;
         wait_for_log_contains(
-            &env.sandbox_log,
+            &env.debug_dir,
             "codex/sandbox-state/update",
             Duration::from_secs(20),
         )?;
@@ -273,9 +270,8 @@ mod unix_impl {
         let codex_home = temp_dir.path().join("codex-home");
         std::fs::create_dir_all(codex_home.join("shell_snapshots"))?;
 
-        let sandbox_log_dir = temp_dir.path().join("sandbox-log");
-        std::fs::create_dir_all(&sandbox_log_dir)?;
-        let sandbox_log = sandbox_log_dir.join("sandbox-state.log");
+        let debug_dir = temp_dir.path().join("debug");
+        std::fs::create_dir_all(&debug_dir)?;
 
         let config = codex_config(mcp_repl, &workspace);
         std::fs::write(codex_home.join("config.toml"), config)?;
@@ -284,7 +280,7 @@ mod unix_impl {
             _temp_dir: temp_dir,
             workspace,
             codex_home,
-            sandbox_log,
+            debug_dir,
         })
     }
 
@@ -569,7 +565,7 @@ responses_websockets = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
-env_vars = ["MCP_REPL_SANDBOX_STATE_LOG"]
+env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
@@ -876,16 +872,31 @@ tryCatch({
         out
     }
 
-    fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) -> TestResult<()> {
+    fn latest_sandbox_log_path(debug_dir: &Path) -> Option<PathBuf> {
+        let mut sessions = std::fs::read_dir(debug_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions
+            .last()
+            .map(|session| session.join("sandbox-state.jsonl"))
+    }
+
+    fn wait_for_log_contains(debug_dir: &Path, needle: &str, timeout: Duration) -> TestResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
+            if let Some(path) = latest_sandbox_log_path(debug_dir)
+                && let Ok(contents) = std::fs::read_to_string(&path)
                 && contents.contains(needle)
             {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let contents = std::fs::read_to_string(path)
+                let path = latest_sandbox_log_path(debug_dir)
+                    .unwrap_or_else(|| debug_dir.join("<missing>/sandbox-state.jsonl"));
+                let contents = std::fs::read_to_string(&path)
                     .map_err(|err| format!("sandbox log read failed: {err}"))
                     .unwrap_or_else(|err| err);
                 return Err(format!(
@@ -934,7 +945,7 @@ tryCatch({
             codex_home: &Path,
             workspace: &Path,
             base_url: &str,
-            sandbox_log: &Path,
+            debug_dir: &Path,
         ) -> TestResult<Self> {
             let pty_system = native_pty_system();
             let pair = pty_system
@@ -948,11 +959,11 @@ tryCatch({
 
             let mut cmd = CommandBuilder::new("sh");
             let shell_script = format!(
-                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_REPL_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_REPL_DEBUG_DIR={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
                 sh_single_quote(&codex_home.display().to_string()),
                 sh_single_quote(base_url),
                 sh_single_quote(base_url),
-                sh_single_quote(&sandbox_log.display().to_string()),
+                sh_single_quote(&debug_dir.display().to_string()),
                 sh_single_quote(&workspace.display().to_string()),
                 sh_single_quote(WARMUP_MARKER),
             );

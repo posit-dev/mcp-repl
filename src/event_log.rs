@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value as JsonValue, json};
 
-pub const DEBUG_EVENTS_DIR_ENV: &str = "MCP_REPL_DEBUG_EVENTS_DIR";
+const EVENTS_LOG_FILE: &str = "events.jsonl";
 
 static LOGGER: OnceLock<Option<Arc<EventLogger>>> = OnceLock::new();
 
@@ -31,12 +31,14 @@ struct EventLogger {
 }
 
 impl EventLogger {
-    fn new(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        fs::create_dir_all(dir)?;
+    fn new(file_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let unix_ms = unix_ms_now();
         let pid = std::process::id();
         let session_instance_id = format!("{unix_ms}-{pid}");
-        let (file, file_path) = create_unique_log_file(dir, unix_ms, pid)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)?;
         Ok(Self {
             file: Mutex::new(file),
             file_path,
@@ -66,16 +68,16 @@ impl EventLogger {
 }
 
 pub fn initialize(
-    debug_events_dir: Option<PathBuf>,
+    debug_dir: Option<PathBuf>,
     context: StartupContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if LOGGER.get().is_some() {
         return Ok(());
     }
 
-    let maybe_dir = resolve_debug_dir(debug_events_dir);
-    let maybe_logger = if let Some(dir) = maybe_dir {
-        let logger = Arc::new(EventLogger::new(&dir)?);
+    crate::debug_logs::initialize(debug_dir)?;
+    let maybe_logger = if let Some(file_path) = crate::debug_logs::log_path(EVENTS_LOG_FILE) {
+        let logger = Arc::new(EventLogger::new(file_path)?);
         logger.write_event("startup", startup_payload(&context, &logger.file_path))?;
         Some(logger)
     } else {
@@ -104,17 +106,6 @@ where
 
 fn current_logger() -> Option<Arc<EventLogger>> {
     LOGGER.get().and_then(|entry| entry.clone())
-}
-
-fn resolve_debug_dir(debug_events_dir: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = debug_events_dir
-        && !path.as_os_str().is_empty()
-    {
-        return Some(path);
-    }
-    std::env::var_os(DEBUG_EVENTS_DIR_ENV)
-        .filter(|raw| !raw.is_empty())
-        .map(PathBuf::from)
 }
 
 fn startup_payload(context: &StartupContext, file_path: &Path) -> JsonValue {
@@ -185,27 +176,6 @@ fn is_sensitive_env_key(key: &str) -> bool {
         .any(|needle| upper.contains(needle))
 }
 
-fn create_unique_log_file(
-    dir: &Path,
-    unix_ms: u128,
-    pid: u32,
-) -> Result<(File, PathBuf), Box<dyn std::error::Error>> {
-    for suffix in 0u32..1_000u32 {
-        let name = if suffix == 0 {
-            format!("mcp-repl-{unix_ms}-{pid}.jsonl")
-        } else {
-            format!("mcp-repl-{unix_ms}-{pid}-{suffix}.jsonl")
-        };
-        let path = dir.join(name);
-        match OpenOptions::new().create_new(true).append(true).open(&path) {
-            Ok(file) => return Ok((file, path)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(Box::new(err)),
-        }
-    }
-    Err("failed to allocate unique event log filename after 1000 attempts".into())
-}
-
 fn unix_ms_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -238,7 +208,7 @@ mod tests {
     #[test]
     fn logger_writes_jsonl_event() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let logger = EventLogger::new(temp.path()).expect("create logger");
+        let logger = EventLogger::new(temp.path().join(EVENTS_LOG_FILE)).expect("create logger");
         logger
             .write_event("test-event", json!({"ok": true}))
             .expect("write event");
@@ -249,18 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_log_file_uses_incrementing_suffix_on_collision() {
+    fn logger_uses_stable_events_file_name() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let unix_ms = 123_u128;
-        let pid = 456_u32;
-        let first_path = temp.path().join(format!("mcp-repl-{unix_ms}-{pid}.jsonl"));
-        std::fs::write(&first_path, "{}\n").expect("seed first path");
-
-        let (_file, second_path) =
-            create_unique_log_file(temp.path(), unix_ms, pid).expect("allocate second path");
+        let logger = EventLogger::new(temp.path().join(EVENTS_LOG_FILE)).expect("create logger");
         assert_eq!(
-            second_path.file_name().and_then(|name| name.to_str()),
-            Some("mcp-repl-123-456-1.jsonl")
+            logger.file_path.file_name().and_then(|name| name.to_str()),
+            Some(EVENTS_LOG_FILE)
         );
     }
 

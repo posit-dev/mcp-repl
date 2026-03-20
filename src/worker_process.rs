@@ -3435,27 +3435,8 @@ fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
 }
 
 fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBuf>) {
-    if std::env::var_os(crate::diagnostics::STARTUP_LOG_ENV).is_none() {
-        return;
-    }
-
-    let Some(path) = crate::diagnostics::startup_log_path_from_env(
-        crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT,
-    ) else {
-        return;
-    };
-
-    let path = if let Some(tmpdir) = session_tmpdir {
-        if path == Path::new(crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT) {
-            tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT)
-        } else {
-            path
-        }
-    } else {
-        path
-    };
-
-    command.env(crate::diagnostics::STARTUP_LOG_ENV, path);
+    let _ = session_tmpdir;
+    crate::debug_logs::apply_child_env(command);
 }
 
 fn maybe_report_sandbox_exec_failure(
@@ -3890,9 +3871,12 @@ mod tests {
 
     #[test]
     fn apply_debug_startup_env_uses_mcp_repl_vars() {
-        let original = std::env::var_os("MCP_REPL_DEBUG_STARTUP");
+        let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
         unsafe {
-            std::env::set_var("MCP_REPL_DEBUG_STARTUP", "1");
+            std::env::set_var(
+                crate::debug_logs::DEBUG_SESSION_DIR_ENV,
+                "/tmp/mcp-repl-debug-session",
+            );
         }
 
         let mut command = Command::new("env");
@@ -3909,18 +3893,16 @@ mod tests {
 
         match original {
             Some(value) => unsafe {
-                std::env::set_var("MCP_REPL_DEBUG_STARTUP", value);
+                std::env::set_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV, value);
             },
             None => unsafe {
-                std::env::remove_var("MCP_REPL_DEBUG_STARTUP");
+                std::env::remove_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
             },
         }
 
         assert_eq!(
-            envs.get("MCP_REPL_DEBUG_STARTUP"),
-            Some(&Some(
-                crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT.to_string()
-            ))
+            envs.get(crate::debug_logs::DEBUG_SESSION_DIR_ENV),
+            Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
         );
     }
 

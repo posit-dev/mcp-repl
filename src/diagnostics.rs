@@ -7,21 +7,8 @@ use std::time::{Duration, Instant};
 static STARTUP_EPOCH: OnceLock<Instant> = OnceLock::new();
 static STARTUP_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static STARTUP_LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-pub(crate) const STARTUP_LOG_ENV: &str = "MCP_REPL_DEBUG_STARTUP";
-pub(crate) const STARTUP_LOG_DEFAULT: &str = "mcp-repl-startup.log";
-pub(crate) const WORKER_STARTUP_LOG_DEFAULT: &str = "mcp-repl-worker-startup.log";
-
-pub(crate) fn startup_log_path_from_env(default_path: &str) -> Option<PathBuf> {
-    let raw = std::env::var(STARTUP_LOG_ENV).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if is_truthy(trimmed) {
-        return Some(PathBuf::from(default_path));
-    }
-    Some(PathBuf::from(trimmed))
-}
+pub(crate) const STARTUP_LOG_FILE_NAME: &str = "startup.log";
+pub(crate) const WORKER_STARTUP_LOG_FILE_NAME: &str = "worker-startup.log";
 
 fn startup_epoch() -> Instant {
     *STARTUP_EPOCH.get_or_init(Instant::now)
@@ -29,7 +16,14 @@ fn startup_epoch() -> Instant {
 
 fn startup_log_path() -> Option<&'static PathBuf> {
     STARTUP_LOG_PATH
-        .get_or_init(|| startup_log_path_from_env(STARTUP_LOG_DEFAULT))
+        .get_or_init(|| {
+            let file_name = if is_worker_mode() {
+                WORKER_STARTUP_LOG_FILE_NAME
+            } else {
+                STARTUP_LOG_FILE_NAME
+            };
+            crate::debug_logs::log_path(file_name)
+        })
         .as_ref()
 }
 
@@ -64,9 +58,8 @@ pub fn elapsed_ms(duration: Duration) -> u128 {
     duration.as_millis()
 }
 
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+fn is_worker_mode() -> bool {
+    let bare = std::ffi::OsStr::new(crate::worker_protocol::WORKER_MODE_ARG);
+    let flag = std::ffi::OsString::from(format!("--{}", crate::worker_protocol::WORKER_MODE_ARG));
+    std::env::args_os().any(|arg| arg == bare || arg == flag)
 }

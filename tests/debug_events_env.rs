@@ -41,7 +41,7 @@ mod unix {
         let output = time::timeout(
             Duration::from_secs(15),
             Command::new(exe)
-                .arg("--debug-events-dir")
+                .arg("--debug-dir")
                 .arg(&debug_dir)
                 .arg("--interpreter")
                 .arg("python")
@@ -78,7 +78,7 @@ mod unix {
         let output = time::timeout(
             Duration::from_secs(15),
             Command::new(exe)
-                .arg("--debug-events-dir")
+                .arg("--debug-dir")
                 .arg(&debug_dir)
                 .arg("--interpreter")
                 .arg("python")

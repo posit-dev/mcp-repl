@@ -12,6 +12,8 @@ from pathlib import Path
 CHUNK_SIZE = 65536
 LOG_DIR_NAME = ".mcp-repl-trace"
 FORWARD_STDERR_ENV = "MCP_REPL_TRACE_FORWARD_STDERR"
+DEBUG_DIR_ENV = "MCP_REPL_DEBUG_DIR"
+DEBUG_SESSION_DIR_ENV = "MCP_REPL_DEBUG_SESSION_DIR"
 STREAM_META = {
     "stdin": {"route": "mcp_client -> mcp_server"},
     "stdout": {"route": "mcp_server -> mcp_client"},
@@ -35,10 +37,42 @@ def now_ms():
     return time.time_ns() // 1_000_000
 
 
+def make_session_dir(base_dir: Path) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"session-{now_ms()}-{os.getpid()}"
+    for suffix in range(1000):
+        name = stem if suffix == 0 else f"{stem}-{suffix}"
+        session_dir = base_dir / name
+        try:
+            session_dir.mkdir(parents=False, exist_ok=False)
+            return session_dir
+        except FileExistsError:
+            continue
+    raise RuntimeError("failed to allocate unique debug session directory")
+
+
+def resolve_log_dir() -> Path:
+    session_dir = os.environ.get(DEBUG_SESSION_DIR_ENV)
+    if session_dir:
+        path = Path(session_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    debug_dir = os.environ.get(DEBUG_DIR_ENV)
+    if debug_dir:
+        path = make_session_dir(Path(debug_dir))
+        os.environ[DEBUG_SESSION_DIR_ENV] = str(path)
+        return path
+
+    path = Path.cwd() / LOG_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def make_log_paths() -> tuple[Path, Path]:
-    cwd = Path.cwd()
-    log_dir = cwd / LOG_DIR_NAME
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = resolve_log_dir()
+    if log_dir.name.startswith("session-"):
+        return log_dir / "wire.jsonl", log_dir / "wire.pretty.json"
     stem = f"trace-{now_ms()}-{os.getpid()}"
     return log_dir / f"{stem}.jsonl", log_dir / f"{stem}.pretty.json"
 
@@ -143,12 +177,14 @@ def main():
         visible_env=filtered_prefixed_env(("MCP_", "CODEX_", "CLAUDE_")),
     )
 
+    child_env = os.environ.copy()
     child = subprocess.Popen(
         real_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        env=child_env,
     )
     log.write("child_spawned", child_pid=child.pid)
 
