@@ -112,7 +112,12 @@ where
     I: IntoIterator,
     I::Item: Into<std::ffi::OsString>,
 {
-    let mut args = args.into_iter().map(Into::into);
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "install") {
+        return None;
+    }
+
+    let mut args = args.into_iter();
     let mut parsed = None;
     while let Some(arg) = args.next() {
         if arg == "--debug-dir" {
@@ -195,6 +200,13 @@ mod tests {
     fn parse_debug_dir_arg_uses_last_occurrence() {
         let parsed = parse_debug_dir_arg(["--debug-dir=/tmp/first", "--debug-dir", "/tmp/final"]);
         assert_eq!(parsed, Some(PathBuf::from("/tmp/final")));
+    }
+
+    #[test]
+    fn parse_debug_dir_arg_ignores_install_passthrough_args() {
+        let parsed =
+            parse_debug_dir_arg(["install", "--arg", "--debug-dir", "--arg", "/tmp/final"]);
+        assert_eq!(parsed, None);
     }
 
     #[test]
