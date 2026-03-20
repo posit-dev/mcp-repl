@@ -43,6 +43,7 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 #[derive(Clone)]
 struct SharedServer {
     backend: Backend,
+    server_name: String,
     worker: Arc<Mutex<WorkerManager>>,
     claude_client_context: Option<ClaudeClientContext>,
     claude_clear_binding: Arc<Mutex<Option<ClaudeClearBinding>>>,
@@ -50,17 +51,22 @@ struct SharedServer {
 }
 
 impl SharedServer {
-    fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    fn new(
+        backend: Backend,
+        server_name: &str,
+        sandbox_plan: SandboxCliPlan,
+    ) -> Result<Self, WorkerError> {
         let claude_client_context = crate::claude::detect_client_context();
         let claude_clear_binding = Arc::new(Mutex::new(None));
         if let Some(context) = claude_client_context.as_ref() {
             *claude_clear_binding
                 .lock()
                 .expect("claude clear binding mutex poisoned") =
-                ClaudeClearBinding::maybe_register(backend, context)?;
+                ClaudeClearBinding::maybe_register(backend, server_name, context)?;
         }
         Ok(Self {
             backend,
+            server_name: server_name.to_string(),
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
             claude_client_context,
             claude_clear_binding,
@@ -81,6 +87,7 @@ impl SharedServer {
         let claude_client_context = self.claude_client_context.clone();
         let claude_clear_binding = self.claude_clear_binding.clone();
         let backend = self.backend;
+        let server_name = self.server_name.clone();
         tokio::task::spawn_blocking(move || {
             let mut worker = worker.lock().unwrap();
             let awaiting_initial_sandbox_state_update =
@@ -96,8 +103,11 @@ impl SharedServer {
                         ClaudeBindingRefresh::MissingCurrentSession
                     );
                 } else {
-                    *claude_clear_binding =
-                        ClaudeClearBinding::maybe_register_late(backend, claude_client_context)?;
+                    *claude_clear_binding = ClaudeClearBinding::maybe_register_late(
+                        backend,
+                        &server_name,
+                        claude_client_context,
+                    )?;
                 }
                 if clear_stale_binding {
                     *claude_clear_binding = None;
@@ -378,9 +388,13 @@ macro_rules! define_backend_tool_server {
 
         #[tool_router]
         impl $server_ty {
-            fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+            fn new(
+                backend: Backend,
+                server_name: &str,
+                sandbox_plan: SandboxCliPlan,
+            ) -> Result<Self, WorkerError> {
                 Ok(Self {
-                    shared: SharedServer::new(backend, sandbox_plan)?,
+                    shared: SharedServer::new(backend, server_name, sandbox_plan)?,
                     tool_router: Self::tool_router(),
                 })
             }
@@ -559,6 +573,7 @@ where
 
 pub async fn run(
     backend: Backend,
+    server_name: &str,
     sandbox_plan: SandboxCliPlan,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
@@ -566,15 +581,16 @@ pub async fn run(
         "server_run_begin",
         json!({
             "backend": format!("{backend:?}"),
+            "server_name": server_name,
         }),
     );
     match backend {
         Backend::R => {
-            let service = RToolServer::new(backend, sandbox_plan)?;
+            let service = RToolServer::new(backend, server_name, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
         Backend::Python => {
-            let service = PythonToolServer::new(backend, sandbox_plan)?;
+            let service = PythonToolServer::new(backend, server_name, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
     }

@@ -42,6 +42,7 @@ struct CliOptions {
     sandbox_plan: SandboxCliPlan,
     debug_repl: bool,
     backend: Backend,
+    server_name: String,
     debug_events_dir: Option<PathBuf>,
 }
 
@@ -87,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Backend::R => "r".to_string(),
                         Backend::Python => "python".to_string(),
                     },
+                    server_name: options.server_name.clone(),
                     debug_repl: options.debug_repl,
                     sandbox_state: None,
                 },
@@ -96,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return debug_repl::run(options.backend, options.sandbox_plan);
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend, options.sandbox_plan).await
+            server::run(options.backend, &options.server_name, options.sandbox_plan).await
         }
         CliCommand::Install(options) => install::run(options),
         CliCommand::ClaudeHook(command) => claude::run_hook(command),
@@ -133,6 +135,7 @@ fn parse_cli_args_with_parser(
     let mut debug_repl = false;
     let mut debug_events_dir = None;
     let mut backend = backend_from_env()?;
+    let mut server_name = None;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -241,19 +244,42 @@ fn parse_cli_args_with_parser(
                 }
                 debug_events_dir = Some(PathBuf::from(value));
             }
+            "--server-name" => {
+                let value = parser.next_value("--server-name")?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --server-name".into());
+                }
+                server_name = Some(value);
+            }
+            _ if arg.starts_with("--server-name=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --server-name".into());
+                }
+                server_name = Some(value.to_string());
+            }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
                 None => return Err(format!("unknown argument: {arg}").into()),
             },
         }
     }
+    let backend = backend.unwrap_or(Backend::R);
 
     Ok(CliCommand::RunServer(CliOptions {
         sandbox_plan: sandbox_args.plan,
         debug_repl,
-        backend: backend.unwrap_or(Backend::R),
+        backend,
+        server_name: server_name.unwrap_or_else(|| default_server_name(backend).to_string()),
         debug_events_dir,
     }))
+}
+
+fn default_server_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::R => "r",
+        Backend::Python => "python",
+    }
 }
 
 fn parse_claude_hook_args(

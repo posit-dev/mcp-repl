@@ -87,6 +87,7 @@ struct ClaudeClearBindingInner {
 #[derive(Debug, Clone)]
 struct InstanceRecordTemplate {
     backend: String,
+    server_name: String,
     pid: u32,
     cwd: Option<String>,
     started_unix_ms: u128,
@@ -148,6 +149,8 @@ struct InstanceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     env_file_path: Option<String>,
     backend: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    server_name: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
@@ -159,6 +162,12 @@ struct InstanceRecord {
 struct LoadedInstanceRecord {
     path: PathBuf,
     record: InstanceRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvFileSyntax {
+    Posix,
+    Windows,
 }
 
 impl ClaudeRuntimeMode {
@@ -205,20 +214,23 @@ impl ClaudeRuntimeMode {
 impl ClaudeClearBinding {
     pub fn maybe_register(
         backend: Backend,
+        server_name: &str,
         context: &ClaudeClientContext,
     ) -> Result<Option<Self>, WorkerError> {
-        Self::maybe_register_with_initial_seq(backend, 0, context)
+        Self::maybe_register_with_initial_seq(backend, server_name, 0, context)
     }
 
     pub fn maybe_register_late(
         backend: Backend,
+        server_name: &str,
         context: &ClaudeClientContext,
     ) -> Result<Option<Self>, WorkerError> {
-        Self::maybe_register_with_initial_seq(backend, 1, context)
+        Self::maybe_register_with_initial_seq(backend, server_name, 1, context)
     }
 
     fn maybe_register_with_initial_seq(
         backend: Backend,
+        server_name: &str,
         initial_control_seq: u64,
         context: &ClaudeClientContext,
     ) -> Result<Option<Self>, WorkerError> {
@@ -229,6 +241,7 @@ impl ClaudeClearBinding {
         };
         let record_template = InstanceRecordTemplate {
             backend: backend_label.to_string(),
+            server_name: server_name.to_string(),
             pid: process_identity.pid,
             cwd: env::current_dir()
                 .ok()
@@ -506,6 +519,13 @@ fn current_claude_env_file_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn current_env_file_syntax() -> EnvFileSyntax {
+    if cfg!(windows) {
+        return EnvFileSyntax::Windows;
+    }
+    EnvFileSyntax::Posix
+}
+
 fn test_scope_key_env() -> Option<String> {
     if let Ok(scope_key) = env::var(CLAUDE_TEST_SCOPE_KEY_ENV)
         && !scope_key.trim().is_empty()
@@ -733,6 +753,7 @@ fn resolve_scope_session_id_in(
     let claimed_active_sessions = live_scope_records
         .iter()
         .filter(|record| record.record.backend == record_template.backend)
+        .filter(|record| instance_record_server_name(&record.record) == record_template.server_name)
         .map(|record| record.record.claude_session_id.clone())
         .collect::<HashSet<_>>();
     if !claimed_active_sessions.contains(&current_session_id) {
@@ -791,10 +812,11 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some(line) = line.strip_prefix("export ") else {
-            continue;
-        };
-        let Some((key, value)) = line.split_once('=') else {
+        let assignment = line
+            .strip_prefix("export ")
+            .or_else(|| line.strip_prefix("set "))
+            .unwrap_or(line);
+        let Some((key, value)) = assignment.split_once('=') else {
             continue;
         };
         if key.trim() != CLAUDE_SESSION_ID_ENV {
@@ -813,6 +835,29 @@ fn decode_session_id_token(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn session_env_file_line(session_id: &str, syntax: EnvFileSyntax) -> String {
+    let encoded_session_id = URL_SAFE_NO_PAD.encode(session_id);
+    match syntax {
+        EnvFileSyntax::Posix => {
+            format!(
+                "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
+            )
+        }
+        EnvFileSyntax::Windows => {
+            format!(
+                "set {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
+            )
+        }
+    }
+}
+
+fn default_server_name_for_backend_label(backend: &str) -> &str {
+    match backend {
+        "python" => "python",
+        _ => "r",
+    }
+}
+
 fn append_session_id_export(path: &Path, session_id: &str) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -824,10 +869,10 @@ fn append_session_id_export(path: &Path, session_id: &str) -> io::Result<()> {
     if needs_separator {
         writeln!(file)?;
     }
-    let encoded_session_id = URL_SAFE_NO_PAD.encode(session_id);
     writeln!(
         file,
-        "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
+        "{}",
+        session_env_file_line(session_id, current_env_file_syntax())
     )?;
     Ok(())
 }
@@ -1005,11 +1050,19 @@ fn instance_record(
         scope_key,
         env_file_path,
         backend: template.backend.clone(),
+        server_name: template.server_name.clone(),
         pid: template.pid,
         cwd: template.cwd.clone(),
         started_unix_ms: template.started_unix_ms,
         control_seq,
     }
+}
+
+fn instance_record_server_name(record: &InstanceRecord) -> &str {
+    if record.server_name.is_empty() {
+        return default_server_name_for_backend_label(&record.backend);
+    }
+    record.server_name.as_str()
 }
 
 fn read_full_instance_record(path: &Path) -> Option<InstanceRecord> {
@@ -1264,8 +1317,8 @@ mod tests {
 
     fn session_export_line(session_id: &str) -> String {
         format!(
-            "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{}\n",
-            URL_SAFE_NO_PAD.encode(session_id)
+            "{}\n",
+            session_env_file_line(session_id, EnvFileSyntax::Posix)
         )
     }
 
@@ -1329,7 +1382,10 @@ mod tests {
         handle_session_start(&input).expect("handle session start");
 
         let raw = fs::read_to_string(&env_file).expect("read env file");
-        assert!(raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=mcp_repl_session_id_b64_"));
+        assert!(raw.contains(&session_env_file_line(
+            "sess-start",
+            current_env_file_syntax()
+        )));
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
@@ -1403,6 +1459,7 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file_a.to_string_lossy().to_string()),
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1417,6 +1474,7 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file_b.to_string_lossy().to_string()),
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1471,6 +1529,7 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file.to_string_lossy().to_string()),
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1520,6 +1579,7 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file.to_string_lossy().to_string()),
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1570,7 +1630,10 @@ mod tests {
 
         let raw = fs::read_to_string(&env_file).expect("read env file");
         assert!(
-            raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=mcp_repl_session_id_b64_"),
+            raw.contains(&session_env_file_line(
+                "sess-no-state-home",
+                current_env_file_syntax()
+            )),
             "expected session start to append the env-file token without HOME/XDG_STATE_HOME"
         );
 
@@ -1624,6 +1687,7 @@ mod tests {
             &runtime,
             &InstanceRecordTemplate {
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: std::process::id(),
                 cwd: None,
                 started_unix_ms: 1,
@@ -1667,7 +1731,7 @@ mod tests {
 
         let context = detect_client_context().expect("claude context");
         let binding =
-            ClaudeClearBinding::maybe_register(Backend::R, &context).expect("maybe register");
+            ClaudeClearBinding::maybe_register(Backend::R, "r", &context).expect("maybe register");
         assert!(
             binding.is_none(),
             "expected env-file-only startup without HOME/XDG_STATE_HOME to skip Claude clear binding"
@@ -1837,6 +1901,7 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1850,6 +1915,7 @@ mod tests {
             &runtime,
             &InstanceRecordTemplate {
                 backend: "python".to_string(),
+                server_name: "python".to_string(),
                 pid: std::process::id(),
                 cwd: None,
                 started_unix_ms: 2,
@@ -1917,6 +1983,7 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -1930,6 +1997,7 @@ mod tests {
             &runtime,
             &InstanceRecordTemplate {
                 backend: "python".to_string(),
+                server_name: "python".to_string(),
                 pid: std::process::id(),
                 cwd: None,
                 started_unix_ms: 2,
@@ -1991,6 +2059,7 @@ mod tests {
             &runtime,
             &InstanceRecordTemplate {
                 backend: "python".to_string(),
+                server_name: "python".to_string(),
                 pid: std::process::id(),
                 cwd: None,
                 started_unix_ms: 2,
@@ -2062,6 +2131,7 @@ mod tests {
                     scope_key: Some(scope_key.clone()),
                     env_file_path: None,
                     backend: "python".to_string(),
+                    server_name: "python".to_string(),
                     pid: live_process.pid,
                     cwd: None,
                     started_unix_ms: live_process.started_unix_ms,
@@ -2076,6 +2146,7 @@ mod tests {
             &runtime,
             &InstanceRecordTemplate {
                 backend: "python".to_string(),
+                server_name: "python".to_string(),
                 pid: std::process::id(),
                 cwd: None,
                 started_unix_ms: 3,
@@ -2122,6 +2193,7 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: live_process.pid,
                 cwd: None,
                 started_unix_ms: live_process.started_unix_ms,
@@ -2227,6 +2299,39 @@ mod tests {
     }
 
     #[test]
+    fn current_claude_session_id_reads_windows_set_syntax_from_env_file() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-current-session-windows-");
+        let env_file = temp.path().join("claude.env");
+        fs::write(
+            &env_file,
+            format!(
+                "{}\n{}\n",
+                session_env_file_line("sess-old", EnvFileSyntax::Windows),
+                session_env_file_line("sess-latest", EnvFileSyntax::Windows)
+            ),
+        )
+        .expect("write env file");
+
+        let binding_session =
+            current_claude_session_from_env_file_with_path(&env_file).expect("binding session");
+        assert_eq!(binding_session.session_id, "sess-latest");
+    }
+
+    #[test]
+    fn session_env_file_line_uses_windows_assignment_syntax() {
+        let line = session_env_file_line("sess-windows", EnvFileSyntax::Windows);
+        assert!(
+            line.starts_with("set MCP_REPL_CLAUDE_SESSION_ID="),
+            "expected Windows env file lines to use `set`, got: {line:?}"
+        );
+        assert!(
+            !line.starts_with("export "),
+            "expected Windows env file lines not to use POSIX export syntax"
+        );
+    }
+
+    #[test]
     fn maybe_register_ignores_malformed_env_file_lines_after_valid_session_export() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-register-");
@@ -2244,7 +2349,7 @@ mod tests {
 
         let context = detect_client_context().expect("claude context");
         let binding =
-            ClaudeClearBinding::maybe_register(Backend::R, &context).expect("maybe register");
+            ClaudeClearBinding::maybe_register(Backend::R, "r", &context).expect("maybe register");
         assert!(
             binding.is_some(),
             "expected claude binding to load session id from env file"
@@ -2310,7 +2415,7 @@ mod tests {
         }
 
         let context = detect_client_context().expect("claude context");
-        let binding = ClaudeClearBinding::maybe_register(Backend::Python, &context)
+        let binding = ClaudeClearBinding::maybe_register(Backend::Python, "python", &context)
             .expect("maybe register")
             .expect("expected claude binding");
         request_restart(&binding.inner.record_path).expect("queue restart request");
@@ -2413,6 +2518,7 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some("/tmp/env".to_string()),
                 backend: "r".to_string(),
+                server_name: "r".to_string(),
                 pid: 1,
                 cwd: None,
                 started_unix_ms: 1,
@@ -2427,6 +2533,7 @@ mod tests {
                 scope_key: Some("scope".to_string()),
                 env_file_path: None,
                 backend: "python".to_string(),
+                server_name: "python".to_string(),
                 pid: 2,
                 cwd: Some("/tmp".to_string()),
                 started_unix_ms: 2,

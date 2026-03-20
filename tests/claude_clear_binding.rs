@@ -1059,6 +1059,104 @@ async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_scope_claims_are_isolated_per_server_name() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let env_vars = claude_scope_env_vars(temp.path(), "scope-server-name");
+
+    run_session_start_with_env(&exe, &env_vars, "sess-a")?;
+    run_session_start_with_env(&exe, &env_vars, "sess-b")?;
+
+    let mut primary = common::spawn_server_with_env_vars(env_vars.clone()).await?;
+    let primary_ready = match repl_text(
+        &mut primary,
+        "primary_scope_state <- 1; print(exists(\"primary_scope_state\"))",
+        "before same-backend multi-server clear on primary server",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            primary.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        primary_ready.contains("TRUE"),
+        "expected primary same-backend server to bind current scope session, got: {primary_ready:?}"
+    );
+
+    let mut alternate = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec!["--server-name".to_string(), "r-alt".to_string()],
+        env_vars.clone(),
+        300,
+    )
+    .await?;
+    let alternate_ready = match repl_text(
+        &mut alternate,
+        "alternate_scope_state <- 1; print(exists(\"alternate_scope_state\"))",
+        "before same-backend multi-server clear on alternate server",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            primary.cancel().await?;
+            alternate.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        alternate_ready.contains("TRUE"),
+        "expected alternate same-backend server to bind the same current scope session, got: {alternate_ready:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars, "sess-b")?;
+
+    let primary_after_clear = match repl_text(
+        &mut primary,
+        "print(exists(\"primary_scope_state\"))",
+        "after same-backend multi-server clear on primary server",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            primary.cancel().await?;
+            alternate.cancel().await?;
+            return Ok(());
+        }
+    };
+    let alternate_after_clear = match repl_text(
+        &mut alternate,
+        "print(exists(\"alternate_scope_state\"))",
+        "after same-backend multi-server clear on alternate server",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            primary.cancel().await?;
+            alternate.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    primary.cancel().await?;
+    alternate.cancel().await?;
+    assert!(
+        primary_after_clear.contains("FALSE"),
+        "expected clear for the current scope session to reset the primary same-backend server, got: {primary_after_clear:?}"
+    );
+    assert!(
+        alternate_after_clear.contains("FALSE"),
+        "expected clear for the current scope session to reset the alternate same-backend server too, got: {alternate_after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_ignores_stale_scope_record_with_reused_pid() -> TestResult<()> {
     let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;

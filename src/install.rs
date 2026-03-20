@@ -122,7 +122,10 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
             InstallTarget::Codex => {
                 let path = root.join("config.toml");
                 for (server_name, interpreter) in &server_specs {
-                    let server_args = with_interpreter_arg(&codex_args, *interpreter);
+                    let server_args = with_server_name_arg(
+                        &with_interpreter_arg(&codex_args, *interpreter),
+                        server_name,
+                    );
                     upsert_codex_mcp_server(&path, server_name, &command, &server_args)?;
                 }
                 println!("Updated codex MCP config: {}", path.display());
@@ -135,7 +138,10 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                     fs::create_dir_all(&settings_dir)?;
                 }
                 for (server_name, interpreter) in &server_specs {
-                    let server_args = with_interpreter_arg(&claude_args, *interpreter);
+                    let server_args = with_server_name_arg(
+                        &with_interpreter_arg(&claude_args, *interpreter),
+                        server_name,
+                    );
                     upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
                     upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
@@ -347,6 +353,28 @@ fn with_interpreter_arg(base_args: &[String], interpreter: InstallInterpreter) -
     let mut args = base_args.to_vec();
     args.push("--interpreter".to_string());
     args.push(interpreter.cli_value().to_string());
+    args
+}
+
+fn with_server_name_arg(base_args: &[String], server_name: &str) -> Vec<String> {
+    let mut iter = base_args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--server-name" {
+            if iter.next().is_some_and(|value| value == server_name) {
+                return base_args.to_vec();
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--server-name=")
+            && value == server_name
+        {
+            return base_args.to_vec();
+        }
+    }
+
+    let mut args = base_args.to_vec();
+    args.push("--server-name".to_string());
+    args.push(server_name.to_string());
     args
 }
 
@@ -1301,6 +1329,52 @@ name="demo"
                 "workspace-write".to_string(),
                 "--interpreter".to_string(),
                 "python".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_server_name_arg_adds_server_name_when_missing() {
+        let args = with_server_name_arg(
+            &[
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ],
+            "python-alt",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--server-name".to_string(),
+                "python-alt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_server_name_arg_preserves_matching_server_name() {
+        let args = with_server_name_arg(
+            &[
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--server-name".to_string(),
+                "r-alt".to_string(),
+            ],
+            "r-alt",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--server-name".to_string(),
+                "r-alt".to_string(),
             ]
         );
     }

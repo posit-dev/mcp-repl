@@ -16,6 +16,7 @@ static LOGGER: OnceLock<Option<Arc<EventLogger>>> = OnceLock::new();
 pub struct StartupContext {
     pub mode: String,
     pub backend: String,
+    pub server_name: String,
     pub debug_repl: bool,
     pub sandbox_state: Option<String>,
 }
@@ -129,6 +130,7 @@ fn startup_payload(context: &StartupContext, file_path: &Path) -> JsonValue {
     json!({
         "mode": context.mode,
         "backend": context.backend,
+        "server_name": context.server_name,
         "debug_repl": context.debug_repl,
         "sandbox_state": context.sandbox_state,
         "cwd": cwd,
