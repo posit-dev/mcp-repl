@@ -3259,24 +3259,16 @@ impl WorkerProcess {
     }
 
     fn cleanup_session_tmpdir(&self) {
-        if std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR").is_some() {
-            return;
-        }
         let Some(path) = self.session_tmpdir.as_ref() else {
             return;
         };
         if !path.is_absolute() || path.as_path() == std::path::Path::new("/") {
             return;
         }
-        persist_worker_startup_log(
+        cleanup_worker_session_tmpdir(
             path,
             crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
         );
-        if let Err(err) = std::fs::remove_dir_all(path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("Failed to remove worker session temp dir: {err}");
-        }
     }
 
     #[cfg(target_os = "macos")]
@@ -3311,6 +3303,18 @@ fn persist_worker_startup_log(session_tmpdir: &Path, destination: Option<PathBuf
             "Failed to persist worker startup log to {}: {err}",
             destination.display()
         );
+    }
+}
+
+fn cleanup_worker_session_tmpdir(session_tmpdir: &Path, worker_log_destination: Option<PathBuf>) {
+    persist_worker_startup_log(session_tmpdir, worker_log_destination);
+    if std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR").is_some() {
+        return;
+    }
+    if let Err(err) = std::fs::remove_dir_all(session_tmpdir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("Failed to remove worker session temp dir: {err}");
     }
 }
 
@@ -4013,6 +4017,44 @@ mod tests {
 
         persist_worker_startup_log(&session_tmpdir, Some(destination.clone()));
 
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read destination log"),
+            "worker startup log\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_worker_session_tmpdir_persists_log_when_keep_tmpdir_is_set() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        let debug_session_dir = temp.path().join("debug-session");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::create_dir_all(&debug_session_dir).expect("create debug session dir");
+
+        let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        let destination = debug_session_dir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        std::fs::write(&source, "worker startup log\n").expect("write source log");
+
+        let original_keep = std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR");
+        unsafe {
+            std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", "1");
+        }
+
+        cleanup_worker_session_tmpdir(&session_tmpdir, Some(destination.clone()));
+
+        match original_keep {
+            Some(value) => unsafe {
+                std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("MCP_REPL_KEEP_SESSION_TMPDIR");
+            },
+        }
+
+        assert!(
+            session_tmpdir.is_dir(),
+            "session tmpdir should be preserved"
+        );
         assert_eq!(
             std::fs::read_to_string(&destination).expect("read destination log"),
             "worker startup log\n"
