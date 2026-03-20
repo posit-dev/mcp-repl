@@ -9,6 +9,7 @@ static STARTUP_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static STARTUP_LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 pub(crate) const STARTUP_LOG_FILE_NAME: &str = "startup.log";
 pub(crate) const WORKER_STARTUP_LOG_FILE_NAME: &str = "worker-startup.log";
+pub(crate) const STARTUP_LOG_PATH_ENV: &str = "MCP_REPL_STARTUP_LOG_PATH";
 
 fn startup_epoch() -> Instant {
     *STARTUP_EPOCH.get_or_init(Instant::now)
@@ -17,6 +18,12 @@ fn startup_epoch() -> Instant {
 fn startup_log_path() -> Option<&'static PathBuf> {
     STARTUP_LOG_PATH
         .get_or_init(|| {
+            if let Some(path) = std::env::var_os(STARTUP_LOG_PATH_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+            {
+                return Some(path);
+            }
             let file_name = if is_worker_mode() {
                 WORKER_STARTUP_LOG_FILE_NAME
             } else {
