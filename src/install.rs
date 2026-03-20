@@ -74,7 +74,6 @@ impl InstallTarget {
 pub struct InstallOptions {
     pub targets: Vec<InstallTarget>,
     pub interpreters: Vec<InstallInterpreter>,
-    pub command: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -85,7 +84,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let command = options.command.unwrap_or_else(default_command);
+    let command = default_command();
     let targets = resolve_target_roots(&options.targets)?;
     let codex_args = codex_install_args(&options.args);
     let claude_args = claude_install_args(&options.args);
@@ -983,7 +982,6 @@ name="demo"
         let err = run(InstallOptions {
             targets: vec![InstallTarget::Codex],
             interpreters: vec![InstallInterpreter::R],
-            command: Some("/path/to/mcp-repl".to_string()),
             args: vec!["--interpreter".to_string(), "python".to_string()],
         })
         .expect_err("expected rejection");
