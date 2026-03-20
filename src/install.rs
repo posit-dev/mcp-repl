@@ -835,12 +835,6 @@ fn is_managed_claude_hook_command(
     command_args: &[String],
     hook_subcommand: &str,
 ) -> bool {
-    let Ok(argv) = shell_words::split(command) else {
-        return false;
-    };
-    let Some(prefix) = claude_hook_command_prefix(&argv, hook_subcommand) else {
-        return false;
-    };
     if hook_obj
         .get(MANAGED_CLAUDE_HOOK_KEY)
         .and_then(JsonValue::as_bool)
@@ -848,6 +842,12 @@ fn is_managed_claude_hook_command(
     {
         return true;
     }
+    let Ok(argv) = shell_words::split(command) else {
+        return false;
+    };
+    let Some(prefix) = claude_hook_command_prefix(&argv, hook_subcommand) else {
+        return false;
+    };
 
     let expected_prefix = std::iter::once(command_program)
         .chain(command_args.iter().map(String::as_str))
@@ -2028,6 +2028,73 @@ name="demo"
         assert!(
             commands.contains(&expected_session_start.as_str()),
             "expected managed Claude hook command to be added"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_replaces_marked_windows_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        let stale_windows_command = claude_hook_command_for_shell(
+            r"C:\Program Files\mcp-repl.exe",
+            &[r"--config=C:\Users\alice\AppData\Roaming\mcp-repl\".to_string()],
+            "session-start",
+            HookCommandShell::Windows,
+        );
+        let expected_session_start = claude_hook_command(
+            "/usr/local/bin/mcp-repl",
+            &["--config=/tmp/mcp-repl.toml".to_string()],
+            "session-start",
+        );
+
+        fs::write(
+            &settings,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": stale_windows_command,
+                                    "mcpReplManaged": true
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        upsert_claude_settings_hooks(
+            &settings,
+            "/usr/local/bin/mcp-repl",
+            &["--config=/tmp/mcp-repl.toml".to_string()],
+        )
+        .expect("upsert hooks");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let startup = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array")
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some("startup"))
+            .expect("startup matcher entry");
+        let commands: Vec<&str> = startup["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![expected_session_start.as_str()],
+            "expected marked Windows managed command to be replaced"
         );
     }
 
