@@ -38,12 +38,10 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     std::fs::create_dir_all(&codex_home)?;
     let exe = resolve_exe()?;
 
-    let status = Command::new(exe)
+    let status = Command::new(&exe)
         .arg("install")
         .arg("--client")
         .arg("codex")
-        .arg("--command")
-        .arg("/usr/local/bin/mcp-repl")
         .env("CODEX_HOME", &codex_home)
         .status()?;
     assert!(
@@ -62,6 +60,11 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert!(
         doc["mcp_servers"]["python"].is_table(),
         "expected mcp_servers.python table"
+    );
+    assert_eq!(
+        doc["mcp_servers"]["r"]["command"].as_str(),
+        Some(exe.to_string_lossy().as_ref()),
+        "expected install to register the current executable path"
     );
 
     let r_args = doc["mcp_servers"]["r"]["args"]
@@ -104,12 +107,10 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let exe = resolve_exe()?;
 
-    let status = Command::new(exe)
+    let status = Command::new(&exe)
         .arg("install")
         .arg("--client")
         .arg("claude")
-        .arg("--command")
-        .arg("/usr/local/bin/mcp-repl")
         .env("HOME", temp.path())
         .status()?;
     assert!(
@@ -126,6 +127,11 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         .expect("expected mcpServers object");
     assert!(servers.contains_key("r"), "expected r server");
     assert!(servers.contains_key("python"), "expected python server");
+    assert_eq!(
+        root["mcpServers"]["r"]["command"].as_str(),
+        Some(exe.to_string_lossy().as_ref()),
+        "expected install to register the current executable path"
+    );
 
     let r_args = root["mcpServers"]["r"]["args"]
         .as_array()
@@ -172,8 +178,6 @@ fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     for cmd in ["install-codex", "install-claude"] {
         let status = Command::new(&exe)
             .arg(cmd)
-            .arg("--command")
-            .arg("/usr/local/bin/mcp-repl")
             .env("CODEX_HOME", &codex_home)
             .env("HOME", temp.path())
             .status()?;
@@ -197,8 +201,6 @@ fn install_rejects_empty_client_selector() -> TestResult<()> {
         .arg("install")
         .arg("--client")
         .arg(",")
-        .arg("--command")
-        .arg("/usr/local/bin/mcp-repl")
         .env("CODEX_HOME", &codex_home)
         .env("HOME", temp.path())
         .status()?;
@@ -212,6 +214,75 @@ fn install_rejects_empty_client_selector() -> TestResult<()> {
 }
 
 #[test]
+fn install_rejects_server_name_flag() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("codex")
+        .arg("--server-name")
+        .arg("custom")
+        .env("CODEX_HOME", &codex_home)
+        .status()?;
+
+    assert!(
+        !status.success(),
+        "expected install with --server-name to fail"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn install_rejects_command_flag() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("codex")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("CODEX_HOME", &codex_home)
+        .status()?;
+
+    assert!(!status.success(), "expected install with --command to fail");
+
+    Ok(())
+}
+
+#[test]
+fn install_rejects_positional_target_selector() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    for target in ["codex", "claude"] {
+        let status = Command::new(&exe)
+            .arg("install")
+            .arg(target)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", temp.path())
+            .status()?;
+
+        assert!(
+            !status.success(),
+            "expected install {target} to fail without --client"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn install_subcommands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
@@ -220,8 +291,6 @@ fn install_subcommands_are_rejected() -> TestResult<()> {
 
     let codex_status = Command::new(&exe)
         .arg("install-codex")
-        .arg("--command")
-        .arg("/usr/local/bin/mcp-repl")
         .env("CODEX_HOME", &codex_home)
         .status()?;
     assert!(
@@ -231,8 +300,6 @@ fn install_subcommands_are_rejected() -> TestResult<()> {
 
     let claude_status = Command::new(exe)
         .arg("install-claude")
-        .arg("--command")
-        .arg("/usr/local/bin/mcp-repl")
         .env("HOME", temp.path())
         .status()?;
     assert!(

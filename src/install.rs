@@ -74,9 +74,6 @@ impl InstallTarget {
 pub struct InstallOptions {
     pub targets: Vec<InstallTarget>,
     pub interpreters: Vec<InstallInterpreter>,
-    pub server_name: String,
-    pub server_name_explicit: bool,
-    pub command: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -87,31 +84,15 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let command = options.command.unwrap_or_else(default_command);
+    let command = default_command();
     let targets = resolve_target_roots(&options.targets)?;
     let codex_args = codex_install_args(&options.args);
     let claude_args = claude_install_args(&options.args);
     let interpreters = effective_interpreters(&options.interpreters);
-    let mut server_specs = Vec::new();
-    let mut used_server_names = std::collections::BTreeSet::new();
-    for (idx, interpreter) in interpreters.iter().enumerate() {
-        let server_name = if idx == 0 {
-            if options.server_name_explicit {
-                options.server_name.clone()
-            } else {
-                interpreter.default_server_name().to_string()
-            }
-        } else {
-            interpreter.default_server_name().to_string()
-        };
-        if !used_server_names.insert(server_name.clone()) {
-            return Err(format!(
-                "duplicate server name generated for install: {server_name} (check --server-name and --interpreter values)"
-            )
-            .into());
-        }
-        server_specs.push((server_name, *interpreter));
-    }
+    let server_specs: Vec<(String, InstallInterpreter)> = interpreters
+        .iter()
+        .map(|interpreter| (interpreter.default_server_name().to_string(), *interpreter))
+        .collect();
 
     for (target, root) in targets {
         match target {
@@ -1001,9 +982,6 @@ name="demo"
         let err = run(InstallOptions {
             targets: vec![InstallTarget::Codex],
             interpreters: vec![InstallInterpreter::R],
-            server_name: DEFAULT_R_SERVER_NAME.to_string(),
-            server_name_explicit: false,
-            command: Some("/path/to/mcp-repl".to_string()),
             args: vec!["--interpreter".to_string(), "python".to_string()],
         })
         .expect_err("expected rejection");

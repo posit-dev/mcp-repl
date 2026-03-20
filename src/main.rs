@@ -110,10 +110,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     let mut parser = ArgParser::new();
     if parser.peek() == Some("install") {
         parser.next();
-        return Ok(CliCommand::Install(parse_install_args(
-            &mut parser,
-            Vec::new(),
-        )?));
+        return Ok(CliCommand::Install(parse_install_args(&mut parser)?));
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
@@ -304,11 +301,8 @@ impl ArgParser {
 
 fn parse_install_args(
     parser: &mut ArgParser,
-    mut targets: Vec<install::InstallTarget>,
 ) -> Result<install::InstallOptions, Box<dyn std::error::Error>> {
-    let mut server_name = install::DEFAULT_R_SERVER_NAME.to_string();
-    let mut server_name_explicit = false;
-    let mut command = None;
+    let mut targets = Vec::new();
     let mut args = Vec::new();
     let mut interpreters: Vec<install::InstallInterpreter> = Vec::new();
 
@@ -340,28 +334,6 @@ fn parse_install_args(
                 }
                 parse_install_targets_value(value, &mut targets)?;
             }
-            "--server-name" => {
-                server_name = parser.next_value("--server-name")?;
-                server_name_explicit = true;
-            }
-            _ if arg.starts_with("--server-name=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --server-name".into());
-                }
-                server_name = value.to_string();
-                server_name_explicit = true;
-            }
-            "--command" => {
-                command = Some(parser.next_value("--command")?);
-            }
-            _ if arg.starts_with("--command=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --command".into());
-                }
-                command = Some(value.to_string());
-            }
             "--arg" => {
                 args.push(parser.next_value("--arg")?);
             }
@@ -376,9 +348,8 @@ fn parse_install_args(
                 if let Some(flag) = arg.strip_prefix('-') {
                     return Err(format!("unknown install option: -{flag}").into());
                 }
-                targets.push(
-                    install::InstallTarget::parse(&arg)
-                        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+                return Err(
+                    format!("unknown install argument: {arg} (use --client codex|claude)").into(),
                 );
             }
         }
@@ -387,9 +358,6 @@ fn parse_install_args(
     Ok(install::InstallOptions {
         targets,
         interpreters,
-        server_name,
-        server_name_explicit,
-        command,
         args,
     })
 }
@@ -456,7 +424,7 @@ fn print_usage() {
     println!(
         "Usage:\n\
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
-mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
@@ -473,7 +441,7 @@ install defaults to the full interpreter grid for each selected client (currentl
 fn print_install_usage() {
     println!(
         "Usage:\n\
-mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--arg <value>]...\n\n\
 If no target is specified for `install`, available targets are used:\n\
 - codex: $CODEX_HOME or ~/.codex (must exist)\n\
 - claude: ~/.claude.json (created if needed)\n\
@@ -523,14 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_install_args_defaults_server_name_to_r() {
+    fn parse_install_args_defaults_to_no_interpreters() {
         let mut parser = ArgParser {
             args: Vec::new(),
             index: 0,
         };
-        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
-        assert_eq!(parsed.server_name, "r");
-        assert!(!parsed.server_name_explicit);
+        let parsed = parse_install_args(&mut parser).expect("parse install args");
         assert!(parsed.interpreters.is_empty());
     }
 
@@ -545,7 +511,7 @@ mod tests {
             ],
             index: 0,
         };
-        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        let parsed = parse_install_args(&mut parser).expect("parse install args");
         assert_eq!(
             parsed.interpreters,
             vec![
@@ -561,7 +527,7 @@ mod tests {
             args: vec!["--interpreter=python,r".to_string()],
             index: 0,
         };
-        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        let parsed = parse_install_args(&mut parser).expect("parse install args");
         assert_eq!(
             parsed.interpreters,
             vec![
@@ -577,13 +543,40 @@ mod tests {
             args: vec!["--client".to_string(), "codex,claude".to_string()],
             index: 0,
         };
-        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        let parsed = parse_install_args(&mut parser).expect("parse install args");
         assert_eq!(
             parsed.targets,
             vec![
                 install::InstallTarget::Codex,
                 install::InstallTarget::Claude
             ]
+        );
+    }
+
+    #[test]
+    fn parse_install_args_rejects_command_flag() {
+        let mut parser = ArgParser {
+            args: vec!["--command".to_string(), "/path/to/mcp-repl".to_string()],
+            index: 0,
+        };
+        let err = parse_install_args(&mut parser).expect_err("reject --command");
+        assert!(
+            err.to_string()
+                .contains("unknown install option: --command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_install_args_rejects_positional_client_target() {
+        let mut parser = ArgParser {
+            args: vec!["codex".to_string()],
+            index: 0,
+        };
+        let err = parse_install_args(&mut parser).expect_err("reject positional target");
+        assert!(
+            err.to_string().contains("unknown install argument: codex"),
+            "unexpected error: {err}"
         );
     }
 

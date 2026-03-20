@@ -7,6 +7,7 @@ mod unix_impl {
     use super::{TestResult, common};
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::io::{ErrorKind, Read, Write};
     use std::net::SocketAddr;
     use std::os::unix::process::CommandExt;
@@ -57,11 +58,11 @@ mod unix_impl {
             return Ok(String::new());
         }
 
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console)?;
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
+        let mcp_console = resolve_mcp_console_path()?;
+        let env = create_isolated_codex_env(&mcp_console, &mock_server.base_url())?;
 
         let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
         let mode_flag = match mode {
@@ -77,7 +78,6 @@ mod unix_impl {
         let mut cmd = std::process::Command::new("sh");
         cmd.env("CODEX_HOME", env.codex_home.display().to_string());
         cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
-        cmd.env("OPENAI_BASE_URL", mock_server.base_url());
         cmd.env(
             "MCP_CONSOLE_SANDBOX_STATE_LOG",
             env.sandbox_log.display().to_string(),
@@ -140,14 +140,13 @@ mod unix_impl {
             return Ok(());
         }
 
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console)?;
-
         let workspace_args = tool_args_for_code(&sandbox_run_code());
         let full_access_probe_args = tool_args_for_code(&outside_workspace_probe_code()?);
         let mock_server =
             MockResponsesServer::start(tool_name(), workspace_args, Some(full_access_probe_args))
                 .await?;
+        let mcp_console = resolve_mcp_console_path()?;
+        let env = create_isolated_codex_env(&mcp_console, &mock_server.base_url())?;
 
         let mut driver = CodexPtyDriver::spawn(
             &env.codex_home,
@@ -255,7 +254,10 @@ mod unix_impl {
             .is_ok()
     }
 
-    fn create_isolated_codex_env(mcp_console: &Path) -> TestResult<IsolatedCodexEnv> {
+    fn create_isolated_codex_env(
+        mcp_console: &Path,
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
         let workspace = temp_dir.path().join("workspace");
         std::fs::create_dir_all(&workspace)?;
@@ -277,7 +279,7 @@ mod unix_impl {
         std::fs::create_dir_all(&sandbox_log_dir)?;
         let sandbox_log = sandbox_log_dir.join("sandbox-state.log");
 
-        let config = codex_config(mcp_console, &workspace);
+        let config = codex_config(mcp_console, &workspace, openai_base_url);
         std::fs::write(codex_home.join("config.toml"), config)?;
 
         Ok(IsolatedCodexEnv {
@@ -396,11 +398,22 @@ mod unix_impl {
             out.push('\n');
         }
 
-        Ok(out.trim_end().to_string())
+        Ok(renumber_exec_item_ids(out.trim_end()))
     }
 
     fn normalize_exec_text(text: &str, workspace: &Path, codex_home: &Path) -> String {
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
+            return String::new();
+        }
+        if text.contains("ERROR codex_api::endpoint::responses_websocket:")
+            || text.contains("WARN codex_core::session_startup_prewarm:")
+            || text
+                .contains("WARN codex_core::codex: stream disconnected - retrying sampling request")
+            || text.contains("WARN codex_core::client: falling back to HTTP")
+            || text.starts_with("Reconnecting... ")
+            || text.contains(r#""type":"error","message":"Reconnecting... "#)
+            || text.contains("Falling back from WebSockets to HTTPS transport.")
+        {
             return String::new();
         }
         let workspace_display = workspace.display().to_string();
@@ -442,6 +455,41 @@ mod unix_impl {
             text = format!("<TIMESTAMP>{}", &text[text.find(" WARN ").unwrap_or(0)..]);
         }
         text
+    }
+
+    fn renumber_exec_item_ids(text: &str) -> String {
+        let marker = r#""id":"item_"#;
+        let mut ids = BTreeMap::new();
+        let mut next_id = 0usize;
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0usize;
+
+        while let Some(pos) = text[idx..].find(marker) {
+            let start = idx + pos;
+            let digits_start = start + marker.len();
+            let mut digits_end = digits_start;
+            while digits_end < text.len() && text.as_bytes()[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if digits_end == digits_start {
+                out.push_str(&text[idx..digits_start]);
+                idx = digits_start;
+                continue;
+            }
+
+            out.push_str(&text[idx..digits_start]);
+            let original = &text[digits_start..digits_end];
+            let canonical = ids.entry(original.to_string()).or_insert_with(|| {
+                let current = next_id;
+                next_id += 1;
+                current.to_string()
+            });
+            out.push_str(canonical);
+            idx = digits_end;
+        }
+
+        out.push_str(&text[idx..]);
+        out
     }
 
     fn normalize_ms_duration(text: &str) -> String {
@@ -550,11 +598,13 @@ mod unix_impl {
         "mcp__r__repl".to_string()
     }
 
-    fn codex_config(mcp_console: &Path, repo_root: &Path) -> String {
+    fn codex_config(mcp_console: &Path, repo_root: &Path, openai_base_url: &str) -> String {
         let mcp_console = toml_escape(&mcp_console.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
+        let openai_base_url = toml_escape(openai_base_url);
         format!(
             r#"model_provider = "openai"
+openai_base_url = "{openai_base_url}"
 disable_paste_burst = true
 project_doc_max_bytes = 0
 
@@ -951,9 +1001,8 @@ tryCatch({
 
             let mut cmd = CommandBuilder::new("sh");
             let shell_script = format!(
-                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
                 sh_single_quote(&codex_home.display().to_string()),
-                sh_single_quote(base_url),
                 sh_single_quote(base_url),
                 sh_single_quote(&sandbox_log.display().to_string()),
                 sh_single_quote(&workspace.display().to_string()),
