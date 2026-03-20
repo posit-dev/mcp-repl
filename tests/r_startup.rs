@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -26,6 +27,13 @@ fn backend_unavailable(text: &str) -> bool {
         )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
+}
+
+fn is_busy_response(text: &str) -> bool {
+    text.contains("<<console status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -60,21 +68,30 @@ async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
 
     let mut session = common::spawn_server_with_env_vars(env_vars).await?;
 
-    let result = session
-        .write_stdin_raw_with(
-            r#"
+    let input = r#"
 cat("RPROFILE=", getOption("mcp_repl_rprofile_test"), "\n", sep = "")
 cat("RENVIRON=", Sys.getenv("MCP_REPL_RENVIRON_TEST"), "\n", sep = "")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if backend_unavailable(&text) {
-        eprintln!("r_startup backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+"#;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            return Err("timed out waiting for R startup probe to complete".into());
+        }
+
+        let result = session.write_stdin_raw_with(input, Some(1.0)).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("r_startup backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        break text;
+    };
 
     assert!(
         text.contains("RPROFILE=RPROFILE_OK_6a8d0df6"),
