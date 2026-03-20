@@ -415,6 +415,7 @@ mod unix_impl {
         }
 
         let mut text = normalize_temp_paths(&normalize_codex_home_path(&text));
+        text = normalize_loopback_websocket_url(&text);
         text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
@@ -432,10 +433,12 @@ mod unix_impl {
         if text.chars().all(|ch| ch.is_ascii_digit() || ch == ',') {
             text = "<N>".to_string();
         }
-        if let Some(rest) = text.strip_prefix("202")
-            && rest.contains(" WARN ")
-        {
-            text = format!("<TIMESTAMP>{}", &text[text.find(" WARN ").unwrap_or(0)..]);
+        if text.starts_with("202") {
+            if let Some(pos) = text.find(" WARN ") {
+                text = format!("<TIMESTAMP>{}", &text[pos..]);
+            } else if let Some(pos) = text.find(" ERROR ") {
+                text = format!("<TIMESTAMP>{}", &text[pos..]);
+            }
         }
         text
     }
@@ -456,6 +459,29 @@ mod unix_impl {
                 idx = end;
             } else {
                 idx = abs + marker.len();
+            }
+        }
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    fn normalize_loopback_websocket_url(text: &str) -> String {
+        let marker = "ws://127.0.0.1:";
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+        while let Some(pos) = text[idx..].find(marker) {
+            let start = idx + pos;
+            out.push_str(&text[idx..start]);
+            let mut end = start + marker.len();
+            while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start + marker.len() && text[end..].starts_with("/v1/responses") {
+                out.push_str("<WS_URL>");
+                idx = end + "/v1/responses".len();
+            } else {
+                out.push_str(marker);
+                idx = start + marker.len();
             }
         }
         out.push_str(&text[idx..]);
@@ -541,6 +567,30 @@ mod unix_impl {
 
     fn tool_name() -> String {
         "mcp__r__repl".to_string()
+    }
+
+    #[test]
+    fn normalize_exec_text_scrubs_timestamped_error_lines() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let input = "2026-03-20T20:26:18.707303Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: ws://127.0.0.1:64598/v1/responses";
+        let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(
+            normalized,
+            "<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>"
+        );
+    }
+
+    #[test]
+    fn normalize_exec_text_scrubs_loopback_websocket_urls_in_json() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let input = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: ws://127.0.0.1:64598/v1/responses)"}"#;
+        let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(
+            normalized,
+            r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>)"}"#
+        );
     }
 
     fn codex_config(mcp_repl: &Path, repo_root: &Path) -> String {

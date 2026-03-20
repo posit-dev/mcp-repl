@@ -23,7 +23,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (3p, 24.9%, @0..272/1090)"
+      "text": "--More-- (3p, 24.9%, @0..269/1078)"
     }
   ]
 }
@@ -62,7 +62,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+      "text": "[repl] echoed input elided: 3 lines (153 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
     },
     {
       "type": "text",
@@ -105,7 +105,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+      "text": "[repl] echoed input elided: 3 lines (153 bytes); head: > ; tail: > cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
     },
     {
       "type": "text",

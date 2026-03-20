@@ -1,27 +1,64 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEBUG_DIR_ENV: &str = "MCP_REPL_DEBUG_DIR";
 pub(crate) const DEBUG_SESSION_DIR_ENV: &str = "MCP_REPL_DEBUG_SESSION_DIR";
 
-static SESSION_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static SESSION_STATE: OnceLock<Mutex<SessionState>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+enum SessionState {
+    Uninitialized,
+    Ready(Option<PathBuf>),
+    Failed(String),
+}
 
 pub fn initialize(cli_debug_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    if SESSION_DIR.get().is_some() {
-        return Ok(());
+    let mut state = session_state()
+        .lock()
+        .expect("debug session state mutex poisoned");
+    match &*state {
+        SessionState::Ready(Some(_)) => return Ok(()),
+        SessionState::Ready(None) if cli_debug_dir.is_none() => return Ok(()),
+        SessionState::Failed(message) => return Err(message.clone().into()),
+        SessionState::Ready(None) | SessionState::Uninitialized => {}
     }
-    let session_dir = resolve_session_dir(cli_debug_dir)?;
-    let _ = SESSION_DIR.set(session_dir);
+
+    let session_dir = match resolve_session_dir(cli_debug_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            let message = err.to_string();
+            *state = SessionState::Failed(message.clone());
+            return Err(message.into());
+        }
+    };
+    *state = SessionState::Ready(session_dir);
     Ok(())
 }
 
-pub fn session_dir() -> Option<&'static PathBuf> {
-    SESSION_DIR
-        .get_or_init(|| resolve_session_dir(None).ok().flatten())
-        .as_ref()
+pub fn session_dir() -> Option<PathBuf> {
+    let mut state = session_state()
+        .lock()
+        .expect("debug session state mutex poisoned");
+    match &*state {
+        SessionState::Ready(path) => return path.clone(),
+        SessionState::Failed(_) => return None,
+        SessionState::Uninitialized => {}
+    }
+
+    match resolve_session_dir(None) {
+        Ok(path) => {
+            *state = SessionState::Ready(path.clone());
+            path
+        }
+        Err(err) => {
+            *state = SessionState::Failed(err.to_string());
+            None
+        }
+    }
 }
 
 pub fn log_path(file_name: &str) -> Option<PathBuf> {
@@ -36,7 +73,7 @@ pub fn apply_child_env(command: &mut Command) {
 }
 
 fn propagated_session_dir() -> Option<PathBuf> {
-    session_dir_from_env_var(DEBUG_SESSION_DIR_ENV).or_else(|| session_dir().cloned())
+    session_dir_from_env_var(DEBUG_SESSION_DIR_ENV).or_else(session_dir)
 }
 
 fn resolve_session_dir(
@@ -119,9 +156,19 @@ fn create_unique_session_dir(base_dir: &Path) -> Result<PathBuf, Box<dyn std::er
     Err("failed to allocate unique debug session directory after 1000 attempts".into())
 }
 
+fn session_state() -> &'static Mutex<SessionState> {
+    SESSION_STATE.get_or_init(|| Mutex::new(SessionState::Uninitialized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reset_session_state_for_test() {
+        *session_state()
+            .lock()
+            .expect("debug session state mutex poisoned") = SessionState::Uninitialized;
+    }
 
     #[test]
     fn create_unique_session_dir_creates_child_directory() {
@@ -140,5 +187,39 @@ mod tests {
     fn find_debug_dir_from_equals_arg_parses_path() {
         let parsed = parse_debug_dir_arg(["--debug-dir=/tmp/mcp-repl-debug"]);
         assert_eq!(parsed, Some(PathBuf::from("/tmp/mcp-repl-debug")));
+    }
+
+    #[test]
+    fn initialize_preserves_early_debug_dir_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad_path = temp.path().join("debug-root");
+        std::fs::write(&bad_path, "not a directory").expect("write bad path");
+
+        let original = std::env::var_os(DEBUG_DIR_ENV);
+        reset_session_state_for_test();
+        unsafe {
+            std::env::set_var(DEBUG_DIR_ENV, &bad_path);
+        }
+
+        assert_eq!(session_dir(), None);
+        let err = initialize(None).expect_err("initialize should preserve earlier failure");
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(DEBUG_DIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(DEBUG_DIR_ENV);
+            },
+        }
+        reset_session_state_for_test();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("debug-root")
+                || message.contains("directory")
+                || message.contains("exists"),
+            "unexpected error: {message}"
+        );
     }
 }
