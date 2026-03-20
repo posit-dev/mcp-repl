@@ -43,14 +43,11 @@ mod unix {
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
             return Ok(PathBuf::from(path));
         }
-        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-            return Ok(PathBuf::from(path));
-        }
 
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        for candidate in ["mcp-repl", "mcp-console"] {
+        for candidate in ["mcp-repl"] {
             let mut candidate_path = path.clone();
             candidate_path.push(candidate);
             if candidate_path.exists() {
@@ -79,8 +76,8 @@ mod unix {
             .arg("--worker")
             .env_remove("R_PROFILE_USER")
             .env_remove("R_PROFILE_SITE")
-            .env("MCP_CONSOLE_IPC_READ_FD", child_read_fd.to_string())
-            .env("MCP_CONSOLE_IPC_WRITE_FD", child_write_fd.to_string())
+            .env("MCP_REPL_IPC_READ_FD", child_read_fd.to_string())
+            .env("MCP_REPL_IPC_WRITE_FD", child_write_fd.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

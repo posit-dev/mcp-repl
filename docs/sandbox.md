@@ -17,7 +17,7 @@ If no update is provided, the first tool call fails fast.
 The worker also gets a per-session temp directory, exported as:
 
 - `TMPDIR`
-- `MCP_CONSOLE_R_SESSION_TMPDIR`
+- `MCP_REPL_R_SESSION_TMPDIR`
 
 ## Configure sandbox policy
 
@@ -60,7 +60,7 @@ Proxy-aware network behavior when `network_access: true`:
 - proxy env vars are inspected (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase variants),
 - loopback proxy endpoints are allowlisted for outbound traffic,
 - proxy configured but no usable loopback endpoint => fail closed (no network),
-- `MCP_CONSOLE_MANAGED_NETWORK=1` enforces proxy-only mode,
+- `MCP_REPL_MANAGED_NETWORK=1` enforces proxy-only mode,
 - `ALLOW_LOCAL_BINDING=1` additionally allows localhost bind/inbound operations.
 
 ## Linux behavior
@@ -73,8 +73,8 @@ Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock
 
 Optional `bwrap` stage:
 
-- `MCP_CONSOLE_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
-- `MCP_CONSOLE_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
+- `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
+- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
 - if `bwrap` is requested but unavailable, worker startup fails fast.
 
 ## Windows behavior (experimental)

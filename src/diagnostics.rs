@@ -1,42 +1,44 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-static STARTUP_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static STARTUP_EPOCH: OnceLock<Instant> = OnceLock::new();
+static STARTUP_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static STARTUP_LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-const STARTUP_LOG_PATH_ENV: &str = "MCP_CONSOLE_DEBUG_STARTUP_FILE";
-const STARTUP_LOG_DEFAULT: &str = "mcp-console-startup.log";
+pub(crate) const STARTUP_LOG_ENV: &str = "MCP_REPL_DEBUG_STARTUP";
+pub(crate) const STARTUP_LOG_DEFAULT: &str = "mcp-repl-startup.log";
+pub(crate) const WORKER_STARTUP_LOG_DEFAULT: &str = "mcp-repl-worker-startup.log";
 
-fn startup_enabled() -> bool {
-    *STARTUP_LOG_ENABLED.get_or_init(|| {
-        let enabled = std::env::var("MCP_CONSOLE_DEBUG_STARTUP")
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
-        if enabled {
-            return true;
-        }
-        std::env::var(STARTUP_LOG_PATH_ENV)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-    })
+pub(crate) fn startup_log_path_from_env(default_path: &str) -> Option<PathBuf> {
+    let raw = std::env::var(STARTUP_LOG_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_truthy(trimmed) {
+        return Some(PathBuf::from(default_path));
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 fn startup_epoch() -> Instant {
     *STARTUP_EPOCH.get_or_init(Instant::now)
 }
 
+fn startup_log_path() -> Option<&'static PathBuf> {
+    STARTUP_LOG_PATH
+        .get_or_init(|| startup_log_path_from_env(STARTUP_LOG_DEFAULT))
+        .as_ref()
+}
+
 pub fn startup_log(message: impl AsRef<str>) {
-    if !startup_enabled() {
+    let Some(path) = startup_log_path() else {
         return;
-    }
+    };
     let elapsed = startup_epoch().elapsed();
     let file = STARTUP_LOG_FILE.get_or_init(|| {
-        let path = std::env::var(STARTUP_LOG_PATH_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| STARTUP_LOG_DEFAULT.to_string());
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -60,4 +62,11 @@ pub fn startup_log(message: impl AsRef<str>) {
 
 pub fn elapsed_ms(duration: Duration) -> u128 {
     duration.as_millis()
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

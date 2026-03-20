@@ -213,7 +213,7 @@ async fn sandbox_state_update_applies_full_access_policy() -> TestResult<()> {
     if std::env::var_os("CODEX_SANDBOX").is_some() {
         return Ok(());
     }
-    let target = std::env::temp_dir().join("mcp-console-sandbox-state-update.txt");
+    let target = std::env::temp_dir().join("mcp-repl-sandbox-state-update.txt");
     let _ = std::fs::remove_file(&target);
     let mut session = common::spawn_server().await?;
     session

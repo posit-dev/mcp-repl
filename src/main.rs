@@ -251,19 +251,9 @@ fn parse_backend_arg(
         let value = parser.next_value("--interpreter")?;
         return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
     }
-    if arg == "--backend" {
-        let value = parser.next_value("--backend")?;
-        return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
-    }
     if let Some(value) = arg.strip_prefix("--interpreter=") {
         if value.is_empty() {
             return Err("missing value for --interpreter".into());
-        }
-        return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
-    }
-    if let Some(value) = arg.strip_prefix("--backend=") {
-        if value.is_empty() {
-            return Err("missing value for --backend".into());
         }
         return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
     }
@@ -459,8 +449,7 @@ mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
---interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
---backend: compatibility alias for --interpreter\n\
+--interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
@@ -502,23 +491,6 @@ mod tests {
             index: 0,
         };
         let parsed = parse_backend_arg("--interpreter=python", &mut parser).expect("parse flag");
-        assert_eq!(parsed, Some(Backend::Python));
-    }
-
-    #[test]
-    fn parse_backend_arg_accepts_backend_compatibility_forms() {
-        let mut parser = ArgParser {
-            args: vec!["python".to_string()],
-            index: 0,
-        };
-        let parsed = parse_backend_arg("--backend", &mut parser).expect("parse flag");
-        assert_eq!(parsed, Some(Backend::Python));
-
-        let mut parser = ArgParser {
-            args: Vec::new(),
-            index: 0,
-        };
-        let parsed = parse_backend_arg("--backend=python", &mut parser).expect("parse flag");
         assert_eq!(parsed, Some(Backend::Python));
     }
 

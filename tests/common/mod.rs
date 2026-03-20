@@ -21,7 +21,7 @@ use tokio::process::Command;
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
-const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
+const PAGER_PAGE_CHARS_ENV: &str = "MCP_REPL_PAGER_PAGE_CHARS";
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 
@@ -980,7 +980,7 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_PROFILE_SITE");
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
-        cmd.env_remove("MCP_CONSOLE_UPDATE_PLOT_IMAGES");
+        cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
         cmd.env(PAGER_PAGE_CHARS_ENV, page_bytes.to_string());
         cmd.args(&args);
         for (key, value) in &env_vars {
@@ -1001,7 +1001,7 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
 fn parse_backend_from_args(args: &[String]) -> TestBackend {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--interpreter" || arg == "--backend" {
+        if arg == "--interpreter" {
             if iter.next().is_some_and(|value| value == "python") {
                 return TestBackend::Python;
             }
@@ -1009,12 +1009,6 @@ fn parse_backend_from_args(args: &[String]) -> TestBackend {
         }
         if arg
             .strip_prefix("--interpreter=")
-            .is_some_and(|value| value == "python")
-        {
-            return TestBackend::Python;
-        }
-        if arg
-            .strip_prefix("--backend=")
             .is_some_and(|value| value == "python")
         {
             return TestBackend::Python;
@@ -1027,14 +1021,11 @@ fn resolve_server_path() -> TestResult<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
         return Ok(PathBuf::from(path));
     }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-        return Ok(PathBuf::from(path));
-    }
 
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
+    for candidate in ["mcp-repl"] {
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {

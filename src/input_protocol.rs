@@ -1,4 +1,4 @@
-pub(crate) const INPUT_FRAME_PREFIX: &str = "MCP_CONSOLE_INPUT ";
+pub(crate) const INPUT_FRAME_PREFIX: &str = "MCP_REPL_INPUT ";
 
 pub(crate) fn format_input_frame_header(len: usize) -> String {
     format!("{INPUT_FRAME_PREFIX}{len}\n")

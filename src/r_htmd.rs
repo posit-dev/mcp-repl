@@ -3,7 +3,7 @@ use harp::protect::RProtect;
 use libr::SEXP;
 
 #[harp::register]
-pub extern "C-unwind" fn mcp_console_htmd_file_to_markdown(path: SEXP) -> harp::Result<SEXP> {
+pub extern "C-unwind" fn mcp_repl_htmd_file_to_markdown(path: SEXP) -> harp::Result<SEXP> {
     let path = String::try_from(RObject::view(path))?;
     if path.trim().is_empty() {
         return unsafe { Ok(libr::R_NilValue) };
@@ -27,7 +27,7 @@ pub extern "C-unwind" fn mcp_console_htmd_file_to_markdown(path: SEXP) -> harp::
 }
 
 #[harp::register]
-pub extern "C-unwind" fn mcp_console_htmd_html_to_markdown(html: SEXP) -> harp::Result<SEXP> {
+pub extern "C-unwind" fn mcp_repl_htmd_html_to_markdown(html: SEXP) -> harp::Result<SEXP> {
     let html = String::try_from(RObject::view(html))?;
     if html.trim().is_empty() {
         return unsafe { Ok(libr::R_NilValue) };

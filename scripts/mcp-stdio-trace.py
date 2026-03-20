@@ -125,7 +125,7 @@ def main():
     global child
 
     if len(sys.argv) < 2:
-        print("usage: mcp-repl-trace-proxy REAL_MCP_SERVER [ARGS...]", file=sys.stderr)
+        print("usage: mcp-stdio-trace REAL_MCP_SERVER [ARGS...]", file=sys.stderr)
         return 2
 
     real_cmd = sys.argv[1:]

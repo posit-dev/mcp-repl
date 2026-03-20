@@ -82,9 +82,6 @@ impl SharedServer {
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
-        if std::env::var_os("MCP_CONSOLE_DEBUG_MCP").is_some() {
-            eprintln!("custom request: {}", request.method);
-        }
         crate::event_log::log(
             "custom_request_received",
             json!({

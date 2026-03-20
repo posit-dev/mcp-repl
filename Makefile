@@ -18,7 +18,7 @@ RUNS ?= 1
 venv:
 	python3 -m venv $(VENV)
 	$(PIP) install -U pip
-	@echo "NOTE: eval harness deps are optional and not required for mcp-console itself."
+	@echo "NOTE: eval harness deps are optional and not required for mcp-repl itself."
 	@echo "Install inspect_ai however you prefer (pip, uv, or editable checkout), then:"
 	@echo "  $(PIP) install pyyaml pandas"
 	$(PIP) install pyyaml pandas

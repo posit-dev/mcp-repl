@@ -33,11 +33,11 @@ async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
     let home_dir = tempfile::tempdir()?;
     std::fs::write(
         home_dir.path().join(".Renviron"),
-        "MCP_CONSOLE_RENVIRON_TEST=RENVIRON_OK_9f6f9f68\n",
+        "MCP_REPL_RENVIRON_TEST=RENVIRON_OK_9f6f9f68\n",
     )?;
     std::fs::write(
         home_dir.path().join(".Rprofile"),
-        "options(mcp_console_rprofile_test = \"RPROFILE_OK_6a8d0df6\")\n",
+        "options(mcp_repl_rprofile_test = \"RPROFILE_OK_6a8d0df6\")\n",
     )?;
 
     let home = home_dir.path().to_string_lossy().to_string();
@@ -63,8 +63,8 @@ async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             r#"
-cat("RPROFILE=", getOption("mcp_console_rprofile_test"), "\n", sep = "")
-cat("RENVIRON=", Sys.getenv("MCP_CONSOLE_RENVIRON_TEST"), "\n", sep = "")
+cat("RPROFILE=", getOption("mcp_repl_rprofile_test"), "\n", sep = "")
+cat("RENVIRON=", Sys.getenv("MCP_REPL_RENVIRON_TEST"), "\n", sep = "")
 "#,
             Some(10.0),
         )

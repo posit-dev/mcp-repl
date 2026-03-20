@@ -218,7 +218,7 @@ fn render_reply(
 }
 
 fn detect_image_support() -> bool {
-    if let Ok(value) = env::var("MCP_CONSOLE_REPL_IMAGES") {
+    if let Ok(value) = env::var("MCP_REPL_IMAGES") {
         return is_truthy(&value);
     }
     let term = env::var("TERM").unwrap_or_default().to_lowercase();
@@ -279,4 +279,27 @@ fn write_kitty_image(stdout: &mut impl Write, data: &str, mime_type: &str) -> io
     }
     stdout.write_all(b"\n")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_image_support_uses_mcp_repl_env() {
+        let original = env::var_os("MCP_REPL_IMAGES");
+        unsafe {
+            env::set_var("MCP_REPL_IMAGES", "1");
+        }
+        let enabled = detect_image_support();
+        match original {
+            Some(value) => unsafe {
+                env::set_var("MCP_REPL_IMAGES", value);
+            },
+            None => unsafe {
+                env::remove_var("MCP_REPL_IMAGES");
+            },
+        }
+        assert!(enabled, "expected MCP_REPL_IMAGES=1 to enable images");
+    }
 }

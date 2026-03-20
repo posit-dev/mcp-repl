@@ -157,7 +157,7 @@ startup logs, sandbox-state tracing, and the external wire-trace proxy.
 
 - Default interpreter: R
 - CLI: `mcp-repl --interpreter r|python`
-- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
+- Environment: `MCP_REPL_INTERPRETER=r|python`
 
 ## Runtime discovery
 
@@ -165,9 +165,7 @@ startup logs, sandbox-state tracing, and the external wire-trace proxy.
 
 `mcp-repl` chooses interpreter in this order:
 - `--interpreter <r|python>` (if provided)
-- compatibility CLI alias: `--backend <r|python>`
 - `MCP_REPL_INTERPRETER`
-- compatibility env alias: `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R interpreter: which R installation is used

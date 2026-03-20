@@ -57,8 +57,8 @@ mod unix_impl {
             return Ok(String::new());
         }
 
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console)?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl)?;
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
@@ -79,7 +79,7 @@ mod unix_impl {
         cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
         cmd.env("OPENAI_BASE_URL", mock_server.base_url());
         cmd.env(
-            "MCP_CONSOLE_SANDBOX_STATE_LOG",
+            "MCP_REPL_SANDBOX_STATE_LOG",
             env.sandbox_log.display().to_string(),
         );
         cmd.env("TERM", "xterm-256color");
@@ -140,8 +140,8 @@ mod unix_impl {
             return Ok(());
         }
 
-        let mcp_console = resolve_mcp_console_path()?;
-        let env = create_isolated_codex_env(&mcp_console)?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl)?;
 
         let workspace_args = tool_args_for_code(&sandbox_run_code());
         let full_access_probe_args = tool_args_for_code(&outside_workspace_probe_code()?);
@@ -255,7 +255,7 @@ mod unix_impl {
             .is_ok()
     }
 
-    fn create_isolated_codex_env(mcp_console: &Path) -> TestResult<IsolatedCodexEnv> {
+    fn create_isolated_codex_env(mcp_repl: &Path) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
         let workspace = temp_dir.path().join("workspace");
         std::fs::create_dir_all(&workspace)?;
@@ -277,7 +277,7 @@ mod unix_impl {
         std::fs::create_dir_all(&sandbox_log_dir)?;
         let sandbox_log = sandbox_log_dir.join("sandbox-state.log");
 
-        let config = codex_config(mcp_console, &workspace);
+        let config = codex_config(mcp_repl, &workspace);
         std::fs::write(codex_home.join("config.toml"), config)?;
 
         Ok(IsolatedCodexEnv {
@@ -522,18 +522,15 @@ mod unix_impl {
         out
     }
 
-    fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+    fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
-            return Ok(PathBuf::from(path));
-        }
-        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
             return Ok(PathBuf::from(path));
         }
 
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        for candidate in ["mcp-repl", "mcp-console"] {
+        for candidate in ["mcp-repl"] {
             let mut candidate_path = path.clone();
             candidate_path.push(candidate);
             if cfg!(windows) {
@@ -550,8 +547,8 @@ mod unix_impl {
         "mcp__r__repl".to_string()
     }
 
-    fn codex_config(mcp_console: &Path, repo_root: &Path) -> String {
-        let mcp_console = toml_escape(&mcp_console.display().to_string());
+    fn codex_config(mcp_repl: &Path, repo_root: &Path) -> String {
+        let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         format!(
             r#"model_provider = "openai"
@@ -571,8 +568,8 @@ remote_models = true
 responses_websockets = false
 
 [mcp_servers.r]
-command = "{mcp_console}"
-env_vars = ["MCP_CONSOLE_SANDBOX_STATE_LOG"]
+command = "{mcp_repl}"
+env_vars = ["MCP_REPL_SANDBOX_STATE_LOG"]
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
@@ -584,7 +581,7 @@ trust_level = "trusted"
     }
 
     fn sandbox_run_code() -> String {
-        "target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})"
+        "target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})"
             .to_string()
     }
 
@@ -592,7 +589,7 @@ trust_level = "trusted"
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        let target = std::env::temp_dir().join(format!("mcp-console-codex-probe-{nanos}.txt"));
+        let target = std::env::temp_dir().join(format!("mcp-repl-codex-probe-{nanos}.txt"));
         let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
             .map_err(|err| format!("failed to encode target path: {err}"))?;
         Ok(r#"target <- __TARGET__
@@ -729,7 +726,7 @@ tryCatch({
                 continue;
             }
             if trimmed.starts_with("⚠ MCP startup incomplete")
-                || trimmed.starts_with("⚠ MCP client for `mcp-console` failed to start")
+                || trimmed.starts_with("⚠ MCP client for `mcp-repl` failed to start")
             {
                 continue;
             }
@@ -951,7 +948,7 @@ tryCatch({
 
             let mut cmd = CommandBuilder::new("sh");
             let shell_script = format!(
-                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_REPL_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
                 sh_single_quote(&codex_home.display().to_string()),
                 sh_single_quote(base_url),
                 sh_single_quote(base_url),

@@ -94,8 +94,8 @@ fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
         return Ok(None);
     }
 
-    let mcp_console = resolve_mcp_console_path()?;
-    let Some(staged) = stage_claude_env(&mcp_console)? else {
+    let mcp_repl = resolve_mcp_repl_path()?;
+    let Some(staged) = stage_claude_env(&mcp_repl)? else {
         return Ok(None);
     };
 
@@ -161,18 +161,15 @@ fn claude_available() -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
     if let Ok(path) = env::var("CARGO_BIN_EXE_mcp-repl") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(path) = env::var("CARGO_BIN_EXE_mcp-console") {
         return Ok(PathBuf::from(path));
     }
 
     let mut path = env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
+    for candidate in ["mcp-repl"] {
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {
@@ -260,7 +257,7 @@ fn run_command_with_timeout(
     })
 }
 
-fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
+fn stage_claude_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEnv>> {
     let temp_dir = tempfile::tempdir()?;
     let workspace = temp_dir.path().join("workspace");
     let home = temp_dir.path().join("home");
@@ -313,7 +310,7 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
             JsonValue::Object(JsonMap::from_iter([
                 (
                     "command".to_string(),
-                    JsonValue::String(mcp_console.display().to_string()),
+                    JsonValue::String(mcp_repl.display().to_string()),
                 ),
                 (
                     "args".to_string(),

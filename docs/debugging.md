@@ -33,31 +33,29 @@ MCP_REPL_DEBUG_EVENTS_DIR=/tmp/mcp-repl-events mcp-repl --interpreter r
 
 Use startup diagnostics when the worker fails early or startup feels slow.
 
-- `MCP_CONSOLE_DEBUG_STARTUP=1` enables startup logging
-- `MCP_CONSOLE_DEBUG_STARTUP_FILE=/path/to/file.log` chooses the log file
+- `MCP_REPL_DEBUG_STARTUP=1` enables startup logging with default paths
+- `MCP_REPL_DEBUG_STARTUP=/path/to/file.log` writes startup logs to a specific file
 
-If `MCP_CONSOLE_DEBUG_STARTUP=1` is set and the worker has a session temp directory, `mcp-repl` writes the worker-side startup log to `mcp-console-worker-startup.log` inside that temp directory. Otherwise it uses `MCP_CONSOLE_DEBUG_STARTUP_FILE` if set. The default server-side path is `mcp-console-startup.log`.
+If `MCP_REPL_DEBUG_STARTUP=1` is set, the server writes `mcp-repl-startup.log` in the current working directory. The worker writes `mcp-repl-worker-startup.log` and, when a session temp directory exists, places it there so you can inspect it alongside the rest of the session artifacts.
 
 Example:
 
 ```sh
-MCP_CONSOLE_DEBUG_STARTUP=1 mcp-repl --interpreter python
+MCP_REPL_DEBUG_STARTUP=1 mcp-repl --interpreter python
 ```
 
 ## MCP and sandbox tracing
 
 These switches are useful when the client is sending custom sandbox updates or when the sandbox policy is the thing you are debugging.
 
-- `MCP_CONSOLE_DEBUG_MCP=1` prints incoming custom MCP request method names to `stderr`
-- `MCP_CONSOLE_SANDBOX_STATE_LOG=/path/to/file.jsonl` appends sandbox policy and sandbox-state update payloads as JSON lines
-- `MCP_CONSOLE_KEEP_SESSION_TMPDIR=1` keeps the worker session temp directory after exit so you can inspect it
-- macOS only: `MCP_CONSOLE_SANDBOX_LOG_DENIALS=1` prints collected sandbox denials when the worker exits
+- `MCP_REPL_SANDBOX_STATE_LOG=/path/to/file.jsonl` appends sandbox policy and sandbox-state update payloads as JSON lines
+- `MCP_REPL_KEEP_SESSION_TMPDIR=1` keeps the worker session temp directory after exit so you can inspect it
+- macOS only: `MCP_REPL_SANDBOX_LOG_DENIALS=1` prints collected sandbox denials when the worker exits
 
 Example:
 
 ```sh
-MCP_CONSOLE_SANDBOX_STATE_LOG=/tmp/mcp-repl-sandbox.jsonl \
-MCP_CONSOLE_DEBUG_MCP=1 \
+MCP_REPL_SANDBOX_STATE_LOG=/tmp/mcp-repl-sandbox.jsonl \
 mcp-repl --sandbox inherit
 ```
 
@@ -80,12 +78,12 @@ Behavior:
 
 Useful environment variables:
 
-- `MCP_CONSOLE_REPL_IMAGES=0|1|kitty` controls inline image rendering in the debug REPL
-- `MCP_CONSOLE_PAGER_PAGE_CHARS=<n>` overrides the pager page size if you want larger or smaller pages while debugging
+- `MCP_REPL_IMAGES=0|1|kitty` controls inline image rendering in the debug REPL
+- `MCP_REPL_PAGER_PAGE_CHARS=<n>` overrides the pager page size if you want larger or smaller pages while debugging
 
 ## External wire trace proxy
 
-The built-in event log only sees what reaches `mcp-repl` after startup. If you need the exact stdio traffic between an MCP client and the server, use the external proxy in [scripts/mcp-repl-trace-proxy.py](/Users/tomasz/github/t-kalinowski/mcp-repl/scripts/mcp-repl-trace-proxy.py).
+The built-in event log only sees what reaches `mcp-repl` after startup. If you need the exact stdio traffic between an MCP client and the server, use the external proxy in [scripts/mcp-stdio-trace.py](/Users/tomasz/github/t-kalinowski/mcp-repl/scripts/mcp-stdio-trace.py).
 
 What it does:
 
@@ -108,14 +106,14 @@ Set `MCP_REPL_TRACE_FORWARD_STDERR=1` if you also want the proxied server `stder
 Direct invocation:
 
 ```sh
-scripts/mcp-repl-trace-proxy.py ~/.cargo/bin/mcp-repl --interpreter r
+scripts/mcp-stdio-trace.py ~/.cargo/bin/mcp-repl --interpreter r
 ```
 
 Client-config pattern:
 
 ```json
 {
-  "command": "/absolute/path/to/scripts/mcp-repl-trace-proxy.py",
+  "command": "/absolute/path/to/scripts/mcp-stdio-trace.py",
   "args": [
     "/absolute/path/to/mcp-repl",
     "--interpreter",

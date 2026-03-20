@@ -3259,7 +3259,7 @@ impl WorkerProcess {
     }
 
     fn cleanup_session_tmpdir(&self) {
-        if std::env::var_os("MCP_CONSOLE_KEEP_SESSION_TMPDIR").is_some() {
+        if std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR").is_some() {
             return;
         }
         let Some(path) = self.session_tmpdir.as_ref() else {
@@ -3435,17 +3435,27 @@ fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
 }
 
 fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBuf>) {
-    if let Ok(value) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP") {
-        command.env("MCP_CONSOLE_DEBUG_STARTUP", value);
-        if let Some(tmpdir) = session_tmpdir {
-            let worker_log = tmpdir.join("mcp-console-worker-startup.log");
-            command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", worker_log);
-        } else if let Ok(path) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP_FILE") {
-            command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", path);
-        }
-    } else if let Ok(value) = std::env::var("MCP_CONSOLE_DEBUG_STARTUP_FILE") {
-        command.env("MCP_CONSOLE_DEBUG_STARTUP_FILE", value);
+    if std::env::var_os(crate::diagnostics::STARTUP_LOG_ENV).is_none() {
+        return;
     }
+
+    let Some(path) = crate::diagnostics::startup_log_path_from_env(
+        crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT,
+    ) else {
+        return;
+    };
+
+    let path = if let Some(tmpdir) = session_tmpdir {
+        if path == Path::new(crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT) {
+            tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT)
+        } else {
+            path
+        }
+    } else {
+        path
+    };
+
+    command.env(crate::diagnostics::STARTUP_LOG_ENV, path);
 }
 
 fn maybe_report_sandbox_exec_failure(
@@ -3876,6 +3886,42 @@ mod tests {
                 std::env::remove_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
             },
         }
+    }
+
+    #[test]
+    fn apply_debug_startup_env_uses_mcp_repl_vars() {
+        let original = std::env::var_os("MCP_REPL_DEBUG_STARTUP");
+        unsafe {
+            std::env::set_var("MCP_REPL_DEBUG_STARTUP", "1");
+        }
+
+        let mut command = Command::new("env");
+        apply_debug_startup_env(&mut command, None);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("MCP_REPL_DEBUG_STARTUP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("MCP_REPL_DEBUG_STARTUP");
+            },
+        }
+
+        assert_eq!(
+            envs.get("MCP_REPL_DEBUG_STARTUP"),
+            Some(&Some(
+                crate::diagnostics::WORKER_STARTUP_LOG_DEFAULT.to_string()
+            ))
+        );
     }
 
     #[cfg(target_family = "windows")]

@@ -11,14 +11,11 @@ fn resolve_exe() -> TestResult<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
         return Ok(PathBuf::from(path));
     }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
-        return Ok(PathBuf::from(path));
-    }
 
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl", "mcp-console"] {
+    for candidate in ["mcp-repl"] {
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {
@@ -80,7 +77,7 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         .as_array()
         .expect("expected python args array");
     let has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
-        (a.as_str() == Some("--interpreter") || a.as_str() == Some("--backend"))
+        (a.as_str() == Some("--interpreter") || a.as_str() == Some("--interpreter"))
             && b.as_str() == Some("python")
     });
     assert!(
@@ -151,7 +148,7 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         "expected python args to include `--sandbox workspace-write`"
     );
     let py_has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
-        (a.as_str() == Some("--interpreter") || a.as_str() == Some("--backend"))
+        (a.as_str() == Some("--interpreter") || a.as_str() == Some("--interpreter"))
             && b.as_str() == Some("python")
     });
     assert!(

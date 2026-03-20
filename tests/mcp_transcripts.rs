@@ -126,9 +126,9 @@ async fn snapshots_tempdir_session_restart() -> TestResult<()> {
 
     let setup = r#"
 cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
-cat("TMPDIR_MATCH=", Sys.getenv("TMPDIR") == Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
+cat("TMPDIR_MATCH=", Sys.getenv("TMPDIR") == Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
-marker <- file.path(tempdir(), "mcp-console-snapshot.txt")
+marker <- file.path(tempdir(), "mcp-repl-snapshot.txt")
 tryCatch({
   writeLines("foo", marker)
   cat("TEMPDIR_MARKER_OK\n")
@@ -144,7 +144,7 @@ tryCatch({
 })
 unlink(tf)
 cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
-root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
+root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-snapshot-root.txt")
 tryCatch({
   writeLines("root", root_marker)
   cat("ROOT_MARKER_OK\n")
@@ -155,7 +155,7 @@ cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 "#;
 
     let after_restart = r#"
-root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
+root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-snapshot-root.txt")
 cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")

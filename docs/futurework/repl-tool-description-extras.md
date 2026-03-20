@@ -18,8 +18,8 @@ It should be treated as source material for:
 ## Recovered backend-selection guidance
 
 - Default backend: `r`.
-- CLI backend selection: `mcp-repl --backend r|python`.
-- Environment backend selection: `MCP_REPL_BACKEND=r|python`.
+- CLI backend selection: `mcp-repl --interpreter r|python`.
+- Environment backend selection: `MCP_REPL_INTERPRETER=r|python`.
 
 ## Recovered shared guidance
 
@@ -117,7 +117,7 @@ It should be treated as source material for:
 - Non-empty non-command input is rejected while pager is active.
 - Backend prompt is suppressed during pager mode and restored after exit.
 - Pager output de-duplicates already shown content within a pager session.
-- Pager mode can emit compact input summaries such as `[mcp-console] input: ... [TRUNCATED]`; this is not a backend prompt.
+- Pager mode can emit compact input summaries such as `[mcp-repl] input: ... [TRUNCATED]`; this is not a backend prompt.
 
 ### Pager commands
 

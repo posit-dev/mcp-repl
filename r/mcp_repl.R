@@ -1,4 +1,4 @@
-# mcp-console embedded R code
+# mcp-repl embedded R code
 #
 # This file is evaluated after the embedded R session finishes its normal
 # initialization. It is also used by a separate `R --vanilla` invocation to
@@ -11,13 +11,13 @@ if (nzchar(Sys.getenv("CODEX_SANDBOX_NETWORK_DISABLED"))) {
   Sys.setenv(UV_OFFLINE = "1")
 }
 
-.mcp_console_is_print_env_mode <- function() {
+.mcp_repl_is_print_env_mode <- function() {
   args <- commandArgs(trailingOnly = TRUE)
-  length(args) >= 1L && identical(args[[1L]], "--mcp-console-print-env")
+  length(args) >= 1L && identical(args[[1L]], "--mcp-repl-print-env")
 }
 
 local({
-  .mcp_console_cat_file <- function(path) {
+  .mcp_repl_cat_file <- function(path) {
     if (!is.character(path) || length(path) != 1L || !nzchar(path)) {
       return(invisible(NULL))
     }
@@ -40,8 +40,8 @@ local({
   }
 
   # Redirect R's pager integration (e.g. file.show(), help()) into stdout so
-  # mcp-console can capture and page it with its built-in pager mode.
-  .mcp_console_pager <- function(files,
+  # mcp-repl can capture and page it with its built-in pager mode.
+  .mcp_repl_pager <- function(files,
                                 header = NULL,
                                 title = NULL,
                                 delete.file = FALSE,
@@ -80,7 +80,7 @@ local({
         cat(hdr, "\n", sep = "")
       }
 
-      .mcp_console_cat_file(path)
+      .mcp_repl_cat_file(path)
       if (isTRUE(delete.file)) {
         unlink(path, force = TRUE)
       }
@@ -89,12 +89,12 @@ local({
     invisible(NULL)
   }
 
-  options(pager = .mcp_console_pager)
-  options(help.pager = .mcp_console_pager)
+  options(pager = .mcp_repl_pager)
+  options(help.pager = .mcp_repl_pager)
 })
 
 local({
-  .mcp_console_extract_md_fragment <- function(md, fragment) {
+  .mcp_repl_extract_md_fragment <- function(md, fragment) {
     if (!is.character(md) || length(md) != 1L || !nzchar(md)) {
       return(NULL)
     }
@@ -157,7 +157,7 @@ local({
     paste(lines[seq.int(start, end)], collapse = "\n")
   }
 
-  .mcp_console_extract_html_fragment <- function(lines, fragment) {
+  .mcp_repl_extract_html_fragment <- function(lines, fragment) {
     if (!is.character(lines) || length(lines) == 0L) {
       return(NULL)
     }
@@ -226,7 +226,7 @@ local({
       if (grepl("\\.html?$", path, ignore.case = TRUE)) {
         if (nzchar(fragment)) {
           lines <- readLines(path, warn = FALSE)
-          section <- .mcp_console_extract_html_fragment(lines, fragment)
+          section <- .mcp_repl_extract_html_fragment(lines, fragment)
           html <- if (
             is.character(section) && length(section) == 1L && nzchar(section)
           ) {
@@ -235,12 +235,12 @@ local({
             paste(lines, collapse = "\n")
           }
           md <- tryCatch(
-            .Call("mcp_console_htmd_html_to_markdown", html),
+            .Call("mcp_repl_htmd_html_to_markdown", html),
             error = function(e) NULL
           )
         } else {
           md <- tryCatch(
-            .Call("mcp_console_htmd_file_to_markdown", path),
+            .Call("mcp_repl_htmd_file_to_markdown", path),
             error = function(e) NULL
           )
         }
@@ -253,7 +253,7 @@ local({
 
       lines <- readLines(path, warn = FALSE)
       if (nzchar(fragment)) {
-        section <- .mcp_console_extract_html_fragment(lines, fragment)
+        section <- .mcp_repl_extract_html_fragment(lines, fragment)
         if (is.character(section) && length(section) == 1L && nzchar(section)) {
           cat(section, "\n", sep = "")
           return(invisible(0))
@@ -271,25 +271,25 @@ local({
 })
 
 local({
-  if (.mcp_console_is_print_env_mode()) {
+  if (.mcp_repl_is_print_env_mode()) {
     return(invisible(NULL))
   }
 
-  .mcp_console_error_state <- new.env(parent = emptyenv())
-  .mcp_console_error_state$installed <- FALSE
+  .mcp_repl_error_state <- new.env(parent = emptyenv())
+  .mcp_repl_error_state$installed <- FALSE
 
-  .mcp_console_install_error_handler <- function() {
-    if (isTRUE(.mcp_console_error_state$installed)) {
+  .mcp_repl_install_error_handler <- function() {
+    if (isTRUE(.mcp_repl_error_state$installed)) {
       return(invisible(NULL))
     }
 
-    .mcp_console_error_state$installed <- TRUE
+    .mcp_repl_error_state$installed <- TRUE
     previous <- getOption("error")
-    options(mcp_console.previous_error = previous)
+    options(mcp_repl.previous_error = previous)
 
     options(error = function() {
-      try(.Call("mcp_console_clear_pending_input"), silent = TRUE)
-      handler <- getOption("mcp_console.previous_error")
+      try(.Call("mcp_repl_clear_pending_input"), silent = TRUE)
+      handler <- getOption("mcp_repl.previous_error")
       if (is.function(handler)) {
         handler()
       } else if (!isTRUE(getOption("show.error.messages", TRUE))) {
@@ -308,11 +308,11 @@ local({
     invisible(NULL)
   }
 
-  .mcp_console_install_error_handler()
+  .mcp_repl_install_error_handler()
 })
 
 local({
-  .mcp_console_normalize_rshowdoc_type <- function(type) {
+  .mcp_repl_normalize_rshowdoc_type <- function(type) {
     type <- tolower(as.character(type)[1L])
     if (!nzchar(type)) {
       return("html")
@@ -326,7 +326,7 @@ local({
     type
   }
 
-  .mcp_console_has_manual <- function(what, ext) {
+  .mcp_repl_has_manual <- function(what, ext) {
     if (!is.character(what) || length(what) < 1L) {
       return(FALSE)
     }
@@ -344,7 +344,7 @@ local({
       if (missing(type)) {
         type <- "html"
       } else {
-        type <- .mcp_console_normalize_rshowdoc_type(type)
+        type <- .mcp_repl_normalize_rshowdoc_type(type)
       }
 
       has_package <- FALSE
@@ -357,9 +357,9 @@ local({
 
       if (!has_package && identical(type, "txt")) {
         if (
-          !.mcp_console_has_manual(what, "txt") &&
-            (.mcp_console_has_manual(what, "html") ||
-              .mcp_console_has_manual(what, "htm"))
+          !.mcp_repl_has_manual(what, "txt") &&
+            (.mcp_repl_has_manual(what, "html") ||
+              .mcp_repl_has_manual(what, "htm"))
         ) {
           type <- "html"
         }
@@ -502,23 +502,23 @@ local({
 })
 
 local({
-  if (.mcp_console_is_print_env_mode()) {
+  if (.mcp_repl_is_print_env_mode()) {
     return(invisible(NULL))
   }
 
-  .mcp_console_plot_state <- new.env(parent = emptyenv())
-  .mcp_console_plot_state$counter <- 0L
-  .mcp_console_plot_state$current_id <- NULL
-  .mcp_console_plot_state$next_is_new <- TRUE
-  .mcp_console_plot_state$recordings <- new.env(parent = emptyenv())
-  .mcp_console_plot_state$in_render <- FALSE
-  .mcp_console_plot_state$initialized <- FALSE
-  .mcp_console_plot_default_dpi <- 96
-  .mcp_console_plot_default_width <- 800 / .mcp_console_plot_default_dpi
-  .mcp_console_plot_default_height <- 600 / .mcp_console_plot_default_dpi
-  .mcp_console_plot_default_units <- "in"
+  .mcp_repl_plot_state <- new.env(parent = emptyenv())
+  .mcp_repl_plot_state$counter <- 0L
+  .mcp_repl_plot_state$current_id <- NULL
+  .mcp_repl_plot_state$next_is_new <- TRUE
+  .mcp_repl_plot_state$recordings <- new.env(parent = emptyenv())
+  .mcp_repl_plot_state$in_render <- FALSE
+  .mcp_repl_plot_state$initialized <- FALSE
+  .mcp_repl_plot_default_dpi <- 96
+  .mcp_repl_plot_default_width <- 800 / .mcp_repl_plot_default_dpi
+  .mcp_repl_plot_default_height <- 600 / .mcp_repl_plot_default_dpi
+  .mcp_repl_plot_default_units <- "in"
 
-  .mcp_console_plot_units <- function(units) {
+  .mcp_repl_plot_units <- function(units) {
     if (!is.character(units) || length(units) != 1L || !nzchar(units)) {
       return(NULL)
     }
@@ -540,8 +540,8 @@ local({
     NULL
   }
 
-  .mcp_console_plot_device <- function(...) {
-    path <- tempfile("mcp-console-plot-", fileext = ".png")
+  .mcp_repl_plot_device <- function(...) {
+    path <- tempfile("mcp-repl-plot-", fileext = ".png")
     ok <- FALSE
     tryCatch({
       grDevices::png(filename = path, ...)
@@ -549,7 +549,7 @@ local({
     }, error = function(e) NULL)
 
     if (!ok) {
-      path <- tempfile("mcp-console-plot-", fileext = ".pdf")
+      path <- tempfile("mcp-repl-plot-", fileext = ".pdf")
       grDevices::pdf(file = path, ...)
     }
 
@@ -557,16 +557,16 @@ local({
     invisible(NULL)
   }
 
-  options(device = .mcp_console_plot_device)
+  options(device = .mcp_repl_plot_device)
 
-  .mcp_console_new_plot_id <- function() {
-    st <- .mcp_console_plot_state
+  .mcp_repl_new_plot_id <- function() {
+    st <- .mcp_repl_plot_state
     st$counter <- st$counter + 1L
     sprintf("plot-%d-%d", Sys.getpid(), st$counter)
   }
 
-  .mcp_console_plot_render_recording <- function(recording, width, height, res) {
-    st <- .mcp_console_plot_state
+  .mcp_repl_plot_render_recording <- function(recording, width, height, res) {
+    st <- .mcp_repl_plot_state
     if (isTRUE(st$in_render)) {
       return(NULL)
     }
@@ -576,7 +576,7 @@ local({
       st$in_render <- FALSE
     }, add = TRUE)
 
-    path <- tempfile("mcp-console-plot-", fileext = ".png")
+    path <- tempfile("mcp-repl-plot-", fileext = ".png")
     old_dev <- grDevices::dev.cur()
     ok <- FALSE
 
@@ -614,8 +614,8 @@ local({
     data
   }
 
-  .mcp_console_plot_process_changes <- function(reason = "") {
-    st <- .mcp_console_plot_state
+  .mcp_repl_plot_process_changes <- function(reason = "") {
+    st <- .mcp_repl_plot_state
     if (isTRUE(st$in_render)) {
       return(invisible(NULL))
     }
@@ -635,7 +635,7 @@ local({
     }
 
     if (is.null(st$current_id)) {
-      st$current_id <- .mcp_console_new_plot_id()
+      st$current_id <- .mcp_repl_new_plot_id()
       st$next_is_new <- TRUE
     }
 
@@ -653,34 +653,34 @@ local({
 
     width <- getOption("console.plot.width")
     if (is.null(width)) {
-      width <- .mcp_console_plot_default_width
+      width <- .mcp_repl_plot_default_width
     }
 
     height <- getOption("console.plot.height")
     if (is.null(height)) {
-      height <- .mcp_console_plot_default_height
+      height <- .mcp_repl_plot_default_height
     }
 
-    units <- .mcp_console_plot_units(
-      getOption("console.plot.units", .mcp_console_plot_default_units)
+    units <- .mcp_repl_plot_units(
+      getOption("console.plot.units", .mcp_repl_plot_default_units)
     )
     if (is.null(units)) {
-      units <- .mcp_console_plot_default_units
+      units <- .mcp_repl_plot_default_units
     }
 
     dpi <- getOption("console.plot.dpi")
     if (is.null(dpi)) {
-      dpi <- getOption("console.plot.res", .mcp_console_plot_default_dpi)
+      dpi <- getOption("console.plot.res", .mcp_repl_plot_default_dpi)
     }
 
     if (!is.numeric(width) || !is.finite(width) || width <= 0) {
-      width <- .mcp_console_plot_default_width
+      width <- .mcp_repl_plot_default_width
     }
     if (!is.numeric(height) || !is.finite(height) || height <= 0) {
-      height <- .mcp_console_plot_default_height
+      height <- .mcp_repl_plot_default_height
     }
     if (!is.numeric(dpi) || !is.finite(dpi) || dpi <= 0) {
-      dpi <- .mcp_console_plot_default_dpi
+      dpi <- .mcp_repl_plot_default_dpi
     }
 
     scale <- switch(
@@ -699,13 +699,13 @@ local({
     }
 
     if (!is.finite(width) || width <= 0) {
-      width <- round(.mcp_console_plot_default_width * .mcp_console_plot_default_dpi)
+      width <- round(.mcp_repl_plot_default_width * .mcp_repl_plot_default_dpi)
     }
     if (!is.finite(height) || height <= 0) {
-      height <- round(.mcp_console_plot_default_height * .mcp_console_plot_default_dpi)
+      height <- round(.mcp_repl_plot_default_height * .mcp_repl_plot_default_dpi)
     }
 
-    png_raw <- .mcp_console_plot_render_recording(
+    png_raw <- .mcp_repl_plot_render_recording(
       recording,
       width = width,
       height = height,
@@ -718,19 +718,19 @@ local({
     is_new <- isTRUE(st$next_is_new)
     st$next_is_new <- FALSE
     try(
-      .Call("mcp_console_plot_emit", id, png_raw, "image/png", is_new),
+      .Call("mcp_repl_plot_emit", id, png_raw, "image/png", is_new),
       silent = TRUE
     )
     invisible(NULL)
   }
 
-  .mcp_console_plot_before_new_page <- function(reason = "") {
-    st <- .mcp_console_plot_state
+  .mcp_repl_plot_before_new_page <- function(reason = "") {
+    st <- .mcp_repl_plot_state
     if (isTRUE(st$in_render)) {
       return(invisible(NULL))
     }
 
-    .mcp_console_plot_process_changes(reason)
+    .mcp_repl_plot_process_changes(reason)
     is_grid <- identical(reason, "before.grid.newpage")
     is_new_page <- if (is_grid) {
       TRUE
@@ -739,7 +739,7 @@ local({
     }
 
     if (is_new_page) {
-      st$current_id <- .mcp_console_new_plot_id()
+      st$current_id <- .mcp_repl_new_plot_id()
       st$next_is_new <- TRUE
       st$recordings <- new.env(parent = emptyenv())
     } else {
@@ -748,40 +748,40 @@ local({
     invisible(NULL)
   }
 
-  .mcp_console_plot_task_callback <- function(expr, value, ok, visible) {
+  .mcp_repl_plot_task_callback <- function(expr, value, ok, visible) {
     if (!isTRUE(ok)) {
-      try(.Call("mcp_console_clear_pending_input"), silent = TRUE)
+      try(.Call("mcp_repl_clear_pending_input"), silent = TRUE)
     }
-    .mcp_console_plot_process_changes("task_callback")
+    .mcp_repl_plot_process_changes("task_callback")
     TRUE
   }
 
-  .mcp_console_plot_init <- function() {
-    st <- .mcp_console_plot_state
+  .mcp_repl_plot_init <- function() {
+    st <- .mcp_repl_plot_state
     if (isTRUE(st$initialized)) {
       return(invisible(NULL))
     }
 
-    st$current_id <- .mcp_console_new_plot_id()
+    st$current_id <- .mcp_repl_new_plot_id()
     st$next_is_new <- TRUE
     st$initialized <- TRUE
 
     setHook("before.plot.new", action = "replace", function(...) {
-      .mcp_console_plot_before_new_page("before.plot.new")
+      .mcp_repl_plot_before_new_page("before.plot.new")
     })
     setHook("before.grid.newpage", action = "replace", function(...) {
-      .mcp_console_plot_before_new_page("before.grid.newpage")
+      .mcp_repl_plot_before_new_page("before.grid.newpage")
     })
-    addTaskCallback(.mcp_console_plot_task_callback, name = "mcp-console-plots")
+    addTaskCallback(.mcp_repl_plot_task_callback, name = "mcp-repl-plots")
 
     invisible(NULL)
   }
 
-  .mcp_console_plot_init()
+  .mcp_repl_plot_init()
 })
 
 local({
-  if (.mcp_console_is_print_env_mode()) {
+  if (.mcp_repl_is_print_env_mode()) {
     cat(paste(R.home("share"), R.home("include"), R.home("doc"), sep = ";"))
   }
 })
