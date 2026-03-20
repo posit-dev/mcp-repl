@@ -4,21 +4,8 @@ expression: snapshot
 ---
 $ codex exec --json --sandbox workspace-write --skip-git-repo-check --cd <WORKSPACE> "SANDBOX_TEST_1: run the sandbox write test"
 {"type":"thread.started","thread_id":"<THREAD_ID>"}
-{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`OPENAI_BASE_URL` is deprecated. Set `openai_base_url` in config.toml instead."}}
 {"type":"turn.started"}
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>)"}
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-{"type":"error","message":"Reconnecting... 3/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>)"}
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-{"type":"error","message":"Reconnecting... 4/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>)"}
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-{"type":"error","message":"Reconnecting... 5/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>)"}
-<TIMESTAMP> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: <WS_URL>
-{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Falling back from WebSockets to HTTPS transport. unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: <WS_URL>"}}
-{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"r","tool":"repl","arguments":{"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"},"result":null,"error":null,"status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"r","tool":"repl","arguments":{"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"},"result":{"content":[{"type":"text","text":"[repl] echoed input elided: 8 lines (203 bytes); head: > target <- tempfile(\"mcp-repl-codex\"); tail: + })\nWRITE_OK\n"},{"type":"text","text":"> "}],"structured_content":null},"error":null,"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Tool call 1 completed"}}
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"r","tool":"repl","arguments":{"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"r","tool":"repl","arguments":{"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"},"result":{"content":[{"type":"text","text":"[repl] echoed input elided: 8 lines (203 bytes); head: > target <- tempfile(\"mcp-repl-codex\"); tail: + })\nWRITE_OK\n"},{"type":"text","text":"> "}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Tool call 1 completed"}}
 {"type":"turn.completed","usage":{"input_tokens":"<N>","cached_input_tokens":"<N>","output_tokens":"<N>"}}

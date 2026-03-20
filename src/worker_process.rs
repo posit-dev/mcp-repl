@@ -3685,6 +3685,11 @@ mod tests {
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
+    fn env_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
@@ -3815,6 +3820,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
         let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
@@ -3840,6 +3846,7 @@ mod tests {
 
     #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
         let initial = serde_json::json!({
@@ -3905,6 +3912,7 @@ mod tests {
 
     #[test]
     fn apply_debug_startup_env_uses_mcp_repl_vars() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
         let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
         unsafe {
@@ -3958,6 +3966,7 @@ mod tests {
 
     #[test]
     fn apply_debug_startup_env_uses_session_tmpdir_for_worker_log() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
         let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
         unsafe {
@@ -4035,6 +4044,7 @@ mod tests {
 
     #[test]
     fn cleanup_worker_session_tmpdir_persists_log_when_keep_tmpdir_is_set() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let temp = tempfile::tempdir().expect("tempdir");
         let session_tmpdir = temp.path().join("session-tmp");
         let debug_session_dir = temp.path().join("debug-session");
