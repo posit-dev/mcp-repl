@@ -525,7 +525,7 @@ dependencies = [
 [[package]]
 name = "harp"
 version = "0.1.0"
-source = "git+https://github.com/t-kalinowski/ark#43441280f5bb84d9566e8f47f1c6b8614d056340"
+source = "git+https://github.com/t-kalinowski/ark?rev=43441280f5bb84d9566e8f47f1c6b8614d056340#43441280f5bb84d9566e8f47f1c6b8614d056340"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -551,7 +551,7 @@ dependencies = [
 [[package]]
 name = "harp-macros"
 version = "0.1.0"
-source = "git+https://github.com/t-kalinowski/ark#43441280f5bb84d9566e8f47f1c6b8614d056340"
+source = "git+https://github.com/t-kalinowski/ark?rev=43441280f5bb84d9566e8f47f1c6b8614d056340#43441280f5bb84d9566e8f47f1c6b8614d056340"
 dependencies = [
  "quote",
  "syn 1.0.109",
@@ -830,7 +830,7 @@ dependencies = [
 [[package]]
 name = "libr"
 version = "0.1.0"
-source = "git+https://github.com/t-kalinowski/ark#43441280f5bb84d9566e8f47f1c6b8614d056340"
+source = "git+https://github.com/t-kalinowski/ark?rev=43441280f5bb84d9566e8f47f1c6b8614d056340#43441280f5bb84d9566e8f47f1c6b8614d056340"
 dependencies = [
  "cfg-if",
  "libc",
@@ -1641,7 +1641,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stdext"
 version = "0.1.0"
-source = "git+https://github.com/t-kalinowski/ark#43441280f5bb84d9566e8f47f1c6b8614d056340"
+source = "git+https://github.com/t-kalinowski/ark?rev=43441280f5bb84d9566e8f47f1c6b8614d056340#43441280f5bb84d9566e8f47f1c6b8614d056340"
 dependencies = [
  "anyhow",
  "log",

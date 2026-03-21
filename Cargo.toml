@@ -1,42 +1,46 @@
 [package]
-name = "mcp-repl"
-version = "0.1.0"
-edition = "2024"
-publish = false
-description = "MCP server exposing a long-lived interactive REPL runtime (R or Python backend) over stdio."
-repository = "https://github.com/t-kalinowski/mcp-repl"
-license = "Apache-2.0"
+  name        = "mcp-repl"
+  version     = "0.1.0"
+  edition     = "2024"
+  publish     = false
+  description = "MCP server exposing a long-lived interactive REPL runtime (R or Python backend) over stdio."
+  repository  = "https://github.com/t-kalinowski/mcp-repl"
+  license     = "Apache-2.0"
 
 [[bin]]
-name = "mcp-repl"
-path = "src/main.rs"
+  name = "mcp-repl"
+  path = "src/main.rs"
 
 [dependencies]
-ctor = "0.6.3"
-base64 = "0.22.1"
-harp = { git = "https://github.com/t-kalinowski/ark" }
-htmd = "0.5"
-libc = "0.2"
-libr = { git = "https://github.com/t-kalinowski/ark" }
-memchr = "2.8.0"
-regex-lite = "0.1"
-rmcp = { version = "1.2.0", features = ["client", "transport-child-process", "transport-io"] }
-schemars = "1.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sysinfo = "0.38.4"
-tempfile = "3.27.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-toml_edit = "0.25.5"
+  ctor = "0.6.3"
+  base64 = "0.22.1"
+  htmd = "0.5"
+  libc = "0.2"
+  harp = { git = "https://github.com/t-kalinowski/ark", rev = "43441280f5bb84d9566e8f47f1c6b8614d056340" }
+  libr = { git = "https://github.com/t-kalinowski/ark", rev = "43441280f5bb84d9566e8f47f1c6b8614d056340" }
+  memchr = "2.8.0"
+  regex-lite = "0.1"
+  rmcp = { version = "1.2.0", features = [
+    "client",
+    "transport-child-process",
+    "transport-io",
+  ] }
+  schemars = "1.2"
+  serde = { version = "1", features = ["derive"] }
+  serde_json = "1"
+  sysinfo = "0.38.4"
+  tempfile = "3.27.0"
+  tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+  toml_edit = "0.25.5"
 [target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4.4"
-seccompiler = "0.5.0"
+  landlock    = "0.4.4"
+  seccompiler = "0.5.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-url = "2.5.8"
+  url = "2.5.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = [
+  windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
@@ -48,19 +52,29 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
-] }
+  ] }
 
 [dev-dependencies]
-blake3 = "1.8.3"
-insta = { version = "1.46.3", features = ["yaml"] }
-portable-pty = "0.9.0"
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-vt100 = "0.16.2"
+  blake3 = "1.8.3"
+  insta = { version = "1.46.3", features = ["yaml"] }
+  portable-pty = "0.9.0"
+  tokio = { version = "1", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+  ] }
+  vt100 = "0.16.2"
 
 [features]
-echo-heuristics = []
-pager = []
+  echo-heuristics = []
+  pager           = []
 
 [profile.dev.package]
-insta.opt-level = 3
-similar.opt-level = 3
+  insta.opt-level   = 3
+  similar.opt-level = 3
