@@ -32,10 +32,14 @@ expression: transcript
 >>>   message("ROOT_MARKER_ERROR:", conditionMessage(e))
 >>> })
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
-<<< [repl] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
 <<< TMPDIR_SET=TRUE
 <<< TMPDIR_MATCH=TRUE
-<<< --More-- (3p, 24.9%, @0..269/1078)
+<<< TEMPDIR_UNDER_TMPDIR=TRUE
+<<< TEMPDIR_MARKER_OK
+<<< TEMPFILE_OK
+<<< TEMPDIR_LIST=mcp-repl-snapshot.txt
+<<< ROOT_MARKER_OK
+<<< ROOT_MARKER_EXISTS=TRUE
 
 2) r_repl
 >>> 
@@ -47,9 +51,9 @@ expression: transcript
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 >>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 >>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
-<<< [repl] echoed input elided: 3 lines (153 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
+<<< TEMPDIR_UNDER_TMPDIR=TRUE
 
 4) r_repl
 >>> 
@@ -61,6 +65,6 @@ expression: transcript
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 >>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 >>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
-<<< [repl] echoed input elided: 3 lines (153 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
+<<< TEMPDIR_UNDER_TMPDIR=TRUE

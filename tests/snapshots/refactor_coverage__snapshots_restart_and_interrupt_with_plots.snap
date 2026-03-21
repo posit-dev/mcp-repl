@@ -1,6 +1,6 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: restart_interrupt ==
 -- step 1 --
@@ -17,6 +17,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> \n> set.seed(1)\n> plot(1:5, type = \"l\")"
+    },
     {
       "type": "image",
       "mime_type": "image/png",
@@ -44,7 +48,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (49 bytes); head: > ; tail: > cat(\"plots_done\\n\")\nplots_done"
+      "text": "> \n> plot(5:1, type = \"l\")\n> cat(\"plots_done\\n\")\nplots_done"
     },
     {
       "type": "image",
@@ -92,7 +96,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",
@@ -164,7 +168,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

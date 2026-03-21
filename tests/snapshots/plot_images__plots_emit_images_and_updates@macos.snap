@@ -10,6 +10,10 @@ expression: serialized
       "response": {
         "content": [
           {
+            "type": "text",
+            "text": "> plot(1:10)\n"
+          },
+          {
             "type": "image",
             "data": "blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c",
             "mimeType": "image/png",
@@ -33,6 +37,10 @@ expression: serialized
       "input": "lines(4:8, 4:8)",
       "response": {
         "content": [
+          {
+            "type": "text",
+            "text": "> lines(4:8, 4:8)\n"
+          },
           {
             "type": "image",
             "data": "blake3:397871e52656cc5b0883b57c200ded44fb60ca1d264683ffb13e6bfd4e96ad85",
@@ -59,7 +67,7 @@ expression: serialized
         "content": [
           {
             "type": "text",
-            "text": "[1] 2\n"
+            "text": "> 1+1\n[1] 2\n"
           },
           {
             "type": "text",

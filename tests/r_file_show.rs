@@ -29,7 +29,7 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_show_uses_mcp_repl_pager() -> TestResult<()> {
+async fn file_show_returns_full_output_without_pager() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(4_000).await?;
 
     let result = session
@@ -49,25 +49,13 @@ async fn file_show_uses_mcp_repl_pager() -> TestResult<()> {
         "expected file.show() content in output, got: {text:?}"
     );
     assert!(
-        text.contains("--More--"),
-        "expected mcp-repl pager footer, got: {text:?}"
+        text.contains("file_show_line0200"),
+        "expected full file.show() output in one reply, got: {text:?}"
     );
-
-    let result = session.write_stdin_raw_with(":next", Some(30.0)).await?;
     session.cancel().await?;
-
-    let text = result_text(&result);
-    if backend_unavailable(&text) {
-        eprintln!("r_file_show backend unavailable in this environment; skipping");
-        return Ok(());
-    }
     assert!(
-        text.contains("file_show_line") && !text.contains("file_show_line0001"),
-        "expected a later page of file.show() output, got: {text:?}"
-    );
-    assert!(
-        text.contains("--More--") || text.contains("(END"),
-        "expected pager footer on subsequent page, got: {text:?}"
+        !text.contains("--More--"),
+        "did not expect pager footer, got: {text:?}"
     );
     Ok(())
 }

@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_transcripts.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: interrupt_handler ==
 -- step 1 --
@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

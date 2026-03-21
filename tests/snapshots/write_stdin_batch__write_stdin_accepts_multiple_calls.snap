@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: list_inputs ==
 -- step 1 --
@@ -17,6 +17,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> x <- 1"
+    },
     {
       "type": "text",
       "text": "> "
@@ -39,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> x + 1\n[1] 2"
     },
     {
       "type": "text",

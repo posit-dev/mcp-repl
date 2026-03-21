@@ -42,7 +42,6 @@ fn backend_unavailable(text: &str) -> bool {
         )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
-        || text.contains("[pager] input blocked while pager is active")
 }
 
 #[cfg(not(windows))]

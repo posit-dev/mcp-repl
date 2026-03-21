@@ -5,7 +5,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::backend::Backend;
-use crate::pager;
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
@@ -13,7 +12,6 @@ use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
 const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SAFETY_MARGIN: f64 = 1.05;
 const MIN_SERVER_GRACE: Duration = Duration::from_secs(1);
-const DEBUG_REPL_PAGE_CHARS: u64 = 300;
 const INITIAL_PROMPT_WAIT: Duration = Duration::from_secs(5);
 const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -21,7 +19,6 @@ pub(crate) fn run(
     backend: Backend,
     sandbox_plan: SandboxCliPlan,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_debug_repl_page_size();
     let image_support = detect_image_support();
     eprintln!(
         "debug repl: write_stdin timeout={:.1}s | end input with END | commands: INTERRUPT, RESTART | Ctrl-D to exit | images={}",
@@ -230,18 +227,6 @@ fn detect_image_support() -> bool {
     }
     let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     matches!(term_program.as_str(), "ghostty" | "wezterm" | "iterm.app")
-}
-
-fn ensure_debug_repl_page_size() {
-    if env::var_os(pager::PAGER_PAGE_CHARS_ENV).is_some() {
-        return;
-    }
-    unsafe {
-        env::set_var(
-            pager::PAGER_PAGE_CHARS_ENV,
-            DEBUG_REPL_PAGE_CHARS.to_string(),
-        );
-    }
 }
 
 fn is_truthy(value: &str) -> bool {

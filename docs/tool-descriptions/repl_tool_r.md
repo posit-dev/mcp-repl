@@ -9,8 +9,8 @@ Behavior:
 - Uses the user's R installation and library paths.
 
 - Plots (ggplot2 and base R) are captured and returned as images. Adjust sizing with `options(console.plot.width, console.plot.height, console.plot.units, console.plot.dpi)`.
-- Pager mode activates on large output. Empty input advances one page. Non-empty pager commands must start with `:`. Non-`:` input dismisses pager and is sent to the backend.
+- Large output is returned directly in tool responses. Empty `input` only polls for pending output.
 - Documentation entry points work in-band. Prefer the normal R interfaces such as `?topic`, `help()`, `vignette()`, and `RShowDoc("R-exts")`; the REPL renders their text/HTML output directly instead of launching an external viewer.
-- For large manuals and help pages, use the pager. `?topic`, `help()`, `vignette()`, and `RShowDoc()` can all open there. Use `:help` for commands. The main search flow is `:/pattern`, `:n`, `:p`, `:matches`, and `:goto N`.
+- `?topic`, `help()`, `vignette()`, and `RShowDoc()` render directly into the tool response instead of opening a pager.
 - Debugging: `browser()`, `debug()`, `trace()`.
 - Control: `\u0003` in input interrupts; `\u0004` resets session then runs remaining input.

@@ -557,11 +557,11 @@ async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
-        "expected paged output to still include plot image content"
+        "expected large output to still include plot image content"
     );
     assert!(
-        result_text(&result).contains("--More--"),
-        "expected pager footer in response"
+        !result_text(&result).contains("--More--"),
+        "did not expect pager footer in response"
     );
 
     Ok(())
@@ -759,7 +759,7 @@ async fn python_plot_updates_in_single_request_collapse() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_emitted_after_truncation() -> TestResult<()> {
+async fn python_plot_emitted_after_large_output() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
@@ -781,8 +781,12 @@ async fn python_plot_emitted_after_truncation() -> TestResult<()> {
 
     let text = result_text(&result);
     assert!(
-        text.contains("output truncated"),
-        "expected truncation notice, got: {text:?}"
+        text.contains("END"),
+        "expected the tail of the large output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("output truncated"),
+        "did not expect truncation notice, got: {text:?}"
     );
 
     let images = extract_images(&result);

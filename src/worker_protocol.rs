@@ -14,7 +14,7 @@ pub enum WorkerErrorCode {
     Interrupted,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerContent {
     ContentText {
@@ -29,7 +29,7 @@ pub enum WorkerContent {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TextStream {
     Stdout,

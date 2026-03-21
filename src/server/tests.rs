@@ -128,7 +128,8 @@ fn repl_tool_descriptions_include_language_specific_affordances() {
 
     for description in [r, python] {
         let lower = description.to_lowercase();
-        assert!(lower.contains("pager"));
+        assert!(lower.contains("poll"));
+        assert!(lower.contains("large output"));
         assert!(lower.contains("images"));
         assert!(lower.contains("debug"));
     }

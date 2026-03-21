@@ -115,7 +115,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_trims_continuation_echo() -> TestResult<()> {
+async fn write_stdin_preserves_multiline_echo() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -132,14 +132,14 @@ async fn write_stdin_trims_continuation_echo() -> TestResult<()> {
         return Ok(());
     }
     session.cancel().await?;
-    assert!(text.contains("2"), "expected result, got: {text:?}");
+    assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        !text.contains("> 1+"),
-        "did not expect echoed input prompt line, got: {text:?}"
+        text.contains("> 1+"),
+        "expected echoed first line to be preserved, got: {text:?}"
     );
     assert!(
-        !text.contains("\n+ 1"),
-        "did not expect echoed continuation prompt line, got: {text:?}"
+        text.contains("\n+ 1"),
+        "expected echoed continuation line to be preserved, got: {text:?}"
     );
     Ok(())
 }
@@ -193,11 +193,11 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("Error: boom"),
+        text.contains("\nError: boom\n"),
         "missing error text, got: {text:?}"
     );
     assert!(
-        !text.contains("> Error: boom"),
+        !text.contains("\n> Error: boom\n"),
         "expected leading prompt to be normalized, got: {text:?}"
     );
     assert_ne!(result.is_error, Some(true));
@@ -205,64 +205,34 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_auto_dismisses_pager_for_backend_input() -> TestResult<()> {
+async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+    let mut session = spawn_behavior_session().await?;
 
-    let activate = session
+    let result = session
         .write_stdin_raw_with(
             "line <- paste(rep('x', 200), collapse = ''); for (i in 1:120) cat(sprintf('line%04d %s\\n', i, line))",
             Some(30.0),
         )
         .await?;
-    let activate = wait_until_not_busy(&mut session, activate).await?;
-    let activate_text = result_text(&activate);
-    if backend_unavailable(&activate_text) {
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        activate_text.contains("--More--"),
-        "expected pager activation, got: {activate_text:?}"
-    );
-
-    let run_backend = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
-    let run_backend_text = result_text(&run_backend);
-    assert!(
-        run_backend_text.contains("[1] 2"),
-        "expected backend command to run after auto-dismiss, got: {run_backend_text:?}"
-    );
-    assert!(
-        !run_backend_text.contains("input blocked while pager is active"),
-        "did not expect pager block message, got: {run_backend_text:?}"
-    );
-
-    let reactivate = session
-        .write_stdin_raw_with(
-            "line <- paste(rep('x', 200), collapse = ''); for (i in 1:120) cat(sprintf('line%04d %s\\n', i, line))",
-            Some(30.0),
-        )
-        .await?;
-    let reactivate = wait_until_not_busy(&mut session, reactivate).await?;
-    let reactivate_text = result_text(&reactivate);
-    assert!(
-        reactivate_text.contains("--More--"),
-        "expected pager re-activation, got: {reactivate_text:?}"
-    );
-
-    let invalid_pager = session.write_stdin_raw_with(":wat", Some(10.0)).await?;
-    let invalid_pager_text = result_text(&invalid_pager);
-    assert!(
-        invalid_pager_text.contains("[pager] unrecognized command: :wat"),
-        "expected unrecognized pager command message, got: {invalid_pager_text:?}"
-    );
-    assert!(
-        invalid_pager_text.contains("--More--"),
-        "expected pager to remain active after invalid pager command, got: {invalid_pager_text:?}"
-    );
-
     session.cancel().await?;
+
+    assert!(
+        !text.contains("--More--"),
+        "did not expect pager footer, got: {text:?}"
+    );
+    assert!(
+        text.contains("line0120"),
+        "expected the full output in one reply, got: {text:?}"
+    );
+
     Ok(())
 }
 

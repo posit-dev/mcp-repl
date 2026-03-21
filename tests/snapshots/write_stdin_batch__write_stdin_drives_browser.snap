@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: browser_queue ==
 -- step 1 --
@@ -17,6 +17,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> f <- function() { browser(); x <- 1; x <- x + 1; x }"
+    },
     {
       "type": "text",
       "text": "> "
@@ -39,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Called from: f()"
+      "text": "> f()\nCalled from: f()"
     },
     {
       "type": "text",
@@ -63,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "debug at #1: x <- 1"
+      "text": "Browse[1]> n\ndebug at #1: x <- 1"
     },
     {
       "type": "text",
@@ -87,7 +91,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "debug at #1: x <- x + 1"
+      "text": "Browse[1]> n\ndebug at #1: x <- x + 1"
     },
     {
       "type": "text",
@@ -111,7 +115,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "Browse[1]> c\n[1] 2"
     },
     {
       "type": "text",

@@ -82,6 +82,7 @@ async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_truncation_notice_tail() -> TestResult<()> {
@@ -107,6 +108,7 @@ cat("\nEND\n")
     Ok(())
 }
 
+#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_pager_hits_with_images() -> TestResult<()> {
@@ -153,7 +155,7 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains("worker io error: Broken pipe")
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "pager"))]
 fn normalize_pager_footer_page_counts(text: &str) -> String {
     let marker = "--More-- (";
     let mut out = String::with_capacity(text.len());
@@ -185,16 +187,22 @@ fn normalize_pager_footer_page_counts(text: &str) -> String {
 
 #[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
+    #[cfg(feature = "pager")]
     let rendered = if name == "snapshots_pager_hits_with_images" {
         normalize_pager_footer_page_counts(&snapshot.render())
     } else {
         snapshot.render()
     };
+    #[cfg(not(feature = "pager"))]
+    let rendered = snapshot.render();
+    #[cfg(feature = "pager")]
     let transcript = if name == "snapshots_pager_hits_with_images" {
         normalize_pager_footer_page_counts(&snapshot.render_transcript())
     } else {
         snapshot.render_transcript()
     };
+    #[cfg(not(feature = "pager"))]
+    let transcript = snapshot.render_transcript();
     if backend_unavailable(&rendered) || backend_unavailable(&transcript) {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         return Ok(());

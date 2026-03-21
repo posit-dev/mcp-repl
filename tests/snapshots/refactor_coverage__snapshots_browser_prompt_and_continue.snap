@@ -1,6 +1,6 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: browser_prompt ==
 -- step 1 --
@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Called from: top level "
+      "text": "> browser()\nCalled from: top level "
     },
     {
       "type": "text",
@@ -43,6 +43,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "Browse[1]> c"
+    },
+    {
+      "type": "text",
       "text": "> "
     }
   ]
@@ -63,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

@@ -126,6 +126,7 @@ async fn write_stdin_drives_browser() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_drives_browser", &snapshot)
 }
 
+#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_search() -> TestResult<()> {
@@ -143,6 +144,7 @@ async fn write_stdin_pager_search() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_pager_search", &snapshot)
 }
 
+#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_hits() -> TestResult<()> {
@@ -189,11 +191,9 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
+async fn write_stdin_preserves_huge_echo_only_inputs() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
-    // Large silent inputs should not be returned as echoed transcripts (which can trip pager mode
-    // and waste tokens). The backend prompt is still returned.
     let input = (1..=2_000)
         .map(|idx| format!("x{idx} <- {idx}\n"))
         .collect::<String>();
@@ -212,22 +212,21 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     session.cancel().await?;
     assert!(
         !text.contains("--More--"),
-        "expected no pager activation for echo-only input, got: {text:?}"
+        "did not expect pager activation for echo-only input, got: {text:?}"
     );
     assert!(
-        text.trim_end().ends_with('>'),
-        "expected backend prompt, got: {text:?}"
+        text.contains("x1 <- 1") && text.contains("x2000 <- 2000"),
+        "expected echoed input to be preserved, got: {text:?}"
     );
     assert!(
-        text.len() < 1_000,
-        "expected trimmed output; got {} bytes",
-        text.len()
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_collapses_huge_echo_with_output_attribution() -> TestResult<()> {
+async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let mut input = String::new();
@@ -258,21 +257,16 @@ async fn write_stdin_collapses_huge_echo_with_output_attribution() -> TestResult
         "expected output from both cat() calls, got: {text:?}"
     );
     assert!(
-        text.contains("echoed input elided"),
-        "expected echo elision marker, got: {text:?}"
+        text.contains("x500 <- 500") && text.contains("y500 <- 500"),
+        "expected echoed transcript to be preserved, got: {text:?}"
     );
     assert!(
-        !text.contains("x500 <- 500"),
-        "expected large echoed transcript to be collapsed, got: {text:?}"
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
     );
     assert!(
         !text.contains("--More--"),
-        "expected no pager activation for huge echo with small output, got: {text:?}"
-    );
-    assert!(
-        text.len() < 8_000,
-        "expected bounded output; got {} bytes",
-        text.len()
+        "did not expect pager activation for huge echo with small output, got: {text:?}"
     );
     Ok(())
 }

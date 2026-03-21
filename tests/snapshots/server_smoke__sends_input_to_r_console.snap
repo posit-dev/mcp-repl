@@ -1,6 +1,6 @@
 ---
 source: tests/server_smoke.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: default ==
 -- step 1 --
@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

@@ -25,7 +25,7 @@ r.repl({"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLine
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 8 lines (203 bytes); head: > target <- tempfile(\"mcp-repl-codex\"); tail: + })\nWRITE_OK\n"
+      "text": "> target <- tempfile(\"mcp-repl-codex\")\n> tryCatch({\n+   writeLines(\"ok\", target)\n+   cat(\"WRITE_OK\\n\")\n+   unlink(target)\n+ }, error = function(e) {\n+   message(\"WRITE_ERROR:\", conditionMessage(e))\n+ })\nWRITE_OK\n"
     },
     {
       "type": "text",

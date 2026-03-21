@@ -10,6 +10,10 @@ expression: serialized
       "response": {
         "content": [
           {
+            "type": "text",
+            "text": "> grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))\n"
+          },
+          {
             "type": "image",
             "data": "blake3:47525e6a088b368bfb44d178ec912c488125bafe7cf47165a37fa0377f2d116f",
             "mimeType": "image/png",
@@ -33,6 +37,10 @@ expression: serialized
       "input": "grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))",
       "response": {
         "content": [
+          {
+            "type": "text",
+            "text": "> grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))\n"
+          },
           {
             "type": "image",
             "data": "blake3:13144fb0a14c9e60fe21d1220af6bbf64f335854dafd4e803fe0bcb1c7fbe2ca",
@@ -59,7 +67,7 @@ expression: serialized
         "content": [
           {
             "type": "text",
-            "text": "[1] 2\n"
+            "text": "> 1+1\n[1] 2\n"
           },
           {
             "type": "text",

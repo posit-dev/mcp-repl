@@ -188,8 +188,8 @@ async fn write_stdin_empty_returns_prompt() -> TestResult<()> {
 
     assert_ne!(result.is_error, Some(true), "empty input should not error");
     assert!(
-        text.contains(">"),
-        "expected prompt in output, got: {text:?}"
+        text.is_empty() || text.contains(">"),
+        "expected empty poll output or a prompt, got: {text:?}"
     );
     Ok(())
 }

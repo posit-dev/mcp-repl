@@ -162,6 +162,7 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "pager")]
 #[tokio::test(flavor = "multi_thread")]
 async fn r_show_doc_search_returns_compact_card() -> TestResult<()> {
     let _guard = test_mutex()

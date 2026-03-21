@@ -135,6 +135,10 @@ pub struct IpcPlotImage {
 #[derive(Default, Clone)]
 pub struct IpcHandlers {
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
+    pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
+    pub on_request_end: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -181,6 +185,10 @@ impl ServerIpcConnection {
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
         let plot_handler = handlers.on_plot_image.clone();
+        let readline_start_handler = handlers.on_readline_start.clone();
+        let readline_result_handler = handlers.on_readline_result.clone();
+        let request_end_handler = handlers.on_request_end.clone();
+        let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
         thread::spawn(move || {
             let mut reader = BufReader::new(reader);
@@ -209,6 +217,7 @@ impl ServerIpcConnection {
                 if let Ok(message) = serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
                     match message {
                         WorkerToServerIpcMessage::ReadlineStart { prompt } => {
+                            let prompt_for_handler = prompt.clone();
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
@@ -227,8 +236,16 @@ impl ServerIpcConnection {
                             }
                             guard.last_prompt = Some(prompt);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = readline_start_handler.as_ref() {
+                                handler(prompt_for_handler);
+                            }
                         }
                         WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
+                            let echo_event = IpcEchoEvent {
+                                prompt: prompt.clone(),
+                                line: line.clone(),
+                            };
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.readline_result_count =
                                 guard.readline_result_count.saturating_add(1);
@@ -238,14 +255,22 @@ impl ServerIpcConnection {
                                     guard.readline_unmatched_since = None;
                                 }
                             }
-                            guard.echo_events.push_back(IpcEchoEvent { prompt, line });
+                            guard.echo_events.push_back(echo_event.clone());
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = readline_result_handler.as_ref() {
+                                handler(echo_event);
+                            }
                         }
                         WorkerToServerIpcMessage::SessionEnd => {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.session_end = true;
                             guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = session_end_handler.as_ref() {
+                                handler();
+                            }
                         }
                         WorkerToServerIpcMessage::PlotImage {
                             id,
@@ -273,8 +298,14 @@ impl ServerIpcConnection {
                         }
                         other => {
                             let mut guard = reader_inbox.lock().unwrap();
+                            let is_request_end =
+                                matches!(other, WorkerToServerIpcMessage::RequestEnd);
                             guard.queue.push_back(other);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if is_request_end && let Some(handler) = request_end_handler.as_ref() {
+                                handler();
+                            }
                         }
                     }
                 }
@@ -338,6 +369,7 @@ impl ServerIpcConnection {
         guard.prompt_history.drain(..).collect()
     }
 
+    #[cfg(feature = "pager")]
     pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
         let mut guard = self.inbox.lock().unwrap();
         guard.echo_events.drain(..).collect()

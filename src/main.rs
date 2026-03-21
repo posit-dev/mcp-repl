@@ -7,9 +7,12 @@ mod html_to_markdown;
 mod input_protocol;
 mod install;
 mod ipc;
+#[cfg(feature = "pager")]
 mod output_capture;
 mod output_stream;
+#[cfg(feature = "pager")]
 mod pager;
+mod pending_output_tape;
 mod r_controls;
 mod r_graphics;
 mod r_htmd;

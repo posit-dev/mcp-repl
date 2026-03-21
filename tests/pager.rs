@@ -1,3 +1,5 @@
+#![cfg(feature = "pager")]
+
 mod common;
 
 #[cfg(not(windows))]

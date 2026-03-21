@@ -26,7 +26,6 @@ fn is_busy_response(text: &str) -> bool {
 
 fn is_restart_transient_output(text: &str) -> bool {
     is_busy_response(text)
-        || text.contains("--More--")
         || text.contains("new session started")
         || text.contains("worker exited with status")
 }
@@ -175,22 +174,6 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
             session.cancel().await?;
             panic!("expected fresh session after restart prefix, got: {text:?}");
         }
-        if text.contains("--More--") {
-            let pager_quit = session.write_stdin_raw_with(":q", Some(5.0)).await?;
-            text = result_text(&pager_quit);
-            if text.contains("FALSE") {
-                break;
-            }
-            assert!(
-                !text.contains("TRUE"),
-                "expected restarted session to clear x, got: {text:?}"
-            );
-            if Instant::now() >= deadline {
-                session.cancel().await?;
-                panic!("expected fresh session after restart prefix, got: {text:?}");
-            }
-        }
-
         sleep(Duration::from_millis(100)).await;
         let result = session
             .write_stdin_raw_with("print(exists(\"x\"))", Some(5.0))
