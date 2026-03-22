@@ -48,14 +48,32 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
-fn spill_path(text: &str) -> Option<PathBuf> {
+fn bundle_events_log_path(text: &str) -> Option<PathBuf> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"full output:\s+(/[^]\s]+)").expect("spill-path regex should compile")
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
     });
     re.captures(text)
         .and_then(|caps| caps.get(1))
         .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn bundle_transcript_path(events_log: &PathBuf) -> PathBuf {
+    events_log
+        .parent()
+        .expect("events.log should have a parent bundle dir")
+        .join("transcript.txt")
+}
+
+async fn wait_for_path_to_disappear(path: &PathBuf) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !path.exists() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("path still exists after shutdown: {}", path.display()).into())
 }
 
 async fn wait_until_not_busy(
@@ -85,17 +103,24 @@ async fn wait_until_not_busy(
 }
 
 async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
+    spawn_behavior_session_with_env_vars(Vec::new()).await
+}
+
+async fn spawn_behavior_session_with_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<common::McpTestSession> {
     #[cfg(target_os = "windows")]
     {
-        common::spawn_server_with_args(vec![
-            "--sandbox".to_string(),
-            "danger-full-access".to_string(),
-        ])
+        common::spawn_server_with_args_env_and_pager_page_chars(
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+            env_vars,
+            300,
+        )
         .await
     }
     #[cfg(not(target_os = "windows"))]
     {
-        common::spawn_server().await
+        common::spawn_server_with_env_vars(env_vars).await
     }
 }
 
@@ -250,7 +275,59 @@ async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout_spill_file_backfills_earlier_worker_text_and_excludes_timeout_marker()
+async fn text_only_oversized_reply_uses_output_bundle_dir() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('x', 120), collapse = ''); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big))";
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let events_log = bundle_events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected bundle events.log path in oversized reply, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(bundle_transcript_path(&events_log))?;
+    let events = fs::read_to_string(&events_log)?;
+    let images_dir = events_log
+        .parent()
+        .expect("events.log should have bundle dir parent")
+        .join("images");
+    let image_count = fs::read_dir(&images_dir)?.count();
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("mid080"),
+        "expected transcript bundle to contain the full worker text, got: {transcript:?}"
+    );
+    assert!(
+        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
+        "expected bundle header, got: {events:?}"
+    );
+    assert!(
+        events.contains("T lines="),
+        "expected text range entries in bundle index, got: {events:?}"
+    );
+    assert!(
+        !events.contains("\nI "),
+        "did not expect image entries for text-only oversized output, got: {events:?}"
+    );
+    assert_eq!(
+        image_count, 0,
+        "did not expect image files in text-only bundle"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeout_marker()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
@@ -264,8 +341,8 @@ async fn timeout_spill_file_backfills_earlier_worker_text_and_excludes_timeout_m
         return Ok(());
     }
     assert!(
-        spill_path(&first_text).is_none(),
-        "did not expect spill path on first small timeout reply, got: {first_text:?}"
+        bundle_events_log_path(&first_text).is_none(),
+        "did not expect bundle path on first small timeout reply, got: {first_text:?}"
     );
 
     sleep(Duration::from_millis(260)).await;
@@ -276,10 +353,10 @@ async fn timeout_spill_file_backfills_earlier_worker_text_and_excludes_timeout_m
         session.cancel().await?;
         return Ok(());
     }
-    let path = spill_path(&spilled_text).unwrap_or_else(|| {
-        panic!("expected spill path in oversized poll reply, got: {spilled_text:?}")
+    let events_log = bundle_events_log_path(&spilled_text).unwrap_or_else(|| {
+        panic!("expected bundle path in oversized poll reply, got: {spilled_text:?}")
     });
-    let file_text = fs::read_to_string(&path)?;
+    let file_text = fs::read_to_string(bundle_transcript_path(&events_log))?;
 
     session.cancel().await?;
 
@@ -324,14 +401,14 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     sleep(Duration::from_millis(260)).await;
     let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
     let spilled_text = result_text(&spilled);
-    let path = match spill_path(&spilled_text) {
+    let events_log = match bundle_events_log_path(&spilled_text) {
         Some(path) => path,
         None if spilled_text.contains("<<console status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
         }
-        None => panic!("expected spill path in first oversized poll reply, got: {spilled_text:?}"),
+        None => panic!("expected bundle path in first oversized poll reply, got: {spilled_text:?}"),
     };
 
     sleep(Duration::from_millis(450)).await;
@@ -342,7 +419,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         session.cancel().await?;
         return Ok(());
     }
-    let file_text = fs::read_to_string(&path)?;
+    let file_text = fs::read_to_string(bundle_transcript_path(&events_log))?;
 
     session.cancel().await?;
 
@@ -351,13 +428,186 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         "expected small final poll output inline, got: {final_text:?}"
     );
     assert!(
-        spill_path(&final_text).is_none(),
-        "did not expect spill path to be repeated on later small poll, got: {final_text:?}"
+        bundle_events_log_path(&final_text).is_none(),
+        "did not expect bundle path to be repeated on later small poll, got: {final_text:?}"
     );
     assert!(
         file_text.contains("tail"),
         "expected later small poll output to append to existing spill file, got: {file_text:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_bundle_prunes_oldest_inactive_bundle_when_count_limit_exceeded() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT".to_string(),
+            "2".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "1048576".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES".to_string(),
+            "2097152".to_string(),
+        ),
+    ])
+    .await?;
+    let mut bundles = Vec::new();
+
+    for label in ["a", "b", "c"] {
+        let input = format!(
+            "big <- paste(rep('{label}', 120), collapse = ''); for (i in 1:80) cat(sprintf('{label}%03d %s\\n', i, big))"
+        );
+        let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+        let result = wait_until_not_busy(&mut session, result).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        let events_log = bundle_events_log_path(&text)
+            .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
+        bundles.push(events_log);
+    }
+
+    assert!(
+        !bundles[0].exists(),
+        "expected oldest bundle to be pruned after count cap, still exists: {:?}",
+        bundles[0]
+    );
+    assert!(bundles[1].exists(), "expected second bundle to remain");
+    assert!(bundles[2].exists(), "expected newest bundle to remain");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_bundle_reports_omitted_tail_when_bundle_size_cap_is_hit() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT".to_string(),
+            "20".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "2048".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES".to_string(),
+            "1048576".to_string(),
+        ),
+    ])
+    .await?;
+
+    let input = "big <- paste(rep('z', 120), collapse = ''); for (i in 1:120) cat(sprintf('z%03d %s\\n', i, big))";
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let events_log = bundle_events_log_path(&text)
+        .unwrap_or_else(|| panic!("expected bundle path in capped oversized reply, got: {text:?}"));
+    let transcript = fs::read_to_string(bundle_transcript_path(&events_log))?;
+    let events = fs::read_to_string(&events_log)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("later content omitted"),
+        "expected inline omission notice after bundle cap, got: {text:?}"
+    );
+    assert!(
+        events.contains("later content omitted"),
+        "expected bundle index omission record after bundle cap, got: {events:?}"
+    );
+    assert!(
+        !transcript.contains("z120"),
+        "did not expect capped transcript to contain the omitted tail, got: {transcript:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_bundle_prunes_oldest_inactive_bundle_when_total_size_limit_is_hit() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT".to_string(),
+            "20".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "1048576".to_string(),
+        ),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES".to_string(),
+            "7000".to_string(),
+        ),
+    ])
+    .await?;
+
+    let mut bundles = Vec::new();
+    for label in ["m", "n"] {
+        let input = format!(
+            "big <- paste(rep('{label}', 80), collapse = ''); for (i in 1:45) cat(sprintf('{label}%03d %s\\n', i, big))"
+        );
+        let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+        let result = wait_until_not_busy(&mut session, result).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        let events_log = bundle_events_log_path(&text)
+            .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
+        bundles.push(events_log);
+    }
+
+    assert!(
+        !bundles[0].exists(),
+        "expected oldest bundle to be pruned after total-size cap, still exists: {:?}",
+        bundles[0]
+    );
+    assert!(bundles[1].exists(), "expected newest bundle to remain");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_bundle_is_cleaned_up_when_server_exits() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('q', 120), collapse = ''); for (i in 1:80) cat(sprintf('q%03d %s\\n', i, big))";
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let events_log = bundle_events_log_path(&text)
+        .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
+
+    session.cancel().await?;
+    wait_for_path_to_disappear(&events_log).await?;
 
     Ok(())
 }

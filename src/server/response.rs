@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,28 +18,42 @@ const INLINE_IMAGE_COST: usize = 900;
 const HEAD_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 3;
 const PRE_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 5;
 const POST_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 8;
+const TEXT_ROW_OVERHEAD_BYTES: usize = 160;
+const DEFAULT_OUTPUT_BUNDLE_MAX_COUNT: usize = 20;
+const DEFAULT_OUTPUT_BUNDLE_MAX_BYTES: u64 = 1 << 30;
+const DEFAULT_OUTPUT_BUNDLE_MAX_TOTAL_BYTES: u64 = 2 << 30;
+const OUTPUT_BUNDLE_MAX_COUNT_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT";
+const OUTPUT_BUNDLE_MAX_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES";
+const OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES";
+const OUTPUT_BUNDLE_HEADER: &[u8] = b"v1\ntext transcript.txt\nimages images/\n";
+const OUTPUT_BUNDLE_OMITTED_NOTICE: &str = "output bundle quota reached; later content omitted";
 
 pub(crate) struct ResponseState {
     output_store: OutputStore,
-    active_timeout_transcript: Option<ActiveTranscript>,
     active_timeout_bundle: Option<ActiveOutputBundle>,
 }
 
 struct OutputStore {
-    root: tempfile::TempDir,
+    root: Option<tempfile::TempDir>,
     next_id: u64,
-}
-
-#[derive(Clone)]
-struct ActiveTranscript {
-    path: PathBuf,
+    total_bytes: u64,
+    limits: OutputStoreLimits,
+    bundles: VecDeque<StoredBundle>,
 }
 
 struct ActiveOutputBundle {
+    id: u64,
     paths: OutputBundlePaths,
     next_image_number: usize,
     transcript_bytes: usize,
     transcript_lines: usize,
+    omitted_tail: bool,
+    omission_recorded: bool,
+}
+
+struct BundleAppendResult {
+    retained_items: Vec<ReplyItem>,
+    omitted_this_reply: bool,
 }
 
 #[derive(Clone)]
@@ -48,6 +63,19 @@ struct OutputBundlePaths {
     images_dir: PathBuf,
 }
 
+struct StoredBundle {
+    id: u64,
+    dir: PathBuf,
+    bytes_on_disk: u64,
+}
+
+struct OutputStoreLimits {
+    max_bundle_count: usize,
+    max_bundle_bytes: u64,
+    max_total_bytes: u64,
+}
+
+#[derive(Clone)]
 enum ReplyItem {
     WorkerText(String),
     ServerText(String),
@@ -75,9 +103,13 @@ impl ResponseState {
     pub(crate) fn new() -> Result<Self, WorkerError> {
         Ok(Self {
             output_store: OutputStore::new()?,
-            active_timeout_transcript: None,
             active_timeout_bundle: None,
         })
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), WorkerError> {
+        self.active_timeout_bundle = None;
+        self.output_store.cleanup_now()
     }
 
     /// Converts a worker result into the final MCP reply, including transcript updates and
@@ -106,19 +138,6 @@ impl ResponseState {
         let material = prepare_reply_material(reply);
 
         if material.error_code == Some(WorkerErrorCode::Timeout)
-            && material.image_count == 0
-            && self.active_timeout_bundle.is_none()
-            && self.active_timeout_transcript.is_none()
-        {
-            let path = self
-                .output_store
-                .new_transcript_path()
-                .expect("failed to create timeout transcript path");
-            self.active_timeout_transcript = Some(ActiveTranscript { path });
-        }
-
-        if material.error_code == Some(WorkerErrorCode::Timeout)
-            && material.image_count > 0
             && self.active_timeout_bundle.is_none()
         {
             let bundle = self
@@ -128,41 +147,42 @@ impl ResponseState {
             self.active_timeout_bundle = Some(bundle);
         }
 
-        if material.image_count > 0
-            && self.active_timeout_bundle.is_none()
-            && self.active_timeout_transcript.is_some()
-        {
-            let active = self
-                .active_timeout_transcript
-                .take()
-                .expect("active timeout transcript should exist");
-            let bundle = self
-                .output_store
-                .new_bundle_from_transcript(&active.path)
-                .expect("failed to backfill timeout output bundle from transcript");
-            self.active_timeout_bundle = Some(bundle);
-        }
-
-        if let Some(active) = self.active_timeout_bundle.as_mut() {
-            active
-                .append_items(&material.items)
-                .expect("failed to append timeout output bundle");
-        } else if !material.worker_text.is_empty()
-            && let Some(active) = self.active_timeout_transcript.as_ref()
-        {
-            self.output_store
-                .append(&active.path, &material.worker_text)
-                .expect("failed to append timeout transcript");
-        }
+        let active_append = if let Some(active) = self.active_timeout_bundle.as_mut() {
+            Some(
+                active
+                    .append_items(&mut self.output_store, &material.items)
+                    .expect("failed to append timeout output bundle"),
+            )
+        } else {
+            None
+        };
 
         let contents = if let Some(active) = self.active_timeout_bundle.as_ref() {
-            if should_use_output_bundle(
-                material.image_count.max(active.next_image_number),
-                material.estimated_cost,
-            ) {
-                compact_output_bundle_items(&material.items, active)
+            let append = active_append
+                .as_ref()
+                .expect("active timeout bundle append result should exist");
+            let retained_worker_text = worker_text_from_items(&append.retained_items);
+            if append.omitted_this_reply {
+                compact_text_bundle_items(
+                    append.retained_items.clone(),
+                    &retained_worker_text,
+                    active,
+                )
+            } else if active.next_image_number > 0
+                && should_use_output_bundle(
+                    material.image_count.max(active.next_image_number),
+                    material.estimated_cost,
+                )
+            {
+                compact_output_bundle_items(&append.retained_items, active)
+            } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
+                compact_text_bundle_items(
+                    append.retained_items.clone(),
+                    &retained_worker_text,
+                    active,
+                )
             } else {
-                materialize_items(material.items)
+                materialize_items(append.retained_items.clone())
             }
         } else if material.image_count > 0
             && should_use_output_bundle(material.image_count, material.estimated_cost)
@@ -171,31 +191,25 @@ impl ResponseState {
                 .output_store
                 .new_bundle()
                 .expect("failed to create output bundle");
-            bundle
-                .append_items(&material.items)
+            let append = bundle
+                .append_items(&mut self.output_store, &material.items)
                 .expect("failed to append output bundle");
-            compact_output_bundle_items(&material.items, &bundle)
+            compact_output_bundle_items(&append.retained_items, &bundle)
         } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
-            let path = match self.active_timeout_transcript.as_ref() {
-                Some(active) => active.path.clone(),
-                None => {
-                    let path = self
-                        .output_store
-                        .new_transcript_path()
-                        .expect("failed to create transcript path");
-                    self.output_store
-                        .append(&path, &material.worker_text)
-                        .expect("failed to append transcript");
-                    path
-                }
-            };
-            compact_items(material.items, &material.worker_text, &path)
+            let mut bundle = self
+                .output_store
+                .new_bundle()
+                .expect("failed to create output bundle");
+            let append = bundle
+                .append_items(&mut self.output_store, &material.items)
+                .expect("failed to append output bundle");
+            let retained_worker_text = worker_text_from_items(&append.retained_items);
+            compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
         } else {
             materialize_items(material.items)
         };
 
         if !pending_request_after {
-            self.active_timeout_transcript = None;
             self.active_timeout_bundle = None;
         }
 
@@ -205,28 +219,40 @@ impl ResponseState {
 
 impl OutputStore {
     fn new() -> Result<Self, WorkerError> {
+        let limits = OutputStoreLimits::from_env()?;
         let root = Builder::new()
             .prefix("mcp-repl-output-")
             .tempdir()
             .map_err(WorkerError::Io)?;
-        Ok(Self { root, next_id: 0 })
+        Ok(Self {
+            root: Some(root),
+            next_id: 0,
+            total_bytes: 0,
+            limits,
+            bundles: VecDeque::new(),
+        })
     }
 
-    /// Allocates a stable absolute path for the next transcript file under the server-owned temp
-    /// root.
-    fn new_transcript_path(&mut self) -> Result<PathBuf, WorkerError> {
-        self.next_id = self.next_id.saturating_add(1);
-        let path = self
-            .root
+    fn cleanup_now(&mut self) -> Result<(), WorkerError> {
+        if let Some(root) = self.root.take() {
+            root.close().map_err(WorkerError::Io)?;
+        }
+        self.bundles.clear();
+        self.total_bytes = 0;
+        Ok(())
+    }
+
+    fn root_path(&self) -> &Path {
+        self.root
+            .as_ref()
+            .expect("output store root should exist")
             .path()
-            .join(format!("output-{:04}.txt", self.next_id));
-        std::fs::File::create(&path).map_err(WorkerError::Io)?;
-        Ok(path)
     }
 
     fn new_bundle(&mut self) -> Result<ActiveOutputBundle, WorkerError> {
+        self.prune_for_new_bundle(OUTPUT_BUNDLE_HEADER.len() as u64)?;
         self.next_id = self.next_id.saturating_add(1);
-        let dir = self.root.path().join(format!("output-{:04}", self.next_id));
+        let dir = self.root_path().join(format!("output-{:04}", self.next_id));
         let images_dir = dir.join("images");
         fs::create_dir_all(&images_dir).map_err(WorkerError::Io)?;
         let transcript = dir.join("transcript.txt");
@@ -234,9 +260,18 @@ impl OutputStore {
         std::fs::File::create(&transcript).map_err(WorkerError::Io)?;
         let mut events = std::fs::File::create(&events_log).map_err(WorkerError::Io)?;
         events
-            .write_all(b"v1\ntext transcript.txt\nimages images/\n")
+            .write_all(OUTPUT_BUNDLE_HEADER)
             .map_err(WorkerError::Io)?;
+        self.bundles.push_back(StoredBundle {
+            id: self.next_id,
+            dir: dir.clone(),
+            bytes_on_disk: OUTPUT_BUNDLE_HEADER.len() as u64,
+        });
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(OUTPUT_BUNDLE_HEADER.len() as u64);
         Ok(ActiveOutputBundle {
+            id: self.next_id,
             paths: OutputBundlePaths {
                 transcript,
                 events_log,
@@ -245,25 +280,18 @@ impl OutputStore {
             next_image_number: 0,
             transcript_bytes: 0,
             transcript_lines: 0,
+            omitted_tail: false,
+            omission_recorded: false,
         })
     }
 
-    fn new_bundle_from_transcript(
+    fn append_bundle_bytes(
         &mut self,
-        transcript_path: &Path,
-    ) -> Result<ActiveOutputBundle, WorkerError> {
-        let mut bundle = self.new_bundle()?;
-        let existing = fs::read_to_string(transcript_path).map_err(WorkerError::Io)?;
-        if !existing.is_empty() {
-            bundle.append_worker_text(&existing)?;
-        }
-        Ok(bundle)
-    }
-
-    /// Appends worker-originated text exactly as surfaced to the client, without server-only
-    /// status markers such as timeout notices.
-    fn append(&self, path: &Path, text: &str) -> Result<(), WorkerError> {
-        if text.is_empty() {
+        bundle_id: u64,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        if bytes.is_empty() {
             return Ok(());
         }
         let mut file = OpenOptions::new()
@@ -271,61 +299,297 @@ impl OutputStore {
             .create(true)
             .open(path)
             .map_err(WorkerError::Io)?;
-        file.write_all(text.as_bytes()).map_err(WorkerError::Io)?;
+        file.write_all(bytes).map_err(WorkerError::Io)?;
+        self.record_append(bundle_id, bytes.len() as u64);
         Ok(())
     }
-}
 
-impl ActiveOutputBundle {
-    fn append_items(&mut self, items: &[ReplyItem]) -> Result<(), WorkerError> {
-        for item in items {
-            match item {
-                ReplyItem::WorkerText(text) => self.append_worker_text(text)?,
-                ReplyItem::ServerText(text) => self.append_server_text(text)?,
-                ReplyItem::Image(image) => self.append_image(image)?,
+    fn prepare_append_capacity(
+        &mut self,
+        bundle_id: u64,
+        requested_bytes: u64,
+    ) -> Result<u64, WorkerError> {
+        let bundle_bytes = self
+            .bundle_bytes(bundle_id)
+            .expect("bundle metadata should exist for append");
+        let bundle_remaining = self.limits.max_bundle_bytes.saturating_sub(bundle_bytes);
+        let target = requested_bytes.min(bundle_remaining);
+        self.prune_until_total_capacity(bundle_id, target)?;
+        let total_remaining = self.limits.max_total_bytes.saturating_sub(self.total_bytes);
+        Ok(target.min(total_remaining))
+    }
+
+    fn bundle_bytes(&self, bundle_id: u64) -> Option<u64> {
+        self.bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .map(|bundle| bundle.bytes_on_disk)
+    }
+
+    fn record_append(&mut self, bundle_id: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("bundle metadata should exist for append");
+        bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_add(bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+    }
+
+    fn prune_for_new_bundle(&mut self, initial_bytes: u64) -> Result<(), WorkerError> {
+        while self.bundles.len() >= self.limits.max_bundle_count {
+            if !self.prune_oldest_inactive_bundle(None)? {
+                return Err(WorkerError::Protocol(
+                    "output bundle count quota left no room for a new bundle".to_string(),
+                ));
+            }
+        }
+        self.prune_until_total_capacity(0, initial_bytes)?;
+        if self.total_bytes.saturating_add(initial_bytes) > self.limits.max_total_bytes {
+            return Err(WorkerError::Protocol(
+                "output bundle total quota is too small for a new bundle".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prune_until_total_capacity(
+        &mut self,
+        active_bundle_id: u64,
+        needed_bytes: u64,
+    ) -> Result<(), WorkerError> {
+        while self.total_bytes.saturating_add(needed_bytes) > self.limits.max_total_bytes {
+            if !self.prune_oldest_inactive_bundle(Some(active_bundle_id))? {
+                break;
             }
         }
         Ok(())
     }
 
-    fn append_worker_text(&mut self, text: &str) -> Result<(), WorkerError> {
+    fn prune_oldest_inactive_bundle(
+        &mut self,
+        active_bundle_id: Option<u64>,
+    ) -> Result<bool, WorkerError> {
+        let Some(index) = self
+            .bundles
+            .iter()
+            .position(|bundle| Some(bundle.id) != active_bundle_id)
+        else {
+            return Ok(false);
+        };
+        let bundle = self
+            .bundles
+            .remove(index)
+            .expect("bundle index should exist");
+        fs::remove_dir_all(&bundle.dir).map_err(WorkerError::Io)?;
+        self.total_bytes = self.total_bytes.saturating_sub(bundle.bytes_on_disk);
+        Ok(true)
+    }
+}
+
+impl OutputStoreLimits {
+    fn from_env() -> Result<Self, WorkerError> {
+        let max_bundle_count =
+            parse_limit_env::<usize>(OUTPUT_BUNDLE_MAX_COUNT_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_COUNT)?;
+        let max_bundle_bytes =
+            parse_limit_env::<u64>(OUTPUT_BUNDLE_MAX_BYTES_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_BYTES)?;
+        let max_total_bytes = parse_limit_env::<u64>(
+            OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV,
+            DEFAULT_OUTPUT_BUNDLE_MAX_TOTAL_BYTES,
+        )?;
+        if max_bundle_count == 0 {
+            return Err(WorkerError::Protocol(
+                "output bundle count quota must be greater than zero".to_string(),
+            ));
+        }
+        if max_bundle_bytes < OUTPUT_BUNDLE_HEADER.len() as u64 {
+            return Err(WorkerError::Protocol(format!(
+                "{OUTPUT_BUNDLE_MAX_BYTES_ENV} must be at least {} bytes",
+                OUTPUT_BUNDLE_HEADER.len()
+            )));
+        }
+        if max_total_bytes < OUTPUT_BUNDLE_HEADER.len() as u64 {
+            return Err(WorkerError::Protocol(format!(
+                "{OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV} must be at least {} bytes",
+                OUTPUT_BUNDLE_HEADER.len()
+            )));
+        }
+        Ok(Self {
+            max_bundle_count,
+            max_bundle_bytes,
+            max_total_bytes,
+        })
+    }
+}
+
+impl ActiveOutputBundle {
+    fn append_items(
+        &mut self,
+        store: &mut OutputStore,
+        items: &[ReplyItem],
+    ) -> Result<BundleAppendResult, WorkerError> {
+        let mut retained_items = Vec::with_capacity(items.len());
+        let mut omitted_this_reply = false;
+        if self.omitted_tail {
+            return Ok(BundleAppendResult {
+                retained_items,
+                omitted_this_reply,
+            });
+        }
+
+        for item in items {
+            let append = match item {
+                ReplyItem::WorkerText(text) => self.append_worker_text(store, text)?,
+                ReplyItem::ServerText(text) => self.append_server_text(store, text)?,
+                ReplyItem::Image(image) => self.append_image(store, image)?,
+            };
+            if let Some(retained_item) = append {
+                let partial_worker_text = matches!(
+                    (item, &retained_item),
+                    (ReplyItem::WorkerText(original), ReplyItem::WorkerText(retained))
+                        if retained.len() < original.len()
+                );
+                retained_items.push(retained_item);
+                if partial_worker_text {
+                    omitted_this_reply = true;
+                    self.apply_omission(store)?;
+                    break;
+                }
+            } else {
+                omitted_this_reply = true;
+                self.apply_omission(store)?;
+                break;
+            }
+        }
+
+        Ok(BundleAppendResult {
+            retained_items,
+            omitted_this_reply,
+        })
+    }
+
+    fn append_worker_text(
+        &mut self,
+        store: &mut OutputStore,
+        text: &str,
+    ) -> Result<Option<ReplyItem>, WorkerError> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let start_byte = self.transcript_bytes;
         let start_line = self.transcript_lines.saturating_add(1);
-        let byte_len = text.len();
-        let line_len = count_lines(text);
-        OutputStore::append_impl(&self.paths.transcript, text.as_bytes())?;
-        self.transcript_bytes = self.transcript_bytes.saturating_add(byte_len);
-        self.transcript_lines = self.transcript_lines.saturating_add(line_len);
-        let end_byte = self.transcript_bytes;
-        let end_line = self.transcript_lines.max(start_line);
-        let line = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
-        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
-    }
-
-    fn append_server_text(&mut self, text: &str) -> Result<(), WorkerError> {
-        if text.is_empty() {
-            return Ok(());
+        let omission_reserve = if self.omission_recorded {
+            0
+        } else {
+            omission_event_line_len()
+        };
+        let granted = store.prepare_append_capacity(
+            self.id,
+            (text.len() + TEXT_ROW_OVERHEAD_BYTES + omission_reserve) as u64,
+        )? as usize;
+        if granted == 0 {
+            return Ok(None);
         }
-        let escaped =
-            serde_json::to_string(text).unwrap_or_else(|_| "\"<server_text>\"".to_string());
-        let line = format!("S {escaped}\n");
-        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
+        let initial_retained = truncate_utf8_prefix(text, granted);
+        if initial_retained.is_empty() {
+            return Ok(None);
+        }
+        let mut retained = initial_retained;
+        loop {
+            let line_len = count_lines(retained);
+            let end_byte = start_byte.saturating_add(retained.len());
+            let end_line = self
+                .transcript_lines
+                .saturating_add(line_len)
+                .max(start_line);
+            let row = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
+            let reserve = if retained.len() < text.len() {
+                omission_reserve
+            } else {
+                0
+            };
+            if retained
+                .len()
+                .saturating_add(row.len())
+                .saturating_add(reserve)
+                <= granted
+            {
+                store.append_bundle_bytes(self.id, &self.paths.transcript, retained.as_bytes())?;
+                store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+                self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
+                self.transcript_lines = self.transcript_lines.saturating_add(line_len);
+                return Ok(Some(ReplyItem::WorkerText(retained.to_string())));
+            }
+            let allowed_text_bytes = granted.saturating_sub(row.len().saturating_add(reserve));
+            let next = truncate_utf8_prefix(retained, allowed_text_bytes);
+            if next.is_empty() || next.len() == retained.len() {
+                return Ok(None);
+            }
+            retained = next;
+        }
     }
 
-    fn append_image(&mut self, image: &ReplyImage) -> Result<(), WorkerError> {
-        self.next_image_number = self.next_image_number.saturating_add(1);
+    fn append_server_text(
+        &mut self,
+        store: &mut OutputStore,
+        text: &str,
+    ) -> Result<Option<ReplyItem>, WorkerError> {
+        let retained = self.append_events_log_text(store, text)?;
+        Ok(retained.map(|text| ReplyItem::ServerText(text.to_string())))
+    }
+
+    fn append_events_log_text<'a>(
+        &mut self,
+        store: &mut OutputStore,
+        text: &'a str,
+    ) -> Result<Option<&'a str>, WorkerError> {
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let line = build_events_log_server_line(text);
+        let granted = store.prepare_append_capacity(self.id, line.len() as u64)?;
+        if granted < line.len() as u64 {
+            return Ok(None);
+        }
+        store.append_bundle_bytes(self.id, &self.paths.events_log, line.as_bytes())?;
+        Ok(Some(text))
+    }
+
+    fn append_image(
+        &mut self,
+        store: &mut OutputStore,
+        image: &ReplyImage,
+    ) -> Result<Option<ReplyItem>, WorkerError> {
+        let next_number = self.next_image_number.saturating_add(1);
         let extension = image_extension(&image.mime_type);
-        let file_name = format!("{:03}.{extension}", self.next_image_number);
+        let file_name = format!("{next_number:03}.{extension}");
         let path = self.paths.images_dir.join(&file_name);
         let bytes = STANDARD
             .decode(image.data.as_bytes())
             .map_err(|err| WorkerError::Protocol(format!("invalid image data: {err}")))?;
-        fs::write(&path, bytes).map_err(WorkerError::Io)?;
-        let line = format!("I images/{file_name}\n");
-        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
+        let row = format!("I images/{file_name}\n");
+        let granted = store.prepare_append_capacity(self.id, (bytes.len() + row.len()) as u64)?;
+        if granted < (bytes.len() + row.len()) as u64 {
+            return Ok(None);
+        }
+        fs::write(&path, &bytes).map_err(WorkerError::Io)?;
+        store.record_append(self.id, bytes.len() as u64);
+        store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+        self.next_image_number = next_number;
+        Ok(Some(ReplyItem::Image(image.clone())))
+    }
+
+    fn apply_omission(&mut self, store: &mut OutputStore) -> Result<(), WorkerError> {
+        self.omitted_tail = true;
+        if self.omission_recorded {
+            return Ok(());
+        }
+        let _ = self.append_events_log_text(store, OUTPUT_BUNDLE_OMITTED_NOTICE)?;
+        self.omission_recorded = true;
+        Ok(())
     }
 
     fn image_path(&self, index: usize) -> PathBuf {
@@ -340,16 +604,35 @@ impl ActiveOutputBundle {
     }
 }
 
-impl OutputStore {
-    fn append_impl(path: &Path, bytes: &[u8]) -> Result<(), WorkerError> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-            .map_err(WorkerError::Io)?;
-        file.write_all(bytes).map_err(WorkerError::Io)?;
-        Ok(())
+fn parse_limit_env<T>(name: &str, default: T) -> Result<T, WorkerError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value.to_string_lossy();
+    value
+        .parse::<T>()
+        .map_err(|err| WorkerError::Protocol(format!("invalid {name}: {err}")))
+}
+
+fn truncate_utf8_prefix(text: &str, limit_bytes: usize) -> &str {
+    let mut end = limit_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
     }
+    &text[..end]
+}
+
+fn build_events_log_server_line(text: &str) -> String {
+    let escaped = serde_json::to_string(text).unwrap_or_else(|_| "\"<server_text>\"".to_string());
+    format!("S {escaped}\n")
+}
+
+fn omission_event_line_len() -> usize {
+    build_events_log_server_line(OUTPUT_BUNDLE_OMITTED_NOTICE).len()
 }
 
 /// Normalizes one worker reply into renderable items while preserving the split between
@@ -447,8 +730,22 @@ fn image_to_content(image: &ReplyImage) -> Content {
     )
 }
 
-fn compact_items(items: Vec<ReplyItem>, worker_text: &str, path: &Path) -> Vec<Content> {
-    let preview = build_preview(worker_text, path);
+fn worker_text_from_items(items: &[ReplyItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        if let ReplyItem::WorkerText(text) = item {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn compact_text_bundle_items(
+    items: Vec<ReplyItem>,
+    worker_text: &str,
+    bundle: &ActiveOutputBundle,
+) -> Vec<Content> {
+    let preview = build_preview(worker_text, &bundle.paths.events_log, bundle.omitted_tail);
     let mut out = Vec::new();
     let mut worker_inserted = false;
     for item in items {
@@ -509,18 +806,26 @@ fn should_use_output_bundle(image_count: usize, estimated_cost: usize) -> bool {
 }
 
 fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
+    let omitted = if bundle.omitted_tail {
+        "; later content omitted"
+    } else {
+        ""
+    };
     match bundle.next_image_number {
         0 => format!(
-            "...[middle truncated; ordered output bundle index: {}]...",
-            bundle.paths.events_log.display()
+            "...[middle truncated; ordered output bundle index: {}{}]...",
+            bundle.paths.events_log.display(),
+            omitted
         ),
         1 => format!(
-            "...[middle truncated; first image shown inline; ordered output bundle index: {}]...",
-            bundle.paths.events_log.display()
+            "...[middle truncated; first image shown inline; ordered output bundle index: {}{}]...",
+            bundle.paths.events_log.display(),
+            omitted
         ),
         _ => format!(
-            "...[middle truncated; first and last images shown inline; ordered output bundle index: {}]...",
-            bundle.paths.events_log.display()
+            "...[middle truncated; first and last images shown inline; ordered output bundle index: {}{}]...",
+            bundle.paths.events_log.display(),
+            omitted
         ),
     }
 }
@@ -647,14 +952,17 @@ fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -
     content_image_with_meta(data, mime_type, format!("plot-{index}"), true)
 }
 
-fn build_preview(text: &str, path: &Path) -> String {
-    if let Some(preview) = build_line_preview(text, path) {
+fn build_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
+    if omitted_tail && text.chars().count() <= INLINE_TEXT_BUDGET {
+        return build_short_preview(text, path);
+    }
+    if let Some(preview) = build_line_preview(text, path, omitted_tail) {
         return preview;
     }
-    build_char_preview(text, path)
+    build_char_preview(text, path, omitted_tail)
 }
 
-fn build_line_preview(text: &str, path: &Path) -> Option<String> {
+fn build_line_preview(text: &str, path: &Path, omitted_tail: bool) -> Option<String> {
     if !text.contains('\n') {
         return None;
     }
@@ -695,18 +1003,24 @@ fn build_line_preview(text: &str, path: &Path) -> Option<String> {
 
     let head = lines[..head_count].concat();
     let tail = lines[lines.len() - tail_count..].concat();
+    let omitted = if omitted_tail {
+        "; later content omitted"
+    } else {
+        ""
+    };
     let marker = format!(
-        "...[middle truncated; shown lines 1-{head_count} and {}-{} of {} total; full output: {}]...",
+        "...[middle truncated; shown lines 1-{head_count} and {}-{} of {} total; full output: {}{}]...",
         lines.len() - tail_count + 1,
         lines.len(),
         lines.len(),
-        path.display()
+        path.display(),
+        omitted
     );
 
     Some(format!("{head}{marker}\n{tail}"))
 }
 
-fn build_char_preview(text: &str, path: &Path) -> String {
+fn build_char_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let head_chars = INLINE_TEXT_BUDGET * 2 / 3;
@@ -715,14 +1029,33 @@ fn build_char_preview(text: &str, path: &Path) -> String {
     let tail_start = total.saturating_sub(tail_chars);
     let head: String = chars[..head_end].iter().collect();
     let tail: String = chars[tail_start..].iter().collect();
+    let omitted = if omitted_tail {
+        "; later content omitted"
+    } else {
+        ""
+    };
     let marker = format!(
-        "...[middle truncated; shown chars 1-{head_end} and {}-{} of {} total; full output: {}]...",
+        "...[middle truncated; shown chars 1-{head_end} and {}-{} of {} total; full output: {}{}]...",
         tail_start.saturating_add(1),
         total,
         total,
-        path.display()
+        path.display(),
+        omitted
     );
     format!("{head}\n{marker}\n{tail}")
+}
+
+fn build_short_preview(text: &str, path: &Path) -> String {
+    let mut out = String::new();
+    out.push_str(text);
+    if !text.is_empty() && !text.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "...[full output: {}; later content omitted]...",
+        path.display()
+    ));
+    out
 }
 
 fn ensure_nonempty_contents(contents: &mut Vec<Content>) {

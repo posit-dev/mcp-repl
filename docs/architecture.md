@@ -30,7 +30,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 ### Output, images, and debug surfaces
 
 - `src/pending_output_tape.rs`, `src/output_stream.rs`, and the optional pager modules under `src/pager/` shape tool output.
-- `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates transcript files for oversized text-only replies, creates output bundles with `transcript.txt`, `events.log`, and `images/` for oversized mixed or image-heavy replies, and decides the bounded inline preview at seal time.
+- `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates output bundles with `transcript.txt`, `events.log`, and `images/` for oversized replies, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
 - `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.
 
 ### Validation harnesses

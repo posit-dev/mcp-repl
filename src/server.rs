@@ -462,6 +462,15 @@ where
     {
         let mut state = shutdown_state.lock().unwrap();
         state.worker.shutdown();
+        if let Err(err) = state.response.shutdown() {
+            eprintln!("output bundle cleanup error: {err}");
+            crate::event_log::log(
+                "output_bundle_cleanup_error",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
     }
     match &result {
         Ok(()) => crate::event_log::log("server_listen_end", json!({"status": "ok"})),

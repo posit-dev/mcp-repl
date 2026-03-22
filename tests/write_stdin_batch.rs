@@ -36,14 +36,21 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
-fn spill_path(text: &str) -> Option<PathBuf> {
+fn bundle_events_log_path(text: &str) -> Option<PathBuf> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"full output:\s+(/[^]\s]+)").expect("spill-path regex should compile")
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
     });
     re.captures(text)
         .and_then(|caps| caps.get(1))
         .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn bundle_transcript_path(events_log: &PathBuf) -> PathBuf {
+    events_log
+        .parent()
+        .expect("events.log should have bundle dir parent")
+        .join("transcript.txt")
 }
 
 #[cfg(not(windows))]
@@ -265,11 +272,16 @@ async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    let spill_path = spill_path(&text);
-    let spill_text = spill_path.as_ref().map(fs::read_to_string).transpose()?;
+    let events_log = bundle_events_log_path(&text);
+    let spill_text = events_log
+        .as_ref()
+        .map(bundle_transcript_path)
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()?;
     session.cancel().await?;
     assert!(
-        text.contains("full output:")
+        text.contains("events.log")
             || (text.contains("x500 <- 500") && text.contains("y500 <- 500")),
         "expected either an inline transcript or a spill path, got: {text:?}"
     );
