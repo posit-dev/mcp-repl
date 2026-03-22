@@ -543,7 +543,7 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
     );
     assert!(
         !result_text(&result).contains("full output:"),
-        "did not expect spill path marker in mixed text+image reply: {}",
+        "did not expect oversized-output path marker in mixed text+image reply: {}",
         result_text(&result)
     );
 
@@ -793,7 +793,7 @@ plot(1:10)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mixed_plot_replies_spill_bundle_and_keep_first_and_last_images() -> TestResult<()> {
+async fn mixed_plot_replies_output_bundle_and_keep_first_and_last_images() -> TestResult<()> {
     let mut session = spawn_server().await?;
 
     let input = r#"
@@ -811,13 +811,13 @@ for (i in 1:6) {
     assert_ne!(
         result.is_error,
         Some(true),
-        "mixed plot spill reported an error: {}",
+        "mixed plot output bundle reported an error: {}",
         result_text(&result)
     );
 
     let text = result_text(&result);
     let events_log = events_log_path(&text).unwrap_or_else(|| {
-        panic!("expected spill bundle events.log path in response, got: {text:?}")
+        panic!("expected output bundle events.log path in response, got: {text:?}")
     });
     let bundle_dir = events_log
         .parent()
@@ -830,7 +830,7 @@ for (i in 1:6) {
     assert_eq!(
         images.len(),
         2,
-        "expected spill reply to keep exactly two inline images"
+        "expected output-bundle reply to keep exactly two inline images"
     );
     assert_eq!(
         image_names,
@@ -842,17 +842,17 @@ for (i in 1:6) {
             "005.png".to_string(),
             "006.png".to_string(),
         ],
-        "expected sequential image names in spill bundle"
+        "expected sequential image names in output bundle"
     );
     assert_eq!(
         images[0].bytes,
         fs::read(bundle_dir.join("images/001.png"))?,
-        "expected first inline image to match first spilled image"
+        "expected first inline image to match first output-bundle image"
     );
     assert_eq!(
         images[1].bytes,
         fs::read(bundle_dir.join("images/006.png"))?,
-        "expected second inline image to match last spilled image"
+        "expected second inline image to match last output-bundle image"
     );
     assert!(
         text.contains("events.log"),
@@ -885,7 +885,7 @@ for (i in 1:6) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout_image_spill_bundle_backfills_earlier_worker_text() -> TestResult<()> {
+async fn timeout_image_output_bundle_backfills_earlier_worker_text() -> TestResult<()> {
     let mut session = spawn_server().await?;
 
     let input = r#"
@@ -906,25 +906,25 @@ for (i in 1:6) {
     }
     assert!(
         events_log_path(&first_text).is_none(),
-        "did not expect spill bundle on first small timeout reply, got: {first_text:?}"
+        "did not expect output bundle on first small timeout reply, got: {first_text:?}"
     );
 
     let result = session.write_stdin_raw_with("", Some(60.0)).await?;
     let text = result_text(&result);
     if text.contains("<<console status: busy") {
-        eprintln!("plot_images timeout spill poll remained busy; skipping");
+        eprintln!("plot_images timeout output-bundle poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert_ne!(
         result.is_error,
         Some(true),
-        "timeout image spill reported an error: {}",
+        "timeout image output bundle reported an error: {}",
         text
     );
 
     let events_log = events_log_path(&text).unwrap_or_else(|| {
-        panic!("expected spill bundle events.log path in timeout poll, got: {text:?}")
+        panic!("expected output bundle events.log path in timeout poll, got: {text:?}")
     });
     let bundle_dir = events_log
         .parent()

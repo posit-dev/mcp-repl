@@ -12,19 +12,19 @@ use crate::worker_process::WorkerError;
 use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode, WorkerReply};
 
 const INLINE_TEXT_BUDGET: usize = 3500;
-const IMAGE_SPILL_THRESHOLD: usize = 5;
+const IMAGE_OUTPUT_BUNDLE_THRESHOLD: usize = 5;
 const INLINE_IMAGE_COST: usize = 900;
 const HEAD_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 3;
 const PRE_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 5;
 const POST_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 8;
 
 pub(crate) struct ResponseState {
-    spills: SpillStore,
+    output_store: OutputStore,
     active_timeout_transcript: Option<ActiveTranscript>,
-    active_timeout_bundle: Option<ActiveSpillBundle>,
+    active_timeout_bundle: Option<ActiveOutputBundle>,
 }
 
-struct SpillStore {
+struct OutputStore {
     root: tempfile::TempDir,
     next_id: u64,
 }
@@ -34,15 +34,15 @@ struct ActiveTranscript {
     path: PathBuf,
 }
 
-struct ActiveSpillBundle {
-    paths: SpillBundlePaths,
+struct ActiveOutputBundle {
+    paths: OutputBundlePaths,
     next_image_number: usize,
     transcript_bytes: usize,
     transcript_lines: usize,
 }
 
 #[derive(Clone)]
-struct SpillBundlePaths {
+struct OutputBundlePaths {
     transcript: PathBuf,
     events_log: PathBuf,
     images_dir: PathBuf,
@@ -74,7 +74,7 @@ struct ReplyMaterial {
 impl ResponseState {
     pub(crate) fn new() -> Result<Self, WorkerError> {
         Ok(Self {
-            spills: SpillStore::new()?,
+            output_store: OutputStore::new()?,
             active_timeout_transcript: None,
             active_timeout_bundle: None,
         })
@@ -111,7 +111,7 @@ impl ResponseState {
             && self.active_timeout_transcript.is_none()
         {
             let path = self
-                .spills
+                .output_store
                 .new_transcript_path()
                 .expect("failed to create timeout transcript path");
             self.active_timeout_transcript = Some(ActiveTranscript { path });
@@ -122,9 +122,9 @@ impl ResponseState {
             && self.active_timeout_bundle.is_none()
         {
             let bundle = self
-                .spills
+                .output_store
                 .new_bundle()
-                .expect("failed to create timeout spill bundle");
+                .expect("failed to create timeout output bundle");
             self.active_timeout_bundle = Some(bundle);
         }
 
@@ -137,53 +137,53 @@ impl ResponseState {
                 .take()
                 .expect("active timeout transcript should exist");
             let bundle = self
-                .spills
+                .output_store
                 .new_bundle_from_transcript(&active.path)
-                .expect("failed to backfill timeout spill bundle from transcript");
+                .expect("failed to backfill timeout output bundle from transcript");
             self.active_timeout_bundle = Some(bundle);
         }
 
         if let Some(active) = self.active_timeout_bundle.as_mut() {
             active
                 .append_items(&material.items)
-                .expect("failed to append timeout spill bundle");
+                .expect("failed to append timeout output bundle");
         } else if !material.worker_text.is_empty()
             && let Some(active) = self.active_timeout_transcript.as_ref()
         {
-            self.spills
+            self.output_store
                 .append(&active.path, &material.worker_text)
                 .expect("failed to append timeout transcript");
         }
 
         let contents = if let Some(active) = self.active_timeout_bundle.as_ref() {
-            if should_spill_bundle(
+            if should_use_output_bundle(
                 material.image_count.max(active.next_image_number),
                 material.estimated_cost,
             ) {
-                compact_bundle_items(&material.items, active)
+                compact_output_bundle_items(&material.items, active)
             } else {
                 materialize_items(material.items)
             }
         } else if material.image_count > 0
-            && should_spill_bundle(material.image_count, material.estimated_cost)
+            && should_use_output_bundle(material.image_count, material.estimated_cost)
         {
             let mut bundle = self
-                .spills
+                .output_store
                 .new_bundle()
-                .expect("failed to create spill bundle");
+                .expect("failed to create output bundle");
             bundle
                 .append_items(&material.items)
-                .expect("failed to append spill bundle");
-            compact_bundle_items(&material.items, &bundle)
+                .expect("failed to append output bundle");
+            compact_output_bundle_items(&material.items, &bundle)
         } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
             let path = match self.active_timeout_transcript.as_ref() {
                 Some(active) => active.path.clone(),
                 None => {
                     let path = self
-                        .spills
+                        .output_store
                         .new_transcript_path()
                         .expect("failed to create transcript path");
-                    self.spills
+                    self.output_store
                         .append(&path, &material.worker_text)
                         .expect("failed to append transcript");
                     path
@@ -203,29 +203,30 @@ impl ResponseState {
     }
 }
 
-impl SpillStore {
+impl OutputStore {
     fn new() -> Result<Self, WorkerError> {
         let root = Builder::new()
-            .prefix("mcp-repl-spill-")
+            .prefix("mcp-repl-output-")
             .tempdir()
             .map_err(WorkerError::Io)?;
         Ok(Self { root, next_id: 0 })
     }
 
-    /// Allocates a stable absolute path for the next spill file under the server-owned temp root.
+    /// Allocates a stable absolute path for the next transcript file under the server-owned temp
+    /// root.
     fn new_transcript_path(&mut self) -> Result<PathBuf, WorkerError> {
         self.next_id = self.next_id.saturating_add(1);
         let path = self
             .root
             .path()
-            .join(format!("spill-{:04}.txt", self.next_id));
+            .join(format!("output-{:04}.txt", self.next_id));
         std::fs::File::create(&path).map_err(WorkerError::Io)?;
         Ok(path)
     }
 
-    fn new_bundle(&mut self) -> Result<ActiveSpillBundle, WorkerError> {
+    fn new_bundle(&mut self) -> Result<ActiveOutputBundle, WorkerError> {
         self.next_id = self.next_id.saturating_add(1);
-        let dir = self.root.path().join(format!("spill-{:04}", self.next_id));
+        let dir = self.root.path().join(format!("output-{:04}", self.next_id));
         let images_dir = dir.join("images");
         fs::create_dir_all(&images_dir).map_err(WorkerError::Io)?;
         let transcript = dir.join("transcript.txt");
@@ -235,8 +236,8 @@ impl SpillStore {
         events
             .write_all(b"v1\ntext transcript.txt\nimages images/\n")
             .map_err(WorkerError::Io)?;
-        Ok(ActiveSpillBundle {
-            paths: SpillBundlePaths {
+        Ok(ActiveOutputBundle {
+            paths: OutputBundlePaths {
                 transcript,
                 events_log,
                 images_dir,
@@ -250,7 +251,7 @@ impl SpillStore {
     fn new_bundle_from_transcript(
         &mut self,
         transcript_path: &Path,
-    ) -> Result<ActiveSpillBundle, WorkerError> {
+    ) -> Result<ActiveOutputBundle, WorkerError> {
         let mut bundle = self.new_bundle()?;
         let existing = fs::read_to_string(transcript_path).map_err(WorkerError::Io)?;
         if !existing.is_empty() {
@@ -275,7 +276,7 @@ impl SpillStore {
     }
 }
 
-impl ActiveSpillBundle {
+impl ActiveOutputBundle {
     fn append_items(&mut self, items: &[ReplyItem]) -> Result<(), WorkerError> {
         for item in items {
             match item {
@@ -295,13 +296,13 @@ impl ActiveSpillBundle {
         let start_line = self.transcript_lines.saturating_add(1);
         let byte_len = text.len();
         let line_len = count_lines(text);
-        SpillStore::append_impl(&self.paths.transcript, text.as_bytes())?;
+        OutputStore::append_impl(&self.paths.transcript, text.as_bytes())?;
         self.transcript_bytes = self.transcript_bytes.saturating_add(byte_len);
         self.transcript_lines = self.transcript_lines.saturating_add(line_len);
         let end_byte = self.transcript_bytes;
         let end_line = self.transcript_lines.max(start_line);
         let line = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
-        SpillStore::append_impl(&self.paths.events_log, line.as_bytes())
+        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
     }
 
     fn append_server_text(&mut self, text: &str) -> Result<(), WorkerError> {
@@ -311,7 +312,7 @@ impl ActiveSpillBundle {
         let escaped =
             serde_json::to_string(text).unwrap_or_else(|_| "\"<server_text>\"".to_string());
         let line = format!("S {escaped}\n");
-        SpillStore::append_impl(&self.paths.events_log, line.as_bytes())
+        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
     }
 
     fn append_image(&mut self, image: &ReplyImage) -> Result<(), WorkerError> {
@@ -324,7 +325,7 @@ impl ActiveSpillBundle {
             .map_err(|err| WorkerError::Protocol(format!("invalid image data: {err}")))?;
         fs::write(&path, bytes).map_err(WorkerError::Io)?;
         let line = format!("I images/{file_name}\n");
-        SpillStore::append_impl(&self.paths.events_log, line.as_bytes())
+        OutputStore::append_impl(&self.paths.events_log, line.as_bytes())
     }
 
     fn image_path(&self, index: usize) -> PathBuf {
@@ -339,7 +340,7 @@ impl ActiveSpillBundle {
     }
 }
 
-impl SpillStore {
+impl OutputStore {
     fn append_impl(path: &Path, bytes: &[u8]) -> Result<(), WorkerError> {
         let mut file = OpenOptions::new()
             .append(true)
@@ -465,7 +466,7 @@ fn compact_items(items: Vec<ReplyItem>, worker_text: &str, path: &Path) -> Vec<C
     out
 }
 
-fn compact_bundle_items(items: &[ReplyItem], bundle: &ActiveSpillBundle) -> Vec<Content> {
+fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle) -> Vec<Content> {
     let first_image_idx = items
         .iter()
         .position(|item| matches!(item, ReplyItem::Image(_)));
@@ -483,15 +484,18 @@ fn compact_bundle_items(items: &[ReplyItem], bundle: &ActiveSpillBundle) -> Vec<
         out.push(Content::text(head_text));
     }
     if bundle.next_image_number > 0 {
-        out.push(load_spilled_image_content(bundle, 1));
+        out.push(load_output_bundle_image_content(bundle, 1));
     }
-    out.push(Content::text(build_bundle_notice(bundle)));
+    out.push(Content::text(build_output_bundle_notice(bundle)));
     let pre_last_text = collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET);
     if !pre_last_text.is_empty() {
         out.push(Content::text(pre_last_text));
     }
     if bundle.next_image_number > 1 {
-        out.push(load_spilled_image_content(bundle, bundle.next_image_number));
+        out.push(load_output_bundle_image_content(
+            bundle,
+            bundle.next_image_number,
+        ));
     }
     let post_last_text = collect_prefix_text_after(items, last_image_idx, POST_LAST_TEXT_BUDGET);
     if !post_last_text.is_empty() {
@@ -500,22 +504,22 @@ fn compact_bundle_items(items: &[ReplyItem], bundle: &ActiveSpillBundle) -> Vec<
     out
 }
 
-fn should_spill_bundle(image_count: usize, estimated_cost: usize) -> bool {
-    image_count >= IMAGE_SPILL_THRESHOLD || estimated_cost > INLINE_TEXT_BUDGET
+fn should_use_output_bundle(image_count: usize, estimated_cost: usize) -> bool {
+    image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD || estimated_cost > INLINE_TEXT_BUDGET
 }
 
-fn build_bundle_notice(bundle: &ActiveSpillBundle) -> String {
+fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
     match bundle.next_image_number {
         0 => format!(
-            "...[middle truncated; ordered spill: {}]...",
+            "...[middle truncated; ordered output bundle index: {}]...",
             bundle.paths.events_log.display()
         ),
         1 => format!(
-            "...[middle truncated; first image shown inline; ordered spill: {}]...",
+            "...[middle truncated; first image shown inline; ordered output bundle index: {}]...",
             bundle.paths.events_log.display()
         ),
         _ => format!(
-            "...[middle truncated; first and last images shown inline; ordered spill: {}]...",
+            "...[middle truncated; first and last images shown inline; ordered output bundle index: {}]...",
             bundle.paths.events_log.display()
         ),
     }
@@ -634,9 +638,10 @@ fn mime_type_from_path(path: &Path) -> String {
     }
 }
 
-fn load_spilled_image_content(bundle: &ActiveSpillBundle, index: usize) -> Content {
+fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -> Content {
     let path = bundle.image_path(index);
-    let bytes = fs::read(&path).unwrap_or_else(|err| panic!("failed to read spilled image: {err}"));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|err| panic!("failed to read output bundle image: {err}"));
     let mime_type = mime_type_from_path(&path);
     let data = STANDARD.encode(bytes);
     content_image_with_meta(data, mime_type, format!("plot-{index}"), true)

@@ -17,7 +17,7 @@ pub enum WorkerErrorCode {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentOrigin {
-    /// Text that came from the worker REPL and is eligible for transcript spill files.
+    /// Text that came from the worker REPL and is eligible for transcript files.
     #[default]
     Worker,
     /// Text synthesized by the server, such as timeout or busy-status notices.

@@ -587,7 +587,7 @@ async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
     );
     assert!(
         !result_text(&result).contains("full output:"),
-        "did not expect spill path marker in mixed text+image reply: {}",
+        "did not expect oversized-output path marker in mixed text+image reply: {}",
         result_text(&result)
     );
 
@@ -826,7 +826,8 @@ async fn python_plot_emitted_after_large_output() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_mixed_plot_replies_spill_bundle_and_keep_first_and_last_images() -> TestResult<()> {
+async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images() -> TestResult<()>
+{
     if !python_plot_tests_enabled() {
         return Ok(());
     }
@@ -841,13 +842,13 @@ async fn python_mixed_plot_replies_spill_bundle_and_keep_first_and_last_images()
     assert_ne!(
         result.is_error,
         Some(true),
-        "mixed plot spill reported an error: {}",
+        "mixed plot output bundle reported an error: {}",
         result_text(&result)
     );
 
     let text = result_text(&result);
     let events_log = events_log_path(&text).unwrap_or_else(|| {
-        panic!("expected spill bundle events.log path in response, got: {text:?}")
+        panic!("expected output bundle events.log path in response, got: {text:?}")
     });
     let bundle_dir = events_log
         .parent()
@@ -860,7 +861,7 @@ async fn python_mixed_plot_replies_spill_bundle_and_keep_first_and_last_images()
     assert_eq!(
         images.len(),
         2,
-        "expected spill reply to keep exactly two inline images"
+        "expected output-bundle reply to keep exactly two inline images"
     );
     assert_eq!(
         image_names,
@@ -872,17 +873,17 @@ async fn python_mixed_plot_replies_spill_bundle_and_keep_first_and_last_images()
             "005.png".to_string(),
             "006.png".to_string(),
         ],
-        "expected sequential image names in spill bundle"
+        "expected sequential image names in output bundle"
     );
     assert_eq!(
         images[0].bytes,
         fs::read(bundle_dir.join("images/001.png"))?,
-        "expected first inline image to match first spilled image"
+        "expected first inline image to match first output-bundle image"
     );
     assert_eq!(
         images[1].bytes,
         fs::read(bundle_dir.join("images/006.png"))?,
-        "expected second inline image to match last spilled image"
+        "expected second inline image to match last output-bundle image"
     );
     assert!(
         text.contains("events.log"),
