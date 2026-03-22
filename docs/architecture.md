@@ -35,7 +35,6 @@ The repository is organized around a few concrete subsystems rather than deep pa
 ### Validation harnesses
 
 - `tests/` is the primary public validation surface. The tests exercise tool behavior, snapshots, sandboxing, and client integrations through the exposed MCP interface.
-- Local `eval/` experiments may exist in a working tree, but they are not part of the tracked repository contract and should not be treated as runtime dependencies.
 
 ## Design Constraints
 

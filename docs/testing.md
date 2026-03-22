@@ -41,10 +41,3 @@ When behavior is unclear:
    - the stdio trace proxy
 3. Add or update a public API test.
 4. Re-run the full verification set.
-
-## Eval Harnesses
-
-- Local `eval/tasks/` and `eval/inspect_ai/` directories may exist for experimental agent benchmarks.
-- Treat them as optional feedback loops, not tracked release-critical test inputs.
-
-These evals help measure agent usefulness when present, but they do not replace the integration test suite under `tests/`.

@@ -86,7 +86,7 @@ fn docs_index_lists_normative_docs_and_classifies_special_areas() {
         );
     }
 
-    for relative in ["docs/notes/", "docs/futurework/", "eval/inspect_swe/"] {
+    for relative in ["docs/notes/", "docs/futurework/"] {
         assert!(
             docs_index.contains(relative),
             "docs/index.md should classify {relative}"
@@ -185,5 +185,24 @@ fn agent_docs_prefer_plain_paths_over_markdown_links() {
         let path = root.join(relative);
         let text = read(&path);
         assert_uses_plain_paths(&text, relative);
+    }
+}
+
+#[test]
+fn agent_docs_do_not_reference_ignored_eval_paths() {
+    let root = repo_root();
+    for relative in [
+        "AGENTS.md",
+        "docs/index.md",
+        "docs/architecture.md",
+        "docs/testing.md",
+        "docs/plans/README.md",
+    ] {
+        let path = root.join(relative);
+        let text = read(&path);
+        assert!(
+            !text.contains("eval/"),
+            "{relative} should not reference ignored eval paths"
+        );
     }
 }
