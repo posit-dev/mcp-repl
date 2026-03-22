@@ -220,6 +220,8 @@ Tool guides:
 
 ## Docs
 
+Start with `docs/index.md` if you want the engineering map for the repository.
+
 Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_tool_r.md`
 - `docs/tool-descriptions/repl_tool_python.md`
