@@ -49,6 +49,7 @@ struct ActiveOutputBundle {
     transcript_lines: usize,
     omitted_tail: bool,
     omission_recorded: bool,
+    pre_index_image_files: Vec<String>,
 }
 
 struct BundleAppendResult {
@@ -58,6 +59,7 @@ struct BundleAppendResult {
 
 #[derive(Clone)]
 struct OutputBundlePaths {
+    dir: PathBuf,
     transcript: PathBuf,
     events_log: PathBuf,
     images_dir: PathBuf,
@@ -250,29 +252,22 @@ impl OutputStore {
     }
 
     fn new_bundle(&mut self) -> Result<ActiveOutputBundle, WorkerError> {
-        self.prune_for_new_bundle(OUTPUT_BUNDLE_HEADER.len() as u64)?;
+        self.prune_for_new_bundle(0)?;
         self.next_id = self.next_id.saturating_add(1);
         let dir = self.root_path().join(format!("output-{:04}", self.next_id));
+        fs::create_dir_all(&dir).map_err(WorkerError::Io)?;
         let images_dir = dir.join("images");
-        fs::create_dir_all(&images_dir).map_err(WorkerError::Io)?;
         let transcript = dir.join("transcript.txt");
         let events_log = dir.join("events.log");
-        std::fs::File::create(&transcript).map_err(WorkerError::Io)?;
-        let mut events = std::fs::File::create(&events_log).map_err(WorkerError::Io)?;
-        events
-            .write_all(OUTPUT_BUNDLE_HEADER)
-            .map_err(WorkerError::Io)?;
         self.bundles.push_back(StoredBundle {
             id: self.next_id,
             dir: dir.clone(),
-            bytes_on_disk: OUTPUT_BUNDLE_HEADER.len() as u64,
+            bytes_on_disk: 0,
         });
-        self.total_bytes = self
-            .total_bytes
-            .saturating_add(OUTPUT_BUNDLE_HEADER.len() as u64);
         Ok(ActiveOutputBundle {
             id: self.next_id,
             paths: OutputBundlePaths {
+                dir,
                 transcript,
                 events_log,
                 images_dir,
@@ -282,6 +277,7 @@ impl OutputStore {
             transcript_lines: 0,
             omitted_tail: false,
             omission_recorded: false,
+            pre_index_image_files: Vec::new(),
         })
     }
 
@@ -405,18 +401,6 @@ impl OutputStoreLimits {
                 "output bundle count quota must be greater than zero".to_string(),
             ));
         }
-        if max_bundle_bytes < OUTPUT_BUNDLE_HEADER.len() as u64 {
-            return Err(WorkerError::Protocol(format!(
-                "{OUTPUT_BUNDLE_MAX_BYTES_ENV} must be at least {} bytes",
-                OUTPUT_BUNDLE_HEADER.len()
-            )));
-        }
-        if max_total_bytes < OUTPUT_BUNDLE_HEADER.len() as u64 {
-            return Err(WorkerError::Protocol(format!(
-                "{OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV} must be at least {} bytes",
-                OUTPUT_BUNDLE_HEADER.len()
-            )));
-        }
         Ok(Self {
             max_bundle_count,
             max_bundle_bytes,
@@ -479,12 +463,16 @@ impl ActiveOutputBundle {
         if text.is_empty() {
             return Ok(None);
         }
+        if self.has_images() && !self.has_events_log() {
+            self.materialize_events_log(store)?;
+        }
+        self.ensure_transcript(store)?;
         let start_byte = self.transcript_bytes;
         let start_line = self.transcript_lines.saturating_add(1);
         let omission_reserve = if self.omission_recorded {
             0
         } else {
-            omission_event_line_len()
+            usize::from(self.has_events_log()) * omission_event_line_len()
         };
         let granted = store.prepare_append_capacity(
             self.id,
@@ -518,7 +506,9 @@ impl ActiveOutputBundle {
                 <= granted
             {
                 store.append_bundle_bytes(self.id, &self.paths.transcript, retained.as_bytes())?;
-                store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+                if self.has_events_log() {
+                    store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+                }
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
                 self.transcript_lines = self.transcript_lines.saturating_add(line_len);
                 return Ok(Some(ReplyItem::WorkerText(retained.to_string())));
@@ -537,6 +527,9 @@ impl ActiveOutputBundle {
         store: &mut OutputStore,
         text: &str,
     ) -> Result<Option<ReplyItem>, WorkerError> {
+        if !self.has_events_log() {
+            return Ok(Some(ReplyItem::ServerText(text.to_string())));
+        }
         let retained = self.append_events_log_text(store, text)?;
         Ok(retained.map(|text| ReplyItem::ServerText(text.to_string())))
     }
@@ -563,6 +556,10 @@ impl ActiveOutputBundle {
         store: &mut OutputStore,
         image: &ReplyImage,
     ) -> Result<Option<ReplyItem>, WorkerError> {
+        self.ensure_images_dir()?;
+        if self.has_text() && !self.has_events_log() {
+            self.materialize_events_log(store)?;
+        }
         let next_number = self.next_image_number.saturating_add(1);
         let extension = image_extension(&image.mime_type);
         let file_name = format!("{next_number:03}.{extension}");
@@ -577,19 +574,101 @@ impl ActiveOutputBundle {
         }
         fs::write(&path, &bytes).map_err(WorkerError::Io)?;
         store.record_append(self.id, bytes.len() as u64);
-        store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+        if self.has_events_log() {
+            store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+        } else {
+            self.pre_index_image_files.push(file_name);
+        }
         self.next_image_number = next_number;
         Ok(Some(ReplyItem::Image(image.clone())))
     }
 
     fn apply_omission(&mut self, store: &mut OutputStore) -> Result<(), WorkerError> {
         self.omitted_tail = true;
-        if self.omission_recorded {
+        if self.omission_recorded || !self.has_events_log() {
             return Ok(());
         }
         let _ = self.append_events_log_text(store, OUTPUT_BUNDLE_OMITTED_NOTICE)?;
         self.omission_recorded = true;
         Ok(())
+    }
+
+    fn ensure_transcript(&self, _store: &mut OutputStore) -> Result<(), WorkerError> {
+        if self.paths.transcript.exists() {
+            return Ok(());
+        }
+        std::fs::File::create(&self.paths.transcript).map_err(WorkerError::Io)?;
+        Ok(())
+    }
+
+    fn ensure_images_dir(&self) -> Result<(), WorkerError> {
+        if self.paths.images_dir.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.paths.images_dir).map_err(WorkerError::Io)
+    }
+
+    fn materialize_events_log(&mut self, store: &mut OutputStore) -> Result<(), WorkerError> {
+        if self.has_events_log() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OUTPUT_BUNDLE_HEADER);
+        if self.has_text() {
+            bytes.extend_from_slice(self.backfill_text_row().as_bytes());
+        } else {
+            for image_name in &self.pre_index_image_files {
+                bytes.extend_from_slice(format!("I images/{image_name}\n").as_bytes());
+            }
+        }
+        if self.omitted_tail {
+            bytes.extend_from_slice(
+                build_events_log_server_line(OUTPUT_BUNDLE_OMITTED_NOTICE).as_bytes(),
+            );
+            self.omission_recorded = true;
+        }
+        let granted = store.prepare_append_capacity(self.id, bytes.len() as u64)?;
+        if granted < bytes.len() as u64 {
+            return Err(WorkerError::Protocol(
+                "output bundle could not materialize events.log within quota".to_string(),
+            ));
+        }
+        std::fs::File::create(&self.paths.events_log).map_err(WorkerError::Io)?;
+        store.append_bundle_bytes(self.id, &self.paths.events_log, &bytes)?;
+        self.pre_index_image_files.clear();
+        Ok(())
+    }
+
+    fn has_text(&self) -> bool {
+        self.transcript_bytes > 0
+    }
+
+    fn has_images(&self) -> bool {
+        self.next_image_number > 0
+    }
+
+    fn has_events_log(&self) -> bool {
+        self.paths.events_log.exists()
+    }
+
+    fn backfill_text_row(&self) -> String {
+        format!(
+            "T lines=1-{} bytes=0-{}\n",
+            self.transcript_lines.max(1),
+            self.transcript_bytes
+        )
+    }
+
+    fn disclosure_path(&self) -> &Path {
+        if self.has_events_log() {
+            &self.paths.events_log
+        } else if self.has_text() {
+            &self.paths.transcript
+        } else if self.has_images() {
+            &self.paths.images_dir
+        } else {
+            &self.paths.dir
+        }
     }
 
     fn image_path(&self, index: usize) -> PathBuf {
@@ -745,7 +824,7 @@ fn compact_text_bundle_items(
     worker_text: &str,
     bundle: &ActiveOutputBundle,
 ) -> Vec<Content> {
-    let preview = build_preview(worker_text, &bundle.paths.events_log, bundle.omitted_tail);
+    let preview = build_preview(worker_text, bundle.disclosure_path(), bundle.omitted_tail);
     let mut out = Vec::new();
     let mut worker_inserted = false;
     for item in items {
@@ -811,20 +890,28 @@ fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
     } else {
         ""
     };
+    let path = bundle.disclosure_path();
+    let label = if bundle.has_events_log() {
+        "ordered output bundle index"
+    } else if bundle.has_images() && !bundle.has_text() {
+        "output bundle images"
+    } else {
+        "full output"
+    };
     match bundle.next_image_number {
         0 => format!(
-            "...[middle truncated; ordered output bundle index: {}{}]...",
-            bundle.paths.events_log.display(),
+            "...[middle truncated; {label}: {}{}]...",
+            path.display(),
             omitted
         ),
         1 => format!(
-            "...[middle truncated; first image shown inline; ordered output bundle index: {}{}]...",
-            bundle.paths.events_log.display(),
+            "...[middle truncated; first image shown inline; {label}: {}{}]...",
+            path.display(),
             omitted
         ),
         _ => format!(
-            "...[middle truncated; first and last images shown inline; ordered output bundle index: {}{}]...",
-            bundle.paths.events_log.display(),
+            "...[middle truncated; first and last images shown inline; {label}: {}{}]...",
+            path.display(),
             omitted
         ),
     }

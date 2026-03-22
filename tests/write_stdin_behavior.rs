@@ -58,11 +58,20 @@ fn bundle_events_log_path(text: &str) -> Option<PathBuf> {
         .map(|path| PathBuf::from(path.as_str()))
 }
 
-fn bundle_transcript_path(events_log: &PathBuf) -> PathBuf {
-    events_log
-        .parent()
-        .expect("events.log should have a parent bundle dir")
-        .join("transcript.txt")
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(/[^]\s]+/transcript\.txt)").expect("transcript regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn bundle_root(path: &PathBuf) -> PathBuf {
+    path.parent()
+        .expect("bundle artifact should have a parent bundle dir")
+        .to_path_buf()
 }
 
 async fn wait_for_path_to_disappear(path: &PathBuf) -> TestResult<()> {
@@ -289,16 +298,12 @@ async fn text_only_oversized_reply_uses_output_bundle_dir() -> TestResult<()> {
         return Ok(());
     }
 
-    let events_log = bundle_events_log_path(&text).unwrap_or_else(|| {
-        panic!("expected bundle events.log path in oversized reply, got: {text:?}")
-    });
-    let transcript = fs::read_to_string(bundle_transcript_path(&events_log))?;
-    let events = fs::read_to_string(&events_log)?;
-    let images_dir = events_log
-        .parent()
-        .expect("events.log should have bundle dir parent")
-        .join("images");
-    let image_count = fs::read_dir(&images_dir)?.count();
+    let transcript_path = bundle_transcript_path(&text)
+        .unwrap_or_else(|| panic!("expected transcript path in oversized reply, got: {text:?}"));
+    let transcript = fs::read_to_string(&transcript_path)?;
+    let bundle_dir = bundle_root(&transcript_path);
+    let events_log = bundle_dir.join("events.log");
+    let images_dir = bundle_dir.join("images");
 
     session.cancel().await?;
 
@@ -307,20 +312,12 @@ async fn text_only_oversized_reply_uses_output_bundle_dir() -> TestResult<()> {
         "expected transcript bundle to contain the full worker text, got: {transcript:?}"
     );
     assert!(
-        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
-        "expected bundle header, got: {events:?}"
+        !events_log.exists(),
+        "did not expect events.log for text-only bundle"
     );
     assert!(
-        events.contains("T lines="),
-        "expected text range entries in bundle index, got: {events:?}"
-    );
-    assert!(
-        !events.contains("\nI "),
-        "did not expect image entries for text-only oversized output, got: {events:?}"
-    );
-    assert_eq!(
-        image_count, 0,
-        "did not expect image files in text-only bundle"
+        !images_dir.exists(),
+        "did not expect images dir for text-only bundle"
     );
 
     Ok(())
@@ -340,10 +337,7 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        bundle_events_log_path(&first_text).is_none(),
-        "did not expect bundle path on first small timeout reply, got: {first_text:?}"
-    );
+    assert!(bundle_events_log_path(&first_text).is_none());
 
     sleep(Duration::from_millis(260)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -353,10 +347,10 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
         session.cancel().await?;
         return Ok(());
     }
-    let events_log = bundle_events_log_path(&spilled_text).unwrap_or_else(|| {
-        panic!("expected bundle path in oversized poll reply, got: {spilled_text:?}")
+    let transcript_path = bundle_transcript_path(&spilled_text).unwrap_or_else(|| {
+        panic!("expected transcript path in oversized poll reply, got: {spilled_text:?}")
     });
-    let file_text = fs::read_to_string(bundle_transcript_path(&events_log))?;
+    let file_text = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
 
@@ -401,14 +395,16 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     sleep(Duration::from_millis(260)).await;
     let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
     let spilled_text = result_text(&spilled);
-    let events_log = match bundle_events_log_path(&spilled_text) {
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
         None if spilled_text.contains("<<console status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
         }
-        None => panic!("expected bundle path in first oversized poll reply, got: {spilled_text:?}"),
+        None => {
+            panic!("expected transcript path in first oversized poll reply, got: {spilled_text:?}")
+        }
     };
 
     sleep(Duration::from_millis(450)).await;
@@ -419,7 +415,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         session.cancel().await?;
         return Ok(());
     }
-    let file_text = fs::read_to_string(bundle_transcript_path(&events_log))?;
+    let file_text = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
 
@@ -471,9 +467,10 @@ async fn output_bundle_prunes_oldest_inactive_bundle_when_count_limit_exceeded()
             session.cancel().await?;
             return Ok(());
         }
-        let events_log = bundle_events_log_path(&text)
-            .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
-        bundles.push(events_log);
+        let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+            panic!("expected transcript path in oversized reply, got: {text:?}")
+        });
+        bundles.push(transcript_path);
     }
 
     assert!(
@@ -517,10 +514,11 @@ async fn output_bundle_reports_omitted_tail_when_bundle_size_cap_is_hit() -> Tes
         return Ok(());
     }
 
-    let events_log = bundle_events_log_path(&text)
-        .unwrap_or_else(|| panic!("expected bundle path in capped oversized reply, got: {text:?}"));
-    let transcript = fs::read_to_string(bundle_transcript_path(&events_log))?;
-    let events = fs::read_to_string(&events_log)?;
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected transcript path in capped oversized reply, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+    let events_log = bundle_root(&transcript_path).join("events.log");
 
     session.cancel().await?;
 
@@ -529,8 +527,8 @@ async fn output_bundle_reports_omitted_tail_when_bundle_size_cap_is_hit() -> Tes
         "expected inline omission notice after bundle cap, got: {text:?}"
     );
     assert!(
-        events.contains("later content omitted"),
-        "expected bundle index omission record after bundle cap, got: {events:?}"
+        !events_log.exists(),
+        "did not expect events.log for text-only capped bundle"
     );
     assert!(
         !transcript.contains("z120"),
@@ -573,9 +571,10 @@ async fn output_bundle_prunes_oldest_inactive_bundle_when_total_size_limit_is_hi
             session.cancel().await?;
             return Ok(());
         }
-        let events_log = bundle_events_log_path(&text)
-            .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
-        bundles.push(events_log);
+        let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+            panic!("expected transcript path in oversized reply, got: {text:?}")
+        });
+        bundles.push(transcript_path);
     }
 
     assert!(
@@ -603,11 +602,11 @@ async fn output_bundle_is_cleaned_up_when_server_exits() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    let events_log = bundle_events_log_path(&text)
-        .unwrap_or_else(|| panic!("expected bundle path in oversized reply, got: {text:?}"));
+    let transcript_path = bundle_transcript_path(&text)
+        .unwrap_or_else(|| panic!("expected transcript path in oversized reply, got: {text:?}"));
 
     session.cancel().await?;
-    wait_for_path_to_disappear(&events_log).await?;
+    wait_for_path_to_disappear(&transcript_path).await?;
 
     Ok(())
 }
