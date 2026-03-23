@@ -2136,7 +2136,7 @@ mod tests {
         OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
         ensure_output_ring, reset_output_ring,
     };
-    use crate::worker_protocol::TextStream;
+    use crate::worker_protocol::{ContentOrigin, TextStream};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct OutputPagerFixture {
@@ -2255,7 +2255,7 @@ mod tests {
 
         assert_eq!(contents.len(), 3);
         let first = match &contents[0] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stdout));
                 text.as_str()
             }
@@ -2264,7 +2264,7 @@ mod tests {
         assert_eq!(first, "line1\n");
 
         let marker = match &contents[1] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2278,7 +2278,7 @@ mod tests {
         );
 
         let last = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stdout));
                 text.as_str()
             }
@@ -2294,7 +2294,7 @@ mod tests {
         let marker =
             gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).expect("expected marker");
         let text = match marker {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text
             }
@@ -2393,7 +2393,7 @@ mod tests {
 
         assert!(matches!(contents[0], WorkerContent::ContentImage { .. }));
         let marker = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2448,7 +2448,7 @@ mod tests {
         pager.dedupe_images(&mut contents);
 
         let marker_one = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2460,7 +2460,7 @@ mod tests {
         );
 
         let marker_two = match &contents[3] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -3469,10 +3469,13 @@ mod tests {
         let body = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream }
-                    if text.contains("warning foo details") =>
-                {
-                    Some((*stream, text.as_str()))
+                WorkerContent::ContentText {
+                    text,
+                    stream,
+                    origin,
+                    ..
+                } if text.contains("warning foo details") => {
+                    Some((*stream, *origin, text.as_str()))
                 }
                 _ => None,
             })
@@ -3481,6 +3484,11 @@ mod tests {
             matches!(body.0, TextStream::Stderr),
             "expected compact search body to preserve stderr stream, got: {:?}",
             body.0
+        );
+        assert!(
+            matches!(body.1, ContentOrigin::Worker),
+            "expected compact search body to stay worker-originated, got: {:?}",
+            body.1
         );
 
         drop(guard);
@@ -3548,7 +3556,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3596,7 +3604,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3654,7 +3662,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3705,7 +3713,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stdout) && text.contains("alpha ")
             )),
             "expected compact search card to keep the stdout prefix segment, got: {:?}",
@@ -3714,7 +3722,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stderr) && text.contains("foo")
             )),
             "expected compact search card to keep the stderr match segment, got: {:?}",
@@ -3723,7 +3731,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stdout) && text.contains(" omega")
             )),
             "expected compact search card to keep the stdout suffix segment, got: {:?}",

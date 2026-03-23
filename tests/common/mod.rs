@@ -991,7 +991,8 @@ fn resolve_server_path() -> TestResult<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl"] {
+    {
+        let candidate = "mcp-repl";
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {

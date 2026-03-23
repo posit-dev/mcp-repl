@@ -1,4 +1,4 @@
-use crate::worker_protocol::{TextStream, WorkerContent};
+use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 use super::{
     MATCH_BREADCRUMB_MAX_BYTES, MATCH_LINE_MAX_BYTES, MAX_MATCH_LIMIT, MatchSpec, PagerBuffer,
@@ -387,22 +387,30 @@ struct SnippetWindow {
     has_suffix_ellipsis: bool,
 }
 
-fn same_stream(left: TextStream, right: TextStream) -> bool {
-    matches!(
-        (left, right),
-        (TextStream::Stdout, TextStream::Stdout) | (TextStream::Stderr, TextStream::Stderr)
-    )
+fn same_text_content(
+    left_stream: TextStream,
+    left_origin: ContentOrigin,
+    right_stream: TextStream,
+    right_origin: ContentOrigin,
+) -> bool {
+    left_stream == right_stream && left_origin == right_origin
 }
 
-fn append_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: TextStream) {
+fn append_text_content(
+    contents: &mut Vec<WorkerContent>,
+    text: &str,
+    stream: TextStream,
+    origin: ContentOrigin,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(WorkerContent::ContentText {
         text: last_text,
         stream: last_stream,
+        origin: last_origin,
     }) = contents.last_mut()
-        && same_stream(*last_stream, stream)
+        && same_text_content(*last_stream, *last_origin, stream, origin)
     {
         last_text.push_str(text);
         return;
@@ -410,18 +418,25 @@ fn append_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: Te
     contents.push(WorkerContent::ContentText {
         text: text.to_string(),
         stream,
+        origin,
     });
 }
 
-fn prepend_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: TextStream) {
+fn prepend_text_content(
+    contents: &mut Vec<WorkerContent>,
+    text: &str,
+    stream: TextStream,
+    origin: ContentOrigin,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(WorkerContent::ContentText {
         text: first_text,
         stream: first_stream,
+        origin: first_origin,
     }) = contents.first_mut()
-        && same_stream(*first_stream, stream)
+        && same_text_content(*first_stream, *first_origin, stream, origin)
     {
         let mut combined = String::with_capacity(text.len() + first_text.len());
         combined.push_str(text);
@@ -434,20 +449,21 @@ fn prepend_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: T
         WorkerContent::ContentText {
             text: text.to_string(),
             stream,
+            origin,
         },
     );
 }
 
-fn first_text_stream(contents: &[WorkerContent]) -> Option<TextStream> {
+fn first_text_style(contents: &[WorkerContent]) -> Option<(TextStream, ContentOrigin)> {
     contents.iter().find_map(|content| match content {
-        WorkerContent::ContentText { stream, .. } => Some(*stream),
+        WorkerContent::ContentText { stream, origin, .. } => Some((*stream, *origin)),
         WorkerContent::ContentImage { .. } => None,
     })
 }
 
-fn last_text_stream(contents: &[WorkerContent]) -> Option<TextStream> {
+fn last_text_style(contents: &[WorkerContent]) -> Option<(TextStream, ContentOrigin)> {
     contents.iter().rev().find_map(|content| match content {
-        WorkerContent::ContentText { stream, .. } => Some(*stream),
+        WorkerContent::ContentText { stream, origin, .. } => Some((*stream, *origin)),
         WorkerContent::ContentImage { .. } => None,
     })
 }
@@ -469,6 +485,7 @@ fn push_line_segment(
     segment_start: u64,
     segment_end: u64,
     stream: TextStream,
+    origin: ContentOrigin,
 ) {
     if segment_start >= segment_end {
         return;
@@ -480,7 +497,7 @@ fn push_line_segment(
     if start_byte >= end_byte {
         return;
     }
-    append_text_content(contents, &line[start_byte..end_byte], stream);
+    append_text_content(contents, &line[start_byte..end_byte], stream, origin);
 }
 
 fn render_match_snippet_contents(
@@ -493,6 +510,7 @@ fn render_match_snippet_contents(
 ) -> Vec<WorkerContent> {
     let trimmed = line.trim_end();
     let snippet_stream = decoded_match_stream(buffer, match_start, line, default_stream);
+    let snippet_origin = ContentOrigin::Worker;
     let snippet_start_chars = trimmed[..window.start_byte].chars().count() as u64;
     let snippet_end_chars = trimmed[..window.end_byte].chars().count() as u64;
     let snippet_start = line_start.saturating_add(snippet_start_chars);
@@ -513,6 +531,7 @@ fn render_match_snippet_contents(
                 cursor,
                 segment_start,
                 snippet_stream,
+                snippet_origin,
             );
         }
         let segment_end = span.end.min(snippet_end);
@@ -527,6 +546,7 @@ fn render_match_snippet_contents(
             } else {
                 TextStream::Stdout
             },
+            snippet_origin,
         );
         cursor = segment_end;
     }
@@ -539,6 +559,7 @@ fn render_match_snippet_contents(
             cursor,
             snippet_end,
             snippet_stream,
+            snippet_origin,
         );
     }
 
@@ -547,6 +568,7 @@ fn render_match_snippet_contents(
             &mut contents,
             &trimmed[window.start_byte..window.end_byte],
             snippet_stream,
+            snippet_origin,
         );
     }
 
@@ -555,16 +577,18 @@ fn render_match_snippet_contents(
     if window.has_prefix_ellipsis {
         prefix.push_str("...");
     }
-    let prefix_stream = first_text_stream(&contents).unwrap_or(snippet_stream);
-    prepend_text_content(&mut contents, &prefix, prefix_stream);
+    let (prefix_stream, prefix_origin) =
+        first_text_style(&contents).unwrap_or((snippet_stream, snippet_origin));
+    prepend_text_content(&mut contents, &prefix, prefix_stream, prefix_origin);
 
     let suffix = if window.has_suffix_ellipsis {
         "...\n"
     } else {
         "\n"
     };
-    let suffix_stream = last_text_stream(&contents).unwrap_or(snippet_stream);
-    append_text_content(&mut contents, suffix, suffix_stream);
+    let (suffix_stream, suffix_origin) =
+        last_text_style(&contents).unwrap_or((snippet_stream, snippet_origin));
+    append_text_content(&mut contents, suffix, suffix_stream, suffix_origin);
     contents
 }
 

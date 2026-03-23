@@ -69,7 +69,7 @@ fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
         .map(|path| PathBuf::from(path.as_str()))
 }
 
-fn bundle_root(path: &PathBuf) -> PathBuf {
+fn bundle_root(path: &std::path::Path) -> PathBuf {
     path.parent()
         .expect("bundle artifact should have a parent bundle dir")
         .to_path_buf()
@@ -94,7 +94,7 @@ async fn wait_for_timeout_bundle_dir(temp_root: &std::path::Path) -> TestResult<
     Err("timed out waiting for timeout output bundle dir".into())
 }
 
-async fn wait_for_path_to_disappear(path: &PathBuf) -> TestResult<()> {
+async fn wait_for_path_to_disappear(path: &std::path::Path) -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if !path.exists() {
