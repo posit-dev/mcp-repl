@@ -85,14 +85,17 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
+        let reuse_active_timeout_bundle = !matches!(input.chars().next(), Some('\u{3}' | '\u{4}'));
         self.run_state(move |state| {
             let result =
                 state
                     .worker
                     .write_stdin(input, worker_timeout, server_timeout, None, false);
-            state
-                .response
-                .finalize_worker_result(result, state.worker.pending_request())
+            state.response.finalize_worker_result(
+                result,
+                state.worker.pending_request(),
+                reuse_active_timeout_bundle,
+            )
         })
         .await
     }
@@ -355,9 +358,11 @@ macro_rules! define_backend_tool_server {
                     .shared
                     .run_state(move |state| {
                         let result = state.worker.restart(worker_timeout);
-                        state
-                            .response
-                            .finalize_worker_result(result, state.worker.pending_request())
+                        state.response.finalize_worker_result(
+                            result,
+                            state.worker.pending_request(),
+                            false,
+                        )
                     })
                     .await?;
                 Ok(result)

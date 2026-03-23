@@ -52,9 +52,11 @@ struct ActiveOutputBundle {
     history_image_count: usize,
     transcript_bytes: usize,
     transcript_lines: usize,
+    transcript_has_partial_line: bool,
     omitted_tail: bool,
     omission_recorded: bool,
     pre_index_image_paths: Vec<String>,
+    disclosed: bool,
 }
 
 struct BundleAppendResult {
@@ -125,9 +127,12 @@ impl ResponseState {
         &mut self,
         result: Result<WorkerReply, WorkerError>,
         pending_request_after: bool,
+        reuse_active_timeout_bundle: bool,
     ) -> CallToolResult {
         match result {
-            Ok(reply) => self.finalize_reply(reply, pending_request_after),
+            Ok(reply) => {
+                self.finalize_reply(reply, pending_request_after, reuse_active_timeout_bundle)
+            }
             Err(err) => {
                 eprintln!("worker write stdin error: {err}");
                 finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
@@ -141,9 +146,16 @@ impl ResponseState {
         &mut self,
         reply: WorkerReply,
         pending_request_after: bool,
+        reuse_active_timeout_bundle: bool,
     ) -> CallToolResult {
         let material = prepare_reply_material(reply);
         let mut active_timeout_bundle = self.active_timeout_bundle.take();
+        if !reuse_active_timeout_bundle
+            && let Some(active) = active_timeout_bundle.take()
+            && let Err(err) = self.finish_timeout_bundle(active)
+        {
+            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
+        }
         if material.error_code == Some(WorkerErrorCode::Timeout) && active_timeout_bundle.is_none()
         {
             match self.output_store.new_bundle() {
@@ -159,6 +171,7 @@ impl ResponseState {
                 Ok(append) => {
                     let retained_worker_text = worker_text_from_items(&append.retained_items);
                     let contents = if append.omitted_this_reply {
+                        active.disclosed = true;
                         compact_text_bundle_items(
                             append.retained_items.clone(),
                             &retained_worker_text,
@@ -170,8 +183,10 @@ impl ResponseState {
                             material.worker_text.chars().count(),
                         )
                     {
+                        active.disclosed = true;
                         compact_output_bundle_items(&append.retained_items, &active)
                     } else if text_should_spill(material.worker_text.chars().count()) {
+                        active.disclosed = true;
                         compact_text_bundle_items(
                             append.retained_items.clone(),
                             &retained_worker_text,
@@ -182,11 +197,20 @@ impl ResponseState {
                     };
                     if pending_request_after {
                         self.active_timeout_bundle = Some(active);
+                    } else if let Err(err) = self.finish_timeout_bundle(active) {
+                        eprintln!(
+                            "dropping closed timeout bundle after output-bundle error: {err}"
+                        );
                     }
                     contents
                 }
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                    if let Err(err) = self.finish_timeout_bundle(active) {
+                        eprintln!(
+                            "dropping closed timeout bundle after output-bundle error: {err}"
+                        );
+                    }
                     materialize_items(material.inline_items)
                 }
             }
@@ -307,10 +331,23 @@ impl OutputStore {
             history_image_count: 0,
             transcript_bytes: 0,
             transcript_lines: 0,
+            transcript_has_partial_line: false,
             omitted_tail: false,
             omission_recorded: false,
             pre_index_image_paths: Vec::new(),
+            disclosed: false,
         })
+    }
+
+    fn remove_bundle(&mut self, bundle_id: u64) -> Result<(), WorkerError> {
+        let Some(index) = self
+            .bundles
+            .iter()
+            .position(|bundle| bundle.id == bundle_id)
+        else {
+            return Ok(());
+        };
+        self.remove_bundle_at(index)
     }
 
     fn append_bundle_bytes(
@@ -441,13 +478,18 @@ impl OutputStore {
         else {
             return Ok(false);
         };
+        self.remove_bundle_at(index)?;
+        Ok(true)
+    }
+
+    fn remove_bundle_at(&mut self, index: usize) -> Result<(), WorkerError> {
         let bundle = self
             .bundles
             .remove(index)
             .expect("bundle index should exist");
         fs::remove_dir_all(&bundle.dir).map_err(WorkerError::Io)?;
         self.total_bytes = self.total_bytes.saturating_sub(bundle.bytes_on_disk);
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -475,6 +517,10 @@ impl OutputStoreLimits {
 }
 
 impl ActiveOutputBundle {
+    fn was_disclosed(&self) -> bool {
+        self.disclosed
+    }
+
     fn append_items(
         &mut self,
         store: &mut OutputStore,
@@ -533,7 +579,6 @@ impl ActiveOutputBundle {
         }
         self.ensure_transcript(store)?;
         let start_byte = self.transcript_bytes;
-        let start_line = self.transcript_lines.saturating_add(1);
         let omission_reserve = if self.omission_recorded {
             0
         } else {
@@ -552,12 +597,13 @@ impl ActiveOutputBundle {
         }
         let mut retained = initial_retained;
         loop {
-            let line_len = count_lines(retained);
+            let (start_line, end_line, next_line_count, next_has_partial_line) =
+                append_text_line_span(
+                    retained,
+                    self.transcript_lines,
+                    self.transcript_has_partial_line,
+                );
             let end_byte = start_byte.saturating_add(retained.len());
-            let end_line = self
-                .transcript_lines
-                .saturating_add(line_len)
-                .max(start_line);
             let row = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
             let reserve = if retained.len() < text.len() {
                 omission_reserve
@@ -575,7 +621,8 @@ impl ActiveOutputBundle {
                     store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
                 }
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
-                self.transcript_lines = self.transcript_lines.saturating_add(line_len);
+                self.transcript_lines = next_line_count;
+                self.transcript_has_partial_line = next_has_partial_line;
                 return Ok(Some(ReplyItem::WorkerText(retained.to_string())));
             }
             let allowed_text_bytes = granted.saturating_sub(row.len().saturating_add(reserve));
@@ -800,6 +847,15 @@ impl ActiveOutputBundle {
             }
         }
         None
+    }
+}
+
+impl ResponseState {
+    fn finish_timeout_bundle(&mut self, active: ActiveOutputBundle) -> Result<(), WorkerError> {
+        if active.was_disclosed() {
+            return Ok(());
+        }
+        self.output_store.remove_bundle(active.id)
     }
 }
 
@@ -1110,16 +1166,37 @@ fn take_suffix_chars(text: &str, limit: usize) -> String {
     chars[start..].iter().collect()
 }
 
-fn count_lines(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
+fn append_text_line_span(
+    text: &str,
+    transcript_lines: usize,
+    transcript_has_partial_line: bool,
+) -> (usize, usize, usize, bool) {
+    assert!(!text.is_empty(), "text line spans require non-empty text");
     let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
-    if text.ends_with('\n') {
-        newline_count
+    let start_line = if transcript_lines == 0 {
+        1
+    } else if transcript_has_partial_line {
+        transcript_lines
     } else {
-        newline_count.saturating_add(1)
+        transcript_lines.saturating_add(1)
+    };
+    let next_line_count = if transcript_has_partial_line {
+        transcript_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
+            .saturating_sub(1)
+    } else {
+        transcript_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
     }
+    .max(start_line);
+    (
+        start_line,
+        next_line_count,
+        next_line_count,
+        !text.ends_with('\n'),
+    )
 }
 
 fn image_extension(mime_type: &str) -> &str {
@@ -1339,11 +1416,54 @@ fn content_image(data: String, mime_type: String) -> Content {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_error_prompt;
+    use base64::Engine as _;
+
+    use super::{OutputStore, ReplyImage, ReplyItem, normalize_error_prompt};
 
     #[test]
     fn compact_search_cards_do_not_trigger_error_prompt_normalization() {
         let text = "[pager] search for `Error` @10\n[match] Error: boom\n".to_string();
         assert_eq!(normalize_error_prompt(text.clone(), true), text);
+    }
+
+    #[test]
+    fn events_log_text_rows_preserve_partial_line_state_across_images() {
+        let mut store = OutputStore::new().expect("output store should initialize");
+        let mut bundle = store.new_bundle().expect("bundle should initialize");
+
+        let first = bundle
+            .append_worker_text(&mut store, "a")
+            .expect("first worker text should append");
+        assert!(matches!(first, Some(ReplyItem::WorkerText(text)) if text == "a"));
+
+        let image = ReplyImage {
+            data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        };
+        let retained_image = bundle
+            .append_image(&mut store, &image)
+            .expect("image should append");
+        assert!(matches!(retained_image, Some(ReplyItem::Image(_))));
+
+        let second = bundle
+            .append_worker_text(&mut store, "b\n")
+            .expect("second worker text should append");
+        assert!(matches!(second, Some(ReplyItem::WorkerText(text)) if text == "b\n"));
+
+        let transcript = std::fs::read_to_string(&bundle.paths.transcript)
+            .expect("transcript should be readable");
+        let events = std::fs::read_to_string(&bundle.paths.events_log)
+            .expect("events log should be readable");
+
+        assert_eq!(transcript, "ab\n");
+        assert!(
+            events.contains("T lines=1-1 bytes=0-1\n"),
+            "expected first text row to cover the initial partial line, got: {events:?}"
+        );
+        assert!(
+            events.contains("T lines=1-1 bytes=1-3\n"),
+            "expected text after the image to continue the same line, got: {events:?}"
+        );
     }
 }

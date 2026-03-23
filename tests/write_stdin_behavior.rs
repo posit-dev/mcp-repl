@@ -631,6 +631,116 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let temp = tempdir()?;
+    let mut session = spawn_behavior_session_with_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "cat('start\\n'); flush.console(); Sys.sleep(0.2); cat('end\\n')",
+            Some(0.05),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect timeout bundle disclosure on first small timeout reply, got: {first_text:?}"
+    );
+
+    let hidden_bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
+
+    sleep(Duration::from_millis(260)).await;
+    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior final inline poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    wait_for_path_to_disappear(&hidden_bundle_dir).await?;
+    session.cancel().await?;
+
+    assert!(
+        final_text.contains("end"),
+        "expected final worker output inline, got: {final_text:?}"
+    );
+    assert!(
+        bundle_transcript_path(&final_text).is_none(),
+        "did not expect hidden timeout bundle disclosure on final inline poll, got: {final_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let spilled_text = result_text(&spilled);
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<console status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => {
+            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
+        }
+    };
+    let transcript_before = fs::read_to_string(&transcript_path)?;
+
+    let restart = session
+        .write_stdin_raw_with("\u{4}print('after reset')", Some(10.0))
+        .await?;
+    let restart_text = result_text(&restart);
+    if restart_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior ctrl-d restart did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(100)).await;
+    let transcript_after = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("after reset"),
+        "expected restarted session output, got: {restart_text:?}"
+    );
+    assert_eq!(
+        transcript_after, transcript_before,
+        "did not expect ctrl-d restart output to append to prior timeout bundle"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn output_bundle_prunes_oldest_inactive_bundle_when_count_limit_exceeded() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session_with_env_vars(vec![
