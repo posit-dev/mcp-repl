@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use rmcp::model::{AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent};
-use serde_json::json;
+use rmcp::model::{AnnotateAble, CallToolResult, Content, RawContent, RawImageContent};
 use tempfile::Builder;
 
 use crate::worker_process::WorkerError;
@@ -88,8 +87,6 @@ enum ReplyItem {
 struct ReplyImage {
     data: String,
     mime_type: String,
-    id: String,
-    is_new: bool,
 }
 
 struct ReplyMaterial {
@@ -759,17 +756,12 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
             WorkerContent::ContentImage {
                 data,
                 mime_type,
-                id,
-                is_new,
+                id: _,
+                is_new: _,
             } => {
                 image_count = image_count.saturating_add(1);
                 estimated_cost = estimated_cost.saturating_add(INLINE_IMAGE_COST);
-                items.push(ReplyItem::Image(ReplyImage {
-                    data,
-                    mime_type,
-                    id,
-                    is_new,
-                }));
+                items.push(ReplyItem::Image(ReplyImage { data, mime_type }));
             }
         }
     }
@@ -801,12 +793,7 @@ fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
 }
 
 fn image_to_content(image: &ReplyImage) -> Content {
-    content_image_with_meta(
-        image.data.clone(),
-        image.mime_type.clone(),
-        image.id.clone(),
-        image.is_new,
-    )
+    content_image(image.data.clone(), image.mime_type.clone())
 }
 
 fn worker_text_from_items(items: &[ReplyItem]) -> String {
@@ -1036,7 +1023,7 @@ fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -
         fs::read(&path).unwrap_or_else(|err| panic!("failed to read output bundle image: {err}"));
     let mime_type = mime_type_from_path(&path);
     let data = STANDARD.encode(bytes);
-    content_image_with_meta(data, mime_type, format!("plot-{index}"), true)
+    content_image(data, mime_type)
 }
 
 fn build_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
@@ -1208,38 +1195,13 @@ fn normalize_error_prompt(text: String, is_error: bool) -> String {
     if normalized_any { normalized } else { text }
 }
 
-fn content_image_with_meta(data: String, mime_type: String, id: String, is_new: bool) -> Content {
-    let mut meta = Meta::new();
-    let image_id = normalize_plot_id(&id);
-    meta.0.insert(
-        "mcpConsole".to_string(),
-        json!({
-            "imageId": image_id,
-            "isNewPage": is_new,
-        }),
-    );
+fn content_image(data: String, mime_type: String) -> Content {
     RawContent::Image(RawImageContent {
         data,
         mime_type,
-        meta: Some(meta),
+        meta: None,
     })
     .no_annotation()
-}
-
-fn normalize_plot_id(raw: &str) -> String {
-    let Some(rest) = raw.strip_prefix("plot-") else {
-        return raw.to_string();
-    };
-    let mut parts = rest.splitn(2, '-');
-    let _pid = parts.next();
-    let Some(counter) = parts.next() else {
-        return raw.to_string();
-    };
-    if counter.chars().all(|ch| ch.is_ascii_digit()) {
-        format!("plot-{counter}")
-    } else {
-        raw.to_string()
-    }
 }
 
 #[cfg(test)]

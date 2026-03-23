@@ -106,6 +106,26 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
     value
 }
 
+fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
+    let snapshot = response_snapshot(result);
+    let content = snapshot
+        .get("content")
+        .and_then(|value| value.as_array())
+        .expect("tool result content should be an array");
+    for item in content {
+        let is_image = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "image");
+        if is_image {
+            assert!(
+                item.get("_meta").is_none(),
+                "expected image results to omit _meta for {context}: {item}"
+            );
+        }
+    }
+}
+
 fn step_snapshot(input: &str, result: &CallToolResult) -> PlotStepSnapshot {
     PlotStepSnapshot {
         tool: "r_repl".to_string(),
@@ -378,6 +398,8 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "plot(1:10)");
+    assert_images_expose_no_meta(&update_result, "lines(4:8, 4:8)");
     assert!(
         !plot_images.is_empty(),
         "expected plot(1:10) to emit image content"
@@ -501,6 +523,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
     );
 
     let plot_images = extract_images(&plot_result);
+    assert_images_expose_no_meta(&plot_result, "multi-panel plot");
     assert_eq!(
         plot_images.len(),
         1,
@@ -631,6 +654,8 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "grid base plot");
+    assert_images_expose_no_meta(&update_result, "grid plot update");
     assert!(
         !plot_images.is_empty(),
         "expected grid plot to emit image content"
