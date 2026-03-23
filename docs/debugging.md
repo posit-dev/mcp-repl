@@ -73,7 +73,7 @@ Behavior:
 Useful environment variables:
 
 - `MCP_REPL_IMAGES=0|1|kitty` controls inline image rendering in the debug REPL
-- `MCP_REPL_PAGER_PAGE_CHARS=<n>` overrides the pager page size if you want larger or smaller pages while debugging
+- `MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT`, `MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES`, and `MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES` let you lower bundle quotas when reproducing spill and pruning behavior
 
 ## External wire trace proxy
 

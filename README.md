@@ -1,42 +1,68 @@
 # mcp-repl
 
-`mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
+`mcp-repl` is an MCP server provides an interactive console for agents.
 
-It is backend-agnostic in design. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
+It gives an agent a persistent R or Python session that stays alive across tool calls, so it can work the way a person would in a console: load data once, inspect objects, try ideas, read help, make plots, and keep iterating in context.
 
-Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
 
-- Stateful REPL execution in one long-lived process.
-- LLM-oriented output handling: prompt/echo cleanup and built-in pager mode.
-- In-band docs for common help flows (`?`, `help()`, `vignette()`, `RShowDoc()`).
-- Plot images returned as MCP image content.
-- OS-level sandboxing by default, plus a memory resource guardrail.
+A shell tool can run `Rscript -e` or `python -c`, but that is not the same as having a session.
+
+Data analysis languages were designed with interactive affordances. To be able to take full advantage of what the runtime offers, it only makes sense for an LLM to also be able to access those same interactive workflows.
+
+If the work is exploratory, stateful, or iterative, a throwaway command runner keeps forcing the agent to rebuild context. `mcp-repl` keeps the session open instead. That makes a difference for:
+
+- data exploration
+- interactive help and documentation lookup
+- plotting and visual checks
+- debugging
+- any workflow where intermediate objects should stay in memory
+
+It is built for real agent use: sandboxing is on by default, plots and help are supported in-band, session control with interrupts or restarts is explicit, and large replies stay readable.
+
+## How it works
+
+Your MCP client sends code to `repl`. `mcp-repl` runs it inside a long-lived R or Python process and keeps that process alive for the next call.
+
+That means variables, loaded packages, imported modules, plots, and other session state remain available until you reset the session or exit it.
+
+Results come back as text and, when relevant, images.
+
+## What it is good at
+
+- Exploring data without rebuilding context on every turn.
+- Reading help in-band instead of bouncing out to a browser.
+- Producing plots the agent can inspect immediately.
+- Iterating in a private scratch session before returning an answer.
+- Multi-step analysis where keeping state saves time and tokens.
 
 ### Safe by default
 
 Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+## Token efficient
 
-### Token efficient
+### Keeps output readable
 
-`mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
-- There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
-- Echoed inputs are automatically pruned or elided so output is easy to attribute.
-- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
-- Documentation receives special handling. Built-in entry points like `?`, `help`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band, replacing the usual HTML browser flow.
+REPL output can get messy quickly. `mcp-repl` keeps the response focused on what matters:
 
-### Pager
+- Echoed input is cleaned up so it is easier to see what happened.
+- Help pages render in-band instead of opening a separate browser flow.
+- Very large replies stay compact in the tool response, with a preview and a path to the full saved output when needed.
+- Plot images are returned directly through MCP instead of requiring a separate GUI workflow.
 
-The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
+### Large outputs still work
 
-Internally, the pager is backed by a bounded ring buffer with an event timeline, not a naive "dump and slice" stream. That gives it predictable memory usage while still supporting strong navigation semantics:
-- Output is tracked with stable offsets, so commands like `:seek` (offset/percent/line) and `:range` can jump deterministically.
-- Text and image events are merged into one timeline, so pagination decisions can account for both without duplicating content.
-- Already-shown ranges and images are tracked explicitly; when overlap occurs, the pager emits offset-based elision markers instead of replaying content.
-- UTF-8-aware indexing keeps search and cursor movement aligned to characters while preserving exact byte offsets internally.
+Most replies stay inline. When output gets too large, `mcp-repl` keeps the immediate response short and saves the full output as a structured bundle on disk.
 
-These affordances are all driven by observed LLM workflows and aim to reduce token waste while improving access to reference material.
+Models are good at searching and exploring files when the structure is clear. Instead of flooding the tool reply, `mcp-repl` produces a bundle the model can inspect on demand: compact previews in the immediate response, plus stable paths to the full transcript and plot files when deeper exploration is needed.
+
+The practical effect is simple:
+
+- the tool reply stays readable
+- the full output is still available
+- the model can explore the saved bundle incrementally
+- long transcripts and plot-heavy replies do not flood model context
 
 ### Plots
 
