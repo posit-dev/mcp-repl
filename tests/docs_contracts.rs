@@ -67,3 +67,31 @@ fn plans_layout_exists() {
         assert_exists(&root.join(required));
     }
 }
+
+#[test]
+fn plot_image_snapshots_do_not_expose_mcp_console_meta() {
+    let snapshots_dir = repo_root().join("tests/snapshots");
+    for entry in fs::read_dir(&snapshots_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", snapshots_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read snapshot entry: {err}"));
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("plot_images__") || !name.ends_with(".snap") {
+            continue;
+        }
+        let contents = read(&path);
+        assert!(
+            !contents.contains("\"_meta\""),
+            "plot snapshot should not expose _meta: {}",
+            path.display()
+        );
+        assert!(
+            !contents.contains("mcpConsole"),
+            "plot snapshot should not expose mcpConsole: {}",
+            path.display()
+        );
+    }
+}
