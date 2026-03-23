@@ -36,8 +36,11 @@ pub(crate) struct ResponseState {
     active_timeout_bundle: Option<ActiveOutputBundle>,
 }
 
+type OutputStoreRootFactory = fn() -> std::io::Result<tempfile::TempDir>;
+
 struct OutputStore {
     root: Option<tempfile::TempDir>,
+    create_root: OutputStoreRootFactory,
     next_id: u64,
     total_bytes: u64,
     limits: OutputStoreLimits,
@@ -211,7 +214,7 @@ impl ResponseState {
                             "dropping closed timeout bundle after output-bundle error: {err}"
                         );
                     }
-                    materialize_items(material.inline_items)
+                    compact_without_output_bundle(&material)
                 }
             }
         } else if material.bundle_image_count > 0
@@ -228,13 +231,13 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(material.inline_items)
+                            compact_without_output_bundle(&material)
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(material.inline_items)
+                    compact_without_output_bundle(&material)
                 }
             }
         } else if text_should_spill(material.worker_text.chars().count()) {
@@ -254,13 +257,13 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(material.inline_items)
+                            compact_without_output_bundle(&material)
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(material.inline_items)
+                    compact_without_output_bundle(&material)
                 }
             }
         } else {
@@ -274,12 +277,9 @@ impl ResponseState {
 impl OutputStore {
     fn new() -> Result<Self, WorkerError> {
         let limits = OutputStoreLimits::from_env()?;
-        let root = Builder::new()
-            .prefix("mcp-repl-output-")
-            .tempdir()
-            .map_err(WorkerError::Io)?;
         Ok(Self {
-            root: Some(root),
+            root: None,
+            create_root: create_output_store_root,
             next_id: 0,
             total_bytes: 0,
             limits,
@@ -296,29 +296,35 @@ impl OutputStore {
         Ok(())
     }
 
-    fn root_path(&self) -> &Path {
-        self.root
+    fn ensure_root_path(&mut self) -> Result<&Path, WorkerError> {
+        if self.root.is_none() {
+            self.root = Some((self.create_root)().map_err(WorkerError::Io)?);
+        }
+        Ok(self
+            .root
             .as_ref()
             .expect("output store root should exist")
-            .path()
+            .path())
     }
 
     fn new_bundle(&mut self) -> Result<ActiveOutputBundle, WorkerError> {
         self.prune_for_new_bundle(0)?;
         self.next_id = self.next_id.saturating_add(1);
-        let dir = self.root_path().join(format!("output-{:04}", self.next_id));
+        let bundle_id = self.next_id;
+        let root_path = self.ensure_root_path()?.to_path_buf();
+        let dir = root_path.join(format!("output-{bundle_id:04}"));
         fs::create_dir_all(&dir).map_err(WorkerError::Io)?;
         let images_dir = dir.join("images");
         let images_history_dir = images_dir.join("history");
         let transcript = dir.join("transcript.txt");
         let events_log = dir.join("events.log");
         self.bundles.push_back(StoredBundle {
-            id: self.next_id,
+            id: bundle_id,
             dir: dir.clone(),
             bytes_on_disk: 0,
         });
         Ok(ActiveOutputBundle {
-            id: self.next_id,
+            id: bundle_id,
             paths: OutputBundlePaths {
                 dir,
                 transcript,
@@ -491,6 +497,10 @@ impl OutputStore {
         self.total_bytes = self.total_bytes.saturating_sub(bundle.bytes_on_disk);
         Ok(())
     }
+}
+
+fn create_output_store_root() -> std::io::Result<tempfile::TempDir> {
+    Builder::new().prefix("mcp-repl-output-").tempdir()
 }
 
 impl OutputStoreLimits {
@@ -993,7 +1003,30 @@ fn compact_text_bundle_items(
     worker_text: &str,
     bundle: &ActiveOutputBundle,
 ) -> Vec<Content> {
-    let preview = build_preview(worker_text, bundle.disclosure_path(), bundle.omitted_tail);
+    let preview = build_preview(
+        worker_text,
+        Some(bundle.disclosure_path()),
+        bundle.omitted_tail,
+    );
+    let mut out = Vec::new();
+    let mut worker_inserted = false;
+    for item in items {
+        match item {
+            ReplyItem::WorkerText(_) => {
+                if !worker_inserted {
+                    out.push(Content::text(preview.clone()));
+                    worker_inserted = true;
+                }
+            }
+            ReplyItem::ServerText(text) => out.push(Content::text(text)),
+            ReplyItem::Image(image) => out.push(image_to_content(&image)),
+        }
+    }
+    out
+}
+
+fn compact_text_without_bundle_items(items: Vec<ReplyItem>, worker_text: &str) -> Vec<Content> {
+    let preview = build_preview(worker_text, None, false);
     let mut out = Vec::new();
     let mut worker_inserted = false;
     for item in items {
@@ -1049,6 +1082,60 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
     out
 }
 
+fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
+    let first_image_idx = items
+        .iter()
+        .position(|item| matches!(item, ReplyItem::Image(_)));
+    let last_image_idx = items
+        .iter()
+        .rposition(|item| matches!(item, ReplyItem::Image(_)));
+    let mut out = Vec::new();
+
+    let head_text = collect_prefix_text(
+        items,
+        first_image_idx.unwrap_or(items.len()),
+        HEAD_TEXT_BUDGET,
+    );
+    if !head_text.is_empty() {
+        out.push(Content::text(head_text));
+    }
+    if let Some(index) = first_image_idx
+        && let ReplyItem::Image(image) = &items[index]
+    {
+        out.push(image_to_content(image));
+    }
+    out.push(Content::text(build_output_bundle_unavailable_notice(
+        count_images(items),
+    )));
+    let pre_last_text = collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET);
+    if !pre_last_text.is_empty() {
+        out.push(Content::text(pre_last_text));
+    }
+    if let Some(index) = last_image_idx
+        && Some(index) != first_image_idx
+        && let ReplyItem::Image(image) = &items[index]
+    {
+        out.push(image_to_content(image));
+    }
+    let post_last_text = collect_prefix_text_after(items, last_image_idx, POST_LAST_TEXT_BUDGET);
+    if !post_last_text.is_empty() {
+        out.push(Content::text(post_last_text));
+    }
+    out
+}
+
+fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
+    if material.bundle_image_count > 0
+        && should_use_output_bundle(
+            material.bundle_image_count,
+            material.worker_text.chars().count(),
+        )
+    {
+        return compact_output_without_bundle_items(&material.inline_items);
+    }
+    compact_text_without_bundle_items(material.inline_items.clone(), &material.worker_text)
+}
+
 fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
     image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD || text_should_spill(worker_text_chars)
 }
@@ -1087,6 +1174,16 @@ fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
             path.display(),
             omitted
         ),
+    }
+}
+
+fn build_output_bundle_unavailable_notice(image_count: usize) -> String {
+    match image_count {
+        0 => "...[middle truncated; output bundle unavailable]...".to_string(),
+        1 => "...[middle truncated; first image shown inline; output bundle unavailable]..."
+            .to_string(),
+        _ => "...[middle truncated; first and last images shown inline; output bundle unavailable]..."
+            .to_string(),
     }
 }
 
@@ -1236,7 +1333,7 @@ fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -
     content_image(data, mime_type)
 }
 
-fn build_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
+fn build_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
     if omitted_tail && text.chars().count() <= INLINE_TEXT_BUDGET {
         return build_short_preview(text, path);
     }
@@ -1246,7 +1343,7 @@ fn build_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
     build_char_preview(text, path, omitted_tail)
 }
 
-fn build_line_preview(text: &str, path: &Path, omitted_tail: bool) -> Option<String> {
+fn build_line_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> Option<String> {
     if !text.contains('\n') {
         return None;
     }
@@ -1292,19 +1389,18 @@ fn build_line_preview(text: &str, path: &Path, omitted_tail: bool) -> Option<Str
     } else {
         ""
     };
+    let storage = preview_storage_clause(path);
     let marker = format!(
-        "...[middle truncated; shown lines 1-{head_count} and {}-{} of {} total; full output: {}{}]...",
+        "...[middle truncated; shown lines 1-{head_count} and {}-{} of {} total; {storage}{omitted}]...",
         lines.len() - tail_count + 1,
         lines.len(),
         lines.len(),
-        path.display(),
-        omitted
     );
 
     Some(format!("{head}{marker}\n{tail}"))
 }
 
-fn build_char_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
+fn build_char_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let head_chars = INLINE_TEXT_BUDGET * 2 / 3;
@@ -1318,28 +1414,34 @@ fn build_char_preview(text: &str, path: &Path, omitted_tail: bool) -> String {
     } else {
         ""
     };
+    let storage = preview_storage_clause(path);
     let marker = format!(
-        "...[middle truncated; shown chars 1-{head_end} and {}-{} of {} total; full output: {}{}]...",
+        "...[middle truncated; shown chars 1-{head_end} and {}-{} of {} total; {storage}{omitted}]...",
         tail_start.saturating_add(1),
         total,
         total,
-        path.display(),
-        omitted
     );
     format!("{head}\n{marker}\n{tail}")
 }
 
-fn build_short_preview(text: &str, path: &Path) -> String {
+fn build_short_preview(text: &str, path: Option<&Path>) -> String {
     let mut out = String::new();
     out.push_str(text);
     if !text.is_empty() && !text.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(&format!(
-        "...[full output: {}; later content omitted]...",
-        path.display()
+        "...[{}; later content omitted]...",
+        preview_storage_clause(path)
     ));
     out
+}
+
+fn preview_storage_clause(path: Option<&Path>) -> String {
+    match path {
+        Some(path) => format!("full output: {}", path.display()),
+        None => "output bundle unavailable".to_string(),
+    }
 }
 
 fn ensure_nonempty_contents(contents: &mut Vec<Content>) {
@@ -1417,8 +1519,27 @@ fn content_image(data: String, mime_type: String) -> Content {
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
+    use std::io;
 
-    use super::{OutputStore, ReplyImage, ReplyItem, normalize_error_prompt};
+    use rmcp::model::RawContent;
+
+    use super::{OutputStore, ReplyImage, ReplyItem, ResponseState, normalize_error_prompt};
+    use crate::worker_protocol::WorkerContent;
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match &item.raw {
+                RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fail_output_store_root_creation() -> io::Result<tempfile::TempDir> {
+        Err(io::Error::other("simulated tempdir failure"))
+    }
 
     #[test]
     fn compact_search_cards_do_not_trigger_error_prompt_normalization() {
@@ -1464,6 +1585,35 @@ mod tests {
         assert!(
             events.contains("T lines=1-1 bytes=1-3\n"),
             "expected text after the image to continue the same line, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn output_bundle_setup_failure_returns_pathless_truncated_reply() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.create_root = fail_output_store_root_creation;
+
+        let oversized_text = "a".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let result = state.finalize_worker_result(
+            Ok(crate::worker_protocol::WorkerReply::Output {
+                contents: vec![WorkerContent::worker_stdout(oversized_text)],
+                is_error: false,
+                error_code: None,
+                prompt: None,
+                prompt_variants: None,
+            }),
+            false,
+            false,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected truncated fallback notice when bundle setup fails, got: {text:?}"
+        );
+        assert!(
+            !text.contains("/transcript.txt") && !text.contains("/events.log"),
+            "did not expect bundle path in fallback reply, got: {text:?}"
         );
     }
 }

@@ -129,7 +129,9 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
-        !guard.events.is_empty() || !guard.stdout_tail.is_empty() || !guard.stderr_tail.is_empty()
+        !guard.events.is_empty()
+            || tail_has_flushable_bytes(&guard.stdout_tail)
+            || tail_has_flushable_bytes(&guard.stderr_tail)
     }
 
     pub(crate) fn clear(&self) {
@@ -338,7 +340,11 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream) {
         if tail.is_empty() {
             return;
         }
-        std::mem::take(tail)
+        let flush_len = flushable_prefix_len(tail);
+        if flush_len == 0 {
+            return;
+        }
+        tail.drain(..flush_len).collect::<Vec<u8>>()
     };
     let seq = next_seq(inner);
     inner.events.push_back(PendingOutputEvent::TextFragment {
@@ -354,6 +360,31 @@ fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u
         Some(PendingOutputEvent::TextFragment { bytes, .. }) => Some(bytes.as_slice()),
         Some(PendingOutputEvent::Image { .. } | PendingOutputEvent::Sideband { .. }) | None => None,
     }
+}
+
+fn tail_has_flushable_bytes(bytes: &[u8]) -> bool {
+    flushable_prefix_len(bytes) > 0
+}
+
+fn flushable_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset: usize = 0;
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(_) => return bytes.len(),
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if let Some(error_len) = err.error_len() {
+                    let invalid_end = valid_up_to.saturating_add(error_len);
+                    offset = offset.saturating_add(invalid_end);
+                    remaining = &remaining[invalid_end..];
+                } else {
+                    return offset.saturating_add(valid_up_to);
+                }
+            }
+        }
+    }
+    bytes.len()
 }
 
 #[cfg(test)]
@@ -461,6 +492,25 @@ mod tests {
         assert_eq!(
             formatted.contents,
             vec![WorkerContent::stdout("x\n[repl] session ended\n")]
+        );
+    }
+
+    #[test]
+    fn split_utf8_sequence_is_preserved_across_snapshot_drains() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "incomplete utf-8 prefix should stay buffered across drain boundaries"
+        );
+
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("é\n")]
         );
     }
 }
