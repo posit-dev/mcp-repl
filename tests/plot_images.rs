@@ -31,6 +31,14 @@ struct PlotTranscriptSnapshot {
     steps: Vec<PlotStepSnapshot>,
 }
 
+#[derive(Debug)]
+struct TextEventRow {
+    start_line: usize,
+    end_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 fn result_text(result: &CallToolResult) -> String {
     result
         .content
@@ -177,6 +185,57 @@ fn extract_images(result: &CallToolResult) -> Vec<ImageData> {
             _ => None,
         })
         .collect()
+}
+
+fn parse_text_event_rows(events: &str) -> Vec<TextEventRow> {
+    events
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("T ")?;
+            let mut parts = rest.split_whitespace();
+            let lines = parts.next()?.strip_prefix("lines=")?;
+            let bytes = parts.next()?.strip_prefix("bytes=")?;
+            let mut line_parts = lines.split('-');
+            let mut byte_parts = bytes.split('-');
+            Some(TextEventRow {
+                start_line: line_parts.next()?.parse().ok()?,
+                end_line: line_parts.next()?.parse().ok()?,
+                start_byte: byte_parts.next()?.parse().ok()?,
+                end_byte: byte_parts.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn advance_visible_lines(
+    text: &str,
+    visible_lines: usize,
+    has_partial_line: bool,
+) -> (usize, usize, bool) {
+    assert!(!text.is_empty(), "text event rows should not be empty");
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    let start_line = if visible_lines == 0 {
+        1
+    } else if has_partial_line {
+        visible_lines
+    } else {
+        visible_lines.saturating_add(1)
+    };
+    let next_visible_lines = if has_partial_line {
+        visible_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
+            .saturating_sub(1)
+    } else {
+        visible_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
+    };
+    (
+        start_line,
+        next_visible_lines.max(start_line),
+        !text.ends_with('\n'),
+    )
 }
 
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -1055,6 +1114,73 @@ for (i in 1:6) {
         !transcript.contains("images/history/001/001.png"),
         "did not expect transcript.txt to contain image paths, got: {transcript:?}"
     );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_output_bundle_events_log_keeps_partial_line_ranges_stable() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = r#"
+cat("a")
+flush.console()
+Sys.sleep(0.05)
+for (i in 1:5) {
+  plot(1:10, main = sprintf("plot%03d", i))
+  cat(sprintf("b%03d\n", i))
+  flush.console()
+}
+"#;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot output bundle with partial lines reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let rows = parse_text_event_rows(&events);
+
+    assert!(
+        transcript.contains("b001\nb002\nb003\nb004\nb005\n"),
+        "expected transcript.txt to preserve the mixed plot text, got: {transcript:?}"
+    );
+    assert!(
+        rows.len() >= 2,
+        "expected multiple text rows in events.log for the mixed output bundle, got: {events:?}"
+    );
+    let mut visible_lines = 0;
+    let mut has_partial_line = false;
+    for row in rows {
+        let text = std::str::from_utf8(&transcript.as_bytes()[row.start_byte..row.end_byte])
+            .unwrap_or_else(|err| panic!("expected text row bytes to decode as UTF-8: {err}"));
+        let (expected_start, expected_end, next_partial) =
+            advance_visible_lines(text, visible_lines, has_partial_line);
+        assert_eq!(
+            (row.start_line, row.end_line),
+            (expected_start, expected_end),
+            "expected events.log line span to match transcript slice {text:?}, got: {events:?}"
+        );
+        visible_lines = expected_end;
+        has_partial_line = next_partial;
+    }
 
     session.cancel().await?;
 
