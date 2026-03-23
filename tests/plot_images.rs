@@ -3,7 +3,9 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TestResult, spawn_server, spawn_server_with_pager_page_chars};
+use common::{
+    TestResult, spawn_server, spawn_server_with_env_vars, spawn_server_with_pager_page_chars,
+};
 use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
@@ -1315,6 +1317,136 @@ cat("TAIL_ONLY\n")
     );
 
     session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path() -> TestResult<()> {
+    let temp = tempdir()?;
+    let mut session = spawn_server_with_env_vars(vec![
+        ("TMPDIR".to_string(), temp.path().display().to_string()),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "12000".to_string(),
+        ),
+    ])
+    .await?;
+
+    let input = r#"
+Sys.sleep(0.25)
+for (i in 1:6) {
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!("plot_images timeout omission poll did not flush bundle state yet; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        bundled.is_error,
+        Some(true),
+        "image-only timeout omission poll reported an error: {}",
+        bundled_text
+    );
+    assert!(
+        bundled_text.contains("later content omitted"),
+        "expected omission notice in image-only timeout poll, got: {bundled_text:?}"
+    );
+    assert!(
+        bundled_text.contains("output-0001"),
+        "expected omission reply to disclose a bundle path, got: {bundled_text:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()> {
+    let temp = tempdir()?;
+    let mut session = spawn_server_with_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?;
+
+    let input = r#"
+Sys.sleep(0.25)
+for (i in 1:6) {
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!("plot_images timeout bundle poll did not flush image history yet; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let events_log = events_log_path(&bundled_text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in timeout poll, got: {bundled_text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    fs::remove_file(bundle_dir.join("images/001.png"))?;
+
+    let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let damaged_text = result_text(&damaged);
+    assert_ne!(
+        damaged.is_error,
+        Some(true),
+        "missing anchor image poll reported an error: {}",
+        damaged_text
+    );
+    assert!(
+        damaged_text.contains("events.log"),
+        "expected damaged anchor poll to keep disclosing the output bundle, got: {damaged_text:?}"
+    );
+
+    let mut settled_text = damaged_text;
+    while settled_text.contains("<<console status: busy") {
+        sleep(Duration::from_millis(100)).await;
+        let next = session.write_stdin_raw_with("", Some(0.5)).await?;
+        settled_text = result_text(&next);
+    }
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected session to stay alive after anchor image deletion, got: {follow_up_text:?}"
+    );
 
     Ok(())
 }

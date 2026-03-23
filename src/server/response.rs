@@ -1052,6 +1052,14 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         .iter()
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
     let mut out = Vec::new();
+    let first_anchor = (bundle.next_image_number > 0)
+        .then(|| load_output_bundle_image_content(bundle, 1))
+        .flatten();
+    let last_anchor = (bundle.next_image_number > 1)
+        .then(|| load_output_bundle_image_content(bundle, bundle.next_image_number))
+        .flatten();
+    let displayed_anchor_count =
+        usize::from(first_anchor.is_some()) + usize::from(last_anchor.is_some());
 
     let head_text = collect_prefix_text(
         items,
@@ -1061,19 +1069,19 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
     if !head_text.is_empty() {
         out.push(Content::text(head_text));
     }
-    if bundle.next_image_number > 0 {
-        out.push(load_output_bundle_image_content(bundle, 1));
+    if let Some(image) = first_anchor {
+        out.push(image);
     }
-    out.push(Content::text(build_output_bundle_notice(bundle)));
+    out.push(Content::text(build_output_bundle_notice(
+        bundle,
+        displayed_anchor_count,
+    )));
     let pre_last_text = collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET);
     if !pre_last_text.is_empty() {
         out.push(Content::text(pre_last_text));
     }
-    if bundle.next_image_number > 1 {
-        out.push(load_output_bundle_image_content(
-            bundle,
-            bundle.next_image_number,
-        ));
+    if let Some(image) = last_anchor {
+        out.push(image);
     }
     let post_last_text = collect_prefix_text_after(items, last_image_idx, POST_LAST_TEXT_BUDGET);
     if !post_last_text.is_empty() {
@@ -1144,7 +1152,10 @@ fn text_should_spill(worker_text_chars: usize) -> bool {
     worker_text_chars > INLINE_TEXT_HARD_SPILL_THRESHOLD
 }
 
-fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
+fn build_output_bundle_notice(
+    bundle: &ActiveOutputBundle,
+    displayed_anchor_count: usize,
+) -> String {
     let omitted = if bundle.omitted_tail {
         "; later content omitted"
     } else {
@@ -1158,14 +1169,19 @@ fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
     } else {
         "full output"
     };
-    match bundle.next_image_number {
+    match displayed_anchor_count {
         0 => format!(
             "...[middle truncated; {label}: {}{}]...",
             path.display(),
             omitted
         ),
-        1 => format!(
+        1 if bundle.next_image_number <= 1 => format!(
             "...[middle truncated; first image shown inline; {label}: {}{}]...",
+            path.display(),
+            omitted
+        ),
+        1 => format!(
+            "...[middle truncated; one image shown inline; {label}: {}{}]...",
             path.display(),
             omitted
         ),
@@ -1324,13 +1340,21 @@ fn mime_type_from_path(path: &Path) -> String {
     }
 }
 
-fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -> Content {
+fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -> Option<Content> {
     let path = bundle.image_path(index);
-    let bytes =
-        fs::read(&path).unwrap_or_else(|err| panic!("failed to read output bundle image: {err}"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "skipping unreadable output bundle image {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
     let mime_type = mime_type_from_path(&path);
     let data = STANDARD.encode(bytes);
-    content_image(data, mime_type)
+    Some(content_image(data, mime_type))
 }
 
 fn build_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
@@ -1593,10 +1617,13 @@ mod tests {
         let mut state = ResponseState::new().expect("response state should initialize");
         state.output_store.create_root = fail_output_store_root_creation;
 
-        let oversized_text = "a".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let oversized_text = format!(
+            "START{}END",
+            "a".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
         let result = state.finalize_worker_result(
             Ok(crate::worker_protocol::WorkerReply::Output {
-                contents: vec![WorkerContent::worker_stdout(oversized_text)],
+                contents: vec![WorkerContent::worker_stdout(oversized_text.clone())],
                 is_error: false,
                 error_code: None,
                 prompt: None,
@@ -1614,6 +1641,10 @@ mod tests {
         assert!(
             !text.contains("/transcript.txt") && !text.contains("/events.log"),
             "did not expect bundle path in fallback reply, got: {text:?}"
+        );
+        assert!(
+            text.contains("START") && text.contains("END"),
+            "expected truncated fallback reply to preserve worker output preview, got: {text:?}"
         );
     }
 }
