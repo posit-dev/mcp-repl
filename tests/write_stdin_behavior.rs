@@ -580,7 +580,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout_bundle_file_creation_failure_drops_content_without_panicking() -> TestResult<()> {
+async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
     let mut session = spawn_behavior_session_with_env_vars(vec![(
@@ -619,8 +619,8 @@ async fn timeout_bundle_file_creation_failure_drops_content_without_panicking() 
         "did not expect a transcript path after bundle file creation failed: {spilled_text:?}"
     );
     assert!(
-        !spilled_text.contains("mid080"),
-        "expected oversized worker text to be dropped after bundle file creation failed: {spilled_text:?}"
+        spilled_text.contains("mid080") && spilled_text.contains("end"),
+        "expected bundle write failure to fall back to inline worker text, got: {spilled_text:?}"
     );
     assert!(
         follow_up_text.contains("[1] 2"),

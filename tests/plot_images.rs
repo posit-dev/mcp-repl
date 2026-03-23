@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tempfile::tempdir;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 struct ImageData {
@@ -1120,6 +1121,71 @@ for (i in 1:6) {
         events.contains("I images/history/001/001.png")
             && events.contains("I images/history/006/001.png"),
         "expected events.log to cover the full image set, got: {events:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_text_only_poll_does_not_duplicate_prefix_text() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = r#"
+cat("HEAD_ONLY\n")
+flush.console()
+Sys.sleep(0.25)
+for (i in 1:6) {
+  cat(sprintf("plot%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+cat("TAIL_ONLY\n")
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!(
+            "plot_images timeout output-bundle poll did not flush image history yet; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let final_result = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let final_text = result_text(&final_result);
+
+    assert_ne!(
+        final_result.is_error,
+        Some(true),
+        "timeout text-only follow-up poll reported an error: {}",
+        final_text
+    );
+    assert!(
+        !final_text.contains("<<console status: busy"),
+        "expected timeout text-only follow-up poll to finish, got: {final_text:?}"
+    );
+    assert!(
+        events_log_path(&final_text).is_some(),
+        "expected output bundle disclosure in final timeout poll, got: {final_text:?}"
+    );
+    assert_eq!(
+        final_text
+            .matches(
+                "> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY\n> [repl] input discarded while worker busy"
+            )
+            .count(),
+        1,
+        "expected trailing timeout text segment to appear once, got: {final_text:?}"
     );
 
     session.cancel().await?;

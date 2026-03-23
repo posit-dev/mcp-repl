@@ -187,7 +187,7 @@ impl ResponseState {
                 }
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.inline_items))
+                    materialize_items(material.inline_items)
                 }
             }
         } else if material.bundle_image_count > 0
@@ -204,13 +204,13 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(server_only_items(material.inline_items))
+                            materialize_items(material.inline_items)
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.inline_items))
+                    materialize_items(material.inline_items)
                 }
             }
         } else if text_should_spill(material.worker_text.chars().count()) {
@@ -230,13 +230,13 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(server_only_items(material.inline_items))
+                            materialize_items(material.inline_items)
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.inline_items))
+                    materialize_items(material.inline_items)
                 }
             }
         } else {
@@ -911,13 +911,6 @@ fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
         .collect()
 }
 
-fn server_only_items(items: Vec<ReplyItem>) -> Vec<ReplyItem> {
-    items
-        .into_iter()
-        .filter(|item| matches!(item, ReplyItem::ServerText(_)))
-        .collect()
-}
-
 fn image_to_content(image: &ReplyImage) -> Content {
     content_image(image.data.clone(), image.mime_type.clone())
 }
@@ -1080,7 +1073,10 @@ fn collect_suffix_text_before(items: &[ReplyItem], index: Option<usize>, budget:
 }
 
 fn collect_prefix_text_after(items: &[ReplyItem], index: Option<usize>, budget: usize) -> String {
-    let start = index.map(|index| index.saturating_add(1)).unwrap_or(0);
+    let Some(index) = index else {
+        return String::new();
+    };
+    let start = index.saturating_add(1);
     collect_prefix_text(&items[start..], items[start..].len(), budget)
 }
 
