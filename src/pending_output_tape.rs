@@ -23,6 +23,7 @@ pub(crate) enum PendingOutputEvent {
     TextFragment {
         seq: u64,
         stream: TextStream,
+        origin: ContentOrigin,
         bytes: Vec<u8>,
         terminated: bool,
     },
@@ -64,11 +65,15 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn append_stdout_bytes(&self, bytes: &[u8]) {
-        self.append_bytes(bytes, TextStream::Stdout);
+        self.append_bytes(bytes, TextStream::Stdout, ContentOrigin::Worker);
     }
 
     pub(crate) fn append_stderr_bytes(&self, bytes: &[u8]) {
-        self.append_bytes(bytes, TextStream::Stderr);
+        self.append_bytes(bytes, TextStream::Stderr, ContentOrigin::Worker);
+    }
+
+    pub(crate) fn append_server_stderr_bytes(&self, bytes: &[u8]) {
+        self.append_bytes(bytes, TextStream::Stderr, ContentOrigin::Server);
     }
 
     pub(crate) fn append_stdout_status_line(&self, bytes: &[u8]) {
@@ -80,16 +85,22 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout);
-        flush_tail(&mut guard, TextStream::Stderr);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
         let needs_separator = last_text_fragment_bytes(&guard.events)
             .is_some_and(|last| !last.ends_with(b"\n"))
             && !bytes.starts_with(b"\n");
+        let mut status_line = Vec::with_capacity(bytes.len() + usize::from(needs_separator));
         if needs_separator {
-            tail_mut(&mut guard, TextStream::Stdout).push(b'\n');
+            status_line.push(b'\n');
         }
-        tail_mut(&mut guard, TextStream::Stdout).extend_from_slice(bytes);
-        commit_complete_lines(&mut guard, TextStream::Stdout);
+        status_line.extend_from_slice(bytes);
+        append_complete_bytes(
+            &mut guard,
+            TextStream::Stdout,
+            ContentOrigin::Server,
+            &status_line,
+        );
     }
 
     pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
@@ -98,8 +109,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout);
-        flush_tail(&mut guard, TextStream::Stderr);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
         guard.events.push_back(PendingOutputEvent::Image {
             seq,
@@ -116,8 +127,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout);
-        flush_tail(&mut guard, TextStream::Stderr);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
         guard
             .events
@@ -151,18 +162,26 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn drain_snapshot(&self) -> PendingOutputSnapshot {
+        self.drain_snapshot_with_policy(false)
+    }
+
+    pub(crate) fn drain_final_snapshot(&self) -> PendingOutputSnapshot {
+        self.drain_snapshot_with_policy(true)
+    }
+
+    fn drain_snapshot_with_policy(&self, flush_incomplete: bool) -> PendingOutputSnapshot {
         let mut guard = self
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
-        flush_tail(&mut guard, TextStream::Stdout);
-        flush_tail(&mut guard, TextStream::Stderr);
+        flush_tail(&mut guard, TextStream::Stdout, flush_incomplete);
+        flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
         PendingOutputSnapshot {
             events: guard.events.drain(..).collect(),
         }
     }
 
-    fn append_bytes(&self, bytes: &[u8], stream: TextStream) {
+    fn append_bytes(&self, bytes: &[u8], stream: TextStream, origin: ContentOrigin) {
         if bytes.is_empty() {
             return;
         }
@@ -171,9 +190,9 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, other_stream(stream));
+        flush_tail(&mut guard, other_stream(stream), false);
         tail_mut(&mut guard, stream).extend_from_slice(bytes);
-        commit_complete_lines(&mut guard, stream);
+        commit_complete_lines(&mut guard, stream, origin);
     }
 }
 
@@ -182,7 +201,12 @@ impl PendingOutputSnapshot {
         let mut formatted = FormattedPendingOutput::default();
         for event in &self.events {
             match event {
-                PendingOutputEvent::TextFragment { stream, bytes, .. } => {
+                PendingOutputEvent::TextFragment {
+                    stream,
+                    origin,
+                    bytes,
+                    ..
+                } => {
                     if bytes.is_empty() {
                         continue;
                     }
@@ -198,7 +222,7 @@ impl PendingOutputSnapshot {
                     } else {
                         rendered
                     };
-                    push_text(&mut formatted.contents, *stream, text);
+                    push_text(&mut formatted.contents, *stream, *origin, text);
                 }
                 PendingOutputEvent::Image {
                     data,
@@ -219,16 +243,22 @@ impl PendingOutputSnapshot {
     }
 }
 
-fn push_text(contents: &mut Vec<WorkerContent>, stream: TextStream, text: String) {
+fn push_text(
+    contents: &mut Vec<WorkerContent>,
+    stream: TextStream,
+    origin: ContentOrigin,
+    text: String,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(WorkerContent::ContentText {
         text: existing,
         stream: existing_stream,
-        ..
+        origin: existing_origin,
     }) = contents.last_mut()
         && *existing_stream == stream
+        && *existing_origin == origin
     {
         existing.push_str(&text);
         return;
@@ -236,7 +266,7 @@ fn push_text(contents: &mut Vec<WorkerContent>, stream: TextStream, text: String
     contents.push(WorkerContent::ContentText {
         text,
         stream,
-        origin: ContentOrigin::Worker,
+        origin,
     });
 }
 
@@ -315,7 +345,30 @@ fn tail_mut(inner: &mut PendingOutputTapeInner, stream: TextStream) -> &mut Vec<
     }
 }
 
-fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream) {
+fn append_complete_bytes(
+    inner: &mut PendingOutputTapeInner,
+    stream: TextStream,
+    origin: ContentOrigin,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let seq = next_seq(inner);
+    inner.events.push_back(PendingOutputEvent::TextFragment {
+        seq,
+        stream,
+        origin,
+        bytes: bytes.to_vec(),
+        terminated: bytes.ends_with(b"\n"),
+    });
+}
+
+fn commit_complete_lines(
+    inner: &mut PendingOutputTapeInner,
+    stream: TextStream,
+    origin: ContentOrigin,
+) {
     loop {
         let line = {
             let tail = tail_mut(inner, stream);
@@ -328,19 +381,23 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
         inner.events.push_back(PendingOutputEvent::TextFragment {
             seq,
             stream,
+            origin,
             bytes: line,
             terminated: true,
         });
     }
 }
 
-fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream) {
+fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_incomplete: bool) {
     let bytes = {
         let tail = tail_mut(inner, stream);
         if tail.is_empty() {
             return;
         }
-        let flush_len = flushable_prefix_len(tail);
+        let mut flush_len = flushable_prefix_len(tail);
+        if flush_incomplete && flush_len == 0 {
+            flush_len = tail.len();
+        }
         if flush_len == 0 {
             return;
         }
@@ -350,6 +407,7 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream) {
     inner.events.push_back(PendingOutputEvent::TextFragment {
         seq,
         stream,
+        origin: ContentOrigin::Worker,
         bytes,
         terminated: false,
     });
@@ -404,12 +462,14 @@ mod tests {
                 PendingOutputEvent::TextFragment {
                     seq: 0,
                     stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
                     bytes: b"abc".to_vec(),
                     terminated: false,
                 },
                 PendingOutputEvent::TextFragment {
                     seq: 1,
                     stream: TextStream::Stderr,
+                    origin: ContentOrigin::Worker,
                     bytes: b"boom\n".to_vec(),
                     terminated: true,
                 },
@@ -491,7 +551,35 @@ mod tests {
         let formatted = snapshot.format_contents();
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("x\n[repl] session ended\n")]
+            vec![
+                WorkerContent::ContentText {
+                    text: "x".to_string(),
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                },
+                WorkerContent::ContentText {
+                    text: "\n[repl] session ended\n".to_string(),
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Server,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn server_stderr_notice_preserves_server_origin() {
+        let tape = PendingOutputTape::new();
+        tape.append_server_stderr_bytes(b"[repl] guardrail\n");
+
+        let snapshot = tape.drain_snapshot();
+        let formatted = snapshot.format_contents();
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::ContentText {
+                text: "stderr: [repl] guardrail\n".to_string(),
+                stream: TextStream::Stderr,
+                origin: ContentOrigin::Server,
+            }]
         );
     }
 
@@ -511,6 +599,18 @@ mod tests {
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
+    fn final_snapshot_flushes_incomplete_utf8_as_hex_escape() {
+        let tape = PendingOutputTape::new();
+        tape.append_stdout_bytes(&[0xC3]);
+
+        let snapshot = tape.drain_final_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![WorkerContent::stdout("\\xC3")]
         );
     }
 }

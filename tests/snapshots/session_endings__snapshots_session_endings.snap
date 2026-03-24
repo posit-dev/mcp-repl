@@ -255,7 +255,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"no\")\n[repl] session ended"
+      "text": "> quit(\"no\")"
+    },
+    {
+      "type": "text",
+      "text": "[repl] session ended"
     }
   ]
 }
@@ -325,7 +329,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit()\n[repl] session ended"
+      "text": "> quit()"
+    },
+    {
+      "type": "text",
+      "text": "[repl] session ended"
     }
   ]
 }
@@ -395,7 +403,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"yes\")\n[repl] session ended"
+      "text": "> quit(\"yes\")"
+    },
+    {
+      "type": "text",
+      "text": "[repl] session ended"
     }
   ]
 }

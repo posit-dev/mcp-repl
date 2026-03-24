@@ -666,7 +666,11 @@ impl WorkerManager {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_formatted_output();
+        } = if timed_out {
+            self.drain_formatted_output()
+        } else {
+            self.drain_final_formatted_output()
+        };
         let is_error = saw_stderr;
 
         if timed_out {
@@ -751,7 +755,7 @@ impl WorkerManager {
         context: InputContext,
     ) -> ReplyWithOffset {
         let mut contents = context.prefix_contents;
-        let formatted = self.drain_formatted_output();
+        let formatted = self.drain_final_formatted_output();
         contents.extend(formatted.contents);
         contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
         ReplyWithOffset {
@@ -783,7 +787,7 @@ impl WorkerManager {
                     self.note_session_end(true);
                 }
                 let mut contents = context.prefix_contents;
-                let formatted = self.drain_formatted_output();
+                let formatted = self.drain_final_formatted_output();
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
                 let resolved_prompt = if session_end {
@@ -978,7 +982,7 @@ impl WorkerManager {
             return;
         };
         self.pending_output_tape
-            .append_stderr_bytes(event.message.as_bytes());
+            .append_server_stderr_bytes(event.message.as_bytes());
     }
 
     fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
@@ -996,7 +1000,7 @@ impl WorkerManager {
                         message.push('\n');
                     }
                     self.pending_output_tape
-                        .append_stderr_bytes(message.as_bytes());
+                        .append_server_stderr_bytes(message.as_bytes());
                 } else {
                     let message = "[repl] session ended\n".to_string();
                     self.pending_output_tape
@@ -1265,6 +1269,12 @@ impl WorkerManager {
         self.pending_output_tape.drain_snapshot().format_contents()
     }
 
+    fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
+        self.pending_output_tape
+            .drain_final_snapshot()
+            .format_contents()
+    }
+
     fn build_idle_poll_reply(&mut self) -> ReplyWithOffset {
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
@@ -1400,7 +1410,7 @@ impl WorkerManager {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_formatted_output();
+        } = self.drain_final_formatted_output();
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
             _ => true,

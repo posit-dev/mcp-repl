@@ -138,6 +138,13 @@ impl ResponseState {
             }
             Err(err) => {
                 eprintln!("worker write stdin error: {err}");
+                if let Some(active) = self.active_timeout_bundle.take()
+                    && let Err(cleanup_err) = self.finish_bundle(active)
+                {
+                    eprintln!(
+                        "dropping closed timeout bundle after output-bundle error: {cleanup_err}"
+                    );
+                }
                 finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
             }
         }
@@ -155,7 +162,7 @@ impl ResponseState {
         let mut active_timeout_bundle = self.active_timeout_bundle.take();
         if !reuse_active_timeout_bundle
             && let Some(active) = active_timeout_bundle.take()
-            && let Err(err) = self.finish_timeout_bundle(active)
+            && let Err(err) = self.finish_bundle(active)
         {
             eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
         }
@@ -200,7 +207,7 @@ impl ResponseState {
                     };
                     if pending_request_after {
                         self.active_timeout_bundle = Some(active);
-                    } else if let Err(err) = self.finish_timeout_bundle(active) {
+                    } else if let Err(err) = self.finish_bundle(active) {
                         eprintln!(
                             "dropping closed timeout bundle after output-bundle error: {err}"
                         );
@@ -209,7 +216,7 @@ impl ResponseState {
                 }
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    if let Err(err) = self.finish_timeout_bundle(active) {
+                    if let Err(err) = self.finish_bundle(active) {
                         eprintln!(
                             "dropping closed timeout bundle after output-bundle error: {err}"
                         );
@@ -231,6 +238,11 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
+                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                                );
+                            }
                             compact_without_output_bundle(&material)
                         }
                     }
@@ -257,6 +269,11 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
+                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                                );
+                            }
                             compact_without_output_bundle(&material)
                         }
                     }
@@ -754,8 +771,12 @@ impl ActiveOutputBundle {
         if self.omission_recorded || !self.has_events_log() {
             return Ok(());
         }
-        let _ = self.append_events_log_text(store, OUTPUT_BUNDLE_OMITTED_NOTICE)?;
-        self.omission_recorded = true;
+        if self
+            .append_events_log_text(store, OUTPUT_BUNDLE_OMITTED_NOTICE)?
+            .is_some()
+        {
+            self.omission_recorded = true;
+        }
         Ok(())
     }
 
@@ -861,7 +882,7 @@ impl ActiveOutputBundle {
 }
 
 impl ResponseState {
-    fn finish_timeout_bundle(&mut self, active: ActiveOutputBundle) -> Result<(), WorkerError> {
+    fn finish_bundle(&mut self, active: ActiveOutputBundle) -> Result<(), WorkerError> {
         if active.was_disclosed() {
             return Ok(());
         }
@@ -1021,6 +1042,9 @@ fn compact_text_bundle_items(
             ReplyItem::ServerText(text) => out.push(Content::text(text)),
             ReplyItem::Image(image) => out.push(image_to_content(&image)),
         }
+    }
+    if !worker_inserted {
+        out.insert(0, Content::text(preview));
     }
     out
 }
@@ -1543,12 +1567,15 @@ fn content_image(data: String, mime_type: String) -> Content {
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
+    use std::fs;
     use std::io;
 
     use rmcp::model::RawContent;
+    use tempfile::Builder;
 
     use super::{OutputStore, ReplyImage, ReplyItem, ResponseState, normalize_error_prompt};
-    use crate::worker_protocol::WorkerContent;
+    use crate::worker_process::WorkerError;
+    use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
 
     fn result_text(result: &rmcp::model::CallToolResult) -> String {
         result
@@ -1563,6 +1590,25 @@ mod tests {
 
     fn fail_output_store_root_creation() -> io::Result<tempfile::TempDir> {
         Err(io::Error::other("simulated tempdir failure"))
+    }
+
+    fn output_store_root_with_text_conflict() -> io::Result<tempfile::TempDir> {
+        let root = Builder::new().prefix("mcp-repl-output-test-").tempdir()?;
+        fs::create_dir_all(root.path().join("output-0001/transcript.txt"))?;
+        Ok(root)
+    }
+
+    fn worker_reply(
+        contents: Vec<WorkerContent>,
+        error_code: Option<WorkerErrorCode>,
+    ) -> WorkerReply {
+        WorkerReply::Output {
+            contents,
+            is_error: false,
+            error_code,
+            prompt: None,
+            prompt_variants: None,
+        }
     }
 
     #[test]
@@ -1645,6 +1691,192 @@ mod tests {
         assert!(
             text.contains("START") && text.contains("END"),
             "expected truncated fallback reply to preserve worker output preview, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn worker_error_clears_active_timeout_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        let bundle_dir = bundle.paths.dir.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Err(WorkerError::Protocol(
+                "simulated worker failure".to_string(),
+            )),
+            false,
+            true,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("simulated worker failure"),
+            "expected worker error text, got: {text:?}"
+        );
+        assert!(
+            state.active_timeout_bundle.is_none(),
+            "expected worker error to clear the active timeout bundle"
+        );
+        assert!(
+            state.output_store.bundles.is_empty(),
+            "expected worker error to drop the hidden timeout bundle"
+        );
+        assert!(
+            !bundle_dir.exists(),
+            "expected dropped timeout bundle directory to be removed: {bundle_dir:?}"
+        );
+    }
+
+    #[test]
+    fn text_spill_append_failure_cleans_up_undisclosed_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.create_root = output_store_root_with_text_conflict;
+
+        let oversized_text = format!(
+            "START{}END",
+            "a".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(oversized_text)],
+                None,
+            )),
+            false,
+            false,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected inline fallback after append failure, got: {text:?}"
+        );
+        assert!(
+            state.output_store.bundles.is_empty(),
+            "expected failed text bundle append to remove the undisclosed bundle"
+        );
+    }
+
+    #[test]
+    fn image_bundle_append_failure_cleans_up_undisclosed_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let contents = (0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD)
+            .map(|index| WorkerContent::ContentImage {
+                data: "!not-base64!".to_string(),
+                mime_type: "image/png".to_string(),
+                id: format!("image-{index}"),
+                is_new: true,
+            })
+            .collect();
+
+        let result = state.finalize_worker_result(Ok(worker_reply(contents, None)), false, false);
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected inline fallback after image bundle append failure, got: {text:?}"
+        );
+        assert!(
+            state.output_store.bundles.is_empty(),
+            "expected failed image bundle append to remove the undisclosed bundle"
+        );
+    }
+
+    #[test]
+    fn omission_recorded_stays_false_when_notice_cannot_be_written() {
+        let mut store = OutputStore::new().expect("output store should initialize");
+        let mut bundle = store.new_bundle().expect("bundle should initialize");
+
+        let worker_text = bundle
+            .append_worker_text(&mut store, "a")
+            .expect("worker text should append");
+        assert!(matches!(worker_text, Some(ReplyItem::WorkerText(text)) if text == "a"));
+
+        let image = ReplyImage {
+            data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        };
+        let retained_image = bundle
+            .append_image(&mut store, &image)
+            .expect("image should append");
+        assert!(matches!(retained_image, Some(ReplyItem::Image(_))));
+        assert!(
+            bundle.has_events_log(),
+            "expected mixed bundle to materialize events.log"
+        );
+
+        let events_before =
+            fs::read_to_string(&bundle.paths.events_log).expect("events log should exist");
+        store.limits.max_bundle_bytes = store
+            .bundle_bytes(bundle.id)
+            .expect("bundle metadata should exist");
+
+        bundle
+            .apply_omission(&mut store)
+            .expect("omission should degrade to inline state");
+
+        let events_after =
+            fs::read_to_string(&bundle.paths.events_log).expect("events log should still exist");
+        assert!(bundle.omitted_tail, "expected omission state to be set");
+        assert!(
+            !bundle.omission_recorded,
+            "did not expect omission row to be marked recorded when quota blocked the write"
+        );
+        assert_eq!(
+            events_after, events_before,
+            "did not expect events.log to change when omission row could not be appended"
+        );
+    }
+
+    #[test]
+    fn timeout_omission_without_worker_text_still_discloses_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("bundle should initialize");
+        let image = ReplyImage {
+            data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        };
+        let retained_image = bundle
+            .append_image(&mut state.output_store, &image)
+            .expect("first image should append");
+        assert!(matches!(retained_image, Some(ReplyItem::Image(_))));
+        state.output_store.limits.max_bundle_bytes = state
+            .output_store
+            .bundle_bytes(bundle.id)
+            .expect("bundle metadata should exist");
+        let images_dir = bundle.paths.images_dir.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::ContentImage {
+                    data: base64::engine::general_purpose::STANDARD.encode([1_u8]),
+                    mime_type: "image/png".to_string(),
+                    id: "image-2".to_string(),
+                    is_new: true,
+                }],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            false,
+            true,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("later content omitted"),
+            "expected omission notice even without worker text, got: {text:?}"
+        );
+        assert!(
+            text.contains(images_dir.to_string_lossy().as_ref()),
+            "expected omission notice to disclose bundle path, got: {text:?}"
         );
     }
 }
