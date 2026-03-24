@@ -766,7 +766,6 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
         }
     };
     let transcript_before = fs::read_to_string(&transcript_path)?;
-
     sleep(Duration::from_millis(260)).await;
     let follow_up = session
         .write_stdin_raw_with("cat('NEW_TURN\\n')", Some(2.0))
@@ -793,7 +792,6 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
         transcript_after.contains(&transcript_before),
         "expected original timeout bundle contents to remain intact"
     );
-
     Ok(())
 }
 

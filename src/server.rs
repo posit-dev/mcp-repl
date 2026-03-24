@@ -18,7 +18,7 @@ mod response;
 mod tests;
 mod timeouts;
 
-use self::response::ResponseState;
+use self::response::{ResponseState, TimeoutBundleReuse};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
@@ -86,7 +86,7 @@ impl SharedServer {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         self.run_state(move |state| {
-            let reuse_active_timeout_bundle = should_reuse_timeout_bundle(&input);
+            let timeout_bundle_reuse = timeout_bundle_reuse(&input);
             let result =
                 state
                     .worker
@@ -95,7 +95,7 @@ impl SharedServer {
             state.response.finalize_worker_result(
                 result,
                 state.worker.pending_request(),
-                reuse_active_timeout_bundle,
+                timeout_bundle_reuse,
                 detached_prefix_item_count,
             )
         })
@@ -257,11 +257,31 @@ impl SharedServer {
     }
 }
 
-fn should_reuse_timeout_bundle(input: &str) -> bool {
-    if matches!(input.chars().next(), Some('\u{3}' | '\u{4}')) {
-        return false;
+fn timeout_bundle_reuse(input: &str) -> TimeoutBundleReuse {
+    if input.is_empty() || input.chars().all(|ch| matches!(ch, '\r' | '\n')) {
+        return TimeoutBundleReuse::FullReply;
     }
-    input.is_empty() || input.chars().all(|ch| matches!(ch, '\r' | '\n'))
+
+    let Some(first) = input.chars().next() else {
+        return TimeoutBundleReuse::FullReply;
+    };
+    let tail = &input[first.len_utf8()..];
+    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
+        rest
+    } else if let Some(rest) = tail.strip_prefix('\n') {
+        rest
+    } else if let Some(rest) = tail.strip_prefix('\r') {
+        rest
+    } else {
+        tail
+    };
+
+    match first {
+        '\u{3}' if tail.is_empty() => TimeoutBundleReuse::FullReply,
+        '\u{3}' => TimeoutBundleReuse::FollowUpInput,
+        '\u{4}' => TimeoutBundleReuse::None,
+        _ => TimeoutBundleReuse::FollowUpInput,
+    }
 }
 
 fn server_info() -> ServerInfo {
@@ -382,7 +402,7 @@ macro_rules! define_backend_tool_server {
                         state.response.finalize_worker_result(
                             result,
                             state.worker.pending_request(),
-                            false,
+                            TimeoutBundleReuse::None,
                             0,
                         )
                     })
