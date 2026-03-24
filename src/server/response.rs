@@ -317,6 +317,7 @@ impl ResponseState {
                                     &material.reply_inline_items,
                                     &material.reply_worker_text,
                                     false,
+                                    Some(active.id),
                                 ));
                                 contents
                             } else if text_should_spill(material.reply_worker_text.chars().count())
@@ -329,6 +330,7 @@ impl ResponseState {
                                     &material.reply_inline_items,
                                     &material.reply_worker_text,
                                     true,
+                                    Some(active.id),
                                 ));
                                 contents
                             } else {
@@ -495,7 +497,14 @@ impl OutputStore {
     }
 
     fn new_bundle(&mut self) -> Result<ActiveOutputBundle, WorkerError> {
-        self.prune_for_new_bundle(0)?;
+        self.new_bundle_preserving(None)
+    }
+
+    fn new_bundle_preserving(
+        &mut self,
+        protected_bundle_id: Option<u64>,
+    ) -> Result<ActiveOutputBundle, WorkerError> {
+        self.prune_for_new_bundle(0, protected_bundle_id)?;
         self.next_id = self.next_id.saturating_add(1);
         let bundle_id = self.next_id;
         let root_path = self.ensure_root_path()?.to_path_buf();
@@ -630,15 +639,19 @@ impl OutputStore {
         self.total_bytes = self.total_bytes.saturating_sub(bytes);
     }
 
-    fn prune_for_new_bundle(&mut self, initial_bytes: u64) -> Result<(), WorkerError> {
+    fn prune_for_new_bundle(
+        &mut self,
+        initial_bytes: u64,
+        protected_bundle_id: Option<u64>,
+    ) -> Result<(), WorkerError> {
         while self.bundles.len() >= self.limits.max_bundle_count {
-            if !self.prune_oldest_inactive_bundle(None)? {
+            if !self.prune_oldest_inactive_bundle(protected_bundle_id)? {
                 return Err(WorkerError::Protocol(
                     "output bundle count quota left no room for a new bundle".to_string(),
                 ));
             }
         }
-        self.prune_until_total_capacity(0, initial_bytes)?;
+        self.prune_until_total_capacity(protected_bundle_id.unwrap_or(0), initial_bytes)?;
         if self.total_bytes.saturating_add(initial_bytes) > self.limits.max_total_bytes {
             return Err(WorkerError::Protocol(
                 "output bundle total quota is too small for a new bundle".to_string(),
@@ -1397,8 +1410,9 @@ fn compact_reply_items_with_new_bundle(
     reply_inline_items: &[ReplyItem],
     reply_worker_text: &str,
     text_only: bool,
+    protected_bundle_id: Option<u64>,
 ) -> Vec<Content> {
-    match output_store.new_bundle() {
+    match output_store.new_bundle_preserving(protected_bundle_id) {
         Ok(mut bundle) => match bundle.append_items(output_store, reply_bundle_items) {
             Ok(append) => {
                 if text_only {
@@ -2165,6 +2179,58 @@ mod tests {
         assert!(
             !follow_up_transcript.contains("TAIL\n"),
             "did not expect the detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
+        );
+    }
+
+    #[test]
+    fn follow_up_bundle_does_not_prune_disclosed_timeout_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .expect("existing timeout text should append");
+        bundle.disclosed = true;
+        let timeout_transcript_path = bundle.paths.transcript.clone();
+        state.output_store.limits.max_bundle_count = 1;
+        state.active_timeout_bundle = Some(bundle);
+
+        let large_follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "z".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("TAIL\n"),
+                    WorkerContent::worker_stdout(large_follow_up),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let timeout_transcript =
+            fs::read_to_string(&timeout_transcript_path).unwrap_or_else(|err| {
+                panic!("expected timeout transcript to survive quota fallback: {err}")
+            });
+
+        assert!(
+            timeout_transcript.contains("HEAD\nTAIL\n"),
+            "expected timeout transcript to remain readable after follow-up compaction fallback, got: {timeout_transcript:?}"
+        );
+        assert!(
+            !timeout_transcript.contains("FOLLOW_UP_START"),
+            "did not expect fresh follow-up output in the preserved timeout transcript: {timeout_transcript:?}"
+        );
+        assert!(
+            disclosed_path(&text, "transcript.txt").is_none(),
+            "did not expect a fresh follow-up bundle path when the active timeout bundle is the only quota slot: {text:?}"
         );
     }
 
