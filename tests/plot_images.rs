@@ -1583,8 +1583,8 @@ lines(3:8, 3:8)
     );
     assert_eq!(
         images[0].bytes,
-        fs::read(bundle_dir.join("images/001.png"))?,
-        "expected inline image to match final top-level alias"
+        fs::read(bundle_dir.join("images/history/001/001.png"))?,
+        "expected inline image to match the first history entry"
     );
     assert_eq!(
         fs::read(bundle_dir.join("images/001.png"))?,

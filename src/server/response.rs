@@ -124,9 +124,21 @@ impl ResponseState {
         })
     }
 
+    pub(crate) fn clear_active_timeout_bundle(&mut self) -> Result<(), WorkerError> {
+        if let Some(active) = self.active_timeout_bundle.take() {
+            self.finish_bundle(active)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn shutdown(&mut self) -> Result<(), WorkerError> {
         self.active_timeout_bundle = None;
         self.output_store.cleanup_now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_timeout_bundle(&self) -> bool {
+        self.active_timeout_bundle.is_some()
     }
 
     /// Converts a worker result into the final MCP reply, including transcript updates and
@@ -147,9 +159,7 @@ impl ResponseState {
             ),
             Err(err) => {
                 eprintln!("worker write stdin error: {err}");
-                if let Some(active) = self.active_timeout_bundle.take()
-                    && let Err(cleanup_err) = self.finish_bundle(active)
-                {
+                if let Err(cleanup_err) = self.clear_active_timeout_bundle() {
                     eprintln!(
                         "dropping closed timeout bundle after output-bundle error: {cleanup_err}"
                     );
@@ -551,11 +561,16 @@ impl OutputStore {
     }
 
     fn remove_bundle_at(&mut self, index: usize) -> Result<(), WorkerError> {
+        let bundle = self.bundles.get(index).expect("bundle index should exist");
+        match fs::remove_dir_all(&bundle.dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(WorkerError::Io(err)),
+        }
         let bundle = self
             .bundles
             .remove(index)
-            .expect("bundle index should exist");
-        fs::remove_dir_all(&bundle.dir).map_err(WorkerError::Io)?;
+            .expect("bundle index should still exist");
         self.total_bytes = self.total_bytes.saturating_sub(bundle.bytes_on_disk);
         Ok(())
     }
@@ -1152,7 +1167,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
     let mut out = Vec::new();
     let first_anchor = (bundle.next_image_number > 0)
-        .then(|| load_output_bundle_image_content(bundle, 1))
+        .then(|| load_output_bundle_history_image_content(bundle, 1, 1))
         .flatten();
     let last_anchor = (bundle.next_image_number > 1)
         .then(|| load_output_bundle_image_content(bundle, bundle.next_image_number))
@@ -1499,7 +1514,26 @@ fn mime_type_from_path(path: &Path) -> String {
 
 fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -> Option<Content> {
     let path = bundle.image_path(index);
-    let bytes = match fs::read(&path) {
+    load_output_bundle_image_content_at_path(&path)
+}
+
+fn load_output_bundle_history_image_content(
+    bundle: &ActiveOutputBundle,
+    image_index: usize,
+    history_index: usize,
+) -> Option<Content> {
+    let stem = format!("images/history/{image_index:03}/{history_index:03}");
+    for extension in ["png", "jpg", "jpeg", "gif", "webp", "svg"] {
+        let path = bundle.paths.dir.join(format!("{stem}.{extension}"));
+        if path.exists() {
+            return load_output_bundle_image_content_at_path(&path);
+        }
+    }
+    load_output_bundle_image_content(bundle, image_index)
+}
+
+fn load_output_bundle_image_content_at_path(path: &Path) -> Option<Content> {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!(
@@ -1509,7 +1543,7 @@ fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -
             return None;
         }
     };
-    let mime_type = mime_type_from_path(&path);
+    let mime_type = mime_type_from_path(path);
     let data = STANDARD.encode(bytes);
     Some(content_image(data, mime_type))
 }
@@ -1707,7 +1741,10 @@ mod tests {
     use rmcp::model::RawContent;
     use tempfile::Builder;
 
-    use super::{OutputStore, ReplyImage, ReplyItem, ResponseState, normalize_error_prompt};
+    use super::{
+        OutputStore, ReplyImage, ReplyItem, ResponseState, compact_output_bundle_items,
+        normalize_error_prompt,
+    };
     use crate::worker_process::WorkerError;
     use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
 
@@ -1717,6 +1754,19 @@ mod tests {
             .iter()
             .filter_map(|item| match &item.raw {
                 RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn result_images(result: &rmcp::model::CallToolResult) -> Vec<Vec<u8>> {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match &item.raw {
+                RawContent::Image(image) => base64::engine::general_purpose::STANDARD
+                    .decode(image.data.as_bytes())
+                    .ok(),
                 _ => None,
             })
             .collect()
@@ -1887,6 +1937,10 @@ mod tests {
             .expect("timeout bundle should initialize");
         let bundle_dir = bundle.paths.dir.clone();
         state.active_timeout_bundle = Some(bundle);
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected test setup to install an active timeout bundle"
+        );
 
         let result = state.finalize_worker_result(
             Err(WorkerError::Protocol(
@@ -1969,6 +2023,73 @@ mod tests {
         assert!(
             state.output_store.bundles.is_empty(),
             "expected failed image bundle append to remove the undisclosed bundle"
+        );
+    }
+
+    #[test]
+    fn removing_missing_bundle_dir_still_releases_quota() {
+        let mut store = OutputStore::new().expect("output store should initialize");
+        let mut bundle = store.new_bundle().expect("bundle should initialize");
+        bundle
+            .append_worker_text(&mut store, "quota")
+            .expect("worker text should append");
+        let bundle_id = bundle.id;
+        let bundle_dir = bundle.paths.dir.clone();
+        let bytes_before = store
+            .bundle_bytes(bundle_id)
+            .expect("bundle metadata should exist before removal");
+        assert!(bytes_before > 0, "expected test bundle to consume quota");
+
+        fs::remove_dir_all(&bundle_dir).expect("bundle dir should be removable");
+        store
+            .remove_bundle(bundle_id)
+            .expect("missing bundle dir should still clean up metadata");
+
+        assert_eq!(
+            store.total_bytes, 0,
+            "expected quota accounting to be released"
+        );
+        assert!(
+            store.bundle_bytes(bundle_id).is_none(),
+            "expected bundle metadata to be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn single_image_update_bundle_uses_first_history_frame_as_inline_anchor() {
+        let mut store = OutputStore::new().expect("output store should initialize");
+        let mut bundle = store.new_bundle().expect("bundle should initialize");
+        let first_bytes = vec![0_u8];
+        let last_bytes = vec![1_u8];
+        let first = ReplyImage {
+            data: base64::engine::general_purpose::STANDARD.encode(&first_bytes),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        };
+        let last = ReplyImage {
+            data: base64::engine::general_purpose::STANDARD.encode(&last_bytes),
+            mime_type: "image/png".to_string(),
+            is_new: false,
+        };
+        let retained_first = bundle
+            .append_image(&mut store, &first)
+            .expect("first image should append")
+            .expect("first image should be retained");
+        let retained_last = bundle
+            .append_image(&mut store, &last)
+            .expect("updated image should append")
+            .expect("updated image should be retained");
+
+        let result = super::finalize_batch(
+            compact_output_bundle_items(&[retained_first, retained_last], &bundle),
+            false,
+        );
+        let images = result_images(&result);
+
+        assert_eq!(images.len(), 1, "expected exactly one inline anchor image");
+        assert_eq!(
+            images[0], first_bytes,
+            "expected inline anchor to use the first history frame"
         );
     }
 

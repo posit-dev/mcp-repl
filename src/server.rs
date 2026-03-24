@@ -135,9 +135,15 @@ impl SharedServer {
 
         let outcome = self
             .run_state(move |state| {
-                state
+                let outcome = state
                     .worker
-                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT);
+                if matches!(outcome, Ok(true))
+                    && let Err(err) = state.response.clear_active_timeout_bundle()
+                {
+                    return Err(err);
+                }
+                outcome
             })
             .await?;
         match outcome {
@@ -206,9 +212,15 @@ impl SharedServer {
 
         match self
             .run_state(move |state| {
-                state
+                let outcome = state
                     .worker
-                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT);
+                if matches!(outcome, Ok(true))
+                    && let Err(err) = state.response.clear_active_timeout_bundle()
+                {
+                    return Err(err);
+                }
+                outcome
             })
             .await
         {
