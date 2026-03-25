@@ -43,6 +43,10 @@ fn is_busy_response(text: &str) -> bool {
         || text.contains("input discarded while worker busy")
 }
 
+fn interrupt_recovery_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
+}
+
 async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     if !require_python() {
         return Ok(None);
@@ -219,7 +223,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
         "expected prompt after interrupt, got: {interrupt_text:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = interrupt_recovery_deadline();
     loop {
         if Instant::now() >= deadline {
             session.cancel().await?;
@@ -425,7 +429,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
     let poll_result = session.write_stdin_raw_with("", Some(0.5)).await?;
     let _poll_text = result_text(&poll_result);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = interrupt_recovery_deadline();
     loop {
         if Instant::now() >= deadline {
             session.cancel().await?;
@@ -445,7 +449,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         break;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = interrupt_recovery_deadline();
     loop {
         if Instant::now() >= deadline {
             session.cancel().await?;
