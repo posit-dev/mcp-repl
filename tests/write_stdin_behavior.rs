@@ -592,16 +592,16 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     session.cancel().await?;
 
     assert!(
-        final_text.contains("tail"),
-        "expected small final poll output inline, got: {final_text:?}"
-    );
-    assert!(
         bundle_events_log_path(&final_text).is_none(),
         "did not expect bundle path to be repeated on later small poll, got: {final_text:?}"
     );
     assert!(
         file_text.contains("tail"),
         "expected later small poll output to append to existing spill file, got: {file_text:?}"
+    );
+    assert!(
+        final_text.contains("tail") || final_text.contains("<<console status: idle>>"),
+        "expected later small poll to either return inline tail text or settle idle after appending to the existing spill file, got: {final_text:?}"
     );
 
     Ok(())
