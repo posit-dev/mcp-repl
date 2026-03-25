@@ -3,6 +3,7 @@
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::sync::{Mutex, OnceLock};
+use tokio::time::{Duration, Instant, sleep};
 
 mod common;
 
@@ -33,6 +34,32 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+async fn wait_until_not_busy(
+    session: &mut common::McpTestSession,
+    initial: rmcp::model::CallToolResult,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<console status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(250)).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<console status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn r_show_doc_prints_manual_html_in_console() -> TestResult<()> {
     let _guard = test_mutex()
@@ -46,6 +73,7 @@ async fn r_show_doc_prints_manual_html_in_console() -> TestResult<()> {
             Some(60.0),
         )
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_manuals backend unavailable in this environment; skipping");
@@ -81,6 +109,7 @@ async fn r_show_doc_accepts_text_type_alias() -> TestResult<()> {
             Some(60.0),
         )
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_manuals backend unavailable in this environment; skipping");
@@ -112,6 +141,7 @@ async fn browseurl_supports_html_fragments_for_r_manuals() -> TestResult<()> {
             Some(60.0),
         )
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_manuals backend unavailable in this environment; skipping");
@@ -144,6 +174,7 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with("RShowDoc(\"R-exts\"); invisible(NULL)", Some(60.0))
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_manuals backend unavailable in this environment; skipping");
@@ -173,6 +204,7 @@ async fn r_show_doc_search_returns_compact_card() -> TestResult<()> {
     let setup = session
         .write_stdin_raw_with("RShowDoc(\"R-exts\"); invisible(NULL)", Some(60.0))
         .await?;
+    let setup = wait_until_not_busy(&mut session, setup).await?;
     let setup_text = result_text(&setup);
     if backend_unavailable(&setup_text) {
         eprintln!("r_manuals backend unavailable in this environment; skipping");
