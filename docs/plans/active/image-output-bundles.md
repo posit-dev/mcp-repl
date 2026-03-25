@@ -4,7 +4,7 @@
 
 - Add a server-owned output bundle for oversized mixed text/image replies.
 - Keep `transcript.txt` as worker-originated REPL text only.
-- Add `events.log` as the ordered index over the full normalized reply stream.
+- Add `events.log` as the ordered index over the retained mixed worker-text/image bundle contents.
 - Keep the visible reply bounded with one truncation notice and the first/last image inline.
 
 ## Current Decisions
@@ -14,7 +14,7 @@
   - `events.log`
   - `images/001.png`, `002.png`, ...
   - `images/history/001/001.png`, `001/002.png`, ...
-- `events.log` covers the full normalized stream, not just the omitted middle.
+- `events.log` covers the full retained mixed worker-text/image stream within the bundle, not just the omitted middle.
 - `T` rows include both line and byte ranges into `transcript.txt`.
 - `I` rows include only the relative history image path.
 - Output bundle compaction uses one merged pass over normalized reply items.

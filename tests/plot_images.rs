@@ -1315,9 +1315,17 @@ for (i in 1:6) {
         "expected transcript.txt to include later text, got: {transcript:?}"
     );
     assert!(
+        !transcript.contains("<<console status: busy"),
+        "did not expect timeout marker in transcript.txt, got: {transcript:?}"
+    );
+    assert!(
         events.contains("I images/history/001/001.png")
             && events.contains("I images/history/006/001.png"),
         "expected events.log to cover the full image set, got: {events:?}"
+    );
+    assert!(
+        !events.contains("<<console status: busy"),
+        "did not expect timeout marker in events.log, got: {events:?}"
     );
 
     session.cancel().await?;
