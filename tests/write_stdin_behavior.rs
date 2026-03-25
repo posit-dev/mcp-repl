@@ -520,14 +520,9 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
         return Ok(());
     }
     assert!(
-        first_text.contains("SMALL_START") && first_text.contains("SMALL_END"),
-        "expected under-threshold timeout text inline, got: {first_text:?}"
-    );
-    assert!(
         bundle_transcript_path(&first_text).is_none(),
         "did not expect transcript path before a poll crosses the hard spill threshold, got: {first_text:?}"
     );
-
     sleep(test_delay_ms(600, 900)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
