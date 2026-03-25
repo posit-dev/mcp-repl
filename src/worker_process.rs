@@ -324,6 +324,8 @@ const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
+    #[cfg(feature = "pager")]
+    let mut echo_event_count = ipc.pending_echo_event_count();
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -331,12 +333,27 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
-        let changed = next_prompt.is_some() || !next_prompt_variants.is_empty();
+        #[cfg(feature = "pager")]
+        let next_echo_event_count = ipc.pending_echo_event_count();
+        let changed = next_prompt.is_some() || !next_prompt_variants.is_empty() || {
+            #[cfg(feature = "pager")]
+            {
+                next_echo_event_count != echo_event_count
+            }
+            #[cfg(not(feature = "pager"))]
+            {
+                false
+            }
+        };
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
+        #[cfg(feature = "pager")]
+        {
+            echo_event_count = next_echo_event_count;
+        }
 
         if changed {
             stable_for = Duration::from_millis(0);
@@ -583,6 +600,24 @@ impl WorkerManager {
         self.last_detached_prefix_item_count
     }
 
+    fn reset_preserving_detached_prefix_item_count(&mut self) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset();
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
+    #[cfg(feature = "pager")]
+    fn reset_with_pager_preserving_detached_prefix_item_count(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_with_pager(preserve_pager);
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
     /// Entry point for the public `repl` tool.
     /// This handles control prefixes, timeout-follow-up polling, and busy rejection before new input is sent.
     #[cfg(not(feature = "pager"))]
@@ -626,7 +661,7 @@ impl WorkerManager {
             let input_context = self.prepare_input_context();
             let err = WorkerError::Guardrail(event.message);
             let reply = self.build_reply_from_worker_error(&err, input_context);
-            let _ = self.reset();
+            let _ = self.reset_preserving_detached_prefix_item_count();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -683,7 +718,7 @@ impl WorkerManager {
             Err(err) => {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 let reply = self.build_reply_from_worker_error(&err, input_context);
-                let _ = self.reset();
+                let _ = self.reset_preserving_detached_prefix_item_count();
                 return Ok(self.finalize_reply(reply));
             }
         };
@@ -735,7 +770,7 @@ impl WorkerManager {
             let err = WorkerError::Guardrail(event.message);
             let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
             let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager(preserve_pager);
+            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -809,7 +844,7 @@ impl WorkerManager {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
                 let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 return Ok(self.finalize_reply(reply));
             }
         };
@@ -1297,7 +1332,7 @@ impl WorkerManager {
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error(&err, context);
-                let _ = self.reset();
+                let _ = self.reset_preserving_detached_prefix_item_count();
                 Ok(reply)
             }
         }
@@ -1445,7 +1480,7 @@ impl WorkerManager {
             Err(err) => {
                 let reply = self.build_reply_from_worker_error(&err, context, page_bytes);
                 let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 Ok(reply)
             }
         }
@@ -4474,6 +4509,81 @@ mod tests {
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected completion after request-end");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
+    }
+
+    #[cfg(feature = "pager")]
+    #[test]
+    fn completion_settle_waits_for_late_echo_events() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+\n1", &server);
+        let prompt = "> ".to_string();
+        let delayed_worker = worker.clone();
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let late_sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "1+\n".to_string(),
+            });
+            thread::sleep(Duration::from_millis(11));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "+ ".to_string(),
+                line: "1\n".to_string(),
+            });
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        late_sender.join().expect("late sender should join");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 2);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "1+\n");
+        assert_eq!(completion.echo_events[1].prompt, "+ ");
+        assert_eq!(completion.echo_events[1].line, "1\n");
+    }
+
+    #[test]
+    fn send_worker_request_error_preserves_detached_prefix_count() {
+        let mut manager =
+            WorkerManager::new(Backend::R, SandboxCliPlan::default()).expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"detached output\n");
+
+        let reply = manager
+            .write_stdin(
+                "1+1".to_string(),
+                Duration::from_millis(50),
+                Duration::ZERO,
+                None,
+                false,
+            )
+            .expect("reply");
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert_eq!(
+            manager.detached_prefix_item_count(),
+            1,
+            "detached-prefix metadata must survive reset until server-side finalization"
+        );
+        let WorkerReply::Output { contents, .. } = reply;
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, .. } if text.contains("detached output")
+            )),
+            "expected detached output to remain in the reply"
+        );
     }
 
     #[test]

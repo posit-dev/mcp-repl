@@ -376,6 +376,12 @@ impl ServerIpcConnection {
         guard.echo_events.drain(..).collect()
     }
 
+    #[cfg(feature = "pager")]
+    pub fn pending_echo_event_count(&self) -> usize {
+        let guard = self.inbox.lock().unwrap();
+        guard.echo_events.len()
+    }
+
     pub fn wait_for_request_end(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
