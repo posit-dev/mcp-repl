@@ -146,8 +146,12 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
-        !guard.events.is_empty()
-            || tail_has_flushable_bytes(&guard.stdout_tail)
+        guard.events.iter().any(|event| {
+            matches!(
+                event,
+                PendingOutputEvent::TextFragment { .. } | PendingOutputEvent::Image { .. }
+            )
+        }) || tail_has_flushable_bytes(&guard.stdout_tail)
             || tail_has_flushable_bytes(&guard.stderr_tail)
     }
 

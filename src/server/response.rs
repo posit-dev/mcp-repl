@@ -1194,7 +1194,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
 
     let inline_items = collapse_image_updates(bundle_items.clone());
     let reply_inline_items = collapse_image_updates(reply_bundle_items.clone());
-    let bundle_image_count = count_images(&bundle_items);
+    let bundle_image_count = count_images(&inline_items);
 
     ReplyMaterial {
         inline_items,
@@ -1450,7 +1450,7 @@ fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
 }
 
 fn compact_reply_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
-    let reply_image_count = count_images(&material.reply_bundle_items);
+    let reply_image_count = count_images(&material.reply_inline_items);
     if reply_image_count > 0
         && should_use_output_bundle(
             reply_image_count,
@@ -1472,7 +1472,7 @@ fn render_reply_items(
     reply_worker_text: &str,
     protected_bundle_id: Option<u64>,
 ) -> Vec<Content> {
-    let reply_image_count = count_images(reply_bundle_items);
+    let reply_image_count = count_images(reply_inline_items);
     if reply_image_count > 0
         && should_use_output_bundle(reply_image_count, reply_worker_text.chars().count())
     {
@@ -1549,7 +1549,7 @@ fn should_spill_detached_prefix_only(material: &ReplyMaterial) -> bool {
         && count_images(&material.detached_prefix_items) == 0
         && text_should_spill(material.detached_prefix_worker_text.chars().count())
         && !should_use_output_bundle(
-            count_images(&material.reply_bundle_items),
+            count_images(&material.reply_inline_items),
             material.reply_worker_text.chars().count(),
         )
 }

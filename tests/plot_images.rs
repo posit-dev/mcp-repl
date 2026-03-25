@@ -1615,3 +1615,77 @@ lines(3:8, 3:8)
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_reply_plot_updates_stay_inline_and_show_final_state() -> TestResult<()> {
+    let mut batch_session = spawn_server().await?;
+    let mut control_session = spawn_server().await?;
+
+    let steps = [
+        "plot(1:10)",
+        "lines(2:9, 2:9)",
+        "lines(3:8, 3:8)",
+        "lines(4:7, 4:7)",
+        "lines(5:6, 5:6)",
+        "lines(c(1, 10), c(10, 1))",
+    ];
+    let batch_input = steps.join("\n");
+    let batch = batch_session
+        .write_stdin_raw_with(&batch_input, Some(60.0))
+        .await?;
+    if any_backend_unavailable(&[&batch]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        batch_session.cancel().await?;
+        control_session.cancel().await?;
+        return Ok(());
+    }
+
+    let batch_text = result_text(&batch);
+    let batch_images = extract_images(&batch);
+    assert_eq!(
+        batch_images.len(),
+        1,
+        "expected one inline image for same-reply updates, got: {batch_text:?}"
+    );
+    assert!(
+        events_log_path(&batch_text).is_none(),
+        "did not expect output bundle for collapsed same-reply updates, got: {batch_text:?}"
+    );
+
+    let mut control = None;
+    for step in steps {
+        let result = control_session
+            .write_stdin_raw_with(step, Some(60.0))
+            .await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("plot_images backend unavailable in this environment; skipping");
+            batch_session.cancel().await?;
+            control_session.cancel().await?;
+            return Ok(());
+        }
+        control = Some(result);
+    }
+
+    let control = control.expect("control sequence should produce a final image");
+    let control_images = extract_images(&control);
+
+    batch_session.cancel().await?;
+    control_session.cancel().await?;
+
+    assert_eq!(
+        control_images.len(),
+        1,
+        "expected control sequence to end with one inline image"
+    );
+    assert_eq!(
+        batch_images[0].mime_type, control_images[0].mime_type,
+        "expected same mime type for batch and control plot replies"
+    );
+    assert_eq!(
+        batch_images[0].bytes, control_images[0].bytes,
+        "expected same-reply updates to expose the final plot state inline"
+    );
+
+    Ok(())
+}
