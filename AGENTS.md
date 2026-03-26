@@ -7,9 +7,10 @@ Keep this file short. It is a table of contents, not the full manual.
 - If you modified code, run all required checks before replying:
   - `cargo check`
   - `cargo build`
-  - `cargo clippy`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
   - `cargo test`
   - `cargo +nightly fmt`
+- Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 
 ## Start Here

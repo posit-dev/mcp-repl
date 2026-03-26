@@ -1238,8 +1238,9 @@ for (i in 1:5) {
     let mut visible_lines = 0;
     let mut has_partial_line = false;
     for row in rows {
-        let text = std::str::from_utf8(&transcript.as_bytes()[row.start_byte..row.end_byte])
-            .unwrap_or_else(|err| panic!("expected text row bytes to decode as UTF-8: {err}"));
+        let text = transcript
+            .get(row.start_byte..row.end_byte)
+            .unwrap_or_else(|| panic!("expected valid UTF-8 row slice for {row:?}"));
         let (expected_start, expected_end, next_partial) =
             advance_visible_lines(text, visible_lines, has_partial_line);
         assert_eq!(

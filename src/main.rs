@@ -672,8 +672,10 @@ mod tests {
     #[test]
     fn empty_plan_uses_inherited_state_when_available() {
         let plan = SandboxCliPlan::default();
-        let mut inherited = SandboxState::default();
-        inherited.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let inherited = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
             .expect("effective sandbox state");
         assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);

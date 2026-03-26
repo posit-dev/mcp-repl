@@ -2295,8 +2295,10 @@ mod tests {
 
     #[test]
     fn prepare_worker_command_sets_allow_local_binding_one_when_enabled() {
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         state.managed_network_policy.allow_local_binding = true;
 
         let prepared =
@@ -2314,8 +2316,10 @@ mod tests {
 
     #[test]
     fn prepare_worker_command_sets_allow_local_binding_zero_when_explicitly_disabled() {
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         state.managed_network_policy.allow_local_binding = false;
 
         let prepared =
@@ -2333,8 +2337,10 @@ mod tests {
 
     #[test]
     fn prepare_worker_command_clears_managed_domain_env_when_lists_are_empty() {
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         state.managed_network_policy.allowed_domains = Vec::new();
         state.managed_network_policy.denied_domains = Vec::new();
 
