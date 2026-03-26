@@ -38,7 +38,7 @@
 
 ## Phase Status
 
-- Phase 0: completed. Default-path pager behavior was mostly removed, simplified, and isolated behind a feature flag. `PendingOutputTape` became the main default collector.
+- Phase 0: completed. Default-path pager behavior was mostly removed, simplified, and isolated behind a separate legacy mode. `PendingOutputTape` became the main default collector.
 - Phase 1: completed. Multiple design rounds narrowed the space: no modal pager, no default read tool, no live reader-thread formatting, and no worker-owned transcript files.
 - Phase 2: completed. Lock the public text format, timeout follow-up behavior, worker-only file contents, and detached-idle behavior for text-only v1.
 - Phase 3: active. Implement server-owned worker transcript storage, hidden-on-timeout file creation, and the seal-time formatter as the first bounded implementation step.
@@ -184,7 +184,7 @@ Behavior:
 
 ## Decision Log
 
-- 2026-03-21: Ignore the pager for the new design. Treat it as feature-gated legacy behavior that will go away.
+- 2026-03-21: Ignore the pager for the new design. Treat it as legacy behavior outside the default `files` mode.
 - 2026-03-21: Prefer full omitted-output retrieval over permanent middle-drop, but do it through visible file paths rather than a default read tool.
 - 2026-03-21: Default retrieval path is “show the file path in normal reply text.” A dedicated read tool, if ever needed, is future work and should be opt-in.
 - 2026-03-21: Polling is the primary workflow. Agents are expected to keep polling with bounded replies and use filesystem tools only when the preview is not enough.

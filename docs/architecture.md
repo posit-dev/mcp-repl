@@ -31,7 +31,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 - `src/pending_output_tape.rs` and `src/output_stream.rs` stage worker text and images until reply sealing.
 - `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates oversized-output bundle directories with lazily materialized `transcript.txt`, `events.log`, and `images/`, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
-- `src/pager/` remains feature-gated support code for pager-enabled builds; it is not the default reply path described in the tool docs.
+- `src/pager/` remains legacy support code for `--oversized-output pager`; it is not the default reply path described in the tool docs.
 - `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.
 
 ### Validation harnesses

@@ -1,5 +1,3 @@
-#![cfg(feature = "pager")]
-
 mod common;
 
 use common::TestResult;

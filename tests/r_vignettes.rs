@@ -38,7 +38,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_vignettes test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(4_000).await?;
+    let mut session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -77,7 +77,7 @@ async fn browse_vignettes_prints_text_listing() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_vignettes test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(20_000).await?;
+    let mut session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_with(

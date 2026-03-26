@@ -72,6 +72,7 @@
   vt100 = "0.16.2"
 
 [features]
+  default         = ["pager"]
   echo-heuristics = []
   pager           = []
 

@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_show_returns_full_output_without_pager() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(4_000).await?;
+    let mut session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_with(

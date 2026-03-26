@@ -1,5 +1,4 @@
 #![allow(clippy::await_holding_lock)]
-#![cfg(feature = "pager")]
 
 mod common;
 

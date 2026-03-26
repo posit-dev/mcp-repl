@@ -31,6 +31,7 @@ use crate::output_capture::{
     OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
+use crate::oversized_output::OversizedOutputMode;
 #[cfg(feature = "pager")]
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
@@ -324,7 +325,6 @@ const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
-    #[cfg(feature = "pager")]
     let mut echo_event_count = ipc.pending_echo_event_count();
 
     let start = std::time::Instant::now();
@@ -333,27 +333,16 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
-        #[cfg(feature = "pager")]
         let next_echo_event_count = ipc.pending_echo_event_count();
-        let changed = next_prompt.is_some() || !next_prompt_variants.is_empty() || {
-            #[cfg(feature = "pager")]
-            {
-                next_echo_event_count != echo_event_count
-            }
-            #[cfg(not(feature = "pager"))]
-            {
-                false
-            }
-        };
+        let changed = next_prompt.is_some()
+            || !next_prompt_variants.is_empty()
+            || next_echo_event_count != echo_event_count;
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
-        #[cfg(feature = "pager")]
-        {
-            echo_event_count = next_echo_event_count;
-        }
+        echo_event_count = next_echo_event_count;
 
         if changed {
             stable_for = Duration::from_millis(0);
@@ -385,17 +374,13 @@ impl From<std::io::Error> for WorkerError {
 struct InputContext {
     prefix_contents: Vec<WorkerContent>,
     prefix_is_error: bool,
-    #[cfg(feature = "pager")]
     start_offset: u64,
-    #[cfg(feature = "pager")]
     prefix_bytes: u64,
-    #[cfg(feature = "pager")]
     input_echo: Option<String>,
 }
 
 struct ReplyWithOffset {
     reply: WorkerReply,
-    #[cfg_attr(not(feature = "pager"), allow(dead_code))]
     end_offset: u64,
 }
 
@@ -404,7 +389,6 @@ struct RequestState {
     started_at: std::time::Instant,
 }
 
-#[cfg(feature = "pager")]
 struct SnapshotWithImages {
     contents: Vec<WorkerContent>,
     pages_left: u64,
@@ -412,7 +396,6 @@ struct SnapshotWithImages {
     last_range: Option<(u64, u64)>,
 }
 
-#[cfg(feature = "pager")]
 struct CompletionSnapshot {
     snapshot: SnapshotWithImages,
     saw_stderr: bool,
@@ -421,7 +404,6 @@ struct CompletionSnapshot {
 struct CompletionInfo {
     prompt: Option<String>,
     prompt_variants: Option<Vec<String>>,
-    #[cfg(feature = "pager")]
     echo_events: Vec<IpcEchoEvent>,
     session_end_seen: bool,
 }
@@ -486,6 +468,7 @@ pub struct WorkerManager {
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
+    oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
     #[cfg(feature = "pager")]
     output: OutputBuffer,
@@ -507,7 +490,11 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    pub fn new(
+        backend: Backend,
+        sandbox_plan: SandboxCliPlan,
+        oversized_output: OversizedOutputMode,
+    ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let mut inherited_state = sandbox_defaults.clone();
@@ -557,6 +544,7 @@ impl WorkerManager {
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,
+            oversized_output,
             pending_output_tape: PendingOutputTape::new(),
             #[cfg(feature = "pager")]
             output: OutputBuffer::default(),
@@ -618,16 +606,46 @@ impl WorkerManager {
         result
     }
 
-    /// Entry point for the public `repl` tool.
-    /// This handles control prefixes, timeout-follow-up polling, and busy rejection before new input is sent.
-    #[cfg(not(feature = "pager"))]
     pub fn write_stdin(
         &mut self,
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        _page_bytes_override: Option<u64>,
-        _echo_input: bool,
+        page_bytes_override: Option<u64>,
+        echo_input: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.write_stdin_files(text, worker_timeout, server_timeout)
+            }
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.write_stdin_pager(
+                        text,
+                        worker_timeout,
+                        server_timeout,
+                        page_bytes_override,
+                        echo_input,
+                    )
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    let _ = (page_bytes_override, echo_input);
+                    Err(WorkerError::Protocol(
+                        "pager mode is unavailable in this build".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Entry point for the public `repl` tool in default files mode.
+    fn write_stdin_files(
+        &mut self,
+        text: String,
+        worker_timeout: Duration,
+        server_timeout: Duration,
     ) -> Result<WorkerReply, WorkerError> {
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
@@ -639,13 +657,7 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
-            return self.write_stdin(
-                remaining.to_string(),
-                worker_timeout,
-                server_timeout,
-                None,
-                false,
-            );
+            return self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout);
         }
 
         if self.guardrail_busy_event_pending() {
@@ -658,9 +670,9 @@ impl WorkerManager {
                 .take()
                 .expect("guardrail event should be present");
             self.guardrail.busy.store(false, Ordering::Relaxed);
-            let input_context = self.prepare_input_context();
+            let input_context = self.prepare_input_context_files();
             let err = WorkerError::Guardrail(event.message);
-            let reply = self.build_reply_from_worker_error(&err, input_context);
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let _ = self.reset_preserving_detached_prefix_item_count();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
@@ -668,8 +680,8 @@ impl WorkerManager {
         }
 
         if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context();
-            let reply = self.build_reply_from_worker_error(&err, input_context);
+            let input_context = self.prepare_input_context_files();
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -678,12 +690,12 @@ impl WorkerManager {
         self.resolve_timeout_marker();
         if text.is_empty() {
             if self.pending_request || self.pending_output_tape.has_pending() {
-                let reply = self.poll_pending_output(worker_timeout)?;
+                let reply = self.poll_pending_output_files(worker_timeout)?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
-            let reply = self.build_idle_poll_reply();
+            let reply = self.build_idle_poll_reply_files();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -692,7 +704,7 @@ impl WorkerManager {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
         if !text.is_empty() && self.pending_request {
-            let mut reply = self.poll_pending_output(worker_timeout)?;
+            let mut reply = self.poll_pending_output_files(worker_timeout)?;
             let WorkerReply::Output {
                 contents,
                 is_error,
@@ -711,25 +723,25 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        let input_context = self.prepare_input_context();
+        let input_context = self.prepare_input_context_files();
 
         let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
             Ok(result) => result,
             Err(err) => {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                let reply = self.build_reply_from_worker_error(&err, input_context);
+                let reply = self.build_reply_from_worker_error_files(&err, input_context);
                 let _ = self.reset_preserving_detached_prefix_item_count();
                 return Ok(self.finalize_reply(reply));
             }
         };
-        let reply = self.build_reply_from_request(request, input_context)?;
+        let reply = self.build_reply_from_request_files(request, input_context)?;
         let reply = self.finalize_reply(reply);
         self.maybe_reset_after_session_end();
         Ok(reply)
     }
 
     #[cfg(feature = "pager")]
-    pub fn write_stdin(
+    fn write_stdin_pager(
         &mut self,
         text: String,
         worker_timeout: Duration,
@@ -747,7 +759,7 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
-            return self.write_stdin(
+            return self.write_stdin_pager(
                 remaining.to_string(),
                 worker_timeout,
                 server_timeout,
@@ -766,9 +778,9 @@ impl WorkerManager {
                 .expect("guardrail event should be present");
             self.guardrail.busy.store(false, Ordering::Relaxed);
             let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-            let input_context = self.prepare_input_context(&text, echo_input);
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
             let err = WorkerError::Guardrail(event.message);
-            let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
             let preserve_pager = self.pager.is_active();
             let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             let reply = self.finalize_reply(reply);
@@ -792,8 +804,8 @@ impl WorkerManager {
 
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
         if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context(&text, echo_input);
-            let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -803,12 +815,12 @@ impl WorkerManager {
         self.resolve_timeout_marker();
         if text.is_empty() {
             if self.pending_request || self.output.has_pending_output() {
-                let reply = self.poll_pending_output(worker_timeout, page_bytes)?;
+                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
-            let reply = self.build_idle_poll_reply();
+            let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -817,7 +829,7 @@ impl WorkerManager {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
         if self.pending_request {
-            let mut reply = self.poll_pending_output(worker_timeout, page_bytes)?;
+            let mut reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
             let WorkerReply::Output {
                 contents,
                 is_error,
@@ -836,19 +848,20 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        let input_context = self.prepare_input_context(&text, echo_input);
+        let input_context = self.prepare_input_context_pager(&text, echo_input);
 
         let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
             Ok(result) => result,
             Err(err) => {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+                let reply =
+                    self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
                 let preserve_pager = self.pager.is_active();
                 let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 return Ok(self.finalize_reply(reply));
             }
         };
-        let reply = self.build_reply_from_request(request, input_context, page_bytes)?;
+        let reply = self.build_reply_from_request_pager(request, input_context, page_bytes)?;
         let reply = self.finalize_reply(reply);
         self.maybe_reset_after_session_end();
         Ok(reply)
@@ -888,14 +901,15 @@ impl WorkerManager {
 
     /// Serves empty-input polls and busy follow-up replies for a timed-out request.
     /// Each poll only returns newly available output, but the server may keep appending it to one transcript file.
-    #[cfg(not(feature = "pager"))]
-    fn poll_pending_output(&mut self, timeout: Duration) -> Result<ReplyWithOffset, WorkerError> {
+    fn poll_pending_output_files(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReplyWithOffset, WorkerError> {
         let poll_start = std::time::Instant::now();
         let mut timed_out = false;
         let mut completion = CompletionInfo {
             prompt: None,
             prompt_variants: None,
-            #[cfg(feature = "pager")]
             echo_events: Vec::new(),
             session_end_seen: false,
         };
@@ -972,7 +986,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn poll_pending_output(
+    fn poll_pending_output_pager(
         &mut self,
         timeout: Duration,
         page_bytes: u64,
@@ -1101,8 +1115,7 @@ impl WorkerManager {
 
     /// Drains detached output that arrived before the next accepted request so it can be prefixed
     /// into that request's visible reply.
-    #[cfg(not(feature = "pager"))]
-    fn prepare_input_context(&mut self) -> InputContext {
+    fn prepare_input_context_files(&mut self) -> InputContext {
         let FormattedPendingOutput {
             contents,
             saw_stderr,
@@ -1110,11 +1123,14 @@ impl WorkerManager {
         InputContext {
             prefix_contents: contents,
             prefix_is_error: saw_stderr,
+            start_offset: 0,
+            prefix_bytes: 0,
+            input_echo: None,
         }
     }
 
     #[cfg(feature = "pager")]
-    fn prepare_input_context(&mut self, text: &str, echo_input: bool) -> InputContext {
+    fn prepare_input_context_pager(&mut self, text: &str, echo_input: bool) -> InputContext {
         self.output.start_capture();
 
         let had_pending_output = self.output.has_pending_output();
@@ -1183,8 +1199,7 @@ impl WorkerManager {
         })
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn build_reply_from_worker_error(
+    fn build_reply_from_worker_error_files(
         &mut self,
         err: &WorkerError,
         context: InputContext,
@@ -1207,7 +1222,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn build_reply_from_worker_error(
+    fn build_reply_from_worker_error_pager(
         &mut self,
         err: &WorkerError,
         context: InputContext,
@@ -1247,8 +1262,7 @@ impl WorkerManager {
         }
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn build_reply_from_request(
+    fn build_reply_from_request_files(
         &mut self,
         request: RequestState,
         context: InputContext,
@@ -1331,7 +1345,7 @@ impl WorkerManager {
                 })
             }
             Err(err) => {
-                let reply = self.build_reply_from_worker_error(&err, context);
+                let reply = self.build_reply_from_worker_error_files(&err, context);
                 let _ = self.reset_preserving_detached_prefix_item_count();
                 Ok(reply)
             }
@@ -1339,7 +1353,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn build_reply_from_request(
+    fn build_reply_from_request_pager(
         &mut self,
         request: RequestState,
         context: InputContext,
@@ -1478,7 +1492,7 @@ impl WorkerManager {
                 })
             }
             Err(err) => {
-                let reply = self.build_reply_from_worker_error(&err, context, page_bytes);
+                let reply = self.build_reply_from_worker_error_pager(&err, context, page_bytes);
                 let preserve_pager = self.pager.is_active();
                 let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 Ok(reply)
@@ -1522,7 +1536,6 @@ impl WorkerManager {
                 result = Ok(CompletionInfo {
                     prompt: None,
                     prompt_variants: None,
-                    #[cfg(feature = "pager")]
                     echo_events: Vec::new(),
                     session_end_seen: true,
                 });
@@ -1555,17 +1568,35 @@ impl WorkerManager {
         let poll = Duration::from_millis(5);
         let start = std::time::Instant::now();
 
-        #[cfg(feature = "pager")]
-        let mut last = self.output.end_offset().unwrap_or(0);
-        #[cfg(not(feature = "pager"))]
-        let mut last = self.pending_output_tape.current_seq();
+        let mut last = match self.oversized_output {
+            OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.output.end_offset().unwrap_or(0)
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    0
+                }
+            }
+        };
         let mut stable_for = Duration::from_millis(0);
         while start.elapsed() < total {
             thread::sleep(poll);
-            #[cfg(feature = "pager")]
-            let now = self.output.end_offset().unwrap_or(0);
-            #[cfg(not(feature = "pager"))]
-            let now = self.pending_output_tape.current_seq();
+            let now = match self.oversized_output {
+                OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
+                OversizedOutputMode::Pager => {
+                    #[cfg(feature = "pager")]
+                    {
+                        self.output.end_offset().unwrap_or(0)
+                    }
+                    #[cfg(not(feature = "pager"))]
+                    {
+                        0
+                    }
+                }
+            };
             if now == last {
                 stable_for = stable_for.saturating_add(poll);
                 if stable_for >= stable_needed {
@@ -1619,17 +1650,23 @@ impl WorkerManager {
         let Some(event) = slot.take() else {
             return;
         };
-        #[cfg(feature = "pager")]
-        self.output_timeline
-            .append_text(event.message.as_bytes(), true);
-        #[cfg(not(feature = "pager"))]
-        self.pending_output_tape
-            .append_server_stderr_bytes(event.message.as_bytes());
+        match self.oversized_output {
+            OversizedOutputMode::Files => self
+                .pending_output_tape
+                .append_server_stderr_bytes(event.message.as_bytes()),
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                self.output_timeline
+                    .append_text(event.message.as_bytes(), true);
+            }
+        }
     }
 
     fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        #[cfg(feature = "pager")]
-        set_last_reply_marker_offset(reply.end_offset);
+        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
+            #[cfg(feature = "pager")]
+            set_last_reply_marker_offset(reply.end_offset);
+        }
         reply.reply
     }
 
@@ -1643,18 +1680,26 @@ impl WorkerManager {
                     if !message.ends_with('\n') {
                         message.push('\n');
                     }
-                    #[cfg(feature = "pager")]
-                    self.output_timeline.append_text(message.as_bytes(), true);
-                    #[cfg(not(feature = "pager"))]
-                    self.pending_output_tape
-                        .append_server_stderr_bytes(message.as_bytes());
+                    match self.oversized_output {
+                        OversizedOutputMode::Files => self
+                            .pending_output_tape
+                            .append_server_stderr_bytes(message.as_bytes()),
+                        OversizedOutputMode::Pager => {
+                            #[cfg(feature = "pager")]
+                            self.output_timeline.append_text(message.as_bytes(), true);
+                        }
+                    }
                 } else {
                     let message = "[repl] session ended\n".to_string();
-                    #[cfg(feature = "pager")]
-                    self.output_timeline.append_text(message.as_bytes(), false);
-                    #[cfg(not(feature = "pager"))]
-                    self.pending_output_tape
-                        .append_stdout_status_line(message.as_bytes());
+                    match self.oversized_output {
+                        OversizedOutputMode::Files => self
+                            .pending_output_tape
+                            .append_stdout_status_line(message.as_bytes()),
+                        OversizedOutputMode::Pager => {
+                            #[cfg(feature = "pager")]
+                            self.output_timeline.append_text(message.as_bytes(), false);
+                        }
+                    }
                 }
             }
         }
@@ -1662,21 +1707,44 @@ impl WorkerManager {
 
     fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
-            #[cfg(feature = "pager")]
-            let _ = self.reset_with_pager(self.pager.is_active());
-            #[cfg(not(feature = "pager"))]
-            let _ = self.reset();
+            let _ = match self.oversized_output {
+                OversizedOutputMode::Files => self.reset(),
+                OversizedOutputMode::Pager => {
+                    #[cfg(feature = "pager")]
+                    {
+                        self.reset_with_pager(self.pager.is_active())
+                    }
+                    #[cfg(not(feature = "pager"))]
+                    {
+                        Err(WorkerError::Protocol(
+                            "pager mode is unavailable in this build".to_string(),
+                        ))
+                    }
+                }
+            };
             self.session_end_seen = false;
         }
     }
 
-    #[cfg(not(feature = "pager"))]
     pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        #[cfg(feature = "pager")]
-        {
-            return self.interrupt_with_pager(timeout);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.interrupt_files(timeout),
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.interrupt_pager(timeout)
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    Err(WorkerError::Protocol(
+                        "pager mode is unavailable in this build".to_string(),
+                    ))
+                }
+            }
         }
+    }
 
+    fn interrupt_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
@@ -1700,7 +1768,7 @@ impl WorkerManager {
         }
 
         if self.pending_request {
-            let mut reply = self.poll_pending_output(timeout)?;
+            let mut reply = self.poll_pending_output_files(timeout)?;
             let prompt = match &reply.reply {
                 WorkerReply::Output { prompt, .. } => prompt.clone(),
             };
@@ -1785,8 +1853,25 @@ impl WorkerManager {
         }))
     }
 
-    #[cfg(not(feature = "pager"))]
     pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.restart_files(timeout),
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.restart_pager(timeout)
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    Err(WorkerError::Protocol(
+                        "pager mode is unavailable in this build".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_restart_begin",
             serde_json::json!({
@@ -1803,14 +1888,14 @@ impl WorkerManager {
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
 
-        let reply = self.build_session_reset_reply("new session started");
-        self.reset_output_state();
+        let reply = self.build_session_reset_reply_files("new session started");
+        self.reset_output_state_files();
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
 
     #[cfg(feature = "pager")]
-    pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    fn interrupt_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
@@ -1835,7 +1920,7 @@ impl WorkerManager {
 
         let page_bytes = pager::resolve_page_bytes(None);
         if self.pending_request {
-            let mut reply = self.poll_pending_output(timeout, page_bytes)?;
+            let mut reply = self.poll_pending_output_pager(timeout, page_bytes)?;
             let pager_active = self.pager.is_active();
             let prompt = match &reply.reply {
                 WorkerReply::Output { prompt, .. } => prompt.clone(),
@@ -1943,7 +2028,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_restart_begin",
             serde_json::json!({
@@ -1961,8 +2046,8 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
 
         let page_bytes = pager::resolve_page_bytes(None);
-        let reply = self.build_session_reset_reply(page_bytes, "new session started");
-        self.reset_output_state(false);
+        let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
+        self.reset_output_state_pager(false);
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -1990,7 +2075,21 @@ impl WorkerManager {
             if let Some(process) = self.process.take() {
                 process.cleanup_session_tmpdir();
             }
-            self.process = Some(self.spawn_process()?);
+            self.process = Some(match self.oversized_output {
+                OversizedOutputMode::Files => self.spawn_process_files()?,
+                OversizedOutputMode::Pager => {
+                    #[cfg(feature = "pager")]
+                    {
+                        self.spawn_process_with_pager(false)?
+                    }
+                    #[cfg(not(feature = "pager"))]
+                    {
+                        return Err(WorkerError::Protocol(
+                            "pager mode is unavailable in this build".to_string(),
+                        ));
+                    }
+                }
+            });
         }
 
         Ok(())
@@ -2007,14 +2106,21 @@ impl WorkerManager {
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
-        #[cfg(feature = "pager")]
-        {
-            self.process = Some(self.spawn_process_with_pager(false)?);
-        }
-        #[cfg(not(feature = "pager"))]
-        {
-            self.process = Some(self.spawn_process()?);
-        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.spawn_process_with_pager(false)?
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    return Err(WorkerError::Protocol(
+                        "pager mode is unavailable in this build".to_string(),
+                    ));
+                }
+            }
+        });
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
         Ok(())
     }
@@ -2082,7 +2188,21 @@ impl WorkerManager {
         if !changed {
             if awaiting_before && self.process.is_none() {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                self.process = Some(self.spawn_process()?);
+                self.process = Some(match self.oversized_output {
+                    OversizedOutputMode::Files => self.spawn_process_files()?,
+                    OversizedOutputMode::Pager => {
+                        #[cfg(feature = "pager")]
+                        {
+                            self.spawn_process_with_pager(false)?
+                        }
+                        #[cfg(not(feature = "pager"))]
+                        {
+                            return Err(WorkerError::Protocol(
+                                "pager mode is unavailable in this build".to_string(),
+                            ));
+                        }
+                    }
+                });
                 return Ok(true);
             }
             return Ok(false);
@@ -2092,12 +2212,25 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.process = Some(self.spawn_process()?);
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => {
+                #[cfg(feature = "pager")]
+                {
+                    self.spawn_process_with_pager(false)?
+                }
+                #[cfg(not(feature = "pager"))]
+                {
+                    return Err(WorkerError::Protocol(
+                        "pager mode is unavailable in this build".to_string(),
+                    ));
+                }
+            }
+        });
         Ok(true)
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn reset_output_state(&mut self) {
+    fn reset_output_state_files(&mut self) {
         self.pending_output_tape.clear();
         self.pending_request = false;
         self.pending_request_started_at = None;
@@ -2108,7 +2241,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn reset_output_state(&mut self, preserve_pager: bool) {
+    fn reset_output_state_pager(&mut self, preserve_pager: bool) {
         self.pending_output_tape.clear();
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -2151,8 +2284,7 @@ impl WorkerManager {
             .format_contents()
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn build_idle_poll_reply(&mut self) -> ReplyWithOffset {
+    fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
@@ -2170,7 +2302,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn build_idle_poll_reply(&mut self) -> ReplyWithOffset {
+    fn build_idle_poll_reply_pager(&mut self) -> ReplyWithOffset {
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
@@ -2187,9 +2319,8 @@ impl WorkerManager {
         }
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state();
+    fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
+        self.reset_output_state_files();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2230,16 +2361,11 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
-        self.spawn_process_with_pager(false)
-    }
-
-    #[cfg(feature = "pager")]
     fn spawn_process_with_pager(
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state(preserve_pager);
+        self.reset_output_state_pager(preserve_pager);
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2329,8 +2455,10 @@ impl WorkerManager {
         match status {
             Ok(()) => {
                 self.settle_output_after_request_end(Duration::from_millis(120));
-                #[cfg(feature = "pager")]
-                update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
+                if matches!(self.oversized_output, OversizedOutputMode::Pager) {
+                    #[cfg(feature = "pager")]
+                    update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
+                }
                 self.clear_pending_request_state();
             }
             Err(IpcWaitError::SessionEnd) => {
@@ -2357,8 +2485,7 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
-    #[cfg(not(feature = "pager"))]
-    fn build_session_reset_reply(&mut self, meta: &str) -> ReplyWithOffset {
+    fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
@@ -2385,7 +2512,7 @@ impl WorkerManager {
     }
 
     #[cfg(feature = "pager")]
-    fn build_session_reset_reply(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
+    fn build_session_reset_reply_pager(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
         let end_offset = self.output.end_offset().unwrap_or(0);
         let mut is_error = false;
 
@@ -4551,8 +4678,12 @@ mod tests {
 
     #[test]
     fn send_worker_request_error_preserves_detached_prefix_count() {
-        let mut manager =
-            WorkerManager::new(Backend::R, SandboxCliPlan::default()).expect("worker manager");
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
         manager
             .pending_output_tape
             .append_stdout_bytes(b"detached output\n");
@@ -4616,7 +4747,11 @@ mod tests {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
         }
         let result = std::panic::catch_unwind(|| {
-            WorkerManager::new(Backend::Python, SandboxCliPlan::default())
+            WorkerManager::new(
+                Backend::Python,
+                SandboxCliPlan::default(),
+                crate::oversized_output::OversizedOutputMode::Files,
+            )
         });
 
         match original_tmpdir {
@@ -4660,7 +4795,12 @@ mod tests {
                 ),
             ],
         };
-        let mut manager = WorkerManager::new(Backend::Python, plan).expect("worker manager");
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
         let inherited_before = manager
             .inherited_sandbox_state
             .clone()

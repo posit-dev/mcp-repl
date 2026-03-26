@@ -6,6 +6,7 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
+use regex_lite::Regex;
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -210,7 +211,7 @@ fn strip_trailing_prompt(text: &str) -> String {
 }
 
 fn normalize_text_snapshot(text: &str) -> String {
-    let normalized = normalize_newlines(text.to_string());
+    let normalized = normalize_output_bundle_paths(&normalize_newlines(text.to_string()));
     let mut stripped = strip_trailing_prompt(&normalized);
     while stripped.ends_with('\n') {
         stripped.pop();
@@ -219,6 +220,31 @@ fn normalize_text_snapshot(text: &str) -> String {
         stripped = format!("stderr:{rest}");
     }
     stripped
+}
+
+fn normalize_output_bundle_paths(text: &str) -> String {
+    static OUTPUT_BUNDLE_PATH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = OUTPUT_BUNDLE_PATH_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?x)
+            (?:[A-Za-z]:)?(?:[/\\][^\s\]"')]+)*[/\\]
+            mcp-repl-output(?:-[A-Za-z0-9]+)?[/\\]
+            output-\d{4}[/\\]
+            (?:transcript\.txt|events\.log)
+        "#,
+        )
+        .expect("output bundle path regex")
+    });
+    re.replace_all(text, |captures: &regex_lite::Captures<'_>| {
+        let matched = captures.get(0).expect("full match").as_str();
+        let leaf = if matched.ends_with("events.log") {
+            "events.log"
+        } else {
+            "transcript.txt"
+        };
+        format!("<mcp-repl-output>/output-0001/{leaf}")
+    })
+    .into_owned()
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -501,6 +527,27 @@ impl McpSnapshot {
     {
         let name = name.into();
         let mut session = spawn_server().await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
+    pub async fn pager_session<F>(
+        &mut self,
+        name: impl Into<String>,
+        page_chars: u64,
+        f: F,
+    ) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_server_with_pager_page_chars(page_chars).await?;
         f(&mut session).await?;
         let steps = session.steps.clone();
         session.cancel().await?;
@@ -867,7 +914,7 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
 }
 
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_pager_page_chars(TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(Vec::new(), Vec::new()).await
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
@@ -877,12 +924,11 @@ pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<M
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), env_vars, TEST_PAGER_PAGE_CHARS)
-        .await
+    spawn_server_with_args_env(Vec::new(), env_vars).await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(args, Vec::new(), TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(args, Vec::new()).await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
@@ -929,6 +975,21 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    let mut args = args;
+    args.push("--oversized-output".to_string());
+    args.push("pager".to_string());
+    let mut env_vars = env_vars;
+    env_vars.push((
+        "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
+        page_bytes.to_string(),
+    ));
+    spawn_server_with_args_env(args, env_vars).await
+}
+
+pub async fn spawn_server_with_args_env(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
     let backend = parse_backend_from_args(&args);
@@ -947,7 +1008,6 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
-        let _ = page_bytes;
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);

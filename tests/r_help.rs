@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_help_is_llm_friendly() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(20_000).await?;
+    let mut session = common::spawn_server().await?;
 
     let result = session.write_stdin_raw_with("?mean", Some(30.0)).await?;
     session.cancel().await?;

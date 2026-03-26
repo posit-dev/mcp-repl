@@ -245,6 +245,29 @@ async fn write_stdin_preserves_multiline_echo() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_does_not_treat_colon_input_as_pager_command_by_default() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session.write_stdin_raw_with(":q", Some(10.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        !text.contains("[pager]")
+            && !text.contains("--More--")
+            && !text.contains("no pager active"),
+        "did not expect pager handling in default files mode, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

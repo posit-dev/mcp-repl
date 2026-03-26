@@ -7,10 +7,9 @@ mod html_to_markdown;
 mod input_protocol;
 mod install;
 mod ipc;
-#[cfg(feature = "pager")]
 mod output_capture;
 mod output_stream;
-#[cfg(feature = "pager")]
+mod oversized_output;
 mod pager;
 mod pending_output_tape;
 mod r_controls;
@@ -29,6 +28,7 @@ mod worker_protocol;
 use std::path::PathBuf;
 
 use crate::backend::{Backend, backend_from_env};
+use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::{
     SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
 };
@@ -44,6 +44,7 @@ struct CliOptions {
     debug_repl: bool,
     backend: Backend,
     debug_dir: Option<PathBuf>,
+    oversized_output: OversizedOutputMode,
 }
 
 #[derive(Debug, Default)]
@@ -95,10 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             if options.debug_repl {
                 crate::diagnostics::startup_log("main: debug repl mode");
-                return debug_repl::run(options.backend, options.sandbox_plan);
+                return debug_repl::run(
+                    options.backend,
+                    options.sandbox_plan,
+                    options.oversized_output,
+                );
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend, options.sandbox_plan).await
+            server::run(
+                options.backend,
+                options.sandbox_plan,
+                options.oversized_output,
+            )
+            .await
         }
         CliCommand::Install(options) => install::run(options),
     }
@@ -122,6 +132,8 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
+    let mut oversized_output = OversizedOutputMode::Files;
+    let mut oversized_output_seen = false;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -230,6 +242,30 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                 }
                 debug_dir = Some(PathBuf::from(value));
             }
+            "--oversized-output" => {
+                if oversized_output_seen {
+                    return Err("duplicate --oversized-output".into());
+                }
+                let value = parser.next_value("--oversized-output")?;
+                oversized_output =
+                    OversizedOutputMode::parse(&value).map_err(|err| err.to_string())?;
+                oversized_output_seen = true;
+            }
+            _ if arg.starts_with("--oversized-output=") => {
+                if oversized_output_seen {
+                    return Err("duplicate --oversized-output".into());
+                }
+                let value = arg
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                if value.is_empty() {
+                    return Err("missing value for --oversized-output".into());
+                }
+                oversized_output =
+                    OversizedOutputMode::parse(value).map_err(|err| err.to_string())?;
+                oversized_output_seen = true;
+            }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
                 None => return Err(format!("unknown argument: {arg}").into()),
@@ -242,6 +278,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
         debug_dir,
+        oversized_output,
     }))
 }
 
@@ -418,11 +455,12 @@ fn parse_writable_root(raw: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--oversized-output <files|pager>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
+--oversized-output: choose oversized-output handling (files: default spill-to-files mode; pager: legacy modal pager)\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\

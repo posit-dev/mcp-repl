@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::backend::Backend;
+use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
@@ -18,6 +19,7 @@ const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) fn run(
     backend: Backend,
     sandbox_plan: SandboxCliPlan,
+    oversized_output: OversizedOutputMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let image_support = detect_image_support();
     eprintln!(
@@ -30,7 +32,7 @@ pub(crate) fn run(
     let mut stderr = io::stderr();
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
-    let mut worker = WorkerManager::new(backend, sandbox_plan)?;
+    let mut worker = WorkerManager::new(backend, sandbox_plan, oversized_output)?;
     worker.warm_start()?;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
     render_reply(reply, &mut stdout, &mut stderr, image_support)?;

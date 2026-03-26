@@ -151,14 +151,13 @@ async fn write_stdin_drives_browser() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_drives_browser", &snapshot)
 }
 
-#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_search() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session("pager_search_queue", mcp_script! {
+        .pager_session("pager_search_queue", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":/line0050", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);
@@ -169,14 +168,13 @@ async fn write_stdin_pager_search() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_pager_search", &snapshot)
 }
 
-#[cfg(feature = "pager")]
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_hits() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session("pager_hits_queue", mcp_script! {
+        .pager_session("pager_hits_queue", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":hits line0150", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);

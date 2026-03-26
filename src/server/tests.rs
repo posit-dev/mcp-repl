@@ -118,8 +118,14 @@ fn cleanup_echo_only_sequences(
 
 #[test]
 fn repl_tool_descriptions_are_backend_specific() {
-    let r = super::repl_tool_description_for_backend(crate::backend::Backend::R);
-    let python = super::repl_tool_description_for_backend(crate::backend::Backend::Python);
+    let r = super::repl_tool_description_for_backend(
+        crate::backend::Backend::R,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
+    let python = super::repl_tool_description_for_backend(
+        crate::backend::Backend::Python,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
 
     assert_ne!(r, python, "expected backend-specific repl descriptions");
     assert!(r.contains("R code"));
@@ -128,8 +134,14 @@ fn repl_tool_descriptions_are_backend_specific() {
 
 #[test]
 fn repl_tool_descriptions_include_language_specific_affordances() {
-    let r = super::repl_tool_description_for_backend(crate::backend::Backend::R);
-    let python = super::repl_tool_description_for_backend(crate::backend::Backend::Python);
+    let r = super::repl_tool_description_for_backend(
+        crate::backend::Backend::R,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
+    let python = super::repl_tool_description_for_backend(
+        crate::backend::Backend::Python,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
 
     for description in [r, python] {
         let lower = description.to_lowercase();
@@ -140,6 +152,23 @@ fn repl_tool_descriptions_include_language_specific_affordances() {
     }
     assert!(r.contains("help()"));
     assert!(python.contains("help()"));
+}
+
+#[test]
+fn repl_tool_descriptions_are_mode_specific() {
+    let files = super::repl_tool_description_for_backend(
+        crate::backend::Backend::R,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
+    let pager = super::repl_tool_description_for_backend(
+        crate::backend::Backend::R,
+        crate::oversized_output::OversizedOutputMode::Pager,
+    );
+
+    assert_ne!(files, pager, "expected mode-specific repl descriptions");
+    assert!(files.contains("output bundle"));
+    assert!(pager.contains("modal pager"));
+    assert!(pager.contains(":q"));
 }
 
 #[test]
