@@ -123,8 +123,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout, false);
-        flush_tail(&mut guard, TextStream::Stderr, false);
+        flush_tail(&mut guard, TextStream::Stdout, true);
+        flush_tail(&mut guard, TextStream::Stderr, true);
         let seq = next_seq(&mut guard);
         guard.events.push_back(PendingOutputEvent::Image {
             seq,
@@ -141,8 +141,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout, false);
-        flush_tail(&mut guard, TextStream::Stderr, false);
+        flush_tail(&mut guard, TextStream::Stdout, true);
+        flush_tail(&mut guard, TextStream::Stderr, true);
         let seq = next_seq(&mut guard);
         guard
             .events
@@ -704,6 +704,30 @@ mod tests {
             second.format_contents().contents,
             vec![WorkerContent::stdout("é\n")]
         );
+    }
+
+    #[test]
+    fn split_utf8_prefix_flushes_before_image_event() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+        );
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+
+        let snapshot = tape.drain_snapshot();
+        assert!(matches!(
+            snapshot.events.as_slice(),
+            [
+                PendingOutputEvent::TextFragment { bytes, .. },
+                PendingOutputEvent::Image { .. },
+                PendingOutputEvent::TextFragment { bytes: second, .. },
+            ] if bytes == &vec![0xC3] && second == &vec![0xA9, b'\n']
+        ));
     }
 
     #[test]

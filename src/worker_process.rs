@@ -678,6 +678,10 @@ impl WorkerManager {
         }
         if !text.is_empty() && self.pending_request {
             let mut reply = self.poll_pending_output_files(worker_timeout)?;
+            let detached_prefix_item_count = match &reply.reply {
+                WorkerReply::Output { contents, .. } => contents.len(),
+            };
+            self.last_detached_prefix_item_count = detached_prefix_item_count;
             let WorkerReply::Output {
                 contents,
                 is_error,
