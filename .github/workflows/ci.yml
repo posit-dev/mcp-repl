@@ -43,7 +43,12 @@ jobs:
         run: cargo clippy --all-targets --all-features
 
       - name: cargo test (skip client integrations)
+        if: matrix.os != 'windows-latest'
         run: cargo test -- --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
+
+      - name: cargo test (windows serial, skip client integrations)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -j 1 -- --test-threads=1 --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check
