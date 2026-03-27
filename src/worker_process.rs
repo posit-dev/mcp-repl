@@ -4629,6 +4629,11 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        manager.warm_start().expect("warm start");
+        manager.output.start_capture();
+        manager
+            .output
+            .advance_offset_to(manager.output.end_offset().unwrap_or(0));
         manager
             .output_timeline
             .append_text(b"detached output\n", false);

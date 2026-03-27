@@ -1688,6 +1688,19 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
     out
 }
 
+fn materialize_items_with_output_bundle_notice(
+    items: Vec<ReplyItem>,
+    bundle: &ActiveOutputBundle,
+    displayed_anchor_count: usize,
+) -> Vec<Content> {
+    let mut out = materialize_items(items);
+    out.push(Content::text(build_output_bundle_notice(
+        bundle,
+        displayed_anchor_count,
+    )));
+    out
+}
+
 fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
     let first_image_idx = items
         .iter()
@@ -1747,7 +1760,11 @@ fn render_active_bundle_contents(
     spill_worker_text_chars: usize,
 ) -> Result<Vec<Content>, WorkerError> {
     let append = active.append_items(output_store, bundle_items)?;
+    let retained_image_count = count_images(&append.retained_items);
     let retained_worker_text = worker_text_from_items(&append.retained_items);
+    let has_incremental_content = !append.retained_items.is_empty();
+    let image_bundle_still_needed = active.next_image_number > 0
+        && should_use_output_bundle(active.history_image_count, spill_worker_text_chars);
 
     if append.omitted_this_reply {
         active.disclosed = true;
@@ -1756,11 +1773,16 @@ fn render_active_bundle_contents(
             &retained_worker_text,
             active,
         ))
-    } else if active.next_image_number > 0
-        && should_use_output_bundle(active.history_image_count, spill_worker_text_chars)
-    {
+    } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
         Ok(compact_output_bundle_items(&append.retained_items, active))
+    } else if active.was_disclosed() && image_bundle_still_needed && has_incremental_content {
+        active.disclosed = true;
+        Ok(materialize_items_with_output_bundle_notice(
+            inline_items.to_vec(),
+            active,
+            0,
+        ))
     } else if text_should_spill(spill_worker_text_chars) {
         active.disclosed = true;
         Ok(compact_text_bundle_items(
@@ -2951,6 +2973,62 @@ mod tests {
         assert!(
             !follow_up_transcript.contains("TAIL\n"),
             "did not expect detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_image_bundle_keeps_later_small_polls_incremental() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+            let image = ReplyImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                is_new: true,
+            };
+            let retained = bundle
+                .append_image(&mut state.output_store, &image)
+                .expect("timeout image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("TAIL\n".to_string())],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert!(
+            disclosed_path(&text, "events.log").is_some()
+                || disclosed_path(&text, "transcript.txt").is_some(),
+            "expected later small poll to keep disclosing the existing bundle path, got: {text:?}"
+        );
+        assert!(
+            images.is_empty(),
+            "did not expect anchor images on later small poll"
+        );
+        assert!(
+            text.contains("TAIL\n"),
+            "expected later small poll to keep the new text visible, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("TAIL\n"),
+            "expected later small poll output to append to the existing timeout bundle, got: {transcript:?}"
         );
     }
 
