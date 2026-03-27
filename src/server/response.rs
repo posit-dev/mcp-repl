@@ -506,7 +506,7 @@ impl ResponseState {
                 &mut active,
                 &material.detached_prefix_items,
                 &material.detached_prefix_inline_items,
-                &material.detached_prefix_worker_text,
+                material.detached_prefix_worker_text.chars().count(),
             ) {
                 Ok(contents) => contents,
                 Err(err) => {
@@ -555,7 +555,7 @@ impl ResponseState {
                 &mut active,
                 bundle_items,
                 inline_items,
-                worker_text,
+                worker_text.chars().count(),
             ) {
                 Ok(contents) => {
                     if pending_request_after {
@@ -597,14 +597,19 @@ impl ResponseState {
         }
 
         let current_image_count = count_images(bundle_items);
+        let staged_worker_text_chars = staged_timeout_output
+            .as_ref()
+            .map_or(0, StagedTimeoutOutput::worker_text_chars);
+        let combined_worker_text_chars =
+            staged_worker_text_chars.saturating_add(worker_text.chars().count());
         let combined_image_count = staged_timeout_output
             .as_ref()
             .map_or(current_image_count, |staged| {
                 staged.image_count().saturating_add(current_image_count)
             });
         let use_output_bundle = combined_image_count > 0
-            && should_use_output_bundle(combined_image_count, worker_text.chars().count());
-        let text_spills = text_should_spill(worker_text.chars().count());
+            && should_use_output_bundle(combined_image_count, combined_worker_text_chars);
+        let text_spills = text_should_spill(combined_worker_text_chars);
 
         if let Some(mut staged) = staged_timeout_output {
             if use_output_bundle || text_spills {
@@ -615,7 +620,7 @@ impl ResponseState {
                             &mut active,
                             bundle_items,
                             inline_items,
-                            worker_text,
+                            combined_worker_text_chars,
                         ) {
                             Ok(contents) => {
                                 if pending_request_after {
@@ -687,7 +692,7 @@ impl ResponseState {
                             &mut bundle,
                             bundle_items,
                             inline_items,
-                            worker_text,
+                            worker_text.chars().count(),
                         ) {
                             Ok(contents) => {
                                 if pending_request_after {
@@ -1401,6 +1406,16 @@ impl StagedTimeoutOutput {
         count_images(&self.items)
     }
 
+    fn worker_text_chars(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| match item {
+                ReplyItem::WorkerText(text) => text.chars().count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     fn has_retained_worker_output(&self) -> bool {
         self.items
             .iter()
@@ -1729,7 +1744,7 @@ fn render_active_bundle_contents(
     active: &mut ActiveOutputBundle,
     bundle_items: &[ReplyItem],
     inline_items: &[ReplyItem],
-    worker_text: &str,
+    spill_worker_text_chars: usize,
 ) -> Result<Vec<Content>, WorkerError> {
     let append = active.append_items(output_store, bundle_items)?;
     let retained_worker_text = worker_text_from_items(&append.retained_items);
@@ -1742,11 +1757,11 @@ fn render_active_bundle_contents(
             active,
         ))
     } else if active.next_image_number > 0
-        && should_use_output_bundle(active.history_image_count, worker_text.chars().count())
+        && should_use_output_bundle(active.history_image_count, spill_worker_text_chars)
     {
         active.disclosed = true;
         Ok(compact_output_bundle_items(&append.retained_items, active))
-    } else if text_should_spill(worker_text.chars().count()) {
+    } else if text_should_spill(spill_worker_text_chars) {
         active.disclosed = true;
         Ok(compact_text_bundle_items(
             append.retained_items.clone(),
@@ -3132,6 +3147,72 @@ mod tests {
         assert!(
             !transcript.contains("DONE\n"),
             "did not expect fresh follow-up output in the detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_bundle_spills_once_cumulative_staged_text_crosses_threshold() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let chunk_body = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD / 2);
+        let first_chunk = format!("FIRST_START\n{chunk_body}\nFIRST_END\n");
+        let second_chunk = format!("SECOND_START\n{chunk_body}\nSECOND_END\n");
+
+        assert!(
+            !super::text_should_spill(first_chunk.chars().count()),
+            "expected each staged timeout chunk to stay under the spill threshold"
+        );
+        assert!(
+            super::text_should_spill(
+                first_chunk
+                    .chars()
+                    .count()
+                    .saturating_add(second_chunk.chars().count())
+            ),
+            "expected staged timeout chunks to exceed the spill threshold cumulatively"
+        );
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(first_chunk.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = result_text(&first);
+        assert!(
+            disclosed_path(&first_text, "transcript.txt").is_none(),
+            "did not expect the first under-threshold timeout poll to disclose a bundle path"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the first under-threshold timeout poll to retain hidden timeout state"
+        );
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(second_chunk.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let second_text = result_text(&second);
+        let transcript_path = disclosed_path(&second_text, "transcript.txt").unwrap_or_else(|| {
+            panic!("expected the cumulative timeout poll to disclose a transcript path, got: {second_text:?}")
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+            "expected the disclosed timeout bundle to backfill the first staged chunk, got: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+            "expected the disclosed timeout bundle to include the later poll chunk, got: {transcript:?}"
         );
     }
 

@@ -1259,6 +1259,7 @@ impl WorkerManager {
         context: InputContext,
         page_bytes: u64,
     ) -> ReplyWithOffset {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
         let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
         let mut contents = context.prefix_contents;
@@ -1389,6 +1390,7 @@ impl WorkerManager {
         context: InputContext,
         page_bytes: u64,
     ) -> Result<ReplyWithOffset, WorkerError> {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
                 let mut session_end = completion.session_end_seen;
@@ -4617,6 +4619,41 @@ mod tests {
             "detached-prefix metadata must survive reset until server-side finalization"
         );
         let WorkerReply::Output { .. } = reply;
+    }
+
+    #[test]
+    fn pager_timeout_preserves_detached_prefix_count() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager
+            .output_timeline
+            .append_text(b"detached output\n", false);
+
+        let reply = manager
+            .write_stdin(
+                "import time; time.sleep(1)".to_string(),
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+                None,
+                false,
+            )
+            .expect("reply");
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert_eq!(
+            manager.detached_prefix_item_count(),
+            1,
+            "detached-prefix metadata must survive pager-mode timeouts until server-side finalization"
+        );
+        let WorkerReply::Output { error_code, .. } = reply;
+        assert_eq!(error_code, Some(WorkerErrorCode::Timeout));
     }
 
     #[test]
