@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -65,8 +66,48 @@ fn backend_unavailable(stdout: &str, stderr: &str) -> bool {
         || stderr.contains("[repl] error")
 }
 
+fn debug_repl_test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn wait_for_prompt_or_idle(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    seen: &mut Vec<u8>,
+    deadline: Instant,
+) -> (bool, bool) {
+    let mut saw_prompt = false;
+    let mut saw_idle = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(chunk) => {
+                seen.extend_from_slice(&chunk);
+                let output = String::from_utf8_lossy(seen);
+                if output.contains("> ") {
+                    saw_prompt = true;
+                    break;
+                }
+                if output.contains("<<repl status: idle>>") {
+                    saw_idle = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    (saw_prompt, saw_idle)
+}
+
 #[test]
 fn debug_repl_prints_initial_prompt() -> TestResult<()> {
+    let _guard = debug_repl_test_mutex()
+        .lock()
+        .expect("debug repl prompt test mutex poisoned");
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl");
@@ -116,32 +157,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
-    let mut saw_prompt = false;
-    let mut saw_idle = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(chunk) => {
-                seen.extend_from_slice(&chunk);
-                let output = String::from_utf8_lossy(&seen);
-                if output.contains("> ") {
-                    saw_prompt = true;
-                    break;
-                }
-                if output.contains("<<repl status: idle>>") {
-                    saw_idle = true;
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // keep waiting
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    let (saw_prompt, saw_idle) = wait_for_prompt_or_idle(&rx, &mut seen, deadline);
 
     drop(child.stdin.take());
     let _ = child.kill();
@@ -171,6 +187,9 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
 
 #[test]
 fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult<()> {
+    let _guard = debug_repl_test_mutex()
+        .lock()
+        .expect("debug repl prompt test mutex poisoned");
     let exe = resolve_mcp_repl_path()?;
     let temp = tempdir()?;
     let mut cmd = Command::new(exe);
@@ -223,6 +242,33 @@ fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult
             }
         }
     });
+
+    let startup_deadline = Instant::now() + Duration::from_secs(20);
+    let mut startup_seen = Vec::new();
+    let (saw_prompt, saw_idle) = wait_for_prompt_or_idle(&rx, &mut startup_seen, startup_deadline);
+
+    let mut startup_err_seen = Vec::new();
+    while let Ok(chunk) = err_rx.try_recv() {
+        startup_err_seen.extend_from_slice(&chunk);
+    }
+    let startup_stdout = String::from_utf8_lossy(&startup_seen);
+    let startup_stderr = String::from_utf8_lossy(&startup_err_seen);
+    if !((saw_prompt && startup_stdout.contains("> "))
+        || (saw_idle && startup_stdout.contains("<<repl status: idle>>")))
+        && backend_unavailable(&startup_stdout, &startup_stderr)
+    {
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("debug_repl backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        (saw_prompt && startup_stdout.contains("> "))
+            || (saw_idle && startup_stdout.contains("<<repl status: idle>>")),
+        "expected prompt or idle status before sending debug repl input, got stdout: {startup_stdout:?}, stderr: {startup_stderr:?}"
+    );
+
     {
         let stdin = child.stdin.as_mut().ok_or("missing stdin")?;
         write!(
