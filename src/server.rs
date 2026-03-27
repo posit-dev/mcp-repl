@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-mod response;
+pub(crate) mod response;
 #[cfg(test)]
 mod tests;
 mod timeouts;
 
-use self::response::{ResponseState, TimeoutBundleReuse};
+use self::response::{ResponseState, TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
@@ -104,7 +104,7 @@ impl SharedServer {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         self.run_state(move |state| {
-            let timeout_bundle_reuse = timeout_bundle_reuse(&input);
+            let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
             let result =
                 state
                     .worker
@@ -272,33 +272,6 @@ impl SharedServer {
                 );
             }
         }
-    }
-}
-
-fn timeout_bundle_reuse(input: &str) -> TimeoutBundleReuse {
-    if input.is_empty() {
-        return TimeoutBundleReuse::FullReply;
-    }
-
-    let Some(first) = input.chars().next() else {
-        return TimeoutBundleReuse::FullReply;
-    };
-    let tail = &input[first.len_utf8()..];
-    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\n') {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\r') {
-        rest
-    } else {
-        tail
-    };
-
-    match first {
-        '\u{3}' if tail.is_empty() => TimeoutBundleReuse::FullReply,
-        '\u{3}' => TimeoutBundleReuse::FollowUpInput,
-        '\u{4}' => TimeoutBundleReuse::None,
-        _ => TimeoutBundleReuse::FollowUpInput,
     }
 }
 

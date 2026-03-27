@@ -916,6 +916,78 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "big <- paste(rep('i', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.5); cat('TAIL\\n')"
+    );
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.05, 0.2)))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(260, 700)).await;
+    let spilled = session
+        .write_stdin_raw_with("", Some(test_timeout_secs(0.1, 0.3)))
+        .await?;
+    let spilled_text = result_text(&spilled);
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<console status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => {
+            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
+        }
+    };
+
+    sleep(test_delay_ms(250, 600)).await;
+    let busy_follow_up = session
+        .write_stdin_raw_with("1+1", Some(test_timeout_secs(0.05, 0.2)))
+        .await?;
+    let busy_text = result_text(&busy_follow_up);
+    if !busy_text.contains("input discarded while worker busy")
+        && !busy_text.contains("<<console status: busy")
+    {
+        eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(1300, 2500)).await;
+    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior final poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("TAIL"),
+        "expected the disclosed timeout bundle to keep receiving later worker output after a silent busy follow-up, got: {transcript:?}"
+    );
+    assert!(
+        bundle_transcript_path(&final_text).is_none(),
+        "did not expect the settled poll to switch to a different transcript path, got: {final_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

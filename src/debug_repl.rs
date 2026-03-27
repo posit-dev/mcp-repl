@@ -4,17 +4,26 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use rmcp::model::{CallToolResult, RawContent};
+
 use crate::backend::Backend;
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::SandboxCliPlan;
+use crate::server::response::{ResponseState, TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use crate::worker_process::{WorkerError, WorkerManager};
-use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
+use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SAFETY_MARGIN: f64 = 1.05;
 const MIN_SERVER_GRACE: Duration = Duration::from_secs(1);
 const INITIAL_PROMPT_WAIT: Duration = Duration::from_secs(5);
 const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+struct VisibleReplyContext {
+    pending_request_after: bool,
+    detached_prefix_item_count: usize,
+    timeout_bundle_reuse: TimeoutBundleReuse,
+}
 
 pub(crate) fn run(
     backend: Backend,
@@ -33,9 +42,25 @@ pub(crate) fn run(
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
     let mut worker = WorkerManager::new(backend, sandbox_plan, oversized_output)?;
+    let mut response = if oversized_output == OversizedOutputMode::Files {
+        Some(ResponseState::new()?)
+    } else {
+        None
+    };
     worker.warm_start()?;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
-    render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+    render_visible_reply(
+        response.as_mut(),
+        Ok(reply),
+        VisibleReplyContext {
+            pending_request_after: worker.pending_request(),
+            detached_prefix_item_count: worker.detached_prefix_item_count(),
+            timeout_bundle_reuse: TimeoutBundleReuse::FullReply,
+        },
+        &mut stdout,
+        &mut stderr,
+        image_support,
+    )?;
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -46,13 +71,35 @@ pub(crate) fn run(
         };
 
         if is_exact_command(&line, "INTERRUPT") {
-            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT);
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: 0,
+                    timeout_bundle_reuse: TimeoutBundleReuse::None,
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
+            )?;
             continue;
         }
         if is_exact_command(&line, "RESTART") {
-            let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT);
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: 0,
+                    timeout_bundle_reuse: TimeoutBundleReuse::None,
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
+            )?;
             continue;
         }
         if is_exact_command(&line, "END") {
@@ -62,8 +109,19 @@ pub(crate) fn run(
                 server_timeout,
                 None,
                 false,
+            );
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: worker.detached_prefix_item_count(),
+                    timeout_bundle_reuse: TimeoutBundleReuse::FullReply,
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
             )?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
             continue;
         }
 
@@ -82,14 +140,30 @@ pub(crate) fn run(
             }
         }
 
+        let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
         let reply = worker.write_stdin(
             input,
             DEFAULT_WRITE_STDIN_TIMEOUT,
             server_timeout,
             None,
             false,
+        );
+        render_visible_reply(
+            response.as_mut(),
+            reply,
+            VisibleReplyContext {
+                pending_request_after: worker.pending_request(),
+                detached_prefix_item_count: worker.detached_prefix_item_count(),
+                timeout_bundle_reuse,
+            },
+            &mut stdout,
+            &mut stderr,
+            image_support,
         )?;
-        render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+    }
+
+    if let Some(response) = response.as_mut() {
+        response.shutdown()?;
     }
 
     Ok(())
@@ -208,6 +282,98 @@ fn render_reply(
                         }
                     }
                 }
+            }
+        }
+    }
+    stdout.flush()?;
+    stderr.flush()?;
+    Ok(())
+}
+
+fn render_visible_reply(
+    response: Option<&mut ResponseState>,
+    reply: Result<WorkerReply, WorkerError>,
+    context: VisibleReplyContext,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    image_support: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(response) = response {
+        let error_banner = reply_error_banner(&reply);
+        let reply = response.finalize_worker_result(
+            reply,
+            context.pending_request_after,
+            context.timeout_bundle_reuse,
+            context.detached_prefix_item_count,
+        );
+        render_finalized_reply(reply, error_banner, stdout, stderr, image_support)?;
+        return Ok(());
+    }
+
+    render_reply(reply?, stdout, stderr, image_support)?;
+    Ok(())
+}
+
+fn reply_error_banner(reply: &Result<WorkerReply, WorkerError>) -> Option<Option<WorkerErrorCode>> {
+    match reply {
+        Ok(WorkerReply::Output {
+            is_error,
+            error_code,
+            ..
+        }) => {
+            if error_code.is_some() {
+                Some(*error_code)
+            } else if *is_error {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        Err(_) => Some(None),
+    }
+}
+
+fn render_finalized_reply(
+    reply: CallToolResult,
+    error_banner: Option<Option<WorkerErrorCode>>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    image_support: bool,
+) -> io::Result<()> {
+    if let Some(code) = error_banner.flatten() {
+        writeln!(stderr, "[repl] error: {code:?}")?;
+    } else if error_banner.is_some() {
+        writeln!(stderr, "[repl] error")?;
+    }
+
+    for content in reply.content {
+        match content.raw {
+            RawContent::Text(text) => stdout.write_all(text.text.as_bytes())?,
+            RawContent::Image(image) => {
+                if image_support && write_kitty_image(stdout, &image.data, &image.mime_type)? {
+                    // image rendered
+                } else {
+                    writeln!(
+                        stderr,
+                        "[repl] image mime={} bytes={}",
+                        image.mime_type,
+                        image.data.len()
+                    )?;
+                }
+            }
+            RawContent::Audio(audio) => {
+                writeln!(
+                    stderr,
+                    "[repl] audio mime={} bytes={}",
+                    audio.mime_type,
+                    audio.data.len()
+                )?;
+            }
+            RawContent::Resource(_) => {
+                writeln!(stderr, "[repl] resource content omitted")?;
+            }
+            RawContent::ResourceLink(_) => {
+                writeln!(stderr, "[repl] resource link omitted")?;
             }
         }
     }

@@ -174,15 +174,15 @@ fn repl_tool_descriptions_are_mode_specific() {
 #[test]
 fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
     assert!(matches!(
-        super::timeout_bundle_reuse(""),
+        super::response::timeout_bundle_reuse_for_input(""),
         super::response::TimeoutBundleReuse::FullReply
     ));
     assert!(matches!(
-        super::timeout_bundle_reuse("\n"),
+        super::response::timeout_bundle_reuse_for_input("\n"),
         super::response::TimeoutBundleReuse::FollowUpInput
     ));
     assert!(matches!(
-        super::timeout_bundle_reuse("\r\n"),
+        super::response::timeout_bundle_reuse_for_input("\r\n"),
         super::response::TimeoutBundleReuse::FollowUpInput
     ));
 }

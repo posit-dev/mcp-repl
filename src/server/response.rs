@@ -150,6 +150,33 @@ pub(crate) enum TimeoutBundleReuse {
     FollowUpInput,
 }
 
+pub(crate) fn timeout_bundle_reuse_for_input(input: &str) -> TimeoutBundleReuse {
+    if input.is_empty() {
+        return TimeoutBundleReuse::FullReply;
+    }
+
+    let Some(first) = input.chars().next() else {
+        return TimeoutBundleReuse::FullReply;
+    };
+    let tail = &input[first.len_utf8()..];
+    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
+        rest
+    } else if let Some(rest) = tail.strip_prefix('\n') {
+        rest
+    } else if let Some(rest) = tail.strip_prefix('\r') {
+        rest
+    } else {
+        tail
+    };
+
+    match first {
+        '\u{3}' if tail.is_empty() => TimeoutBundleReuse::FullReply,
+        '\u{3}' => TimeoutBundleReuse::FollowUpInput,
+        '\u{4}' => TimeoutBundleReuse::None,
+        _ => TimeoutBundleReuse::FollowUpInput,
+    }
+}
+
 impl ResponseState {
     pub(crate) fn new() -> Result<Self, WorkerError> {
         Ok(Self {
@@ -1008,7 +1035,41 @@ impl OutputStore {
 }
 
 fn create_output_store_root() -> std::io::Result<tempfile::TempDir> {
-    Builder::new().prefix("mcp-repl-output-").tempdir()
+    match Builder::new().prefix("mcp-repl-output-").tempdir() {
+        Ok(root) => Ok(root),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && output_store_temp_env_has_non_unicode_value() =>
+        {
+            Builder::new()
+                .prefix("mcp-repl-output-")
+                .tempdir_in(fallback_output_store_root_dir())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn output_store_temp_env_has_non_unicode_value() -> bool {
+    ["TMPDIR", "TMP", "TEMP"]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some() && std::env::var(name).is_err())
+}
+
+fn fallback_output_store_root_dir() -> PathBuf {
+    let candidate = std::env::temp_dir();
+    if candidate.exists() {
+        return candidate;
+    }
+
+    #[cfg(target_family = "unix")]
+    {
+        PathBuf::from("/tmp")
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    {
+        std::env::current_dir().unwrap_or(candidate)
+    }
 }
 
 impl OutputStoreLimits {
