@@ -38,12 +38,27 @@ async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     .await
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
-    text.contains("failed to start R session")
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+#[cfg(not(windows))]
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
         || text.contains("worker exited with status")
         || text.contains("worker exited with signal")
         || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
 }
