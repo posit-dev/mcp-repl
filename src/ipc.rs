@@ -365,6 +365,7 @@ impl ServerIpcConnection {
             .queue
             .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
         reset_after_completed_request(&mut guard);
+        guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
     }
@@ -1351,7 +1352,6 @@ fn take_request_end(guard: &mut ServerIpcInbox) -> bool {
 
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     guard.request_end_seen = false;
-    guard.echo_events.clear();
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;

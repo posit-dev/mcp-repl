@@ -72,6 +72,7 @@ pub(crate) struct FormattedPendingOutput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderedTextState {
     stream: TextStream,
+    origin: ContentOrigin,
     terminated: bool,
 }
 
@@ -270,13 +271,14 @@ impl PendingOutputSnapshot {
                         continue;
                     }
                     let text = if matches!(stream, TextStream::Stderr) {
-                        render_stderr_text(last_rendered_text, rendered)
+                        render_stderr_text(last_rendered_text, *origin, rendered)
                     } else {
                         rendered
                     };
                     push_text(&mut formatted.contents, *stream, *origin, text);
                     last_rendered_text = Some(RenderedTextState {
                         stream: *stream,
+                        origin: *origin,
                         terminated: *terminated,
                     });
                 }
@@ -542,10 +544,14 @@ fn note_progress(inner: &mut PendingOutputTapeInner) {
     inner.progress_seq = inner.progress_seq.saturating_add(1);
 }
 
-fn render_stderr_text(previous_text: Option<RenderedTextState>, rendered: String) -> String {
-    if previous_text
-        .is_some_and(|state| matches!(state.stream, TextStream::Stderr) && !state.terminated)
-    {
+fn render_stderr_text(
+    previous_text: Option<RenderedTextState>,
+    origin: ContentOrigin,
+    rendered: String,
+) -> String {
+    if previous_text.is_some_and(|state| {
+        matches!(state.stream, TextStream::Stderr) && state.origin == origin && !state.terminated
+    }) {
         return rendered;
     }
     let needs_separator =
@@ -668,6 +674,7 @@ fn rendered_text_state_after<'a>(
         match event {
             PendingOutputEvent::TextFragment {
                 stream,
+                origin,
                 bytes,
                 terminated,
                 ..
@@ -675,6 +682,7 @@ fn rendered_text_state_after<'a>(
                 if !bytes.is_empty() {
                     state = Some(RenderedTextState {
                         stream: *stream,
+                        origin: *origin,
                         terminated: *terminated,
                     });
                 }
@@ -1044,6 +1052,23 @@ mod tests {
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stderr("def\n")]
+        );
+    }
+
+    #[test]
+    fn server_stderr_notice_reprefixes_after_partial_worker_stderr() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stderr_bytes(b"partial");
+        tape.append_server_stderr_bytes(b"[repl] session ended\n");
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![
+                WorkerContent::worker_stderr("stderr: partial"),
+                WorkerContent::server_stderr("\nstderr: [repl] session ended\n"),
+            ]
         );
     }
 

@@ -4955,6 +4955,33 @@ mod tests {
     }
 
     #[test]
+    fn completion_preserves_echo_events_when_next_prompt_arrives_immediately() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+
+        driver_on_input_start("first()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "first()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert!(completion.protocol_warnings.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "first()\n");
+    }
+
+    #[test]
     fn completion_retains_echo_events_when_session_ends_before_request_end() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("quit()", &server);
