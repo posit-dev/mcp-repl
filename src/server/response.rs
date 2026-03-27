@@ -1171,11 +1171,8 @@ impl ActiveOutputBundle {
         store: &mut OutputStore,
         text: &str,
     ) -> Result<Option<ReplyItem>, WorkerError> {
-        if !self.has_events_log() {
-            return Ok(Some(ReplyItem::ServerText(text.to_string())));
-        }
-        let retained = self.append_events_log_text(store, text)?;
-        Ok(retained.map(|text| ReplyItem::ServerText(text.to_string())))
+        let _ = store;
+        Ok(Some(ReplyItem::ServerText(text.to_string())))
     }
 
     fn append_events_log_text<'a>(
@@ -1772,11 +1769,15 @@ fn render_active_bundle_contents(
 
     if append.omitted_this_reply {
         active.disclosed = true;
-        Ok(compact_text_bundle_items(
-            append.retained_items.clone(),
-            &retained_worker_text,
-            active,
-        ))
+        if active.next_image_number > 0 {
+            Ok(compact_output_bundle_items(&append.retained_items, active))
+        } else {
+            Ok(compact_text_bundle_items(
+                append.retained_items.clone(),
+                &retained_worker_text,
+                active,
+            ))
+        }
     } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
         Ok(compact_output_bundle_items(&append.retained_items, active))
@@ -3632,6 +3633,148 @@ mod tests {
         assert!(
             !transcript.contains(busy_marker),
             "did not expect timeout busy marker in transcript bundle, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_timeout_bundle_events_log_excludes_server_status_lines() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let busy_marker = "<<console status: busy>>\n";
+        let mut contents = vec![WorkerContent::worker_stdout("HEAD\n")];
+        contents.extend((0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD).map(|index| {
+            WorkerContent::ContentImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                id: format!("plot-{index}"),
+                is_new: true,
+            }
+        }));
+        contents.push(WorkerContent::server_stdout(busy_marker));
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(contents, Some(WorkerErrorCode::Timeout))),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let events_path = disclosed_path(&text, "events.log").unwrap_or_else(|| {
+            panic!("expected events log path in mixed timeout reply, got: {text:?}")
+        });
+        let events = fs::read_to_string(&events_path)
+            .unwrap_or_else(|err| panic!("expected events log to be readable: {err}"));
+
+        assert!(
+            text.contains(busy_marker),
+            "expected busy marker to remain inline, got: {text:?}"
+        );
+        assert!(
+            !events.contains(busy_marker),
+            "did not expect server-only busy marker in events.log, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn quota_truncated_active_image_bundle_keeps_inline_preview_compact() {
+        let initial_image_count = super::IMAGE_OUTPUT_BUNDLE_THRESHOLD;
+        let later_image_count = 5usize;
+        let mut sizing_state = ResponseState::new().expect("response state should initialize");
+        let mut sizing_bundle = sizing_state
+            .output_store
+            .new_bundle()
+            .expect("bundle should initialize");
+        for index in 0..initial_image_count {
+            let retained = sizing_bundle
+                .append_image(
+                    &mut sizing_state.output_store,
+                    &ReplyImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                        mime_type: "image/png".to_string(),
+                        is_new: true,
+                    },
+                )
+                .expect("initial image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        let current_bytes = sizing_state
+            .output_store
+            .bundle_bytes(sizing_bundle.id)
+            .expect("bundle metadata should exist");
+        for offset in 0..3 {
+            let retained = sizing_bundle
+                .append_image(
+                    &mut sizing_state.output_store,
+                    &ReplyImage {
+                        data: base64::engine::general_purpose::STANDARD
+                            .encode([(initial_image_count + offset) as u8]),
+                        mime_type: "image/png".to_string(),
+                        is_new: true,
+                    },
+                )
+                .expect("sizing image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        let quota_cap = sizing_state
+            .output_store
+            .bundle_bytes(sizing_bundle.id)
+            .expect("bundle metadata should exist after sizing");
+        assert!(
+            quota_cap > current_bytes,
+            "expected sizing pass to consume additional bundle bytes"
+        );
+
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("bundle should initialize");
+        for index in 0..initial_image_count {
+            let retained = bundle
+                .append_image(
+                    &mut state.output_store,
+                    &ReplyImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                        mime_type: "image/png".to_string(),
+                        is_new: true,
+                    },
+                )
+                .expect("initial image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        bundle.disclosed = true;
+        state.output_store.limits.max_bundle_bytes = quota_cap;
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                (0..later_image_count)
+                    .map(|offset| WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD
+                            .encode([(initial_image_count + offset) as u8]),
+                        mime_type: "image/png".to_string(),
+                        id: format!("later-{offset}"),
+                        is_new: true,
+                    })
+                    .collect(),
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+
+        assert!(
+            text.contains("later content omitted"),
+            "expected quota-truncated image bundle to report omitted content, got: {text:?}"
+        );
+        assert!(
+            !images.is_empty() && images.len() <= 2,
+            "expected quota-truncated image bundle to keep only compact anchor previews, got {} images",
+            images.len()
         );
     }
 
