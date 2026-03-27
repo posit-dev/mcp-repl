@@ -182,19 +182,8 @@ async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
 async fn spawn_behavior_session_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<common::McpTestSession> {
-    #[cfg(target_os = "windows")]
-    {
-        common::spawn_server_with_args_env_and_pager_page_chars(
-            vec!["--sandbox".to_string(), "danger-full-access".to_string()],
-            env_vars,
-            300,
-        )
-        .await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        common::spawn_server_with_files_env_vars(env_vars).await
-    }
+    // These assertions exercise the files-mode public API on every platform.
+    common::spawn_server_with_files_env_vars(env_vars).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
