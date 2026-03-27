@@ -95,6 +95,8 @@ pub enum WorkerToServerIpcMessage {
         data: String,
         is_new: bool,
     },
+    /// Emitted exactly when the backend knows the logical request has consumed all queued input.
+    /// No later `ReadlineResult` should follow for that same request.
     RequestEnd,
     SessionEnd,
 }
@@ -109,8 +111,6 @@ struct ServerIpcInbox {
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
     request_end_seen: bool,
-    dropping_late_echoes: bool,
-    expected_readline_lines: VecDeque<String>,
     protocol_warnings: VecDeque<String>,
     session_end: bool,
     disconnected: bool,
@@ -256,26 +256,11 @@ impl ServerIpcConnection {
                                 line: line.clone(),
                             };
                             let mut guard = reader_inbox.lock().unwrap();
-                            let mut matched_expected_line = false;
                             if guard.request_end_seen {
-                                if guard.dropping_late_echoes {
-                                    if take_matching_expected_readline_line(&mut guard, &line) {
-                                        matched_expected_line = true;
-                                        reset_after_completed_request(&mut guard);
-                                    } else {
-                                        reader_cvar.notify_all();
-                                        continue;
-                                    }
-                                }
-                                if guard.request_end_seen {
-                                    guard.protocol_warnings.push_back(
-                                        "protocol warning: worker emitted ReadlineResult after RequestEnd"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                            if !matched_expected_line {
-                                let _ = take_matching_expected_readline_line(&mut guard, &line);
+                                guard.protocol_warnings.push_back(
+                                    "protocol warning: worker emitted ReadlineResult after RequestEnd"
+                                        .to_string(),
+                                );
                             }
                             guard.readline_result_count =
                                 guard.readline_result_count.saturating_add(1);
@@ -374,27 +359,14 @@ impl ServerIpcConnection {
         Ok(())
     }
 
-    pub fn clear_prompt_history(&self) {
+    pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
+        guard
+            .queue
+            .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
+        reset_after_completed_request(&mut guard);
         guard.prompt_history.clear();
-    }
-
-    pub fn clear_echo_events(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.echo_events.clear();
-    }
-
-    pub fn clear_readline_tracking(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.readline_result_count = 0;
-        guard.readline_unmatched_starts = 0;
-        guard.readline_unmatched_since = None;
-        guard.last_prompt = None;
-    }
-
-    pub fn set_expected_readline_lines(&self, input: &str) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.expected_readline_lines = expected_readline_lines(input);
+        guard.protocol_warnings.clear();
     }
 
     pub fn waiting_for_next_input(&self, min_wait: Duration) -> bool {
@@ -406,14 +378,6 @@ impl ServerIpcConnection {
             return false;
         };
         since.elapsed() >= min_wait
-    }
-
-    pub fn clear_request_end_events(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard
-            .queue
-            .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
-        guard.dropping_late_echoes = guard.request_end_seen;
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {
@@ -1387,39 +1351,11 @@ fn take_request_end(guard: &mut ServerIpcInbox) -> bool {
 
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     guard.request_end_seen = false;
-    guard.dropping_late_echoes = false;
     guard.echo_events.clear();
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;
     guard.last_prompt = None;
-}
-
-fn expected_readline_lines(input: &str) -> VecDeque<String> {
-    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines = VecDeque::new();
-    let mut remaining = normalized.as_str();
-    while !remaining.is_empty() {
-        if let Some(pos) = remaining.find('\n') {
-            let (line, tail) = remaining.split_at(pos + 1);
-            lines.push_back(line.to_string());
-            remaining = tail;
-        } else {
-            lines.push_back(format!("{remaining}\n"));
-            break;
-        }
-    }
-    lines
-}
-
-fn take_matching_expected_readline_line(guard: &mut ServerIpcInbox, line: &str) -> bool {
-    match guard.expected_readline_lines.front() {
-        Some(expected) if expected == line => {
-            guard.expected_readline_lines.pop_front();
-            true
-        }
-        _ => false,
-    }
 }
 
 fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {

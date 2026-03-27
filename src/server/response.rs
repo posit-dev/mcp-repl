@@ -1942,19 +1942,19 @@ fn render_active_bundle_contents(
     } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
         Ok(compact_output_bundle_items(&append.retained_items, active))
-    } else if active.was_disclosed() && image_bundle_still_needed && has_incremental_content {
-        active.disclosed = true;
-        Ok(materialize_items_with_output_bundle_notice(
-            inline_items.to_vec(),
-            active,
-            0,
-        ))
     } else if text_should_spill(spill_worker_text_chars) {
         active.disclosed = true;
         Ok(compact_text_bundle_items(
             append.retained_items.clone(),
             &retained_worker_text,
             active,
+        ))
+    } else if active.was_disclosed() && image_bundle_still_needed && has_incremental_content {
+        active.disclosed = true;
+        Ok(materialize_items_with_output_bundle_notice(
+            inline_items.to_vec(),
+            active,
+            0,
         ))
     } else {
         Ok(materialize_items(inline_items.to_vec()))
@@ -3274,6 +3274,64 @@ mod tests {
         assert!(
             transcript.contains("TAIL\n"),
             "expected later small poll output to append to the existing timeout bundle, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_image_bundle_spills_later_oversized_text_to_existing_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+            let image = ReplyImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                is_new: true,
+            };
+            let retained = bundle
+                .append_image(&mut state.output_store, &image)
+                .expect("timeout image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let oversized = (0..1200)
+            .map(|index| format!("line{index:04}\n"))
+            .collect::<String>();
+        assert!(
+            super::text_should_spill(oversized.chars().count()),
+            "expected later timeout text to cross the hard spill threshold"
+        );
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(oversized.clone())],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert!(
+            disclosed_path(&text, "events.log").is_some(),
+            "expected later oversized poll to keep disclosing the existing bundle path, got: {text:?}"
+        );
+        assert!(
+            !text.contains("line0600\n"),
+            "did not expect a middle line from the oversized text to stay inline, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("line0600\n"),
+            "expected the existing bundle transcript to receive the oversized text, got: {transcript:?}"
         );
     }
 

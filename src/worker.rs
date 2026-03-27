@@ -176,8 +176,8 @@ fn request_loop(rx: mpsc::Receiver<QueuedRequest>, state: Arc<WorkerState>) {
         let result = write_stdin_request(request.text);
         if let Err(err) = result {
             emit_stderr_message(&err.message);
+            emit_request_end();
         }
-        emit_request_end();
         state.mark_idle();
     }
 }
