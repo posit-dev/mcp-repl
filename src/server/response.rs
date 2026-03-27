@@ -264,40 +264,7 @@ impl ResponseState {
             && staged_timeout_output.is_none()
             && should_spill_detached_prefix_only(&material)
         {
-            match self.output_store.new_bundle() {
-                Ok(mut bundle) => {
-                    match bundle
-                        .append_items(&mut self.output_store, &material.detached_prefix_items)
-                    {
-                        Ok(append) => {
-                            let retained_worker_text =
-                                worker_text_from_items(&append.retained_items);
-                            let mut contents = compact_text_bundle_items(
-                                append.retained_items,
-                                &retained_worker_text,
-                                &bundle,
-                            );
-                            contents.extend(materialize_items(material.reply_inline_items.clone()));
-                            contents
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "dropping detached idle bundle after output-bundle error: {err}"
-                            );
-                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
-                                eprintln!(
-                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
-                                );
-                            }
-                            compact_without_output_bundle(&material)
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    compact_without_output_bundle(&material)
-                }
-            }
+            self.finalize_reply_with_spilled_detached_prefix(&material, pending_request_after)
         } else {
             let TimeoutReplySegment {
                 contents,
@@ -321,6 +288,43 @@ impl ResponseState {
         };
 
         finalize_batch(contents, material.is_error)
+    }
+
+    fn finalize_reply_with_spilled_detached_prefix(
+        &mut self,
+        material: &ReplyMaterial,
+        pending_request_after: bool,
+    ) -> Vec<Content> {
+        let FollowUpDetachedPrefix {
+            mut contents,
+            protected_bundle_id,
+            retained_active_timeout_bundle,
+            retained_staged_timeout_output,
+        } = self.render_follow_up_detached_prefix(material, None, None);
+        let TimeoutReplySegment {
+            contents: reply_contents,
+            retained_active_timeout_bundle: retained_reply_timeout_bundle,
+            retained_staged_timeout_output: retained_reply_staged_timeout_output,
+        } = self.render_timeout_reply_segment(
+            TimeoutReplyView {
+                bundle_items: &material.reply_bundle_items,
+                inline_items: &material.reply_inline_items,
+                worker_text: &material.reply_worker_text,
+                error_code: material.error_code,
+                protected_bundle_id,
+            },
+            pending_request_after,
+            None,
+            None,
+        );
+        contents.extend(reply_contents);
+        self.active_timeout_bundle = retained_reply_timeout_bundle;
+        self.staged_timeout_output = retained_reply_staged_timeout_output;
+
+        debug_assert!(retained_active_timeout_bundle.is_none());
+        debug_assert!(retained_staged_timeout_output.is_none());
+
+        contents
     }
 
     fn finalize_follow_up_reply(
@@ -1810,14 +1814,6 @@ fn compact_items_without_output_bundle(
     materialize_items(inline_items.to_vec())
 }
 
-fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
-    compact_items_without_output_bundle(
-        &material.bundle_items,
-        &material.inline_items,
-        &material.worker_text,
-    )
-}
-
 fn compact_detached_prefix_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
     compact_items_without_output_bundle(
         &material.detached_prefix_items,
@@ -2537,6 +2533,93 @@ mod tests {
         assert!(
             !transcript.contains("FOLLOWUP_OK"),
             "did not expect follow-up reply to be appended to detached prefix bundle: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn detached_prefix_timeout_poll_preserves_later_timeout_bundle_state() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let detached_prefix = format!(
+            "IDLE_START\n{}\nIDLE_END\n",
+            "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let first_timeout_chunk = "FIRST_TIMEOUT\n".to_string();
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout(first_timeout_chunk.clone()),
+                ],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            1,
+        );
+
+        let first_text = result_text(&first);
+        let detached_transcript_path = disclosed_path(&first_text, "transcript.txt")
+            .unwrap_or_else(|| {
+                panic!("expected detached prefix transcript path, got: {first_text:?}")
+            });
+        let detached_transcript =
+            fs::read_to_string(&detached_transcript_path).unwrap_or_else(|err| {
+                panic!("expected detached prefix transcript to be readable: {err}")
+            });
+
+        assert!(
+            first_text.contains(&first_timeout_chunk),
+            "expected the first timed-out chunk to stay inline, got: {first_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the timed-out poll to retain timeout state after detached-prefix compaction"
+        );
+        assert!(
+            detached_transcript.contains("IDLE_START") && detached_transcript.contains("IDLE_END"),
+            "expected detached-prefix transcript content, got: {detached_transcript:?}"
+        );
+        assert!(
+            !detached_transcript.contains(&first_timeout_chunk),
+            "did not expect the timed-out chunk in the detached-prefix transcript: {detached_transcript:?}"
+        );
+
+        let later_timeout_chunk = format!(
+            "SECOND_START\n{}\nSECOND_END\n",
+            "y".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(later_timeout_chunk.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let second_text = result_text(&second);
+        let timeout_transcript_path = disclosed_path(&second_text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected timeout transcript path, got: {second_text:?}"));
+        let timeout_transcript = fs::read_to_string(&timeout_transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert_ne!(
+            timeout_transcript_path, detached_transcript_path,
+            "expected the later timeout spill to use a separate transcript path"
+        );
+        assert!(
+            timeout_transcript.contains(&first_timeout_chunk),
+            "expected the later timeout transcript to backfill the first timed-out chunk, got: {timeout_transcript:?}"
+        );
+        assert!(
+            timeout_transcript.contains("SECOND_START")
+                && timeout_transcript.contains("SECOND_END"),
+            "expected the later timeout transcript to include the new timed-out chunk, got: {timeout_transcript:?}"
+        );
+        assert!(
+            !timeout_transcript.contains("IDLE_START"),
+            "did not expect detached-prefix output in the later timeout transcript: {timeout_transcript:?}"
         );
     }
 
