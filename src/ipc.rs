@@ -105,10 +105,11 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
-    expected_echo_events: usize,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
+    request_end_seen: bool,
+    protocol_warnings: VecDeque<String>,
     session_end: bool,
     disconnected: bool,
 }
@@ -222,6 +223,12 @@ impl ServerIpcConnection {
                         WorkerToServerIpcMessage::ReadlineStart { prompt } => {
                             let prompt_for_handler = prompt.clone();
                             let mut guard = reader_inbox.lock().unwrap();
+                            if guard.request_end_seen {
+                                guard.protocol_warnings.push_back(
+                                    "protocol warning: worker emitted ReadlineStart after RequestEnd"
+                                        .to_string(),
+                                );
+                            }
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
                             if guard.readline_unmatched_starts == 1 {
@@ -250,6 +257,12 @@ impl ServerIpcConnection {
                                 line: line.clone(),
                             };
                             let mut guard = reader_inbox.lock().unwrap();
+                            if guard.request_end_seen {
+                                guard.protocol_warnings.push_back(
+                                    "protocol warning: worker emitted ReadlineResult after RequestEnd"
+                                        .to_string(),
+                                );
+                            }
                             guard.readline_result_count =
                                 guard.readline_result_count.saturating_add(1);
                             if guard.readline_unmatched_starts > 0 {
@@ -303,6 +316,9 @@ impl ServerIpcConnection {
                             let mut guard = reader_inbox.lock().unwrap();
                             let is_request_end =
                                 matches!(other, WorkerToServerIpcMessage::RequestEnd);
+                            if is_request_end {
+                                guard.request_end_seen = true;
+                            }
                             guard.queue.push_back(other);
                             reader_cvar.notify_all();
                             drop(guard);
@@ -362,16 +378,6 @@ impl ServerIpcConnection {
         guard.last_prompt = None;
     }
 
-    pub fn set_expected_echo_event_count(&self, count: usize) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.expected_echo_events = count;
-    }
-
-    pub fn expected_echo_event_count(&self) -> usize {
-        let guard = self.inbox.lock().unwrap();
-        guard.expected_echo_events
-    }
-
     pub fn waiting_for_next_input(&self, min_wait: Duration) -> bool {
         let guard = self.inbox.lock().unwrap();
         if guard.readline_result_count == 0 || guard.readline_unmatched_starts == 0 {
@@ -388,6 +394,7 @@ impl ServerIpcConnection {
         guard
             .queue
             .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
+        guard.request_end_seen = false;
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {
@@ -403,6 +410,11 @@ impl ServerIpcConnection {
     pub fn pending_echo_event_count(&self) -> usize {
         let guard = self.inbox.lock().unwrap();
         guard.echo_events.len()
+    }
+
+    pub fn take_protocol_warnings(&self) -> Vec<String> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.protocol_warnings.drain(..).collect()
     }
 
     pub fn wait_for_request_end(&self, timeout: Duration) -> Result<(), IpcWaitError> {

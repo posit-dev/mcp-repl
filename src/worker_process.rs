@@ -42,7 +42,7 @@ use crate::sandbox_cli::{
     sandbox_plan_requests_inherited_state,
 };
 use crate::worker_protocol::{
-    TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
+    ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 #[cfg(target_family = "unix")]
@@ -164,7 +164,6 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.clear_readline_tracking();
     ipc.clear_prompt_history();
     ipc.clear_echo_events();
-    ipc.set_expected_echo_event_count(expected_echo_event_count(_text));
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
@@ -192,6 +191,7 @@ fn driver_wait_for_completion(
                     prompt,
                     prompt_variants: Some(prompt_variants),
                     echo_events: ipc.take_echo_events(),
+                    protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: false,
                 });
             }
@@ -204,6 +204,7 @@ fn driver_wait_for_completion(
                         prompt,
                         prompt_variants: Some(prompt_variants),
                         echo_events: ipc.take_echo_events(),
+                        protocol_warnings: ipc.take_protocol_warnings(),
                         session_end_seen: false,
                     });
                 }
@@ -214,6 +215,7 @@ fn driver_wait_for_completion(
                     prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
+                    protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
             }
@@ -376,8 +378,8 @@ const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
-    let expected_echo_event_count = ipc.expected_echo_event_count();
     let mut echo_event_count = ipc.pending_echo_event_count();
+    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -386,6 +388,9 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
         let next_echo_event_count = ipc.pending_echo_event_count();
+        if next_echo_event_count > echo_event_count {
+            saw_late_echo_event = true;
+        }
         let changed = next_prompt.is_some()
             || !next_prompt_variants.is_empty()
             || next_echo_event_count != echo_event_count;
@@ -400,9 +405,7 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if stable_for >= COMPLETION_METADATA_STABLE
-                && echo_event_count >= expected_echo_event_count
-            {
+            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -459,6 +462,7 @@ struct CompletionInfo {
     prompt: Option<String>,
     prompt_variants: Option<Vec<String>>,
     echo_events: Vec<IpcEchoEvent>,
+    protocol_warnings: Vec<String>,
     session_end_seen: bool,
 }
 
@@ -943,6 +947,7 @@ impl WorkerManager {
             prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
             session_end_seen: false,
         };
 
@@ -989,6 +994,7 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
+        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
 
         let session_end = completion.session_end_seen;
         let resolved_prompt = normalize_prompt(completion.prompt.clone());
@@ -1001,6 +1007,9 @@ impl WorkerManager {
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
+            }
+            if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
+                let _ = drop_echo_only_contents(&mut contents, &echo);
             }
             append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
@@ -1031,6 +1040,7 @@ impl WorkerManager {
             prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
             session_end_seen: false,
         };
 
@@ -1100,6 +1110,7 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
+        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
 
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
@@ -1314,6 +1325,7 @@ impl WorkerManager {
                 let formatted = self.drain_final_formatted_output();
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
+                append_protocol_warnings(&mut contents, &completion.protocol_warnings);
                 let resolved_prompt = if session_end {
                     None
                 } else {
@@ -1323,6 +1335,9 @@ impl WorkerManager {
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
+                    }
+                    if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
+                        let _ = drop_echo_only_contents(&mut contents, &echo);
                     }
                     append_prompt_if_missing(&mut contents, resolved_prompt.clone());
                 }
@@ -1424,6 +1439,7 @@ impl WorkerManager {
                     last_range,
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
+                append_protocol_warnings(&mut contents, &completion.protocol_warnings);
                 pager::maybe_activate_and_append_footer(
                     &mut self.pager,
                     &mut contents,
@@ -1544,7 +1560,7 @@ impl WorkerManager {
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = std::time::Instant::now();
-        let mut result = self.driver.wait_for_completion(timeout, ipc);
+        let mut result = self.driver.wait_for_completion(timeout, ipc.clone());
         if matches!(
             &result,
             Err(WorkerError::Protocol(message))
@@ -1567,6 +1583,7 @@ impl WorkerManager {
                     prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
+                    protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
             }
@@ -3210,21 +3227,48 @@ fn drop_echo_only_output(
     true
 }
 
+fn drop_echo_only_contents(contents: &mut Vec<WorkerContent>, echo: &str) -> bool {
+    if echo.is_empty() {
+        return false;
+    }
+
+    let mut remaining = echo;
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            return false;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            return false;
+        }
+        if remaining.len() >= text.len() {
+            if !remaining.starts_with(text.as_str()) {
+                return false;
+            }
+            remaining = &remaining[text.len()..];
+        } else {
+            return false;
+        }
+    }
+
+    if !remaining.is_empty() {
+        return false;
+    }
+
+    contents.clear();
+    true
+}
+
 fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
 
 fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-fn expected_echo_event_count(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    normalize_input_newlines(text)
-        .split_terminator('\n')
-        .count()
 }
 
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
@@ -3237,6 +3281,12 @@ fn timeout_status_content(timeout: Duration) -> WorkerContent {
 
 fn idle_status_content() -> WorkerContent {
     WorkerContent::server_stdout("<<console status: idle>>")
+}
+
+fn append_protocol_warnings(contents: &mut Vec<WorkerContent>, warnings: &[String]) {
+    for warning in warnings {
+        contents.push(WorkerContent::server_stderr(format!("[repl] {warning}")));
+    }
 }
 
 const TIMEOUT_STATUS_GRANULARITY_MS: u64 = 100;
@@ -4567,7 +4617,6 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
 
         let late_sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(1));
@@ -4580,6 +4629,7 @@ mod tests {
                 prompt: "+ ".to_string(),
                 line: "1\n".to_string(),
             });
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::RequestEnd);
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -4588,10 +4638,44 @@ mod tests {
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 2);
+        assert!(completion.protocol_warnings.is_empty());
         assert_eq!(completion.echo_events[0].prompt, "> ");
         assert_eq!(completion.echo_events[0].line, "1+\n");
         assert_eq!(completion.echo_events[1].prompt, "+ ");
         assert_eq!(completion.echo_events[1].line, "1\n");
+    }
+
+    #[test]
+    fn completion_warns_when_readline_result_arrives_after_request_end() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let delayed_worker = worker.clone();
+        let late_sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "1+1\n".to_string(),
+            });
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        late_sender.join().expect("late sender should join");
+
+        assert!(
+            completion
+                .protocol_warnings
+                .iter()
+                .any(|warning| warning.contains("ReadlineResult after RequestEnd")),
+            "expected protocol warning, got: {:?}",
+            completion.protocol_warnings
+        );
     }
 
     #[test]
