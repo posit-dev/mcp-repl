@@ -293,6 +293,11 @@ fn has_interpreter_config_arg(args: &[String]) -> bool {
     })
 }
 
+fn has_oversized_output_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--oversized-output" || arg.starts_with("--oversized-output="))
+}
+
 fn has_interpreter_value(args: &[String], target: &str) -> bool {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -340,6 +345,10 @@ fn codex_install_args(base_args: &[String]) -> Vec<String> {
         args.push("--sandbox".to_string());
         args.push("inherit".to_string());
     }
+    if !has_oversized_output_arg(base_args) {
+        args.push("--oversized-output".to_string());
+        args.push("files".to_string());
+    }
     args
 }
 
@@ -348,6 +357,10 @@ fn claude_install_args(base_args: &[String]) -> Vec<String> {
     if !has_sandbox_config_arg(base_args) {
         args.push("--sandbox".to_string());
         args.push("workspace-write".to_string());
+    }
+    if !has_oversized_output_arg(base_args) {
+        args.push("--oversized-output".to_string());
+        args.push("files".to_string());
     }
     args
 }
@@ -879,7 +892,9 @@ name="demo"
                 "--interpreter".to_string(),
                 "python".to_string(),
                 "--sandbox".to_string(),
-                "inherit".to_string()
+                "inherit".to_string(),
+                "--oversized-output".to_string(),
+                "files".to_string()
             ]
         );
     }
@@ -893,7 +908,9 @@ name="demo"
                 "--interpreter".to_string(),
                 "python".to_string(),
                 "--sandbox".to_string(),
-                "workspace-write".to_string()
+                "workspace-write".to_string(),
+                "--oversized-output".to_string(),
+                "files".to_string()
             ]
         );
     }
@@ -906,8 +923,16 @@ name="demo"
             "--interpreter".to_string(),
             "python".to_string(),
         ];
-        assert_eq!(codex_install_args(&base), base);
-        assert_eq!(claude_install_args(&base), base);
+        let expected = vec![
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), expected);
+        assert_eq!(claude_install_args(&base), expected);
     }
 
     #[test]
@@ -918,8 +943,16 @@ name="demo"
             "--interpreter".to_string(),
             "python".to_string(),
         ];
-        assert_eq!(codex_install_args(&base), base);
-        assert_eq!(claude_install_args(&base), base);
+        let expected = vec![
+            "--config".to_string(),
+            "sandbox_mode=read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), expected);
+        assert_eq!(claude_install_args(&base), expected);
     }
 
     #[test]
@@ -929,8 +962,47 @@ name="demo"
             "--interpreter".to_string(),
             "python".to_string(),
         ];
-        assert_eq!(codex_install_args(&base), base);
-        assert_eq!(claude_install_args(&base), base);
+        let expected = vec![
+            "--config=sandbox_workspace_write.network_access=true".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), expected);
+        assert_eq!(claude_install_args(&base), expected);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_oversized_output_mode() {
+        let base = vec![
+            "--oversized-output".to_string(),
+            "pager".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(
+            codex_install_args(&base),
+            vec![
+                "--oversized-output".to_string(),
+                "pager".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+            ]
+        );
+        assert_eq!(
+            claude_install_args(&base),
+            vec![
+                "--oversized-output".to_string(),
+                "pager".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+            ]
+        );
     }
 
     #[test]

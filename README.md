@@ -96,6 +96,8 @@ Point your MCP client at the binary (either via `PATH` or by using an explicit p
 You can auto-install into existing agent config files:
 
 ```sh
+# bare mcp-repl defaults to pager unless you pass --oversized-output explicitly
+
 # install to all available targets (does not create ~/.codex if missing)
 mcp-repl install
 
@@ -109,8 +111,11 @@ mcp-repl install --client claude
 mcp-repl install --client codex --interpreter r
 ```
 
-`install --client codex` writes `--sandbox inherit` by default. That sentinel means `mcp-repl` should
-inherit sandbox policy updates from Codex for the session.
+Bare `mcp-repl` defaults to `--oversized-output pager`.
+
+`install --client codex` writes `--sandbox inherit --oversized-output files` by default. That
+sentinel means `mcp-repl` should inherit sandbox policy updates from Codex for the session while
+keeping installed Codex configs on the file-backed oversized-output path.
 
 Example `R` REPL Codex config (paths vary by OS/user):
 
@@ -123,6 +128,7 @@ tool_timeout_sec = 1800
 # If no update is sent, mcp-repl exits with an error.
 args = [
   "--sandbox", "inherit",
+  "--oversized-output", "files",
   "--interpreter", "r",
 ]
 ```
@@ -138,12 +144,13 @@ tool_timeout_sec = 1800
 # If no update is sent, mcp-repl exits with an error.
 args = [
   "--sandbox", "inherit",
+  "--oversized-output", "files",
   "--interpreter", "python",
 ]
 ```
 
-For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode
-because Claude does not propagate sandbox state updates to MCP servers:
+For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode and
+`--oversized-output files` because Claude does not propagate sandbox state updates to MCP servers:
 
 ```json
 // ~/.claude.json
@@ -151,11 +158,11 @@ because Claude does not propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--oversized-output", "files", "--interpreter", "r"]
     },
     "python": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
+      "args": ["--sandbox", "workspace-write", "--oversized-output", "files", "--interpreter", "python"]
     }
   }
 }

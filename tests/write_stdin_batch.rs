@@ -97,7 +97,7 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session(
+        .files_session(
             "timeout_list",
             mcp_session!(|session| {
                 session.write_stdin_with("Sys.sleep(5)", Some(2.0)).await;
@@ -270,7 +270,7 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let mut input = String::new();
     for idx in 1..=1_000 {

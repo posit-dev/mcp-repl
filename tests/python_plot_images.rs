@@ -400,7 +400,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -413,7 +413,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &plot_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let update_input = format!(
         "{}; plt.figure(1); plt.plot(list(range(4, 9)), list(range(4, 9))); plt.show()",
         python_plot_preamble()
@@ -424,7 +424,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&update_input, &update_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -483,7 +483,7 @@ async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -496,14 +496,14 @@ async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &first_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let second_result = session
         .write_stdin_raw_with(&plot_input, Some(30.0))
         .await?;
     steps.push(step_snapshot(&plot_input, &second_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -559,7 +559,7 @@ async fn python_multi_panel_plots_emit_single_image() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -647,7 +647,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -660,7 +660,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &plot_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let update_input = format!(
         "{}; plt.figure(2); plt.plot([0.1, 0.9], [0.9, 0.1]); plt.show()",
         python_plot_preamble()
@@ -671,7 +671,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&update_input, &update_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -730,7 +730,7 @@ async fn python_grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -743,14 +743,14 @@ async fn python_grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &first_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let second_result = session
         .write_stdin_raw_with(&plot_input, Some(30.0))
         .await?;
     steps.push(step_snapshot(&plot_input, &second_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -809,7 +809,7 @@ async fn python_plot_updates_in_single_request_collapse() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
 
     let input = format!(
         "{}; plt.figure(1); plt.clf(); plt.plot(list(range(1, 11))); plt.plot(list(range(2, 10)), list(range(2, 10))); plt.plot(list(range(2, 10)), list(range(2, 10))); plt.show()",
@@ -881,7 +881,7 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
 
     let input = format!(
         "{}; exec(\"for i in range(1, 7):\\n    print(f'warn{{i:03d}}')\\n    plt.figure(i)\\n    plt.clf()\\n    plt.plot(list(range(1, 11)))\\n    plt.title(f'plot{{i:03d}}')\\n    plt.show()\")",
@@ -985,7 +985,7 @@ async fn python_same_reply_plot_updates_bundle_preserves_image_history() -> Test
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
 
     let input = format!(
         "{}; exec(\"big = 'h' * {}\\nprint('HISTORY_START')\\nprint(big)\\nprint('HISTORY_END')\\nplt.figure(1)\\nplt.clf()\\nplt.plot(list(range(1, 11)))\\nplt.plot(list(range(2, 10)), list(range(2, 10)))\\nplt.plot(list(range(3, 9)), list(range(3, 9)))\\nplt.show()\")",

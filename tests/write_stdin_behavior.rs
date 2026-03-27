@@ -169,7 +169,7 @@ async fn spawn_behavior_session_with_env_vars(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        common::spawn_server_with_env_vars(env_vars).await
+        common::spawn_server_with_files_env_vars(env_vars).await
     }
 }
 

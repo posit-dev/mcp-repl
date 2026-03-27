@@ -214,7 +214,7 @@ fn driver_wait_for_completion(
                 return Ok(CompletionInfo {
                     prompt: None,
                     prompt_variants: None,
-                    echo_events: Vec::new(),
+                    echo_events: ipc.take_echo_events(),
                     protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
@@ -434,6 +434,7 @@ struct InputContext {
     start_offset: u64,
     prefix_bytes: u64,
     input_echo: Option<String>,
+    input_transcript: Option<String>,
 }
 
 struct ReplyWithOffset {
@@ -1002,12 +1003,17 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
+        let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+        let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+        if !timed_out {
+            maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
+            if let Some(echo) = echo_transcript.as_deref() {
+                let _ = drop_echo_only_contents(&mut contents, echo);
+            }
+        }
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
-            }
-            if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
-                let _ = drop_echo_only_contents(&mut contents, &echo);
             }
             append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
@@ -1109,7 +1115,18 @@ impl WorkerManager {
             contents.push(timeout_status_content(elapsed));
         }
         append_protocol_warnings(&mut contents, &completion.protocol_warnings);
+        if !timed_out && let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
+            let _ = drop_echo_only_contents(&mut contents, &echo);
+        }
 
+        let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+        let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+        if !timed_out {
+            maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
+            if let Some(echo) = echo_transcript.as_deref() {
+                let _ = drop_echo_only_contents(&mut contents, echo);
+            }
+        }
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
             &mut contents,
@@ -1166,6 +1183,7 @@ impl WorkerManager {
             start_offset: 0,
             prefix_bytes: 0,
             input_echo: None,
+            input_transcript: None,
         }
     }
 
@@ -1174,10 +1192,13 @@ impl WorkerManager {
 
         let had_pending_output = self.output.has_pending_output();
         let saw_background_output = self.output.pending_output_since_last_reply();
+        let prompt_hint = self.current_prompt_hint();
+        self.remember_prompt(prompt_hint.clone());
 
         let mut input_echo = echo_input
             .then(|| text.to_string())
             .and_then(|value| pager::build_input_echo(&value));
+        let input_transcript = build_input_transcript(prompt_hint.as_deref(), text);
 
         let mut prefix_contents = Vec::new();
         let mut prefix_bytes: u64 = 0;
@@ -1206,6 +1227,7 @@ impl WorkerManager {
             start_offset,
             prefix_bytes,
             input_echo,
+            input_transcript,
         }
     }
 
@@ -1330,12 +1352,15 @@ impl WorkerManager {
                     normalize_prompt(completion.prompt.clone())
                 };
                 self.remember_prompt(resolved_prompt.clone());
+                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+                maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
+                if let Some(echo) = echo_transcript.as_deref() {
+                    let _ = drop_echo_only_contents(&mut contents, echo);
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
-                    }
-                    if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
-                        let _ = drop_echo_only_contents(&mut contents, &echo);
                     }
                     append_prompt_if_missing(&mut contents, resolved_prompt.clone());
                 }
@@ -1404,6 +1429,7 @@ impl WorkerManager {
         self.last_detached_prefix_item_count = context.prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 let mut session_end = completion.session_end_seen;
                 if !session_end
                     && let Some(process) = self.process.as_mut()
@@ -1438,6 +1464,9 @@ impl WorkerManager {
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
                 append_protocol_warnings(&mut contents, &completion.protocol_warnings);
+                if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
+                    let _ = drop_echo_only_contents(&mut contents, &echo);
+                }
                 pager::maybe_activate_and_append_footer(
                     &mut self.pager,
                     &mut contents,
@@ -1454,6 +1483,17 @@ impl WorkerManager {
                 self.remember_prompt(resolved_prompt.clone());
                 if self.pager.is_active() && !session_end {
                     self.pager_prompt = resolved_prompt.clone();
+                }
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    fallback_input_transcript.is_some()
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript);
+                maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
+                if let Some(echo) = echo_transcript.as_deref() {
+                    let _ = drop_echo_only_contents(&mut contents, echo);
                 }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
@@ -1478,6 +1518,7 @@ impl WorkerManager {
                 })
             }
             Err(WorkerError::Timeout(_)) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 if let Some(process) = self.process.as_mut() {
                     match process.is_running() {
                         Ok(true) => {}
@@ -1507,6 +1548,10 @@ impl WorkerManager {
                     last_range,
                 } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
                 contents.append(&mut page_contents);
+                maybe_trim_echo_prefix(&mut contents, fallback_input_transcript.as_deref(), true);
+                if let Some(echo) = fallback_input_transcript.as_deref() {
+                    let _ = drop_echo_only_contents(&mut contents, echo);
+                }
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
@@ -2731,14 +2776,32 @@ fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
     Some(transcript)
 }
 
-fn line_matches_echo_event(line: &[u8], event: &IpcEchoEvent) -> bool {
+fn echo_event_prefix_len(line: &[u8], event: &IpcEchoEvent) -> Option<usize> {
     let prompt = event.prompt.as_bytes();
     let consumed = event.line.as_bytes();
-    if line.len() != prompt.len().saturating_add(consumed.len()) {
-        return false;
+    if line.len() == prompt.len().saturating_add(consumed.len()) {
+        let (prefix, suffix) = line.split_at(prompt.len());
+        if prefix == prompt && suffix == consumed {
+            return Some(line.len());
+        }
+    }
+
+    let consumed = if let Some(consumed) = consumed.strip_suffix(b"\r\n") {
+        consumed
+    } else if let Some(consumed) = consumed.strip_suffix(b"\n") {
+        consumed
+    } else {
+        return None;
+    };
+    let prefix_len = prompt.len().saturating_add(consumed.len());
+    if line.len() <= prefix_len {
+        return None;
     }
     let (prefix, suffix) = line.split_at(prompt.len());
-    prefix == prompt && suffix == consumed
+    if prefix != prompt || !suffix.starts_with(consumed) {
+        return None;
+    }
+    Some(prefix_len)
 }
 
 #[derive(Default)]
@@ -2841,6 +2904,8 @@ fn collapse_echo_with_attribution(
     echo_events: &[IpcEchoEvent],
     prompt_variants: &[String],
 ) -> (Vec<u8>, Vec<(u64, OutputEventKind)>, Vec<OutputTextSpan>) {
+    use std::cell::Cell;
+
     const ECHO_MARKER_MIN_BYTES: usize = 512;
 
     let mut out_bytes: Vec<u8> = Vec::new();
@@ -2850,6 +2915,7 @@ fn collapse_echo_with_attribution(
     let prompt_variants = prompt_variants_bytes(prompt_variants);
     let mut pending = PendingEchoRun::default();
     let mut echo_idx = 0usize;
+    let saw_substantive_output = Cell::new(false);
 
     let base_offset = range.start_offset;
     let end_offset = range.end_offset;
@@ -2877,6 +2943,9 @@ fn collapse_echo_with_attribution(
             return;
         }
         let pending = pending.take();
+        if !saw_substantive_output.get() {
+            return;
+        }
         let head = pending.head.as_deref().unwrap_or_default();
         let tail = pending.tail.as_deref().unwrap_or_default();
         if pending.lines >= 2 || pending.bytes >= ECHO_MARKER_MIN_BYTES {
@@ -2909,6 +2978,7 @@ fn collapse_echo_with_attribution(
                 &mut echo_idx,
                 &prompt_variants,
                 &mut pending,
+                &saw_substantive_output,
                 &mut flush_pending,
                 &mut out_bytes,
                 &mut out_text_spans,
@@ -2933,6 +3003,7 @@ fn collapse_echo_with_attribution(
             &mut echo_idx,
             &prompt_variants,
             &mut pending,
+            &saw_substantive_output,
             &mut flush_pending,
             &mut out_bytes,
             &mut out_text_spans,
@@ -2978,6 +3049,7 @@ fn consume_text_segment_with_spans(
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
+    saw_substantive_output: &std::cell::Cell<bool>,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
@@ -3001,6 +3073,7 @@ fn consume_text_segment_with_spans(
                 echo_idx,
                 prompt_variants,
                 pending,
+                saw_substantive_output,
                 flush_pending,
                 out_bytes,
                 out_text_spans,
@@ -3013,6 +3086,7 @@ fn consume_text_segment_with_spans(
             echo_idx,
             prompt_variants,
             pending,
+            saw_substantive_output,
             flush_pending,
             out_bytes,
             out_text_spans,
@@ -3027,6 +3101,7 @@ fn consume_text_segment_with_spans(
             echo_idx,
             prompt_variants,
             pending,
+            saw_substantive_output,
             flush_pending,
             out_bytes,
             out_text_spans,
@@ -3042,6 +3117,7 @@ fn consume_text_segment(
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
+    saw_substantive_output: &std::cell::Cell<bool>,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
@@ -3058,13 +3134,24 @@ fn consume_text_segment(
         let line = &segment[start..end];
         start = end;
 
-        let is_echo =
-            *echo_idx < echo_events.len() && line_matches_echo_event(line, &echo_events[*echo_idx]);
-        if is_echo {
-            pending.push(line);
+        let echo_prefix = if *echo_idx < echo_events.len() {
+            echo_event_prefix_len(line, &echo_events[*echo_idx])
+        } else {
+            None
+        };
+        if let Some(prefix_len) = echo_prefix {
+            pending.push(&line[..prefix_len]);
             *echo_idx = echo_idx.saturating_add(1);
-            continue;
+            if prefix_len == line.len() {
+                continue;
+            }
         }
+
+        let line = if let Some(prefix_len) = echo_prefix {
+            &line[prefix_len..]
+        } else {
+            line
+        };
 
         let substantive =
             !is_ascii_whitespace_only(line) && !is_prompt_only_fragment(line, prompt_variants);
@@ -3072,6 +3159,9 @@ fn consume_text_segment(
             flush_pending(out_bytes, out_text_spans, pending);
         }
         append_text_with_span(out_bytes, out_text_spans, line, is_stderr);
+        if substantive {
+            saw_substantive_output.set(true);
+        }
     }
 }
 
@@ -3267,6 +3357,16 @@ fn normalize_prompt(prompt: Option<String>) -> Option<String> {
 
 fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn build_input_transcript(prompt: Option<&str>, input: &str) -> Option<String> {
+    let prompt = prompt?;
+    let normalized = normalize_input_newlines(input);
+    let trimmed = normalized.trim_end_matches('\n').trim_end();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    Some(format!("{prompt}{trimmed}\n"))
 }
 
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
@@ -4562,6 +4662,70 @@ mod tests {
     }
 
     #[test]
+    fn collapse_echo_with_attribution_drops_leading_multi_expression_echo_prefix() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 27,
+            bytes: b"> x <- 1\n> y <- 2\n[1] 2\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 27,
+                is_stderr: false,
+            }],
+        };
+
+        let (bytes, events, text_spans) = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            &["> ".to_string()],
+        );
+
+        assert_eq!(String::from_utf8(bytes).expect("utf8"), "[1] 2\n> ");
+        assert!(events.is_empty(), "did not expect sideband events");
+        assert_eq!(
+            text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(text_spans[0].start_byte, 0);
+        assert_eq!(text_spans[0].end_byte, 8);
+        assert!(!text_spans[0].is_stderr);
+    }
+
+    #[test]
+    fn collapse_echo_with_attribution_drops_leading_echo_prefix_without_separator_newline() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 42,
+            bytes: b"> xstderr: Error: object 'x' not found\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 42,
+                is_stderr: false,
+            }],
+        };
+
+        let (bytes, events, text_spans) =
+            collapse_echo_with_attribution(range, &[echo_event("> ", "x\n")], &["> ".to_string()]);
+
+        assert_eq!(
+            String::from_utf8(bytes).expect("utf8"),
+            "stderr: Error: object 'x' not found\n> "
+        );
+        assert!(events.is_empty(), "did not expect sideband events");
+        assert_eq!(
+            text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(text_spans[0].start_byte, 0);
+        assert_eq!(text_spans[0].end_byte, 38);
+        assert!(!text_spans[0].is_stderr);
+    }
+
+    #[test]
     fn control_prefix_accepts_immediate_tail_without_newline() {
         let (action, remaining) =
             split_write_stdin_control_prefix("\u{3}1+1").expect("expected control prefix");
@@ -4674,6 +4838,29 @@ mod tests {
             "expected protocol warning, got: {:?}",
             completion.protocol_warnings
         );
+    }
+
+    #[test]
+    fn completion_retains_echo_events_when_session_ends_before_request_end() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("quit()", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
+
+        assert!(completion.session_end_seen);
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]

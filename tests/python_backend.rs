@@ -60,7 +60,7 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
         return Ok(None);
     }
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let probe = session.write_stdin_raw_with("", Some(2.0)).await?;
     let probe_text = result_text(&probe);
     if probe_text.contains("worker io error: Permission denied")

@@ -17,7 +17,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(

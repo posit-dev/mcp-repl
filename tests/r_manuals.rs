@@ -65,7 +65,7 @@ async fn r_show_doc_prints_manual_html_in_console() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_manuals test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -101,7 +101,7 @@ async fn r_show_doc_accepts_text_type_alias() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_manuals test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -133,7 +133,7 @@ async fn browseurl_supports_html_fragments_for_r_manuals() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_manuals test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -169,7 +169,7 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_manuals test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with("RShowDoc(\"R-exts\"); invisible(NULL)", Some(60.0))

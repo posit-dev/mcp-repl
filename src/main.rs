@@ -122,7 +122,16 @@ fn ignore_sigpipe() {
 }
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
-    let mut parser = ArgParser::new();
+    parse_cli_args_from(
+        std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::error::Error>> {
+    let mut parser = ArgParser { args, index: 0 };
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(&mut parser)?));
@@ -132,7 +141,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
-    let mut oversized_output = OversizedOutputMode::Files;
+    let mut oversized_output = OversizedOutputMode::Pager;
     let mut oversized_output_seen = false;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
@@ -305,16 +314,6 @@ struct ArgParser {
 }
 
 impl ArgParser {
-    fn new() -> Self {
-        Self {
-            args: std::env::args_os()
-                .skip(1)
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-            index: 0,
-        }
-    }
-
     fn next(&mut self) -> Option<String> {
         let value = self.args.get(self.index)?.clone();
         self.index += 1;
@@ -460,7 +459,7 @@ mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|pytho
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
---oversized-output: choose oversized-output handling (files: default spill-to-files mode; pager: legacy modal pager)\n\
+--oversized-output: choose oversized-output handling (pager: default legacy modal pager; files: spill oversized replies to files)\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
@@ -503,6 +502,26 @@ mod tests {
         };
         let parsed = parse_backend_arg("--interpreter=python", &mut parser).expect("parse flag");
         assert_eq!(parsed, Some(Backend::Python));
+    }
+
+    #[test]
+    fn parse_cli_args_defaults_oversized_output_to_pager() {
+        let command = parse_cli_args_from(Vec::new()).expect("parse cli args");
+        let CliCommand::RunServer(options) = command else {
+            panic!("expected server command");
+        };
+        assert_eq!(options.oversized_output, OversizedOutputMode::Pager);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_explicit_oversized_output_files() {
+        let command =
+            parse_cli_args_from(vec!["--oversized-output".to_string(), "files".to_string()])
+                .expect("parse cli args");
+        let CliCommand::RunServer(options) = command else {
+            panic!("expected server command");
+        };
+        assert_eq!(options.oversized_output, OversizedOutputMode::Files);
     }
 
     #[test]

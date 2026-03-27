@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OversizedOutputMode {
-    #[default]
     Files,
+    #[default]
     Pager,
 }
 

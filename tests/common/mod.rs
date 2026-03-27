@@ -534,6 +534,22 @@ impl McpSnapshot {
         Ok(())
     }
 
+    pub async fn files_session<F>(&mut self, name: impl Into<String>, f: F) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_server_with_files().await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
     pub async fn pager_session<F>(
         &mut self,
         name: impl Into<String>,
@@ -917,6 +933,10 @@ pub async fn spawn_server() -> TestResult<McpTestSession> {
     spawn_server_with_args_env(Vec::new(), Vec::new()).await
 }
 
+pub async fn spawn_server_with_files() -> TestResult<McpTestSession> {
+    spawn_server_with_args(vec!["--oversized-output".to_string(), "files".to_string()]).await
+}
+
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
     spawn_server_with_args_env_and_pager_page_chars(Vec::new(), Vec::new(), page_bytes).await
 }
@@ -927,8 +947,30 @@ pub async fn spawn_server_with_env_vars(
     spawn_server_with_args_env(Vec::new(), env_vars).await
 }
 
+pub async fn spawn_server_with_files_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env(
+        vec!["--oversized-output".to_string(), "files".to_string()],
+        env_vars,
+    )
+    .await
+}
+
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
     spawn_server_with_args_env(args, Vec::new()).await
+}
+
+pub async fn spawn_python_server_with_files() -> TestResult<McpTestSession> {
+    spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--oversized-output".to_string(),
+        "files".to_string(),
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+    ])
+    .await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {

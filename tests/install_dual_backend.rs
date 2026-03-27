@@ -76,6 +76,14 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         has_sandbox_inherit,
         "expected r args to include `--sandbox inherit`"
     );
+    let r_has_files_mode = r_args
+        .iter()
+        .zip(r_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--oversized-output") && b.as_str() == Some("files"));
+    assert!(
+        r_has_files_mode,
+        "expected r args to include `--oversized-output files`"
+    );
 
     let py_args = doc["mcp_servers"]["python"]["args"]
         .as_array()
@@ -95,6 +103,14 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert!(
         py_has_sandbox_inherit,
         "expected python args to include `--sandbox inherit`"
+    );
+    let py_has_files_mode = py_args
+        .iter()
+        .zip(py_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--oversized-output") && b.as_str() == Some("files"));
+    assert!(
+        py_has_files_mode,
+        "expected python args to include `--oversized-output files`"
     );
 
     Ok(())
@@ -142,6 +158,14 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         r_has_workspace_write,
         "expected r args to include `--sandbox workspace-write`"
     );
+    let r_has_files_mode = r_args
+        .iter()
+        .zip(r_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--oversized-output") && b.as_str() == Some("files"));
+    assert!(
+        r_has_files_mode,
+        "expected r args to include `--oversized-output files`"
+    );
 
     let py_args = root["mcpServers"]["python"]["args"]
         .as_array()
@@ -153,6 +177,14 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert!(
         py_has_workspace_write,
         "expected python args to include `--sandbox workspace-write`"
+    );
+    let py_has_files_mode = py_args
+        .iter()
+        .zip(py_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--oversized-output") && b.as_str() == Some("files"));
+    assert!(
+        py_has_files_mode,
+        "expected python args to include `--oversized-output files`"
     );
     let py_has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
         (a.as_str() == Some("--interpreter") || a.as_str() == Some("--interpreter"))
