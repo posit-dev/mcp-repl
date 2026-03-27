@@ -376,6 +376,7 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
     let mut echo_event_count = ipc.pending_echo_event_count();
+    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -384,6 +385,9 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
         let next_echo_event_count = ipc.pending_echo_event_count();
+        if next_echo_event_count > echo_event_count {
+            saw_late_echo_event = true;
+        }
         let changed = next_prompt.is_some()
             || !next_prompt_variants.is_empty()
             || next_echo_event_count != echo_event_count;
@@ -398,7 +402,7 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if stable_for >= COMPLETION_METADATA_STABLE {
+            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -4562,7 +4566,7 @@ mod tests {
                 prompt: "> ".to_string(),
                 line: "1+\n".to_string(),
             });
-            thread::sleep(Duration::from_millis(11));
+            thread::sleep(Duration::from_millis(21));
             let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
                 prompt: "+ ".to_string(),
                 line: "1\n".to_string(),
