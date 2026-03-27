@@ -28,6 +28,7 @@
 - The shipped implementation creates a hidden worker transcript file on the first timeout reply, appends later worker-originated poll text to that same file, and discloses the path only if an oversized text-only reply is actually compacted.
 - Non-timeout oversized text-only replies create a worker transcript file lazily at response time and disclose it immediately in the compacted reply.
 - Mixed text+image replies stay unchanged in v1.
+- Text-only spilling uses Unicode character count, not encoded byte length, because the threshold is meant to approximate visible reply size rather than bundle storage usage.
 - Detached idle output remains non-blocking because `repl(input=...)` still accepts new input once no timed-out request is active; oversized text from that accepted reply follows the same text-only compaction path.
 
 ## Long-Term Direction
