@@ -204,7 +204,10 @@ impl PendingOutputTape {
         if let Some(echo_prefix) = leading_echo_prefix.as_deref() {
             let (matched_bytes, keep_remaining_suffix) =
                 leading_echo_match_progress(&events, echo_prefix);
-            if keep_remaining_suffix {
+            if keep_remaining_suffix
+                && !(snapshot_has_no_visible_text(&events)
+                    && snapshot_crossed_request_boundary(&events))
+            {
                 guard.pending_echo_prefix = echo_prefix[matched_bytes..].to_string();
             } else {
                 guard.pending_echo_prefix.clear();
@@ -316,11 +319,37 @@ fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[Pe
             kind: PendingSidebandKind::ReadlineResult { prompt, line },
             ..
         } = event
+            && is_trim_eligible_readline_prompt(prompt)
         {
             echo_prefix.push_str(prompt);
             echo_prefix.push_str(line);
         }
     }
+}
+
+fn snapshot_has_no_visible_text(events: &[PendingOutputEvent]) -> bool {
+    events
+        .iter()
+        .all(|event| !matches!(event, PendingOutputEvent::TextFragment { bytes, .. } if !render_bytes(bytes).is_empty()))
+}
+
+fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::RequestEnd | PendingSidebandKind::SessionEnd,
+                ..
+            }
+        )
+    })
+}
+
+fn is_trim_eligible_readline_prompt(prompt: &str) -> bool {
+    matches!(
+        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
+        ">" | "+" | ">>>" | "..."
+    )
 }
 
 fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str) -> (usize, bool) {
@@ -913,6 +942,32 @@ mod tests {
         assert_eq!(
             third.format_contents().contents,
             vec![WorkerContent::stdout("[1] 2\n")]
+        );
+    }
+
+    #[test]
+    fn request_end_clears_pending_echo_prefix_after_sideband_only_snapshot() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "x <- 1\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::RequestEnd);
+
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        let guard = tape
+            .inner
+            .lock()
+            .expect("pending output tape mutex poisoned");
+        assert!(
+            guard.pending_echo_prefix.is_empty(),
+            "request boundary should clear unmatched carried echo"
         );
     }
 

@@ -1010,6 +1010,7 @@ impl WorkerManager {
             &mut contents,
             echo_transcript.as_deref(),
             trim_enabled,
+            should_drop_echo_only_contents(&completion.echo_events),
             &completion.protocol_warnings,
         );
         if !timed_out && !session_end {
@@ -1123,6 +1124,7 @@ impl WorkerManager {
             &mut contents,
             echo_transcript.as_deref(),
             trim_enabled,
+            should_drop_echo_only_contents(&completion.echo_events),
             &completion.protocol_warnings,
         );
         pager::maybe_activate_and_append_footer(
@@ -1355,6 +1357,7 @@ impl WorkerManager {
                     &mut contents,
                     echo_transcript.as_deref(),
                     trim_enabled,
+                    should_drop_echo_only_contents(&completion.echo_events),
                     &completion.protocol_warnings,
                 );
                 if !session_end {
@@ -1479,8 +1482,9 @@ impl WorkerManager {
                 if self.pager.is_active() && !session_end {
                     self.pager_prompt = resolved_prompt.clone();
                 }
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
                 let trim_enabled = if completion.echo_events.is_empty() {
-                    fallback_input_transcript.is_some()
+                    has_fallback_input_transcript
                 } else {
                     should_trim_echo_prefix(&completion.echo_events)
                 };
@@ -1490,6 +1494,11 @@ impl WorkerManager {
                     &mut contents,
                     echo_transcript.as_deref(),
                     trim_enabled,
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
                     &completion.protocol_warnings,
                 );
                 if !session_end {
@@ -3164,16 +3173,35 @@ fn consume_text_segment(
 }
 
 fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    if events.is_empty() {
+    let Some((first, rest)) = events.split_first() else {
+        return false;
+    };
+    if !is_primary_repl_prompt(&first.prompt) {
         return false;
     }
-    if events.len() == 1 {
+    if rest.is_empty() {
         return true;
     }
-    events
-        .iter()
-        .skip(1)
+    rest.iter()
         .all(|event| is_continuation_prompt(&event.prompt))
+}
+
+fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
+    let Some((first, rest)) = events.split_first() else {
+        return false;
+    };
+    if !is_primary_repl_prompt(&first.prompt) {
+        return false;
+    }
+    rest.iter()
+        .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
+}
+
+fn is_primary_repl_prompt(prompt: &str) -> bool {
+    matches!(
+        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
+        ">" | ">>>"
+    )
 }
 
 fn is_continuation_prompt(prompt: &str) -> bool {
@@ -3353,10 +3381,11 @@ fn trim_echo_then_append_protocol_warnings(
     contents: &mut Vec<WorkerContent>,
     echo: Option<&str>,
     trim_enabled: bool,
+    drop_echo_only_enabled: bool,
     warnings: &[String],
 ) {
     maybe_trim_echo_prefix(contents, echo, trim_enabled);
-    if let Some(echo) = echo {
+    if drop_echo_only_enabled && let Some(echo) = echo {
         let _ = drop_echo_only_contents(contents, echo);
     }
     append_protocol_warnings(contents, warnings);
@@ -4670,6 +4699,7 @@ mod tests {
             &mut contents,
             Some(echo),
             false,
+            true,
             std::slice::from_ref(&warning),
         );
 
@@ -4687,6 +4717,7 @@ mod tests {
         trim_echo_then_append_protocol_warnings(
             &mut contents,
             Some("> x <- 1\n"),
+            true,
             true,
             std::slice::from_ref(&warning),
         );
@@ -4710,6 +4741,12 @@ mod tests {
 
         let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
         assert!(!should_trim_echo_prefix(&multi));
+
+        let browser = vec![echo_event("Browse[1]> ", "n\n")];
+        assert!(!should_trim_echo_prefix(&browser));
+
+        let readline = vec![echo_event("FIRST> ", "alpha\n")];
+        assert!(!should_trim_echo_prefix(&readline));
     }
 
     #[test]

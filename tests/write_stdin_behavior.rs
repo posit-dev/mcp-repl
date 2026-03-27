@@ -121,6 +121,30 @@ async fn wait_until_not_busy(
     Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
+async fn wait_until_file_contains(path: &std::path::Path, needle: &str) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                if text.contains(needle) {
+                    return Ok(text);
+                }
+                last_text = text;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(format!(
+        "file did not contain {needle:?} before timeout: {} last contents: {last_text:?}",
+        path.display()
+    )
+    .into())
+}
+
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -325,6 +349,60 @@ async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestRe
         text.contains("> 1+1"),
         "expected later echoed expression to remain for attribution after output interleaving, got: {text:?}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_non_repl_readline_transcripts() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "first <- readline('FIRST> '); second <- readline('SECOND> '); big <- paste(rep('z', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('DONE_START\\n'); cat(big); cat('\\nDONE_END\\n')"
+    );
+    let first = session.write_stdin_raw_with(&input, Some(10.0)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("FIRST> "),
+        "expected first readline prompt, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("FIRST> alpha"),
+        "expected first readline transcript in follow-up reply, got: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("SECOND> "),
+        "expected second readline prompt after the first answer, got: {second_text:?}"
+    );
+
+    let third = session.write_stdin_raw_with("beta", Some(30.0)).await?;
+    let third = wait_until_not_busy(&mut session, third).await?;
+    let third_text = result_text(&third);
+    let transcript_path = bundle_transcript_path(&third_text).unwrap_or_else(|| {
+        panic!("expected transcript path in spilled readline reply, got: {third_text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("SECOND> beta"),
+        "expected second readline transcript in transcript.txt, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("DONE_START") && transcript.contains("DONE_END"),
+        "expected spilled worker output in transcript.txt, got: {transcript:?}"
+    );
+
     Ok(())
 }
 
@@ -706,15 +784,15 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
         "did not expect busy marker text inside the worker transcript, got: {spilled_text:?}"
     );
 
-    sleep(test_delay_ms(1100, 2000)).await;
-    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_poll = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
-    let final_transcript = fs::read_to_string(&transcript_path)?;
+    let final_transcript = wait_until_file_contains(&transcript_path, "TAIL").await?;
 
     session.cancel().await?;
 
