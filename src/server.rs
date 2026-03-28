@@ -60,6 +60,7 @@ struct SharedServer {
 struct ServerState {
     worker: WorkerManager,
     response: ResponseState,
+    oversized_output: OversizedOutputMode,
 }
 
 impl SharedServer {
@@ -72,6 +73,7 @@ impl SharedServer {
             state: Arc::new(Mutex::new(ServerState {
                 worker: WorkerManager::new(backend, sandbox_plan, oversized_output)?,
                 response: ResponseState::new()?,
+                oversized_output,
             })),
         })
     }
@@ -107,16 +109,28 @@ impl SharedServer {
         let server_timeout = apply_safety_margin(timeout);
         self.run_state(move |state| {
             let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
-            let result =
-                state
-                    .worker
-                    .write_stdin(input, worker_timeout, server_timeout, None, false);
+            let raw_input = input;
+            let use_inline_pager_materialization =
+                matches!(state.oversized_output, OversizedOutputMode::Pager);
+            let result = state.worker.write_stdin(
+                raw_input.clone(),
+                worker_timeout,
+                server_timeout,
+                None,
+                false,
+            );
+            let pending_request_after = state.worker.pending_request();
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();
-            let mut result = state.response.finalize_worker_result(
+            let mut result = finalize_visible_reply(
+                state,
                 result,
-                state.worker.pending_request(),
+                pending_request_after,
                 timeout_bundle_reuse,
                 detached_prefix_item_count,
+                use_inline_pager_materialization
+                    && !pending_request_after
+                    && !state.response.has_timeout_bundle_state()
+                    && !raw_input.trim_start().starts_with(':'),
             );
             strip_text_stream_meta(&mut result);
             result
@@ -412,11 +426,14 @@ macro_rules! define_backend_tool_server {
                     .shared
                     .run_state(move |state| {
                         let result = state.worker.restart(worker_timeout);
-                        let mut result = state.response.finalize_worker_result(
+                        let pending_request_after = state.worker.pending_request();
+                        let mut result = finalize_visible_reply(
+                            state,
                             result,
-                            state.worker.pending_request(),
+                            pending_request_after,
                             TimeoutBundleReuse::None,
                             0,
+                            true,
                         );
                         strip_text_stream_meta(&mut result);
                         result
@@ -449,6 +466,33 @@ macro_rules! define_backend_tool_server {
             }
         }
     };
+}
+
+fn finalize_visible_reply(
+    state: &mut ServerState,
+    result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+    pending_request_after: bool,
+    timeout_bundle_reuse: TimeoutBundleReuse,
+    detached_prefix_item_count: usize,
+    use_inline_pager_materialization: bool,
+) -> CallToolResult {
+    match state.oversized_output {
+        OversizedOutputMode::Files => state.response.finalize_worker_result(
+            result,
+            pending_request_after,
+            timeout_bundle_reuse,
+            detached_prefix_item_count,
+        ),
+        OversizedOutputMode::Pager if use_inline_pager_materialization => state
+            .response
+            .materialize_worker_result_inline(result, detached_prefix_item_count),
+        OversizedOutputMode::Pager => state.response.finalize_worker_result(
+            result,
+            pending_request_after,
+            timeout_bundle_reuse,
+            detached_prefix_item_count,
+        ),
+    }
 }
 
 define_backend_tool_server!(RFilesToolServer, "../docs/tool-descriptions/repl_tool_r.md");

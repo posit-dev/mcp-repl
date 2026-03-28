@@ -116,6 +116,37 @@ print("detached ready")
     Ok(())
 }
 
+#[cfg(unix)]
+async fn arm_background_ipc_holder(session: &mut common::McpTestSession) -> TestResult<()> {
+    let setup = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import subprocess, sys
+script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+subprocess.Popen(
+    [sys.executable, "-c", script],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=False,
+)
+print("ipc background ready")
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    if is_busy_response(&setup_text) {
+        return Err("background-ipc setup remained busy".into());
+    }
+    assert!(
+        setup_text.contains("ipc background ready"),
+        "expected background-ipc setup reply, got: {setup_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_smoke() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
@@ -242,6 +273,119 @@ print("detached respawn armed")
     );
     assert!(
         follow_up_text.contains("AFTER_RESPAWN"),
+        "expected prompt recovery after respawn, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    arm_background_ipc_holder(&mut session).await?;
+
+    let start = Instant::now();
+    let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
+    let elapsed = start.elapsed();
+    let quit_text = result_text(&quit);
+    if is_busy_response(&quit_text) {
+        eprintln!("python_quit_does_not_wait_for_background_ipc_holders remained busy on quit");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        elapsed < shutdown_completion_budget(),
+        "expected quit() to finish before background IPC holder exit, got {elapsed:?}: {quit_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_IPC_QUIT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!(
+            "python_quit_does_not_wait_for_background_ipc_holders remained busy after respawn"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_IPC_QUIT"),
+        "expected prompt recovery after quit() respawn, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let arm = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os, subprocess, sys, threading, time
+script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+def leave_background_ipc_tail():
+    time.sleep(0.2)
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=False,
+    )
+    os._exit(0)
+threading.Thread(target=leave_background_ipc_tail, daemon=True).start()
+print("ipc respawn armed")
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let arm_text = result_text(&arm);
+    if is_busy_response(&arm_text) {
+        eprintln!("python_respawn_does_not_wait_for_background_ipc_holders remained busy");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        arm_text.contains("ipc respawn armed"),
+        "expected background-ipc respawn arming reply, got: {arm_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+    let start = Instant::now();
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_IPC_RESPAWN')", Some(5.0))
+        .await?;
+    let elapsed = start.elapsed();
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!(
+            "python_respawn_does_not_wait_for_background_ipc_holders remained busy after exit"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        elapsed < shutdown_completion_budget(),
+        "expected respawn to finish before background IPC holder exit, got {elapsed:?}: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_IPC_RESPAWN"),
         "expected prompt recovery after respawn, got: {follow_up_text:?}"
     );
     Ok(())

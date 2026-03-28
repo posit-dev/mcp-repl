@@ -162,3 +162,69 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_page_size_keeps_pager_mode_instead_of_spilling_to_output_bundle() -> TestResult<()> {
+    let page_bytes = 10_000;
+    let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "line <- paste(rep('x', 200), collapse = ''); for (i in 1:300) cat(sprintf('line%04d %s\\n', i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let mut initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager_page_size backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    if busy_response(&initial_text) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            initial_text = text;
+            if !busy_response(&initial_text) {
+                break;
+            }
+        }
+    }
+    assert!(
+        !busy_response(&initial_text),
+        "pager_page_size worker remained busy after waiting for completion: {initial_text:?}"
+    );
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager footer on the first page, got: {initial_text:?}"
+    );
+    assert!(
+        !initial_text.contains("transcript.txt"),
+        "did not expect output-bundle disclosure to replace pager output, got: {initial_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        !next_text.contains("unexpected ':'"),
+        "expected pager state to remain active for :next, got: {next_text:?}"
+    );
+    assert!(
+        next_text.contains("--More--") || next_text.contains("(END"),
+        "expected pager output for :next, got: {next_text:?}"
+    );
+
+    Ok(())
+}

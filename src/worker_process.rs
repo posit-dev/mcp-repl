@@ -358,7 +358,6 @@ const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
-const OUTPUT_READER_QUIESCE_POLL: Duration = Duration::from_millis(5);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
@@ -3697,6 +3696,7 @@ struct SpawnedWorker {
 
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
+    done_rx: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
     #[cfg(target_family = "unix")]
     wake_writer: std::io::PipeWriter,
@@ -3704,12 +3704,12 @@ struct OutputReader {
 
 impl OutputReader {
     fn stop_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
-        let start = std::time::Instant::now();
-        while !self.handle.is_finished() && start.elapsed() < OUTPUT_READER_QUIESCE_GRACE {
-            thread::sleep(OUTPUT_READER_QUIESCE_POLL);
-        }
-        if !self.handle.is_finished() {
+        if matches!(
+            self.done_rx.recv_timeout(OUTPUT_READER_QUIESCE_GRACE),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
             self.request_stop();
+            let _ = self.done_rx.recv();
         }
         self.handle
             .join()
@@ -4282,6 +4282,9 @@ impl WorkerProcess {
         let term_deadline = start + shutdown_term_delay(timeout);
 
         if !timeout.is_zero() {
+            // TODO: Replace these try_wait() polling loops with a dedicated waiter thread so
+            // teardown can block on a completion signal, then escalate on timeout without spin
+            // sleeps.
             loop {
                 if let Some(status) = self.child.try_wait()? {
                     self.exit_status = Some(status);
@@ -4315,24 +4318,32 @@ impl WorkerProcess {
             }
         }
 
-        self.quiesce_output_producers()?;
-        self.cleanup_session_tmpdir();
-        self.report_denials();
-        Ok(())
+        self.finalize_terminated_process()
     }
 
     fn kill(mut self) -> Result<(), WorkerError> {
         let _ = self.send_sigkill();
         let _ = self.child.wait();
-        self.quiesce_output_producers()?;
-        self.cleanup_session_tmpdir();
-        self.report_denials();
-        Ok(())
+        self.finalize_terminated_process()
     }
 
     fn finish_exited(mut self) -> Result<(), WorkerError> {
         if self.exit_status.is_none() {
             self.exit_status = Some(self.child.wait()?);
+        }
+        self.finalize_terminated_process()
+    }
+
+    fn finalize_terminated_process(&mut self) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        {
+            // Once the root worker is gone, kill any remaining session peers before waiting on
+            // stdio or IPC readers they may still be holding open.
+            let _ = self.send_sigkill();
+            // TODO: Track descendants or use stronger OS-level containment so children that have
+            // escaped the worker process group are still killable after the root exits.
+            // TODO: Reset the worker-side IPC fds back to CLOEXEC in the backend after startup so
+            // ordinary exec'd children do not inherit them in the first place.
         }
         self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
@@ -4344,6 +4355,8 @@ impl WorkerProcess {
         // Keep teardown bounded even if a detached descendant still holds stdio open. A more
         // robust long-term design would pair this with session-scoped output rings or stronger
         // OS-level containment so stale descendants cannot target a future session at all.
+        // TODO: Give the IPC reader the same local wake/cancel path as stdout/stderr so teardown
+        // never has to rely on remote EOF to unblock that thread.
         if let Some(reader) = self.stdout_reader.take() {
             reader.stop_and_join("worker stdout reader thread panicked")?;
         }
@@ -4650,6 +4663,7 @@ where
         return Ok(None);
     };
     let (wake_reader, wake_writer) = std::io::pipe()?;
+    let (done_tx, done_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
     let thread_stop = stop_requested.clone();
     let handle = thread::spawn(move || {
@@ -4695,9 +4709,11 @@ where
                 Err(_) => break,
             }
         }
+        let _ = done_tx.send(());
     });
     Ok(Some(OutputReader {
         handle,
+        done_rx,
         stop_requested,
         wake_writer,
     }))
@@ -4715,6 +4731,7 @@ where
     let Some(mut stream) = stream else {
         return Ok(None);
     };
+    let (done_tx, done_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
     let thread_stop = stop_requested.clone();
     let handle = thread::spawn(move || {
@@ -4757,9 +4774,11 @@ where
                 Err(_) => break,
             }
         }
+        let _ = done_tx.send(());
     });
     Ok(Some(OutputReader {
         handle,
+        done_rx,
         stop_requested,
     }))
 }

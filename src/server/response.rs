@@ -227,6 +227,10 @@ impl ResponseState {
         self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some()
     }
 
+    pub(crate) fn has_timeout_bundle_state(&self) -> bool {
+        self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some()
+    }
+
     fn materialize_staged_timeout_output(
         &mut self,
         staged: &StagedTimeoutOutput,
@@ -271,6 +275,29 @@ impl ResponseState {
                         "dropping closed timeout bundle after output-bundle error: {cleanup_err}"
                     );
                 }
+                finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
+            }
+        }
+    }
+
+    /// Materializes a worker reply inline without applying files-mode bundle compaction.
+    pub(crate) fn materialize_worker_result_inline(
+        &mut self,
+        result: Result<WorkerReply, WorkerError>,
+        detached_prefix_item_count: usize,
+    ) -> CallToolResult {
+        if (self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some())
+            && let Err(cleanup_err) = self.clear_active_timeout_bundle()
+        {
+            eprintln!("dropping closed timeout bundle after output-bundle error: {cleanup_err}");
+        }
+        match result {
+            Ok(reply) => {
+                let material = prepare_reply_material(reply, detached_prefix_item_count);
+                finalize_batch(materialize_items(material.inline_items), material.is_error)
+            }
+            Err(err) => {
+                eprintln!("worker write stdin error: {err}");
                 finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
             }
         }
@@ -1064,11 +1091,11 @@ impl OutputStore {
 }
 
 fn create_output_store_root() -> std::io::Result<tempfile::TempDir> {
+    let temp_env_has_non_unicode_value = output_store_temp_env_has_non_unicode_value();
     match Builder::new().prefix("mcp-repl-output-").tempdir() {
         Ok(root) => Ok(root),
         Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound
-                && output_store_temp_env_has_non_unicode_value() =>
+            if err.kind() == std::io::ErrorKind::NotFound && temp_env_has_non_unicode_value =>
         {
             Builder::new()
                 .prefix("mcp-repl-output-")
