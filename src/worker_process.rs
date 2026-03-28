@@ -49,8 +49,14 @@ use crate::worker_protocol::{
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::io::AsRawHandle;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Storage::FileSystem::PeekNamedPipe;
 
 #[derive(Debug, Clone)]
 struct GuardrailEvent {
@@ -351,6 +357,8 @@ const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
+const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
+const OUTPUT_READER_QUIESCE_POLL: Duration = Duration::from_millis(5);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
@@ -3653,8 +3661,8 @@ struct WorkerProcess {
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
-    stdout_reader: Option<std::thread::JoinHandle<()>>,
-    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    stdout_reader: Option<OutputReader>,
+    stderr_reader: Option<OutputReader>,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
     #[cfg(target_family = "unix")]
@@ -3681,10 +3689,41 @@ struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
-    stdout_reader: Option<std::thread::JoinHandle<()>>,
-    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    stdout_reader: Option<OutputReader>,
+    stderr_reader: Option<OutputReader>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
+}
+
+struct OutputReader {
+    handle: std::thread::JoinHandle<()>,
+    stop_requested: Arc<AtomicBool>,
+    #[cfg(target_family = "unix")]
+    wake_writer: std::io::PipeWriter,
+}
+
+impl OutputReader {
+    fn stop_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
+        let start = std::time::Instant::now();
+        while !self.handle.is_finished() && start.elapsed() < OUTPUT_READER_QUIESCE_GRACE {
+            thread::sleep(OUTPUT_READER_QUIESCE_POLL);
+        }
+        if !self.handle.is_finished() {
+            self.request_stop();
+        }
+        self.handle
+            .join()
+            .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        #[cfg(target_family = "unix")]
+        {
+            let _ = self.wake_writer.write_all(&[0]);
+            let _ = self.wake_writer.flush();
+        }
+    }
 }
 
 impl WorkerProcess {
@@ -3957,9 +3996,9 @@ impl WorkerProcess {
             .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
         let stdin_tx = spawn_stdin_writer(stdin);
         let stdout_reader =
-            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone());
+            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
         let stderr_reader =
-            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone());
+            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone())?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -4070,7 +4109,7 @@ impl WorkerProcess {
             let stdin_tx = spawn_stdin_writer(master);
             // Python runs under a PTY so stdout/stderr are merged.
             let stdout_reader =
-                spawn_output_reader(Some(master_reader), TextStream::Stdout, live_output.clone());
+                spawn_output_reader(Some(master_reader), TextStream::Stdout, live_output.clone())?;
 
             #[cfg(target_os = "macos")]
             let mut denial_logger = prepared.denial_logger;
@@ -4145,7 +4184,7 @@ impl WorkerProcess {
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {
-            self.send_signal(libc::SIGTERM)
+            self.send_signal_and_descendants(libc::SIGTERM)
         }
         #[cfg(not(target_family = "unix"))]
         {
@@ -4156,7 +4195,7 @@ impl WorkerProcess {
     fn send_sigkill(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {
-            self.send_signal(libc::SIGKILL)
+            self.send_signal_and_descendants(libc::SIGKILL)
         }
         #[cfg(not(target_family = "unix"))]
         {
@@ -4182,36 +4221,16 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
-    fn kill_process_tree_scan(&self, signal: i32) {
-        let pid = self.child.id() as i32;
-        let root = Pid::from_u32(pid as u32);
+    fn send_signal_and_descendants(&self, signal: i32) -> Result<(), WorkerError> {
+        let root = Pid::from_u32(self.child.id());
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::All, true);
-        let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-        for (proc_pid, process) in system.processes() {
-            if let Some(parent) = process.parent() {
-                children.entry(parent).or_default().push(*proc_pid);
-            }
-        }
-
-        let mut stack = vec![root];
-        let mut seen: HashSet<Pid> = HashSet::new();
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current) {
-                continue;
-            }
-            if let Some(kids) = children.get(&current) {
-                for child in kids {
-                    if !seen.contains(child) {
-                        stack.push(*child);
-                    }
-                }
-            }
-        }
-
-        for pid in seen {
+        let descendants = collect_process_tree_pids(&system, root);
+        let result = self.send_signal(signal);
+        for pid in descendants {
             let _ = unsafe { libc::kill(pid.as_u32() as i32, signal) };
         }
+        result
     }
 
     fn note_expected_exit(&mut self) {
@@ -4277,11 +4296,7 @@ impl WorkerProcess {
         }
 
         if self.child.try_wait()?.is_none() {
-            let _sig_ok = self.send_sigterm().is_ok();
-            #[cfg(target_family = "unix")]
-            if !_sig_ok {
-                self.kill_process_tree_scan(libc::SIGTERM);
-            }
+            let _ = self.send_sigterm();
             let term_deadline = std::cmp::min(
                 timeout_deadline,
                 std::time::Instant::now() + Duration::from_secs(2),
@@ -4292,11 +4307,7 @@ impl WorkerProcess {
                     break;
                 }
                 if std::time::Instant::now() >= term_deadline {
-                    let _sig_ok = self.send_sigkill().is_ok();
-                    #[cfg(target_family = "unix")]
-                    if !_sig_ok {
-                        self.kill_process_tree_scan(libc::SIGKILL);
-                    }
+                    let _ = self.send_sigkill();
                     let _ = self.child.wait();
                     break;
                 }
@@ -4311,11 +4322,7 @@ impl WorkerProcess {
     }
 
     fn kill(mut self) -> Result<(), WorkerError> {
-        let _sig_ok = self.send_sigkill().is_ok();
-        #[cfg(target_family = "unix")]
-        if !_sig_ok {
-            self.kill_process_tree_scan(libc::SIGKILL);
-        }
+        let _ = self.send_sigkill();
         let _ = self.child.wait();
         self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
@@ -4334,15 +4341,14 @@ impl WorkerProcess {
     }
 
     fn quiesce_output_producers(&mut self) -> Result<(), WorkerError> {
-        if let Some(handle) = self.stdout_reader.take() {
-            handle.join().map_err(|_| {
-                WorkerError::Protocol("worker stdout reader thread panicked".to_string())
-            })?;
+        // Keep teardown bounded even if a detached descendant still holds stdio open. A more
+        // robust long-term design would pair this with session-scoped output rings or stronger
+        // OS-level containment so stale descendants cannot target a future session at all.
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.stop_and_join("worker stdout reader thread panicked")?;
         }
-        if let Some(handle) = self.stderr_reader.take() {
-            handle.join().map_err(|_| {
-                WorkerError::Protocol("worker stderr reader thread panicked".to_string())
-            })?;
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.stop_and_join("worker stderr reader thread panicked")?;
         }
         if let Some(ipc) = self.ipc.get() {
             ipc.join_reader_thread().map_err(WorkerError::Io)?;
@@ -4517,6 +4523,18 @@ fn start_memory_guardrail(
 
 #[cfg(target_family = "unix")]
 fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
+    let pids = collect_process_tree_pids(system, root);
+    let mut total_kb: u64 = 0;
+    for pid in &pids {
+        if let Some(process) = system.process(*pid) {
+            total_kb = total_kb.saturating_add(process.memory());
+        }
+    }
+    (total_kb, pids)
+}
+
+#[cfg(target_family = "unix")]
+fn collect_process_tree_pids(system: &System, root: Pid) -> Vec<Pid> {
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
     for (proc_pid, process) in system.processes() {
         if let Some(parent) = process.parent() {
@@ -4539,15 +4557,13 @@ fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
         }
     }
 
-    let mut total_kb: u64 = 0;
     let mut pids = Vec::new();
     for pid in seen {
-        if let Some(process) = system.process(pid) {
-            total_kb = total_kb.saturating_add(process.memory());
+        if system.process(pid).is_some() {
             pids.push(pid);
         }
     }
-    (total_kb, pids)
+    pids
 }
 
 fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBuf>) {
@@ -4621,18 +4637,55 @@ fn open_pty_pair() -> Result<(File, File), WorkerError> {
     Ok((master, slave))
 }
 
+#[cfg(target_family = "unix")]
 fn spawn_output_reader<R>(
     stream: Option<R>,
     output_stream: TextStream,
     live_output: LiveOutputCapture,
-) -> Option<std::thread::JoinHandle<()>>
+) -> Result<Option<OutputReader>, WorkerError>
 where
-    R: Read + Send + 'static,
+    R: Read + AsRawFd + Send + 'static,
 {
-    let mut stream = stream?;
-    Some(thread::spawn(move || {
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let (wake_reader, wake_writer) = std::io::pipe()?;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop_requested.clone();
+    let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let stream_fd = stream.as_raw_fd();
+        let wake_fd = wake_reader.as_raw_fd();
         loop {
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: stream_fd,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_fd,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if fds[1].revents != 0 {
+                break;
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
             match stream.read(&mut buffer) {
                 Ok(0) => {
                     break;
@@ -4642,6 +4695,102 @@ where
                 Err(_) => break,
             }
         }
+    });
+    Ok(Some(OutputReader {
+        handle,
+        stop_requested,
+        wake_writer,
+    }))
+}
+
+#[cfg(target_family = "windows")]
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
+where
+    R: Read + AsRawHandle + Send + 'static,
+{
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop_requested.clone();
+    let handle = thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        let stream_handle = stream.as_raw_handle();
+        loop {
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut available = 0u32;
+            let peek_ok = unsafe {
+                PeekNamedPipe(
+                    stream_handle as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peek_ok == 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(code)
+                        if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_HANDLE_EOF as i32 =>
+                    {
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if available == 0 {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(Some(OutputReader {
+        handle,
+        stop_requested,
+    }))
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
+where
+    R: Read + Send + 'static,
+{
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let handle = thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(Some(OutputReader {
+        handle,
+        stop_requested,
     }))
 }
 

@@ -74,6 +74,48 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     Ok(Some(session))
 }
 
+#[cfg(unix)]
+const DETACHED_STDIO_HOLDER_SECS: f64 = 2.5;
+
+#[cfg(unix)]
+fn shutdown_completion_budget() -> Duration {
+    if cfg!(target_os = "macos") {
+        Duration::from_millis(1_500)
+    } else {
+        Duration::from_millis(1_200)
+    }
+}
+
+#[cfg(unix)]
+async fn arm_detached_stdio_holder(session: &mut common::McpTestSession) -> TestResult<()> {
+    let setup = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import subprocess, sys
+script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+subprocess.Popen(
+    [sys.executable, "-c", script],
+    stdin=subprocess.DEVNULL,
+    close_fds=True,
+    start_new_session=True,
+)
+print("detached ready")
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    if is_busy_response(&setup_text) {
+        return Err("detached-stdio setup remained busy".into());
+    }
+    assert!(
+        setup_text.contains("detached ready"),
+        "expected detached-stdio setup reply, got: {setup_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_smoke() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
@@ -90,6 +132,118 @@ async fn python_smoke() -> TestResult<()> {
     assert!(text.contains("2"), "expected 2, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    arm_detached_stdio_holder(&mut session).await?;
+
+    let start = Instant::now();
+    let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
+    let elapsed = start.elapsed();
+    let quit_text = result_text(&quit);
+    if is_busy_response(&quit_text) {
+        eprintln!("python_quit_does_not_wait_for_detached_stdio_holders remained busy on quit");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        elapsed < shutdown_completion_budget(),
+        "expected quit() to finish before detached child exit, got {elapsed:?}: {quit_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_QUIT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!(
+            "python_quit_does_not_wait_for_detached_stdio_holders remained busy after respawn"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_QUIT"),
+        "expected prompt recovery after quit() respawn, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_respawn_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let arm = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os, subprocess, sys, threading, time
+script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+def leave_detached_tail():
+    time.sleep(0.2)
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+    os._exit(0)
+threading.Thread(target=leave_detached_tail, daemon=True).start()
+print("detached respawn armed")
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let arm_text = result_text(&arm);
+    if is_busy_response(&arm_text) {
+        eprintln!("python_respawn_does_not_wait_for_detached_stdio_holders remained busy");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        arm_text.contains("detached respawn armed"),
+        "expected detached-respawn arming reply, got: {arm_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+    let start = Instant::now();
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
+        .await?;
+    let elapsed = start.elapsed();
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!(
+            "python_respawn_does_not_wait_for_detached_stdio_holders remained busy after exit"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        elapsed < shutdown_completion_budget(),
+        "expected respawn to finish before detached child exit, got {elapsed:?}: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_RESPAWN"),
+        "expected prompt recovery after respawn, got: {follow_up_text:?}"
+    );
     Ok(())
 }
 
