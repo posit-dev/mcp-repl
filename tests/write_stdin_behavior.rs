@@ -201,6 +201,10 @@ async fn spawn_behavior_session_with_env_vars(
     common::spawn_server_with_files_env_vars(env_vars).await
 }
 
+async fn spawn_pager_behavior_session(page_chars: u64) -> TestResult<common::McpTestSession> {
+    common::spawn_server_with_pager_page_chars(page_chars).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_discards_when_busy() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -814,6 +818,87 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(20_000).await?;
+
+    let input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.2); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
+    );
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect timeout bundle disclosure before the pager busy follow-up, got: {first_text:?}"
+    );
+
+    sleep(test_delay_ms(260, 700)).await;
+    let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
+    let busy_text = result_text(&busy_follow_up);
+    if !busy_text.contains("input discarded while worker busy")
+        && !busy_text.contains("<<repl status: busy")
+    {
+        eprintln!(
+            "write_stdin_behavior pager busy follow-up completed without a busy marker; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&busy_text).unwrap_or_else(|| {
+        panic!(
+            "expected pager busy follow-up spill to disclose a transcript path, got: {busy_text:?}"
+        )
+    });
+    let spilled_text = fs::read_to_string(&transcript_path)?;
+
+    assert!(
+        spilled_text.contains("SMALL_START") && spilled_text.contains("SMALL_END"),
+        "expected pager spill transcript to backfill the earlier timeout text, got: {spilled_text:?}"
+    );
+    assert!(
+        spilled_text.contains("BIG_START") && spilled_text.contains("BIG_END"),
+        "expected pager busy follow-up spill to include the later oversized worker text, got: {spilled_text:?}"
+    );
+    assert!(
+        !spilled_text.contains("input discarded while worker busy")
+            && !spilled_text.contains("<<repl status: busy"),
+        "did not expect pager busy marker text inside the worker transcript, got: {spilled_text:?}"
+    );
+
+    let final_poll = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior pager final poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let final_transcript =
+        wait_until_file_contains_via_polls(&mut session, &transcript_path, "TAIL").await?;
+
+    session.cancel().await?;
+
+    assert!(
+        final_transcript.contains("TAIL"),
+        "expected the original pager timeout bundle to receive the final tail text, got: {final_transcript:?}"
+    );
+    if let Some(path) = bundle_transcript_path(&final_text) {
+        assert_eq!(
+            path, transcript_path,
+            "did not expect the settled pager poll to switch to a different transcript path, got: {final_text:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
@@ -1166,6 +1251,44 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
     assert!(
         bundle_transcript_path(&final_text).is_none(),
         "did not expect the settled poll to switch to a different transcript path, got: {final_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(20_000).await?;
+
+    let first = session
+        .write_stdin_raw_with("Sys.sleep(0.2); 1+1", Some(0.05))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(260, 700)).await;
+    let follow_up = session.write_stdin_raw_with("3+3", Some(2.0)).await?;
+    let follow_up = wait_until_not_busy(&mut session, follow_up).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected the settled timeout result to be prefixed into the next pager reply, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("[1] 6"),
+        "expected the fresh pager follow-up result, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("Sys.sleep(0.2); 1+1"),
+        "did not expect the timed-out request echo to leak into the next pager reply, got: {follow_up_text:?}"
     );
 
     Ok(())

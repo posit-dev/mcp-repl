@@ -183,38 +183,18 @@ fn driver_wait_for_completion(
         let slice = remaining.min(Duration::from_millis(50));
         match ipc.wait_for_request_end(slice) {
             Ok(()) => {
-                let (prompt, prompt_variants) = collect_completion_metadata(&ipc);
-                return Ok(CompletionInfo {
-                    prompt,
-                    prompt_variants: Some(prompt_variants),
-                    echo_events: ipc.take_echo_events(),
-                    protocol_warnings: ipc.take_protocol_warnings(),
-                    session_end_seen: false,
-                });
+                return Ok(completion_info_from_ipc(&ipc, false));
             }
             Err(IpcWaitError::Timeout) => {
                 if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
                     && ipc.try_take_request_end()
                 {
-                    let (prompt, prompt_variants) = collect_completion_metadata(&ipc);
-                    return Ok(CompletionInfo {
-                        prompt,
-                        prompt_variants: Some(prompt_variants),
-                        echo_events: ipc.take_echo_events(),
-                        protocol_warnings: ipc.take_protocol_warnings(),
-                        session_end_seen: false,
-                    });
+                    return Ok(completion_info_from_ipc(&ipc, false));
                 }
                 continue;
             }
             Err(IpcWaitError::SessionEnd) => {
-                return Ok(CompletionInfo {
-                    prompt: None,
-                    prompt_variants: None,
-                    echo_events: ipc.take_echo_events(),
-                    protocol_warnings: ipc.take_protocol_warnings(),
-                    session_end_seen: true,
-                });
+                return Ok(completion_info_from_ipc(&ipc, true));
             }
             Err(IpcWaitError::Disconnected) => {
                 return Err(WorkerError::Protocol(
@@ -464,6 +444,23 @@ struct CompletionInfo {
     session_end_seen: bool,
 }
 
+fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -> CompletionInfo {
+    let (prompt, prompt_variants) = if session_end_seen {
+        (None, None)
+    } else {
+        let (prompt, prompt_variants) = collect_completion_metadata(ipc);
+        (prompt, Some(prompt_variants))
+    };
+
+    CompletionInfo {
+        prompt,
+        prompt_variants,
+        echo_events: ipc.take_echo_events(),
+        protocol_warnings: ipc.take_protocol_warnings(),
+        session_end_seen,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WriteStdinControlAction {
     Interrupt,
@@ -533,6 +530,7 @@ pub struct WorkerManager {
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
     session_end_seen: bool,
+    settled_pending_completion: Option<CompletionInfo>,
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
@@ -607,6 +605,7 @@ impl WorkerManager {
             pending_request: false,
             pending_request_started_at: None,
             session_end_seen: false,
+            settled_pending_completion: None,
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
@@ -851,7 +850,10 @@ impl WorkerManager {
         self.maybe_emit_guardrail_notice();
         self.resolve_timeout_marker();
         if text.is_empty() {
-            if self.pending_request || self.output.has_pending_output() {
+            if self.pending_request
+                || self.output.has_pending_output()
+                || self.settled_pending_completion.is_some()
+            {
                 let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
@@ -867,6 +869,10 @@ impl WorkerManager {
         }
         if self.pending_request {
             let mut reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
+            let detached_prefix_item_count = match &reply.reply {
+                WorkerReply::Output { contents, .. } => contents.len(),
+            };
+            self.last_detached_prefix_item_count = detached_prefix_item_count;
             let WorkerReply::Output {
                 contents,
                 is_error,
@@ -1078,6 +1084,11 @@ impl WorkerManager {
                 Err(err) => return Err(err),
             }
         }
+        if !completed_request && let Some(info) = self.settled_pending_completion.take() {
+            completion = info;
+            completed_request = true;
+            end_offset = self.output.end_offset().unwrap_or(end_offset);
+        }
 
         if end_offset < start_offset {
             end_offset = start_offset;
@@ -1198,20 +1209,35 @@ impl WorkerManager {
             .then(|| text.to_string())
             .and_then(|value| pager::build_input_echo(&value));
         let input_transcript = build_input_transcript(prompt_hint.as_deref(), text);
+        let settled_completion = self.settled_pending_completion.take();
 
         let mut prefix_contents = Vec::new();
         let mut prefix_bytes: u64 = 0;
         let mut prefix_is_error = false;
 
-        if had_pending_output {
+        if had_pending_output || settled_completion.is_some() {
             let pending_end = self.output.end_offset().unwrap_or(0);
             let pending_start = self.output.current_offset().unwrap_or(pending_end);
             let pending_bytes = pending_end.saturating_sub(pending_start);
 
-            prefix_is_error = self
-                .output
-                .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
-            prefix_contents = pager::take_range_from_ring(&self.output, pending_end);
+            if let Some(completion) = settled_completion {
+                let FormattedPendingOutput {
+                    contents,
+                    saw_stderr,
+                } = take_range_from_ring_after_completion(
+                    &self.output,
+                    pending_start,
+                    pending_end,
+                    &completion,
+                );
+                prefix_is_error = saw_stderr;
+                prefix_contents = contents;
+            } else {
+                prefix_is_error = self
+                    .output
+                    .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
+                prefix_contents = pager::take_range_from_ring(&self.output, pending_end);
+            }
             prefix_bytes = pending_bytes;
         }
 
@@ -1248,6 +1274,7 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
+        self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         self.process
             .as_mut()
@@ -2243,6 +2270,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
+        self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -2261,6 +2289,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
+        self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
         self.pager_prompt = None;
         self.last_prompt = None;
@@ -2460,11 +2489,18 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
+                let settled_completion =
+                    matches!(self.oversized_output, OversizedOutputMode::Pager)
+                        .then(|| completion_info_from_ipc(&ipc, false));
                 self.settle_output_after_request_end(Duration::from_millis(120));
                 if matches!(self.oversized_output, OversizedOutputMode::Pager) {
                     update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
                 }
                 self.clear_pending_request_state();
+                if let Some(completion) = settled_completion {
+                    self.remember_prompt(completion.prompt.clone());
+                    self.settled_pending_completion = Some(completion);
+                }
             }
             Err(IpcWaitError::SessionEnd) => {
                 self.note_session_end(true);
@@ -2487,6 +2523,7 @@ impl WorkerManager {
     fn clear_pending_request_state(&mut self) {
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.settled_pending_completion = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -2681,6 +2718,51 @@ fn snapshot_after_completion(
     maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
     CompletionSnapshot {
         snapshot,
+        saw_stderr,
+    }
+}
+
+fn take_range_from_ring_after_completion(
+    output: &OutputBuffer,
+    start_offset: u64,
+    end_offset: u64,
+    completion: &CompletionInfo,
+) -> FormattedPendingOutput {
+    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+
+    if !trim_enabled {
+        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+        let range = output.read_range(start_offset, end_offset);
+        output.advance_offset_to(end_offset);
+        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
+        let (bytes, events, text_spans) =
+            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+        let mut contents =
+            pager::contents_from_collapsed_output(bytes, events, text_spans, end_offset);
+        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
+        return FormattedPendingOutput {
+            contents,
+            saw_stderr,
+        };
+    }
+
+    if let Some(echo) = echo_transcript.as_deref() {
+        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
+    }
+    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
+    let effective_start = output.current_offset().unwrap_or(start_offset);
+    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+    let mut contents = pager::take_range_from_ring(output, end_offset);
+    trim_echo_then_append_protocol_warnings(
+        &mut contents,
+        echo_transcript.as_deref(),
+        trim_enabled,
+        should_drop_echo_only_contents(&completion.echo_events),
+        &completion.protocol_warnings,
+    );
+    FormattedPendingOutput {
+        contents,
         saw_stderr,
     }
 }
@@ -4655,7 +4737,8 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring, reset_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring,
+        reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
     use std::sync::{Mutex, OnceLock};
@@ -4675,6 +4758,17 @@ mod tests {
             prompt: prompt.to_string(),
             line: line.to_string(),
         }
+    }
+
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     #[test]
@@ -5088,6 +5182,47 @@ mod tests {
             manager.detached_prefix_item_count(),
             2,
             "session-end cleanup must preserve detached-prefix metadata until server finalization"
+        );
+    }
+
+    #[test]
+    fn pager_prepare_input_context_trims_echo_from_settled_completion() {
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.output.start_capture();
+        manager
+            .output_timeline
+            .append_text(b"> Sys.sleep(0.2); 1+1\n[1] 2\n", false);
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some("> ".to_string()),
+            prompt_variants: Some(vec!["> ".to_string()]),
+            echo_events: vec![echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let context = manager.prepare_input_context_pager("3+3", false);
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("[1] 2\n"),
+            "expected settled pager output to be preserved, got: {text:?}"
+        );
+        assert!(
+            !text.contains("Sys.sleep(0.2); 1+1"),
+            "did not expect settled pager echo to leak into the next input context, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected settled completion metadata to be consumed with the detached prefix"
         );
     }
 

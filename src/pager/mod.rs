@@ -1575,7 +1575,7 @@ pub(crate) fn maybe_activate_and_append_footer(
     contents.push(WorkerContent::server_stderr(pager.footer(pages_left)));
 }
 
-fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
     if range.bytes.is_empty() && range.events.is_empty() {
         return Vec::new();
     }
@@ -1586,6 +1586,16 @@ fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
         &range.events,
         output_event_to_content,
     )
+}
+
+pub(crate) fn contents_from_collapsed_output(
+    bytes: Vec<u8>,
+    events: Vec<(u64, OutputEventKind)>,
+    text_spans: Vec<crate::output_capture::OutputTextSpan>,
+    source_end: u64,
+) -> Vec<WorkerContent> {
+    let buffer = PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
+    buffer.contents_for_range(0, buffer.len())
 }
 
 fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
