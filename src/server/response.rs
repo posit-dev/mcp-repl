@@ -722,11 +722,7 @@ impl ResponseState {
                     }
                 }
                 return TimeoutReplySegment {
-                    contents: compact_items_without_output_bundle(
-                        bundle_items,
-                        inline_items,
-                        worker_text,
-                    ),
+                    contents: compact_staged_timeout_without_output_bundle(&staged, bundle_items),
                     retained_active_timeout_bundle: None,
                     retained_staged_timeout_output: None,
                 };
@@ -1977,6 +1973,21 @@ fn compact_items_without_output_bundle(
         return compact_text_without_bundle_items(inline_items.to_vec(), worker_text);
     }
     materialize_items(inline_items.to_vec())
+}
+
+fn compact_staged_timeout_without_output_bundle(
+    staged: &StagedTimeoutOutput,
+    current_bundle_items: &[ReplyItem],
+) -> Vec<Content> {
+    let mut combined_bundle_items = staged.items.clone();
+    combined_bundle_items.extend(current_bundle_items.iter().cloned());
+    let combined_inline_items = collapse_image_updates(combined_bundle_items.clone());
+    let combined_worker_text = worker_text_from_items(&combined_bundle_items);
+    compact_items_without_output_bundle(
+        &combined_bundle_items,
+        &combined_inline_items,
+        &combined_worker_text,
+    )
 }
 
 fn compact_detached_prefix_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
@@ -3597,6 +3608,63 @@ mod tests {
         assert!(
             transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
             "expected the disclosed timeout bundle to include the later poll chunk, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn staged_timeout_fallback_keeps_earlier_output_when_bundle_setup_fails() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let chunk_body = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD / 2);
+        let first_chunk = format!("FIRST_START\n{chunk_body}\nFIRST_END\n");
+        let second_chunk = format!("SECOND_START\n{chunk_body}\nSECOND_END\n");
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(first_chunk.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = result_text(&first);
+        assert!(
+            first_text.contains("FIRST_START"),
+            "expected the initial timed-out reply to stay inline, got: {first_text:?}"
+        );
+        assert!(
+            state.staged_timeout_output.is_some(),
+            "expected the initial timed-out reply to retain staged timeout state"
+        );
+
+        state.output_store.create_root = output_store_root_with_text_conflict;
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(second_chunk)],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let second_text = result_text(&second);
+
+        assert!(
+            second_text.contains("output bundle unavailable"),
+            "expected inline fallback after timeout bundle setup failure, got: {second_text:?}"
+        );
+        assert!(
+            !second_text.contains("/transcript.txt") && !second_text.contains("/events.log"),
+            "did not expect a bundle path after timeout bundle setup failure, got: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("FIRST_START"),
+            "expected the staged timeout prefix to survive the inline fallback, got: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("SECOND_END"),
+            "expected the current timeout chunk to survive the inline fallback, got: {second_text:?}"
         );
     }
 
