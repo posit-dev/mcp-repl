@@ -80,7 +80,7 @@ pub(crate) fn run(
                 VisibleReplyContext {
                     pending_request_after: worker.pending_request(),
                     detached_prefix_item_count: 0,
-                    timeout_bundle_reuse: TimeoutBundleReuse::None,
+                    timeout_bundle_reuse: timeout_bundle_reuse_for_exact_command("INTERRUPT"),
                 },
                 &mut stdout,
                 &mut stderr,
@@ -96,7 +96,7 @@ pub(crate) fn run(
                 VisibleReplyContext {
                     pending_request_after: worker.pending_request(),
                     detached_prefix_item_count: 0,
-                    timeout_bundle_reuse: TimeoutBundleReuse::None,
+                    timeout_bundle_reuse: timeout_bundle_reuse_for_exact_command("RESTART"),
                 },
                 &mut stdout,
                 &mut stderr,
@@ -217,6 +217,14 @@ fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, WorkerError> {
 fn is_exact_command(line: &str, command: &str) -> bool {
     let trimmed = line.trim_end_matches(['\n', '\r']);
     trimmed == command
+}
+
+fn timeout_bundle_reuse_for_exact_command(command: &str) -> TimeoutBundleReuse {
+    match command {
+        "INTERRUPT" => TimeoutBundleReuse::FullReply,
+        "RESTART" => TimeoutBundleReuse::None,
+        _ => unreachable!("unsupported exact debug repl command: {command}"),
+    }
 }
 
 fn split_end_marker(line: &str) -> (String, bool) {
@@ -442,9 +450,32 @@ fn write_kitty_image(stdout: &mut impl Write, data: &str, mime_type: &str) -> io
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::server::response::{ResponseState, TimeoutBundleReuse};
-    use crate::worker_protocol::{WorkerContent, WorkerReply};
+    use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
+
+    fn rendered_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| match &content.raw {
+                RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn transcript_path(text: &str) -> Option<std::path::PathBuf> {
+        let end = text
+            .find("transcript.txt")?
+            .saturating_add("transcript.txt".len());
+        let start = text[..end]
+            .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+            .map_or(0, |idx| idx.saturating_add(1));
+        Some(std::path::PathBuf::from(&text[start..end]))
+    }
 
     #[test]
     fn detect_image_support_uses_mcp_repl_env() {
@@ -505,6 +536,58 @@ mod tests {
         assert!(
             stderr.contains("stderr: boom\n"),
             "expected stderr chunk on stderr, got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn exact_interrupt_keeps_disclosed_timeout_bundle_open() {
+        let mut response = ResponseState::new().expect("response state should initialize");
+        let timed_out_head = format!("HEAD_START\n{}\nHEAD_END\n", "x".repeat(5000));
+        let first = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![WorkerContent::worker_stdout(timed_out_head)],
+                is_error: false,
+                error_code: Some(WorkerErrorCode::Timeout),
+                prompt: None,
+                prompt_variants: None,
+            }),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = rendered_text(&first);
+        let transcript_path = transcript_path(&first_text).unwrap_or_else(|| {
+            panic!("expected transcript path after timed-out output, got: {first_text:?}")
+        });
+
+        let interrupt_tail = "INTERRUPT_TAIL\n";
+        let second = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![WorkerContent::worker_stdout(interrupt_tail)],
+                is_error: false,
+                error_code: None,
+                prompt: Some("> ".to_string()),
+                prompt_variants: None,
+            }),
+            false,
+            timeout_bundle_reuse_for_exact_command("INTERRUPT"),
+            0,
+        );
+        let second_text = rendered_text(&second);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            second_text.contains(interrupt_tail),
+            "expected interrupt reply to stay visible inline, got: {second_text:?}"
+        );
+        assert!(
+            transcript.contains("HEAD_START") && transcript.contains("HEAD_END"),
+            "expected earlier timed-out output in the disclosed transcript, got: {transcript:?}"
+        );
+        assert!(
+            transcript.contains(interrupt_tail),
+            "expected exact INTERRUPT to keep appending to the disclosed timeout bundle, got: {transcript:?}"
         );
     }
 }
