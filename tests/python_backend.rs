@@ -4,6 +4,7 @@ use common::TestResult;
 use rmcp::model::RawContent;
 use std::fs;
 use std::path::PathBuf;
+use tempfile::tempdir;
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -55,12 +56,25 @@ fn interrupt_recovery_deadline() -> Instant {
     Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
 }
 
-async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
+async fn start_python_session_with_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<Option<common::McpTestSession>> {
     if !require_python() {
         return Ok(None);
     }
 
-    let mut session = common::spawn_python_server_with_files().await?;
+    let mut session = common::spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        env_vars,
+    )
+    .await?;
     let probe = session.write_stdin_raw_with("", Some(2.0)).await?;
     let probe_text = result_text(&probe);
     if probe_text.contains("worker io error: Permission denied")
@@ -72,6 +86,10 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     }
 
     Ok(Some(session))
+}
+
+async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
+    start_python_session_with_env_vars(Vec::new()).await
 }
 
 #[cfg(unix)]
@@ -158,6 +176,40 @@ async fn python_smoke() -> TestResult<()> {
     let text = result_text(&result);
     if is_busy_response(&text) {
         eprintln!("python_smoke remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(text.contains("2"), "expected 2, got: {text:?}");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_smoke_without_register_at_fork() -> TestResult<()> {
+    if !require_python() {
+        return Ok(());
+    }
+
+    let temp = tempdir()?;
+    fs::write(
+        temp.path().join("sitecustomize.py"),
+        "import os\ntry:\n    del os.register_at_fork\nexcept AttributeError:\n    pass\n",
+    )?;
+
+    let Some(mut session) = start_python_session_with_env_vars(vec![(
+        "PYTHONPATH".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_smoke_without_register_at_fork remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }

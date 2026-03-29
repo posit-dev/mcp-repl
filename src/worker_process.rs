@@ -756,17 +756,7 @@ impl WorkerManager {
                 WorkerReply::Output { contents, .. } => contents.len(),
             };
             self.last_detached_prefix_item_count = detached_prefix_item_count;
-            let WorkerReply::Output {
-                contents,
-                is_error,
-                error_code,
-                ..
-            } = &mut reply.reply;
-            contents.push(WorkerContent::server_stderr(
-                "[repl] input discarded while worker busy",
-            ));
-            *is_error = true;
-            *error_code = Some(WorkerErrorCode::Busy);
+            mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -885,17 +875,7 @@ impl WorkerManager {
                 WorkerReply::Output { contents, .. } => contents.len(),
             };
             self.last_detached_prefix_item_count = detached_prefix_item_count;
-            let WorkerReply::Output {
-                contents,
-                is_error,
-                error_code,
-                ..
-            } = &mut reply.reply;
-            contents.push(WorkerContent::server_stderr(
-                "[repl] input discarded while worker busy",
-            ));
-            *is_error = true;
-            *error_code = Some(WorkerErrorCode::Busy);
+            mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -3683,6 +3663,22 @@ fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
     }
 }
 
+fn mark_busy_follow_up_reply(reply: &mut WorkerReply) {
+    let WorkerReply::Output {
+        contents,
+        is_error,
+        error_code,
+        ..
+    } = reply;
+    contents.push(WorkerContent::server_stderr(
+        "[repl] input discarded while worker busy",
+    ));
+    *is_error = true;
+    if error_code.is_none() {
+        *error_code = Some(WorkerErrorCode::Busy);
+    }
+}
+
 struct WorkerProcess {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
@@ -5383,6 +5379,84 @@ mod tests {
             "detached-prefix metadata must survive reset until server-side finalization"
         );
         let WorkerReply::Output { .. } = reply;
+    }
+
+    #[test]
+    fn busy_follow_up_reply_sets_busy_error_code_when_missing() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::worker_stdout("tail\n")],
+            is_error: false,
+            error_code: None,
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents
+            .into_iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+
+        assert!(
+            is_error,
+            "expected busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(error_code, Some(WorkerErrorCode::Busy));
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn busy_follow_up_reply_preserves_timeout_error_code() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
+            is_error: false,
+            error_code: Some(WorkerErrorCode::Timeout),
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents
+            .into_iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+
+        assert!(
+            is_error,
+            "expected timed-out busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(
+            error_code,
+            Some(WorkerErrorCode::Timeout),
+            "expected timed-out busy follow-up replies to preserve Timeout"
+        );
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
     }
 
     #[test]

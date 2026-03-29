@@ -61,7 +61,10 @@ def _close_ipc_in_fork_child():
             pass
 
 
-os.register_at_fork(after_in_child=_close_ipc_in_fork_child)
+try:
+    os.register_at_fork(after_in_child=_close_ipc_in_fork_child)
+except AttributeError:
+    pass
 
 
 def _send(obj):
