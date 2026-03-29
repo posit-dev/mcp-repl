@@ -697,8 +697,10 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
+            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
             let remaining_reply =
                 self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout)?;
+            self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
 
@@ -3652,6 +3654,32 @@ fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply 
         error_code: suffix_error_code.or(error_code),
         prompt: suffix_prompt.or(prompt),
         prompt_variants: suffix_prompt_variants.or(prompt_variants),
+    }
+}
+
+fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
+    let WorkerReply::Output {
+        contents, prompt, ..
+    } = prefix;
+    let Some(prompt_text) = prompt.as_deref() else {
+        return contents.len();
+    };
+    if prompt_text.is_empty() {
+        return contents.len();
+    }
+    let Some(idx) = contents
+        .iter()
+        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
+    else {
+        return contents.len();
+    };
+    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
+        return contents.len();
+    };
+    if matches!(text.strip_suffix(prompt_text), Some("")) {
+        contents.len().saturating_sub(1)
+    } else {
+        contents.len()
     }
 }
 

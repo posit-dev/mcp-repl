@@ -1119,6 +1119,68 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); detached <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); tryCatch({{ Sys.sleep(30) }}, interrupt = function(e) {{ cat('DETACHED_START\\n'); cat(detached); cat('\\nDETACHED_END\\n'); flush.console() }})"
+    );
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect timeout bundle disclosure before the ctrl-c follow-up, got: {first_text:?}"
+    );
+
+    sleep(test_delay_ms(260, 700)).await;
+    let follow_up = session
+        .write_stdin_raw_with("\u{3}cat('NEW_TURN\\n')", Some(10.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if follow_up_text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior ctrl-c follow-up did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let disclosed_path = bundle_transcript_path(&follow_up_text).unwrap_or_else(|| {
+        panic!(
+            "expected detached prefix to disclose a timeout bundle path, got: {follow_up_text:?}"
+        )
+    });
+    let transcript =
+        wait_until_file_contains_via_polls(&mut session, &disclosed_path, "DETACHED_END").await?;
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("NEW_TURN"),
+        "expected fresh follow-up output inline, got: {follow_up_text:?}"
+    );
+    assert!(
+        transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+        "expected the timeout bundle to preserve the earlier timed-out output, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("DETACHED_START") && transcript.contains("DETACHED_END"),
+        "expected detached interrupt output on the timeout bundle path, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("NEW_TURN"),
+        "did not expect fresh follow-up output to append to the timeout bundle: {transcript:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> TestResult<()> {
     let _guard = lock_test_mutex();
