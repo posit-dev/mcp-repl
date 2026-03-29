@@ -221,6 +221,95 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fork_child_closes_raw_ipc_fds_without_wrapper_close() -> TestResult<()> {
+    if !require_python() {
+        return Ok(());
+    }
+
+    let temp = tempdir()?;
+    let marker_path = temp.path().join("fork-close.log");
+    fs::write(
+        temp.path().join("sitecustomize.py"),
+        r#"import os
+_real_fdopen = os.fdopen
+_target_fds = {
+    int(os.environ["MCP_REPL_IPC_READ_FD"]),
+    int(os.environ["MCP_REPL_IPC_WRITE_FD"]),
+}
+_marker = os.environ["MCP_REPL_FORK_CLOSE_MARKER"]
+
+class _SpyStream:
+    def __init__(self, stream, fd):
+        self._stream = stream
+        self._fd = fd
+
+    def __iter__(self):
+        return iter(self._stream)
+
+    def close(self):
+        with open(_marker, "a", encoding="utf-8") as handle:
+            handle.write(f"{{self._fd}}\n")
+        return self._stream.close()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+def _wrapped_fdopen(fd, *args, **kwargs):
+    stream = _real_fdopen(fd, *args, **kwargs)
+    if fd in _target_fds:
+        return _SpyStream(stream, fd)
+    return stream
+
+os.fdopen = _wrapped_fdopen
+"#,
+    )?;
+
+    let Some(mut session) = start_python_session_with_env_vars(vec![
+        ("PYTHONPATH".to_string(), temp.path().display().to_string()),
+        (
+            "MCP_REPL_FORK_CLOSE_MARKER".to_string(),
+            marker_path.display().to_string(),
+        ),
+    ])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+print("FORK_OK", status)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python os.fork() remained busy".into());
+    }
+    assert!(
+        text.contains("FORK_OK"),
+        "expected fork round-trip output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+
+    assert!(
+        !marker_path.exists(),
+        "expected at-fork cleanup to bypass wrapped stream close, got marker contents: {:?}",
+        fs::read_to_string(&marker_path).ok()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
         return Ok(());

@@ -536,7 +536,10 @@ impl ResponseState {
                     Err(err) => {
                         eprintln!("dropping output-bundle setup after output-bundle error: {err}");
                         return FollowUpDetachedPrefix {
-                            contents: compact_detached_prefix_without_output_bundle(material),
+                            contents: compact_staged_timeout_without_output_bundle(
+                                &staged,
+                                &material.detached_prefix_items,
+                            ),
                             protected_bundle_id: None,
                             retained_active_timeout_bundle: None,
                             retained_staged_timeout_output: None,
@@ -3727,6 +3730,72 @@ mod tests {
         assert!(
             second_text.contains("SECOND_END"),
             "expected the current timeout chunk to survive the inline fallback, got: {second_text:?}"
+        );
+    }
+
+    #[test]
+    fn follow_up_detached_prefix_fallback_keeps_staged_timeout_output_when_bundle_setup_fails() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let first_chunk = "FIRST_START\nHEAD\nFIRST_END\n".to_string();
+        let detached_prefix = format!(
+            "TAIL_START\n{}\nTAIL_END\n",
+            "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(first_chunk.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = result_text(&first);
+        assert!(
+            first_text.contains("FIRST_START"),
+            "expected the initial timed-out reply to stay inline, got: {first_text:?}"
+        );
+        assert!(
+            state.staged_timeout_output.is_some(),
+            "expected the initial timed-out reply to retain staged timeout state"
+        );
+
+        state.output_store.create_root = output_store_root_with_text_conflict;
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout("FOLLOW_UP_OK\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+        let second_text = result_text(&second);
+
+        assert!(
+            second_text.contains("output bundle unavailable"),
+            "expected inline fallback after detached-prefix bundle setup failure, got: {second_text:?}"
+        );
+        assert!(
+            !second_text.contains("/transcript.txt") && !second_text.contains("/events.log"),
+            "did not expect a bundle path after detached-prefix bundle setup failure, got: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("FIRST_START"),
+            "expected the staged timeout prefix to survive the detached-prefix fallback, got: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("TAIL_END"),
+            "expected the current detached prefix to survive the fallback preview, got: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("FOLLOW_UP_OK"),
+            "expected the follow-up reply inline after detached-prefix bundle setup failure, got: {second_text:?}"
         );
     }
 

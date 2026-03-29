@@ -54,9 +54,11 @@ _plot_show = None
 def _close_ipc_in_fork_child():
     global _ipc_ok
     _ipc_ok = False
-    for stream in (_ipc_read, _ipc_write):
+    # The child only needs the inherited descriptors gone. Closing the buffered wrappers can
+    # deadlock on inherited _io locks from threads that vanished across fork.
+    for fd in (_ipc_read_fd, _ipc_write_fd):
         try:
-            stream.close()
+            os.close(fd)
         except Exception:
             pass
 
