@@ -219,6 +219,61 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_files_mode()
+-> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            "import time; time.sleep(0.2); print('DETACHED_OK')",
+            Some(0.05),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial Python request to time out, got: {first_text:?}"
+    );
+
+    sleep(Duration::from_millis(if cfg!(target_os = "macos") {
+        700
+    } else {
+        350
+    }))
+    .await;
+
+    let follow_up = session
+        .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        session.cancel().await?;
+        return Err(format!(
+            "python follow-up remained busy after timed-out request settled: {follow_up_text:?}"
+        )
+        .into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("DETACHED_OK"),
+        "expected the settled timeout result to be prefixed into the next files-mode reply, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("FOLLOWUP_OK"),
+        "expected the fresh Python follow-up result, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("import time; time.sleep(0.2); print('DETACHED_OK')"),
+        "did not expect the timed-out Python echo to leak into the next visible reply, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_fork_child_closes_raw_ipc_fds_without_wrapper_close() -> TestResult<()> {

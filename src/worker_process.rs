@@ -1,3 +1,5 @@
+#[cfg(all(test, target_family = "unix"))]
+use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_family = "unix")]
@@ -57,6 +59,27 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Storage::FileSystem::PeekNamedPipe;
+
+#[cfg(all(test, target_family = "unix"))]
+thread_local! {
+    static TEST_UNIX_KILL_RECORDER: RefCell<Option<Vec<(i32, i32)>>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_family = "unix")]
+fn raw_unix_kill(target: i32, signal: i32) -> i32 {
+    #[cfg(test)]
+    if let Ok(Some(result)) = TEST_UNIX_KILL_RECORDER.try_with(|recorder| {
+        let mut recorder = recorder.borrow_mut();
+        recorder.as_mut().map(|calls| {
+            calls.push((target, signal));
+            0
+        })
+    }) {
+        return result;
+    }
+
+    unsafe { libc::kill(target, signal) }
+}
 
 #[derive(Debug, Clone)]
 struct GuardrailEvent {
@@ -536,6 +559,7 @@ pub struct WorkerManager {
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
+    pending_request_input_transcript: Option<String>,
     session_end_seen: bool,
     settled_pending_completion: Option<CompletionInfo>,
     last_detached_prefix_item_count: usize,
@@ -611,6 +635,7 @@ impl WorkerManager {
             },
             pending_request: false,
             pending_request_started_at: None,
+            pending_request_input_transcript: None,
             session_end_seen: false,
             settled_pending_completion: None,
             last_detached_prefix_item_count: 0,
@@ -943,6 +968,7 @@ impl WorkerManager {
         let poll_start = std::time::Instant::now();
         let mut timed_out = false;
         let mut completed_request = false;
+        let mut consumed_completion = false;
         let mut completion = CompletionInfo {
             prompt: None,
             prompt_variants: None,
@@ -960,6 +986,7 @@ impl WorkerManager {
                     }
                     completion = info;
                     completed_request = true;
+                    consumed_completion = true;
                 }
                 Err(WorkerError::Timeout(_)) => {
                     let worker_exited = match self.process.as_mut() {
@@ -971,6 +998,7 @@ impl WorkerManager {
                         self.clear_pending_request_state();
                         completion.session_end_seen = true;
                         completed_request = true;
+                        consumed_completion = true;
                     } else {
                         timed_out = true;
                     }
@@ -983,7 +1011,11 @@ impl WorkerManager {
             && let Some(info) = self.settled_pending_completion.take()
         {
             completion = info;
+            consumed_completion = true;
         }
+        let fallback_input_transcript = (!timed_out && consumed_completion)
+            .then(|| self.take_input_transcript_fallback(&completion))
+            .flatten();
 
         let FormattedPendingOutput {
             mut contents,
@@ -1011,15 +1043,27 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
+        let has_fallback_input_transcript = fallback_input_transcript.is_some();
+        let trim_enabled = !timed_out
+            && if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
         let echo_transcript = (!timed_out)
-            .then(|| echo_transcript_from_events(&completion.echo_events))
+            .then(|| {
+                echo_transcript_from_events(&completion.echo_events).or(fallback_input_transcript)
+            })
             .flatten();
         trim_echo_then_append_protocol_warnings(
             &mut contents,
             echo_transcript.as_deref(),
             trim_enabled,
-            should_drop_echo_only_contents(&completion.echo_events),
+            if !timed_out && completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_drop_echo_only_contents(&completion.echo_events)
+            },
             &completion.protocol_warnings,
         );
         if !timed_out && !session_end {
@@ -1188,18 +1232,31 @@ impl WorkerManager {
     /// into that request's visible reply.
     fn prepare_input_context_files(&mut self) -> InputContext {
         let settled_completion = self.settled_pending_completion.take();
+        let fallback_input_transcript = settled_completion
+            .as_ref()
+            .and_then(|completion| self.take_input_transcript_fallback(completion));
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
         } = self.drain_sealed_formatted_output();
         if let Some(completion) = settled_completion.as_ref() {
-            let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-            let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+            let has_fallback_input_transcript = fallback_input_transcript.is_some();
+            let trim_enabled = if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
+            let echo_transcript =
+                echo_transcript_from_events(&completion.echo_events).or(fallback_input_transcript);
             trim_echo_then_append_protocol_warnings(
                 &mut contents,
                 echo_transcript.as_deref(),
                 trim_enabled,
-                should_drop_echo_only_contents(&completion.echo_events),
+                if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_drop_echo_only_contents(&completion.echo_events)
+                },
                 &completion.protocol_warnings,
             );
         }
@@ -1280,6 +1337,12 @@ impl WorkerManager {
     ) -> Result<RequestState, WorkerError> {
         let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
+        if matches!(self.oversized_output, OversizedOutputMode::Files) {
+            let prompt = self.current_prompt_hint();
+            self.remember_prompt(prompt.clone());
+            self.pending_request_input_transcript =
+                build_input_transcript(prompt.as_deref(), &text);
+        }
         let ipc = self
             .process
             .as_ref()
@@ -1393,13 +1456,24 @@ impl WorkerManager {
                     normalize_prompt(completion.prompt.clone())
                 };
                 self.remember_prompt(resolved_prompt.clone());
-                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+                let fallback_input_transcript = self.take_input_transcript_fallback(&completion);
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript);
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
                     trim_enabled,
-                    should_drop_echo_only_contents(&completion.echo_events),
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
                     &completion.protocol_warnings,
                 );
                 if !session_end {
@@ -1800,7 +1874,7 @@ impl WorkerManager {
                     match self.oversized_output {
                         OversizedOutputMode::Files => self
                             .pending_output_tape
-                            .append_server_stderr_bytes(message.as_bytes()),
+                            .append_server_stderr_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
                             self.output_timeline.append_text(message.as_bytes(), true);
                         }
@@ -2285,6 +2359,7 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.pending_request_input_transcript = None;
         self.session_end_seen = false;
         self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
@@ -2304,6 +2379,7 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.pending_request_input_transcript = None;
         self.session_end_seen = false;
         self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
@@ -2545,6 +2621,15 @@ impl WorkerManager {
         self.pending_request_started_at = None;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn take_input_transcript_fallback(&mut self, completion: &CompletionInfo) -> Option<String> {
+        let transcript = self.pending_request_input_transcript.take();
+        completion
+            .echo_events
+            .is_empty()
+            .then_some(transcript)
+            .flatten()
     }
 
     fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
@@ -4234,7 +4319,7 @@ impl WorkerProcess {
     #[cfg(target_family = "unix")]
     fn send_signal(&self, signal: i32) -> Result<(), WorkerError> {
         let pid = self.child.id() as i32;
-        let result = unsafe { libc::kill(-pid, signal) };
+        let result = raw_unix_kill(-pid, signal);
         if result == 0 {
             Ok(())
         } else {
@@ -4255,9 +4340,22 @@ impl WorkerProcess {
         let descendants = collect_process_tree_pids(&system, root);
         let result = self.send_signal(signal);
         for pid in descendants {
-            let _ = unsafe { libc::kill(pid.as_u32() as i32, signal) };
+            let _ = raw_unix_kill(pid.as_u32() as i32, signal);
         }
         result
+    }
+
+    #[cfg(target_family = "unix")]
+    fn send_signal_descendants_only(&self, signal: i32) {
+        let root = Pid::from_u32(self.child.id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        for pid in collect_process_tree_pids(&system, root) {
+            if pid == root {
+                continue;
+            }
+            let _ = raw_unix_kill(pid.as_u32() as i32, signal);
+        }
     }
 
     fn note_expected_exit(&mut self) {
@@ -4338,7 +4436,7 @@ impl WorkerProcess {
                 }
                 if std::time::Instant::now() >= term_deadline {
                     let _ = self.send_sigkill();
-                    let _ = self.child.wait();
+                    self.exit_status = Some(self.child.wait()?);
                     break;
                 }
                 thread::sleep(Duration::from_millis(20));
@@ -4350,7 +4448,7 @@ impl WorkerProcess {
 
     fn kill(mut self) -> Result<(), WorkerError> {
         let _ = self.send_sigkill();
-        let _ = self.child.wait();
+        self.exit_status = Some(self.child.wait()?);
         self.finalize_terminated_process()
     }
 
@@ -4366,7 +4464,11 @@ impl WorkerProcess {
         {
             // Once the root worker is gone, kill any remaining session peers before waiting on
             // stdio or IPC readers they may still be holding open.
-            let _ = self.send_sigkill();
+            if self.exit_status.is_some() {
+                self.send_signal_descendants_only(libc::SIGKILL);
+            } else {
+                let _ = self.send_sigkill();
+            }
             // TODO: Track descendants or use stronger OS-level containment so children that have
             // escaped the worker process group are still killable after the root exits.
         }
@@ -4994,6 +5096,68 @@ mod tests {
             .join("")
     }
 
+    #[cfg(target_family = "unix")]
+    fn sleeping_test_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn successful_test_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn exiting test child")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn failing_test_status() -> std::process::ExitStatus {
+        Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("collect failing exit status")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn test_worker_process(child: Child) -> WorkerProcess {
+        let (stdin_tx, _stdin_rx) = mpsc::channel();
+        WorkerProcess {
+            child,
+            stdin_tx,
+            session_tmpdir: None,
+            ipc: IpcHandle::new(),
+            stdout_reader: None,
+            stderr_reader: None,
+            expected_exit: false,
+            exit_status: None,
+            guardrail_stop: Arc::new(AtomicBool::new(false)),
+            guardrail_thread: None,
+            guardrail_thread_handle: None,
+            #[cfg(target_os = "macos")]
+            denial_logger: None,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn capture_recorded_unix_kills<F, R>(f: F) -> (R, Vec<(i32, i32)>)
+    where
+        F: FnOnce() -> R,
+    {
+        TEST_UNIX_KILL_RECORDER.with(|recorder| {
+            assert!(
+                recorder.borrow().is_none(),
+                "did not expect nested unix kill recorder"
+            );
+            *recorder.borrow_mut() = Some(Vec::new());
+        });
+        let result = f();
+        let kills = TEST_UNIX_KILL_RECORDER
+            .with(|recorder| recorder.borrow_mut().take().expect("recorded kills"));
+        (result, kills)
+    }
+
     #[test]
     fn trims_echo_prefix_across_text_chunks() {
         let mut contents = vec![
@@ -5483,6 +5647,96 @@ mod tests {
             manager.detached_prefix_item_count(),
             2,
             "session-end cleanup must preserve detached-prefix metadata until server finalization"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn finish_exited_does_not_signal_reaped_root_pid() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let child = successful_test_child();
+        let (result, kills) =
+            capture_recorded_unix_kills(|| test_worker_process(child).finish_exited());
+
+        assert!(
+            result.is_ok(),
+            "expected finish_exited to succeed: {result:?}"
+        );
+        assert!(
+            kills.is_empty(),
+            "did not expect finish_exited to signal an already reaped root pid, got: {kills:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn failing_session_end_notice_flushes_partial_stdout_in_files_mode() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let mut process = test_worker_process(sleeping_test_child());
+        process.exit_status = Some(failing_test_status());
+        manager.process = Some(process);
+
+        manager.note_session_end(true);
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            text.contains("\\xC3"),
+            "expected the partial stdout tail to survive the exit-status notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("worker exited with status 7"),
+            "expected the exit-status notice to stay visible, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_trims_echo_from_prompt_fallback_when_echo_events_missing() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input_transcript =
+            Some(">>> import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected the settled files-mode output to survive trimming, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the Python prompt echo to leak into the next files-mode reply, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected settled completion metadata to be consumed with the detached prefix"
         );
     }
 

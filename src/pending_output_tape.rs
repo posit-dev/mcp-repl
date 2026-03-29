@@ -104,6 +104,33 @@ impl PendingOutputTape {
         self.append_bytes(bytes, TextStream::Stderr, ContentOrigin::Server);
     }
 
+    pub(crate) fn append_server_stderr_status_line(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("pending output tape mutex poisoned");
+        note_progress(&mut guard);
+        flush_tail(&mut guard, TextStream::Stdout, true);
+        flush_tail(&mut guard, TextStream::Stderr, true);
+        let needs_separator = last_text_fragment_bytes(&guard.events)
+            .is_some_and(|last| !last.ends_with(b"\n"))
+            && !bytes.starts_with(b"\n");
+        let mut status_line = Vec::with_capacity(bytes.len() + usize::from(needs_separator));
+        if needs_separator {
+            status_line.push(b'\n');
+        }
+        status_line.extend_from_slice(bytes);
+        append_complete_bytes(
+            &mut guard,
+            TextStream::Stderr,
+            ContentOrigin::Server,
+            &status_line,
+        );
+    }
+
     pub(crate) fn append_stdout_status_line(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
