@@ -166,6 +166,45 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let long_sleep =
+        r#"tryCatch({ Sys.sleep(30) }, interrupt = function(e) cat("interrupt received\n"))"#;
+    let timeout_result = session.write_stdin_raw_with(long_sleep, Some(0.2)).await?;
+    let timeout_text = result_text(&timeout_result);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("\u{3}1+1", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("interrupt prefix did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("interrupt received"),
+        "expected interrupt handler output to be preserved in pager mode, got: {text:?}"
+    );
+    assert!(
+        text.contains("[1] 2") || text.contains("2"),
+        "expected evaluation after interrupt prefix, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
     let mut session = spawn_interrupt_session().await?;
@@ -211,6 +250,37 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
     assert!(
         text.contains("FALSE"),
         "expected fresh session output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{4}print('AFTER_RESET')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) || text.contains("worker exited with status") {
+        eprintln!("restart prefix did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("new session started"),
+        "expected restart notice to be preserved in pager mode, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_RESET"),
+        "expected follow-up output after restart prefix, got: {text:?}"
     );
 
     session.cancel().await?;

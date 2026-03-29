@@ -1,6 +1,6 @@
 ---
 source: tests/session_endings.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: restart_timeout_zero ==
 1) r_repl timeout_ms=10000
@@ -39,6 +39,7 @@ expression: snapshot.render_transcript()
 1) r_repl timeout_ms=10000
 >>> 
 >>> 1+1
+<<< [repl] new session started
 <<< [1] 2
 
 == session: quit_no ==

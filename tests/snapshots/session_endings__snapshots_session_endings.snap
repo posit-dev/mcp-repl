@@ -197,6 +197,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "[repl] new session started"
+    },
+    {
+      "type": "text",
       "text": "[1] 2"
     },
     {

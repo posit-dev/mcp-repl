@@ -797,13 +797,16 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
-            return self.write_stdin_pager(
+            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
+            let remaining_reply = self.write_stdin_pager(
                 remaining.to_string(),
                 worker_timeout,
                 server_timeout,
                 page_bytes_override,
                 echo_input,
-            );
+            )?;
+            self.last_detached_prefix_item_count += control_prefix_item_count;
+            return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
 
         if self.guardrail_busy_event_pending() {

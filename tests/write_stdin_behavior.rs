@@ -744,12 +744,69 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first_input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.2); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n')"
+    );
+    let first = session
+        .write_stdin_raw_with(&first_input, Some(test_timeout_secs(0.05, 0.2)))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the initial under-threshold timeout reply to spill, got: {first_text:?}"
+    );
+
+    sleep(test_delay_ms(260, 700)).await;
+    let follow_up_input = format!(
+        "fresh <- paste(rep('f', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('FRESH_START\\n'); cat(fresh); cat('\\nFRESH_END\\n')"
+    );
+    let follow_up = session
+        .write_stdin_raw_with(&follow_up_input, Some(2.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if follow_up_text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior follow-up remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&follow_up_text).unwrap_or_else(|| {
+        panic!(
+            "expected combined detached timeout output and follow-up reply to spill, got: {follow_up_text:?}"
+        )
+    });
+    let transcript =
+        wait_until_file_contains_via_polls(&mut session, &transcript_path, "SMALL_END").await?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+        "expected the detached timeout prefix in the spilled transcript, got: {transcript:?}"
+    );
+    assert!(
+        follow_up_text.contains("FRESH_START") && follow_up_text.contains("FRESH_END"),
+        "expected the fresh follow-up reply to remain visible, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.2); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.2); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
     );
     let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);
@@ -824,7 +881,7 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
     let mut session = spawn_pager_behavior_session(20_000).await?;
 
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.2); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.2); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
     );
     let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);

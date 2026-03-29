@@ -149,6 +149,7 @@ struct FollowUpDetachedPrefix {
     protected_bundle_id: Option<u64>,
     retained_active_timeout_bundle: Option<ActiveOutputBundle>,
     retained_staged_timeout_output: Option<StagedTimeoutOutput>,
+    retained_bundle_is_detached_prefix_only: bool,
 }
 
 struct TimeoutReplySegment {
@@ -376,6 +377,7 @@ impl ResponseState {
             protected_bundle_id,
             retained_active_timeout_bundle,
             retained_staged_timeout_output,
+            retained_bundle_is_detached_prefix_only: _,
         } = self.render_follow_up_detached_prefix(material, None, None);
         let TimeoutReplySegment {
             contents: reply_contents,
@@ -397,8 +399,12 @@ impl ResponseState {
         self.active_timeout_bundle = retained_reply_timeout_bundle;
         self.staged_timeout_output = retained_reply_staged_timeout_output;
 
-        debug_assert!(retained_active_timeout_bundle.is_none());
         debug_assert!(retained_staged_timeout_output.is_none());
+        if let Some(active) = retained_active_timeout_bundle
+            && let Err(err) = self.finish_bundle(active)
+        {
+            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
+        }
 
         contents
     }
@@ -415,6 +421,7 @@ impl ResponseState {
             protected_bundle_id,
             mut retained_active_timeout_bundle,
             mut retained_staged_timeout_output,
+            retained_bundle_is_detached_prefix_only,
         } = self.render_follow_up_detached_prefix(
             material,
             active_timeout_bundle,
@@ -451,14 +458,20 @@ impl ResponseState {
         self.active_timeout_bundle = retained_reply_timeout_bundle;
         self.staged_timeout_output = retained_reply_staged_timeout_output;
 
-        if pending_request_after
-            && (material.error_code != Some(WorkerErrorCode::Timeout)
-                || reply_is_server_only_follow_up)
-            && self.active_timeout_bundle.is_none()
-            && self.staged_timeout_output.is_none()
-        {
-            self.active_timeout_bundle = retained_active_timeout_bundle.take();
-            self.staged_timeout_output = retained_staged_timeout_output.take();
+        if self.active_timeout_bundle.is_none() && self.staged_timeout_output.is_none() {
+            if pending_request_after
+                && retained_bundle_is_detached_prefix_only
+                && reply_is_server_only_follow_up
+            {
+                self.active_timeout_bundle = retained_active_timeout_bundle.take();
+            } else if pending_request_after
+                && !retained_bundle_is_detached_prefix_only
+                && (material.error_code != Some(WorkerErrorCode::Timeout)
+                    || reply_is_server_only_follow_up)
+            {
+                self.active_timeout_bundle = retained_active_timeout_bundle.take();
+                self.staged_timeout_output = retained_staged_timeout_output.take();
+            }
         }
         if let Some(active) = retained_active_timeout_bundle.take()
             && let Err(err) = self.finish_bundle(active)
@@ -480,24 +493,41 @@ impl ResponseState {
         }
 
         let detached_prefix_image_count = count_images(&material.detached_prefix_items);
-        let combined_image_count =
-            staged_timeout_output
-                .as_ref()
-                .map_or(detached_prefix_image_count, |staged| {
-                    staged
-                        .image_count()
-                        .saturating_add(detached_prefix_image_count)
-                });
+        let reply_image_count = if material.detached_prefix_items.is_empty() {
+            0
+        } else {
+            count_images(&material.reply_bundle_items)
+        };
+        let detached_prefix_worker_text_chars =
+            material.detached_prefix_worker_text.chars().count();
+        let reply_worker_text_chars = if material.detached_prefix_items.is_empty() {
+            0
+        } else {
+            material.reply_worker_text.chars().count()
+        };
+        let combined_image_count = staged_timeout_output.as_ref().map_or(
+            detached_prefix_image_count.saturating_add(reply_image_count),
+            |staged| {
+                staged
+                    .image_count()
+                    .saturating_add(detached_prefix_image_count)
+                    .saturating_add(reply_image_count)
+            },
+        );
+        let combined_worker_text_chars = staged_timeout_output.as_ref().map_or(
+            detached_prefix_worker_text_chars.saturating_add(reply_worker_text_chars),
+            |staged| {
+                staged
+                    .worker_text_chars()
+                    .saturating_add(detached_prefix_worker_text_chars)
+                    .saturating_add(reply_worker_text_chars)
+            },
+        );
         let use_output_bundle = combined_image_count > 0
-            && should_use_output_bundle(
-                combined_image_count,
-                material.detached_prefix_worker_text.chars().count(),
-            );
+            && should_use_output_bundle(combined_image_count, combined_worker_text_chars);
 
         if let Some(mut staged) = staged_timeout_output {
-            if use_output_bundle
-                || text_should_spill(material.detached_prefix_worker_text.chars().count())
-            {
+            if use_output_bundle || text_should_spill(combined_worker_text_chars) {
                 match self.materialize_staged_timeout_output(&staged, None) {
                     Ok(active) => {
                         return self
@@ -510,6 +540,7 @@ impl ResponseState {
                             protected_bundle_id: None,
                             retained_active_timeout_bundle: None,
                             retained_staged_timeout_output: None,
+                            retained_bundle_is_detached_prefix_only: false,
                         };
                     }
                 }
@@ -522,12 +553,11 @@ impl ResponseState {
                 retained_staged_timeout_output: staged
                     .has_retained_worker_output()
                     .then_some(staged),
+                retained_bundle_is_detached_prefix_only: false,
             };
         }
 
-        if use_output_bundle
-            || text_should_spill(material.detached_prefix_worker_text.chars().count())
-        {
+        if use_output_bundle || text_should_spill(combined_worker_text_chars) {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
                     match bundle
@@ -549,8 +579,9 @@ impl ResponseState {
                             return FollowUpDetachedPrefix {
                                 contents,
                                 protected_bundle_id: Some(bundle.id),
-                                retained_active_timeout_bundle: None,
+                                retained_active_timeout_bundle: Some(bundle),
                                 retained_staged_timeout_output: None,
+                                retained_bundle_is_detached_prefix_only: true,
                             };
                         }
                         Err(err) => {
@@ -574,6 +605,7 @@ impl ResponseState {
                 protected_bundle_id: None,
                 retained_active_timeout_bundle: None,
                 retained_staged_timeout_output: None,
+                retained_bundle_is_detached_prefix_only: false,
             };
         }
         FollowUpDetachedPrefix {
@@ -581,6 +613,7 @@ impl ResponseState {
             protected_bundle_id: None,
             retained_active_timeout_bundle: None,
             retained_staged_timeout_output: None,
+            retained_bundle_is_detached_prefix_only: false,
         }
     }
 
@@ -613,6 +646,7 @@ impl ResponseState {
                         protected_bundle_id,
                         retained_active_timeout_bundle: None,
                         retained_staged_timeout_output: None,
+                        retained_bundle_is_detached_prefix_only: false,
                     };
                 }
             }
@@ -623,6 +657,7 @@ impl ResponseState {
             protected_bundle_id,
             retained_active_timeout_bundle: Some(active),
             retained_staged_timeout_output: None,
+            retained_bundle_is_detached_prefix_only: false,
         }
     }
 
