@@ -87,6 +87,7 @@ struct StoredBundle {
     id: u64,
     dir: PathBuf,
     bytes_on_disk: u64,
+    reserved_events_log_bytes: u64,
 }
 
 struct OutputStoreLimits {
@@ -942,6 +943,7 @@ impl OutputStore {
             id: bundle_id,
             dir: dir.clone(),
             bytes_on_disk: 0,
+            reserved_events_log_bytes: 0,
         });
         Ok(ActiveOutputBundle {
             id: bundle_id,
@@ -995,6 +997,25 @@ impl OutputStore {
         Ok(())
     }
 
+    fn append_events_log_bytes(
+        &mut self,
+        bundle_id: u64,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(WorkerError::Io)?;
+        file.write_all(bytes).map_err(WorkerError::Io)?;
+        self.record_events_log_append(bundle_id, bytes.len() as u64);
+        Ok(())
+    }
+
     fn prepare_append_capacity(
         &mut self,
         bundle_id: u64,
@@ -1014,7 +1035,14 @@ impl OutputStore {
         self.bundles
             .iter()
             .find(|bundle| bundle.id == bundle_id)
-            .map(|bundle| bundle.bytes_on_disk)
+            .map(StoredBundle::accounted_bytes)
+    }
+
+    fn reserved_events_log_bytes(&self, bundle_id: u64) -> Option<u64> {
+        self.bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .map(|bundle| bundle.reserved_events_log_bytes)
     }
 
     fn record_append(&mut self, bundle_id: u64, bytes: u64) {
@@ -1028,6 +1056,38 @@ impl OutputStore {
             .expect("bundle metadata should exist for append");
         bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_add(bytes);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
+    }
+
+    fn reserve_events_log_bytes(&mut self, bundle_id: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("bundle metadata should exist for events.log reservation");
+        bundle.reserved_events_log_bytes = bundle.reserved_events_log_bytes.saturating_add(bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+    }
+
+    fn record_events_log_append(&mut self, bundle_id: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("bundle metadata should exist for events.log append");
+        let consumed_reserved = bytes.min(bundle.reserved_events_log_bytes);
+        bundle.reserved_events_log_bytes = bundle
+            .reserved_events_log_bytes
+            .saturating_sub(consumed_reserved);
+        bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_add(bytes);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(bytes.saturating_sub(consumed_reserved));
     }
 
     fn record_file_replace(&mut self, bundle_id: u64, old_bytes: u64, new_bytes: u64) {
@@ -1123,8 +1183,15 @@ impl OutputStore {
             .bundles
             .remove(index)
             .expect("bundle index should still exist");
-        self.total_bytes = self.total_bytes.saturating_sub(bundle.bytes_on_disk);
+        self.total_bytes = self.total_bytes.saturating_sub(bundle.accounted_bytes());
         Ok(())
+    }
+}
+
+impl StoredBundle {
+    fn accounted_bytes(&self) -> u64 {
+        self.bytes_on_disk
+            .saturating_add(self.reserved_events_log_bytes)
     }
 }
 
@@ -1308,7 +1375,11 @@ impl ActiveOutputBundle {
             {
                 store.append_bundle_bytes(self.id, &self.paths.transcript, retained.as_bytes())?;
                 if self.has_events_log() {
-                    store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+                    store.append_events_log_bytes(
+                        self.id,
+                        &self.paths.events_log,
+                        row.as_bytes(),
+                    )?;
                 }
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
                 self.transcript_lines = next_line_count;
@@ -1347,7 +1418,7 @@ impl ActiveOutputBundle {
         if granted < line.len() as u64 {
             return Ok(None);
         }
-        store.append_bundle_bytes(self.id, &self.paths.events_log, line.as_bytes())?;
+        store.append_events_log_bytes(self.id, &self.paths.events_log, line.as_bytes())?;
         Ok(Some(text))
     }
 
@@ -1392,7 +1463,23 @@ impl ActiveOutputBundle {
             .map_or(0, |metadata| metadata.len());
         let alias_growth = (bytes.len() as u64).saturating_sub(alias_old_len);
         let row = format!("I {history_rel_path}\n");
-        let required = bytes.len() as u64 + row.len() as u64 + alias_growth;
+        let future_events_log_reserve = if self.has_events_log() {
+            0
+        } else {
+            row.len() as u64
+                + if self.pre_index_image_paths.is_empty() {
+                    OUTPUT_BUNDLE_HEADER.len() as u64
+                } else {
+                    0
+                }
+        };
+        let required = bytes.len() as u64
+            + alias_growth
+            + if self.has_events_log() {
+                row.len() as u64
+            } else {
+                future_events_log_reserve
+            };
         let granted = store.prepare_append_capacity(self.id, required)?;
         if granted < required {
             return Ok(None);
@@ -1417,8 +1504,9 @@ impl ActiveOutputBundle {
         fs::write(&alias_path, &bytes).map_err(WorkerError::Io)?;
         store.record_file_replace(self.id, replace_old_len, bytes.len() as u64);
         if self.has_events_log() {
-            store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
+            store.append_events_log_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
         } else {
+            store.reserve_events_log_bytes(self.id, future_events_log_reserve);
             self.pre_index_image_paths.push(history_rel_path);
         }
         self.next_image_number = image_number;
@@ -1475,14 +1563,18 @@ impl ActiveOutputBundle {
             );
             self.omission_recorded = true;
         }
-        let granted = store.prepare_append_capacity(self.id, bytes.len() as u64)?;
-        if granted < bytes.len() as u64 {
+        let reserved = store
+            .reserved_events_log_bytes(self.id)
+            .expect("bundle metadata should exist for events.log reservation tracking");
+        let needed = (bytes.len() as u64).saturating_sub(reserved);
+        let granted = store.prepare_append_capacity(self.id, needed)?;
+        if granted < needed {
             return Err(WorkerError::Protocol(
                 "output bundle could not materialize events.log within quota".to_string(),
             ));
         }
         std::fs::File::create(&self.paths.events_log).map_err(WorkerError::Io)?;
-        store.append_bundle_bytes(self.id, &self.paths.events_log, &bytes)?;
+        store.append_events_log_bytes(self.id, &self.paths.events_log, &bytes)?;
         self.pre_index_image_paths.clear();
         Ok(())
     }
@@ -3353,6 +3445,92 @@ mod tests {
         assert!(
             transcript.contains("TAIL\n"),
             "expected later small poll output to append to the existing timeout bundle, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_image_bundle_preserves_path_under_quota_when_later_text_arrives() {
+        let oversized = (0..1200)
+            .map(|index| format!("line{index:04}\n"))
+            .collect::<String>();
+        assert!(
+            super::text_should_spill(oversized.chars().count()),
+            "expected later text to cross the hard spill threshold"
+        );
+
+        let mut sizing_state = ResponseState::new().expect("response state should initialize");
+        let mut sizing_bundle = sizing_state
+            .output_store
+            .new_bundle()
+            .expect("sizing bundle should initialize");
+        for index in 0..(super::IMAGE_OUTPUT_BUNDLE_THRESHOLD - 1) {
+            let image = ReplyImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                is_new: true,
+            };
+            let retained = sizing_bundle
+                .append_image(&mut sizing_state.output_store, &image)
+                .expect("sizing image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        let retained_tail = sizing_bundle
+            .append_worker_text(
+                &mut sizing_state.output_store,
+                &oversized,
+                TextStream::Stdout,
+            )
+            .expect("sizing tail should append");
+        assert!(
+            matches!(retained_tail, Some(ReplyItem::WorkerText { text, .. }) if text == oversized)
+        );
+        let quota_cap = sizing_state
+            .output_store
+            .bundle_bytes(sizing_bundle.id)
+            .expect("sizing bundle metadata should exist");
+
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_bytes = quota_cap;
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+            let image = ReplyImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                is_new: true,
+            };
+            let _ = bundle
+                .append_image(&mut state.output_store, &image)
+                .expect("timeout image append should not error")
+                .is_some();
+        }
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(oversized.clone())],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            disclosed_path(&text, "events.log").is_some()
+                || disclosed_path(&text, "transcript.txt").is_some(),
+            "expected later text to stay on the disclosed bundle path under quota pressure, got: {text:?}"
+        );
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to stay readable: {err}"));
+        assert!(
+            transcript.contains("line0600\n"),
+            "expected later text to append to the existing timeout bundle, got: {transcript:?}"
         );
     }
 
