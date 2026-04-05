@@ -444,6 +444,12 @@ struct InputContext {
     input_transcript: Option<String>,
 }
 
+#[derive(Default)]
+struct InputFallback {
+    transcript: Option<String>,
+    raw_input: Option<String>,
+}
+
 struct ReplyWithOffset {
     reply: WorkerReply,
     end_offset: u64,
@@ -559,7 +565,7 @@ pub struct WorkerManager {
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
-    pending_request_input_transcript: Option<String>,
+    pending_request_input: Option<String>,
     session_end_seen: bool,
     settled_pending_completion: Option<CompletionInfo>,
     last_detached_prefix_item_count: usize,
@@ -635,7 +641,7 @@ impl WorkerManager {
             },
             pending_request: false,
             pending_request_started_at: None,
-            pending_request_input_transcript: None,
+            pending_request_input: None,
             session_end_seen: false,
             settled_pending_completion: None,
             last_detached_prefix_item_count: 0,
@@ -1013,9 +1019,12 @@ impl WorkerManager {
             completion = info;
             consumed_completion = true;
         }
-        let fallback_input_transcript = (!timed_out && consumed_completion)
-            .then(|| self.take_input_transcript_fallback(&completion))
-            .flatten();
+        let fallback_input = if !timed_out && consumed_completion {
+            self.take_input_fallback(&completion)
+        } else {
+            InputFallback::default()
+        };
+        let fallback_input_transcript = fallback_input.transcript.clone();
 
         let FormattedPendingOutput {
             mut contents,
@@ -1052,7 +1061,8 @@ impl WorkerManager {
             };
         let echo_transcript = (!timed_out)
             .then(|| {
-                echo_transcript_from_events(&completion.echo_events).or(fallback_input_transcript)
+                echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone())
             })
             .flatten();
         trim_echo_then_append_protocol_warnings(
@@ -1066,6 +1076,17 @@ impl WorkerManager {
             },
             &completion.protocol_warnings,
         );
+        if !timed_out && completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+            let prompt_variants = fallback_prompt_variants(
+                completion.prompt.as_deref(),
+                completion.prompt_variants.as_deref(),
+            );
+            let _ = trim_leading_input_echo_from_contents(
+                &mut contents,
+                fallback_input.raw_input.as_deref(),
+                &prompt_variants,
+            );
+        }
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1232,9 +1253,11 @@ impl WorkerManager {
     /// into that request's visible reply.
     fn prepare_input_context_files(&mut self) -> InputContext {
         let settled_completion = self.settled_pending_completion.take();
-        let fallback_input_transcript = settled_completion
+        let fallback_input = settled_completion
             .as_ref()
-            .and_then(|completion| self.take_input_transcript_fallback(completion));
+            .map(|completion| self.take_input_fallback(completion))
+            .unwrap_or_default();
+        let fallback_input_transcript = fallback_input.transcript.clone();
         // Detached output can still be waiting on a trailing UTF-8 continuation byte.
         // Keep incomplete tails buffered so the next read can render the original character.
         let FormattedPendingOutput {
@@ -1248,8 +1271,8 @@ impl WorkerManager {
             } else {
                 should_trim_echo_prefix(&completion.echo_events)
             };
-            let echo_transcript =
-                echo_transcript_from_events(&completion.echo_events).or(fallback_input_transcript);
+            let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                .or(fallback_input_transcript.clone());
             trim_echo_then_append_protocol_warnings(
                 &mut contents,
                 echo_transcript.as_deref(),
@@ -1261,6 +1284,17 @@ impl WorkerManager {
                 },
                 &completion.protocol_warnings,
             );
+            if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                let prompt_variants = fallback_prompt_variants(
+                    completion.prompt.as_deref(),
+                    completion.prompt_variants.as_deref(),
+                );
+                let _ = trim_leading_input_echo_from_contents(
+                    &mut contents,
+                    fallback_input.raw_input.as_deref(),
+                    &prompt_variants,
+                );
+            }
         }
         InputContext {
             prefix_contents: contents,
@@ -1342,8 +1376,7 @@ impl WorkerManager {
         if matches!(self.oversized_output, OversizedOutputMode::Files) {
             let prompt = self.current_prompt_hint();
             self.remember_prompt(prompt.clone());
-            self.pending_request_input_transcript =
-                build_input_transcript(prompt.as_deref(), &text);
+            self.pending_request_input = Some(text.clone());
         }
         let ipc = self
             .process
@@ -1458,7 +1491,8 @@ impl WorkerManager {
                     normalize_prompt(completion.prompt.clone())
                 };
                 self.remember_prompt(resolved_prompt.clone());
-                let fallback_input_transcript = self.take_input_transcript_fallback(&completion);
+                let fallback_input = self.take_input_fallback(&completion);
+                let fallback_input_transcript = fallback_input.transcript.clone();
                 let has_fallback_input_transcript = fallback_input_transcript.is_some();
                 let trim_enabled = if completion.echo_events.is_empty() {
                     has_fallback_input_transcript
@@ -1466,7 +1500,7 @@ impl WorkerManager {
                     should_trim_echo_prefix(&completion.echo_events)
                 };
                 let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript);
+                    .or(fallback_input_transcript.clone());
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
@@ -1478,6 +1512,17 @@ impl WorkerManager {
                     },
                     &completion.protocol_warnings,
                 );
+                if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                    let prompt_variants = fallback_prompt_variants(
+                        completion.prompt.as_deref(),
+                        completion.prompt_variants.as_deref(),
+                    );
+                    let _ = trim_leading_input_echo_from_contents(
+                        &mut contents,
+                        fallback_input.raw_input.as_deref(),
+                        &prompt_variants,
+                    );
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -2361,7 +2406,7 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.pending_request_input_transcript = None;
+        self.pending_request_input = None;
         self.session_end_seen = false;
         self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
@@ -2381,7 +2426,7 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.pending_request_input_transcript = None;
+        self.pending_request_input = None;
         self.session_end_seen = false;
         self.settled_pending_completion = None;
         self.last_detached_prefix_item_count = 0;
@@ -2625,13 +2670,19 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
-    fn take_input_transcript_fallback(&mut self, completion: &CompletionInfo) -> Option<String> {
-        let transcript = self.pending_request_input_transcript.take();
-        completion
+    fn take_input_fallback(&mut self, completion: &CompletionInfo) -> InputFallback {
+        let raw_input = completion
             .echo_events
             .is_empty()
-            .then_some(transcript)
-            .flatten()
+            .then(|| self.pending_request_input.take())
+            .flatten();
+        let transcript = raw_input
+            .as_deref()
+            .and_then(|input| build_input_transcript(completion.prompt.as_deref(), input));
+        InputFallback {
+            transcript,
+            raw_input,
+        }
     }
 
     fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
@@ -3587,6 +3638,65 @@ fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn fallback_prompt_variants(
+    prompt: Option<&str>,
+    prompt_variants: Option<&[String]>,
+) -> Vec<String> {
+    let mut variants = Vec::new();
+    if let Some(prompt_variants) = prompt_variants {
+        for prompt in prompt_variants {
+            push_fallback_prompt_variant(&mut variants, prompt);
+        }
+    }
+    if let Some(prompt) = prompt {
+        push_fallback_prompt_variant(&mut variants, prompt);
+    }
+    variants
+}
+
+fn push_fallback_prompt_variant(variants: &mut Vec<String>, prompt: &str) {
+    let prompt = prompt.trim_end_matches(['\n', '\r']);
+    if prompt.is_empty() {
+        return;
+    }
+    if !variants.iter().any(|existing| existing == prompt) {
+        variants.push(prompt.to_string());
+    }
+    if let Some(alt) = swap_fallback_prompt_variant(prompt)
+        && alt != prompt
+        && !variants.iter().any(|existing| existing == &alt)
+    {
+        variants.push(alt);
+    }
+}
+
+fn swap_fallback_prompt_variant(prompt: &str) -> Option<String> {
+    let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
+    let suffix = &prompt[core.len()..];
+    let swapped_core = if core == ">" {
+        Some("+".to_string())
+    } else if core == "+" {
+        Some(">".to_string())
+    } else if core == ">>>" {
+        Some("...".to_string())
+    } else if core == "..." {
+        Some(">>>".to_string())
+    } else if core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')) {
+        let mut swapped = core.to_string();
+        let last = swapped.pop()?;
+        let replacement = match last {
+            '>' => '+',
+            '+' => '>',
+            _ => return None,
+        };
+        swapped.push(replacement);
+        Some(swapped)
+    } else {
+        None
+    };
+    swapped_core.map(|core| format!("{core}{suffix}"))
+}
+
 fn build_input_transcript(prompt: Option<&str>, input: &str) -> Option<String> {
     let prompt = prompt?;
     let normalized = normalize_input_newlines(input);
@@ -3595,6 +3705,137 @@ fn build_input_transcript(prompt: Option<&str>, input: &str) -> Option<String> {
         return None;
     }
     Some(format!("{prompt}{trimmed}\n"))
+}
+
+fn trim_line_endings(text: &str) -> &str {
+    text.trim_end_matches(['\n', '\r'])
+}
+
+fn line_matches_input_echo(line: &str, input_line: &str, prompt_variants: &[String]) -> bool {
+    let line = trim_line_endings(line);
+    if input_line.is_empty() {
+        return line.is_empty() || prompt_variants.iter().any(|prompt| line == prompt);
+    }
+    if line == input_line {
+        return true;
+    }
+    prompt_variants.iter().any(|prompt| {
+        line.strip_prefix(prompt)
+            .is_some_and(|rest| rest == input_line)
+    })
+}
+
+fn trim_leading_text_prefix(contents: &mut Vec<WorkerContent>, mut prefix_bytes: usize) -> bool {
+    if prefix_bytes == 0 {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < contents.len() && prefix_bytes > 0 {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText {
+                text,
+                stream,
+                origin,
+            } if matches!(stream, TextStream::Stdout)
+                && matches!(origin, ContentOrigin::Worker) =>
+            {
+                if prefix_bytes >= text.len() {
+                    prefix_bytes -= text.len();
+                    text.clear();
+                    true
+                } else {
+                    if !text.is_char_boundary(prefix_bytes) {
+                        return false;
+                    }
+                    *text = text[prefix_bytes..].to_string();
+                    prefix_bytes = 0;
+                    false
+                }
+            }
+            _ => break,
+        };
+        if remove_current {
+            contents.remove(idx);
+        } else {
+            idx = idx.saturating_add(1);
+        }
+    }
+    prefix_bytes == 0
+}
+
+fn trim_leading_input_echo_from_contents(
+    contents: &mut Vec<WorkerContent>,
+    input: Option<&str>,
+    prompt_variants: &[String],
+) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    let normalized_input = normalize_input_newlines(input);
+    let trimmed_input = normalized_input.trim_end_matches('\n');
+    if trimmed_input.is_empty() {
+        return false;
+    }
+    let input_lines: Vec<&str> = trimmed_input.split('\n').collect();
+    let last_nonempty_input = input_lines
+        .iter()
+        .rev()
+        .find(|line| !line.is_empty())
+        .copied();
+
+    let mut leading_text = String::new();
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            break;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            break;
+        }
+        leading_text.push_str(text);
+    }
+    if leading_text.is_empty() {
+        return false;
+    }
+
+    let output_lines: Vec<&str> = leading_text.split_inclusive('\n').collect();
+    let mut output_idx = 0usize;
+    let mut input_idx = 0usize;
+    let mut trim_bytes = 0usize;
+
+    while output_idx < output_lines.len() && input_idx < input_lines.len() {
+        let line = output_lines[output_idx];
+        if !line_matches_input_echo(line, input_lines[input_idx], prompt_variants) {
+            break;
+        }
+        trim_bytes += line.len();
+        output_idx += 1;
+        input_idx += 1;
+    }
+    if input_idx != input_lines.len() {
+        return false;
+    }
+
+    while output_idx < output_lines.len() {
+        let line = trim_line_endings(output_lines[output_idx]);
+        let matches_prompt_only = prompt_variants.iter().any(|prompt| line == prompt);
+        let matches_last_duplicate = last_nonempty_input.is_some_and(|last| {
+            prompt_variants
+                .iter()
+                .any(|prompt| line.strip_prefix(prompt).is_some_and(|rest| rest == last))
+        });
+        if !matches_prompt_only && !matches_last_duplicate {
+            break;
+        }
+        trim_bytes += output_lines[output_idx].len();
+        output_idx += 1;
+    }
+
+    trim_leading_text_prefix(contents, trim_bytes)
 }
 
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
@@ -5715,8 +5956,7 @@ mod tests {
         manager
             .pending_output_tape
             .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
-        manager.pending_request_input_transcript =
-            Some(">>> import time; time.sleep(0.2)\n".to_string());
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
             prompt_variants: Some(vec![">>> ".to_string()]),

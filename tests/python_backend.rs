@@ -611,6 +611,39 @@ async fn python_multiline_block() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("def f():\n    return 3\n\nf()", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!(
+            "python_multiline_block_does_not_echo_input_in_visible_reply remained busy; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let visible = visible_reply_text(&text)?;
+
+    session.cancel().await?;
+
+    assert!(visible.contains("3"), "expected 3, got: {visible:?}");
+    assert!(
+        !visible.contains("def f():"),
+        "did not expect the multiline function definition to echo back, got: {visible:?}"
+    );
+    assert!(
+        !visible.contains("return 3"),
+        "did not expect the multiline body to echo back, got: {visible:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_roundtrip() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
