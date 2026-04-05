@@ -845,7 +845,7 @@ pub(super) fn take_matches(
                 spec.limit,
                 more_available,
             )),
-            WorkerContent::stdout(output),
+            WorkerContent::server_stdout(output),
         ],
         span,
         view_ranges,
@@ -1360,7 +1360,7 @@ pub(super) fn take_hits_next(
                     );
                 }
                 return (
-                    vec![WorkerContent::stdout(output)],
+                    vec![WorkerContent::server_stdout(output)],
                     pages_left_now,
                     span,
                     view_ranges,
@@ -1381,7 +1381,7 @@ pub(super) fn take_hits_next(
                     );
                 }
                 return (
-                    vec![WorkerContent::stdout(output)],
+                    vec![WorkerContent::server_stdout(output)],
                     pages_left_now,
                     span,
                     view_ranges,
@@ -1395,7 +1395,7 @@ pub(super) fn take_hits_next(
         (Vec::new(), pages_left_now, RangeSpan::default(), Vec::new())
     } else {
         (
-            vec![WorkerContent::stdout(output)],
+            vec![WorkerContent::server_stdout(output)],
             pages_left_now,
             span,
             view_ranges,

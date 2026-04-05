@@ -2149,7 +2149,7 @@ mod tests {
         OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
         ensure_output_ring, reset_output_ring,
     };
-    use crate::worker_protocol::{ContentOrigin, TextStream};
+    use crate::worker_protocol::TextStream;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct OutputPagerFixture {
@@ -3499,7 +3499,7 @@ mod tests {
             body.0
         );
         assert!(
-            matches!(body.1, ContentOrigin::Worker),
+            matches!(body.1, crate::worker_protocol::ContentOrigin::Worker),
             "expected compact search body to stay worker-originated, got: {:?}",
             body.1
         );
@@ -3866,6 +3866,37 @@ mod tests {
             next.contains("gamma foo"),
             "expected search navigation to continue from the previously active hit, got: {next}"
         );
+    }
+
+    #[test]
+    fn matches_and_hits_output_stay_server_originated() {
+        let mut pager = activate_pager_with_text("alpha foo\nbeta foo\n");
+
+        for (command, contents) in [
+            (
+                ":matches foo\n",
+                match pager.handle_command(":matches foo\n") {
+                    WorkerReply::Output { contents, .. } => contents,
+                },
+            ),
+            (
+                ":hits foo\n",
+                match pager.handle_command(":hits foo\n") {
+                    WorkerReply::Output { contents, .. } => contents,
+                },
+            ),
+        ] {
+            assert!(
+                contents.iter().all(|content| match content {
+                    WorkerContent::ContentText { origin, .. } => {
+                        matches!(origin, crate::worker_protocol::ContentOrigin::Server)
+                    }
+                    WorkerContent::ContentImage { .. } => true,
+                }),
+                "expected {command} output to stay server-originated, got: {:?}",
+                contents
+            );
+        }
     }
 
     #[test]

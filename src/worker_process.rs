@@ -1235,10 +1235,12 @@ impl WorkerManager {
         let fallback_input_transcript = settled_completion
             .as_ref()
             .and_then(|completion| self.take_input_transcript_fallback(completion));
+        // Detached output can still be waiting on a trailing UTF-8 continuation byte.
+        // Keep incomplete tails buffered so the next read can render the original character.
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_sealed_formatted_output();
+        } = self.drain_formatted_output();
         if let Some(completion) = settled_completion.as_ref() {
             let has_fallback_input_transcript = fallback_input_transcript.is_some();
             let trim_enabled = if completion.echo_events.is_empty() {
@@ -5737,6 +5739,35 @@ mod tests {
         assert!(
             manager.settled_pending_completion.is_none(),
             "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_preserves_split_utf8_across_detached_prefix_boundary() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let first = manager.prepare_input_context_files();
+        assert!(
+            first.prefix_contents.is_empty(),
+            "expected incomplete utf-8 tail to stay buffered until continuation arrives, got: {:?}",
+            first.prefix_contents
+        );
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(&[0xA9, b'\n']);
+        let second = manager.prepare_input_context_files();
+
+        assert_eq!(
+            contents_text(&second.prefix_contents),
+            "é\n",
+            "expected the continued utf-8 sequence to render intact in the next detached prefix"
         );
     }
 
