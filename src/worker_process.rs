@@ -1260,12 +1260,12 @@ impl WorkerManager {
             .map(|completion| self.take_input_fallback(completion))
             .unwrap_or_default();
         let fallback_input_transcript = fallback_input.transcript.clone();
-        // Detached output can still be waiting on a trailing UTF-8 continuation byte.
-        // Keep incomplete tails buffered so the next read can render the original character.
+        // A new accepted request seals the detached prefix. Flush any incomplete UTF-8 tail now
+        // so it stays with the detached transcript instead of merging into fresh request output.
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_formatted_output();
+        } = self.drain_sealed_formatted_output();
         if let Some(completion) = settled_completion.as_ref() {
             let has_fallback_input_transcript = fallback_input_transcript.is_some();
             let trim_enabled = if completion.echo_events.is_empty() {
@@ -6076,7 +6076,7 @@ mod tests {
     }
 
     #[test]
-    fn files_prepare_input_context_preserves_split_utf8_across_detached_prefix_boundary() {
+    fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -6086,10 +6086,10 @@ mod tests {
         manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
 
         let first = manager.prepare_input_context_files();
-        assert!(
-            first.prefix_contents.is_empty(),
-            "expected incomplete utf-8 tail to stay buffered until continuation arrives, got: {:?}",
-            first.prefix_contents
+        assert_eq!(
+            contents_text(&first.prefix_contents),
+            "\\xC3",
+            "expected an accepted request to seal the detached utf-8 lead byte into the prefix"
         );
 
         manager
@@ -6099,8 +6099,8 @@ mod tests {
 
         assert_eq!(
             contents_text(&second.prefix_contents),
-            "é\n",
-            "expected the continued utf-8 sequence to render intact in the next detached prefix"
+            "\\xA9\n",
+            "expected the next request output to stay split after the detached prefix was sealed"
         );
     }
 

@@ -401,6 +401,9 @@ mod unix_impl {
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
             return String::new();
         }
+        if text == "Reading additional input from stdin..." {
+            return String::new();
+        }
         if text.contains("ERROR codex_api::endpoint::responses_websocket:")
             || text.contains("WARN codex_core::session_startup_prewarm:")
             || text
@@ -633,6 +636,18 @@ mod unix_impl {
         let codex_home = Path::new("/tmp/codex-home");
         let input = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: ws://127.0.0.1:64598/v1/responses)"}"#;
         let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(normalized, "");
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_stdin_status_line() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let normalized = normalize_exec_text(
+            "Reading additional input from stdin...",
+            workspace,
+            codex_home,
+        );
         assert_eq!(normalized, "");
     }
 
