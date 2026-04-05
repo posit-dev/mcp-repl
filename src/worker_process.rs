@@ -115,13 +115,15 @@ impl LiveOutputCapture {
     fn append_text(&self, bytes: &[u8], stream: TextStream) {
         match stream {
             TextStream::Stdout => {
-                self.output_timeline.append_text(bytes, false);
+                self.output_timeline
+                    .append_text(bytes, false, ContentOrigin::Worker);
                 if let Some(tape) = &self.pending_output_tape {
                     tape.append_stdout_bytes(bytes);
                 }
             }
             TextStream::Stderr => {
-                self.output_timeline.append_text(bytes, true);
+                self.output_timeline
+                    .append_text(bytes, true, ContentOrigin::Worker);
                 if let Some(tape) = &self.pending_output_tape {
                     tape.append_stderr_bytes(bytes);
                 }
@@ -1895,9 +1897,11 @@ impl WorkerManager {
             OversizedOutputMode::Files => self
                 .pending_output_tape
                 .append_server_stderr_bytes(event.message.as_bytes()),
-            OversizedOutputMode::Pager => self
-                .output_timeline
-                .append_text(event.message.as_bytes(), true),
+            OversizedOutputMode::Pager => self.output_timeline.append_text(
+                event.message.as_bytes(),
+                true,
+                ContentOrigin::Server,
+            ),
         }
     }
 
@@ -1923,7 +1927,11 @@ impl WorkerManager {
                             .pending_output_tape
                             .append_server_stderr_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(message.as_bytes(), true);
+                            self.output_timeline.append_text(
+                                message.as_bytes(),
+                                true,
+                                ContentOrigin::Server,
+                            );
                         }
                     }
                 } else {
@@ -1933,7 +1941,11 @@ impl WorkerManager {
                             .pending_output_tape
                             .append_stdout_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(message.as_bytes(), false);
+                            self.output_timeline.append_text(
+                                message.as_bytes(),
+                                false,
+                                ContentOrigin::Server,
+                            );
                         }
                     }
                 }
@@ -3211,13 +3223,20 @@ fn collapse_echo_with_attribution(
                 "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
                 pending.lines, pending.bytes, head_snip, tail_snip
             );
-            append_text_with_span(out_bytes, out_text_spans, marker.as_bytes(), false);
+            append_text_with_span(
+                out_bytes,
+                out_text_spans,
+                marker.as_bytes(),
+                false,
+                ContentOrigin::Worker,
+            );
         } else {
             append_text_with_span(
                 out_bytes,
                 out_text_spans,
                 &summarize_echo_line_for_output(tail),
                 false,
+                ContentOrigin::Worker,
             );
         }
     };
@@ -3275,6 +3294,7 @@ fn append_text_with_span(
     out_text_spans: &mut Vec<OutputTextSpan>,
     bytes: &[u8],
     is_stderr: bool,
+    origin: ContentOrigin,
 ) {
     if bytes.is_empty() {
         return;
@@ -3284,6 +3304,7 @@ fn append_text_with_span(
     let end_byte = out_bytes.len();
     if let Some(last) = out_text_spans.last_mut()
         && last.is_stderr == is_stderr
+        && last.origin == origin
         && last.end_byte == start_byte
     {
         last.end_byte = end_byte;
@@ -3292,6 +3313,7 @@ fn append_text_with_span(
             start_byte,
             end_byte,
             is_stderr,
+            origin,
         });
     }
 }
@@ -3325,6 +3347,7 @@ fn consume_text_segment_with_spans(
             consume_text_segment(
                 &segment[cursor - segment_start..start - segment_start],
                 false,
+                ContentOrigin::Worker,
                 echo_events,
                 echo_idx,
                 prompt_variants,
@@ -3338,6 +3361,7 @@ fn consume_text_segment_with_spans(
         consume_text_segment(
             &segment[start - segment_start..end - segment_start],
             span.is_stderr,
+            span.origin,
             echo_events,
             echo_idx,
             prompt_variants,
@@ -3353,6 +3377,7 @@ fn consume_text_segment_with_spans(
         consume_text_segment(
             &segment[cursor - segment_start..],
             false,
+            ContentOrigin::Worker,
             echo_events,
             echo_idx,
             prompt_variants,
@@ -3369,6 +3394,7 @@ fn consume_text_segment_with_spans(
 fn consume_text_segment(
     segment: &[u8],
     is_stderr: bool,
+    origin: ContentOrigin,
     echo_events: &[IpcEchoEvent],
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
@@ -3414,7 +3440,7 @@ fn consume_text_segment(
         if substantive {
             flush_pending(out_bytes, out_text_spans, pending);
         }
-        append_text_with_span(out_bytes, out_text_spans, line, is_stderr);
+        append_text_with_span(out_bytes, out_text_spans, line, is_stderr, origin);
         if substantive {
             saw_substantive_output.set(true);
         }
@@ -5521,6 +5547,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: 27,
                 is_stderr: false,
+                origin: ContentOrigin::Worker,
             }],
         };
 
@@ -5553,6 +5580,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: 42,
                 is_stderr: false,
+                origin: ContentOrigin::Worker,
             }],
         };
 
@@ -6089,9 +6117,11 @@ mod tests {
         )
         .expect("worker manager");
         manager.output.start_capture();
-        manager
-            .output_timeline
-            .append_text(b"> Sys.sleep(0.2); 1+1\n[1] 2\n", false);
+        manager.output_timeline.append_text(
+            b"> Sys.sleep(0.2); 1+1\n[1] 2\n",
+            false,
+            ContentOrigin::Worker,
+        );
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
             prompt_variants: Some(vec!["> ".to_string()]),

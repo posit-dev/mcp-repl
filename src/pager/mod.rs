@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
 use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
-use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{
+    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+};
 
 mod command;
 mod merge;
@@ -64,6 +66,7 @@ struct PagerTextSpan {
     start: u64,
     end: u64,
     is_stderr: bool,
+    origin: ContentOrigin,
 }
 
 impl merge::EventView for crate::output_capture::OutputEvent {
@@ -117,6 +120,7 @@ impl PagerBuffer {
                     start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
                     end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
                     is_stderr: span.is_stderr,
+                    origin: span.origin,
                 })
             })
             .collect();
@@ -168,6 +172,7 @@ impl PagerBuffer {
                     start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
                     end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
                     is_stderr: span.is_stderr,
+                    origin: span.origin,
                 })
             })
             .collect();
@@ -214,10 +219,11 @@ impl PagerBuffer {
         let start = self.byte_index_for_char_offset(start_offset);
         let end = self.byte_index_for_char_offset(end_offset);
         let bytes = &self.bytes[start..end];
-        merge::merge_bytes_with_events(
+        merge::merge_bytes_with_events_and_spans(
             bytes,
             start as u64,
             end as u64,
+            &self.text_spans_in_byte_offsets(start_offset, end_offset),
             &self.events_in_byte_offsets(start_offset, end_offset),
             output_event_to_content,
         )
@@ -491,6 +497,7 @@ impl PagerBuffer {
                 end: old_char_len
                     .saturating_add(char_offset_for_byte_index(&chunk_char_index, span.end_byte)),
                 is_stderr: span.is_stderr,
+                origin: span.origin,
             });
         }
         for event in range.events {
@@ -544,6 +551,26 @@ impl PagerBuffer {
             });
         }
         events
+    }
+
+    fn text_spans_in_byte_offsets(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Vec<PagerTextSpanByte> {
+        let mut spans = Vec::new();
+        for span in &self.text_spans {
+            if span.end <= start_offset || span.start >= end_offset {
+                continue;
+            }
+            spans.push(PagerTextSpanByte {
+                start: self.byte_index_for_char_offset(span.start.max(start_offset)) as u64,
+                end: self.byte_index_for_char_offset(span.end.min(end_offset)) as u64,
+                is_stderr: span.is_stderr,
+                origin: span.origin,
+            });
+        }
+        spans
     }
 
     fn image_offsets_in_range(&self, start_offset: u64, end_offset: u64, limit: usize) -> Vec<u64> {
@@ -610,6 +637,32 @@ impl merge::EventView for PagerEventByte {
 
     fn kind(&self) -> &OutputEventKind {
         &self.kind
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PagerTextSpanByte {
+    start: u64,
+    end: u64,
+    is_stderr: bool,
+    origin: ContentOrigin,
+}
+
+impl merge::TextSpanView for PagerTextSpanByte {
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    fn end(&self) -> u64 {
+        self.end
+    }
+
+    fn is_stderr(&self) -> bool {
+        self.is_stderr
+    }
+
+    fn origin(&self) -> ContentOrigin {
+        self.origin
     }
 }
 
@@ -1579,13 +1632,8 @@ pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerConten
     if range.bytes.is_empty() && range.events.is_empty() {
         return Vec::new();
     }
-    merge::merge_bytes_with_events(
-        &range.bytes,
-        range.start_offset,
-        range.end_offset,
-        &range.events,
-        output_event_to_content,
-    )
+    let buffer = PagerBuffer::from_range(range);
+    buffer.contents_for_range(0, buffer.len())
 }
 
 pub(crate) fn contents_from_collapsed_output(
@@ -1611,11 +1659,21 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
             id: id.clone(),
             is_new: *is_new,
         },
-        OutputEventKind::Text { text, is_stderr } => {
+        OutputEventKind::Text {
+            text,
+            is_stderr,
+            origin,
+        } => {
             if *is_stderr {
-                WorkerContent::stderr(text.clone())
+                match origin {
+                    ContentOrigin::Worker => WorkerContent::worker_stderr(text.clone()),
+                    ContentOrigin::Server => WorkerContent::server_stderr(text.clone()),
+                }
             } else {
-                WorkerContent::stdout(text.clone())
+                match origin {
+                    ContentOrigin::Worker => WorkerContent::worker_stdout(text.clone()),
+                    ContentOrigin::Server => WorkerContent::server_stdout(text.clone()),
+                }
             }
         }
     }
@@ -2213,7 +2271,7 @@ mod tests {
         let timeline = OutputTimeline::new(ring);
         let output = OutputBuffer::default();
         output.start_capture();
-        timeline.append_text(text.as_bytes(), false);
+        timeline.append_text(text.as_bytes(), false, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
         let range = output.read_range(0, end_offset);
         output.advance_offset_to(end_offset);
@@ -2832,9 +2890,11 @@ mod tests {
             "expected bounded all-matches header, got: {initial}"
         );
 
-        fixture
-            .timeline
-            .append_text(b"foo line refresh-a\nfoo line refresh-b\n", false);
+        fixture.timeline.append_text(
+            b"foo line refresh-a\nfoo line refresh-b\n",
+            false,
+            ContentOrigin::Worker,
+        );
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));
@@ -2899,7 +2959,9 @@ mod tests {
             "expected :n to move to the past-end boundary before refresh, got: {boundary}"
         );
 
-        fixture.timeline.append_text(b"gamma foo\n", false);
+        fixture
+            .timeline
+            .append_text(b"gamma foo\n", false, ContentOrigin::Worker);
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));
@@ -3470,7 +3532,7 @@ mod tests {
         let timeline = OutputTimeline::new(ring);
         let output = OutputBuffer::default();
         output.start_capture();
-        timeline.append_text(b"warning foo details\n", true);
+        timeline.append_text(b"warning foo details\n", true, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
         let range = output.read_range(0, end_offset);
         output.advance_offset_to(end_offset);
@@ -3548,16 +3610,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: stderr_one,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one,
                     end_byte: stderr_one + stdout_line,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one + stdout_line,
                     end_byte: text.len(),
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
             ],
         };
@@ -3596,16 +3661,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: stderr_one,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one,
                     end_byte: stderr_one + stdout_line,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one + stdout_line,
                     end_byte: text.len(),
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
             ],
             text.len() as u64,
@@ -3641,6 +3709,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: "stderr: init\n".len(),
                 is_stderr: true,
+                origin: ContentOrigin::Worker,
             }],
         };
         let mut pager = Pager::default();
@@ -3662,11 +3731,13 @@ mod tests {
                         start_byte: 0,
                         end_byte: "alpha foo\n".len(),
                         is_stderr: false,
+                        origin: ContentOrigin::Worker,
                     },
                     OutputTextSpan {
                         start_byte: "alpha foo\n".len(),
                         end_byte: appended_text.len(),
                         is_stderr: true,
+                        origin: ContentOrigin::Worker,
                     },
                 ],
             });
@@ -3704,16 +3775,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: alpha_len,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: alpha_len,
                     end_byte: alpha_len + foo_len,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: alpha_len + foo_len,
                     end_byte: text.len(),
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
             ],
         };
@@ -3900,6 +3974,58 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_output_replay_preserves_server_origin() {
+        let server_line = "[repl] session ended\n";
+        let worker_line = "worker output\n";
+        let bytes = format!("{server_line}{worker_line}").into_bytes();
+        let contents = contents_from_collapsed_output(
+            bytes,
+            vec![(
+                0,
+                OutputEventKind::Text {
+                    text: "[repl] output truncated (older output dropped)\n".to_string(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Server,
+                },
+            )],
+            vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: server_line.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Server,
+                },
+                OutputTextSpan {
+                    start_byte: server_line.len(),
+                    end_byte: server_line.len() + worker_line.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Worker,
+                },
+            ],
+            (server_line.len() + worker_line.len()) as u64,
+        );
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains(server_line) && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected collapsed replay to preserve server-originated pager text, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains("output truncated") && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected collapsed replay to preserve server-originated text events, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
     fn refreshed_extended_matches_session_keeps_discovered_position() {
         let text = (0..80)
             .map(|i| format!("entry-{i:03} foo\n"))
@@ -3920,7 +4046,9 @@ mod tests {
             );
         }
 
-        fixture.timeline.append_text(b"entry-080 foo\n", false);
+        fixture
+            .timeline
+            .append_text(b"entry-080 foo\n", false, ContentOrigin::Worker);
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));

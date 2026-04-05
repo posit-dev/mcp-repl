@@ -356,26 +356,29 @@ fn decoded_match_start_in_line(buffer: &PagerBuffer, line_start: u64, match_star
     String::from_utf8_lossy(&buffer.bytes[line_start_byte..match_start_byte]).len()
 }
 
-fn decoded_match_stream(
+fn decoded_match_style(
     buffer: &PagerBuffer,
     match_start: u64,
     line: &str,
     default_stream: TextStream,
-) -> TextStream {
+) -> (TextStream, ContentOrigin) {
     for span in &buffer.text_spans {
         if span.start <= match_start && match_start < span.end {
-            return if span.is_stderr {
-                TextStream::Stderr
-            } else {
-                TextStream::Stdout
-            };
+            return (
+                if span.is_stderr {
+                    TextStream::Stderr
+                } else {
+                    TextStream::Stdout
+                },
+                span.origin,
+            );
         }
     }
 
     if line.starts_with("stderr: ") {
-        TextStream::Stderr
+        (TextStream::Stderr, ContentOrigin::Worker)
     } else {
-        default_stream
+        (default_stream, ContentOrigin::Worker)
     }
 }
 
@@ -509,8 +512,8 @@ fn render_match_snippet_contents(
     default_stream: TextStream,
 ) -> Vec<WorkerContent> {
     let trimmed = line.trim_end();
-    let snippet_stream = decoded_match_stream(buffer, match_start, line, default_stream);
-    let snippet_origin = ContentOrigin::Worker;
+    let (snippet_stream, snippet_origin) =
+        decoded_match_style(buffer, match_start, line, default_stream);
     let snippet_start_chars = trimmed[..window.start_byte].chars().count() as u64;
     let snippet_end_chars = trimmed[..window.end_byte].chars().count() as u64;
     let snippet_start = line_start.saturating_add(snippet_start_chars);
@@ -546,7 +549,7 @@ fn render_match_snippet_contents(
             } else {
                 TextStream::Stdout
             },
-            snippet_origin,
+            span.origin,
         );
         cursor = segment_end;
     }
@@ -1601,6 +1604,40 @@ mod tests {
         assert!(
             !message.contains(":skip 1"),
             "expected :where not to suggest skipping past a match that is now on the next unseen page, got: {message}"
+        );
+    }
+
+    #[test]
+    fn search_card_snippet_preserves_server_origin() {
+        let line = "[repl] session ended\n";
+        let buffer = PagerBuffer::from_bytes_and_events(
+            line.as_bytes().to_vec(),
+            Vec::new(),
+            vec![crate::output_capture::OutputTextSpan {
+                start_byte: 0,
+                end_byte: line.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Server,
+            }],
+            line.len() as u64,
+        );
+        let pattern = SearchPattern {
+            pattern: "session ended".to_string(),
+            case_insensitive_ascii: false,
+        };
+        let session = build_full_search_session(&buffer, &pattern, 0).expect("expected search hit");
+
+        let (contents, _, _) = render_search_card(&buffer, &session, &[], TextStream::Stdout);
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains("[match] [repl] session ended")
+                        && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected search-card body to preserve server origin, got: {:?}",
+            contents
         );
     }
 }
