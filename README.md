@@ -246,9 +246,14 @@ Primary REPL-aligned tools:
 - `repl` -> `{ "input": "1+1\n", "timeout_ms": 10000 }`
 - `repl_reset` -> `{}`
 
+The exact `repl` tool description selected at startup depends on the interpreter and
+`--oversized-output` mode.
+
 Tool guides:
 - `docs/tool-descriptions/repl_tool_r.md`
+- `docs/tool-descriptions/repl_tool_r_pager.md`
 - `docs/tool-descriptions/repl_tool_python.md`
+- `docs/tool-descriptions/repl_tool_python_pager.md`
 - `docs/tool-descriptions/repl_reset_tool.md`
 
 ## Session management

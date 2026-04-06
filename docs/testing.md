@@ -12,6 +12,7 @@ This file is the entrypoint for deciding how to verify a change.
 - `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and client-driven updates.
 - `tests/plot_images.rs` and `tests/python_plot_images.rs`: plot/image behavior through the public tool surface.
 - `tests/codex_approvals_tui.rs` and `tests/claude_integration.rs`: client integration coverage.
+- `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.
 
 ## Snapshot Workflow
 
@@ -28,7 +29,7 @@ If you modify code, run:
 
 - `cargo check`
 - `cargo build`
-- `cargo clippy`
+- `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 - `cargo +nightly fmt`
 

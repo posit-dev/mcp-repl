@@ -2,32 +2,32 @@
 
 ## Summary
 
-- Replace the remaining default pager-era large-output behavior with non-modal oversized text previews plus server-owned worker transcript files.
+- Replace the remaining default pager-era large-output behavior in files mode with non-modal output bundles for oversized replies while keeping pager as an explicit mode.
 - Keep `PendingOutputTape` as the always-on raw event collector.
 - Split the design across two independent axes:
   - reply-tracking state: what worker-originated text the server still owes to future `repl()` replies
   - file materialization: whether that worker-originated text is also being accumulated in a server-owned file
 - Keep server-only notices out of worker transcript files.
-- For a timed-out request, create a hidden worker transcript file immediately on the first timeout so the server does not need to retain unbounded text in memory.
+- For a timed-out request, create a hidden bundle immediately on the first timeout so the server does not need to retain unbounded output in memory.
 - Only disclose a file path to the client when a response actually needs truncation or quarantine.
-- Scope v1 to text-only oversized replies. Replies containing any image content remain unchanged.
+- Support both text-only and mixed text/image oversized replies. Mixed bundles use `events.log` plus preserved image history.
 
 ## Status
 
 - State: active
-- Last updated: 2026-03-21
-- Current phase: initial implementation shipped; follow-on cleanup still open
-- Verification: `cargo check`, `cargo build`, `cargo clippy`, `cargo test`, and `cargo +nightly fmt` all pass in the implementation branch
+- Last updated: 2026-04-06
+- Current phase: bundle-backed files mode shipped; follow-on architecture cleanup still open
+- Verification: `cargo check`, `cargo build`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo +nightly fmt` all pass in the implementation branch
 
 ## Current Direction
 
 - Oversized-output logic happens only at reply finalization time after the tape snapshot is drained.
 - Polling remains the primary interaction model.
 - Detached idle output must never make `repl(input=...)` unusable.
-- Worker transcript files are a fallback for omitted worker-originated text, not a mirror of the full visible reply.
-- The shipped implementation creates a hidden worker transcript file on the first timeout reply, appends later worker-originated poll text to that same file, and discloses the path only if an oversized text-only reply is actually compacted.
-- Non-timeout oversized text-only replies create a worker transcript file lazily at response time and disclose it immediately in the compacted reply.
-- Mixed text+image replies stay unchanged in v1.
+- Bundle artifacts are a fallback for retained worker-originated output, not a mirror of the full visible reply.
+- The shipped implementation creates a hidden bundle on the first timeout reply, appends later worker-originated poll output to that same bundle, and discloses `transcript.txt` for text-only compaction or `events.log` for mixed text/image compaction when needed.
+- Non-timeout oversized replies materialize bundle artifacts lazily at response time and disclose them immediately in the compacted reply.
+- Mixed text+image replies use output bundles with `events.log`, latest-image aliases, and preserved image history.
 - Text-only spilling uses Unicode character count, not encoded byte length, because the threshold is meant to approximate visible reply size rather than bundle storage usage.
 - Detached idle output remains non-blocking because `repl(input=...)` still accepts new input once no timed-out request is active; oversized text from that accepted reply follows the same text-only compaction path.
 
@@ -42,9 +42,9 @@
 - Phase 0: completed. Default-path pager behavior was mostly removed, simplified, and isolated behind a separate legacy mode. `PendingOutputTape` became the main default collector.
 - Phase 1: completed. Multiple design rounds narrowed the space: no modal pager, no default read tool, no live reader-thread formatting, and no worker-owned transcript files.
 - Phase 2: completed. Lock the public text format, timeout follow-up behavior, worker-only file contents, and detached-idle behavior for text-only v1.
-- Phase 3: active. Implement server-owned worker transcript storage, hidden-on-timeout file creation, and the seal-time formatter as the first bounded implementation step.
-- Phase 4: pending. Revisit the implementation architecture after the public behavior is validated and move toward a more eager/state-machine-driven design.
-- Phase 5: pending. Update tool descriptions and replace pager-oriented tests and snapshots for the default public surface.
+- Phase 3: completed. Implement bundle-backed files mode, hidden-on-timeout file creation, and the seal-time formatter as the first bounded implementation step.
+- Phase 4: active. Revisit the implementation architecture after the public behavior is validated and move toward a more eager/state-machine-driven design.
+- Phase 5: completed. Update tool descriptions and replace pager-oriented assumptions in the default public surface.
 
 ## Reply-Tracking States
 
@@ -87,7 +87,7 @@
 - Line-based preview is the default public behavior. Char-based preview is fallback only when a clean line-aligned preview cannot fit the internal budget.
 - In line mode and char mode, the marker reports what is already shown, not extra helper metadata.
 - No default transcript-read tool in v1.
-- V1 only compacts text-only replies. Mixed text+image replies remain unchanged so current text/image ordering is preserved.
+- Files mode compacts both text-only and mixed text/image oversized replies. Mixed bundles preserve ordering through `events.log` plus image history, while pager remains separate legacy behavior.
 
 ## Rejected Options
 
@@ -178,7 +178,7 @@ Behavior:
 
 - Stop if file append still happens before the final worker-derived text for a reply is known.
 - Stop if the implementation requires worker protocol changes or pushes formatting logic into reader threads.
-- Stop if mixed text+image replies cannot stay unchanged without hidden reordering; keep them out of v1.
+- Stop if mixed text+image compaction requires hidden reordering that breaks the current ordering guarantees.
 - Stop if detached-idle handling starts forcing polls before new input can run.
 - Stop if the implementation starts hard-coding seal-time mechanics into the public contract. Seal-time is a phase tactic, not the product definition.
 - Stop if the current phase starts accumulating complexity whose only purpose is to preserve the seal-time tactic. If the tactic gets in the way, record the issue and revisit the phased rollout.
@@ -200,6 +200,7 @@ Behavior:
 - 2026-03-21: Timed-out requests create hidden files immediately to avoid unbounded in-memory accumulation.
 - 2026-03-21: Hidden file paths are disclosed only when truncation or quarantine is actually surfaced in a response.
 - 2026-03-21: Detached idle output remains non-blocking; it may be previewed or quarantined, but it does not make `repl(input=...)` unusable.
-- 2026-03-21: Scope v1 to text-only oversized replies and leave mixed text+image replies unchanged.
+- 2026-03-21: Initial scope was text-only oversized replies; mixed text+image handling was deferred while the public contract was still moving.
 - 2026-03-21: The current seal-time phase is a bounded implementation step chosen to keep iteration simple while the public behavior is still moving.
 - 2026-03-21: The likely long-term direction is a more eager/state-machine-driven consumer of tape output with a better memory profile. Do not let the current seal-time phase rename or redefine the broader initiative.
+- 2026-04-06: The shipped files-mode surface now includes mixed text/image output bundles plus backend-specific pager/files tool descriptions. Older text-only-v1 wording is superseded.
