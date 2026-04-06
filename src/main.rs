@@ -9,7 +9,9 @@ mod install;
 mod ipc;
 mod output_capture;
 mod output_stream;
+mod oversized_output;
 mod pager;
+mod pending_output_tape;
 mod r_controls;
 mod r_graphics;
 mod r_htmd;
@@ -26,6 +28,7 @@ mod worker_protocol;
 use std::path::PathBuf;
 
 use crate::backend::{Backend, backend_from_env};
+use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::{
     SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
 };
@@ -41,6 +44,7 @@ struct CliOptions {
     debug_repl: bool,
     backend: Backend,
     debug_dir: Option<PathBuf>,
+    oversized_output: OversizedOutputMode,
 }
 
 #[derive(Debug, Default)]
@@ -92,10 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             if options.debug_repl {
                 crate::diagnostics::startup_log("main: debug repl mode");
-                return debug_repl::run(options.backend, options.sandbox_plan);
+                return debug_repl::run(
+                    options.backend,
+                    options.sandbox_plan,
+                    options.oversized_output,
+                );
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend, options.sandbox_plan).await
+            server::run(
+                options.backend,
+                options.sandbox_plan,
+                options.oversized_output,
+            )
+            .await
         }
         CliCommand::Install(options) => install::run(options),
     }
@@ -109,7 +122,16 @@ fn ignore_sigpipe() {
 }
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
-    let mut parser = ArgParser::new();
+    parse_cli_args_from(
+        std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::error::Error>> {
+    let mut parser = ArgParser { args, index: 0 };
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(&mut parser)?));
@@ -119,6 +141,8 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
+    let mut oversized_output = OversizedOutputMode::Pager;
+    let mut oversized_output_seen = false;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -227,6 +251,30 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                 }
                 debug_dir = Some(PathBuf::from(value));
             }
+            "--oversized-output" => {
+                if oversized_output_seen {
+                    return Err("duplicate --oversized-output".into());
+                }
+                let value = parser.next_value("--oversized-output")?;
+                oversized_output =
+                    OversizedOutputMode::parse(&value).map_err(|err| err.to_string())?;
+                oversized_output_seen = true;
+            }
+            _ if arg.starts_with("--oversized-output=") => {
+                if oversized_output_seen {
+                    return Err("duplicate --oversized-output".into());
+                }
+                let value = arg
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                if value.is_empty() {
+                    return Err("missing value for --oversized-output".into());
+                }
+                oversized_output =
+                    OversizedOutputMode::parse(value).map_err(|err| err.to_string())?;
+                oversized_output_seen = true;
+            }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
                 None => return Err(format!("unknown argument: {arg}").into()),
@@ -239,6 +287,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
         debug_dir,
+        oversized_output,
     }))
 }
 
@@ -265,16 +314,6 @@ struct ArgParser {
 }
 
 impl ArgParser {
-    fn new() -> Self {
-        Self {
-            args: std::env::args_os()
-                .skip(1)
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-            index: 0,
-        }
-    }
-
     fn next(&mut self) -> Option<String> {
         let value = self.args.get(self.index)?.clone();
         self.index += 1;
@@ -415,11 +454,12 @@ fn parse_writable_root(raw: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--oversized-output <files|pager>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
+--oversized-output: choose oversized-output handling (pager: default legacy modal pager; files: spill oversized replies to files)\n\
 --sandbox: base sandbox mode (inherit requires client sandbox update)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
@@ -462,6 +502,26 @@ mod tests {
         };
         let parsed = parse_backend_arg("--interpreter=python", &mut parser).expect("parse flag");
         assert_eq!(parsed, Some(Backend::Python));
+    }
+
+    #[test]
+    fn parse_cli_args_defaults_oversized_output_to_pager() {
+        let command = parse_cli_args_from(Vec::new()).expect("parse cli args");
+        let CliCommand::RunServer(options) = command else {
+            panic!("expected server command");
+        };
+        assert_eq!(options.oversized_output, OversizedOutputMode::Pager);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_explicit_oversized_output_files() {
+        let command =
+            parse_cli_args_from(vec!["--oversized-output".to_string(), "files".to_string()])
+                .expect("parse cli args");
+        let CliCommand::RunServer(options) = command else {
+            panic!("expected server command");
+        };
+        assert_eq!(options.oversized_output, OversizedOutputMode::Files);
     }
 
     #[test]
@@ -631,8 +691,10 @@ mod tests {
     #[test]
     fn empty_plan_uses_inherited_state_when_available() {
         let plan = SandboxCliPlan::default();
-        let mut inherited = SandboxState::default();
-        inherited.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let inherited = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
             .expect("effective sandbox state");
         assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);

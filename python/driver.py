@@ -18,8 +18,16 @@ _write_fd_value = os.environ.get("MCP_REPL_IPC_WRITE_FD")
 if not _read_fd_value or not _write_fd_value:
     raise SystemExit("MCP_REPL_IPC_READ_FD or MCP_REPL_IPC_WRITE_FD missing")
 
-_ipc_read = os.fdopen(int(_read_fd_value), "r", buffering=1)
-_ipc_write = os.fdopen(int(_write_fd_value), "w", buffering=1)
+_ipc_read_fd = int(_read_fd_value)
+_ipc_write_fd = int(_write_fd_value)
+# These env vars are a one-shot bootstrap path for the main worker. Child processes must not
+# inherit the live IPC fds or discover them later through the environment.
+os.set_inheritable(_ipc_read_fd, False)
+os.set_inheritable(_ipc_write_fd, False)
+os.environ.pop("MCP_REPL_IPC_READ_FD", None)
+os.environ.pop("MCP_REPL_IPC_WRITE_FD", None)
+_ipc_read = os.fdopen(_ipc_read_fd, "r", buffering=1)
+_ipc_write = os.fdopen(_ipc_write_fd, "w", buffering=1)
 _ipc_lock = threading.Lock()
 _request_lock = threading.Lock()
 _request_active = False
@@ -41,6 +49,24 @@ _plot_hooks_installed = False
 _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
+
+
+def _close_ipc_in_fork_child():
+    global _ipc_ok
+    _ipc_ok = False
+    # The child only needs the inherited descriptors gone. Closing the buffered wrappers can
+    # deadlock on inherited _io locks from threads that vanished across fork.
+    for fd in (_ipc_read_fd, _ipc_write_fd):
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+try:
+    os.register_at_fork(after_in_child=_close_ipc_in_fork_child)
+except AttributeError:
+    pass
 
 
 def _send(obj):

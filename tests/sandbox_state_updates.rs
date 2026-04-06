@@ -5,8 +5,12 @@ mod common;
 use common::{McpTestSession, TestResult};
 use rmcp::model::{CallToolResult, RawContent};
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tempfile::tempdir;
+use tokio::time::sleep;
 
 const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
 
@@ -32,6 +36,30 @@ fn collect_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn result_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|content| match &content.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
+}
+
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    disclosed_path(text, "transcript.txt")
 }
 
 fn sandbox_update_params(network_access: bool) -> serde_json::Value {
@@ -61,16 +89,22 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 fn busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
 }
 
 async fn spawn_server_retry() -> TestResult<common::McpTestSession> {
+    spawn_server_retry_with_env_vars(Vec::new()).await
+}
+
+async fn spawn_server_retry_with_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<common::McpTestSession> {
     let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for _ in 0..3 {
-        match common::spawn_server().await {
+        match common::spawn_server_with_env_vars(env_vars.clone()).await {
             Ok(session) => return Ok(session),
             Err(err) => {
                 let message = err.to_string();
@@ -90,6 +124,115 @@ async fn spawn_server_retry() -> TestResult<common::McpTestSession> {
             "failed to spawn server after temp-dir retries".to_string(),
         )
     }))
+}
+
+enum SandboxUpdateKind {
+    Request,
+    Notification,
+}
+
+async fn wait_for_timeout_bundle_transcript(
+    session: &mut McpTestSession,
+    input: &str,
+) -> TestResult<Option<PathBuf>> {
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        return Ok(None);
+    }
+
+    sleep(Duration::from_millis(260)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let spilled = session
+            .write_stdin_raw_unterminated_with("", Some(0.1))
+            .await?;
+        let spilled_text = result_text(&spilled);
+        if let Some(path) = bundle_transcript_path(&spilled_text) {
+            return Ok(Some(path));
+        }
+        if !busy_response(&spilled_text) {
+            return Err(format!(
+                "expected timeout bundle disclosure in spill poll, got: {spilled_text:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    Err("timed out waiting for timeout bundle transcript".into())
+}
+
+async fn poll_until_not_busy(session: &mut McpTestSession) -> TestResult<CallToolResult> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let result = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        let text = result_text(&result);
+        if !busy_response(&text) {
+            return Ok(result);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err("timed out waiting for non-busy empty poll".into())
+}
+
+async fn assert_sandbox_update_clears_stale_timeout_bundle(
+    kind: SandboxUpdateKind,
+) -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    if !common::sandbox_exec_available() {
+        eprintln!("sandbox-exec unavailable; skipping");
+        return Ok(());
+    }
+
+    let temp = tempdir()?;
+    let mut session = spawn_server_retry_with_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?;
+    let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
+    let Some(transcript_path) = wait_for_timeout_bundle_transcript(&mut session, input).await?
+    else {
+        eprintln!("sandbox_state_updates backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    };
+    let transcript_before = fs::read_to_string(&transcript_path)?;
+
+    match kind {
+        SandboxUpdateKind::Request => {
+            session
+                .send_custom_request(SANDBOX_STATE_METHOD, sandbox_update_params(true))
+                .await?;
+        }
+        SandboxUpdateKind::Notification => {
+            session
+                .send_custom_notification(SANDBOX_STATE_METHOD, sandbox_update_params(true))
+                .await?;
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    let poll = poll_until_not_busy(&mut session).await?;
+    let poll_text = result_text(&poll);
+    let transcript_after = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        bundle_transcript_path(&poll_text).is_none(),
+        "did not expect empty poll after sandbox restart to reuse prior timeout bundle: {poll_text:?}"
+    );
+    assert_eq!(
+        transcript_after, transcript_before,
+        "did not expect sandbox-triggered restart output to append to prior timeout bundle"
+    );
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -177,6 +320,11 @@ async fn sandbox_state_update_request_restarts_worker() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_update_request_clears_hidden_timeout_bundle() -> TestResult<()> {
+    assert_sandbox_update_clears_stale_timeout_bundle(SandboxUpdateKind::Request).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_update_notification_restarts_worker() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
@@ -201,6 +349,11 @@ async fn sandbox_state_update_notification_restarts_worker() -> TestResult<()> {
     }
     session.cancel().await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_update_notification_clears_hidden_timeout_bundle() -> TestResult<()> {
+    assert_sandbox_update_clears_stale_timeout_bundle(SandboxUpdateKind::Notification).await
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

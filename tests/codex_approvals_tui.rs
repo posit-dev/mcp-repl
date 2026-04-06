@@ -401,6 +401,9 @@ mod unix_impl {
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
             return String::new();
         }
+        if text == "Reading additional input from stdin..." {
+            return String::new();
+        }
         if text.contains("ERROR codex_api::endpoint::responses_websocket:")
             || text.contains("WARN codex_core::session_startup_prewarm:")
             || text
@@ -503,7 +506,7 @@ mod unix_impl {
                 end += 1;
             }
             if end > abs + marker.len() && text[end..].starts_with("ms") {
-                out.push_str("N");
+                out.push('N');
                 idx = end;
             } else {
                 idx = abs + marker.len();
@@ -600,7 +603,8 @@ mod unix_impl {
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        for candidate in ["mcp-repl"] {
+        {
+            let candidate = "mcp-repl";
             let mut candidate_path = path.clone();
             candidate_path.push(candidate);
             if cfg!(windows) {
@@ -635,15 +639,33 @@ mod unix_impl {
         assert_eq!(normalized, "");
     }
 
+    #[test]
+    fn normalize_exec_text_drops_stdin_status_line() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let normalized = normalize_exec_text(
+            "Reading additional input from stdin...",
+            workspace,
+            codex_home,
+        );
+        assert_eq!(normalized, "");
+    }
+
     fn codex_config(mcp_repl: &Path, repo_root: &Path, openai_base_url: &str) -> String {
         let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
         format!(
-            r#"model_provider = "openai"
-openai_base_url = "{openai_base_url}"
+            r#"model_provider = "mock-openai"
 disable_paste_burst = true
 project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
 
 [notice]
 hide_full_access_warning = true

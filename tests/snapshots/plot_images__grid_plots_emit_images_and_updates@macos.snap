@@ -12,13 +12,7 @@ expression: serialized
           {
             "type": "image",
             "data": "blake3:47525e6a088b368bfb44d178ec912c488125bafe7cf47165a37fa0377f2d116f",
-            "mimeType": "image/png",
-            "_meta": {
-              "mcpConsole": {
-                "imageId": "plot-2",
-                "isNewPage": true
-              }
-            }
+            "mimeType": "image/png"
           },
           {
             "type": "text",
@@ -36,13 +30,7 @@ expression: serialized
           {
             "type": "image",
             "data": "blake3:13144fb0a14c9e60fe21d1220af6bbf64f335854dafd4e803fe0bcb1c7fbe2ca",
-            "mimeType": "image/png",
-            "_meta": {
-              "mcpConsole": {
-                "imageId": "plot-2",
-                "isNewPage": false
-              }
-            }
+            "mimeType": "image/png"
           },
           {
             "type": "text",

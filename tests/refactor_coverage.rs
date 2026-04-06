@@ -93,8 +93,9 @@ cat("\nEND\n")
 "#;
 
     snapshot
-        .session(
+        .pager_session(
             "truncation_tail",
+            300,
             mcp_script! {
                 write_stdin(big_output, timeout = 20.0);
                 write_stdin(":tail 8k", timeout = 10.0);
@@ -123,8 +124,9 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
 "##;
 
     snapshot
-        .session(
+        .pager_session(
             "pager_hits_images",
+            300,
             mcp_script! {
                 write_stdin(output, timeout = 10.0);
                 write_stdin(":hits alpha", timeout = 10.0);
@@ -151,6 +153,13 @@ fn backend_unavailable(text: &str) -> bool {
         )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
+}
+
+#[cfg(windows)]
+fn initial_plot_command_completed(text: &str) -> bool {
+    text.contains("plots_done")
+        || text.contains("<<repl status: busy")
+        || text.contains("--More-- (")
 }
 
 #[cfg(not(windows))]
@@ -227,7 +236,7 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
             if text.contains(expected) {
                 return Ok(true);
             }
-            if text.contains("<<console status: busy")
+            if text.contains("<<repl status: busy")
                 || text.contains("worker is busy")
                 || text.contains("request already running")
                 || text.contains("input discarded while worker busy")
@@ -254,7 +263,7 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if !text.contains("plots_done") && !text.contains("<<console status: busy") {
+    if !initial_plot_command_completed(&text) {
         return Err(format!("expected plot command output marker, got: {text:?}").into());
     }
 

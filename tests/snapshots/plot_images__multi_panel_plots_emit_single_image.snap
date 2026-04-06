@@ -12,13 +12,7 @@ expression: serialized
           {
             "type": "image",
             "data": "blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128",
-            "mimeType": "image/png",
-            "_meta": {
-              "mcpConsole": {
-                "imageId": "plot-2",
-                "isNewPage": false
-              }
-            }
+            "mimeType": "image/png"
           },
           {
             "type": "text",

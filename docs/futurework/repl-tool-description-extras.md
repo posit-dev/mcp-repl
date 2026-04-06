@@ -40,9 +40,9 @@ It should be treated as source material for:
 
 - Use short non-blocking/near-non-blocking calls to launch long work, then poll.
 - Treat timeout return as partial progress, not cancellation.
-- Timeout replies surface explicit busy status markers (`<<console status: busy, write_stdin timeout reached; elapsed_ms=...>>`).
+- Timeout replies surface explicit busy status markers (`<<repl status: busy, write_stdin timeout reached; elapsed_ms=...>>`).
 - While work is active, reject/discard concurrent non-empty input and poll until completion.
-- Empty-input poll while idle can return `<<console status: idle>>`.
+- Empty-input poll while idle can return `<<repl status: idle>>`.
 - After completion, resume normal interactive flow.
 
 ## Recovered R-specific guidance

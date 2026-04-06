@@ -1,6 +1,7 @@
 use harp::object::RObject;
 use libr::SEXP;
 
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 #[harp::register]
 pub extern "C-unwind" fn mcp_repl_plot_emit(
     id: SEXP,

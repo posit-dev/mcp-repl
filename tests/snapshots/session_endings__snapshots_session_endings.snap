@@ -1,6 +1,6 @@
 ---
 source: tests/session_endings.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: restart_timeout_zero ==
 -- step 1 --
@@ -197,6 +197,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "[repl] new session started"
+    },
+    {
+      "type": "text",
       "text": "[1] 2"
     },
     {
@@ -243,7 +247,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"no\")\n[repl] session ended"
+      "text": "[repl] session ended"
     }
   ]
 }
@@ -309,7 +313,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit()\n[repl] session ended"
+      "text": "[repl] session ended"
     }
   ]
 }
@@ -375,7 +379,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"yes\")\n[repl] session ended"
+      "text": "[repl] session ended"
     }
   ]
 }

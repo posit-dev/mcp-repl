@@ -1,3 +1,5 @@
+#[cfg(all(test, target_family = "unix"))]
+use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_family = "unix")]
@@ -28,8 +30,11 @@ use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTextSpan,
     OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
+    set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
+use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
+use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
 };
@@ -39,15 +44,42 @@ use crate::sandbox_cli::{
     sandbox_plan_requests_inherited_state,
 };
 use crate::worker_protocol::{
-    TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
+    ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::io::AsRawHandle;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+#[cfg(all(test, target_family = "unix"))]
+thread_local! {
+    static TEST_UNIX_KILL_RECORDER: RefCell<Option<Vec<(i32, i32)>>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_family = "unix")]
+fn raw_unix_kill(target: i32, signal: i32) -> i32 {
+    #[cfg(test)]
+    if let Ok(Some(result)) = TEST_UNIX_KILL_RECORDER.try_with(|recorder| {
+        let mut recorder = recorder.borrow_mut();
+        recorder.as_mut().map(|calls| {
+            calls.push((target, signal));
+            0
+        })
+    }) {
+        return result;
+    }
+
+    unsafe { libc::kill(target, signal) }
+}
 
 #[derive(Debug, Clone)]
 struct GuardrailEvent {
@@ -59,6 +91,63 @@ struct GuardrailEvent {
 struct GuardrailShared {
     event: Arc<Mutex<Option<GuardrailEvent>>>,
     busy: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct LiveOutputCapture {
+    pending_output_tape: Option<PendingOutputTape>,
+    output_timeline: OutputTimeline,
+}
+
+impl LiveOutputCapture {
+    fn new(
+        oversized_output: OversizedOutputMode,
+        pending_output_tape: PendingOutputTape,
+        output_timeline: OutputTimeline,
+    ) -> Self {
+        Self {
+            pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
+                .then_some(pending_output_tape),
+            output_timeline,
+        }
+    }
+
+    fn append_text(&self, bytes: &[u8], stream: TextStream) {
+        match stream {
+            TextStream::Stdout => {
+                self.output_timeline
+                    .append_text(bytes, false, ContentOrigin::Worker);
+                if let Some(tape) = &self.pending_output_tape {
+                    tape.append_stdout_bytes(bytes);
+                }
+            }
+            TextStream::Stderr => {
+                self.output_timeline
+                    .append_text(bytes, true, ContentOrigin::Worker);
+                if let Some(tape) = &self.pending_output_tape {
+                    tape.append_stderr_bytes(bytes);
+                }
+            }
+        }
+    }
+
+    fn append_image(&self, image: IpcPlotImage) {
+        self.output_timeline.append_image(
+            image.id.clone(),
+            image.mime_type.clone(),
+            image.data.clone(),
+            image.is_new,
+        );
+        if let Some(tape) = &self.pending_output_tape {
+            tape.append_image(image.id, image.mime_type, image.data, image.is_new);
+        }
+    }
+
+    fn append_sideband(&self, kind: PendingSidebandKind) {
+        if let Some(tape) = &self.pending_output_tape {
+            tape.append_sideband(kind);
+        }
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -102,10 +191,7 @@ impl RBackendDriver {
 }
 
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
-    ipc.clear_request_end_events();
-    ipc.clear_readline_tracking();
-    ipc.clear_prompt_history();
-    ipc.clear_echo_events();
+    ipc.begin_request();
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
@@ -128,35 +214,18 @@ fn driver_wait_for_completion(
         let slice = remaining.min(Duration::from_millis(50));
         match ipc.wait_for_request_end(slice) {
             Ok(()) => {
-                let (prompt, prompt_variants, echo_events) = collect_completion_metadata(&ipc);
-                return Ok(CompletionInfo {
-                    prompt,
-                    prompt_variants: Some(prompt_variants),
-                    echo_events,
-                    session_end_seen: false,
-                });
+                return Ok(completion_info_from_ipc(&ipc, false));
             }
             Err(IpcWaitError::Timeout) => {
                 if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
                     && ipc.try_take_request_end()
                 {
-                    let (prompt, prompt_variants, echo_events) = collect_completion_metadata(&ipc);
-                    return Ok(CompletionInfo {
-                        prompt,
-                        prompt_variants: Some(prompt_variants),
-                        echo_events,
-                        session_end_seen: false,
-                    });
+                    return Ok(completion_info_from_ipc(&ipc, false));
                 }
                 continue;
             }
             Err(IpcWaitError::SessionEnd) => {
-                return Ok(CompletionInfo {
-                    prompt: None,
-                    prompt_variants: None,
-                    echo_events: Vec::new(),
-                    session_end_seen: true,
-                });
+                return Ok(completion_info_from_ipc(&ipc, true));
             }
             Err(IpcWaitError::Disconnected) => {
                 return Err(WorkerError::Protocol(
@@ -313,13 +382,13 @@ const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
+const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
 
-fn collect_completion_metadata(
-    ipc: &ServerIpcConnection,
-) -> (Option<String>, Vec<String>, Vec<IpcEchoEvent>) {
+fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
-    let mut echo_events = ipc.take_echo_events();
+    let mut echo_event_count = ipc.pending_echo_event_count();
+    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -327,22 +396,25 @@ fn collect_completion_metadata(
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
-        let mut next_echo_events = ipc.take_echo_events();
+        let next_echo_event_count = ipc.pending_echo_event_count();
+        if next_echo_event_count > echo_event_count {
+            saw_late_echo_event = true;
+        }
         let changed = next_prompt.is_some()
             || !next_prompt_variants.is_empty()
-            || !next_echo_events.is_empty();
+            || next_echo_event_count != echo_event_count;
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
-        echo_events.append(&mut next_echo_events);
+        echo_event_count = next_echo_event_count;
 
         if changed {
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if stable_for >= COMPLETION_METADATA_STABLE {
+            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -356,7 +428,7 @@ fn collect_completion_metadata(
             .cloned();
     }
 
-    (prompt, prompt_variants, echo_events)
+    (prompt, prompt_variants)
 }
 
 impl From<std::io::Error> for WorkerError {
@@ -366,11 +438,18 @@ impl From<std::io::Error> for WorkerError {
 }
 
 struct InputContext {
-    start_offset: u64,
     prefix_contents: Vec<WorkerContent>,
-    prefix_bytes: u64,
     prefix_is_error: bool,
+    start_offset: u64,
+    prefix_bytes: u64,
     input_echo: Option<String>,
+    input_transcript: Option<String>,
+}
+
+#[derive(Default)]
+struct InputFallback {
+    transcript: Option<String>,
+    raw_input: Option<String>,
 }
 
 struct ReplyWithOffset {
@@ -399,7 +478,25 @@ struct CompletionInfo {
     prompt: Option<String>,
     prompt_variants: Option<Vec<String>>,
     echo_events: Vec<IpcEchoEvent>,
+    protocol_warnings: Vec<String>,
     session_end_seen: bool,
+}
+
+fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -> CompletionInfo {
+    let (prompt, prompt_variants) = if session_end_seen {
+        (None, None)
+    } else {
+        let (prompt, prompt_variants) = collect_completion_metadata(ipc);
+        (prompt, Some(prompt_variants))
+    };
+
+    CompletionInfo {
+        prompt,
+        prompt_variants,
+        echo_events: ipc.take_echo_events(),
+        protocol_warnings: ipc.take_protocol_warnings(),
+        session_end_seen,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -432,11 +529,10 @@ fn split_write_stdin_control_prefix(input: &str) -> Option<(WriteStdinControlAct
 fn worker_context_event_payload(
     backend: Backend,
     sandbox_state: &SandboxState,
-    preserve_pager: Option<bool>,
 ) -> serde_json::Value {
     let sandbox_policy = serde_json::to_value(&sandbox_state.sandbox_policy)
         .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
-    let mut payload = serde_json::json!({
+    serde_json::json!({
         "backend": format!("{backend:?}"),
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
@@ -451,16 +547,7 @@ fn worker_context_event_payload(
             "denied_domains": sandbox_state.managed_network_policy.denied_domains.clone(),
             "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,
         },
-    });
-    if let Some(preserve_pager) = preserve_pager
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.insert(
-            "preserve_pager".to_string(),
-            serde_json::Value::Bool(preserve_pager),
-        );
-    }
-    payload
+    })
 }
 
 pub struct WorkerManager {
@@ -472,16 +559,18 @@ pub struct WorkerManager {
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
+    oversized_output: OversizedOutputMode,
+    pending_output_tape: PendingOutputTape,
     output: OutputBuffer,
     pager: Pager,
     output_timeline: OutputTimeline,
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
+    pending_request_input: Option<String>,
     session_end_seen: bool,
-    // Prompt captured when pager is activated. We suppress REPL prompts while paging, but once
-    // paging is dismissed we still want to surface the prompt that was actually emitted by the
-    // backend for that turn (without inventing a prompt).
+    settled_pending_completion: Option<CompletionInfo>,
+    last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
     last_spawn: Option<std::time::Instant>,
@@ -490,7 +579,11 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    pub fn new(
+        backend: Backend,
+        sandbox_plan: SandboxCliPlan,
+        oversized_output: OversizedOutputMode,
+    ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let mut inherited_state = sandbox_defaults.clone();
@@ -522,12 +615,14 @@ impl WorkerManager {
                 Err(err) => return Err(WorkerError::Sandbox(err)),
             };
         crate::event_log::log_lazy("worker_manager_created", || {
-            worker_context_event_payload(backend, &sandbox_state, None)
+            worker_context_event_payload(backend, &sandbox_state)
         });
-        let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-        let output_timeline = OutputTimeline::new(output_ring);
+        let output_timeline = {
+            let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+            reset_output_ring();
+            reset_last_reply_marker_offset();
+            OutputTimeline::new(output_ring)
+        };
         Ok(Self {
             exe_path,
             backend,
@@ -537,6 +632,8 @@ impl WorkerManager {
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,
+            oversized_output,
+            pending_output_tape: PendingOutputTape::new(),
             output: OutputBuffer::default(),
             pager: Pager::default(),
             output_timeline,
@@ -546,7 +643,10 @@ impl WorkerManager {
             },
             pending_request: false,
             pending_request_started_at: None,
+            pending_request_input: None,
             session_end_seen: false,
+            settled_pending_completion: None,
+            last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
             last_spawn: None,
@@ -565,6 +665,32 @@ impl WorkerManager {
         self.ensure_process()
     }
 
+    /// Exposes whether a timed-out logical request still owns future empty-input polls.
+    pub fn pending_request(&self) -> bool {
+        self.pending_request
+    }
+
+    pub fn detached_prefix_item_count(&self) -> usize {
+        self.last_detached_prefix_item_count
+    }
+
+    fn reset_preserving_detached_prefix_item_count(&mut self) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset();
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
+    fn reset_with_pager_preserving_detached_prefix_item_count(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_with_pager(preserve_pager);
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
     pub fn write_stdin(
         &mut self,
         text: String,
@@ -573,6 +699,28 @@ impl WorkerManager {
         page_bytes_override: Option<u64>,
         echo_input: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.write_stdin_files(text, worker_timeout, server_timeout)
+            }
+            OversizedOutputMode::Pager => self.write_stdin_pager(
+                text,
+                worker_timeout,
+                server_timeout,
+                page_bytes_override,
+                echo_input,
+            ),
+        }
+    }
+
+    /// Entry point for the public `repl` tool in default files mode.
+    fn write_stdin_files(
+        &mut self,
+        text: String,
+        worker_timeout: Duration,
+        server_timeout: Duration,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
             let control_reply = match control {
@@ -582,13 +730,11 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
-            return self.write_stdin(
-                remaining.to_string(),
-                worker_timeout,
-                server_timeout,
-                page_bytes_override,
-                echo_input,
-            );
+            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
+            let remaining_reply =
+                self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout)?;
+            self.last_detached_prefix_item_count += control_prefix_item_count;
+            return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
 
         if self.guardrail_busy_event_pending() {
@@ -601,12 +747,116 @@ impl WorkerManager {
                 .take()
                 .expect("guardrail event should be present");
             self.guardrail.busy.store(false, Ordering::Relaxed);
-            let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-            let input_context = self.prepare_input_context(&text, echo_input);
+            let input_context = self.prepare_input_context_files();
             let err = WorkerError::Guardrail(event.message);
-            let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
+            let _ = self.reset_preserving_detached_prefix_item_count();
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+
+        if let Err(err) = self.ensure_process() {
+            let input_context = self.prepare_input_context_files();
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        self.maybe_emit_guardrail_notice();
+        self.resolve_timeout_marker();
+        if text.is_empty() {
+            if self.pending_request
+                || self.pending_output_tape.has_pending()
+                || self.settled_pending_completion.is_some()
+            {
+                let reply = self.poll_pending_output_files(worker_timeout)?;
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            let reply = self.build_idle_poll_reply_files();
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        if !text.is_empty() && self.pending_request {
+            self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
+        }
+        if !text.is_empty() && self.pending_request {
+            let mut reply = self.poll_pending_output_files(worker_timeout)?;
+            let detached_prefix_item_count = match &reply.reply {
+                WorkerReply::Output { contents, .. } => contents.len(),
+            };
+            self.last_detached_prefix_item_count = detached_prefix_item_count;
+            mark_busy_follow_up_reply(&mut reply.reply);
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+
+        let input_context = self.prepare_input_context_files();
+
+        let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
+            Ok(result) => result,
+            Err(err) => {
+                self.guardrail.busy.store(false, Ordering::Relaxed);
+                let reply = self.build_reply_from_worker_error_files(&err, input_context);
+                let _ = self.reset_preserving_detached_prefix_item_count();
+                return Ok(self.finalize_reply(reply));
+            }
+        };
+        let reply = self.build_reply_from_request_files(request, input_context)?;
+        let reply = self.finalize_reply(reply);
+        self.maybe_reset_after_session_end();
+        Ok(reply)
+    }
+
+    fn write_stdin_pager(
+        &mut self,
+        text: String,
+        worker_timeout: Duration,
+        server_timeout: Duration,
+        page_bytes_override: Option<u64>,
+        echo_input: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.last_detached_prefix_item_count = 0;
+        if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
+            self.clear_guardrail_busy_event();
+            let control_reply = match control {
+                WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
+                WriteStdinControlAction::Restart => self.restart(worker_timeout),
+            }?;
+            if remaining.is_empty() {
+                return Ok(control_reply);
+            }
+            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
+            let remaining_reply = self.write_stdin_pager(
+                remaining.to_string(),
+                worker_timeout,
+                server_timeout,
+                page_bytes_override,
+                echo_input,
+            )?;
+            self.last_detached_prefix_item_count += control_prefix_item_count;
+            return Ok(prefix_worker_reply(control_reply, remaining_reply));
+        }
+
+        if self.guardrail_busy_event_pending() {
+            let event = self
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned")
+                .take()
+                .expect("guardrail event should be present");
+            self.guardrail.busy.store(false, Ordering::Relaxed);
+            let page_bytes = pager::resolve_page_bytes(page_bytes_override);
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
+            let err = WorkerError::Guardrail(event.message);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
             let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager(preserve_pager);
+            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -614,9 +864,6 @@ impl WorkerManager {
 
         if self.pager.is_active() {
             let trimmed = text.trim();
-            // While pager is active:
-            // - empty input and `:`-prefixed input are pager commands
-            // - other input auto-dismisses pager and is sent to the backend
             if trimmed.is_empty() || trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
                     let reply = self.finalize_reply(reply);
@@ -628,10 +875,11 @@ impl WorkerManager {
                 self.pager_prompt = None;
             }
         }
+
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
         if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context(&text, echo_input);
-            let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -640,53 +888,49 @@ impl WorkerManager {
         self.maybe_emit_guardrail_notice();
         self.resolve_timeout_marker();
         if text.is_empty() {
-            if self.pending_request || self.output.has_pending_output() {
-                let reply = self.poll_pending_output(worker_timeout, page_bytes)?;
+            if self.pending_request
+                || self.output.has_pending_output()
+                || self.settled_pending_completion.is_some()
+            {
+                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
-            let reply = self.build_idle_poll_reply();
+            let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
-        if !text.is_empty() && self.pending_request {
+        if self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
-        if !text.is_empty() && self.pending_request {
-            let mut reply = self.poll_pending_output(worker_timeout, page_bytes)?;
-            let WorkerReply::Output {
-                contents,
-                is_error,
-                error_code,
-                ..
-            } = &mut reply.reply;
-            contents.push(WorkerContent::stderr(
-                "[repl] input discarded while worker busy",
-            ));
-            *is_error = true;
-            if error_code.is_none() {
-                *error_code = Some(WorkerErrorCode::Busy);
-            }
+        if self.pending_request {
+            let mut reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
+            let detached_prefix_item_count = match &reply.reply {
+                WorkerReply::Output { contents, .. } => contents.len(),
+            };
+            self.last_detached_prefix_item_count = detached_prefix_item_count;
+            mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
 
-        let input_context = self.prepare_input_context(&text, echo_input);
+        let input_context = self.prepare_input_context_pager(&text, echo_input);
 
         let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
             Ok(result) => result,
             Err(err) => {
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
+                let reply =
+                    self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
                 let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 return Ok(self.finalize_reply(reply));
             }
         };
-        let reply = self.build_reply_from_request(request, input_context, page_bytes)?;
+        let reply = self.build_reply_from_request_pager(request, input_context, page_bytes)?;
         let reply = self.finalize_reply(reply);
         self.maybe_reset_after_session_end();
         Ok(reply)
@@ -698,8 +942,6 @@ impl WorkerManager {
         }
         self.pager.refresh_from_output(&self.output);
         let mut reply = self.pager.handle_command(text);
-        // `handle_command()` may dismiss the pager (e.g. `q`, `tail`, reaching end). Only emit
-        // the backend prompt once the pager is no longer active.
         let pager_active = self.pager.is_active();
         let WorkerReply::Output {
             contents, prompt, ..
@@ -714,7 +956,7 @@ impl WorkerManager {
         } else {
             self.remember_prompt(resolved_prompt.clone());
             if resolved_prompt.is_none() {
-                contents.push(WorkerContent::stderr(
+                contents.push(WorkerContent::server_stderr(
                     "[repl] protocol error: missing prompt after pager dismiss",
                 ));
             }
@@ -725,7 +967,148 @@ impl WorkerManager {
         Some(ReplyWithOffset { reply, end_offset })
     }
 
-    fn poll_pending_output(
+    /// Serves empty-input polls and busy follow-up replies for a timed-out request.
+    /// Each poll only returns newly available output, but the server may keep appending it to one transcript file.
+    fn poll_pending_output_files(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReplyWithOffset, WorkerError> {
+        let poll_start = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut completed_request = false;
+        let mut consumed_completion = false;
+        let mut completion = CompletionInfo {
+            prompt: None,
+            prompt_variants: None,
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        };
+
+        if self.pending_request {
+            match self.wait_for_request_completion(timeout) {
+                Ok(info) => {
+                    self.clear_pending_request_state();
+                    if info.session_end_seen {
+                        self.note_session_end(true);
+                    }
+                    completion = info;
+                    completed_request = true;
+                    consumed_completion = true;
+                }
+                Err(WorkerError::Timeout(_)) => {
+                    let worker_exited = match self.process.as_mut() {
+                        Some(process) => !process.is_running()?,
+                        None => true,
+                    };
+                    if worker_exited {
+                        self.note_session_end(true);
+                        self.clear_pending_request_state();
+                        completion.session_end_seen = true;
+                        completed_request = true;
+                        consumed_completion = true;
+                    } else {
+                        timed_out = true;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if !timed_out
+            && !completed_request
+            && let Some(info) = self.settled_pending_completion.take()
+        {
+            completion = info;
+            consumed_completion = true;
+        }
+        let fallback_input = if !timed_out && consumed_completion {
+            self.take_input_fallback(&completion)
+        } else {
+            InputFallback::default()
+        };
+        let fallback_input_transcript = fallback_input.transcript.clone();
+
+        let FormattedPendingOutput {
+            mut contents,
+            saw_stderr,
+        } = if timed_out {
+            self.drain_formatted_output()
+        } else {
+            self.drain_final_formatted_output()
+        };
+        let is_error = saw_stderr;
+
+        if timed_out {
+            let elapsed = self
+                .pending_request_started_at
+                .map(|start| start.elapsed())
+                .unwrap_or_else(|| poll_start.elapsed());
+            contents.push(timeout_status_content(elapsed));
+        }
+
+        let session_end = completion.session_end_seen;
+        let resolved_prompt = normalize_prompt(completion.prompt.clone());
+        let resolved_prompt = if session_end || timed_out {
+            None
+        } else {
+            resolved_prompt
+        };
+        self.remember_prompt(resolved_prompt.clone());
+        let has_fallback_input_transcript = fallback_input_transcript.is_some();
+        let trim_enabled = !timed_out
+            && if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
+        let echo_transcript = (!timed_out)
+            .then(|| {
+                echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone())
+            })
+            .flatten();
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            echo_transcript.as_deref(),
+            trim_enabled,
+            if !timed_out && completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_drop_echo_only_contents(&completion.echo_events)
+            },
+            &completion.protocol_warnings,
+        );
+        if !timed_out && completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+            let prompt_variants = fallback_prompt_variants(
+                completion.prompt.as_deref(),
+                completion.prompt_variants.as_deref(),
+            );
+            let _ = trim_leading_input_echo_from_contents(
+                &mut contents,
+                fallback_input.raw_input.as_deref(),
+                &prompt_variants,
+            );
+        }
+        if !timed_out && !session_end {
+            if let Some(prompt_text) = resolved_prompt.as_deref() {
+                strip_prompt_from_contents(&mut contents, prompt_text);
+            }
+            append_prompt_if_missing(&mut contents, resolved_prompt.clone());
+        }
+
+        Ok(ReplyWithOffset {
+            reply: WorkerReply::Output {
+                contents,
+                is_error,
+                error_code: timed_out.then_some(WorkerErrorCode::Timeout),
+                prompt: (!session_end).then_some(()).and(resolved_prompt),
+                prompt_variants: completion.prompt_variants.clone(),
+            },
+            end_offset: 0,
+        })
+    }
+
+    fn poll_pending_output_pager(
         &mut self,
         timeout: Duration,
         page_bytes: u64,
@@ -739,6 +1122,7 @@ impl WorkerManager {
             prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
             session_end_seen: false,
         };
 
@@ -770,6 +1154,11 @@ impl WorkerManager {
                 }
                 Err(err) => return Err(err),
             }
+        }
+        if !completed_request && let Some(info) = self.settled_pending_completion.take() {
+            completion = info;
+            completed_request = true;
+            end_offset = self.output.end_offset().unwrap_or(end_offset);
         }
 
         if end_offset < start_offset {
@@ -808,7 +1197,17 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
-
+        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
+        let echo_transcript = (!timed_out)
+            .then(|| echo_transcript_from_events(&completion.echo_events))
+            .flatten();
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            echo_transcript.as_deref(),
+            trim_enabled,
+            should_drop_echo_only_contents(&completion.echo_events),
+            &completion.protocol_warnings,
+        );
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
             &mut contents,
@@ -852,32 +1251,104 @@ impl WorkerManager {
         })
     }
 
-    fn prepare_input_context(&mut self, text: &str, echo_input: bool) -> InputContext {
+    /// Drains detached output that arrived before the next accepted request so it can be prefixed
+    /// into that request's visible reply.
+    fn prepare_input_context_files(&mut self) -> InputContext {
+        let settled_completion = self.settled_pending_completion.take();
+        let fallback_input = settled_completion
+            .as_ref()
+            .map(|completion| self.take_input_fallback(completion))
+            .unwrap_or_default();
+        let fallback_input_transcript = fallback_input.transcript.clone();
+        // A new accepted request seals the detached prefix. Flush any incomplete UTF-8 tail now
+        // so it stays with the detached transcript instead of merging into fresh request output.
+        let FormattedPendingOutput {
+            mut contents,
+            saw_stderr,
+        } = self.drain_sealed_formatted_output();
+        if let Some(completion) = settled_completion.as_ref() {
+            let has_fallback_input_transcript = fallback_input_transcript.is_some();
+            let trim_enabled = if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
+            let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                .or(fallback_input_transcript.clone());
+            trim_echo_then_append_protocol_warnings(
+                &mut contents,
+                echo_transcript.as_deref(),
+                trim_enabled,
+                if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_drop_echo_only_contents(&completion.echo_events)
+                },
+                &completion.protocol_warnings,
+            );
+            if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                let prompt_variants = fallback_prompt_variants(
+                    completion.prompt.as_deref(),
+                    completion.prompt_variants.as_deref(),
+                );
+                let _ = trim_leading_input_echo_from_contents(
+                    &mut contents,
+                    fallback_input.raw_input.as_deref(),
+                    &prompt_variants,
+                );
+            }
+        }
+        InputContext {
+            prefix_contents: contents,
+            prefix_is_error: saw_stderr,
+            start_offset: 0,
+            prefix_bytes: 0,
+            input_echo: None,
+            input_transcript: None,
+        }
+    }
+
+    fn prepare_input_context_pager(&mut self, text: &str, echo_input: bool) -> InputContext {
         self.output.start_capture();
 
-        // We treat any output that arrives between tool calls as "prefix" output for the next
-        // request, and we include an explicit input marker so the LLM can attribute subsequent
-        // output without relying on prompt-like echoes.
         let had_pending_output = self.output.has_pending_output();
         let saw_background_output = self.output.pending_output_since_last_reply();
+        let prompt_hint = self.current_prompt_hint();
+        self.remember_prompt(prompt_hint.clone());
 
         let mut input_echo = echo_input
             .then(|| text.to_string())
             .and_then(|value| pager::build_input_echo(&value));
+        let input_transcript = build_input_transcript(prompt_hint.as_deref(), text);
+        let settled_completion = self.settled_pending_completion.take();
 
         let mut prefix_contents = Vec::new();
         let mut prefix_bytes: u64 = 0;
         let mut prefix_is_error = false;
 
-        if had_pending_output {
+        if had_pending_output || settled_completion.is_some() {
             let pending_end = self.output.end_offset().unwrap_or(0);
             let pending_start = self.output.current_offset().unwrap_or(pending_end);
             let pending_bytes = pending_end.saturating_sub(pending_start);
 
-            prefix_is_error = self
-                .output
-                .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
-            prefix_contents = pager::take_range_from_ring(&self.output, pending_end);
+            if let Some(completion) = settled_completion {
+                let FormattedPendingOutput {
+                    contents,
+                    saw_stderr,
+                } = take_range_from_ring_after_completion(
+                    &self.output,
+                    pending_start,
+                    pending_end,
+                    &completion,
+                );
+                prefix_is_error = saw_stderr;
+                prefix_contents = contents;
+            } else {
+                prefix_is_error = self
+                    .output
+                    .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
+                prefix_contents = pager::take_range_from_ring(&self.output, pending_end);
+            }
             prefix_bytes = pending_bytes;
         }
 
@@ -887,11 +1358,12 @@ impl WorkerManager {
         }
 
         InputContext {
-            start_offset,
             prefix_contents,
-            prefix_bytes,
             prefix_is_error,
+            start_offset,
+            prefix_bytes,
             input_echo,
+            input_transcript,
         }
     }
 
@@ -903,6 +1375,11 @@ impl WorkerManager {
     ) -> Result<RequestState, WorkerError> {
         let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
+        if matches!(self.oversized_output, OversizedOutputMode::Files) {
+            let prompt = self.current_prompt_hint();
+            self.remember_prompt(prompt.clone());
+            self.pending_request_input = Some(text.clone());
+        }
         let ipc = self
             .process
             .as_ref()
@@ -913,6 +1390,7 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
+        self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         self.process
             .as_mut()
@@ -924,12 +1402,35 @@ impl WorkerManager {
         })
     }
 
-    fn build_reply_from_worker_error(
+    fn build_reply_from_worker_error_files(
+        &mut self,
+        err: &WorkerError,
+        context: InputContext,
+    ) -> ReplyWithOffset {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
+        let mut contents = context.prefix_contents;
+        let formatted = self.drain_sealed_formatted_output();
+        contents.extend(formatted.contents);
+        contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
+        ReplyWithOffset {
+            reply: WorkerReply::Output {
+                contents,
+                is_error: true,
+                error_code: worker_error_code(err),
+                prompt: None,
+                prompt_variants: None,
+            },
+            end_offset: 0,
+        }
+    }
+
+    fn build_reply_from_worker_error_pager(
         &mut self,
         err: &WorkerError,
         context: InputContext,
         page_bytes: u64,
     ) -> ReplyWithOffset {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
         let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
         let mut contents = context.prefix_contents;
@@ -951,7 +1452,7 @@ impl WorkerManager {
             buffer,
             last_range,
         );
-        contents.push(WorkerContent::stderr(format!("worker error: {err}")));
+        contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
@@ -964,14 +1465,138 @@ impl WorkerManager {
         }
     }
 
-    fn build_reply_from_request(
+    fn build_reply_from_request_files(
+        &mut self,
+        request: RequestState,
+        context: InputContext,
+    ) -> Result<ReplyWithOffset, WorkerError> {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
+        match self.wait_for_request_completion(request.timeout) {
+            Ok(completion) => {
+                let mut session_end = completion.session_end_seen;
+                if !session_end
+                    && let Some(process) = self.process.as_mut()
+                    && !process.is_running()?
+                {
+                    session_end = true;
+                }
+                if session_end {
+                    self.note_session_end(true);
+                }
+                let mut contents = context.prefix_contents;
+                let formatted = self.drain_final_formatted_output();
+                let is_error = context.prefix_is_error || formatted.saw_stderr;
+                contents.extend(formatted.contents);
+                let resolved_prompt = if session_end {
+                    None
+                } else {
+                    normalize_prompt(completion.prompt.clone())
+                };
+                self.remember_prompt(resolved_prompt.clone());
+                let fallback_input = self.take_input_fallback(&completion);
+                let fallback_input_transcript = fallback_input.transcript.clone();
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone());
+                trim_echo_then_append_protocol_warnings(
+                    &mut contents,
+                    echo_transcript.as_deref(),
+                    trim_enabled,
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
+                    &completion.protocol_warnings,
+                );
+                if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                    let prompt_variants = fallback_prompt_variants(
+                        completion.prompt.as_deref(),
+                        completion.prompt_variants.as_deref(),
+                    );
+                    let _ = trim_leading_input_echo_from_contents(
+                        &mut contents,
+                        fallback_input.raw_input.as_deref(),
+                        &prompt_variants,
+                    );
+                }
+                if !session_end {
+                    if let Some(prompt_text) = resolved_prompt.as_deref() {
+                        strip_prompt_from_contents(&mut contents, prompt_text);
+                    }
+                    append_prompt_if_missing(&mut contents, resolved_prompt.clone());
+                }
+                self.guardrail.busy.store(false, Ordering::Relaxed);
+                Ok(ReplyWithOffset {
+                    reply: WorkerReply::Output {
+                        contents,
+                        is_error,
+                        error_code: None,
+                        prompt: (!session_end).then_some(()).and(resolved_prompt),
+                        prompt_variants: completion.prompt_variants.clone(),
+                    },
+                    end_offset: 0,
+                })
+            }
+            Err(WorkerError::Timeout(_)) => {
+                if let Some(process) = self.process.as_mut() {
+                    match process.is_running() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(WorkerError::Protocol(
+                                "worker connection closed unexpectedly".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+
+                self.pending_request = true;
+                self.pending_request_started_at = Some(request.started_at);
+                let mut contents = context.prefix_contents;
+                let formatted = self.drain_formatted_output();
+                contents.extend(formatted.contents);
+
+                contents.push(timeout_status_content(request.started_at.elapsed()));
+
+                let is_error = context.prefix_is_error || formatted.saw_stderr;
+
+                Ok(ReplyWithOffset {
+                    reply: WorkerReply::Output {
+                        contents,
+                        is_error,
+                        error_code: Some(WorkerErrorCode::Timeout),
+                        prompt: None,
+                        prompt_variants: None,
+                    },
+                    end_offset: 0,
+                })
+            }
+            Err(err) => {
+                let reply = self.build_reply_from_worker_error_files(&err, context);
+                let _ = self.reset_preserving_detached_prefix_item_count();
+                Ok(reply)
+            }
+        }
+    }
+
+    fn build_reply_from_request_pager(
         &mut self,
         request: RequestState,
         context: InputContext,
         page_bytes: u64,
     ) -> Result<ReplyWithOffset, WorkerError> {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 let mut session_end = completion.session_end_seen;
                 if !session_end
                     && let Some(process) = self.process.as_mut()
@@ -1022,6 +1647,25 @@ impl WorkerManager {
                 if self.pager.is_active() && !session_end {
                     self.pager_prompt = resolved_prompt.clone();
                 }
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript);
+                trim_echo_then_append_protocol_warnings(
+                    &mut contents,
+                    echo_transcript.as_deref(),
+                    trim_enabled,
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
+                    &completion.protocol_warnings,
+                );
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1045,6 +1689,7 @@ impl WorkerManager {
                 })
             }
             Err(WorkerError::Timeout(_)) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 if let Some(process) = self.process.as_mut() {
                     match process.is_running() {
                         Ok(true) => {}
@@ -1074,6 +1719,10 @@ impl WorkerManager {
                     last_range,
                 } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
                 contents.append(&mut page_contents);
+                maybe_trim_echo_prefix(&mut contents, fallback_input_transcript.as_deref(), true);
+                if let Some(echo) = fallback_input_transcript.as_deref() {
+                    let _ = drop_echo_only_contents(&mut contents, echo);
+                }
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
@@ -1103,9 +1752,9 @@ impl WorkerManager {
                 })
             }
             Err(err) => {
-                let reply = self.build_reply_from_worker_error(&err, context, page_bytes);
+                let reply = self.build_reply_from_worker_error_pager(&err, context, page_bytes);
                 let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager(preserve_pager);
+                let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
                 Ok(reply)
             }
         }
@@ -1125,7 +1774,7 @@ impl WorkerManager {
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = std::time::Instant::now();
-        let mut result = self.driver.wait_for_completion(timeout, ipc);
+        let mut result = self.driver.wait_for_completion(timeout, ipc.clone());
         if matches!(
             &result,
             Err(WorkerError::Protocol(message))
@@ -1148,6 +1797,7 @@ impl WorkerManager {
                     prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
+                    protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
             }
@@ -1179,11 +1829,17 @@ impl WorkerManager {
         let poll = Duration::from_millis(5);
         let start = std::time::Instant::now();
 
-        let mut last = self.output.end_offset().unwrap_or(0);
+        let mut last = match self.oversized_output {
+            OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
+            OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+        };
         let mut stable_for = Duration::from_millis(0);
         while start.elapsed() < total {
             thread::sleep(poll);
-            let now = self.output.end_offset().unwrap_or(0);
+            let now = match self.oversized_output {
+                OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
+                OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+            };
             if now == last {
                 stable_for = stable_for.saturating_add(poll);
                 if stable_for >= stable_needed {
@@ -1237,12 +1893,22 @@ impl WorkerManager {
         let Some(event) = slot.take() else {
             return;
         };
-        self.output_timeline
-            .append_text(event.message.as_bytes(), true);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self
+                .pending_output_tape
+                .append_server_stderr_bytes(event.message.as_bytes()),
+            OversizedOutputMode::Pager => self.output_timeline.append_text(
+                event.message.as_bytes(),
+                true,
+                ContentOrigin::Server,
+            ),
+        }
     }
 
     fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        crate::output_capture::set_last_reply_marker_offset(reply.end_offset);
+        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
+            set_last_reply_marker_offset(reply.end_offset);
+        }
         reply.reply
     }
 
@@ -1256,10 +1922,32 @@ impl WorkerManager {
                     if !message.ends_with('\n') {
                         message.push('\n');
                     }
-                    self.output_timeline.append_text(message.as_bytes(), true);
+                    match self.oversized_output {
+                        OversizedOutputMode::Files => self
+                            .pending_output_tape
+                            .append_server_stderr_status_line(message.as_bytes()),
+                        OversizedOutputMode::Pager => {
+                            self.output_timeline.append_text(
+                                message.as_bytes(),
+                                true,
+                                ContentOrigin::Server,
+                            );
+                        }
+                    }
                 } else {
                     let message = "[repl] session ended\n".to_string();
-                    self.output_timeline.append_text(message.as_bytes(), false);
+                    match self.oversized_output {
+                        OversizedOutputMode::Files => self
+                            .pending_output_tape
+                            .append_stdout_status_line(message.as_bytes()),
+                        OversizedOutputMode::Pager => {
+                            self.output_timeline.append_text(
+                                message.as_bytes(),
+                                false,
+                                ContentOrigin::Server,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1267,13 +1955,162 @@ impl WorkerManager {
 
     fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
-            let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager(preserve_pager);
+            let _ = match self.oversized_output {
+                OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
+                OversizedOutputMode::Pager => self
+                    .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
+            };
             self.session_end_seen = false;
         }
     }
 
     pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.interrupt_files(timeout),
+            OversizedOutputMode::Pager => self.interrupt_pager(timeout),
+        }
+    }
+
+    fn interrupt_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        crate::event_log::log(
+            "worker_interrupt_begin",
+            serde_json::json!({
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
+        self.ensure_process()?;
+        if let Err(err) = self.driver.interrupt(
+            self.process
+                .as_mut()
+                .expect("worker process should be available"),
+        ) {
+            self.reset()?;
+            crate::event_log::log(
+                "worker_interrupt_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                }),
+            );
+            return Err(err);
+        }
+
+        if self.pending_request {
+            let mut reply = self.poll_pending_output_files(timeout)?;
+            let prompt = match &reply.reply {
+                WorkerReply::Output { prompt, .. } => prompt.clone(),
+            };
+            let WorkerReply::Output { contents, .. } = &mut reply.reply;
+            if let Some(prompt) = prompt.as_deref() {
+                strip_trailing_prompt(contents, prompt);
+            }
+            if let Some(prompt) = prompt {
+                append_prompt_if_missing(contents, Some(prompt));
+            }
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+
+        let mut timed_out = false;
+        let mut prompt: Option<String> = None;
+        if let Some(process) = self.process.as_ref()
+            && let Some(ipc) = process.ipc.get()
+        {
+            let result = ipc.wait_for_prompt(timeout);
+            match result {
+                Ok(value) => {
+                    prompt = Some(value);
+                }
+                Err(IpcWaitError::Timeout) => {
+                    timed_out = true;
+                }
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                }
+                Err(IpcWaitError::Disconnected) => {
+                    // IPC is optional for the R backend; fall back to prompt-as-output.
+                }
+            }
+        }
+
+        let FormattedPendingOutput {
+            mut contents,
+            saw_stderr,
+        } = self.drain_formatted_output();
+        let is_error = saw_stderr;
+
+        if timed_out {
+            contents.push(timeout_status_content(timeout));
+        }
+
+        let session_end = self.session_end_seen;
+        let resolved_prompt = normalize_prompt(prompt.clone());
+        let resolved_prompt = if session_end || timed_out {
+            None
+        } else {
+            resolved_prompt
+        };
+        self.remember_prompt(resolved_prompt.clone());
+        if !session_end {
+            if let Some(prompt_text) = resolved_prompt.as_deref() {
+                strip_trailing_prompt(&mut contents, prompt_text);
+            }
+            if !timed_out {
+                append_prompt_if_missing(&mut contents, resolved_prompt.clone());
+            }
+        }
+
+        let reply = WorkerReply::Output {
+            contents,
+            is_error,
+            error_code: timed_out.then_some(WorkerErrorCode::Timeout),
+            prompt: (!session_end).then_some(()).and(resolved_prompt),
+            prompt_variants: None,
+        };
+        crate::event_log::log(
+            "worker_interrupt_end",
+            serde_json::json!({
+                "timed_out": timed_out,
+                "session_end": session_end,
+            }),
+        );
+        Ok(self.finalize_reply(ReplyWithOffset {
+            reply,
+            end_offset: 0,
+        }))
+    }
+
+    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.restart_files(timeout),
+            OversizedOutputMode::Pager => self.restart_pager(timeout),
+        }
+    }
+
+    fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        crate::event_log::log(
+            "worker_restart_begin",
+            serde_json::json!({
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
+        if self.awaiting_initial_sandbox_state_update {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        }
+        if let Some(process) = self.process.take() {
+            let _ = process.shutdown_graceful(timeout);
+        }
+        self.guardrail.busy.store(false, Ordering::Relaxed);
+
+        let reply = self.build_session_reset_reply_files("new session started");
+        self.reset_output_state_files(true);
+        crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
+        Ok(self.finalize_reply(reply))
+    }
+
+    fn interrupt_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
@@ -1298,7 +2135,7 @@ impl WorkerManager {
 
         let page_bytes = pager::resolve_page_bytes(None);
         if self.pending_request {
-            let mut reply = self.poll_pending_output(timeout, page_bytes)?;
+            let mut reply = self.poll_pending_output_pager(timeout, page_bytes)?;
             let pager_active = self.pager.is_active();
             let prompt = match &reply.reply {
                 WorkerReply::Output { prompt, .. } => prompt.clone(),
@@ -1333,9 +2170,7 @@ impl WorkerManager {
                 Err(IpcWaitError::SessionEnd) => {
                     self.note_session_end(true);
                 }
-                Err(IpcWaitError::Disconnected) => {
-                    // IPC is optional for the R backend; fall back to prompt-as-output.
-                }
+                Err(IpcWaitError::Disconnected) => {}
             }
         }
 
@@ -1348,8 +2183,6 @@ impl WorkerManager {
         let is_error = self
             .output
             .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let page_is_error = is_error;
-
         let SnapshotWithImages {
             mut contents,
             pages_left,
@@ -1365,7 +2198,7 @@ impl WorkerManager {
             &mut self.pager,
             &mut contents,
             pages_left,
-            page_is_error,
+            is_error,
             buffer,
             last_range,
         );
@@ -1409,7 +2242,7 @@ impl WorkerManager {
         Ok(self.finalize_reply(ReplyWithOffset { reply, end_offset }))
     }
 
-    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_restart_begin",
             serde_json::json!({
@@ -1427,8 +2260,8 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
 
         let page_bytes = pager::resolve_page_bytes(None);
-        let reply = self.build_session_reset_reply(page_bytes, "new session started");
-        self.reset_output_state(false);
+        let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
+        self.reset_output_state_pager(true, false);
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -1454,9 +2287,16 @@ impl WorkerManager {
 
         if needs_spawn {
             if let Some(process) = self.process.take() {
-                process.cleanup_session_tmpdir();
+                process.finish_exited()?;
             }
-            self.process = Some(self.spawn_process()?);
+            match self.oversized_output {
+                OversizedOutputMode::Files => self.reset_output_state_files(false),
+                OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+            }
+            self.process = Some(match self.oversized_output {
+                OversizedOutputMode::Files => self.spawn_process_files()?,
+                OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+            });
         }
 
         Ok(())
@@ -1467,13 +2307,19 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
         if self.awaiting_initial_sandbox_state_update {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
-        self.process = Some(self.spawn_process()?);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
         Ok(())
     }
@@ -1488,12 +2334,12 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
         if self.awaiting_initial_sandbox_state_update {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.reset_output_state_pager(true, preserve_pager);
         self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
         crate::event_log::log(
             "worker_reset_with_pager_end",
@@ -1539,8 +2385,14 @@ impl WorkerManager {
         );
         if !changed {
             if awaiting_before && self.process.is_none() {
-                self.guardrail.busy.store(false, Ordering::Relaxed);
-                self.process = Some(self.spawn_process()?);
+                match self.oversized_output {
+                    OversizedOutputMode::Files => self.reset_output_state_files(true),
+                    OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+                }
+                self.process = Some(match self.oversized_output {
+                    OversizedOutputMode::Files => self.spawn_process_files()?,
+                    OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+                });
                 return Ok(true);
             }
             return Ok(false);
@@ -1549,12 +2401,35 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.process = Some(self.spawn_process()?);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
         Ok(true)
     }
 
-    fn reset_output_state(&mut self, preserve_pager: bool) {
+    fn reset_output_state_files(&mut self, clear_pending_output: bool) {
+        if clear_pending_output {
+            self.pending_output_tape.clear();
+        }
+        self.pending_request = false;
+        self.pending_request_started_at = None;
+        self.pending_request_input = None;
+        self.session_end_seen = false;
+        self.settled_pending_completion = None;
+        self.last_detached_prefix_item_count = 0;
+        self.last_prompt = None;
+        self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn reset_output_state_pager(&mut self, clear_pending_output: bool, preserve_pager: bool) {
+        if clear_pending_output {
+            self.pending_output_tape.clear();
+        }
         reset_output_ring();
         reset_last_reply_marker_offset();
         self.output = OutputBuffer::default();
@@ -1563,7 +2438,10 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.pending_request_input = None;
         self.session_end_seen = false;
+        self.settled_pending_completion = None;
+        self.last_detached_prefix_item_count = 0;
         self.pager_prompt = None;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -1585,7 +2463,40 @@ impl WorkerManager {
         prompt.or_else(|| self.last_prompt.clone())
     }
 
-    fn build_idle_poll_reply(&mut self) -> ReplyWithOffset {
+    fn drain_formatted_output(&self) -> FormattedPendingOutput {
+        self.pending_output_tape.drain_snapshot().format_contents()
+    }
+
+    fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
+        self.pending_output_tape
+            .drain_final_snapshot()
+            .format_contents()
+    }
+
+    fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
+        self.pending_output_tape
+            .drain_sealed_snapshot()
+            .format_contents()
+    }
+
+    fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
+        let prompt = self.current_prompt_hint();
+        self.remember_prompt(prompt.clone());
+        let mut contents = vec![idle_status_content()];
+        append_prompt_if_missing(&mut contents, prompt.clone());
+        ReplyWithOffset {
+            reply: WorkerReply::Output {
+                contents,
+                is_error: false,
+                error_code: None,
+                prompt,
+                prompt_variants: None,
+            },
+            end_offset: 0,
+        }
+    }
+
+    fn build_idle_poll_reply_pager(&mut self) -> ReplyWithOffset {
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
@@ -1602,15 +2513,16 @@ impl WorkerManager {
         }
     }
 
-    fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state(false);
+    fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
         crate::event_log::log_lazy("worker_spawn_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state, Some(false))
+            worker_context_event_payload(self.backend, &self.sandbox_state)
         });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            self.oversized_output,
+            self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1645,14 +2557,15 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state(preserve_pager);
         crate::event_log::log_lazy("worker_spawn_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state, Some(preserve_pager))
+            worker_context_event_payload(self.backend, &self.sandbox_state)
         });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            self.oversized_output,
+            self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1733,10 +2646,26 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
+                let mut settled_completion = completion_info_from_ipc(&ipc, false);
                 self.settle_output_after_request_end(Duration::from_millis(120));
-                let offset = self.output.end_offset().unwrap_or(0);
-                crate::output_capture::update_last_reply_marker_offset_max(offset);
+                if matches!(self.oversized_output, OversizedOutputMode::Pager) {
+                    update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
+                }
+                let worker_exited = match self.process.as_mut() {
+                    Some(process) => match process.is_running() {
+                        Ok(running) => !running,
+                        Err(_) => false,
+                    },
+                    None => true,
+                };
                 self.clear_pending_request_state();
+                if worker_exited {
+                    settled_completion.session_end_seen = true;
+                    self.note_session_end(true);
+                } else {
+                    self.remember_prompt(settled_completion.prompt.clone());
+                }
+                self.settled_pending_completion = Some(settled_completion);
             }
             Err(IpcWaitError::SessionEnd) => {
                 self.note_session_end(true);
@@ -1759,10 +2688,52 @@ impl WorkerManager {
     fn clear_pending_request_state(&mut self) {
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.settled_pending_completion = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
-    fn build_session_reset_reply(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
+    fn take_input_fallback(&mut self, completion: &CompletionInfo) -> InputFallback {
+        let raw_input = completion
+            .echo_events
+            .is_empty()
+            .then(|| self.pending_request_input.take())
+            .flatten();
+        let transcript = raw_input
+            .as_deref()
+            .and_then(|input| build_input_transcript(completion.prompt.as_deref(), input));
+        InputFallback {
+            transcript,
+            raw_input,
+        }
+    }
+
+    fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
+        let FormattedPendingOutput {
+            mut contents,
+            saw_stderr,
+        } = self.drain_sealed_formatted_output();
+        contents.retain(|content| match content {
+            WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
+            _ => true,
+        });
+        let is_error = saw_stderr;
+        if !meta.is_empty() {
+            contents.push(WorkerContent::server_stderr(format!("[repl] {meta}")));
+        }
+
+        ReplyWithOffset {
+            reply: WorkerReply::Output {
+                contents,
+                is_error,
+                error_code: None,
+                prompt: None,
+                prompt_variants: None,
+            },
+            end_offset: 0,
+        }
+    }
+
+    fn build_session_reset_reply_pager(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
         let end_offset = self.output.end_offset().unwrap_or(0);
         let mut is_error = false;
 
@@ -1786,7 +2757,7 @@ impl WorkerManager {
         }
 
         if !meta.is_empty() {
-            contents.push(WorkerContent::stderr(format!("[repl] {meta}")));
+            contents.push(WorkerContent::server_stderr(format!("[repl] {meta}")));
         }
 
         pager::maybe_activate_and_append_footer(
@@ -1832,8 +2803,6 @@ fn snapshot_page_with_images(
             .all(|content| !matches!(content, WorkerContent::ContentImage { .. }))
         && !image_groups.is_empty()
     {
-        // The pager snapshot may exclude image events when the text page is tiny (e.g. just a
-        // prompt). Ensure we still surface the final images for this capture range.
         let max = pager::MAX_IMAGES_PER_PAGE.min(image_groups.len());
         for (_, image) in image_groups.into_iter().take(max) {
             contents.push(image);
@@ -1897,9 +2866,6 @@ fn snapshot_after_completion(
 ) -> CompletionSnapshot {
     let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
     if !trim_enabled {
-        // Multi-expression inputs can produce huge echoed transcripts even when most lines are
-        // silent. Collapse echoed input aggressively (while preserving attribution to the
-        // relevant expression) so we don't page/hang on pure echo.
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
@@ -1921,9 +2887,6 @@ fn snapshot_after_completion(
 
     let echo_transcript = echo_transcript_from_events(&completion.echo_events);
     if let Some(echo) = echo_transcript.as_deref() {
-        // Large multi-line inputs can be echoed back line-by-line by the backend, which can trip
-        // the pager and waste tokens even when the input is silent. If the turn's captured output
-        // is exactly the echoed bytes, drop it entirely.
         let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
     }
 
@@ -1935,6 +2898,51 @@ fn snapshot_after_completion(
     maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
     CompletionSnapshot {
         snapshot,
+        saw_stderr,
+    }
+}
+
+fn take_range_from_ring_after_completion(
+    output: &OutputBuffer,
+    start_offset: u64,
+    end_offset: u64,
+    completion: &CompletionInfo,
+) -> FormattedPendingOutput {
+    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+
+    if !trim_enabled {
+        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+        let range = output.read_range(start_offset, end_offset);
+        output.advance_offset_to(end_offset);
+        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
+        let (bytes, events, text_spans) =
+            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+        let mut contents =
+            pager::contents_from_collapsed_output(bytes, events, text_spans, end_offset);
+        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
+        return FormattedPendingOutput {
+            contents,
+            saw_stderr,
+        };
+    }
+
+    if let Some(echo) = echo_transcript.as_deref() {
+        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
+    }
+    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
+    let effective_start = output.current_offset().unwrap_or(start_offset);
+    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+    let mut contents = pager::take_range_from_ring(output, end_offset);
+    trim_echo_then_append_protocol_warnings(
+        &mut contents,
+        echo_transcript.as_deref(),
+        trim_enabled,
+        should_drop_echo_only_contents(&completion.echo_events),
+        &completion.protocol_warnings,
+    );
+    FormattedPendingOutput {
+        contents,
         saw_stderr,
     }
 }
@@ -2014,7 +3022,7 @@ fn append_image_groups_after_page(
             break;
         }
         if offset > last_offset {
-            contents.push(WorkerContent::stderr(format!(
+            contents.push(WorkerContent::server_stderr(format!(
                 "[pager] elided output: @{last_offset}..{offset}\n"
             )));
         }
@@ -2036,14 +3044,32 @@ fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
     Some(transcript)
 }
 
-fn line_matches_echo_event(line: &[u8], event: &IpcEchoEvent) -> bool {
+fn echo_event_prefix_len(line: &[u8], event: &IpcEchoEvent) -> Option<usize> {
     let prompt = event.prompt.as_bytes();
     let consumed = event.line.as_bytes();
-    if line.len() != prompt.len().saturating_add(consumed.len()) {
-        return false;
+    if line.len() == prompt.len().saturating_add(consumed.len()) {
+        let (prefix, suffix) = line.split_at(prompt.len());
+        if prefix == prompt && suffix == consumed {
+            return Some(line.len());
+        }
+    }
+
+    let consumed = if let Some(consumed) = consumed.strip_suffix(b"\r\n") {
+        consumed
+    } else if let Some(consumed) = consumed.strip_suffix(b"\n") {
+        consumed
+    } else {
+        return None;
+    };
+    let prefix_len = prompt.len().saturating_add(consumed.len());
+    if line.len() <= prefix_len {
+        return None;
     }
     let (prefix, suffix) = line.split_at(prompt.len());
-    prefix == prompt && suffix == consumed
+    if prefix != prompt || !suffix.starts_with(consumed) {
+        return None;
+    }
+    Some(prefix_len)
 }
 
 #[derive(Default)]
@@ -2146,6 +3172,8 @@ fn collapse_echo_with_attribution(
     echo_events: &[IpcEchoEvent],
     prompt_variants: &[String],
 ) -> (Vec<u8>, Vec<(u64, OutputEventKind)>, Vec<OutputTextSpan>) {
+    use std::cell::Cell;
+
     const ECHO_MARKER_MIN_BYTES: usize = 512;
 
     let mut out_bytes: Vec<u8> = Vec::new();
@@ -2155,6 +3183,7 @@ fn collapse_echo_with_attribution(
     let prompt_variants = prompt_variants_bytes(prompt_variants);
     let mut pending = PendingEchoRun::default();
     let mut echo_idx = 0usize;
+    let saw_substantive_output = Cell::new(false);
 
     let base_offset = range.start_offset;
     let end_offset = range.end_offset;
@@ -2182,6 +3211,9 @@ fn collapse_echo_with_attribution(
             return;
         }
         let pending = pending.take();
+        if !saw_substantive_output.get() {
+            return;
+        }
         let head = pending.head.as_deref().unwrap_or_default();
         let tail = pending.tail.as_deref().unwrap_or_default();
         if pending.lines >= 2 || pending.bytes >= ECHO_MARKER_MIN_BYTES {
@@ -2191,13 +3223,20 @@ fn collapse_echo_with_attribution(
                 "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
                 pending.lines, pending.bytes, head_snip, tail_snip
             );
-            append_text_with_span(out_bytes, out_text_spans, marker.as_bytes(), false);
+            append_text_with_span(
+                out_bytes,
+                out_text_spans,
+                marker.as_bytes(),
+                false,
+                ContentOrigin::Worker,
+            );
         } else {
             append_text_with_span(
                 out_bytes,
                 out_text_spans,
                 &summarize_echo_line_for_output(tail),
                 false,
+                ContentOrigin::Worker,
             );
         }
     };
@@ -2214,6 +3253,7 @@ fn collapse_echo_with_attribution(
                 &mut echo_idx,
                 &prompt_variants,
                 &mut pending,
+                &saw_substantive_output,
                 &mut flush_pending,
                 &mut out_bytes,
                 &mut out_text_spans,
@@ -2238,6 +3278,7 @@ fn collapse_echo_with_attribution(
             &mut echo_idx,
             &prompt_variants,
             &mut pending,
+            &saw_substantive_output,
             &mut flush_pending,
             &mut out_bytes,
             &mut out_text_spans,
@@ -2253,6 +3294,7 @@ fn append_text_with_span(
     out_text_spans: &mut Vec<OutputTextSpan>,
     bytes: &[u8],
     is_stderr: bool,
+    origin: ContentOrigin,
 ) {
     if bytes.is_empty() {
         return;
@@ -2262,6 +3304,7 @@ fn append_text_with_span(
     let end_byte = out_bytes.len();
     if let Some(last) = out_text_spans.last_mut()
         && last.is_stderr == is_stderr
+        && last.origin == origin
         && last.end_byte == start_byte
     {
         last.end_byte = end_byte;
@@ -2270,6 +3313,7 @@ fn append_text_with_span(
             start_byte,
             end_byte,
             is_stderr,
+            origin,
         });
     }
 }
@@ -2283,6 +3327,7 @@ fn consume_text_segment_with_spans(
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
+    saw_substantive_output: &std::cell::Cell<bool>,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
@@ -2302,10 +3347,12 @@ fn consume_text_segment_with_spans(
             consume_text_segment(
                 &segment[cursor - segment_start..start - segment_start],
                 false,
+                ContentOrigin::Worker,
                 echo_events,
                 echo_idx,
                 prompt_variants,
                 pending,
+                saw_substantive_output,
                 flush_pending,
                 out_bytes,
                 out_text_spans,
@@ -2314,10 +3361,12 @@ fn consume_text_segment_with_spans(
         consume_text_segment(
             &segment[start - segment_start..end - segment_start],
             span.is_stderr,
+            span.origin,
             echo_events,
             echo_idx,
             prompt_variants,
             pending,
+            saw_substantive_output,
             flush_pending,
             out_bytes,
             out_text_spans,
@@ -2328,10 +3377,12 @@ fn consume_text_segment_with_spans(
         consume_text_segment(
             &segment[cursor - segment_start..],
             false,
+            ContentOrigin::Worker,
             echo_events,
             echo_idx,
             prompt_variants,
             pending,
+            saw_substantive_output,
             flush_pending,
             out_bytes,
             out_text_spans,
@@ -2343,10 +3394,12 @@ fn consume_text_segment_with_spans(
 fn consume_text_segment(
     segment: &[u8],
     is_stderr: bool,
+    origin: ContentOrigin,
     echo_events: &[IpcEchoEvent],
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
+    saw_substantive_output: &std::cell::Cell<bool>,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
@@ -2363,34 +3416,67 @@ fn consume_text_segment(
         let line = &segment[start..end];
         start = end;
 
-        let is_echo =
-            *echo_idx < echo_events.len() && line_matches_echo_event(line, &echo_events[*echo_idx]);
-        if is_echo {
-            pending.push(line);
+        let echo_prefix = if *echo_idx < echo_events.len() {
+            echo_event_prefix_len(line, &echo_events[*echo_idx])
+        } else {
+            None
+        };
+        if let Some(prefix_len) = echo_prefix {
+            pending.push(&line[..prefix_len]);
             *echo_idx = echo_idx.saturating_add(1);
-            continue;
+            if prefix_len == line.len() {
+                continue;
+            }
         }
+
+        let line = if let Some(prefix_len) = echo_prefix {
+            &line[prefix_len..]
+        } else {
+            line
+        };
 
         let substantive =
             !is_ascii_whitespace_only(line) && !is_prompt_only_fragment(line, prompt_variants);
         if substantive {
             flush_pending(out_bytes, out_text_spans, pending);
         }
-        append_text_with_span(out_bytes, out_text_spans, line, is_stderr);
+        append_text_with_span(out_bytes, out_text_spans, line, is_stderr, origin);
+        if substantive {
+            saw_substantive_output.set(true);
+        }
     }
 }
 
 fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    if events.is_empty() {
+    let Some((first, rest)) = events.split_first() else {
+        return false;
+    };
+    if !is_primary_repl_prompt(&first.prompt) {
         return false;
     }
-    if events.len() == 1 {
+    if rest.is_empty() {
         return true;
     }
-    events
-        .iter()
-        .skip(1)
+    rest.iter()
         .all(|event| is_continuation_prompt(&event.prompt))
+}
+
+fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
+    let Some((first, rest)) = events.split_first() else {
+        return false;
+    };
+    if !is_primary_repl_prompt(&first.prompt) {
+        return false;
+    }
+    rest.iter()
+        .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
+}
+
+fn is_primary_repl_prompt(prompt: &str) -> bool {
+    matches!(
+        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
+        ">" | ">>>"
+    )
 }
 
 fn is_continuation_prompt(prompt: &str) -> bool {
@@ -2424,7 +3510,7 @@ fn maybe_trim_echo_prefix(
         if remaining.is_empty() {
             break;
         }
-        let WorkerContent::ContentText { text, stream } = content else {
+        let WorkerContent::ContentText { text, stream, .. } = content else {
             return;
         };
         if !matches!(stream, TextStream::Stdout) {
@@ -2530,6 +3616,56 @@ fn drop_echo_only_output(
     true
 }
 
+fn drop_echo_only_contents(contents: &mut Vec<WorkerContent>, echo: &str) -> bool {
+    if echo.is_empty() {
+        return false;
+    }
+
+    let mut remaining = echo;
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            return false;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            return false;
+        }
+        if remaining.len() >= text.len() {
+            if !remaining.starts_with(text.as_str()) {
+                return false;
+            }
+            remaining = &remaining[text.len()..];
+        } else {
+            return false;
+        }
+    }
+
+    if !remaining.is_empty() {
+        return false;
+    }
+
+    contents.clear();
+    true
+}
+
+fn trim_echo_then_append_protocol_warnings(
+    contents: &mut Vec<WorkerContent>,
+    echo: Option<&str>,
+    trim_enabled: bool,
+    drop_echo_only_enabled: bool,
+    warnings: &[String],
+) {
+    maybe_trim_echo_prefix(contents, echo, trim_enabled);
+    if drop_echo_only_enabled && let Some(echo) = echo {
+        let _ = drop_echo_only_contents(contents, echo);
+    }
+    append_protocol_warnings(contents, warnings);
+}
+
 fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
@@ -2538,16 +3674,222 @@ fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn fallback_prompt_variants(
+    prompt: Option<&str>,
+    prompt_variants: Option<&[String]>,
+) -> Vec<String> {
+    let mut variants = Vec::new();
+    if let Some(prompt_variants) = prompt_variants {
+        for prompt in prompt_variants {
+            push_fallback_prompt_variant(&mut variants, prompt);
+        }
+    }
+    if let Some(prompt) = prompt {
+        push_fallback_prompt_variant(&mut variants, prompt);
+    }
+    variants
+}
+
+fn push_fallback_prompt_variant(variants: &mut Vec<String>, prompt: &str) {
+    let prompt = prompt.trim_end_matches(['\n', '\r']);
+    if prompt.is_empty() {
+        return;
+    }
+    if !variants.iter().any(|existing| existing == prompt) {
+        variants.push(prompt.to_string());
+    }
+    if let Some(alt) = swap_fallback_prompt_variant(prompt)
+        && alt != prompt
+        && !variants.iter().any(|existing| existing == &alt)
+    {
+        variants.push(alt);
+    }
+}
+
+fn swap_fallback_prompt_variant(prompt: &str) -> Option<String> {
+    let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
+    let suffix = &prompt[core.len()..];
+    let swapped_core = if core == ">" {
+        Some("+".to_string())
+    } else if core == "+" {
+        Some(">".to_string())
+    } else if core == ">>>" {
+        Some("...".to_string())
+    } else if core == "..." {
+        Some(">>>".to_string())
+    } else if core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')) {
+        let mut swapped = core.to_string();
+        let last = swapped.pop()?;
+        let replacement = match last {
+            '>' => '+',
+            '+' => '>',
+            _ => return None,
+        };
+        swapped.push(replacement);
+        Some(swapped)
+    } else {
+        None
+    };
+    swapped_core.map(|core| format!("{core}{suffix}"))
+}
+
+fn build_input_transcript(prompt: Option<&str>, input: &str) -> Option<String> {
+    let prompt = prompt?;
+    let normalized = normalize_input_newlines(input);
+    let trimmed = normalized.trim_end_matches('\n').trim_end();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    Some(format!("{prompt}{trimmed}\n"))
+}
+
+fn trim_line_endings(text: &str) -> &str {
+    text.trim_end_matches(['\n', '\r'])
+}
+
+fn line_matches_input_echo(line: &str, input_line: &str, prompt_variants: &[String]) -> bool {
+    let line = trim_line_endings(line);
+    if input_line.is_empty() {
+        return line.is_empty() || prompt_variants.iter().any(|prompt| line == prompt);
+    }
+    if line == input_line {
+        return true;
+    }
+    prompt_variants.iter().any(|prompt| {
+        line.strip_prefix(prompt)
+            .is_some_and(|rest| rest == input_line)
+    })
+}
+
+fn trim_leading_text_prefix(contents: &mut Vec<WorkerContent>, mut prefix_bytes: usize) -> bool {
+    if prefix_bytes == 0 {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < contents.len() && prefix_bytes > 0 {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText {
+                text,
+                stream,
+                origin,
+            } if matches!(stream, TextStream::Stdout)
+                && matches!(origin, ContentOrigin::Worker) =>
+            {
+                if prefix_bytes >= text.len() {
+                    prefix_bytes -= text.len();
+                    text.clear();
+                    true
+                } else {
+                    if !text.is_char_boundary(prefix_bytes) {
+                        return false;
+                    }
+                    *text = text[prefix_bytes..].to_string();
+                    prefix_bytes = 0;
+                    false
+                }
+            }
+            _ => break,
+        };
+        if remove_current {
+            contents.remove(idx);
+        } else {
+            idx = idx.saturating_add(1);
+        }
+    }
+    prefix_bytes == 0
+}
+
+fn trim_leading_input_echo_from_contents(
+    contents: &mut Vec<WorkerContent>,
+    input: Option<&str>,
+    prompt_variants: &[String],
+) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    let normalized_input = normalize_input_newlines(input);
+    let trimmed_input = normalized_input.trim_end_matches('\n');
+    if trimmed_input.is_empty() {
+        return false;
+    }
+    let input_lines: Vec<&str> = trimmed_input.split('\n').collect();
+    let last_nonempty_input = input_lines
+        .iter()
+        .rev()
+        .find(|line| !line.is_empty())
+        .copied();
+
+    let mut leading_text = String::new();
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            break;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            break;
+        }
+        leading_text.push_str(text);
+    }
+    if leading_text.is_empty() {
+        return false;
+    }
+
+    let output_lines: Vec<&str> = leading_text.split_inclusive('\n').collect();
+    let mut output_idx = 0usize;
+    let mut input_idx = 0usize;
+    let mut trim_bytes = 0usize;
+
+    while output_idx < output_lines.len() && input_idx < input_lines.len() {
+        let line = output_lines[output_idx];
+        if !line_matches_input_echo(line, input_lines[input_idx], prompt_variants) {
+            break;
+        }
+        trim_bytes += line.len();
+        output_idx += 1;
+        input_idx += 1;
+    }
+    if input_idx != input_lines.len() {
+        return false;
+    }
+
+    while output_idx < output_lines.len() {
+        let line = trim_line_endings(output_lines[output_idx]);
+        let matches_prompt_only = prompt_variants.iter().any(|prompt| line == prompt);
+        let matches_last_duplicate = last_nonempty_input.is_some_and(|last| {
+            prompt_variants
+                .iter()
+                .any(|prompt| line.strip_prefix(prompt).is_some_and(|rest| rest == last))
+        });
+        if !matches_prompt_only && !matches_last_duplicate {
+            break;
+        }
+        trim_bytes += output_lines[output_idx].len();
+        output_idx += 1;
+    }
+
+    trim_leading_text_prefix(contents, trim_bytes)
+}
+
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
-    WorkerContent::stdout(format!(
-        "<<console status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
+    WorkerContent::server_stdout(format!(
+        "<<repl status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
     ))
 }
 
 fn idle_status_content() -> WorkerContent {
-    WorkerContent::stdout("<<console status: idle>>")
+    WorkerContent::server_stdout("<<repl status: idle>>")
+}
+
+fn append_protocol_warnings(contents: &mut Vec<WorkerContent>, warnings: &[String]) {
+    for warning in warnings {
+        contents.push(WorkerContent::server_stderr(format!("[repl] {warning}")));
+    }
 }
 
 const TIMEOUT_STATUS_GRANULARITY_MS: u64 = 100;
@@ -2567,7 +3909,7 @@ fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<St
     {
         return;
     }
-    contents.push(WorkerContent::stdout(prompt));
+    contents.push(WorkerContent::worker_stdout(prompt));
 }
 
 fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
@@ -2580,7 +3922,7 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
     let Some(idx) = idx else {
         return;
     };
-    let WorkerContent::ContentText { text, stream } = &contents[idx] else {
+    let WorkerContent::ContentText { text, stream, .. } = &contents[idx] else {
         return;
     };
     let Some(prefix) = text.strip_suffix(prompt) else {
@@ -2592,6 +3934,7 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
         contents[idx] = WorkerContent::ContentText {
             text: prefix.to_string(),
             stream: *stream,
+            origin: crate::worker_protocol::ContentOrigin::Worker,
         };
     }
 }
@@ -2603,7 +3946,7 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
     let mut idx = 0usize;
     while idx < contents.len() {
         let remove = match &contents[idx] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 if !matches!(stream, crate::worker_protocol::TextStream::Stdout) {
                     false
                 } else if text == prompt {
@@ -2615,6 +3958,7 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
                         contents[idx] = WorkerContent::ContentText {
                             text: prefix.to_string(),
                             stream: *stream,
+                            origin: crate::worker_protocol::ContentOrigin::Worker,
                         };
                         false
                     }
@@ -2632,11 +3976,83 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
     }
 }
 
+fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply {
+    let WorkerReply::Output {
+        mut contents,
+        is_error,
+        error_code,
+        prompt,
+        prompt_variants,
+    } = prefix;
+    let WorkerReply::Output {
+        contents: suffix_contents,
+        is_error: suffix_is_error,
+        error_code: suffix_error_code,
+        prompt: suffix_prompt,
+        prompt_variants: suffix_prompt_variants,
+    } = suffix;
+    if let Some(prompt_text) = prompt.as_deref() {
+        strip_trailing_prompt(&mut contents, prompt_text);
+    }
+    contents.extend(suffix_contents);
+    WorkerReply::Output {
+        contents,
+        is_error: is_error || suffix_is_error,
+        error_code: suffix_error_code.or(error_code),
+        prompt: suffix_prompt.or(prompt),
+        prompt_variants: suffix_prompt_variants.or(prompt_variants),
+    }
+}
+
+fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
+    let WorkerReply::Output {
+        contents, prompt, ..
+    } = prefix;
+    let Some(prompt_text) = prompt.as_deref() else {
+        return contents.len();
+    };
+    if prompt_text.is_empty() {
+        return contents.len();
+    }
+    let Some(idx) = contents
+        .iter()
+        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
+    else {
+        return contents.len();
+    };
+    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
+        return contents.len();
+    };
+    if matches!(text.strip_suffix(prompt_text), Some("")) {
+        contents.len().saturating_sub(1)
+    } else {
+        contents.len()
+    }
+}
+
+fn mark_busy_follow_up_reply(reply: &mut WorkerReply) {
+    let WorkerReply::Output {
+        contents,
+        is_error,
+        error_code,
+        ..
+    } = reply;
+    contents.push(WorkerContent::server_stderr(
+        "[repl] input discarded while worker busy",
+    ));
+    *is_error = true;
+    if error_code.is_none() {
+        *error_code = Some(WorkerErrorCode::Busy);
+    }
+}
+
 struct WorkerProcess {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
+    stdout_reader: Option<OutputReader>,
+    stderr_reader: Option<OutputReader>,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
     #[cfg(target_family = "unix")]
@@ -2663,8 +4079,42 @@ struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    stdout_reader: Option<OutputReader>,
+    stderr_reader: Option<OutputReader>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
+}
+
+struct OutputReader {
+    handle: std::thread::JoinHandle<()>,
+    done_rx: mpsc::Receiver<()>,
+    stop_requested: Arc<AtomicBool>,
+    #[cfg(target_family = "unix")]
+    wake_writer: std::io::PipeWriter,
+}
+
+impl OutputReader {
+    fn stop_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
+        if matches!(
+            self.done_rx.recv_timeout(OUTPUT_READER_QUIESCE_GRACE),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            self.request_stop();
+            let _ = self.done_rx.recv();
+        }
+        self.handle
+            .join()
+            .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
+    }
+
+    fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        #[cfg(target_family = "unix")]
+        {
+            let _ = self.wake_writer.write_all(&[0]);
+            let _ = self.wake_writer.flush();
+        }
+    }
 }
 
 impl WorkerProcess {
@@ -2755,6 +4205,8 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        oversized_output: OversizedOutputMode,
+        pending_output_tape: PendingOutputTape,
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
     ) -> Result<Self, WorkerError> {
@@ -2762,21 +4214,28 @@ impl WorkerProcess {
         let _ = &guardrail;
 
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
+        let live_output = LiveOutputCapture::new(
+            oversized_output,
+            pending_output_tape.clone(),
+            output_timeline.clone(),
+        );
         let SpawnedWorker {
             child,
             stdin_tx,
             session_tmpdir,
+            stdout_reader,
+            stderr_reader,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match backend {
             Backend::R => Self::spawn_r_worker(
                 exe_path,
                 sandbox_state,
-                output_timeline.clone(),
+                live_output.clone(),
                 &mut ipc_server,
             )?,
             Backend::Python => {
-                Self::spawn_python_worker(sandbox_state, output_timeline.clone(), &mut ipc_server)?
+                Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
             }
         };
         #[allow(unused_mut)]
@@ -2785,16 +4244,36 @@ impl WorkerProcess {
         let ipc = IpcHandle::new();
         #[cfg(any(target_family = "unix", target_family = "windows"))]
         {
-            let image_timeline = output_timeline.clone();
+            let image_capture = live_output.clone();
+            let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
-                    image_timeline.append_image(
-                        image.id,
-                        image.mime_type,
-                        image.data,
-                        image.is_new,
-                    );
+                    image_capture.append_image(image);
                 })),
+                on_readline_start: Some(Arc::new(move |prompt: String| {
+                    sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+                })),
+                on_readline_result: {
+                    let sideband_capture = live_output.clone();
+                    Some(Arc::new(move |event: IpcEchoEvent| {
+                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                            prompt: event.prompt,
+                            line: event.line,
+                        });
+                    }))
+                },
+                on_request_end: {
+                    let sideband_capture = live_output.clone();
+                    Some(Arc::new(move || {
+                        sideband_capture.append_sideband(PendingSidebandKind::RequestEnd);
+                    }))
+                },
+                on_session_end: {
+                    let sideband_capture = live_output.clone();
+                    Some(Arc::new(move || {
+                        sideband_capture.append_sideband(PendingSidebandKind::SessionEnd);
+                    }))
+                },
             };
             #[cfg(target_family = "unix")]
             ipc_server
@@ -2821,6 +4300,8 @@ impl WorkerProcess {
             stdin_tx,
             session_tmpdir,
             ipc,
+            stdout_reader,
+            stderr_reader,
             expected_exit: false,
             exit_status: None,
             #[cfg(target_family = "unix")]
@@ -2837,7 +4318,7 @@ impl WorkerProcess {
     fn spawn_r_worker(
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        output_timeline: OutputTimeline,
+        live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         let prepared =
@@ -2905,8 +4386,10 @@ impl WorkerProcess {
             .take()
             .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
         let stdin_tx = spawn_stdin_writer(stdin);
-        spawn_output_reader(child.stdout.take(), false, output_timeline.clone());
-        spawn_output_reader(child.stderr.take(), true, output_timeline.clone());
+        let stdout_reader =
+            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
+        let stderr_reader =
+            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone())?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -2919,6 +4402,8 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            stdout_reader,
+            stderr_reader,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -2937,13 +4422,13 @@ impl WorkerProcess {
 
     fn spawn_python_worker(
         sandbox_state: &SandboxState,
-        output_timeline: OutputTimeline,
+        live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = sandbox_state;
-            let _ = output_timeline;
+            let _ = live_output;
             let _ = ipc_server;
             Err(WorkerError::Protocol(
                 "python backend requires a unix-style pty".to_string(),
@@ -3014,7 +4499,8 @@ impl WorkerProcess {
             let master_reader = master.try_clone()?;
             let stdin_tx = spawn_stdin_writer(master);
             // Python runs under a PTY so stdout/stderr are merged.
-            spawn_output_reader(Some(master_reader), false, output_timeline.clone());
+            let stdout_reader =
+                spawn_output_reader(Some(master_reader), TextStream::Stdout, live_output.clone())?;
 
             #[cfg(target_os = "macos")]
             let mut denial_logger = prepared.denial_logger;
@@ -3027,6 +4513,8 @@ impl WorkerProcess {
                 child,
                 stdin_tx,
                 session_tmpdir,
+                stdout_reader,
+                stderr_reader: None,
                 #[cfg(target_os = "macos")]
                 denial_logger,
             })
@@ -3087,7 +4575,7 @@ impl WorkerProcess {
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {
-            self.send_signal(libc::SIGTERM)
+            self.send_signal_and_descendants(libc::SIGTERM)
         }
         #[cfg(not(target_family = "unix"))]
         {
@@ -3098,7 +4586,7 @@ impl WorkerProcess {
     fn send_sigkill(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {
-            self.send_signal(libc::SIGKILL)
+            self.send_signal_and_descendants(libc::SIGKILL)
         }
         #[cfg(not(target_family = "unix"))]
         {
@@ -3110,7 +4598,7 @@ impl WorkerProcess {
     #[cfg(target_family = "unix")]
     fn send_signal(&self, signal: i32) -> Result<(), WorkerError> {
         let pid = self.child.id() as i32;
-        let result = unsafe { libc::kill(-pid, signal) };
+        let result = raw_unix_kill(-pid, signal);
         if result == 0 {
             Ok(())
         } else {
@@ -3124,35 +4612,28 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
-    fn kill_process_tree_scan(&self, signal: i32) {
-        let pid = self.child.id() as i32;
-        let root = Pid::from_u32(pid as u32);
+    fn send_signal_and_descendants(&self, signal: i32) -> Result<(), WorkerError> {
+        let root = Pid::from_u32(self.child.id());
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::All, true);
-        let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-        for (proc_pid, process) in system.processes() {
-            if let Some(parent) = process.parent() {
-                children.entry(parent).or_default().push(*proc_pid);
-            }
+        let descendants = collect_process_tree_pids(&system, root);
+        let result = self.send_signal(signal);
+        for pid in descendants {
+            let _ = raw_unix_kill(pid.as_u32() as i32, signal);
         }
+        result
+    }
 
-        let mut stack = vec![root];
-        let mut seen: HashSet<Pid> = HashSet::new();
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current) {
+    #[cfg(target_family = "unix")]
+    fn send_signal_descendants_only(&self, signal: i32) {
+        let root = Pid::from_u32(self.child.id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        for pid in collect_process_tree_pids(&system, root) {
+            if pid == root {
                 continue;
             }
-            if let Some(kids) = children.get(&current) {
-                for child in kids {
-                    if !seen.contains(child) {
-                        stack.push(*child);
-                    }
-                }
-            }
-        }
-
-        for pid in seen {
-            let _ = unsafe { libc::kill(pid.as_u32() as i32, signal) };
+            let _ = raw_unix_kill(pid.as_u32() as i32, signal);
         }
     }
 
@@ -3205,6 +4686,9 @@ impl WorkerProcess {
         let term_deadline = start + shutdown_term_delay(timeout);
 
         if !timeout.is_zero() {
+            // TODO: Replace these try_wait() polling loops with a dedicated waiter thread so
+            // teardown can block on a completion signal, then escalate on timeout without spin
+            // sleeps.
             loop {
                 if let Some(status) = self.child.try_wait()? {
                     self.exit_status = Some(status);
@@ -3219,11 +4703,7 @@ impl WorkerProcess {
         }
 
         if self.child.try_wait()?.is_none() {
-            let _sig_ok = self.send_sigterm().is_ok();
-            #[cfg(target_family = "unix")]
-            if !_sig_ok {
-                self.kill_process_tree_scan(libc::SIGTERM);
-            }
+            let _ = self.send_sigterm();
             let term_deadline = std::cmp::min(
                 timeout_deadline,
                 std::time::Instant::now() + Duration::from_secs(2),
@@ -3234,32 +4714,66 @@ impl WorkerProcess {
                     break;
                 }
                 if std::time::Instant::now() >= term_deadline {
-                    let _sig_ok = self.send_sigkill().is_ok();
-                    #[cfg(target_family = "unix")]
-                    if !_sig_ok {
-                        self.kill_process_tree_scan(libc::SIGKILL);
-                    }
-                    let _ = self.child.wait();
+                    let _ = self.send_sigkill();
+                    self.exit_status = Some(self.child.wait()?);
                     break;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
         }
 
+        self.finalize_terminated_process()
+    }
+
+    fn kill(mut self) -> Result<(), WorkerError> {
+        let _ = self.send_sigkill();
+        self.exit_status = Some(self.child.wait()?);
+        self.finalize_terminated_process()
+    }
+
+    fn finish_exited(mut self) -> Result<(), WorkerError> {
+        if self.exit_status.is_none() {
+            self.exit_status = Some(self.child.wait()?);
+        }
+        self.finalize_terminated_process()
+    }
+
+    fn finalize_terminated_process(&mut self) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        {
+            // Once the root worker is gone, kill any remaining session peers before waiting on
+            // stdio or IPC readers they may still be holding open.
+            if self.exit_status.is_some() {
+                self.send_signal_descendants_only(libc::SIGKILL);
+            } else {
+                let _ = self.send_sigkill();
+            }
+            // TODO: Track descendants or use stronger OS-level containment so children that have
+            // escaped the worker process group are still killable after the root exits.
+        }
+        self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
         self.report_denials();
         Ok(())
     }
 
-    fn kill(mut self) -> Result<(), WorkerError> {
-        let _sig_ok = self.send_sigkill().is_ok();
-        #[cfg(target_family = "unix")]
-        if !_sig_ok {
-            self.kill_process_tree_scan(libc::SIGKILL);
+    fn quiesce_output_producers(&mut self) -> Result<(), WorkerError> {
+        // Keep teardown bounded even if a detached descendant still holds stdio open. A more
+        // robust long-term design would pair this with session-scoped output rings or stronger
+        // OS-level containment so stale descendants cannot target a future session at all.
+        // IPC is stricter than stdout/stderr by contract: only the main worker may own the
+        // sideband fds. Backend startup strips the bootstrap env vars, marks the fds
+        // close-on-exec, and closes them again in forked children, so EOF should track the root
+        // worker lifetime.
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.stop_and_join("worker stdout reader thread panicked")?;
         }
-        let _ = self.child.wait();
-        self.cleanup_session_tmpdir();
-        self.report_denials();
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.stop_and_join("worker stderr reader thread panicked")?;
+        }
+        if let Some(ipc) = self.ipc.get() {
+            ipc.join_reader_thread().map_err(WorkerError::Io)?;
+        }
         Ok(())
     }
 
@@ -3430,6 +4944,18 @@ fn start_memory_guardrail(
 
 #[cfg(target_family = "unix")]
 fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
+    let pids = collect_process_tree_pids(system, root);
+    let mut total_kb: u64 = 0;
+    for pid in &pids {
+        if let Some(process) = system.process(*pid) {
+            total_kb = total_kb.saturating_add(process.memory());
+        }
+    }
+    (total_kb, pids)
+}
+
+#[cfg(target_family = "unix")]
+fn collect_process_tree_pids(system: &System, root: Pid) -> Vec<Pid> {
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
     for (proc_pid, process) in system.processes() {
         if let Some(parent) = process.parent() {
@@ -3452,15 +4978,13 @@ fn process_tree_memory_kb(system: &System, root: Pid) -> (u64, Vec<Pid>) {
         }
     }
 
-    let mut total_kb: u64 = 0;
     let mut pids = Vec::new();
     for pid in seen {
-        if let Some(process) = system.process(pid) {
-            total_kb = total_kb.saturating_add(process.memory());
+        if system.process(pid).is_some() {
             pids.push(pid);
         }
     }
-    (total_kb, pids)
+    pids
 }
 
 fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBuf>) {
@@ -3534,28 +5058,167 @@ fn open_pty_pair() -> Result<(File, File), WorkerError> {
     Ok((master, slave))
 }
 
-fn spawn_output_reader<R>(stream: Option<R>, is_stderr: bool, timeline: OutputTimeline)
+#[cfg(target_family = "unix")]
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
 where
-    R: Read + Send + 'static,
+    R: Read + AsRawFd + Send + 'static,
 {
     let Some(mut stream) = stream else {
-        return;
+        return Ok(None);
     };
-    thread::spawn(move || {
+    let (wake_reader, wake_writer) = std::io::pipe()?;
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop_requested.clone();
+    let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let stream_fd = stream.as_raw_fd();
+        let wake_fd = wake_reader.as_raw_fd();
         loop {
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: stream_fd,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_fd,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if fds[1].revents != 0 {
+                break;
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
             match stream.read(&mut buffer) {
                 Ok(0) => {
                     break;
                 }
-                Ok(n) => {
-                    timeline.append_text(&buffer[..n], is_stderr);
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    Ok(Some(OutputReader {
+        handle,
+        done_rx,
+        stop_requested,
+        wake_writer,
+    }))
+}
+
+#[cfg(target_family = "windows")]
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
+where
+    R: Read + AsRawHandle + Send + 'static,
+{
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop_requested.clone();
+    let handle = thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        let stream_handle = stream.as_raw_handle();
+        loop {
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut available = 0u32;
+            let peek_ok = unsafe {
+                PeekNamedPipe(
+                    stream_handle as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peek_ok == 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(code)
+                        if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_HANDLE_EOF as i32 =>
+                    {
+                        break;
+                    }
+                    _ => break,
                 }
+            }
+            if available == 0 {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    Ok(Some(OutputReader {
+        handle,
+        done_rx,
+        stop_requested,
+    }))
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn spawn_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
+where
+    R: Read + Send + 'static,
+{
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let handle = thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
     });
+    Ok(Some(OutputReader {
+        handle,
+        stop_requested,
+    }))
 }
 
 fn spawn_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>
@@ -3677,6 +5340,10 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring,
+        reset_last_reply_marker_offset, reset_output_ring,
+    };
     use crate::sandbox::SandboxPolicy;
     use std::sync::{Mutex, OnceLock};
 
@@ -3695,6 +5362,79 @@ mod tests {
             prompt: prompt.to_string(),
             line: line.to_string(),
         }
+    }
+
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn sleeping_test_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn successful_test_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn exiting test child")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn failing_test_status() -> std::process::ExitStatus {
+        Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("collect failing exit status")
+    }
+
+    #[cfg(target_family = "unix")]
+    fn test_worker_process(child: Child) -> WorkerProcess {
+        let (stdin_tx, _stdin_rx) = mpsc::channel();
+        WorkerProcess {
+            child,
+            stdin_tx,
+            session_tmpdir: None,
+            ipc: IpcHandle::new(),
+            stdout_reader: None,
+            stderr_reader: None,
+            expected_exit: false,
+            exit_status: None,
+            guardrail_stop: Arc::new(AtomicBool::new(false)),
+            guardrail_thread: None,
+            guardrail_thread_handle: None,
+            #[cfg(target_os = "macos")]
+            denial_logger: None,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn capture_recorded_unix_kills<F, R>(f: F) -> (R, Vec<(i32, i32)>)
+    where
+        F: FnOnce() -> R,
+    {
+        TEST_UNIX_KILL_RECORDER.with(|recorder| {
+            assert!(
+                recorder.borrow().is_none(),
+                "did not expect nested unix kill recorder"
+            );
+            *recorder.borrow_mut() = Some(Vec::new());
+        });
+        let result = f();
+        let kills = TEST_UNIX_KILL_RECORDER
+            .with(|recorder| recorder.borrow_mut().take().expect("recorded kills"));
+        (result, kills)
     }
 
     #[test]
@@ -3737,6 +5477,48 @@ mod tests {
     }
 
     #[test]
+    fn trim_echo_then_append_protocol_warnings_drops_echo_only_multiline_input() {
+        let warning = "ReadlineResult after RequestEnd".to_string();
+        let echo = "> x <- 1\n> y <- 2\n";
+        let mut contents = vec![WorkerContent::stdout(echo)];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some(echo),
+            false,
+            true,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![WorkerContent::server_stderr(format!("[repl] {warning}"))]
+        );
+    }
+
+    #[test]
+    fn trim_echo_then_append_protocol_warnings_keeps_output_before_warning() {
+        let warning = "ReadlineResult after RequestEnd".to_string();
+        let mut contents = vec![WorkerContent::stdout("> x <- 1\n[1] 1\n")];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some("> x <- 1\n"),
+            true,
+            true,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stdout("[1] 1\n"),
+                WorkerContent::server_stderr(format!("[repl] {warning}")),
+            ]
+        );
+    }
+
+    #[test]
     fn trim_decision_respects_continuation_prompts() {
         let single = vec![echo_event("> ", "1+1\n")];
         assert!(should_trim_echo_prefix(&single));
@@ -3746,6 +5528,78 @@ mod tests {
 
         let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
         assert!(!should_trim_echo_prefix(&multi));
+
+        let browser = vec![echo_event("Browse[1]> ", "n\n")];
+        assert!(!should_trim_echo_prefix(&browser));
+
+        let readline = vec![echo_event("FIRST> ", "alpha\n")];
+        assert!(!should_trim_echo_prefix(&readline));
+    }
+
+    #[test]
+    fn collapse_echo_with_attribution_drops_leading_multi_expression_echo_prefix() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 27,
+            bytes: b"> x <- 1\n> y <- 2\n[1] 2\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 27,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let (bytes, events, text_spans) = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            &["> ".to_string()],
+        );
+
+        assert_eq!(String::from_utf8(bytes).expect("utf8"), "[1] 2\n> ");
+        assert!(events.is_empty(), "did not expect sideband events");
+        assert_eq!(
+            text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(text_spans[0].start_byte, 0);
+        assert_eq!(text_spans[0].end_byte, 8);
+        assert!(!text_spans[0].is_stderr);
+    }
+
+    #[test]
+    fn collapse_echo_with_attribution_drops_leading_echo_prefix_without_separator_newline() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 42,
+            bytes: b"> xstderr: Error: object 'x' not found\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 42,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let (bytes, events, text_spans) =
+            collapse_echo_with_attribution(range, &[echo_event("> ", "x\n")], &["> ".to_string()]);
+
+        assert_eq!(
+            String::from_utf8(bytes).expect("utf8"),
+            "stderr: Error: object 'x' not found\n> "
+        );
+        assert!(events.is_empty(), "did not expect sideband events");
+        assert_eq!(
+            text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(text_spans[0].start_byte, 0);
+        assert_eq!(text_spans[0].end_byte, 38);
+        assert!(!text_spans[0].is_stderr);
     }
 
     #[test]
@@ -3793,6 +5647,539 @@ mod tests {
     }
 
     #[test]
+    fn completion_settle_waits_for_late_echo_events() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+\n1", &server);
+        let prompt = "> ".to_string();
+        let delayed_worker = worker.clone();
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+
+        let late_sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "1+\n".to_string(),
+            });
+            thread::sleep(Duration::from_millis(21));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "+ ".to_string(),
+                line: "1\n".to_string(),
+            });
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::RequestEnd);
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        late_sender.join().expect("late sender should join");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 2);
+        assert!(completion.protocol_warnings.is_empty());
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "1+\n");
+        assert_eq!(completion.echo_events[1].prompt, "+ ");
+        assert_eq!(completion.echo_events[1].line, "1\n");
+    }
+
+    #[test]
+    fn completion_warns_when_readline_result_arrives_after_request_end() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let delayed_worker = worker.clone();
+        let late_sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "1+1\n".to_string(),
+            });
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        late_sender.join().expect("late sender should join");
+
+        assert!(
+            completion
+                .protocol_warnings
+                .iter()
+                .any(|warning| warning.contains("ReadlineResult after RequestEnd")),
+            "expected protocol warning, got: {:?}",
+            completion.protocol_warnings
+        );
+    }
+
+    #[test]
+    fn next_request_result_is_retained_when_prompt_is_already_active() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+
+        driver_on_input_start("first()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
+            .expect("expected first completion");
+        assert_eq!(first.prompt.as_deref(), Some("> "));
+
+        driver_on_input_start("second()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let second = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected second completion");
+
+        assert!(second.protocol_warnings.is_empty());
+        assert_eq!(second.echo_events.len(), 1);
+        assert_eq!(second.echo_events[0].prompt, "> ");
+        assert_eq!(second.echo_events[0].line, "second()\n");
+    }
+
+    #[test]
+    fn completion_preserves_echo_events_when_next_prompt_arrives_immediately() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+
+        driver_on_input_start("first()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "first()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert!(completion.protocol_warnings.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "first()\n");
+    }
+
+    #[test]
+    fn completion_retains_echo_events_when_session_ends_before_request_end() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("quit()", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
+
+        assert!(completion.session_end_seen);
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "quit()\n");
+    }
+
+    #[test]
+    fn send_worker_request_error_preserves_detached_prefix_count() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"detached output\n");
+
+        let reply = manager
+            .write_stdin(
+                "1+1".to_string(),
+                Duration::from_millis(50),
+                Duration::ZERO,
+                None,
+                false,
+            )
+            .expect("reply");
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            manager.detached_prefix_item_count() >= 1,
+            "detached-prefix metadata must survive reset until server-side finalization"
+        );
+        let WorkerReply::Output { .. } = reply;
+    }
+
+    #[test]
+    fn busy_follow_up_reply_sets_busy_error_code_when_missing() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::worker_stdout("tail\n")],
+            is_error: false,
+            error_code: None,
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents
+            .into_iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+
+        assert!(
+            is_error,
+            "expected busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(error_code, Some(WorkerErrorCode::Busy));
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn busy_follow_up_reply_preserves_timeout_error_code() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
+            is_error: false,
+            error_code: Some(WorkerErrorCode::Timeout),
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents
+            .into_iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+
+        assert!(
+            is_error,
+            "expected timed-out busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(
+            error_code,
+            Some(WorkerErrorCode::Timeout),
+            "expected timed-out busy follow-up replies to preserve Timeout"
+        );
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_end_reset_preserves_detached_prefix_count() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.last_detached_prefix_item_count = 2;
+        manager.session_end_seen = true;
+
+        manager.maybe_reset_after_session_end();
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert_eq!(
+            manager.detached_prefix_item_count(),
+            2,
+            "session-end cleanup must preserve detached-prefix metadata until server finalization"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn finish_exited_does_not_signal_reaped_root_pid() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let child = successful_test_child();
+        let (result, kills) =
+            capture_recorded_unix_kills(|| test_worker_process(child).finish_exited());
+
+        assert!(
+            result.is_ok(),
+            "expected finish_exited to succeed: {result:?}"
+        );
+        assert!(
+            kills.is_empty(),
+            "did not expect finish_exited to signal an already reaped root pid, got: {kills:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn failing_session_end_notice_flushes_partial_stdout_in_files_mode() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let mut process = test_worker_process(sleeping_test_child());
+        process.exit_status = Some(failing_test_status());
+        manager.process = Some(process);
+
+        manager.note_session_end(true);
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            text.contains("\\xC3"),
+            "expected the partial stdout tail to survive the exit-status notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("worker exited with status 7"),
+            "expected the exit-status notice to stay visible, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn timed_out_request_end_with_exited_worker_reports_session_end_immediately() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let process = test_worker_process(successful_test_child());
+        process.ipc.set(server);
+        manager.process = Some(process);
+        manager.pending_request = true;
+        manager.pending_request_started_at = Some(std::time::Instant::now());
+        manager.pending_request_input = Some("quit()\n".to_string());
+
+        let prompt = ">>> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt,
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        drop(worker);
+        thread::sleep(Duration::from_millis(20));
+
+        manager.resolve_timeout_marker_with_wait(Duration::from_millis(0));
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        assert!(
+            manager.session_end_seen,
+            "expected timed-out completion resolution to notice the exited session"
+        );
+        assert!(
+            manager
+                .settled_pending_completion
+                .as_ref()
+                .is_some_and(|completion| completion.session_end_seen),
+            "expected queued completion metadata to be marked as session-ended"
+        );
+        assert!(
+            text.contains("[repl] session ended"),
+            "expected timed-out completion resolution to record the session-end notice, got: {text:?}"
+        );
+        assert!(
+            !text.contains(">>> "),
+            "did not expect the exited session to keep advertising its prompt, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_trims_echo_from_prompt_fallback_when_echo_events_missing() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected the settled files-mode output to survive trimming, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the Python prompt echo to leak into the next files-mode reply, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let first = manager.prepare_input_context_files();
+        assert_eq!(
+            contents_text(&first.prefix_contents),
+            "\\xC3",
+            "expected an accepted request to seal the detached utf-8 lead byte into the prefix"
+        );
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(&[0xA9, b'\n']);
+        let second = manager.prepare_input_context_files();
+
+        assert_eq!(
+            contents_text(&second.prefix_contents),
+            "\\xA9\n",
+            "expected the next request output to stay split after the detached prefix was sealed"
+        );
+    }
+
+    #[test]
+    fn pager_prepare_input_context_trims_echo_from_settled_completion() {
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b"> Sys.sleep(0.2); 1+1\n[1] 2\n",
+            false,
+            ContentOrigin::Worker,
+        );
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some("> ".to_string()),
+            prompt_variants: Some(vec!["> ".to_string()]),
+            echo_events: vec![echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let context = manager.prepare_input_context_pager("3+3", false);
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("[1] 2\n"),
+            "expected settled pager output to be preserved, got: {text:?}"
+        );
+        assert!(
+            !text.contains("Sys.sleep(0.2); 1+1"),
+            "did not expect settled pager echo to leak into the next input context, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn pager_output_capture_skips_pending_output_tape() {
+        let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        let output = OutputBuffer::default();
+        output.start_capture();
+
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Pager,
+            tape.clone(),
+            OutputTimeline::new(output_ring),
+        );
+        capture.append_text(b"pager output\n", TextStream::Stdout);
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        });
+        capture.append_sideband(PendingSidebandKind::RequestEnd);
+
+        assert!(
+            tape.drain_final_snapshot().events.is_empty(),
+            "pager mode should not mirror text, images, or sideband events into the pending tape"
+        );
+        assert!(
+            output.end_offset().unwrap_or(0) > 0,
+            "pager mode should still append text to the output timeline"
+        );
+    }
+
+    #[test]
     fn python_driver_uses_small_ipc_request_start_signal() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = PythonBackendDriver::new();
@@ -3829,7 +6216,11 @@ mod tests {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
         }
         let result = std::panic::catch_unwind(|| {
-            WorkerManager::new(Backend::Python, SandboxCliPlan::default())
+            WorkerManager::new(
+                Backend::Python,
+                SandboxCliPlan::default(),
+                crate::oversized_output::OversizedOutputMode::Files,
+            )
         });
 
         match original_tmpdir {
@@ -3873,7 +6264,12 @@ mod tests {
                 ),
             ],
         };
-        let mut manager = WorkerManager::new(Backend::Python, plan).expect("worker manager");
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
         let inherited_before = manager
             .inherited_sandbox_state
             .clone()

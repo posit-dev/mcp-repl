@@ -38,7 +38,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_vignettes test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(4_000).await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -55,7 +55,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
     session.cancel().await?;
     assert!(
         text.contains("[repl] vignette: grid (package: grid)"),
-        "expected vignette info in console, got: {text:?}"
+        "expected vignette info in the REPL, got: {text:?}"
     );
     assert!(
         text.contains("Source:") && text.contains("grid.Rnw"),
@@ -77,7 +77,7 @@ async fn browse_vignettes_prints_text_listing() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "r_vignettes test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(20_000).await?;
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(

@@ -3,10 +3,8 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
-#[cfg(windows)]
 use rmcp::model::RawContent;
 
-#[cfg(windows)]
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -62,10 +60,116 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_commands_are_handled_server_side() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate, got: {initial_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
+    let next_text = result_text(&next);
+    assert!(
+        !next_text.contains("unexpected ':'"),
+        "expected :next to be handled by pager, got: {next_text:?}"
+    );
+    assert!(
+        next_text.contains("--More--") || next_text.contains("(END"),
+        "expected pager output for :next, got: {next_text:?}"
+    );
+
+    let hits = session
+        .write_stdin_raw_with(":hits line0150", Some(30.0))
+        .await?;
+    let hits_text = result_text(&hits);
+    assert!(
+        !hits_text.contains("unexpected ':'"),
+        "expected :hits to be handled by pager, got: {hits_text:?}"
+    );
+    assert!(
+        hits_text.contains("[pager]") || hits_text.contains("#1 @"),
+        "expected pager response for :hits, got: {hits_text:?}"
+    );
+
+    let quit = session.write_stdin_raw_with(":q", Some(30.0)).await?;
+    let quit_text = result_text(&quit);
+    assert!(
+        !quit_text.contains("unexpected ':'"),
+        "expected :q to be handled by pager, got: {quit_text:?}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after :q, got: {quit_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "line <- paste(rep(\"foo\", 80), collapse = \" \"); for (i in 1:300) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate, got: {initial_text:?}"
+    );
+
+    let matches = session
+        .write_stdin_raw_with(":matches foo", Some(30.0))
+        .await?;
+    let matches_text = result_text(&matches);
+
+    session.cancel().await?;
+
+    assert!(
+        !matches_text.contains("transcript.txt"),
+        "did not expect oversized :matches output to spill to a bundle, got: {matches_text:?}"
+    );
+    assert!(
+        matches_text.contains("[pager] matches:"),
+        "expected pager summary inline, got: {matches_text:?}"
+    );
+    assert!(
+        matches_text.contains("#1 @"),
+        "expected inline :matches rows to remain navigable in the pager, got: {matches_text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
 async fn paginates_large_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin("1+1", timeout = 10.0);
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
@@ -83,7 +187,7 @@ async fn paginates_large_output() -> TestResult<()> {
 async fn pager_search_and_counts() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":/line01", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);
@@ -101,7 +205,7 @@ async fn pager_search_and_counts() -> TestResult<()> {
 async fn pager_search_preserves_whitespace() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) { suffix <- if (i == 25) \" r\" else if (i == 75) \"r \" else \"\"; cat(sprintf(\"line%04d %s%s\\n\", i, line, suffix)) }", timeout = 30.0);
             write_stdin(":where  r", timeout = 30.0);
             write_stdin(":/ r", timeout = 30.0);
@@ -119,7 +223,7 @@ async fn pager_search_preserves_whitespace() -> TestResult<()> {
 async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":where -i LINE01", timeout = 30.0);
             write_stdin(":/i LINE01", timeout = 30.0);
@@ -136,7 +240,7 @@ async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
 async fn pager_matches_with_headings() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("cat('# Title\\n\\n## Alpha\\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\\n', i)); cat('\\n## Beta\\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\\n', i))", timeout = 30.0);
             write_stdin(":matches foo", timeout = 30.0);
             write_stdin(":matches -C 1 foo", timeout = 30.0);
@@ -152,7 +256,7 @@ async fn pager_matches_with_headings() -> TestResult<()> {
 async fn pager_hits_mode() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("cat('# Title\\n'); for (i in 1:40) cat(sprintf('filler %02d xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n', i)); cat('## Alpha\\n'); for (i in 1:3) cat(sprintf('alpha configure %02d\\n', i)); cat('## Beta\\n'); for (i in 1:3) cat(sprintf('beta configure %02d\\n', i))", timeout = 30.0);
             write_stdin(":hits configure", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);
@@ -168,7 +272,7 @@ async fn pager_hits_mode() -> TestResult<()> {
 async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin("   ", timeout = 30.0);
             write_stdin(":q", timeout = 30.0);
@@ -183,7 +287,7 @@ async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
 async fn pager_dedup_on_seek() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .session("default", mcp_script! {
+        .pager_session("default", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 120), collapse = \"\"); for (i in 1:40) cat(sprintf(\"line%02d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":next", timeout = 30.0);
             write_stdin(":seek 0", timeout = 30.0);

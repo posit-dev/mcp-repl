@@ -15,6 +15,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::windows::ffi::OsStrExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+#[cfg(target_family = "unix")]
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
 #[cfg(target_family = "windows")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -65,6 +67,14 @@ pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
+#[cfg(target_family = "unix")]
+static WORKER_IPC_ALLOWED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_FORK_CLOSE_READ_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_FORK_CLOSE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -95,6 +105,8 @@ pub enum WorkerToServerIpcMessage {
         data: String,
         is_new: bool,
     },
+    /// Emitted exactly when the backend knows the logical request has consumed all queued input.
+    /// No later `ReadlineResult` should follow for that same request.
     RequestEnd,
     SessionEnd,
 }
@@ -108,6 +120,8 @@ struct ServerIpcInbox {
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
+    request_end_seen: bool,
+    protocol_warnings: VecDeque<String>,
     session_end: bool,
     disconnected: bool,
 }
@@ -135,6 +149,10 @@ pub struct IpcPlotImage {
 #[derive(Default, Clone)]
 pub struct IpcHandlers {
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
+    pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
+    pub on_request_end: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +160,7 @@ pub struct ServerIpcConnection {
     sender: mpsc::Sender<ServerToWorkerIpcMessage>,
     inbox: Arc<Mutex<ServerIpcInbox>>,
     cvar: Arc<Condvar>,
+    reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -177,12 +196,17 @@ impl ServerIpcConnection {
         let (tx, rx) = mpsc::channel();
         let inbox = Arc::new(Mutex::new(ServerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
+        let reader_thread = Arc::new(Mutex::new(None));
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
         let plot_handler = handlers.on_plot_image.clone();
+        let readline_start_handler = handlers.on_readline_start.clone();
+        let readline_result_handler = handlers.on_readline_result.clone();
+        let request_end_handler = handlers.on_request_end.clone();
+        let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
             loop {
@@ -209,7 +233,11 @@ impl ServerIpcConnection {
                 if let Ok(message) = serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
                     match message {
                         WorkerToServerIpcMessage::ReadlineStart { prompt } => {
+                            let prompt_for_handler = prompt.clone();
                             let mut guard = reader_inbox.lock().unwrap();
+                            if guard.request_end_seen {
+                                reset_after_completed_request(&mut guard);
+                            }
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
                             if guard.readline_unmatched_starts == 1 {
@@ -227,9 +255,23 @@ impl ServerIpcConnection {
                             }
                             guard.last_prompt = Some(prompt);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = readline_start_handler.as_ref() {
+                                handler(prompt_for_handler);
+                            }
                         }
                         WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
+                            let echo_event = IpcEchoEvent {
+                                prompt: prompt.clone(),
+                                line: line.clone(),
+                            };
                             let mut guard = reader_inbox.lock().unwrap();
+                            if guard.request_end_seen {
+                                guard.protocol_warnings.push_back(
+                                    "protocol warning: worker emitted ReadlineResult after RequestEnd"
+                                        .to_string(),
+                                );
+                            }
                             guard.readline_result_count =
                                 guard.readline_result_count.saturating_add(1);
                             if guard.readline_unmatched_starts > 0 {
@@ -238,14 +280,22 @@ impl ServerIpcConnection {
                                     guard.readline_unmatched_since = None;
                                 }
                             }
-                            guard.echo_events.push_back(IpcEchoEvent { prompt, line });
+                            guard.echo_events.push_back(echo_event.clone());
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = readline_result_handler.as_ref() {
+                                handler(echo_event);
+                            }
                         }
                         WorkerToServerIpcMessage::SessionEnd => {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.session_end = true;
                             guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if let Some(handler) = session_end_handler.as_ref() {
+                                handler();
+                            }
                         }
                         WorkerToServerIpcMessage::PlotImage {
                             id,
@@ -273,13 +323,23 @@ impl ServerIpcConnection {
                         }
                         other => {
                             let mut guard = reader_inbox.lock().unwrap();
+                            let is_request_end =
+                                matches!(other, WorkerToServerIpcMessage::RequestEnd);
+                            if is_request_end {
+                                guard.request_end_seen = true;
+                            }
                             guard.queue.push_back(other);
                             reader_cvar.notify_all();
+                            drop(guard);
+                            if is_request_end && let Some(handler) = request_end_handler.as_ref() {
+                                handler();
+                            }
                         }
                     }
                 }
             }
         });
+        *reader_thread.lock().unwrap() = Some(handle);
 
         spawn_writer(rx, writer);
 
@@ -287,6 +347,7 @@ impl ServerIpcConnection {
             sender: tx,
             inbox,
             cvar,
+            reader_thread,
         })
     }
 
@@ -297,22 +358,26 @@ impl ServerIpcConnection {
         self.sender.send(message)
     }
 
-    pub fn clear_prompt_history(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.prompt_history.clear();
+    pub fn join_reader_thread(&self) -> io::Result<()> {
+        let handle = self.reader_thread.lock().unwrap().take();
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| io::Error::other("ipc reader thread panicked"))?;
+        Ok(())
     }
 
-    pub fn clear_echo_events(&self) {
+    pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
+        guard
+            .queue
+            .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
+        reset_after_completed_request(&mut guard);
         guard.echo_events.clear();
-    }
-
-    pub fn clear_readline_tracking(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.readline_result_count = 0;
-        guard.readline_unmatched_starts = 0;
-        guard.readline_unmatched_since = None;
-        guard.last_prompt = None;
+        guard.prompt_history.clear();
+        guard.protocol_warnings.clear();
     }
 
     pub fn waiting_for_next_input(&self, min_wait: Duration) -> bool {
@@ -326,13 +391,6 @@ impl ServerIpcConnection {
         since.elapsed() >= min_wait
     }
 
-    pub fn clear_request_end_events(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard
-            .queue
-            .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
-    }
-
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()
@@ -341,6 +399,16 @@ impl ServerIpcConnection {
     pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
         let mut guard = self.inbox.lock().unwrap();
         guard.echo_events.drain(..).collect()
+    }
+
+    pub fn pending_echo_event_count(&self) -> usize {
+        let guard = self.inbox.lock().unwrap();
+        guard.echo_events.len()
+    }
+
+    pub fn take_protocol_warnings(&self) -> Vec<String> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.protocol_warnings.drain(..).collect()
     }
 
     pub fn wait_for_request_end(&self, timeout: Duration) -> Result<(), IpcWaitError> {
@@ -1119,6 +1187,14 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPC write fd"))?;
         set_cloexec(read_fd, true)?;
         set_cloexec(write_fd, true)?;
+        register_worker_ipc_fork_contract(read_fd, write_fd)?;
+        // The main worker owns the live sideband fds. Once startup has consumed the bootstrap env
+        // vars, user code and descendants must not see or reuse them.
+        // SAFETY: worker startup consumes these env vars before any worker-managed threads exist.
+        unsafe {
+            std::env::remove_var(IPC_READ_FD_ENV);
+            std::env::remove_var(IPC_WRITE_FD_ENV);
+        }
         let reader = unsafe { File::from_raw_fd(read_fd) };
         let writer = unsafe { File::from_raw_fd(write_fd) };
         WorkerIpcConnection::new(IpcTransport {
@@ -1195,7 +1271,39 @@ pub fn set_global_ipc(conn: WorkerIpcConnection) {
 }
 
 pub fn global_ipc() -> Option<&'static WorkerIpcConnection> {
+    #[cfg(target_family = "unix")]
+    if !WORKER_IPC_ALLOWED.load(AtomicOrdering::SeqCst) {
+        return None;
+    }
     IPC_GLOBAL.get()
+}
+
+#[cfg(target_family = "unix")]
+extern "C" fn close_worker_ipc_in_fork_child() {
+    WORKER_IPC_ALLOWED.store(false, AtomicOrdering::SeqCst);
+    let read_fd = WORKER_IPC_FORK_CLOSE_READ_FD.load(AtomicOrdering::SeqCst);
+    let write_fd = WORKER_IPC_FORK_CLOSE_WRITE_FD.load(AtomicOrdering::SeqCst);
+    unsafe {
+        if read_fd >= 0 {
+            libc::close(read_fd);
+        }
+        if write_fd >= 0 {
+            libc::close(write_fd);
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd) -> io::Result<()> {
+    let result = *WORKER_IPC_ATFORK_REGISTER_RESULT.get_or_init(|| unsafe {
+        libc::pthread_atfork(None, None, Some(close_worker_ipc_in_fork_child))
+    });
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    WORKER_IPC_FORK_CLOSE_READ_FD.store(read_fd, AtomicOrdering::SeqCst);
+    WORKER_IPC_FORK_CLOSE_WRITE_FD.store(write_fd, AtomicOrdering::SeqCst);
+    Ok(())
 }
 
 pub fn emit_readline_start(prompt: &str) {
@@ -1290,6 +1398,14 @@ fn take_request_end(guard: &mut ServerIpcInbox) -> bool {
     };
     guard.queue.remove(idx);
     true
+}
+
+fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
+    guard.request_end_seen = false;
+    guard.readline_result_count = 0;
+    guard.readline_unmatched_starts = 0;
+    guard.readline_unmatched_since = None;
+    guard.last_prompt = None;
 }
 
 fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {

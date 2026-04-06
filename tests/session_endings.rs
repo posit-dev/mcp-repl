@@ -164,7 +164,7 @@ async fn session_endings_windows_smoke() -> TestResult<()> {
             if last_text.contains(expected) {
                 return Ok(true);
             }
-            if last_text.contains("<<console status: busy")
+            if last_text.contains("<<repl status: busy")
                 || last_text.contains("worker is busy")
                 || last_text.contains("request already running")
                 || last_text.contains("input discarded while worker busy")

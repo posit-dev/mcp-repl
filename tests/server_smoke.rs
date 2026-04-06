@@ -23,7 +23,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 
 #[cfg(windows)]
 fn is_busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")

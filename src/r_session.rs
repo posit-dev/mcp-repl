@@ -36,7 +36,7 @@ use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
 
 #[derive(Debug)]
-pub struct SessionReply;
+pub struct RequestCompleted;
 
 pub struct RSession {
     sender: mpsc::Sender<RRequest>,
@@ -68,7 +68,7 @@ impl RSession {
         self.init.wait_ready()
     }
 
-    pub fn send_request(&self, input: String) -> Result<mpsc::Receiver<SessionReply>, String> {
+    pub fn send_request(&self, input: String) -> Result<mpsc::Receiver<RequestCompleted>, String> {
         self.wait_until_ready()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         let request = RRequest {
@@ -84,7 +84,7 @@ impl RSession {
 
 struct RRequest {
     input: String,
-    reply: mpsc::Sender<SessionReply>,
+    reply: mpsc::Sender<RequestCompleted>,
 }
 
 #[derive(Debug)]
@@ -243,7 +243,7 @@ struct SessionStateInner {
 }
 
 struct ActiveRequest {
-    reply: mpsc::Sender<SessionReply>,
+    reply: mpsc::Sender<RequestCompleted>,
     plot_hashes: HashMap<String, u64>,
 }
 
@@ -809,7 +809,10 @@ fn complete_active_request(
     emit_session_end: bool,
 ) {
     if let Some(active) = active {
-        let _ = active.reply.send(SessionReply);
+        // Keep the request boundary coupled to the same R-thread decision that
+        // drained the final queued input line.
+        ipc::emit_request_end();
+        let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
     }
     if emit_session_end {

@@ -1,6 +1,6 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: restart_interrupt ==
 -- step 1 --
@@ -44,7 +44,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[repl] echoed input elided: 3 lines (49 bytes); head: > ; tail: > cat(\"plots_done\\n\")\nplots_done"
+      "text": "plots_done"
     },
     {
       "type": "image",
@@ -116,11 +116,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> Sys.sleep(5)"
-    },
-    {
-      "type": "text",
-      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
+      "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]
 }

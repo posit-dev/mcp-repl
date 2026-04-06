@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::worker_protocol::ContentOrigin;
+
 static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
 static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -68,12 +70,12 @@ impl OutputTimeline {
         Self { ring }
     }
 
-    pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool) {
+    pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
         if bytes.is_empty() {
             return;
         }
         if !is_stderr {
-            self.ring.append_bytes(bytes, false);
+            self.ring.append_bytes(bytes, false, origin);
             return;
         }
 
@@ -90,7 +92,7 @@ impl OutputTimeline {
         }
         payload.extend_from_slice(STDERR_PREFIX);
         payload.extend_from_slice(bytes);
-        self.ring.append_bytes(&payload, true);
+        self.ring.append_bytes(&payload, true, origin);
     }
 
     pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
@@ -219,12 +221,14 @@ struct OutputChunk {
     bytes: Arc<[u8]>,
     range: Range<usize>,
     is_stderr: bool,
+    origin: ContentOrigin,
 }
 
 struct OutputSlice {
     bytes: Arc<[u8]>,
     range: Range<usize>,
     is_stderr: bool,
+    origin: ContentOrigin,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +236,7 @@ pub(crate) struct OutputTextSpan {
     pub start_byte: usize,
     pub end_byte: usize,
     pub is_stderr: bool,
+    pub origin: ContentOrigin,
 }
 
 pub(crate) struct OutputRange {
@@ -271,6 +276,7 @@ pub(crate) enum OutputEventKind {
     Text {
         text: String,
         is_stderr: bool,
+        origin: ContentOrigin,
     },
 }
 
@@ -306,7 +312,7 @@ impl OutputRing {
         self.inner.lock().unwrap().start_offset
     }
 
-    pub(crate) fn append_bytes(&self, bytes: &[u8], is_stderr: bool) {
+    pub(crate) fn append_bytes(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
         if bytes.is_empty() {
             return;
         }
@@ -346,6 +352,7 @@ impl OutputRing {
                 bytes,
                 range: 0..bytes_len,
                 is_stderr,
+                origin,
             });
         }
 
@@ -397,6 +404,7 @@ impl OutputRing {
             let end_byte = start_byte.saturating_add(slice_len);
             if let Some(last) = text_spans.last_mut()
                 && last.is_stderr == slice.is_stderr
+                && last.origin == slice.origin
                 && last.end_byte == start_byte
             {
                 last.end_byte = end_byte;
@@ -405,6 +413,7 @@ impl OutputRing {
                     start_byte,
                     end_byte,
                     is_stderr: slice.is_stderr,
+                    origin: slice.origin,
                 });
             }
             cursor = end_byte;
@@ -505,6 +514,7 @@ impl OutputRing {
                     bytes: chunk.bytes.clone(),
                     range: slice_start..slice_end,
                     is_stderr: chunk.is_stderr,
+                    origin: chunk.origin,
                 });
             }
         }
@@ -544,6 +554,7 @@ impl OutputRing {
         let notice_kind = OutputEventKind::Text {
             text: "[repl] output truncated (older output dropped)\n".to_string(),
             is_stderr: false,
+            origin: ContentOrigin::Server,
         };
         let notice_bytes = event_size_bytes(&notice_kind);
         if notice_bytes.saturating_add(extra_bytes) > self.capacity_bytes {
@@ -727,7 +738,7 @@ mod tests {
     fn output_ring_truncates_instead_of_blocking() {
         let ring = OutputRing::with_capacity(64);
         let payload = (0..200u8).collect::<Vec<_>>();
-        ring.append_bytes(&payload, false);
+        ring.append_bytes(&payload, false, ContentOrigin::Worker);
 
         let end = ring.end_offset();
         let range = ring.read_range(0, end);
@@ -744,7 +755,7 @@ mod tests {
     #[test]
     fn output_ring_truncates_old_events() {
         let ring = OutputRing::with_capacity(128);
-        ring.append_bytes(b"hello\n", false);
+        ring.append_bytes(b"hello\n", false, ContentOrigin::Worker);
         for idx in 0..10 {
             let data = "x".repeat(80);
             ring.append_event(
@@ -768,9 +779,9 @@ mod tests {
     #[test]
     fn output_ring_emits_truncation_notice_event() {
         let ring = OutputRing::with_capacity(128);
-        ring.append_bytes(b"header\n", false);
+        ring.append_bytes(b"header\n", false, ContentOrigin::Worker);
         let payload = vec![b'x'; 512];
-        ring.append_bytes(&payload, false);
+        ring.append_bytes(&payload, false, ContentOrigin::Worker);
 
         let end = ring.end_offset();
         let range = ring.read_range(0, end);
@@ -801,8 +812,8 @@ mod tests {
     #[test]
     fn append_event_clamps_offset_after_truncation() {
         let ring = OutputRing::with_capacity(64);
-        ring.append_bytes(&[b'a'; 64], false);
-        ring.append_bytes(&[b'b'; 128], false);
+        ring.append_bytes(&[b'a'; 64], false, ContentOrigin::Worker);
+        ring.append_bytes(&[b'b'; 128], false, ContentOrigin::Worker);
         ring.append_event(
             0,
             OutputEventKind::Image {
@@ -829,7 +840,7 @@ mod tests {
     #[test]
     fn preserves_control_delim_bytes_in_output() {
         let ring = OutputRing::with_capacity(64);
-        ring.append_bytes(&[0x1e, b'a', 0x1e], false);
+        ring.append_bytes(&[0x1e, b'a', 0x1e], false, ContentOrigin::Worker);
         let end = ring.end_offset();
         let range = ring.read_range(0, end);
         assert!(
@@ -855,7 +866,7 @@ mod tests {
             let value = next_u32(&mut seed);
             if value.is_multiple_of(3) {
                 let len = (value % 512) as usize;
-                ring.append_bytes(&vec![b'x'; len], false);
+                ring.append_bytes(&vec![b'x'; len], false, ContentOrigin::Worker);
             } else {
                 let len = (value % 256) as usize;
                 let text = "x".repeat(len);
@@ -864,6 +875,7 @@ mod tests {
                     OutputEventKind::Text {
                         text,
                         is_stderr: false,
+                        origin: ContentOrigin::Worker,
                     },
                 );
             }

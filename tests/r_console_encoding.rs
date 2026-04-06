@@ -73,7 +73,7 @@ async fn write_stdin_windows_output_has_no_utf8_marker_artifacts() -> TestResult
         .write_stdin_raw_with("options(useFancyQuotes=TRUE); ?mean", Some(30.0))
         .await?;
     let help_text = result_text(&help);
-    if help_text.contains("<<console status: busy") {
+    if help_text.contains("<<repl status: busy") {
         eprintln!("r_console_encoding help output still busy; skipping");
         session.cancel().await?;
         return Ok(());

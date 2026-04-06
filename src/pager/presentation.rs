@@ -76,7 +76,7 @@ pub(super) fn position_marker(
 pub(super) fn elision_marker(start: u64, end: u64) -> WorkerContent {
     // Always include the range: without it, multiple elisions in one page are ambiguous for the
     // MCP consumer to stitch back into a consistent view of the underlying output.
-    WorkerContent::stderr(format!(
+    WorkerContent::server_stderr(format!(
         "[pager] elided output (already shown): @{start}..{end}\n"
     ))
 }

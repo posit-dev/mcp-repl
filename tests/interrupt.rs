@@ -18,7 +18,7 @@ fn result_text(result: &CallToolResult) -> String {
 }
 
 fn is_busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
@@ -26,7 +26,6 @@ fn is_busy_response(text: &str) -> bool {
 
 fn is_restart_transient_output(text: &str) -> bool {
     is_busy_response(text)
-        || text.contains("--More--")
         || text.contains("new session started")
         || text.contains("worker exited with status")
 }
@@ -39,12 +38,27 @@ async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     .await
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
-    text.contains("failed to start R session")
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+#[cfg(not(windows))]
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
         || text.contains("worker exited with status")
         || text.contains("worker exited with signal")
         || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
 }
@@ -64,7 +78,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
@@ -77,7 +91,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     }
     assert!(
         interrupt_text.contains("> ")
-            || interrupt_text.contains("<<console status: busy")
+            || interrupt_text.contains("<<repl status: busy")
             || interrupt_text.contains("worker is busy")
             || interrupt_text.contains("request already running")
             || interrupt_text.contains("input discarded while worker busy"),
@@ -97,7 +111,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
         if text.contains("worker is busy")
             || text.contains("request already running")
             || text.contains("input discarded while worker busy")
-            || text.contains("<<console status: busy")
+            || text.contains("<<repl status: busy")
         {
             sleep(Duration::from_millis(50)).await;
             continue;
@@ -128,13 +142,13 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
         return Ok(());
     }
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
     let result = session.write_stdin_raw_with("\u{3}1+1", Some(5.0)).await?;
     let text = result_text(&result);
-    if text.contains("<<console status: busy")
+    if text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
@@ -143,6 +157,45 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        text.contains("[1] 2") || text.contains("2"),
+        "expected evaluation after interrupt prefix, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let long_sleep =
+        r#"tryCatch({ Sys.sleep(30) }, interrupt = function(e) cat("interrupt received\n"))"#;
+    let timeout_result = session.write_stdin_raw_with(long_sleep, Some(0.2)).await?;
+    let timeout_text = result_text(&timeout_result);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("\u{3}1+1", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("interrupt prefix did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("interrupt received"),
+        "expected interrupt handler output to be preserved in pager mode, got: {text:?}"
+    );
     assert!(
         text.contains("[1] 2") || text.contains("2"),
         "expected evaluation after interrupt prefix, got: {text:?}"
@@ -162,6 +215,11 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
         .write_stdin_raw_with("\u{4}print(exists(\"x\"))", Some(10.0))
         .await?;
     let mut text = result_text(&first);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if text.contains("FALSE") {
@@ -175,27 +233,16 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
             session.cancel().await?;
             panic!("expected fresh session after restart prefix, got: {text:?}");
         }
-        if text.contains("--More--") {
-            let pager_quit = session.write_stdin_raw_with(":q", Some(5.0)).await?;
-            text = result_text(&pager_quit);
-            if text.contains("FALSE") {
-                break;
-            }
-            assert!(
-                !text.contains("TRUE"),
-                "expected restarted session to clear x, got: {text:?}"
-            );
-            if Instant::now() >= deadline {
-                session.cancel().await?;
-                panic!("expected fresh session after restart prefix, got: {text:?}");
-            }
-        }
-
         sleep(Duration::from_millis(100)).await;
         let result = session
             .write_stdin_raw_with("print(exists(\"x\"))", Some(5.0))
             .await?;
         text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
         if is_restart_transient_output(&text) {
             continue;
         }
@@ -203,6 +250,37 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
     assert!(
         text.contains("FALSE"),
         "expected fresh session output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{4}print('AFTER_RESET')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) || text.contains("worker exited with status") {
+        eprintln!("restart prefix did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("new session started"),
+        "expected restart notice to be preserved in pager mode, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_RESET"),
+        "expected follow-up output after restart prefix, got: {text:?}"
     );
 
     session.cancel().await?;

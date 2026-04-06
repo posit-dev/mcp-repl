@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: timeout_list ==
 -- step 1 --
@@ -19,11 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> Sys.sleep(5)"
-    },
-    {
-      "type": "text",
-      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
+      "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]
 }
@@ -43,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
+      "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     },
     {
       "type": "text",

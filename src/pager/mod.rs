@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
 use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
-use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{
+    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+};
 
 mod command;
 mod merge;
@@ -64,6 +66,7 @@ struct PagerTextSpan {
     start: u64,
     end: u64,
     is_stderr: bool,
+    origin: ContentOrigin,
 }
 
 impl merge::EventView for crate::output_capture::OutputEvent {
@@ -117,6 +120,7 @@ impl PagerBuffer {
                     start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
                     end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
                     is_stderr: span.is_stderr,
+                    origin: span.origin,
                 })
             })
             .collect();
@@ -168,6 +172,7 @@ impl PagerBuffer {
                     start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
                     end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
                     is_stderr: span.is_stderr,
+                    origin: span.origin,
                 })
             })
             .collect();
@@ -214,10 +219,11 @@ impl PagerBuffer {
         let start = self.byte_index_for_char_offset(start_offset);
         let end = self.byte_index_for_char_offset(end_offset);
         let bytes = &self.bytes[start..end];
-        merge::merge_bytes_with_events(
+        merge::merge_bytes_with_events_and_spans(
             bytes,
             start as u64,
             end as u64,
+            &self.text_spans_in_byte_offsets(start_offset, end_offset),
             &self.events_in_byte_offsets(start_offset, end_offset),
             output_event_to_content,
         )
@@ -491,6 +497,7 @@ impl PagerBuffer {
                 end: old_char_len
                     .saturating_add(char_offset_for_byte_index(&chunk_char_index, span.end_byte)),
                 is_stderr: span.is_stderr,
+                origin: span.origin,
             });
         }
         for event in range.events {
@@ -544,6 +551,26 @@ impl PagerBuffer {
             });
         }
         events
+    }
+
+    fn text_spans_in_byte_offsets(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Vec<PagerTextSpanByte> {
+        let mut spans = Vec::new();
+        for span in &self.text_spans {
+            if span.end <= start_offset || span.start >= end_offset {
+                continue;
+            }
+            spans.push(PagerTextSpanByte {
+                start: self.byte_index_for_char_offset(span.start.max(start_offset)) as u64,
+                end: self.byte_index_for_char_offset(span.end.min(end_offset)) as u64,
+                is_stderr: span.is_stderr,
+                origin: span.origin,
+            });
+        }
+        spans
     }
 
     fn image_offsets_in_range(&self, start_offset: u64, end_offset: u64, limit: usize) -> Vec<u64> {
@@ -610,6 +637,32 @@ impl merge::EventView for PagerEventByte {
 
     fn kind(&self) -> &OutputEventKind {
         &self.kind
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PagerTextSpanByte {
+    start: u64,
+    end: u64,
+    is_stderr: bool,
+    origin: ContentOrigin,
+}
+
+impl merge::TextSpanView for PagerTextSpanByte {
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    fn end(&self) -> u64 {
+        self.end
+    }
+
+    fn is_stderr(&self) -> bool {
+        self.is_stderr
+    }
+
+    fn origin(&self) -> ContentOrigin {
+        self.origin
     }
 }
 
@@ -885,7 +938,8 @@ impl Pager {
                     next
                 });
             if state.seen_images.contains(&image_id) {
-                *content = WorkerContent::stderr(format!("[pager] image #{num} already shown\n"));
+                *content =
+                    WorkerContent::server_stderr(format!("[pager] image #{num} already shown\n"));
             } else {
                 state.seen_images.insert(image_id);
             }
@@ -1024,7 +1078,7 @@ impl Pager {
     pub(crate) fn handle_command(&mut self, input: &str) -> WorkerReply {
         if self.state.is_none() {
             return pager_reply(
-                vec![WorkerContent::stderr("[pager] no pager active")],
+                vec![WorkerContent::server_stderr("[pager] no pager active")],
                 true,
                 None,
             );
@@ -1033,8 +1087,10 @@ impl Pager {
         let Some(command) = PagerCommand::parse(input) else {
             let page_bytes = page_bytes();
             let pages_left = self.pages_left_for_help(page_bytes);
-            let mut contents = vec![WorkerContent::stderr(non_command_input_message(input))];
-            contents.push(WorkerContent::stderr(self.footer(pages_left)));
+            let mut contents = vec![WorkerContent::server_stderr(non_command_input_message(
+                input,
+            ))];
+            contents.push(WorkerContent::server_stderr(self.footer(pages_left)));
             return pager_reply(contents, false, None);
         };
 
@@ -1043,7 +1099,7 @@ impl Pager {
         if let PagerCommand::Quit = command {
             let footer = self.footer(0);
             self.dismiss();
-            let contents = vec![WorkerContent::stderr(footer)];
+            let contents = vec![WorkerContent::server_stderr(footer)];
             return pager_reply(contents, false, None);
         }
 
@@ -1210,7 +1266,7 @@ impl Pager {
                     } else {
                         state.search_session = None;
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(format!(
+                        let contents = vec![WorkerContent::server_stderr(format!(
                             "[pager] pattern not found: {}",
                             pattern.pattern
                         ))];
@@ -1219,7 +1275,7 @@ impl Pager {
                 }
                 PagerCommand::Where { pattern } => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                    let contents = vec![WorkerContent::stderr(where_in_buffer(
+                    let contents = vec![WorkerContent::server_stderr(where_in_buffer(
                         &state.buffer,
                         &state.seen_ranges,
                         page_bytes,
@@ -1254,7 +1310,7 @@ impl Pager {
                             .without_last_emitted_update()
                         } else {
                             state.search_session = None;
-                            let contents = vec![WorkerContent::stderr(format!(
+                            let contents = vec![WorkerContent::server_stderr(format!(
                                 "[pager] pattern not found: {}",
                                 pattern.pattern
                             ))];
@@ -1281,7 +1337,7 @@ impl Pager {
                         .with_view_ranges(view_ranges)
                         .without_last_emitted_update()
                     } else {
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
                                 .to_string(),
                         )];
@@ -1312,9 +1368,9 @@ impl Pager {
                         extend_search_session_forward(&state.buffer, session, needed_hits);
                         let moved = move_search_session(session, count, true);
                         if moved == SearchStepOutcome::Boundary {
-                            let contents = vec![WorkerContent::stderr(search_boundary_message(
-                                session, true,
-                            ))];
+                            let contents = vec![WorkerContent::server_stderr(
+                                search_boundary_message(session, true),
+                            )];
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
@@ -1364,9 +1420,9 @@ impl Pager {
                             .expect("search session missing after refresh");
                         let moved = move_search_session(session, count, false);
                         if moved == SearchStepOutcome::Boundary {
-                            let contents = vec![WorkerContent::stderr(search_boundary_message(
-                                session, false,
-                            ))];
+                            let contents = vec![WorkerContent::server_stderr(
+                                search_boundary_message(session, false),
+                            )];
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
@@ -1398,7 +1454,7 @@ impl Pager {
                         }
                     } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
                         CommandOutcome::no_range_keep(contents, pages_left, is_error)
@@ -1440,14 +1496,14 @@ impl Pager {
                             .without_last_emitted_update()
                         } else {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                            let contents = vec![WorkerContent::stderr(format!(
+                            let contents = vec![WorkerContent::server_stderr(format!(
                                 "[pager] search hit out of range: {index}"
                             ))];
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         }
                     } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
                         CommandOutcome::no_range_keep(contents, pages_left, is_error)
@@ -1458,7 +1514,7 @@ impl Pager {
                     let (mut contents, span) =
                         take_line_range(&state.buffer, start, end, &mut state.seen_ranges);
                     if contents.is_empty() {
-                        contents.push(WorkerContent::stderr(
+                        contents.push(WorkerContent::server_stderr(
                             "[pager] no remaining output in range".to_string(),
                         ));
                     }
@@ -1483,7 +1539,7 @@ impl Pager {
                     };
 
                     if let Some(message) = error_message {
-                        let contents = vec![WorkerContent::stderr(message)];
+                        let contents = vec![WorkerContent::server_stderr(message)];
                         CommandOutcome::no_range(contents, pages_left, is_error)
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
@@ -1495,7 +1551,7 @@ impl Pager {
                 }
                 PagerCommand::Help => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                    let contents = vec![WorkerContent::stderr(pager_help_text())];
+                    let contents = vec![WorkerContent::server_stderr(pager_help_text())];
                     CommandOutcome::no_range(contents, pages_left, is_error)
                 }
                 PagerCommand::Quit => {
@@ -1534,9 +1590,9 @@ impl Pager {
             if dismiss {
                 let footer = self.footer(0);
                 self.dismiss();
-                contents.push(WorkerContent::stderr(footer));
+                contents.push(WorkerContent::server_stderr(footer));
             } else {
-                contents.push(WorkerContent::stderr(self.footer(pages_left)));
+                contents.push(WorkerContent::server_stderr(self.footer(pages_left)));
             }
         }
 
@@ -1569,20 +1625,25 @@ pub(crate) fn maybe_activate_and_append_footer(
         }
     }
     pager.dedupe_images(contents);
-    contents.push(WorkerContent::stderr(pager.footer(pages_left)));
+    contents.push(WorkerContent::server_stderr(pager.footer(pages_left)));
 }
 
-fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
     if range.bytes.is_empty() && range.events.is_empty() {
         return Vec::new();
     }
-    merge::merge_bytes_with_events(
-        &range.bytes,
-        range.start_offset,
-        range.end_offset,
-        &range.events,
-        output_event_to_content,
-    )
+    let buffer = PagerBuffer::from_range(range);
+    buffer.contents_for_range(0, buffer.len())
+}
+
+pub(crate) fn contents_from_collapsed_output(
+    bytes: Vec<u8>,
+    events: Vec<(u64, OutputEventKind)>,
+    text_spans: Vec<crate::output_capture::OutputTextSpan>,
+    source_end: u64,
+) -> Vec<WorkerContent> {
+    let buffer = PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
+    buffer.contents_for_range(0, buffer.len())
 }
 
 fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
@@ -1598,11 +1659,21 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
             id: id.clone(),
             is_new: *is_new,
         },
-        OutputEventKind::Text { text, is_stderr } => {
+        OutputEventKind::Text {
+            text,
+            is_stderr,
+            origin,
+        } => {
             if *is_stderr {
-                WorkerContent::stderr(text.clone())
+                match origin {
+                    ContentOrigin::Worker => WorkerContent::worker_stderr(text.clone()),
+                    ContentOrigin::Server => WorkerContent::server_stderr(text.clone()),
+                }
             } else {
-                WorkerContent::stdout(text.clone())
+                match origin {
+                    ContentOrigin::Worker => WorkerContent::worker_stdout(text.clone()),
+                    ContentOrigin::Server => WorkerContent::server_stdout(text.clone()),
+                }
             }
         }
     }
@@ -2118,7 +2189,7 @@ fn take_line_range(
 ) -> (Vec<WorkerContent>, RangeSpan) {
     let Some((start_offset, end_offset)) = buffer.line_range_offsets(start_line, end_line) else {
         return (
-            vec![WorkerContent::stderr(
+            vec![WorkerContent::server_stderr(
                 "[pager] line range out of bounds".to_string(),
             )],
             RangeSpan::default(),
@@ -2200,7 +2271,7 @@ mod tests {
         let timeline = OutputTimeline::new(ring);
         let output = OutputBuffer::default();
         output.start_capture();
-        timeline.append_text(text.as_bytes(), false);
+        timeline.append_text(text.as_bytes(), false, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
         let range = output.read_range(0, end_offset);
         output.advance_offset_to(end_offset);
@@ -2255,7 +2326,7 @@ mod tests {
 
         assert_eq!(contents.len(), 3);
         let first = match &contents[0] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stdout));
                 text.as_str()
             }
@@ -2264,7 +2335,7 @@ mod tests {
         assert_eq!(first, "line1\n");
 
         let marker = match &contents[1] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2278,7 +2349,7 @@ mod tests {
         );
 
         let last = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stdout));
                 text.as_str()
             }
@@ -2294,7 +2365,7 @@ mod tests {
         let marker =
             gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).expect("expected marker");
         let text = match marker {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text
             }
@@ -2393,7 +2464,7 @@ mod tests {
 
         assert!(matches!(contents[0], WorkerContent::ContentImage { .. }));
         let marker = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2448,7 +2519,7 @@ mod tests {
         pager.dedupe_images(&mut contents);
 
         let marker_one = match &contents[2] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2460,7 +2531,7 @@ mod tests {
         );
 
         let marker_two = match &contents[3] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 assert!(matches!(stream, TextStream::Stderr));
                 text.as_str()
             }
@@ -2819,9 +2890,11 @@ mod tests {
             "expected bounded all-matches header, got: {initial}"
         );
 
-        fixture
-            .timeline
-            .append_text(b"foo line refresh-a\nfoo line refresh-b\n", false);
+        fixture.timeline.append_text(
+            b"foo line refresh-a\nfoo line refresh-b\n",
+            false,
+            ContentOrigin::Worker,
+        );
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));
@@ -2886,7 +2959,9 @@ mod tests {
             "expected :n to move to the past-end boundary before refresh, got: {boundary}"
         );
 
-        fixture.timeline.append_text(b"gamma foo\n", false);
+        fixture
+            .timeline
+            .append_text(b"gamma foo\n", false, ContentOrigin::Worker);
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));
@@ -3457,7 +3532,7 @@ mod tests {
         let timeline = OutputTimeline::new(ring);
         let output = OutputBuffer::default();
         output.start_capture();
-        timeline.append_text(b"warning foo details\n", true);
+        timeline.append_text(b"warning foo details\n", true, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
         let range = output.read_range(0, end_offset);
         output.advance_offset_to(end_offset);
@@ -3469,10 +3544,13 @@ mod tests {
         let body = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream }
-                    if text.contains("warning foo details") =>
-                {
-                    Some((*stream, text.as_str()))
+                WorkerContent::ContentText {
+                    text,
+                    stream,
+                    origin,
+                    ..
+                } if text.contains("warning foo details") => {
+                    Some((*stream, *origin, text.as_str()))
                 }
                 _ => None,
             })
@@ -3481,6 +3559,11 @@ mod tests {
             matches!(body.0, TextStream::Stderr),
             "expected compact search body to preserve stderr stream, got: {:?}",
             body.0
+        );
+        assert!(
+            matches!(body.1, crate::worker_protocol::ContentOrigin::Worker),
+            "expected compact search body to stay worker-originated, got: {:?}",
+            body.1
         );
 
         drop(guard);
@@ -3527,16 +3610,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: stderr_one,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one,
                     end_byte: stderr_one + stdout_line,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one + stdout_line,
                     end_byte: text.len(),
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
             ],
         };
@@ -3548,7 +3634,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3575,16 +3661,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: stderr_one,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one,
                     end_byte: stderr_one + stdout_line,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: stderr_one + stdout_line,
                     end_byte: text.len(),
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
             ],
             text.len() as u64,
@@ -3596,7 +3685,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3620,6 +3709,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: "stderr: init\n".len(),
                 is_stderr: true,
+                origin: ContentOrigin::Worker,
             }],
         };
         let mut pager = Pager::default();
@@ -3641,11 +3731,13 @@ mod tests {
                         start_byte: 0,
                         end_byte: "alpha foo\n".len(),
                         is_stderr: false,
+                        origin: ContentOrigin::Worker,
                     },
                     OutputTextSpan {
                         start_byte: "alpha foo\n".len(),
                         end_byte: appended_text.len(),
                         is_stderr: true,
+                        origin: ContentOrigin::Worker,
                     },
                 ],
             });
@@ -3654,7 +3746,7 @@ mod tests {
         let stream = contents
             .iter()
             .find_map(|content| match content {
-                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                WorkerContent::ContentText { text, stream, .. } if text.contains("alpha foo") => {
                     Some(*stream)
                 }
                 _ => None,
@@ -3683,16 +3775,19 @@ mod tests {
                     start_byte: 0,
                     end_byte: alpha_len,
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: alpha_len,
                     end_byte: alpha_len + foo_len,
                     is_stderr: true,
+                    origin: ContentOrigin::Worker,
                 },
                 OutputTextSpan {
                     start_byte: alpha_len + foo_len,
                     end_byte: text.len(),
                     is_stderr: false,
+                    origin: ContentOrigin::Worker,
                 },
             ],
         };
@@ -3705,7 +3800,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stdout) && text.contains("alpha ")
             )),
             "expected compact search card to keep the stdout prefix segment, got: {:?}",
@@ -3714,7 +3809,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stderr) && text.contains("foo")
             )),
             "expected compact search card to keep the stderr match segment, got: {:?}",
@@ -3723,7 +3818,7 @@ mod tests {
         assert!(
             contents.iter().any(|content| matches!(
                 content,
-                WorkerContent::ContentText { text, stream }
+                WorkerContent::ContentText { text, stream, .. }
                     if matches!(stream, TextStream::Stdout) && text.contains(" omega")
             )),
             "expected compact search card to keep the stdout suffix segment, got: {:?}",
@@ -3848,6 +3943,89 @@ mod tests {
     }
 
     #[test]
+    fn matches_and_hits_output_stay_server_originated() {
+        let mut pager = activate_pager_with_text("alpha foo\nbeta foo\n");
+
+        for (command, contents) in [
+            (
+                ":matches foo\n",
+                match pager.handle_command(":matches foo\n") {
+                    WorkerReply::Output { contents, .. } => contents,
+                },
+            ),
+            (
+                ":hits foo\n",
+                match pager.handle_command(":hits foo\n") {
+                    WorkerReply::Output { contents, .. } => contents,
+                },
+            ),
+        ] {
+            assert!(
+                contents.iter().all(|content| match content {
+                    WorkerContent::ContentText { origin, .. } => {
+                        matches!(origin, crate::worker_protocol::ContentOrigin::Server)
+                    }
+                    WorkerContent::ContentImage { .. } => true,
+                }),
+                "expected {command} output to stay server-originated, got: {:?}",
+                contents
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_output_replay_preserves_server_origin() {
+        let server_line = "[repl] session ended\n";
+        let worker_line = "worker output\n";
+        let bytes = format!("{server_line}{worker_line}").into_bytes();
+        let contents = contents_from_collapsed_output(
+            bytes,
+            vec![(
+                0,
+                OutputEventKind::Text {
+                    text: "[repl] output truncated (older output dropped)\n".to_string(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Server,
+                },
+            )],
+            vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: server_line.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Server,
+                },
+                OutputTextSpan {
+                    start_byte: server_line.len(),
+                    end_byte: server_line.len() + worker_line.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Worker,
+                },
+            ],
+            (server_line.len() + worker_line.len()) as u64,
+        );
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains(server_line) && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected collapsed replay to preserve server-originated pager text, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains("output truncated") && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected collapsed replay to preserve server-originated text events, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
     fn refreshed_extended_matches_session_keeps_discovered_position() {
         let text = (0..80)
             .map(|i| format!("entry-{i:03} foo\n"))
@@ -3868,7 +4046,9 @@ mod tests {
             );
         }
 
-        fixture.timeline.append_text(b"entry-080 foo\n", false);
+        fixture
+            .timeline
+            .append_text(b"entry-080 foo\n", false, ContentOrigin::Worker);
         fixture.pager.refresh_from_output(&fixture.output);
 
         let next = text_from_reply(fixture.pager.handle_command(":n\n"));

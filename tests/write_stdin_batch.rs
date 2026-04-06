@@ -3,6 +3,8 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+use std::fs;
+use std::path::PathBuf;
 #[cfg(not(windows))]
 use tokio::time::{Duration, sleep};
 
@@ -30,6 +32,29 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    disclosed_path(text, "transcript.txt")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
+}
+
+#[test]
+fn disclosed_path_parses_windows_paths() {
+    let text = "...[full output: C:\\Users\\runner\\AppData\\Local\\Temp\\mcp-repl-output\\output-0001\\transcript.txt]...";
+    assert_eq!(
+        bundle_transcript_path(text),
+        Some(PathBuf::from(
+            r"C:\Users\runner\AppData\Local\Temp\mcp-repl-output\output-0001\transcript.txt"
+        ))
+    );
 }
 
 #[cfg(not(windows))]
@@ -72,7 +97,7 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session(
+        .files_session(
             "timeout_list",
             mcp_session!(|session| {
                 session.write_stdin_with("Sys.sleep(5)", Some(2.0)).await;
@@ -90,19 +115,42 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
+    let mut session = common::spawn_server().await?;
 
-    snapshot
-        .session("timeout_poll", mcp_script! {
-            write_stdin("cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")", timeout = 0.5);
-            write_stdin("", timeout = 2.0);
-        })
+    let first = session
+        .write_stdin_raw_with(
+            "cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")",
+            Some(0.5),
+        )
         .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("start"),
+        "expected timeout reply to include early output, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout status marker, got: {first_text:?}"
+    );
 
-    assert_snapshot_or_skip(
-        "write_stdin_timeout_polling_returns_pending_output",
-        &snapshot,
-    )
+    let second = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let second_text = collect_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        !second_text.contains("<<repl status: busy"),
+        "expected empty poll to finish request, got: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("end"),
+        "expected empty poll to return trailing output, got: {second_text:?}"
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -132,7 +180,7 @@ async fn write_stdin_pager_search() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session("pager_search_queue", mcp_script! {
+        .pager_session("pager_search_queue", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":/line0050", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);
@@ -149,7 +197,7 @@ async fn write_stdin_pager_hits() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
     snapshot
-        .session("pager_hits_queue", mcp_script! {
+        .pager_session("pager_hits_queue", 300, mcp_script! {
             write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
             write_stdin(":hits line0150", timeout = 30.0);
             write_stdin(":n", timeout = 30.0);
@@ -175,7 +223,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -192,8 +240,6 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
-    // Large silent inputs should not be returned as echoed transcripts (which can trip pager mode
-    // and waste tokens). The backend prompt is still returned.
     let input = (1..=2_000)
         .map(|idx| format!("x{idx} <- {idx}\n"))
         .collect::<String>();
@@ -204,7 +250,7 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo-only input still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -212,23 +258,19 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     session.cancel().await?;
     assert!(
         !text.contains("--More--"),
-        "expected no pager activation for echo-only input, got: {text:?}"
+        "did not expect pager activation for echo-only input, got: {text:?}"
     );
     assert!(
-        text.trim_end().ends_with('>'),
-        "expected backend prompt, got: {text:?}"
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
     );
-    assert!(
-        text.len() < 1_000,
-        "expected trimmed output; got {} bytes",
-        text.len()
-    );
+    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_collapses_huge_echo_with_output_attribution() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
 
     let mut input = String::new();
     for idx in 1..=1_000 {
@@ -247,32 +289,59 @@ async fn write_stdin_collapses_huge_echo_with_output_attribution() -> TestResult
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
+    let transcript_path = bundle_transcript_path(&text);
+    let spill_text = transcript_path
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()?;
     session.cancel().await?;
     assert!(
-        text.contains("ok") && text.contains("done"),
-        "expected output from both cat() calls, got: {text:?}"
+        text.contains("transcript.txt") || (text.contains("ok") && text.contains("y500 <- 500")),
+        "expected either an inline transcript or a spill path, got: {text:?}"
     );
+    if let Some(spill_text) = spill_text {
+        assert!(
+            !spill_text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("ok") && spill_text.contains("done"),
+            "expected output from both cat() calls in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            text.contains("done"),
+            "expected the inline tail to keep the final output, got: {text:?}"
+        );
+    } else {
+        assert!(
+            text.contains("ok") && text.contains("done"),
+            "expected output from both cat() calls inline, got: {text:?}"
+        );
+        assert!(
+            !text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix inline, got: {text:?}"
+        );
+        assert!(
+            text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {text:?}"
+        );
+    }
     assert!(
-        text.contains("echoed input elided"),
-        "expected echo elision marker, got: {text:?}"
-    );
-    assert!(
-        !text.contains("x500 <- 500"),
-        "expected large echoed transcript to be collapsed, got: {text:?}"
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
     );
     assert!(
         !text.contains("--More--"),
-        "expected no pager activation for huge echo with small output, got: {text:?}"
-    );
-    assert!(
-        text.len() < 8_000,
-        "expected bounded output; got {} bytes",
-        text.len()
+        "did not expect pager activation for huge echo with small output, got: {text:?}"
     );
     Ok(())
 }

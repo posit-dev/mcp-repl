@@ -61,7 +61,7 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        text.contains(">") || text.contains("<<console status: busy"),
+        text.contains(">") || text.contains("<<repl status: busy"),
         "expected prompt or timeout status in output, got: {text:?}"
     );
     assert!(
@@ -86,7 +86,7 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
         if text.contains("worker is busy")
             || text.contains("request already running")
             || text.contains("input discarded while worker busy")
-            || text.contains("<<console status: busy")
+            || text.contains("<<repl status: busy")
         {
             sleep(Duration::from_millis(50)).await;
             continue;

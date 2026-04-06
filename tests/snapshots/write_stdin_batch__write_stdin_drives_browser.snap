@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: browser_queue ==
 -- step 1 --

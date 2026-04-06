@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 fn is_busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")

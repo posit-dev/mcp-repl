@@ -5,7 +5,7 @@ expression: snapshot.render_transcript()
 == session: interrupt_handler ==
 1) r_repl timeout_ms=200
 >>> tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat("interrupt received\n"))
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
 2) r_repl timeout_ms=5000
 >>> 

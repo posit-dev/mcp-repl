@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_transcripts.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: session_1 ==
 -- step 1 --

@@ -1,4 +1,4 @@
-use crate::worker_protocol::{TextStream, WorkerContent};
+use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 use super::{
     MATCH_BREADCRUMB_MAX_BYTES, MATCH_LINE_MAX_BYTES, MAX_MATCH_LIMIT, MatchSpec, PagerBuffer,
@@ -356,26 +356,29 @@ fn decoded_match_start_in_line(buffer: &PagerBuffer, line_start: u64, match_star
     String::from_utf8_lossy(&buffer.bytes[line_start_byte..match_start_byte]).len()
 }
 
-fn decoded_match_stream(
+fn decoded_match_style(
     buffer: &PagerBuffer,
     match_start: u64,
     line: &str,
     default_stream: TextStream,
-) -> TextStream {
+) -> (TextStream, ContentOrigin) {
     for span in &buffer.text_spans {
         if span.start <= match_start && match_start < span.end {
-            return if span.is_stderr {
-                TextStream::Stderr
-            } else {
-                TextStream::Stdout
-            };
+            return (
+                if span.is_stderr {
+                    TextStream::Stderr
+                } else {
+                    TextStream::Stdout
+                },
+                span.origin,
+            );
         }
     }
 
     if line.starts_with("stderr: ") {
-        TextStream::Stderr
+        (TextStream::Stderr, ContentOrigin::Worker)
     } else {
-        default_stream
+        (default_stream, ContentOrigin::Worker)
     }
 }
 
@@ -387,22 +390,30 @@ struct SnippetWindow {
     has_suffix_ellipsis: bool,
 }
 
-fn same_stream(left: TextStream, right: TextStream) -> bool {
-    matches!(
-        (left, right),
-        (TextStream::Stdout, TextStream::Stdout) | (TextStream::Stderr, TextStream::Stderr)
-    )
+fn same_text_content(
+    left_stream: TextStream,
+    left_origin: ContentOrigin,
+    right_stream: TextStream,
+    right_origin: ContentOrigin,
+) -> bool {
+    left_stream == right_stream && left_origin == right_origin
 }
 
-fn append_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: TextStream) {
+fn append_text_content(
+    contents: &mut Vec<WorkerContent>,
+    text: &str,
+    stream: TextStream,
+    origin: ContentOrigin,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(WorkerContent::ContentText {
         text: last_text,
         stream: last_stream,
+        origin: last_origin,
     }) = contents.last_mut()
-        && same_stream(*last_stream, stream)
+        && same_text_content(*last_stream, *last_origin, stream, origin)
     {
         last_text.push_str(text);
         return;
@@ -410,18 +421,25 @@ fn append_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: Te
     contents.push(WorkerContent::ContentText {
         text: text.to_string(),
         stream,
+        origin,
     });
 }
 
-fn prepend_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: TextStream) {
+fn prepend_text_content(
+    contents: &mut Vec<WorkerContent>,
+    text: &str,
+    stream: TextStream,
+    origin: ContentOrigin,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(WorkerContent::ContentText {
         text: first_text,
         stream: first_stream,
+        origin: first_origin,
     }) = contents.first_mut()
-        && same_stream(*first_stream, stream)
+        && same_text_content(*first_stream, *first_origin, stream, origin)
     {
         let mut combined = String::with_capacity(text.len() + first_text.len());
         combined.push_str(text);
@@ -434,20 +452,21 @@ fn prepend_text_content(contents: &mut Vec<WorkerContent>, text: &str, stream: T
         WorkerContent::ContentText {
             text: text.to_string(),
             stream,
+            origin,
         },
     );
 }
 
-fn first_text_stream(contents: &[WorkerContent]) -> Option<TextStream> {
+fn first_text_style(contents: &[WorkerContent]) -> Option<(TextStream, ContentOrigin)> {
     contents.iter().find_map(|content| match content {
-        WorkerContent::ContentText { stream, .. } => Some(*stream),
+        WorkerContent::ContentText { stream, origin, .. } => Some((*stream, *origin)),
         WorkerContent::ContentImage { .. } => None,
     })
 }
 
-fn last_text_stream(contents: &[WorkerContent]) -> Option<TextStream> {
+fn last_text_style(contents: &[WorkerContent]) -> Option<(TextStream, ContentOrigin)> {
     contents.iter().rev().find_map(|content| match content {
-        WorkerContent::ContentText { stream, .. } => Some(*stream),
+        WorkerContent::ContentText { stream, origin, .. } => Some((*stream, *origin)),
         WorkerContent::ContentImage { .. } => None,
     })
 }
@@ -469,6 +488,7 @@ fn push_line_segment(
     segment_start: u64,
     segment_end: u64,
     stream: TextStream,
+    origin: ContentOrigin,
 ) {
     if segment_start >= segment_end {
         return;
@@ -480,7 +500,7 @@ fn push_line_segment(
     if start_byte >= end_byte {
         return;
     }
-    append_text_content(contents, &line[start_byte..end_byte], stream);
+    append_text_content(contents, &line[start_byte..end_byte], stream, origin);
 }
 
 fn render_match_snippet_contents(
@@ -492,7 +512,8 @@ fn render_match_snippet_contents(
     default_stream: TextStream,
 ) -> Vec<WorkerContent> {
     let trimmed = line.trim_end();
-    let snippet_stream = decoded_match_stream(buffer, match_start, line, default_stream);
+    let (snippet_stream, snippet_origin) =
+        decoded_match_style(buffer, match_start, line, default_stream);
     let snippet_start_chars = trimmed[..window.start_byte].chars().count() as u64;
     let snippet_end_chars = trimmed[..window.end_byte].chars().count() as u64;
     let snippet_start = line_start.saturating_add(snippet_start_chars);
@@ -513,6 +534,7 @@ fn render_match_snippet_contents(
                 cursor,
                 segment_start,
                 snippet_stream,
+                snippet_origin,
             );
         }
         let segment_end = span.end.min(snippet_end);
@@ -527,6 +549,7 @@ fn render_match_snippet_contents(
             } else {
                 TextStream::Stdout
             },
+            span.origin,
         );
         cursor = segment_end;
     }
@@ -539,6 +562,7 @@ fn render_match_snippet_contents(
             cursor,
             snippet_end,
             snippet_stream,
+            snippet_origin,
         );
     }
 
@@ -547,6 +571,7 @@ fn render_match_snippet_contents(
             &mut contents,
             &trimmed[window.start_byte..window.end_byte],
             snippet_stream,
+            snippet_origin,
         );
     }
 
@@ -555,16 +580,18 @@ fn render_match_snippet_contents(
     if window.has_prefix_ellipsis {
         prefix.push_str("...");
     }
-    let prefix_stream = first_text_stream(&contents).unwrap_or(snippet_stream);
-    prepend_text_content(&mut contents, &prefix, prefix_stream);
+    let (prefix_stream, prefix_origin) =
+        first_text_style(&contents).unwrap_or((snippet_stream, snippet_origin));
+    prepend_text_content(&mut contents, &prefix, prefix_stream, prefix_origin);
 
     let suffix = if window.has_suffix_ellipsis {
         "...\n"
     } else {
         "\n"
     };
-    let suffix_stream = last_text_stream(&contents).unwrap_or(snippet_stream);
-    append_text_content(&mut contents, suffix, suffix_stream);
+    let (suffix_stream, suffix_origin) =
+        last_text_style(&contents).unwrap_or((snippet_stream, snippet_origin));
+    append_text_content(&mut contents, suffix, suffix_stream, suffix_origin);
     contents
 }
 
@@ -755,7 +782,7 @@ pub(super) fn take_matches(
 ) -> (Vec<WorkerContent>, RangeSpan, Vec<(u64, u64)>) {
     if session.hits.is_empty() {
         return (
-            vec![WorkerContent::stderr(pattern_not_found_message(
+            vec![WorkerContent::server_stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
@@ -816,12 +843,12 @@ pub(super) fn take_matches(
 
     (
         vec![
-            WorkerContent::stderr(match_header(
+            WorkerContent::server_stderr(match_header(
                 session.hits.len().min(spec.limit),
                 spec.limit,
                 more_available,
             )),
-            WorkerContent::stdout(output),
+            WorkerContent::server_stdout(output),
         ],
         span,
         view_ranges,
@@ -1160,7 +1187,7 @@ pub(super) fn render_search_card(
 ) -> (Vec<WorkerContent>, Option<(u64, u64)>, Option<u64>) {
     let Some(hit) = session.hits.get(session.current_index) else {
         return (
-            vec![WorkerContent::stderr(pattern_not_found_message(
+            vec![WorkerContent::server_stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
@@ -1190,15 +1217,18 @@ pub(super) fn render_search_card(
             session.pattern.pattern, hit.match_start
         )
     };
-    let mut contents = vec![WorkerContent::stderr(header)];
+    let mut contents = vec![WorkerContent::server_stderr(header)];
     if let Some(message) = prior_view_message(view_history, hit.match_start) {
-        contents.push(WorkerContent::stderr(message));
+        contents.push(WorkerContent::server_stderr(message));
     }
 
     let line = read_line_text(buffer, hit.line_idx);
     let match_start_in_line = decoded_match_start_in_line(buffer, hit.line_start, hit.match_start);
     if hit.breadcrumb != "root" {
-        contents.push(WorkerContent::stderr(format!("{}\n", hit.breadcrumb)));
+        contents.push(WorkerContent::server_stderr(format!(
+            "{}\n",
+            hit.breadcrumb
+        )));
     }
     let window = snippet_window_around_match(&line, match_start_in_line, &session.pattern.pattern);
     contents.extend(render_match_snippet_contents(
@@ -1324,7 +1354,7 @@ pub(super) fn take_hits_next(
                 let pages_left_now = pages_left_for_buffer(buffer, page_bytes);
                 if output.is_empty() {
                     return (
-                        vec![WorkerContent::stderr(all_matches_shown_message(
+                        vec![WorkerContent::server_stderr(all_matches_shown_message(
                             &hit_state.pattern.pattern,
                         ))],
                         pages_left_now,
@@ -1333,7 +1363,7 @@ pub(super) fn take_hits_next(
                     );
                 }
                 return (
-                    vec![WorkerContent::stdout(output)],
+                    vec![WorkerContent::server_stdout(output)],
                     pages_left_now,
                     span,
                     view_ranges,
@@ -1344,7 +1374,7 @@ pub(super) fn take_hits_next(
                 if output.is_empty() {
                     let start_offset = buffer.current_offset();
                     return (
-                        vec![WorkerContent::stderr(pattern_not_found_message(
+                        vec![WorkerContent::server_stderr(pattern_not_found_message(
                             &hit_state.pattern.pattern,
                             start_offset,
                         ))],
@@ -1354,7 +1384,7 @@ pub(super) fn take_hits_next(
                     );
                 }
                 return (
-                    vec![WorkerContent::stdout(output)],
+                    vec![WorkerContent::server_stdout(output)],
                     pages_left_now,
                     span,
                     view_ranges,
@@ -1368,7 +1398,7 @@ pub(super) fn take_hits_next(
         (Vec::new(), pages_left_now, RangeSpan::default(), Vec::new())
     } else {
         (
-            vec![WorkerContent::stdout(output)],
+            vec![WorkerContent::server_stdout(output)],
             pages_left_now,
             span,
             view_ranges,
@@ -1574,6 +1604,40 @@ mod tests {
         assert!(
             !message.contains(":skip 1"),
             "expected :where not to suggest skipping past a match that is now on the next unseen page, got: {message}"
+        );
+    }
+
+    #[test]
+    fn search_card_snippet_preserves_server_origin() {
+        let line = "[repl] session ended\n";
+        let buffer = PagerBuffer::from_bytes_and_events(
+            line.as_bytes().to_vec(),
+            Vec::new(),
+            vec![crate::output_capture::OutputTextSpan {
+                start_byte: 0,
+                end_byte: line.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Server,
+            }],
+            line.len() as u64,
+        );
+        let pattern = SearchPattern {
+            pattern: "session ended".to_string(),
+            case_insensitive_ascii: false,
+        };
+        let session = build_full_search_session(&buffer, &pattern, 0).expect("expected search hit");
+
+        let (contents, _, _) = render_search_card(&buffer, &session, &[], TextStream::Stdout);
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, origin, .. }
+                    if text.contains("[match] [repl] session ended")
+                        && matches!(origin, ContentOrigin::Server)
+            )),
+            "expected search-card body to preserve server origin, got: {:?}",
+            contents
         );
     }
 }

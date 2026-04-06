@@ -5,11 +5,11 @@ expression: snapshot.render_transcript()
 == session: timeout_list ==
 1) r_repl timeout_ms=2000
 >>> Sys.sleep(5)
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
 2) r_repl timeout_ms=1000
 >>> 1+1
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 <<< [repl] input discarded while worker busy
 
 3) r_repl timeout_ms=10000

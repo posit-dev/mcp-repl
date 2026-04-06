@@ -4,24 +4,34 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use rmcp::model::{CallToolResult, RawContent};
+
 use crate::backend::Backend;
-use crate::pager;
+use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::SandboxCliPlan;
+use crate::server::response::{
+    ResponseState, TimeoutBundleReuse, text_stream_from_content, timeout_bundle_reuse_for_input,
+};
 use crate::worker_process::{WorkerError, WorkerManager};
-use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
+use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SAFETY_MARGIN: f64 = 1.05;
 const MIN_SERVER_GRACE: Duration = Duration::from_secs(1);
-const DEBUG_REPL_PAGE_CHARS: u64 = 300;
 const INITIAL_PROMPT_WAIT: Duration = Duration::from_secs(5);
 const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+struct VisibleReplyContext {
+    pending_request_after: bool,
+    detached_prefix_item_count: usize,
+    timeout_bundle_reuse: TimeoutBundleReuse,
+}
 
 pub(crate) fn run(
     backend: Backend,
     sandbox_plan: SandboxCliPlan,
+    oversized_output: OversizedOutputMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_debug_repl_page_size();
     let image_support = detect_image_support();
     eprintln!(
         "debug repl: write_stdin timeout={:.1}s | end input with END | commands: INTERRUPT, RESTART | Ctrl-D to exit | images={}",
@@ -33,10 +43,26 @@ pub(crate) fn run(
     let mut stderr = io::stderr();
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
-    let mut worker = WorkerManager::new(backend, sandbox_plan)?;
+    let mut worker = WorkerManager::new(backend, sandbox_plan, oversized_output)?;
+    let mut response = if oversized_output == OversizedOutputMode::Files {
+        Some(ResponseState::new()?)
+    } else {
+        None
+    };
     worker.warm_start()?;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
-    render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+    render_visible_reply(
+        response.as_mut(),
+        Ok(reply),
+        VisibleReplyContext {
+            pending_request_after: worker.pending_request(),
+            detached_prefix_item_count: worker.detached_prefix_item_count(),
+            timeout_bundle_reuse: TimeoutBundleReuse::FullReply,
+        },
+        &mut stdout,
+        &mut stderr,
+        image_support,
+    )?;
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -47,13 +73,35 @@ pub(crate) fn run(
         };
 
         if is_exact_command(&line, "INTERRUPT") {
-            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT);
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: 0,
+                    timeout_bundle_reuse: timeout_bundle_reuse_for_exact_command("INTERRUPT"),
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
+            )?;
             continue;
         }
         if is_exact_command(&line, "RESTART") {
-            let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT);
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: 0,
+                    timeout_bundle_reuse: timeout_bundle_reuse_for_exact_command("RESTART"),
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
+            )?;
             continue;
         }
         if is_exact_command(&line, "END") {
@@ -63,8 +111,19 @@ pub(crate) fn run(
                 server_timeout,
                 None,
                 false,
+            );
+            render_visible_reply(
+                response.as_mut(),
+                reply,
+                VisibleReplyContext {
+                    pending_request_after: worker.pending_request(),
+                    detached_prefix_item_count: worker.detached_prefix_item_count(),
+                    timeout_bundle_reuse: TimeoutBundleReuse::FullReply,
+                },
+                &mut stdout,
+                &mut stderr,
+                image_support,
             )?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
             continue;
         }
 
@@ -83,14 +142,30 @@ pub(crate) fn run(
             }
         }
 
+        let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
         let reply = worker.write_stdin(
             input,
             DEFAULT_WRITE_STDIN_TIMEOUT,
             server_timeout,
             None,
             false,
+        );
+        render_visible_reply(
+            response.as_mut(),
+            reply,
+            VisibleReplyContext {
+                pending_request_after: worker.pending_request(),
+                detached_prefix_item_count: worker.detached_prefix_item_count(),
+                timeout_bundle_reuse,
+            },
+            &mut stdout,
+            &mut stderr,
+            image_support,
         )?;
-        render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+    }
+
+    if let Some(response) = response.as_mut() {
+        response.shutdown()?;
     }
 
     Ok(())
@@ -144,6 +219,14 @@ fn is_exact_command(line: &str, command: &str) -> bool {
     trimmed == command
 }
 
+fn timeout_bundle_reuse_for_exact_command(command: &str) -> TimeoutBundleReuse {
+    match command {
+        "INTERRUPT" => TimeoutBundleReuse::FullReply,
+        "RESTART" => TimeoutBundleReuse::None,
+        _ => unreachable!("unsupported exact debug repl command: {command}"),
+    }
+}
+
 fn split_end_marker(line: &str) -> (String, bool) {
     let (body, _newline) = split_line_ending(line);
     if let Some(prefix) = body.strip_suffix("END") {
@@ -188,7 +271,7 @@ fn render_reply(
             }
             for content in contents {
                 match content {
-                    WorkerContent::ContentText { text, stream } => match stream {
+                    WorkerContent::ContentText { text, stream, .. } => match stream {
                         TextStream::Stdout => stdout.write_all(text.as_bytes())?,
                         TextStream::Stderr => stderr.write_all(text.as_bytes())?,
                     },
@@ -217,6 +300,102 @@ fn render_reply(
     Ok(())
 }
 
+fn render_visible_reply(
+    response: Option<&mut ResponseState>,
+    reply: Result<WorkerReply, WorkerError>,
+    context: VisibleReplyContext,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    image_support: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(response) = response {
+        let error_banner = reply_error_banner(&reply);
+        let reply = response.finalize_worker_result(
+            reply,
+            context.pending_request_after,
+            context.timeout_bundle_reuse,
+            context.detached_prefix_item_count,
+        );
+        render_finalized_reply(reply, error_banner, stdout, stderr, image_support)?;
+        return Ok(());
+    }
+
+    render_reply(reply?, stdout, stderr, image_support)?;
+    Ok(())
+}
+
+fn reply_error_banner(reply: &Result<WorkerReply, WorkerError>) -> Option<Option<WorkerErrorCode>> {
+    match reply {
+        Ok(WorkerReply::Output {
+            is_error,
+            error_code,
+            ..
+        }) => {
+            if error_code.is_some() {
+                Some(*error_code)
+            } else if *is_error {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        Err(_) => Some(None),
+    }
+}
+
+fn render_finalized_reply(
+    reply: CallToolResult,
+    error_banner: Option<Option<WorkerErrorCode>>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    image_support: bool,
+) -> io::Result<()> {
+    if let Some(code) = error_banner.flatten() {
+        writeln!(stderr, "[repl] error: {code:?}")?;
+    } else if error_banner.is_some() {
+        writeln!(stderr, "[repl] error")?;
+    }
+
+    for content in reply.content {
+        let stream = text_stream_from_content(&content).unwrap_or(TextStream::Stdout);
+        match content.raw {
+            RawContent::Text(text) => match stream {
+                TextStream::Stdout => stdout.write_all(text.text.as_bytes())?,
+                TextStream::Stderr => stderr.write_all(text.text.as_bytes())?,
+            },
+            RawContent::Image(image) => {
+                if image_support && write_kitty_image(stdout, &image.data, &image.mime_type)? {
+                    // image rendered
+                } else {
+                    writeln!(
+                        stderr,
+                        "[repl] image mime={} bytes={}",
+                        image.mime_type,
+                        image.data.len()
+                    )?;
+                }
+            }
+            RawContent::Audio(audio) => {
+                writeln!(
+                    stderr,
+                    "[repl] audio mime={} bytes={}",
+                    audio.mime_type,
+                    audio.data.len()
+                )?;
+            }
+            RawContent::Resource(_) => {
+                writeln!(stderr, "[repl] resource content omitted")?;
+            }
+            RawContent::ResourceLink(_) => {
+                writeln!(stderr, "[repl] resource link omitted")?;
+            }
+        }
+    }
+    stdout.flush()?;
+    stderr.flush()?;
+    Ok(())
+}
+
 fn detect_image_support() -> bool {
     if let Ok(value) = env::var("MCP_REPL_IMAGES") {
         return is_truthy(&value);
@@ -230,18 +409,6 @@ fn detect_image_support() -> bool {
     }
     let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     matches!(term_program.as_str(), "ghostty" | "wezterm" | "iterm.app")
-}
-
-fn ensure_debug_repl_page_size() {
-    if env::var_os(pager::PAGER_PAGE_CHARS_ENV).is_some() {
-        return;
-    }
-    unsafe {
-        env::set_var(
-            pager::PAGER_PAGE_CHARS_ENV,
-            DEBUG_REPL_PAGE_CHARS.to_string(),
-        );
-    }
 }
 
 fn is_truthy(value: &str) -> bool {
@@ -283,7 +450,32 @@ fn write_kitty_image(stdout: &mut impl Write, data: &str, mime_type: &str) -> io
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::server::response::{ResponseState, TimeoutBundleReuse};
+    use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
+
+    fn rendered_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| match &content.raw {
+                RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn transcript_path(text: &str) -> Option<std::path::PathBuf> {
+        let end = text
+            .find("transcript.txt")?
+            .saturating_add("transcript.txt".len());
+        let start = text[..end]
+            .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+            .map_or(0, |idx| idx.saturating_add(1));
+        Some(std::path::PathBuf::from(&text[start..end]))
+    }
 
     #[test]
     fn detect_image_support_uses_mcp_repl_env() {
@@ -301,5 +493,101 @@ mod tests {
             },
         }
         assert!(enabled, "expected MCP_REPL_IMAGES=1 to enable images");
+    }
+
+    #[test]
+    fn finalized_reply_preserves_stderr_routing() {
+        let mut response = ResponseState::new().expect("response state should initialize");
+        let reply = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![
+                    WorkerContent::worker_stdout("stdout line\n"),
+                    WorkerContent::worker_stderr("stderr: boom\n"),
+                ],
+                is_error: true,
+                error_code: None,
+                prompt: None,
+                prompt_variants: None,
+            }),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_finalized_reply(reply, Some(None), &mut stdout, &mut stderr, false)
+            .expect("finalized reply should render");
+
+        let stdout = String::from_utf8(stdout).expect("stdout should be valid UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr should be valid UTF-8");
+        assert!(
+            stdout.contains("stdout line\n"),
+            "expected stdout text on stdout, got: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("stderr: boom\n"),
+            "stderr chunk leaked to stdout: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("[repl] error\n"),
+            "expected error banner on stderr, got: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("stderr: boom\n"),
+            "expected stderr chunk on stderr, got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn exact_interrupt_keeps_disclosed_timeout_bundle_open() {
+        let mut response = ResponseState::new().expect("response state should initialize");
+        let timed_out_head = format!("HEAD_START\n{}\nHEAD_END\n", "x".repeat(5000));
+        let first = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![WorkerContent::worker_stdout(timed_out_head)],
+                is_error: false,
+                error_code: Some(WorkerErrorCode::Timeout),
+                prompt: None,
+                prompt_variants: None,
+            }),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = rendered_text(&first);
+        let transcript_path = transcript_path(&first_text).unwrap_or_else(|| {
+            panic!("expected transcript path after timed-out output, got: {first_text:?}")
+        });
+
+        let interrupt_tail = "INTERRUPT_TAIL\n";
+        let second = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![WorkerContent::worker_stdout(interrupt_tail)],
+                is_error: false,
+                error_code: None,
+                prompt: Some("> ".to_string()),
+                prompt_variants: None,
+            }),
+            false,
+            timeout_bundle_reuse_for_exact_command("INTERRUPT"),
+            0,
+        );
+        let second_text = rendered_text(&second);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            second_text.contains(interrupt_tail),
+            "expected interrupt reply to stay visible inline, got: {second_text:?}"
+        );
+        assert!(
+            transcript.contains("HEAD_START") && transcript.contains("HEAD_END"),
+            "expected earlier timed-out output in the disclosed transcript, got: {transcript:?}"
+        );
+        assert!(
+            transcript.contains(interrupt_tail),
+            "expected exact INTERRUPT to keep appending to the disclosed timeout bundle, got: {transcript:?}"
+        );
     }
 }

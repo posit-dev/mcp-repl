@@ -7,7 +7,7 @@ OpenAI Codex vN.NN.N (research preview)
 --------
 workdir: <WORKSPACE>
 model: gpt-5.3-codex
-provider: openai
+provider: mock-openai
 approval: never
 sandbox: workspace-write [workdir, /tmp, $TMPDIR, <CODEX_HOME>/memories]
 reasoning effort: none
@@ -16,24 +16,8 @@ session id: <SESSION_ID>
 --------
 user
 SANDBOX_TEST_1: run the sandbox write test
-mcp: r starting
-mcp: r ready
-mcp startup: ready: r
-tool r.repl({"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"})
-r.repl({"input":"target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"}) success in Nms:
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "[repl] echoed input elided: 8 lines (203 bytes); head: > target <- tempfile(\"mcp-repl-codex\"); tail: + })\nWRITE_OK\n"
-    },
-    {
-      "type": "text",
-      "text": "> "
-    }
-  ],
-  "isError": false
-}
+mcp: r/repl started
+mcp: r/repl (completed)
 codex
 Tool call 1 completed
 Tool call 1 completed

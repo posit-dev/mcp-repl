@@ -1,6 +1,6 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: restart_interrupt ==
 1) r_repl timeout_ms=10000
@@ -13,7 +13,6 @@ expression: snapshot.render_transcript()
 >>> 
 >>> plot(5:1, type = "l")
 >>> cat("plots_done\n")
-<<< [repl] echoed input elided: 3 lines (49 bytes); head: > ; tail: > cat("plots_done\n")
 <<< plots_done
 <<< [image/png len=0]
 
@@ -27,7 +26,7 @@ expression: snapshot.render_transcript()
 
 5) r_repl timeout_ms=200
 >>> Sys.sleep(5)
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
 6) r_repl timeout_ms=5000
 >>> 

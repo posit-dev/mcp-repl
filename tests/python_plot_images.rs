@@ -4,8 +4,12 @@ mod common;
 
 use base64::Engine as _;
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -38,6 +42,49 @@ fn result_text(result: &CallToolResult) -> String {
         .join("")
 }
 
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn top_level_entry_names(dir: &Path) -> TestResult<Vec<String>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn relative_file_paths(root: &Path) -> TestResult<Vec<String>> {
+    let mut paths = Vec::new();
+    collect_relative_file_paths(root, root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_relative_file_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> TestResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_relative_file_paths(root, &path, out)?;
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("file should be under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(relative);
+    }
+    Ok(())
+}
+
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
     let mut value = serde_json::to_value(result)
         .unwrap_or_else(|_| serde_json::json!({"error": "failed to serialize response"}));
@@ -63,6 +110,26 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
         }
     }
     value
+}
+
+fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
+    let snapshot = response_snapshot(result);
+    let content = snapshot
+        .get("content")
+        .and_then(|value| value.as_array())
+        .expect("tool result content should be an array");
+    for item in content {
+        let is_image = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "image");
+        if is_image {
+            assert!(
+                item.get("_meta").is_none(),
+                "expected image results to omit _meta for {context}: {item}"
+            );
+        }
+    }
 }
 
 fn step_snapshot(input: &str, result: &CallToolResult) -> PlotStepSnapshot {
@@ -333,7 +400,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -346,7 +413,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &plot_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let update_input = format!(
         "{}; plt.figure(1); plt.plot(list(range(4, 9)), list(range(4, 9))); plt.show()",
         python_plot_preamble()
@@ -357,7 +424,7 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&update_input, &update_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -385,6 +452,8 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "python base plot");
+    assert_images_expose_no_meta(&update_result, "python plot update");
     assert!(
         !plot_images.is_empty(),
         "expected base plot to emit image content"
@@ -414,7 +483,7 @@ async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -427,14 +496,14 @@ async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &first_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let second_result = session
         .write_stdin_raw_with(&plot_input, Some(30.0))
         .await?;
     steps.push(step_snapshot(&plot_input, &second_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -490,7 +559,7 @@ async fn python_multi_panel_plots_emit_single_image() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -521,6 +590,7 @@ async fn python_multi_panel_plots_emit_single_image() -> TestResult<()> {
     );
 
     let plot_images = extract_images(&plot_result);
+    assert_images_expose_no_meta(&plot_result, "python multi-panel plot");
     assert_eq!(
         plot_images.len(),
         1,
@@ -557,11 +627,16 @@ async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
-        "expected paged output to still include plot image content"
+        "expected large output to still include plot image content"
     );
     assert!(
-        result_text(&result).contains("--More--"),
-        "expected pager footer in response"
+        !result_text(&result).contains("--More--"),
+        "did not expect pager footer in response"
+    );
+    assert!(
+        !result_text(&result).contains("full output:"),
+        "did not expect oversized-output path marker in mixed text+image reply: {}",
+        result_text(&result)
     );
 
     Ok(())
@@ -572,7 +647,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -585,7 +660,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &plot_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let update_input = format!(
         "{}; plt.figure(2); plt.plot([0.1, 0.9], [0.9, 0.1]); plt.show()",
         python_plot_preamble()
@@ -596,7 +671,7 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     steps.push(step_snapshot(&update_input, &update_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -624,6 +699,8 @@ async fn python_grid_plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "python grid base plot");
+    assert_images_expose_no_meta(&update_result, "python grid plot update");
     assert!(
         !plot_images.is_empty(),
         "expected grid plot to emit image content"
@@ -653,7 +730,7 @@ async fn python_grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = format!(
@@ -666,14 +743,14 @@ async fn python_grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     steps.push(step_snapshot(&plot_input, &first_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let second_result = session
         .write_stdin_raw_with(&plot_input, Some(30.0))
         .await?;
     steps.push(step_snapshot(&plot_input, &second_result));
     session.cancel().await?;
 
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
     steps.push(step_snapshot(noop_input, &noop_result));
@@ -732,7 +809,7 @@ async fn python_plot_updates_in_single_request_collapse() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = common::spawn_python_server().await?;
+    let mut session = common::spawn_python_server_with_files().await?;
 
     let input = format!(
         "{}; plt.figure(1); plt.clf(); plt.plot(list(range(1, 11))); plt.plot(list(range(2, 10)), list(range(2, 10))); plt.plot(list(range(2, 10)), list(range(2, 10))); plt.show()",
@@ -759,7 +836,7 @@ async fn python_plot_updates_in_single_request_collapse() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_emitted_after_truncation() -> TestResult<()> {
+async fn python_plot_emitted_after_large_output() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
@@ -781,14 +858,200 @@ async fn python_plot_emitted_after_truncation() -> TestResult<()> {
 
     let text = result_text(&result);
     assert!(
-        text.contains("output truncated"),
-        "expected truncation notice, got: {text:?}"
+        text.contains("END"),
+        "expected the tail of the large output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("output truncated"),
+        "did not expect truncation notice, got: {text:?}"
     );
 
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
         "expected plot image even after truncation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images() -> TestResult<()>
+{
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let mut session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        "{}; exec(\"for i in range(1, 7):\\n    print(f'warn{{i:03d}}')\\n    plt.figure(i)\\n    plt.clf()\\n    plt.plot(list(range(1, 11)))\\n    plt.title(f'plot{{i:03d}}')\\n    plt.show()\")",
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot output bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected output-bundle reply to keep exactly two inline images"
+    );
+    assert_eq!(
+        top_level_images,
+        vec![
+            "001.png".to_string(),
+            "002.png".to_string(),
+            "003.png".to_string(),
+            "004.png".to_string(),
+            "005.png".to_string(),
+            "006.png".to_string(),
+            "history".to_string(),
+        ],
+        "expected top-level final image aliases in output bundle"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "002/001.png".to_string(),
+            "003/001.png".to_string(),
+            "004/001.png".to_string(),
+            "005/001.png".to_string(),
+            "006/001.png".to_string(),
+        ],
+        "expected image history files grouped under images/history"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected first inline image to match first top-level final alias"
+    );
+    assert_eq!(
+        images[1].bytes,
+        fs::read(bundle_dir.join("images/006.png"))?,
+        "expected second inline image to match last top-level final alias"
+    );
+    assert!(
+        text.contains("events.log"),
+        "expected response to teach client about events.log, got: {text:?}"
+    );
+    assert!(
+        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
+        "expected events.log header, got: {events:?}"
+    );
+    assert!(
+        events.contains("T lines="),
+        "expected text range entries in events.log, got: {events:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/006/001.png"),
+        "expected first/last image entries in events.log, got: {events:?}"
+    );
+    assert!(
+        transcript.contains("warn001") && transcript.contains("warn006"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("images/history/001/001.png"),
+        "did not expect transcript.txt to contain image paths, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_same_reply_plot_updates_bundle_preserves_image_history() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let mut session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        "{}; exec(\"big = 'h' * {}\\nprint('HISTORY_START')\\nprint(big)\\nprint('HISTORY_END')\\nplt.figure(1)\\nplt.clf()\\nplt.plot(list(range(1, 11)))\\nplt.plot(list(range(2, 10)), list(range(2, 10)))\\nplt.plot(list(range(3, 9)), list(range(3, 9)))\\nplt.show()\")",
+        python_plot_preamble(),
+        5000,
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "same-reply plot history bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        1,
+        "expected same-reply updates to stay collapsed inline"
+    );
+    assert_eq!(
+        top_level_images,
+        vec!["001.png".to_string(), "history".to_string()],
+        "expected one top-level final alias plus history"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "001/002.png".to_string(),
+            "001/003.png".to_string(),
+        ],
+        "expected every same-reply image update in bundle history"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected inline image to match final top-level alias"
+    );
+    assert_eq!(
+        fs::read(bundle_dir.join("images/001.png"))?,
+        fs::read(bundle_dir.join("images/history/001/003.png"))?,
+        "expected final alias to match the last history entry"
+    );
+    assert!(
+        transcript.contains("HISTORY_START") && transcript.contains("HISTORY_END"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/001/003.png"),
+        "expected events.log to cover the full same-reply history, got: {events:?}"
     );
 
     Ok(())

@@ -6,6 +6,7 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
+use regex_lite::Regex;
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -21,7 +22,6 @@ use tokio::process::Command;
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
-const PAGER_PAGE_CHARS_ENV: &str = "MCP_REPL_PAGER_PAGE_CHARS";
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 
@@ -211,7 +211,7 @@ fn strip_trailing_prompt(text: &str) -> String {
 }
 
 fn normalize_text_snapshot(text: &str) -> String {
-    let normalized = normalize_newlines(text.to_string());
+    let normalized = normalize_output_bundle_paths(&normalize_newlines(text.to_string()));
     let mut stripped = strip_trailing_prompt(&normalized);
     while stripped.ends_with('\n') {
         stripped.pop();
@@ -220,6 +220,31 @@ fn normalize_text_snapshot(text: &str) -> String {
         stripped = format!("stderr:{rest}");
     }
     stripped
+}
+
+fn normalize_output_bundle_paths(text: &str) -> String {
+    static OUTPUT_BUNDLE_PATH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = OUTPUT_BUNDLE_PATH_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?x)
+            (?:[A-Za-z]:)?(?:[/\\][^\s\]"')]+)*[/\\]
+            mcp-repl-output(?:-[A-Za-z0-9]+)?[/\\]
+            output-\d{4}[/\\]
+            (?:transcript\.txt|events\.log)
+        "#,
+        )
+        .expect("output bundle path regex")
+    });
+    re.replace_all(text, |captures: &regex_lite::Captures<'_>| {
+        let matched = captures.get(0).expect("full match").as_str();
+        let leaf = if matched.ends_with("events.log") {
+            "events.log"
+        } else {
+            "transcript.txt"
+        };
+        format!("<mcp-repl-output>/output-0001/{leaf}")
+    })
+    .into_owned()
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -365,15 +390,12 @@ impl McpTestSession {
             }
         };
 
-        let result = self
-            .service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: request_tool.into(),
-                arguments: arguments_for_mcp,
-                task: None,
-            })
-            .await;
+        let request = match arguments_for_mcp {
+            Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
+            None => CallToolRequestParams::new(request_tool),
+        };
+
+        let result = self.service.call_tool(request).await;
 
         let response = match result {
             Ok(result) => SnapshotResponse::ToolResult(tool_result_snapshot(&result)),
@@ -406,14 +428,12 @@ impl McpTestSession {
                 )));
             }
         };
-        self.service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: request_tool.into(),
-                arguments,
-                task: None,
-            })
-            .await
+        let request = match arguments {
+            Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
+            None => CallToolRequestParams::new(request_tool),
+        };
+
+        self.service.call_tool(request).await
     }
 
     pub async fn write_stdin_raw_with(
@@ -422,7 +442,7 @@ impl McpTestSession {
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
-        if !input.ends_with('\n') {
+        if !input.is_empty() && !input.ends_with('\n') {
             input.push('\n');
         }
         let timeout = normalized_test_timeout(timeout);
@@ -507,6 +527,43 @@ impl McpSnapshot {
     {
         let name = name.into();
         let mut session = spawn_server().await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
+    pub async fn files_session<F>(&mut self, name: impl Into<String>, f: F) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_server_with_files().await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
+    pub async fn pager_session<F>(
+        &mut self,
+        name: impl Into<String>,
+        page_chars: u64,
+        f: F,
+    ) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_server_with_pager_page_chars(page_chars).await?;
         f(&mut session).await?;
         let steps = session.steps.clone();
         session.cancel().await?;
@@ -631,7 +688,7 @@ fn normalize_snapshot_text(text: &str) -> String {
     if text.starts_with("\n[repl] session ended") {
         return text.trim_start_matches('\n').to_string();
     }
-    let text = normalize_busy_timeout_elapsed_ms(&normalize_pager_elision(text));
+    let text = normalize_busy_timeout_elapsed_ms(text);
     if !text.contains("stderr:") {
         return text;
     }
@@ -691,34 +748,6 @@ fn normalize_busy_timeout_elapsed_ms(text: &str) -> String {
             end += 1;
         }
         if end > abs + marker.len() {
-            out.push('N');
-        }
-        idx = end;
-    }
-    out.push_str(&text[idx..]);
-    out
-}
-
-fn normalize_pager_elision(text: &str) -> String {
-    let marker = "[pager] elided output: @";
-    let mut out = String::with_capacity(text.len());
-    let mut idx = 0;
-    while let Some(pos) = text[idx..].find(marker) {
-        let abs = idx + pos;
-        out.push_str(&text[idx..abs]);
-        out.push_str(marker);
-        let mut end = abs + marker.len();
-        let bytes = text.as_bytes();
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end + 1 < bytes.len() && bytes[end] == b'.' && bytes[end + 1] == b'.' {
-            end += 2;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            out.push_str("N..N");
-        } else {
             out.push('N');
         }
         idx = end;
@@ -901,7 +930,11 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
 }
 
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_pager_page_chars(TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(Vec::new(), Vec::new()).await
+}
+
+pub async fn spawn_server_with_files() -> TestResult<McpTestSession> {
+    spawn_server_with_args(vec!["--oversized-output".to_string(), "files".to_string()]).await
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
@@ -911,12 +944,33 @@ pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<M
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), env_vars, TEST_PAGER_PAGE_CHARS)
-        .await
+    spawn_server_with_args_env(Vec::new(), env_vars).await
+}
+
+pub async fn spawn_server_with_files_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env(
+        vec!["--oversized-output".to_string(), "files".to_string()],
+        env_vars,
+    )
+    .await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(args, Vec::new(), TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(args, Vec::new()).await
+}
+
+pub async fn spawn_python_server_with_files() -> TestResult<McpTestSession> {
+    spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--oversized-output".to_string(),
+        "files".to_string(),
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+    ])
+    .await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
@@ -963,6 +1017,21 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    let mut args = args;
+    args.push("--oversized-output".to_string());
+    args.push("pager".to_string());
+    let mut env_vars = env_vars;
+    env_vars.push((
+        "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
+        page_bytes.to_string(),
+    ));
+    spawn_server_with_args_env(args, env_vars).await
+}
+
+pub async fn spawn_server_with_args_env(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
     let backend = parse_backend_from_args(&args);
@@ -981,7 +1050,6 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
-        cmd.env(PAGER_PAGE_CHARS_ENV, page_bytes.to_string());
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);
@@ -1025,7 +1093,8 @@ fn resolve_server_path() -> TestResult<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    for candidate in ["mcp-repl"] {
+    {
+        let candidate = "mcp-repl";
         let mut candidate_path = path.clone();
         candidate_path.push(candidate);
         if cfg!(windows) {

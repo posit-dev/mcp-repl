@@ -2,6 +2,7 @@ use harp::object::RObject;
 use harp::protect::RProtect;
 use libr::SEXP;
 
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 #[harp::register]
 pub extern "C-unwind" fn mcp_repl_htmd_file_to_markdown(path: SEXP) -> harp::Result<SEXP> {
     let path = String::try_from(RObject::view(path))?;
@@ -26,6 +27,7 @@ pub extern "C-unwind" fn mcp_repl_htmd_file_to_markdown(path: SEXP) -> harp::Res
     }
 }
 
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 #[harp::register]
 pub extern "C-unwind" fn mcp_repl_htmd_html_to_markdown(html: SEXP) -> harp::Result<SEXP> {
     let html = String::try_from(RObject::view(html))?;

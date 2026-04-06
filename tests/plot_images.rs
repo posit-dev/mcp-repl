@@ -3,10 +3,15 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TestResult, spawn_server, spawn_server_with_pager_page_chars};
+use common::{TestResult, spawn_server_with_files, spawn_server_with_files_env_vars};
+use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::tempdir;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 struct ImageData {
@@ -26,6 +31,14 @@ struct PlotTranscriptSnapshot {
     steps: Vec<PlotStepSnapshot>,
 }
 
+#[derive(Debug)]
+struct TextEventRow {
+    start_line: usize,
+    end_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 fn result_text(result: &CallToolResult) -> String {
     result
         .content
@@ -36,6 +49,49 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn top_level_entry_names(dir: &Path) -> TestResult<Vec<String>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn relative_file_paths(root: &Path) -> TestResult<Vec<String>> {
+    let mut paths = Vec::new();
+    collect_relative_file_paths(root, root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_relative_file_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> TestResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_relative_file_paths(root, &path, out)?;
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("file should be under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(relative);
+    }
+    Ok(())
 }
 
 fn backend_unavailable(text: &str) -> bool {
@@ -84,6 +140,26 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
     value
 }
 
+fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
+    let snapshot = response_snapshot(result);
+    let content = snapshot
+        .get("content")
+        .and_then(|value| value.as_array())
+        .expect("tool result content should be an array");
+    for item in content {
+        let is_image = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "image");
+        if is_image {
+            assert!(
+                item.get("_meta").is_none(),
+                "expected image results to omit _meta for {context}: {item}"
+            );
+        }
+    }
+}
+
 fn step_snapshot(input: &str, result: &CallToolResult) -> PlotStepSnapshot {
     PlotStepSnapshot {
         tool: "r_repl".to_string(),
@@ -109,6 +185,61 @@ fn extract_images(result: &CallToolResult) -> Vec<ImageData> {
             _ => None,
         })
         .collect()
+}
+
+fn text_occurrences(text: &str, needle: &str) -> usize {
+    text.match_indices(needle).count()
+}
+
+fn parse_text_event_rows(events: &str) -> Vec<TextEventRow> {
+    events
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("T ")?;
+            let mut parts = rest.split_whitespace();
+            let lines = parts.next()?.strip_prefix("lines=")?;
+            let bytes = parts.next()?.strip_prefix("bytes=")?;
+            let mut line_parts = lines.split('-');
+            let mut byte_parts = bytes.split('-');
+            Some(TextEventRow {
+                start_line: line_parts.next()?.parse().ok()?,
+                end_line: line_parts.next()?.parse().ok()?,
+                start_byte: byte_parts.next()?.parse().ok()?,
+                end_byte: byte_parts.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn advance_visible_lines(
+    text: &str,
+    visible_lines: usize,
+    has_partial_line: bool,
+) -> (usize, usize, bool) {
+    assert!(!text.is_empty(), "text event rows should not be empty");
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    let start_line = if visible_lines == 0 {
+        1
+    } else if has_partial_line {
+        visible_lines
+    } else {
+        visible_lines.saturating_add(1)
+    };
+    let next_visible_lines = if has_partial_line {
+        visible_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
+            .saturating_sub(1)
+    } else {
+        visible_lines
+            .saturating_add(newline_count)
+            .saturating_add(usize::from(!text.ends_with('\n')))
+    };
+    (
+        start_line,
+        next_visible_lines.max(start_line),
+        !text.ends_with('\n'),
+    )
 }
 
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -176,6 +307,11 @@ fn assert_no_images(result: &CallToolResult, context: &str) {
         "expected no images for {context}, got {images:?}"
     );
 }
+
+const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
+const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
+const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
 
 fn assert_plot_snapshot(name: &str, snapshot: &PlotTranscriptSnapshot) -> TestResult<()> {
     let serialized = serde_json::to_string_pretty(snapshot)?;
@@ -311,7 +447,7 @@ fn is_prompt_line(line: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_images_and_updates() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "plot(1:10)";
@@ -356,6 +492,8 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "plot(1:10)");
+    assert_images_expose_no_meta(&update_result, "lines(4:8, 4:8)");
     assert!(
         !plot_images.is_empty(),
         "expected plot(1:10) to emit image content"
@@ -382,7 +520,7 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_stable_images_for_repeats() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "plot(1:10)";
@@ -448,7 +586,7 @@ async fn plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)";
@@ -479,6 +617,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
     );
 
     let plot_images = extract_images(&plot_result);
+    assert_images_expose_no_meta(&plot_result, "multi-panel plot");
     assert_eq!(
         plot_images.len(),
         1,
@@ -493,7 +632,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_images_when_paged_output() -> TestResult<()> {
-    let mut session = spawn_server_with_pager_page_chars(200).await?;
+    let mut session = spawn_server_with_files().await?;
 
     let input = "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:50) cat(line, \"\\n\"); plot(1:10)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -502,7 +641,6 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -514,11 +652,16 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
-        "expected paged output to still include plot image content"
+        "expected large output to still include plot image content"
     );
     assert!(
-        result_text(&result).contains("--More--"),
-        "expected pager footer in response"
+        !result_text(&result).contains("--More--"),
+        "did not expect pager footer in response"
+    );
+    assert!(
+        !result_text(&result).contains("full output:"),
+        "did not expect oversized-output path marker in mixed text+image reply: {}",
+        result_text(&result)
     );
 
     Ok(())
@@ -526,7 +669,7 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_respect_numeric_size_options() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
 
     let input = "options(console.plot.width = 4, console.plot.height = 3, console.plot.dpi = 100); plot(1:10)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -560,7 +703,7 @@ async fn plots_respect_numeric_size_options() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
@@ -605,6 +748,8 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
     let plot_images = extract_images(&plot_result);
     let update_images = extract_images(&update_result);
 
+    assert_images_expose_no_meta(&plot_result, "grid base plot");
+    assert_images_expose_no_meta(&update_result, "grid plot update");
     assert!(
         !plot_images.is_empty(),
         "expected grid plot to emit image content"
@@ -631,7 +776,7 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
@@ -697,7 +842,7 @@ async fn grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
-    let mut session = spawn_server().await?;
+    let mut session = spawn_server_with_files().await?;
 
     let input = "plot(1:10); lines(2:9, 2:9); lines(2:9, 2:9)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -706,7 +851,6 @@ async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -726,8 +870,8 @@ async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn plot_emitted_after_truncation() -> TestResult<()> {
-    let mut session = spawn_server_with_pager_page_chars(5_000_000).await?;
+async fn plot_emitted_after_large_output() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
 
     let input = r#"
 cat(paste(rep("x", 3000000), collapse = ""))
@@ -740,7 +884,6 @@ plot(1:10)
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -751,14 +894,796 @@ plot(1:10)
 
     let text = result_text(&result);
     assert!(
-        text.contains("output truncated"),
-        "expected truncation notice, got: {text:?}"
+        text.contains("END"),
+        "expected the tail of the large output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("output truncated"),
+        "did not expect truncation notice, got: {text:?}"
     );
 
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
         "expected plot image even after truncation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_reply_with_four_images_and_under_grace_text_stays_inline() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = format!(
+        r#"
+big <- paste(rep("u", {UNDER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("UNDER_START\n")
+cat(big)
+cat("\nUNDER_END\n")
+for (i in 1:4) {{
+  plot(1:10, main = sprintf("plot%03d", i))
+}}
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "under-grace mixed plot reply reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let images = extract_images(&result);
+
+    assert!(
+        text.contains("UNDER_START") && text.contains("UNDER_END"),
+        "expected under-grace mixed reply text inline, got: {text:?}"
+    );
+    assert!(
+        events_log_path(&text).is_none(),
+        "did not expect mixed output bundle for under-grace text, got: {text:?}"
+    );
+    assert_eq!(
+        images.len(),
+        4,
+        "expected four inline images when text stays under the hard spill threshold"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_reply_with_two_images_and_over_grace_text_uses_output_bundle() -> TestResult<()>
+{
+    let mut session = spawn_server_with_files().await?;
+
+    let input = format!(
+        r#"
+big <- paste(rep("v", {OVER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("OVER_START\n")
+cat(big)
+cat("\nOVER_END\n")
+for (i in 1:2) {{
+  plot(1:10, main = sprintf("plot%03d", i))
+}}
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "over-grace mixed plot reply reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in over-grace mixed reply, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected output-bundle mixed reply to keep both endpoint images inline"
+    );
+    assert!(
+        transcript.contains("OVER_START") && transcript.contains("OVER_END"),
+        "expected transcript.txt to contain the over-grace worker text, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn single_image_over_grace_text_does_not_duplicate_pre_image_preview() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = format!(
+        r#"
+cat("PRE_UNIQUE_START\n")
+cat(paste(rep("p", 240), collapse = ""))
+cat("\nPRE_UNIQUE_END\n")
+plot(1:10, main = "single-plot")
+big <- paste(rep("v", {OVER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("POST_START\n")
+cat(big)
+cat("\nPOST_END\n")
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "single-image output bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let images = extract_images(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in single-image reply, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+
+    assert_eq!(
+        images.len(),
+        1,
+        "expected single-image reply to keep exactly one inline image"
+    );
+    assert_eq!(
+        text_occurrences(&text, "PRE_UNIQUE_START\n"),
+        1,
+        "did not expect duplicated pre-image preview text, got: {text:?}"
+    );
+    assert_eq!(
+        text_occurrences(&text, "PRE_UNIQUE_END\n"),
+        1,
+        "did not expect duplicated pre-image preview tail, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("POST_START") && transcript.contains("POST_END"),
+        "expected transcript.txt to contain the over-grace worker text, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_replies_output_bundle_and_keep_first_and_last_images() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = r#"
+for (i in 1:6) {
+  cat(sprintf("warn%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+"#;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot output bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected output-bundle reply to keep exactly two inline images"
+    );
+    assert_eq!(
+        top_level_images,
+        vec![
+            "001.png".to_string(),
+            "002.png".to_string(),
+            "003.png".to_string(),
+            "004.png".to_string(),
+            "005.png".to_string(),
+            "006.png".to_string(),
+            "history".to_string(),
+        ],
+        "expected top-level final image aliases in output bundle"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "002/001.png".to_string(),
+            "003/001.png".to_string(),
+            "004/001.png".to_string(),
+            "005/001.png".to_string(),
+            "006/001.png".to_string(),
+        ],
+        "expected image history files grouped under images/history"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected first inline image to match first top-level final alias"
+    );
+    assert_eq!(
+        images[1].bytes,
+        fs::read(bundle_dir.join("images/006.png"))?,
+        "expected second inline image to match last top-level final alias"
+    );
+    assert!(
+        text.contains("events.log"),
+        "expected response to teach client about events.log, got: {text:?}"
+    );
+    assert!(
+        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
+        "expected events.log header, got: {events:?}"
+    );
+    assert!(
+        events.contains("T lines="),
+        "expected text range entries in events.log, got: {events:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/006/001.png"),
+        "expected first/last image entries in events.log, got: {events:?}"
+    );
+    assert!(
+        transcript.contains("warn001") && transcript.contains("warn006"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("images/history/001/001.png"),
+        "did not expect transcript.txt to contain image paths, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_output_bundle_events_log_keeps_partial_line_ranges_stable() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = r#"
+cat("a")
+flush.console()
+Sys.sleep(0.05)
+for (i in 1:5) {
+  plot(1:10, main = sprintf("plot%03d", i))
+  cat(sprintf("b%03d\n", i))
+  flush.console()
+}
+"#;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot output bundle with partial lines reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let rows = parse_text_event_rows(&events);
+
+    assert!(
+        transcript.contains("b001\nb002\nb003\nb004\nb005\n"),
+        "expected transcript.txt to preserve the mixed plot text, got: {transcript:?}"
+    );
+    assert!(
+        rows.len() >= 2,
+        "expected multiple text rows in events.log for the mixed output bundle, got: {events:?}"
+    );
+    let mut visible_lines = 0;
+    let mut has_partial_line = false;
+    for row in rows {
+        let text = transcript
+            .get(row.start_byte..row.end_byte)
+            .unwrap_or_else(|| panic!("expected valid UTF-8 row slice for {row:?}"));
+        let (expected_start, expected_end, next_partial) =
+            advance_visible_lines(text, visible_lines, has_partial_line);
+        assert_eq!(
+            (row.start_line, row.end_line),
+            (expected_start, expected_end),
+            "expected events.log line span to match transcript slice {text:?}, got: {events:?}"
+        );
+        visible_lines = expected_end;
+        has_partial_line = next_partial;
+    }
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_image_output_bundle_backfills_earlier_worker_text() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = r#"
+cat("warn000\n")
+flush.console()
+Sys.sleep(0.25)
+for (i in 1:6) {
+  cat(sprintf("warn%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        events_log_path(&first_text).is_none(),
+        "did not expect output bundle on first small timeout reply, got: {first_text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("", Some(60.0)).await?;
+    let text = result_text(&result);
+    if text.contains("<<repl status: busy") {
+        eprintln!("plot_images timeout output-bundle poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "timeout image output bundle reported an error: {}",
+        text
+    );
+
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in timeout poll, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+
+    assert!(
+        transcript.contains("warn000"),
+        "expected transcript.txt to backfill early timeout text, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("warn006"),
+        "expected transcript.txt to include later text, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("<<repl status: busy"),
+        "did not expect timeout marker in transcript.txt, got: {transcript:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/006/001.png"),
+        "expected events.log to cover the full image set, got: {events:?}"
+    );
+    assert!(
+        !events.contains("<<repl status: busy"),
+        "did not expect timeout marker in events.log, got: {events:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_text_only_poll_does_not_duplicate_prefix_text() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = r#"
+cat("HEAD_ONLY\n")
+flush.console()
+Sys.sleep(0.25)
+for (i in 1:6) {
+  cat(sprintf("plot%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+cat("TAIL_ONLY\n")
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!(
+            "plot_images timeout output-bundle poll did not flush image history yet; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let final_result = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let final_text = result_text(&final_result);
+
+    assert_ne!(
+        final_result.is_error,
+        Some(true),
+        "timeout text-only follow-up poll reported an error: {}",
+        final_text
+    );
+    assert!(
+        !final_text.contains("<<repl status: busy"),
+        "expected timeout text-only follow-up poll to finish, got: {final_text:?}"
+    );
+    assert!(
+        events_log_path(&final_text).is_some(),
+        "expected output bundle disclosure in final timeout poll, got: {final_text:?}"
+    );
+    assert_eq!(
+        final_text.matches("TAIL_ONLY\n").count(),
+        1,
+        "expected trailing timeout text segment to appear once, got: {final_text:?}"
+    );
+    assert!(
+        !final_text.contains("> cat(\"TAIL_ONLY\\n\")"),
+        "did not expect the trailing command echo to survive the final timeout poll: {final_text:?}"
+    );
+    assert!(
+        !final_text.contains("[repl] input discarded while worker busy"),
+        "did not expect empty-poll completion to inject a busy-discard notice: {final_text:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path() -> TestResult<()> {
+    let temp = tempdir()?;
+    let mut session = spawn_server_with_files_env_vars(vec![
+        ("TMPDIR".to_string(), temp.path().display().to_string()),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "12000".to_string(),
+        ),
+    ])
+    .await?;
+
+    let input = r#"
+Sys.sleep(0.25)
+for (i in 1:6) {
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!("plot_images timeout omission poll did not flush bundle state yet; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        bundled.is_error,
+        Some(true),
+        "image-only timeout omission poll reported an error: {}",
+        bundled_text
+    );
+    assert!(
+        bundled_text.contains("later content omitted"),
+        "expected omission notice in image-only timeout poll, got: {bundled_text:?}"
+    );
+    assert!(
+        bundled_text.contains("output-0001"),
+        "expected omission reply to disclose a bundle path, got: {bundled_text:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()> {
+    let temp = tempdir()?;
+    let mut session = spawn_server_with_files_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?;
+
+    let input = r#"
+Sys.sleep(0.25)
+for (i in 1:6) {
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(600)).await;
+    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let bundled_text = result_text(&bundled);
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
+        eprintln!("plot_images timeout bundle poll did not flush image history yet; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let events_log = events_log_path(&bundled_text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in timeout poll, got: {bundled_text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    fs::remove_file(bundle_dir.join("images/001.png"))?;
+
+    let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
+    let damaged_text = result_text(&damaged);
+    assert_ne!(
+        damaged.is_error,
+        Some(true),
+        "missing anchor image poll reported an error: {}",
+        damaged_text
+    );
+    assert!(
+        damaged_text.contains("events.log"),
+        "expected damaged anchor poll to keep disclosing the output bundle, got: {damaged_text:?}"
+    );
+
+    let mut settled_text = damaged_text;
+    while settled_text.contains("<<repl status: busy") {
+        sleep(Duration::from_millis(100)).await;
+        let next = session.write_stdin_raw_with("", Some(0.5)).await?;
+        settled_text = result_text(&next);
+    }
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected session to stay alive after anchor image deletion, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_reply_plot_updates_bundle_preserves_image_history() -> TestResult<()> {
+    let mut session = spawn_server_with_files().await?;
+
+    let input = format!(
+        r#"
+big <- paste(rep("h", {OVER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("HISTORY_START\n")
+cat(big)
+cat("\nHISTORY_END\n")
+plot(1:10)
+lines(2:9, 2:9)
+lines(3:8, 3:8)
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "same-reply plot history bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        1,
+        "expected same-reply updates to stay collapsed inline"
+    );
+    assert_eq!(
+        top_level_images,
+        vec!["001.png".to_string(), "history".to_string()],
+        "expected one top-level final alias plus history"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "001/002.png".to_string(),
+            "001/003.png".to_string(),
+        ],
+        "expected every same-reply image update in bundle history"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected inline image to match the final bundled image"
+    );
+    assert_eq!(
+        fs::read(bundle_dir.join("images/001.png"))?,
+        fs::read(bundle_dir.join("images/history/001/003.png"))?,
+        "expected final alias to match the last history entry"
+    );
+    assert!(
+        transcript.contains("HISTORY_START") && transcript.contains("HISTORY_END"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/001/003.png"),
+        "expected events.log to cover the full same-reply history, got: {events:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_reply_plot_updates_stay_inline_and_show_final_state() -> TestResult<()> {
+    let mut batch_session = spawn_server_with_files().await?;
+    let mut control_session = spawn_server_with_files().await?;
+
+    let steps = [
+        "plot(1:10)",
+        "lines(2:9, 2:9)",
+        "lines(3:8, 3:8)",
+        "lines(c(1, 10), c(10, 1))",
+    ];
+    let batch_input = steps.join("\n");
+    let batch = batch_session
+        .write_stdin_raw_with(&batch_input, Some(60.0))
+        .await?;
+    if any_backend_unavailable(&[&batch]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        batch_session.cancel().await?;
+        control_session.cancel().await?;
+        return Ok(());
+    }
+
+    let batch_text = result_text(&batch);
+    let batch_images = extract_images(&batch);
+    assert_eq!(
+        batch_images.len(),
+        1,
+        "expected one inline image for same-reply updates, got: {batch_text:?}"
+    );
+    assert!(
+        events_log_path(&batch_text).is_none(),
+        "did not expect output bundle for collapsed same-reply updates, got: {batch_text:?}"
+    );
+
+    let mut control = None;
+    for step in steps {
+        let result = control_session
+            .write_stdin_raw_with(step, Some(60.0))
+            .await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("plot_images backend unavailable in this environment; skipping");
+            batch_session.cancel().await?;
+            control_session.cancel().await?;
+            return Ok(());
+        }
+        control = Some(result);
+    }
+
+    let control = control.expect("control sequence should produce a final image");
+    let control_images = extract_images(&control);
+
+    batch_session.cancel().await?;
+    control_session.cancel().await?;
+
+    assert_eq!(
+        control_images.len(),
+        1,
+        "expected control sequence to end with one inline image"
+    );
+    assert_eq!(
+        batch_images[0].mime_type, control_images[0].mime_type,
+        "expected same mime type for batch and control plot replies"
+    );
+    assert_eq!(
+        batch_images[0].bytes, control_images[0].bytes,
+        "expected same-reply updates to expose the final plot state inline"
     );
 
     Ok(())

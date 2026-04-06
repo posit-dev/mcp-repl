@@ -1,42 +1,69 @@
 # mcp-repl
 
-`mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
+`mcp-repl` is an MCP server that provides a REPL for agents.
 
-It is backend-agnostic in design. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
+It gives an agent a persistent R or Python session that stays alive across tool calls, so it can work the way a person would in a REPL: load data once, inspect objects, try ideas, read help, make plots, and keep iterating in context.
 
-Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
 
-- Stateful REPL execution in one long-lived process.
-- LLM-oriented output handling: prompt/echo cleanup and built-in pager mode.
-- In-band docs for common help flows (`?`, `help()`, `vignette()`, `RShowDoc()`).
-- Plot images returned as MCP image content.
-- OS-level sandboxing by default, plus a memory resource guardrail.
+A shell tool can run `Rscript -e` or `python -c`, but that is not the same as having a session.
+
+Data analysis languages were designed with interactive affordances. To be able to take full advantage of what the runtime offers, it only makes sense for an LLM to also be able to access those same interactive workflows.
+
+If the work is exploratory, stateful, or iterative, a throwaway command runner keeps forcing the agent to rebuild context. `mcp-repl` keeps the session open instead. That makes a difference for:
+
+- data exploration
+- interactive help and documentation lookup
+- plotting and visual checks
+- debugging
+- any workflow where intermediate objects should stay in memory
+
+It is built for real agent use: sandboxing is on by default, plots and help are supported in-band, session control with interrupts or restarts is explicit, and large replies stay readable.
+
+## How it works
+
+Your MCP client sends code to `repl`. `mcp-repl` runs it inside a long-lived R or Python process and keeps that process alive for the next call.
+
+That means variables, loaded packages, imported modules, plots, and other session state remain available until you reset the session or exit it.
+
+Results come back as text and, when relevant, images.
+
+## What it is good at
+
+- Exploring data without rebuilding context on every turn.
+- Reading help in-band instead of bouncing out to a browser.
+- Producing plots the agent can inspect immediately.
+- Iterating in a private scratch session before returning an answer.
+- Multi-step analysis where keeping state saves time and tokens.
 
 ### Safe by default
 
-Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the active R or Python session. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
 
-### Token efficient
+## Token efficient
 
-`mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
-- There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
-- Echoed inputs are automatically pruned or elided so output is easy to attribute.
-- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
-- Documentation receives special handling. Built-in entry points like `?`, `help`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band, replacing the usual HTML browser flow.
+### Keeps output readable
 
-### Pager
+REPL output can get verbose and messy quickly. `mcp-repl` curates the response to avoid wasting tokens or confusing the model:
 
-The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
+- Smart echo behavior: no echo when it is safe to omit, and elided or collapsed echo for large multi-expression blocks. Input is reflected only when needed to connect output back to the code that produced it.
+- Help pages render in-band instead of opening a separate browser flow.
+- Very large replies stay compact in the tool response, with a preview and a path to the full saved output when needed.
+- Plot images are returned directly through MCP instead of requiring a separate GUI workflow.
 
-Internally, the pager is backed by a bounded ring buffer with an event timeline, not a naive "dump and slice" stream. That gives it predictable memory usage while still supporting strong navigation semantics:
-- Output is tracked with stable offsets, so commands like `:seek` (offset/percent/line) and `:range` can jump deterministically.
-- Text and image events are merged into one timeline, so pagination decisions can account for both without duplicating content.
-- Already-shown ranges and images are tracked explicitly; when overlap occurs, the pager emits offset-based elision markers instead of replaying content.
-- UTF-8-aware indexing keeps search and cursor movement aligned to characters while preserving exact byte offsets internally.
+### Large outputs still work
 
-These affordances are all driven by observed LLM workflows and aim to reduce token waste while improving access to reference material.
+Most replies stay inline. When output gets too large, `mcp-repl` keeps the immediate response short and saves the full output as a structured bundle on disk.
+
+Models are good at searching and exploring files when the structure is clear. Instead of flooding the tool reply, `mcp-repl` produces a bundle the model can inspect on demand: compact previews in the immediate response, plus stable paths to the full transcript and plot files when deeper exploration is needed.
+
+The practical effect is simple:
+
+- the tool reply stays readable
+- the full output is still available
+- the model can explore the saved bundle incrementally
+- long transcripts and plot-heavy replies do not flood model context
 
 ### Plots
 
@@ -61,6 +88,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install --git https://github.com/t-kalinowski/mcp-repl --locked
 ```
 
+To install a specific version, pin the tag:
+
+```sh
+cargo install --git https://github.com/t-kalinowski/mcp-repl --tag v0.1.0 --locked
+```
+
 This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
 
 ### 2) Wire into your MCP client
@@ -70,6 +103,8 @@ Point your MCP client at the binary (either via `PATH` or by using an explicit p
 You can auto-install into existing agent config files:
 
 ```sh
+# bare mcp-repl defaults to pager unless you pass --oversized-output explicitly
+
 # install to all available targets (does not create ~/.codex if missing)
 mcp-repl install
 
@@ -83,8 +118,11 @@ mcp-repl install --client claude
 mcp-repl install --client codex --interpreter r
 ```
 
-`install --client codex` writes `--sandbox inherit` by default. That sentinel means `mcp-repl` should
-inherit sandbox policy updates from Codex for the session.
+Bare `mcp-repl` defaults to `--oversized-output pager`.
+
+`install --client codex` writes `--sandbox inherit --oversized-output files` by default. That
+sentinel means `mcp-repl` should inherit sandbox policy updates from Codex for the session while
+keeping installed Codex configs on the file-backed oversized-output path.
 
 Example `R` REPL Codex config (paths vary by OS/user):
 
@@ -97,6 +135,7 @@ tool_timeout_sec = 1800
 # If no update is sent, mcp-repl exits with an error.
 args = [
   "--sandbox", "inherit",
+  "--oversized-output", "files",
   "--interpreter", "r",
 ]
 ```
@@ -112,12 +151,13 @@ tool_timeout_sec = 1800
 # If no update is sent, mcp-repl exits with an error.
 args = [
   "--sandbox", "inherit",
+  "--oversized-output", "files",
   "--interpreter", "python",
 ]
 ```
 
-For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode
-because Claude does not propagate sandbox state updates to MCP servers:
+For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode and
+`--oversized-output files` because Claude does not propagate sandbox state updates to MCP servers:
 
 ```json
 // ~/.claude.json
@@ -125,11 +165,11 @@ because Claude does not propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--oversized-output", "files", "--interpreter", "r"]
     },
     "python": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
+      "args": ["--sandbox", "workspace-write", "--oversized-output", "files", "--interpreter", "python"]
     }
   }
 }
@@ -172,7 +212,7 @@ startup logs, sandbox-state tracing, and the external wire-trace proxy.
 
 - To force a specific R installation, set `R_HOME` in the environment that launches `mcp-repl`.
 - If `R_HOME` is not set, `mcp-repl` discovers it from `R` on `PATH` (via `R RHOME`).
-- To verify which R is active, run `R.home()` in the console session.
+- To verify which R is active, run `R.home()` in the REPL session.
 
 ### Python interpreter: which Python installation is used
 
@@ -206,9 +246,14 @@ Primary REPL-aligned tools:
 - `repl` -> `{ "input": "1+1\n", "timeout_ms": 10000 }`
 - `repl_reset` -> `{}`
 
+The exact `repl` tool description selected at startup depends on the interpreter and
+`--oversized-output` mode.
+
 Tool guides:
 - `docs/tool-descriptions/repl_tool_r.md`
+- `docs/tool-descriptions/repl_tool_r_pager.md`
 - `docs/tool-descriptions/repl_tool_python.md`
+- `docs/tool-descriptions/repl_tool_python_pager.md`
 - `docs/tool-descriptions/repl_reset_tool.md`
 
 ## Session management
@@ -219,6 +264,8 @@ Tool guides:
 - **In-band exits**: standard runtime exits also work (`EOF`, `quit()`, etc.); output is returned and the next request runs in a fresh worker.
 
 ## Docs
+
+Start with `docs/index.md` if you want the engineering map for the repository.
 
 Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_tool_r.md`

@@ -27,7 +27,7 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 fn busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
@@ -116,5 +116,39 @@ async fn repl_reset_clears_state() -> TestResult<()> {
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
+    let mut session = common::spawn_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "cat(sprintf(\"%s %s\\n\", nzchar(Sys.getenv(\"MCP_REPL_IPC_READ_FD\")), nzchar(Sys.getenv(\"MCP_REPL_IPC_WRITE_FD\"))))\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FALSE FALSE"),
+        "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
+    );
+
     Ok(())
 }
