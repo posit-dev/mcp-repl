@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -1665,6 +1667,7 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
         &args.sandbox_policy,
         &args.sandbox_policy_cwd,
         &args.command,
+        args.prepared_capability_sid.as_deref(),
     )
 }
 
@@ -1672,16 +1675,23 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
 struct WindowsSandboxArgs {
     sandbox_policy_cwd: PathBuf,
     sandbox_policy: SandboxPolicy,
+    prepared_capability_sid: Option<String>,
     command: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
 fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
+    windows_sandbox_parse_args_from(std::env::args_os().skip(1).collect())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sandbox_parse_args_from(raw_args: Vec<OsString>) -> Result<WindowsSandboxArgs, String> {
     let mut sandbox_policy_cwd: Option<PathBuf> = None;
     let mut sandbox_policy: Option<SandboxPolicy> = None;
+    let mut prepared_capability_sid: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
 
-    let mut args = std::env::args_os().skip(1).peekable();
+    let mut args = raw_args.into_iter().peekable();
     while let Some(arg) = args.next() {
         if arg == "--windows-sandbox" {
             continue;
@@ -1706,6 +1716,17 @@ fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
             );
             continue;
         }
+        if arg == "--prepared-capability-sid" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --prepared-capability-sid".to_string())?;
+            prepared_capability_sid = Some(
+                value
+                    .into_string()
+                    .map_err(|_| "--prepared-capability-sid must be valid UTF-8".to_string())?,
+            );
+            continue;
+        }
         if arg == "--" {
             command.extend(args.map(|value| value.to_string_lossy().to_string()));
             break;
@@ -1723,8 +1744,23 @@ fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
     Ok(WindowsSandboxArgs {
         sandbox_policy_cwd,
         sandbox_policy,
+        prepared_capability_sid,
         command,
     })
+}
+
+#[cfg(target_os = "windows")]
+pub fn append_windows_prepared_capability_sid(
+    args: &mut Vec<String>,
+    capability_sid: &str,
+) -> Result<(), String> {
+    let separator_index = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| "windows sandbox args missing command separator".to_string())?;
+    args.insert(separator_index, "--prepared-capability-sid".to_string());
+    args.insert(separator_index + 1, capability_sid.to_string());
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2372,6 +2408,62 @@ mod tests {
             Some("0"),
             "managed network marker must be explicitly disabled when no domain restrictions exist"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn append_windows_prepared_capability_sid_inserts_before_command_separator() {
+        let mut args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+            "--sandbox-policy".to_string(),
+            "{\"type\":\"workspace-write\"}".to_string(),
+            "--".to_string(),
+            "worker".to_string(),
+        ];
+
+        append_windows_prepared_capability_sid(&mut args, "S-1-5-21-1-2-3-4")
+            .expect("prepared capability sid should insert");
+
+        assert_eq!(
+            args,
+            vec![
+                "--windows-sandbox".to_string(),
+                "--sandbox-policy-cwd".to_string(),
+                "C:\\workspace".to_string(),
+                "--sandbox-policy".to_string(),
+                "{\"type\":\"workspace-write\"}".to_string(),
+                "--prepared-capability-sid".to_string(),
+                "S-1-5-21-1-2-3-4".to_string(),
+                "--".to_string(),
+                "worker".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_parse_args_accepts_prepared_capability_sid() {
+        let args = vec![
+            OsString::from("--windows-sandbox"),
+            OsString::from("--sandbox-policy-cwd"),
+            OsString::from("C:\\workspace"),
+            OsString::from("--sandbox-policy"),
+            OsString::from("{\"type\":\"workspace-write\"}"),
+            OsString::from("--prepared-capability-sid"),
+            OsString::from("S-1-5-21-1-2-3-4"),
+            OsString::from("--"),
+            OsString::from("worker"),
+        ];
+
+        let parsed = windows_sandbox_parse_args_from(args).expect("windows sandbox args");
+
+        assert_eq!(
+            parsed.prepared_capability_sid.as_deref(),
+            Some("S-1-5-21-1-2-3-4")
+        );
+        assert_eq!(parsed.command, vec!["worker".to_string()]);
     }
 
     #[cfg(target_os = "linux")]

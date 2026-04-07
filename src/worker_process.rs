@@ -559,6 +559,8 @@ pub struct WorkerManager {
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
+    #[cfg(target_os = "windows")]
+    windows_sandbox_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
     oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
     output: OutputBuffer,
@@ -632,6 +634,8 @@ impl WorkerManager {
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,
+            #[cfg(target_os = "windows")]
+            windows_sandbox_launch: None,
             oversized_output,
             pending_output_tape: PendingOutputTape::new(),
             output: OutputBuffer::default(),
@@ -2375,6 +2379,10 @@ impl WorkerManager {
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
         self.sandbox_state = resolved_state;
+        #[cfg(target_os = "windows")]
+        if changed {
+            self.windows_sandbox_launch = None;
+        }
         crate::event_log::log(
             "worker_sandbox_state_update",
             serde_json::json!({
@@ -2517,6 +2525,8 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        #[cfg(target_os = "windows")]
+        let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -2525,6 +2535,8 @@ impl WorkerManager {
             self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch.as_ref(),
         )?;
         let ipc = process
             .ipc
@@ -2560,6 +2572,8 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        #[cfg(target_os = "windows")]
+        let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -2568,6 +2582,8 @@ impl WorkerManager {
             self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch.as_ref(),
         )?;
         let ipc = process
             .ipc
@@ -2622,6 +2638,46 @@ impl WorkerManager {
         let now = std::time::Instant::now();
         self.last_spawn = Some(now);
         self.spawn_count = self.spawn_count.saturating_add(1);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn ensure_windows_sandbox_launch(
+        &mut self,
+    ) -> Result<Option<crate::windows_sandbox::PreparedSandboxLaunch>, WorkerError> {
+        if self.backend != Backend::R || !self.sandbox_state.sandbox_policy.requires_sandbox() {
+            self.windows_sandbox_launch = None;
+            return Ok(None);
+        }
+
+        let needs_prepare = self.windows_sandbox_launch.as_ref().is_none_or(|launch| {
+            !launch.matches(
+                &self.sandbox_state.sandbox_policy,
+                &self.sandbox_state.sandbox_cwd,
+                &self.sandbox_state.session_temp_dir,
+            )
+        });
+
+        if needs_prepare {
+            crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
+                worker_context_event_payload(self.backend, &self.sandbox_state)
+            });
+            let prepared = crate::windows_sandbox::prepare_sandbox_launch(
+                &self.sandbox_state.sandbox_policy,
+                &self.sandbox_state.sandbox_cwd,
+                &self.sandbox_state.session_temp_dir,
+            )
+            .map_err(WorkerError::Sandbox)?;
+            crate::event_log::log(
+                "worker_windows_sandbox_prepare_end",
+                serde_json::json!({
+                    "status": "ok",
+                    "capability_sid": prepared.capability_sid(),
+                }),
+            );
+            self.windows_sandbox_launch = Some(prepared);
+        }
+
+        Ok(self.windows_sandbox_launch.clone())
     }
 
     fn resolve_timeout_marker(&mut self) {
@@ -4209,6 +4265,9 @@ impl WorkerProcess {
         pending_output_tape: PendingOutputTape,
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
+        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
+            &crate::windows_sandbox::PreparedSandboxLaunch,
+        >,
     ) -> Result<Self, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
@@ -4233,6 +4292,8 @@ impl WorkerProcess {
                 sandbox_state,
                 live_output.clone(),
                 &mut ipc_server,
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch,
             )?,
             Backend::Python => {
                 Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
@@ -4320,10 +4381,21 @@ impl WorkerProcess {
         sandbox_state: &SandboxState,
         live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
+        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
+            &crate::windows_sandbox::PreparedSandboxLaunch,
+        >,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let prepared =
+        let mut prepared =
             prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
                 .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = prepared_windows_launch {
+            crate::sandbox::append_windows_prepared_capability_sid(
+                &mut prepared.args,
+                prepared_windows_launch.capability_sid(),
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         let session_tmpdir = prepared
             .env
             .get(R_SESSION_TMPDIR_ENV)

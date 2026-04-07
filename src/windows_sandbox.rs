@@ -4,10 +4,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
+use std::fs::File;
+use std::io;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -19,6 +23,8 @@ use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::AdjustTokenPrivileges;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -35,6 +41,9 @@ use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::EqualSid;
+use windows_sys::Win32::Security::GetAce;
+use windows_sys::Win32::Security::GetAclInformation;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
@@ -49,6 +58,7 @@ use windows_sys::Win32::Security::TOKEN_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
+use windows_sys::Win32::Security::{ACCESS_DENIED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation};
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
@@ -68,6 +78,7 @@ use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
 use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -90,11 +101,46 @@ const DENY_ACCESS: i32 = 3;
 const REVOKE_ACCESS: i32 = 4;
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
+const INHERIT_ONLY_ACE: u8 = 0x08;
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
     allow: HashSet<PathBuf>,
     deny: HashSet<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSandboxLaunch {
+    policy: SandboxPolicy,
+    sandbox_policy_cwd: PathBuf,
+    session_temp_dir: PathBuf,
+    capability_sid: String,
+}
+
+impl PreparedSandboxLaunch {
+    pub fn capability_sid(&self) -> &str {
+        &self.capability_sid
+    }
+
+    pub fn matches(
+        &self,
+        policy: &SandboxPolicy,
+        sandbox_policy_cwd: &Path,
+        session_temp_dir: &Path,
+    ) -> bool {
+        self.policy == *policy
+            && self.sandbox_policy_cwd == canonicalize_or_identity(sandbox_policy_cwd)
+            && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
+    }
+}
+
+struct WrapperChildStdio {
+    stdin_write: File,
+    stdout_read: File,
+    stderr_read: File,
+    child_stdin: HANDLE,
+    child_stdout: HANDLE,
+    child_stderr: HANDLE,
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -219,17 +265,31 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
     if ok != 0 { Some(sid) } else { None }
 }
 
-fn make_random_cap_sid_string() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let a = (nanos as u32) ^ pid;
-    let b = ((nanos >> 32) as u32).wrapping_add(pid.rotate_left(7));
-    let c = ((nanos >> 64) as u32).wrapping_add(pid.rotate_left(13));
-    let d = ((nanos >> 96) as u32).wrapping_add(pid.rotate_left(19));
+fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
+    let scope = match policy {
+        SandboxPolicy::ReadOnly => "read-only",
+        SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => "unsupported",
+    };
+    let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+    let seed = format!(
+        "mcp-repl-windows-sandbox-v1\0{scope}\0{}",
+        canonical_cwd.display()
+    );
+    let a = stable_sid_word(seed.as_bytes(), 0x243f_6a88);
+    let b = stable_sid_word(seed.as_bytes(), 0x85a3_08d3);
+    let c = stable_sid_word(seed.as_bytes(), 0x1319_8a2e);
+    let d = stable_sid_word(seed.as_bytes(), 0x0370_7344);
     format!("S-1-5-21-{a}-{b}-{c}-{d}")
+}
+
+fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
+    let mut hash = 2_166_136_261u32 ^ seed;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
 }
 
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
@@ -241,6 +301,63 @@ fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
     }
 }
 
+fn sandbox_acl_env_map(session_temp_dir: &Path) -> HashMap<String, String> {
+    let temp_dir = session_temp_dir.to_string_lossy().to_string();
+    HashMap::from([
+        ("TEMP".to_string(), temp_dir.clone()),
+        ("TMP".to_string(), temp_dir.clone()),
+        (R_SESSION_TMPDIR_ENV.to_string(), temp_dir),
+    ])
+}
+
+pub fn prepare_sandbox_launch(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+) -> Result<PreparedSandboxLaunch, String> {
+    validate_windows_policy(policy)?;
+
+    let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+    let canonical_session_temp_dir = canonicalize_or_identity(session_temp_dir);
+    let env_map = sandbox_acl_env_map(&canonical_session_temp_dir);
+    let cap_sid = stable_cap_sid_string(policy, &canonical_cwd);
+
+    unsafe {
+        let psid_capability = convert_string_sid_to_sid(&cap_sid)
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let paths = compute_allow_deny_paths(
+            policy,
+            &canonical_cwd,
+            &canonical_cwd,
+            Some(&canonical_session_temp_dir),
+            &env_map,
+        );
+        for path in &paths.allow {
+            add_allow_ace(path, psid_capability).map_err(|err| {
+                format!(
+                    "failed to apply writable ACL to '{}': {err}",
+                    path.display()
+                )
+            })?;
+        }
+        if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
+            for path in &paths.deny {
+                add_deny_write_ace(path, psid_capability).map_err(|err| {
+                    format!("failed to apply deny ACL to '{}': {err}", path.display())
+                })?;
+            }
+        }
+        LocalFree(psid_capability as HLOCAL);
+    }
+
+    Ok(PreparedSandboxLaunch {
+        policy: policy.clone(),
+        sandbox_policy_cwd: canonical_cwd,
+        session_temp_dir: canonical_session_temp_dir,
+        capability_sid: cap_sid,
+    })
+}
+
 #[repr(C)]
 struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
@@ -250,6 +367,7 @@ pub fn run_sandboxed_command(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     command: &[String],
+    prepared_capability_sid: Option<&str>,
 ) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
@@ -258,6 +376,7 @@ pub fn run_sandboxed_command(
     validate_windows_policy(policy)?;
 
     unsafe {
+        crate::diagnostics::startup_log("windows-sandbox: begin");
         let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
@@ -265,7 +384,19 @@ pub fn run_sandboxed_command(
         let session_temp_dir =
             env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
-        let cap_sid = make_random_cap_sid_string();
+        let expected_cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+        let cap_sid = match prepared_capability_sid {
+            Some(value) => {
+                if value != expected_cap_sid {
+                    return Err(
+                        "prepared capability SID did not match expected workspace identity"
+                            .to_string(),
+                    );
+                }
+                value.to_string()
+            }
+            None => expected_cap_sid,
+        };
         let psid_capability = convert_string_sid_to_sid(&cap_sid)
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
 
@@ -283,35 +414,21 @@ pub fn run_sandboxed_command(
         let null_device_ace_applied = allow_null_device(psid_capability);
 
         let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
-        let paths = compute_allow_deny_paths(
-            policy,
-            sandbox_policy_cwd,
-            sandbox_policy_cwd,
-            session_temp_dir.as_deref(),
-            &env_map,
-        );
-        for path in &paths.allow {
-            match add_allow_ace(path, psid_capability) {
-                Ok(true) => acl_guards.push((path.clone(), psid_capability)),
-                Ok(false) => {}
-                Err(err) => {
-                    cleanup_capability_acl_state(
-                        &acl_guards,
-                        psid_capability,
-                        null_device_ace_applied,
-                    );
-                    CloseHandle(restricted_token);
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(format!(
-                        "failed to apply writable ACL to '{}': {err}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
-            for path in &paths.deny {
-                match add_deny_write_ace(path, psid_capability) {
+        if prepared_capability_sid.is_none() {
+            let paths = compute_allow_deny_paths(
+                policy,
+                sandbox_policy_cwd,
+                sandbox_policy_cwd,
+                session_temp_dir.as_deref(),
+                &env_map,
+            );
+            crate::diagnostics::startup_log(format!(
+                "windows-sandbox: acl plan allow={} deny={}",
+                paths.allow.len(),
+                paths.deny.len()
+            ));
+            for path in &paths.allow {
+                match add_allow_ace(path, psid_capability) {
                     Ok(true) => acl_guards.push((path.clone(), psid_capability)),
                     Ok(false) => {}
                     Err(err) => {
@@ -323,25 +440,66 @@ pub fn run_sandboxed_command(
                         CloseHandle(restricted_token);
                         LocalFree(psid_capability as HLOCAL);
                         return Err(format!(
-                            "failed to apply deny ACL to '{}': {err}",
+                            "failed to apply writable ACL to '{}': {err}",
                             path.display()
                         ));
                     }
                 }
             }
+            crate::diagnostics::startup_log("windows-sandbox: allow ACLs applied");
+            if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
+                for path in &paths.deny {
+                    match add_deny_write_ace(path, psid_capability) {
+                        Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                        Ok(false) => {}
+                        Err(err) => {
+                            cleanup_capability_acl_state(
+                                &acl_guards,
+                                psid_capability,
+                                null_device_ace_applied,
+                            );
+                            CloseHandle(restricted_token);
+                            LocalFree(psid_capability as HLOCAL);
+                            return Err(format!(
+                                "failed to apply deny ACL to '{}': {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                crate::diagnostics::startup_log("windows-sandbox: deny ACLs applied");
+            }
         }
 
-        let spawn_result =
-            create_process_as_user(restricted_token, command, sandbox_policy_cwd, &env_map);
+        let stdio_pipes = create_wrapper_child_stdio()?;
+        crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
+        let spawn_result = create_process_as_user(
+            restricted_token,
+            command,
+            sandbox_policy_cwd,
+            &env_map,
+            Some((
+                stdio_pipes.child_stdin,
+                stdio_pipes.child_stdout,
+                stdio_pipes.child_stderr,
+            )),
+        );
         let (proc_info, _startup_info) = match spawn_result {
             Ok(value) => value,
             Err(err) => {
+                drop(stdio_pipes);
                 cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
                 CloseHandle(restricted_token);
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
         };
+        crate::diagnostics::startup_log("windows-sandbox: child spawned");
+        CloseHandle(stdio_pipes.child_stdin);
+        CloseHandle(stdio_pipes.child_stdout);
+        CloseHandle(stdio_pipes.child_stderr);
+        let (stdin_forwarder, stdout_forwarder, stderr_forwarder) =
+            spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -366,6 +524,8 @@ pub fn run_sandboxed_command(
 
         let mut exit_code: u32 = 1;
         if GetExitCodeProcess(proc_info.hProcess, &mut exit_code) == 0 {
+            let _ = stdout_forwarder.join();
+            let _ = stderr_forwarder.join();
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
@@ -383,6 +543,9 @@ pub fn run_sandboxed_command(
         if let Some(job) = job_handle {
             CloseHandle(job);
         }
+        drop(stdin_forwarder);
+        let _ = stdout_forwarder.join();
+        let _ = stderr_forwarder.join();
         cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
@@ -491,6 +654,7 @@ unsafe fn create_process_as_user(
     argv: &[String],
     cwd: &Path,
     env_map: &HashMap<String, String>,
+    stdio: Option<(HANDLE, HANDLE, HANDLE)>,
 ) -> Result<(PROCESS_INFORMATION, STARTUPINFOW), String> {
     let cmdline_str = argv
         .iter()
@@ -504,7 +668,22 @@ unsafe fn create_process_as_user(
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let desktop = to_wide("Winsta0\\Default");
     startup_info.lpDesktop = desktop.as_ptr() as *mut u16;
-    ensure_inheritable_stdio(&mut startup_info)?;
+    if let Some((stdin_handle, stdout_handle, stderr_handle)) = stdio {
+        for handle in [stdin_handle, stdout_handle, stderr_handle] {
+            if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(format!(
+                    "SetHandleInformation failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdInput = stdin_handle;
+        startup_info.hStdOutput = stdout_handle;
+        startup_info.hStdError = stderr_handle;
+    } else {
+        ensure_inheritable_stdio(&mut startup_info)?;
+    }
 
     let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
     let ok = CreateProcessAsUserW(
@@ -527,6 +706,103 @@ unsafe fn create_process_as_user(
         ));
     }
     Ok((proc_info, startup_info))
+}
+
+unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
+    let mut child_stdin: HANDLE = std::ptr::null_mut();
+    let mut stdin_write: HANDLE = std::ptr::null_mut();
+    let mut stdout_read: HANDLE = std::ptr::null_mut();
+    let mut child_stdout: HANDLE = std::ptr::null_mut();
+    let mut stderr_read: HANDLE = std::ptr::null_mut();
+    let mut child_stderr: HANDLE = std::ptr::null_mut();
+
+    if CreatePipe(&mut child_stdin, &mut stdin_write, std::ptr::null_mut(), 0) == 0 {
+        return Err(format!(
+            "CreatePipe stdin failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if CreatePipe(&mut stdout_read, &mut child_stdout, std::ptr::null_mut(), 0) == 0 {
+        CloseHandle(child_stdin);
+        CloseHandle(stdin_write);
+        return Err(format!(
+            "CreatePipe stdout failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if CreatePipe(&mut stderr_read, &mut child_stderr, std::ptr::null_mut(), 0) == 0 {
+        CloseHandle(child_stdin);
+        CloseHandle(stdin_write);
+        CloseHandle(stdout_read);
+        CloseHandle(child_stdout);
+        return Err(format!(
+            "CreatePipe stderr failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    for handle in [child_stdin, child_stdout, child_stderr] {
+        if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            let err = format!(
+                "SetHandleInformation failed for child stdio handle: {}",
+                std::io::Error::last_os_error()
+            );
+            CloseHandle(child_stdin);
+            CloseHandle(stdin_write);
+            CloseHandle(stdout_read);
+            CloseHandle(child_stdout);
+            CloseHandle(stderr_read);
+            CloseHandle(child_stderr);
+            return Err(err);
+        }
+    }
+
+    Ok(WrapperChildStdio {
+        stdin_write: File::from_raw_handle(stdin_write as _),
+        stdout_read: File::from_raw_handle(stdout_read as _),
+        stderr_read: File::from_raw_handle(stderr_read as _),
+        child_stdin,
+        child_stdout,
+        child_stderr,
+    })
+}
+
+fn spawn_wrapper_stdio_forwarders(
+    stdio: WrapperChildStdio,
+) -> (
+    thread::JoinHandle<()>,
+    thread::JoinHandle<()>,
+    thread::JoinHandle<()>,
+) {
+    let WrapperChildStdio {
+        stdin_write,
+        stdout_read,
+        stderr_read,
+        child_stdin: _,
+        child_stdout: _,
+        child_stderr: _,
+    } = stdio;
+
+    let stdin_forwarder = thread::spawn(move || {
+        let mut wrapper_stdin = io::stdin();
+        let mut child_stdin = stdin_write;
+        let _ = io::copy(&mut wrapper_stdin, &mut child_stdin);
+        let _ = child_stdin.flush();
+    });
+    let stdout_forwarder = thread::spawn(move || {
+        let mut child_stdout = stdout_read;
+        let mut wrapper_stdout = io::stdout();
+        let _ = io::copy(&mut child_stdout, &mut wrapper_stdout);
+        let _ = wrapper_stdout.flush();
+    });
+    let stderr_forwarder = thread::spawn(move || {
+        let mut child_stderr = stderr_read;
+        let mut wrapper_stderr = io::stderr();
+        let _ = io::copy(&mut child_stderr, &mut wrapper_stderr);
+        let _ = wrapper_stderr.flush();
+    });
+
+    (stdin_forwarder, stdout_forwarder, stderr_forwarder)
 }
 
 unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
@@ -636,6 +912,12 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
+    if dacl_has_allow_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
 
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -696,6 +978,12 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
+    if dacl_has_write_deny_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
 
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -744,6 +1032,77 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
         return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
     }
     Ok(true)
+}
+
+unsafe fn dacl_size_info(dacl: *mut ACL) -> Option<ACL_SIZE_INFORMATION> {
+    if dacl.is_null() {
+        return None;
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = GetAclInformation(
+        dacl as *const ACL,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    );
+    (ok != 0).then_some(info)
+}
+
+unsafe fn ace_sid_ptr(ace: *mut c_void) -> *mut c_void {
+    let base = ace as usize;
+    (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void
+}
+
+unsafe fn dacl_has_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && (allowed.Mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE))
+                == (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    let deny_write_mask = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD;
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let denied = &*(ace as *const ACCESS_DENIED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0 && (denied.Mask & deny_write_mask) != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
@@ -1420,6 +1779,36 @@ mod tests {
                 .contains(&canonicalize_or_identity(&session_temp_dir))
         );
         assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn stable_capability_sid_is_deterministic_for_workspace() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let first = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let second = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn stable_capability_sid_changes_with_policy_or_workspace() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd_a = tmp.path().join("workspace-a");
+        let cwd_b = tmp.path().join("workspace-b");
+        std::fs::create_dir_all(&cwd_a).expect("workspace a dir");
+        std::fs::create_dir_all(&cwd_b).expect("workspace b dir");
+
+        let workspace_a =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_a);
+        let workspace_b =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_b);
+        let readonly_a = stable_cap_sid_string(&SandboxPolicy::ReadOnly, &cwd_a);
+
+        assert_ne!(workspace_a, workspace_b);
+        assert_ne!(workspace_a, readonly_a);
     }
 
     #[test]
