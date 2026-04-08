@@ -521,7 +521,7 @@ pub fn prepare_worker_command(
         },
     );
 
-    prepare_session_temp_dir(&state.session_temp_dir)?;
+    ensure_session_temp_dir(&state.session_temp_dir)?;
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
@@ -776,7 +776,7 @@ fn build_session_temp_dir_path() -> PathBuf {
         })
 }
 
-fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
+pub(crate) fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::SessionTempDir(format!(
             "session temp dir is not absolute: {}",
@@ -796,6 +796,34 @@ fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
             "refusing to use a temp dir without parent".to_string(),
         ));
     }
+    reset_session_temp_dir(path)
+}
+
+fn ensure_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
+    if !path.is_absolute() {
+        return Err(SandboxError::SessionTempDir(format!(
+            "session temp dir is not absolute: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let base_tmp = std::env::temp_dir();
+    if !path.starts_with(&base_tmp) {
+        return Err(SandboxError::SessionTempDir(format!(
+            "session temp dir outside system temp: {} (base: {})",
+            path.to_string_lossy(),
+            base_tmp.to_string_lossy()
+        )));
+    }
+    if path.parent().is_none() {
+        return Err(SandboxError::SessionTempDir(
+            "refusing to use a temp dir without parent".to_string(),
+        ));
+    }
+    std::fs::create_dir_all(path).map_err(|err| SandboxError::SessionTempDir(err.to_string()))?;
+    Ok(())
+}
+
+fn reset_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if let Err(err) = std::fs::remove_dir_all(path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
@@ -2243,6 +2271,36 @@ mod tests {
                 panic!("unexpected error: {message}")
             }
         }
+    }
+
+    #[test]
+    fn prepare_worker_command_preserves_existing_session_tempdir_contents() {
+        let session_temp_dir = std::env::temp_dir().join(format!(
+            "mcp-repl-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        prepare_session_temp_dir(&session_temp_dir).expect("prepare session temp dir");
+        let marker = session_temp_dir.join("marker.txt");
+        std::fs::write(&marker, "keep").expect("write marker");
+
+        let state = SandboxState {
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        let _ = prepare_worker_command(Path::new("echo"), vec!["ok".to_string()], &state)
+            .expect("prepare worker command");
+
+        assert!(
+            marker.exists(),
+            "prepare_worker_command should not reset the session temp dir"
+        );
+
+        std::fs::remove_file(&marker).expect("remove marker");
+        std::fs::remove_dir_all(&session_temp_dir).expect("cleanup session temp dir");
     }
 
     #[cfg(target_os = "macos")]

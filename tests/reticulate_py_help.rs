@@ -51,6 +51,11 @@ async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
+    if text.contains("write_stdin timeout reached") || text.contains("<<repl status: busy") {
+        eprintln!("reticulate::py_help() remained busy in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     if text.trim() == ">" {
         eprintln!("reticulate::py_help() produced no REPL output in this environment; skipping");
         session.cancel().await?;

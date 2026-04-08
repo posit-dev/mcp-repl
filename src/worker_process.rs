@@ -2522,6 +2522,8 @@ impl WorkerManager {
     }
 
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
+        crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2571,6 +2573,8 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
+        crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
