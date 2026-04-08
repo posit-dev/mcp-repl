@@ -266,15 +266,48 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
 }
 
 fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
-    let scope = match policy {
-        SandboxPolicy::ReadOnly => "read-only",
-        SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => "unsupported",
-    };
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+    let policy_seed = match policy {
+        SandboxPolicy::ReadOnly => serde_json::json!({
+            "mode": "read-only",
+        }),
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        } => {
+            let mut canonical_roots = writable_roots
+                .iter()
+                .map(|root| {
+                    if root.is_absolute() {
+                        canonicalize_or_identity(root)
+                    } else {
+                        canonicalize_or_identity(&canonical_cwd.join(root))
+                    }
+                })
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            canonical_roots.sort();
+            canonical_roots.dedup();
+            serde_json::json!({
+                "mode": "workspace-write",
+                "writable_roots": canonical_roots,
+                "network_access": network_access,
+                "exclude_tmpdir_env_var": exclude_tmpdir_env_var,
+                "exclude_slash_tmp": exclude_slash_tmp,
+            })
+        }
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+            serde_json::json!({
+                "mode": "unsupported",
+            })
+        }
+    };
     let seed = format!(
-        "mcp-repl-windows-sandbox-v1\0{scope}\0{}",
-        canonical_cwd.display()
+        "mcp-repl-windows-sandbox-v2\0{}\0{}",
+        canonical_cwd.display(),
+        policy_seed
     );
     let a = stable_sid_word(seed.as_bytes(), 0x243f_6a88);
     let b = stable_sid_word(seed.as_bytes(), 0x85a3_08d3);
@@ -1809,6 +1842,26 @@ mod tests {
 
         assert_ne!(workspace_a, workspace_b);
         assert_ne!(workspace_a, readonly_a);
+    }
+
+    #[test]
+    fn stable_capability_sid_changes_when_workspace_write_policy_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+
+        let base = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let with_root =
+            stable_cap_sid_string(&workspace_policy(vec![extra_root], false, false), &cwd);
+        let with_network = stable_cap_sid_string(&workspace_policy(Vec::new(), true, false), &cwd);
+        let with_tmp_exclusion =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, true), &cwd);
+
+        assert_ne!(base, with_root);
+        assert_ne!(base, with_network);
+        assert_ne!(base, with_tmp_exclusion);
     }
 
     #[test]

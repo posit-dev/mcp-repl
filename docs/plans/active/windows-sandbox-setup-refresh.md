@@ -54,5 +54,7 @@
 
 - 2026-04-07: Start with an in-memory setup cache rather than a persistent registry because the current requirement is to avoid polluting disk with sandbox metadata while still removing launch-path ACL work.
 - 2026-04-07: Reset the per-session temp directory before Windows ACL preparation, and avoid re-resetting it during command preparation. Recreating the temp dir after ACL setup drops the prepared permissions and causes Windows worker startup failures like `Fatal error: cannot create 'R_TempDir'`.
+- 2026-04-08: Temp-dir resets must invalidate the cached prepared Windows launch state. Recreating the session temp dir at the same path destroys its prepared ACEs even though the cached launch key still matches by path.
+- 2026-04-08: Deterministic capability SIDs must include the full workspace-write policy shape, not just mode plus cwd. Otherwise tightening writable roots or related flags can silently keep the old write access alive through stale ACEs.
 - 2026-04-08: Windows embedded R must use `UImode_RTerm`. With `UImode_RGui`, even simple child-process launches like `system2("cmd", c("/c", "echo", "CMD_OK"))` can hang inside the worker.
 - 2026-04-08: Embedded-worker stdin ownership is tracked separately in `docs/futurework/stdin-transport-single-owner.md` so this PR can stay focused on the sandbox refactor.

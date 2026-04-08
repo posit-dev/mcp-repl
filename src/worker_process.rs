@@ -2524,6 +2524,8 @@ impl WorkerManager {
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        self.invalidate_windows_sandbox_launch_after_temp_reset();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2575,6 +2577,8 @@ impl WorkerManager {
     ) -> Result<WorkerProcess, WorkerError> {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        self.invalidate_windows_sandbox_launch_after_temp_reset();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2646,6 +2650,11 @@ impl WorkerManager {
         let now = std::time::Instant::now();
         self.last_spawn = Some(now);
         self.spawn_count = self.spawn_count.saturating_add(1);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn invalidate_windows_sandbox_launch_after_temp_reset(&mut self) {
+        self.windows_sandbox_launch = None;
     }
 
     #[cfg(target_os = "windows")]
