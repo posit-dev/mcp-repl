@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 #[cfg(target_family = "unix")]
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(not(target_family = "windows"))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -16,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::backend::Backend;
+#[cfg(not(target_family = "windows"))]
 use crate::input_protocol::format_input_frame_header;
 #[cfg(target_family = "windows")]
 use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
@@ -273,15 +276,27 @@ fn driver_refresh_backend_info(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let header = format_input_frame_header(text.len());
-        let mut payload = Vec::with_capacity(header.len() + text.len());
-        payload.extend_from_slice(header.as_bytes());
-        payload.extend_from_slice(text.as_bytes());
-        payload
+        #[cfg(target_family = "windows")]
+        {
+            let _ = text;
+            Vec::new()
+        }
+        #[cfg(not(target_family = "windows"))]
+        {
+            let header = format_input_frame_header(text.len());
+            let mut payload = Vec::with_capacity(header.len() + text.len());
+            payload.extend_from_slice(header.as_bytes());
+            payload.extend_from_slice(text.as_bytes());
+            payload
+        }
     }
 
     fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) {
         driver_on_input_start(text, ipc);
+        #[cfg(target_family = "windows")]
+        let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
+            text: text.to_string(),
+        });
     }
 
     fn wait_for_completion(
@@ -4455,7 +4470,16 @@ impl WorkerProcess {
             });
         }
         let mut child = command
-            .stdin(Stdio::piped())
+            .stdin({
+                #[cfg(target_family = "windows")]
+                {
+                    Stdio::null()
+                }
+                #[cfg(not(target_family = "windows"))]
+                {
+                    Stdio::piped()
+                }
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -4473,11 +4497,16 @@ impl WorkerProcess {
             )));
         }
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-        let stdin_tx = spawn_stdin_writer(stdin);
+        #[cfg(target_family = "windows")]
+        let stdin_tx = spawn_noop_stdin_writer();
+        #[cfg(not(target_family = "windows"))]
+        let stdin_tx = {
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
+            spawn_stdin_writer(stdin)
+        };
         let stdout_reader =
             spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
         let stderr_reader =
@@ -5313,6 +5342,7 @@ where
     }))
 }
 
+#[cfg(not(target_family = "windows"))]
 fn spawn_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>
 where
     W: Write + Send + 'static,
@@ -5333,6 +5363,25 @@ where
                     let result = writer.flush().map_err(WorkerError::Io);
                     let _ = reply.send(result);
                     break;
+                }
+            }
+        }
+    });
+    tx
+}
+
+#[cfg(target_family = "windows")]
+fn spawn_noop_stdin_writer() -> mpsc::Sender<StdinCommand> {
+    let (tx, rx) = mpsc::channel::<StdinCommand>();
+    thread::spawn(move || {
+        for command in rx {
+            match command {
+                StdinCommand::Write { payload, reply } => {
+                    let _ = payload;
+                    let _ = reply.send(Ok(()));
+                }
+                StdinCommand::Close { reply } => {
+                    let _ = reply.send(Ok(()));
                 }
             }
         }
