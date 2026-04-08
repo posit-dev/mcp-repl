@@ -1,11 +1,9 @@
-#[cfg(not(target_family = "windows"))]
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(not(target_family = "windows"))]
 use crate::input_protocol::parse_input_frame_header;
 use crate::ipc::{
     ServerToWorkerIpcMessage, connect_from_env, emit_backend_info, emit_request_end, set_global_ipc,
@@ -61,7 +59,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     crate::diagnostics::startup_log("worker: run begin");
     let state = Arc::new(WorkerState::default());
     let (request_tx, request_rx) = mpsc::sync_channel(1);
-    init_ipc(state.clone(), request_tx.clone()).map_err(|err| {
+    init_ipc(state.clone()).map_err(|err| {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
@@ -72,19 +70,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || request_loop(request_rx, request_state))
         .map_err(|err| format!("failed to spawn worker request thread: {err}"))?;
 
-    #[cfg(not(target_family = "windows"))]
-    let _stdin_thread = {
-        let stdin_state = state.clone();
-        let stdin_requests = request_tx.clone();
-        thread::Builder::new()
-            .name("worker-stdin".to_string())
-            .spawn(move || {
-                if let Err(err) = stdin_loop(stdin_state, stdin_requests) {
-                    eprintln!("worker stdin error: {err}");
-                }
-            })
-            .map_err(|err| format!("failed to spawn worker stdin thread: {err}"))?
-    };
+    let stdin_state = state.clone();
+    let stdin_requests = request_tx.clone();
+    let _stdin_thread = thread::Builder::new()
+        .name("worker-stdin".to_string())
+        .spawn(move || {
+            if let Err(err) = stdin_loop(stdin_state, stdin_requests) {
+                eprintln!("worker stdin error: {err}");
+            }
+        })
+        .map_err(|err| format!("failed to spawn worker stdin thread: {err}"))?;
 
     crate::diagnostics::startup_log("worker: starting R session");
     if let Err(err) = RSession::start_on_current_thread() {
@@ -105,10 +100,7 @@ fn wait_for_r_session() -> Result<&'static RSession, String> {
     }
 }
 
-fn init_ipc(
-    state: Arc<WorkerState>,
-    request_tx: mpsc::SyncSender<QueuedRequest>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = connect_from_env(Duration::from_secs(2))?;
     set_global_ipc(conn.clone());
     if let Err(err) = thread::Builder::new()
@@ -116,9 +108,7 @@ fn init_ipc(
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::StdinWrite { text }) => {
-                        handle_write_stdin(text, state.clone(), &request_tx);
-                    }
+                    Some(ServerToWorkerIpcMessage::StdinWrite { .. }) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         let _ = crate::r_session::request_interrupt();
                         crate::r_session::clear_pending_input();
@@ -143,7 +133,6 @@ fn init_ipc(
     Ok(())
 }
 
-#[cfg(not(target_family = "windows"))]
 fn stdin_loop(
     state: Arc<WorkerState>,
     request_tx: mpsc::SyncSender<QueuedRequest>,
