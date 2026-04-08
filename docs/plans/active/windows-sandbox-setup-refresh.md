@@ -9,7 +9,7 @@
 ## Status
 
 - State: active
-- Last updated: 2026-04-07
+- Last updated: 2026-04-08
 - Current phase: implementation
 
 ## Current Direction
@@ -42,9 +42,9 @@
 
 ## Next Safe Slice
 
-- Introduce a parent-side Windows setup helper and cache.
-- Thread prepared capability SID information from `WorkerManager` into the Windows wrapper invocation.
-- Skip ACL mutation in the wrapper when prepared state is supplied.
+- Review the Windows reticulate bridge and decide whether more of the reticulate surface should stay out-of-process on Windows.
+- Decide whether to add an explicit cleanup tool for legacy Windows ACL buildup from older runs.
+- Add more repeated warm-start coverage for Windows worker respawn behavior.
 
 ## Stop Conditions
 
@@ -55,3 +55,5 @@
 
 - 2026-04-07: Start with an in-memory setup cache rather than a persistent registry because the current requirement is to avoid polluting disk with sandbox metadata while still removing launch-path ACL work.
 - 2026-04-07: Reset the per-session temp directory before Windows ACL preparation, and avoid re-resetting it during command preparation. Recreating the temp dir after ACL setup drops the prepared permissions and causes Windows worker startup failures like `Fatal error: cannot create 'R_TempDir'`.
+- 2026-04-08: Windows embedded R must use `UImode_RTerm`. With `UImode_RGui`, even simple child-process launches like `system2("cmd", c("/c", "echo", "CMD_OK"))` can hang inside the worker.
+- 2026-04-08: The remaining Windows reticulate timeout had two layers. Reticulate subprocess calls needed `system2(..., input = "")`, and in-process `reticulate:::py_initialize()` still hung in the piped worker. For now, Windows `py_config()`, `import_builtins()`, and `py_help()` use a small external-Python bridge instead of embedded Python initialization.

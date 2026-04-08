@@ -16,7 +16,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
+async fn reticulate_py_help_is_rendered() -> TestResult<()> {
     let mut session = common::spawn_server_with_files().await?;
 
     let result = session
@@ -51,20 +51,13 @@ async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("write_stdin timeout reached") || text.contains("<<repl status: busy") {
-        eprintln!("reticulate::py_help() remained busy in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if text.trim() == ">" {
-        eprintln!("reticulate::py_help() produced no REPL output in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
     assert!(
         text.to_ascii_lowercase().contains("help"),
         "expected reticulate::py_help() output, got: {text:?}"
+    );
+    assert!(
+        text.contains("Return the number of items"),
+        "expected reticulate::py_help() doc text, got: {text:?}"
     );
     assert!(
         !text.contains("--More--"),

@@ -26,7 +26,7 @@ use libr::{
 #[cfg(target_family = "windows")]
 use libr::{
     R_DefParamsEx, R_SetParams, R_common_command_line, Rboolean_FALSE, Rboolean_TRUE, Rstart,
-    UImode_RGui, UserBreak, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
+    UImode_RTerm, UserBreak, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
 };
 #[cfg(target_family = "windows")]
 use std::mem::MaybeUninit;
@@ -508,7 +508,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         R_common_command_line(&mut c_args_len, c_args.as_mut_ptr(), params);
 
         (*params).R_Interactive = 1;
-        (*params).CharacterMode = UImode_RGui;
+        (*params).CharacterMode = UImode_RTerm;
         // Keep startup behavior aligned with R defaults. R_common_command_line
         // already adjusts these based on the provided command-line arguments.
         (*params).set_NoRenviron(Rboolean_FALSE);
