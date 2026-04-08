@@ -6,14 +6,19 @@ use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -104,7 +109,9 @@ const REVOKE_ACCESS: i32 = 4;
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
 const INHERIT_ONLY_ACE: u8 = 0x08;
-const WRAPPER_STDIO_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
+const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -150,8 +157,22 @@ struct WrapperStdioForwarders {
     stdin_forwarder: thread::JoinHandle<()>,
     stdout_forwarder: thread::JoinHandle<()>,
     stderr_forwarder: thread::JoinHandle<()>,
-    stdout_done: mpsc::Receiver<()>,
-    stderr_done: mpsc::Receiver<()>,
+    stdout_state: Arc<WrapperForwarderState>,
+    stderr_state: Arc<WrapperForwarderState>,
+}
+
+struct WrapperForwarderState {
+    bytes_copied: AtomicU64,
+    done: AtomicBool,
+}
+
+impl WrapperForwarderState {
+    fn new() -> Self {
+        Self {
+            bytes_copied: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -570,8 +591,8 @@ pub fn run_sandboxed_command(
             stdin_forwarder,
             stdout_forwarder,
             stderr_forwarder,
-            stdout_done,
-            stderr_done,
+            stdout_state,
+            stderr_state,
         } = spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
@@ -618,8 +639,8 @@ pub fn run_sandboxed_command(
             CloseHandle(job);
         }
         drop(stdin_forwarder);
-        drain_wrapper_forwarder(stdout_forwarder, stdout_done);
-        drain_wrapper_forwarder(stderr_forwarder, stderr_done);
+        drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
+        drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
         cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
@@ -851,44 +872,98 @@ fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwa
         child_stderr: _,
     } = stdio;
 
-    let (stdout_done_tx, stdout_done_rx) = mpsc::channel();
-    let (stderr_done_tx, stderr_done_rx) = mpsc::channel();
-
     let stdin_forwarder = thread::spawn(move || {
         let mut wrapper_stdin = io::stdin();
         let mut child_stdin = stdin_write;
         let _ = io::copy(&mut wrapper_stdin, &mut child_stdin);
         let _ = child_stdin.flush();
     });
+    let stdout_state = Arc::new(WrapperForwarderState::new());
+    let stdout_state_thread = Arc::clone(&stdout_state);
     let stdout_forwarder = thread::spawn(move || {
-        let mut child_stdout = stdout_read;
-        let mut wrapper_stdout = io::stdout();
-        let _ = io::copy(&mut child_stdout, &mut wrapper_stdout);
-        let _ = wrapper_stdout.flush();
-        let _ = stdout_done_tx.send(());
+        copy_wrapper_output(stdout_read, io::stdout(), &stdout_state_thread);
     });
+    let stderr_state = Arc::new(WrapperForwarderState::new());
+    let stderr_state_thread = Arc::clone(&stderr_state);
     let stderr_forwarder = thread::spawn(move || {
-        let mut child_stderr = stderr_read;
-        let mut wrapper_stderr = io::stderr();
-        let _ = io::copy(&mut child_stderr, &mut wrapper_stderr);
-        let _ = wrapper_stderr.flush();
-        let _ = stderr_done_tx.send(());
+        copy_wrapper_output(stderr_read, io::stderr(), &stderr_state_thread);
     });
 
     WrapperStdioForwarders {
         stdin_forwarder,
         stdout_forwarder,
         stderr_forwarder,
-        stdout_done: stdout_done_rx,
-        stderr_done: stderr_done_rx,
+        stdout_state,
+        stderr_state,
     }
 }
 
-fn drain_wrapper_forwarder(handle: thread::JoinHandle<()>, done: mpsc::Receiver<()>) {
-    if done.recv_timeout(WRAPPER_STDIO_DRAIN_TIMEOUT).is_ok() {
-        let _ = handle.join();
-    } else {
-        drop(handle);
+fn copy_wrapper_output(
+    mut child_output: File,
+    mut wrapper_output: impl Write,
+    state: &WrapperForwarderState,
+) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match child_output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if wrapper_output.write_all(&buffer[..count]).is_err() {
+                    break;
+                }
+                state
+                    .bytes_copied
+                    .fetch_add(count as u64, Ordering::Relaxed);
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = wrapper_output.flush();
+    state.done.store(true, Ordering::Release);
+}
+
+fn drain_wrapper_forwarder(handle: thread::JoinHandle<()>, state: &WrapperForwarderState) {
+    drain_wrapper_forwarder_with_timeouts(
+        handle,
+        state,
+        WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT,
+        WRAPPER_STDIO_DRAIN_MAX_WAIT,
+        WRAPPER_STDIO_DRAIN_POLL_INTERVAL,
+    );
+}
+
+fn drain_wrapper_forwarder_with_timeouts(
+    handle: thread::JoinHandle<()>,
+    state: &WrapperForwarderState,
+    idle_timeout: Duration,
+    max_wait: Duration,
+    poll_interval: Duration,
+) {
+    let start = Instant::now();
+    let mut last_progress = start;
+    let mut last_bytes = state.bytes_copied.load(Ordering::Relaxed);
+
+    loop {
+        if state.done.load(Ordering::Acquire) {
+            let _ = handle.join();
+            return;
+        }
+
+        let now = Instant::now();
+        let bytes = state.bytes_copied.load(Ordering::Relaxed);
+        if bytes != last_bytes {
+            last_bytes = bytes;
+            last_progress = now;
+        }
+
+        if now.duration_since(last_progress) >= idle_timeout
+            || now.duration_since(start) >= max_wait
+        {
+            drop(handle);
+            return;
+        }
+
+        thread::sleep(poll_interval);
     }
 }
 
@@ -1578,6 +1653,7 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn workspace_policy(
@@ -1591,6 +1667,53 @@ mod tests {
             exclude_tmpdir_env_var,
             exclude_slash_tmp: false,
         }
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_waits_while_progress_continues() {
+        let state = Arc::new(WrapperForwarderState::new());
+        let thread_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(20));
+                thread_state.bytes_copied.fetch_add(1024, Ordering::Relaxed);
+            }
+            thread_state.done.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(30),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+        );
+
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        assert!(state.done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_stops_after_idle_timeout_without_progress() {
+        let state = Arc::new(WrapperForwarderState::new());
+        let thread_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            thread_state.done.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        );
+
+        assert!(start.elapsed() < Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(120));
     }
 
     #[test]
