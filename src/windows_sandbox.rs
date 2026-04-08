@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -142,6 +143,12 @@ impl PreparedSandboxLaunch {
             && self.sandbox_policy_cwd == canonicalize_or_identity(sandbox_policy_cwd)
             && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchCapabilitySids {
+    filesystem_sid: String,
+    launch_sid: String,
 }
 
 struct WrapperChildStdio {
@@ -348,6 +355,47 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
     format!("S-1-5-21-{a}-{b}-{c}-{d}")
 }
 
+fn make_random_sid_string() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let a = (nanos as u32) ^ pid;
+    let b = ((nanos >> 32) as u32).wrapping_add(pid.rotate_left(7));
+    let c = ((nanos >> 64) as u32).wrapping_add(pid.rotate_left(13));
+    let d = ((nanos >> 96) as u32).wrapping_add(pid.rotate_left(19));
+    format!("S-1-5-21-{a}-{b}-{c}-{d}")
+}
+
+fn resolve_launch_capability_sids(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    prepared_capability_sid: Option<&str>,
+) -> Result<LaunchCapabilitySids, String> {
+    let expected_filesystem_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+    match prepared_capability_sid {
+        Some(value) => {
+            if value != expected_filesystem_sid {
+                return Err(
+                    "prepared capability SID did not match expected workspace identity".to_string(),
+                );
+            }
+            Ok(LaunchCapabilitySids {
+                filesystem_sid: value.to_string(),
+                launch_sid: make_random_sid_string(),
+            })
+        }
+        None => {
+            let sid = make_random_sid_string();
+            Ok(LaunchCapabilitySids {
+                filesystem_sid: sid.clone(),
+                launch_sid: sid,
+            })
+        }
+    }
+}
+
 fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
     let mut hash = 2_166_136_261u32 ^ seed;
     for byte in bytes {
@@ -439,6 +487,24 @@ pub fn prepare_sandbox_launch(
     })
 }
 
+pub fn refresh_prepared_sandbox_launch_session_temp_dir(
+    launch: &PreparedSandboxLaunch,
+) -> Result<(), String> {
+    unsafe {
+        let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let refresh_result = add_allow_ace(&launch.session_temp_dir, psid_capability);
+        LocalFree(psid_capability as HLOCAL);
+        match refresh_result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(format!(
+                "failed to refresh writable ACL on '{}': {err}",
+                launch.session_temp_dir.display()
+            )),
+        }
+    }
+}
+
 #[repr(C)]
 struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
@@ -465,34 +531,38 @@ pub fn run_sandboxed_command(
         let session_temp_dir =
             env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
-        let expected_cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
-        let cap_sid = match prepared_capability_sid {
-            Some(value) => {
-                if value != expected_cap_sid {
-                    return Err(
-                        "prepared capability SID did not match expected workspace identity"
-                            .to_string(),
-                    );
-                }
-                value.to_string()
-            }
-            None => expected_cap_sid,
+        let capability_sids =
+            resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
+        let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
+            .ok_or_else(|| "ConvertStringSidToSidW failed for filesystem SID".to_string())?;
+        let launch_sid_is_distinct = capability_sids.launch_sid != capability_sids.filesystem_sid;
+        let psid_launch = if launch_sid_is_distinct {
+            convert_string_sid_to_sid(&capability_sids.launch_sid)
+                .ok_or_else(|| "ConvertStringSidToSidW failed for launch SID".to_string())?
+        } else {
+            psid_capability
         };
-        let psid_capability = convert_string_sid_to_sid(&cap_sid)
-            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
 
         let base_token = get_current_token_for_restriction()?;
-        let token_result = create_restricted_token_for_policy(base_token, &[psid_capability]);
+        let mut restricted_capability_sids = vec![psid_capability];
+        if launch_sid_is_distinct {
+            restricted_capability_sids.push(psid_launch);
+        }
+        let token_result =
+            create_restricted_token_for_policy(base_token, &restricted_capability_sids);
         CloseHandle(base_token);
         let restricted_token = match token_result {
             Ok(token) => token,
             Err(err) => {
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
         };
 
-        let null_device_ace_applied = allow_null_device(psid_capability);
+        let null_device_ace_applied = allow_null_device(psid_launch);
 
         let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
         if prepared_capability_sid.is_none() {
@@ -515,10 +585,13 @@ pub fn run_sandboxed_command(
                     Err(err) => {
                         cleanup_capability_acl_state(
                             &acl_guards,
-                            psid_capability,
+                            psid_launch,
                             null_device_ace_applied,
                         );
                         CloseHandle(restricted_token);
+                        if launch_sid_is_distinct {
+                            LocalFree(psid_launch as HLOCAL);
+                        }
                         LocalFree(psid_capability as HLOCAL);
                         return Err(format!(
                             "failed to apply writable ACL to '{}': {err}",
@@ -536,10 +609,13 @@ pub fn run_sandboxed_command(
                         Err(err) => {
                             cleanup_capability_acl_state(
                                 &acl_guards,
-                                psid_capability,
+                                psid_launch,
                                 null_device_ace_applied,
                             );
                             CloseHandle(restricted_token);
+                            if launch_sid_is_distinct {
+                                LocalFree(psid_launch as HLOCAL);
+                            }
                             LocalFree(psid_capability as HLOCAL);
                             return Err(format!(
                                 "failed to apply deny ACL to '{}': {err}",
@@ -555,8 +631,11 @@ pub fn run_sandboxed_command(
         let stdio_pipes = match create_wrapper_child_stdio() {
             Ok(pipes) => pipes,
             Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
@@ -577,8 +656,11 @@ pub fn run_sandboxed_command(
             Ok(value) => value,
             Err(err) => {
                 drop(stdio_pipes);
-                cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
@@ -605,10 +687,13 @@ pub fn run_sandboxed_command(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
-            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+            cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
             LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "WaitForSingleObject failed: {}",
@@ -624,10 +709,13 @@ pub fn run_sandboxed_command(
             drop(stdin_forwarder);
             drop(stdout_forwarder);
             drop(stderr_forwarder);
-            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+            cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
             LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "GetExitCodeProcess failed: {}",
@@ -641,10 +729,13 @@ pub fn run_sandboxed_command(
         drop(stdin_forwarder);
         drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
         drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
-        cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+        cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
         CloseHandle(restricted_token);
+        if launch_sid_is_distinct {
+            LocalFree(psid_launch as HLOCAL);
+        }
         LocalFree(psid_capability as HLOCAL);
 
         Ok(exit_code as i32)
@@ -2004,6 +2095,24 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_uses_distinct_launch_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let expected = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let resolved = resolve_launch_capability_sids(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            Some(&expected),
+        )
+        .expect("prepared launch SIDs");
+
+        assert_eq!(resolved.filesystem_sid, expected);
+        assert_ne!(resolved.launch_sid, resolved.filesystem_sid);
+    }
+
+    #[test]
     fn stable_capability_sid_changes_with_policy_or_workspace() {
         let tmp = tempdir().expect("tempdir");
         let cwd_a = tmp.path().join("workspace-a");
@@ -2039,6 +2148,50 @@ mod tests {
         assert_ne!(base, with_root);
         assert_ne!(base, with_network);
         assert_ne!(base, with_tmp_exclusion);
+    }
+
+    #[test]
+    fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("reset session temp dir");
+        refresh_prepared_sandbox_launch_session_temp_dir(&prepared)
+            .expect("refresh session temp dir ACL");
+
+        let probe = session_temp_dir.join("probe.txt");
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            format!("Set-Content -LiteralPath '{}' -Value 'OK'", probe.display()),
+        ];
+
+        let run_result =
+            run_sandboxed_command(&policy, &cwd, &command, Some(prepared.capability_sid()));
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            revoke_ace(&cwd, sid);
+            revoke_ace(&session_temp_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+
+        let status = run_result.expect("sandboxed command should run");
+        assert_eq!(status, 0);
+        assert!(
+            probe.is_file(),
+            "expected sandboxed command to recreate probe file after tempdir reset"
+        );
     }
 
     #[test]

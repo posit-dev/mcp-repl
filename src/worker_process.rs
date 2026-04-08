@@ -2524,8 +2524,6 @@ impl WorkerManager {
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
-        #[cfg(target_os = "windows")]
-        self.invalidate_windows_sandbox_launch_after_temp_reset();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2577,8 +2575,6 @@ impl WorkerManager {
     ) -> Result<WorkerProcess, WorkerError> {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
-        #[cfg(target_os = "windows")]
-        self.invalidate_windows_sandbox_launch_after_temp_reset();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2653,11 +2649,6 @@ impl WorkerManager {
     }
 
     #[cfg(target_os = "windows")]
-    fn invalidate_windows_sandbox_launch_after_temp_reset(&mut self) {
-        self.windows_sandbox_launch = None;
-    }
-
-    #[cfg(target_os = "windows")]
     fn ensure_windows_sandbox_launch(
         &mut self,
     ) -> Result<Option<crate::windows_sandbox::PreparedSandboxLaunch>, WorkerError> {
@@ -2666,33 +2657,40 @@ impl WorkerManager {
             return Ok(None);
         }
 
-        let needs_prepare = self.windows_sandbox_launch.as_ref().is_none_or(|launch| {
-            !launch.matches(
+        let launch_matches = self.windows_sandbox_launch.as_ref().is_some_and(|launch| {
+            launch.matches(
                 &self.sandbox_state.sandbox_policy,
                 &self.sandbox_state.sandbox_cwd,
                 &self.sandbox_state.session_temp_dir,
             )
         });
-
-        if needs_prepare {
-            crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
-                worker_context_event_payload(self.backend, &self.sandbox_state)
-            });
-            let prepared = crate::windows_sandbox::prepare_sandbox_launch(
-                &self.sandbox_state.sandbox_policy,
-                &self.sandbox_state.sandbox_cwd,
-                &self.sandbox_state.session_temp_dir,
+        if launch_matches {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_session_temp_dir(
+                self.windows_sandbox_launch
+                    .as_ref()
+                    .expect("matching launch must exist"),
             )
             .map_err(WorkerError::Sandbox)?;
-            crate::event_log::log(
-                "worker_windows_sandbox_prepare_end",
-                serde_json::json!({
-                    "status": "ok",
-                    "capability_sid": prepared.capability_sid(),
-                }),
-            );
-            self.windows_sandbox_launch = Some(prepared);
+            return Ok(self.windows_sandbox_launch.clone());
         }
+
+        crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state)
+        });
+        let prepared = crate::windows_sandbox::prepare_sandbox_launch(
+            &self.sandbox_state.sandbox_policy,
+            &self.sandbox_state.sandbox_cwd,
+            &self.sandbox_state.session_temp_dir,
+        )
+        .map_err(WorkerError::Sandbox)?;
+        crate::event_log::log(
+            "worker_windows_sandbox_prepare_end",
+            serde_json::json!({
+                "status": "ok",
+                "capability_sid": prepared.capability_sid(),
+            }),
+        );
+        self.windows_sandbox_launch = Some(prepared);
 
         Ok(self.windows_sandbox_launch.clone())
     }

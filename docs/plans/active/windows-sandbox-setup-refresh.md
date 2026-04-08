@@ -61,4 +61,6 @@
 - 2026-04-08: Wrapper shutdown should still give stdout/stderr forwarders a short bounded grace period to flush buffered pipe data after the child exits. Immediate thread drop avoids hangs but can truncate the tail of fast-exiting commands.
 - 2026-04-08: The bounded drain should be progress-aware rather than a fixed grace window. Keep waiting while bytes are still moving, but abandon when the pipe stops making progress long enough to indicate a hung inherited writer.
 - 2026-04-08: Windows embedded R must use `UImode_RTerm`. With `UImode_RGui`, even simple child-process launches like `system2("cmd", c("/c", "echo", "CMD_OK"))` can hang inside the worker.
+- 2026-04-08: Launch-scoped resources such as `\\.\NUL` must use a per-launch SID even when filesystem ACLs are prepared on a stable capability SID. Otherwise concurrent sandboxes for the same workspace can revoke each other's device access on exit.
+- 2026-04-08: Worker respawns should refresh the recreated session temp directory against the cached prepared launch instead of invalidating the whole Windows setup cache. Resetting the temp dir destroys only that directory's ACEs, not the prepared workspace ACLs.
 - 2026-04-08: Embedded-worker stdin ownership is tracked separately in `docs/futurework/stdin-transport-single-owner.md` so this PR can stay focused on the sandbox refactor.
