@@ -2665,12 +2665,30 @@ impl WorkerManager {
             )
         });
         if launch_matches {
-            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+            let refresh_result = crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
                 self.windows_sandbox_launch
                     .as_ref()
                     .expect("matching launch must exist"),
-            )
-            .map_err(WorkerError::Sandbox)?;
+            );
+            match refresh_result {
+                Ok(()) => {}
+                Err(err)
+                    if crate::windows_sandbox::should_fallback_to_inline_windows_sandbox_setup(
+                        &err,
+                    ) =>
+                {
+                    crate::event_log::log(
+                        "worker_windows_sandbox_refresh_end",
+                        serde_json::json!({
+                            "status": "inline_fallback",
+                            "error": err,
+                        }),
+                    );
+                    self.windows_sandbox_launch = None;
+                    return Ok(None);
+                }
+                Err(err) => return Err(WorkerError::Sandbox(err)),
+            }
             return Ok(self.windows_sandbox_launch.clone());
         }
 
@@ -2681,8 +2699,26 @@ impl WorkerManager {
             &self.sandbox_state.sandbox_policy,
             &self.sandbox_state.sandbox_cwd,
             &self.sandbox_state.session_temp_dir,
-        )
-        .map_err(WorkerError::Sandbox)?;
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err)
+                if crate::windows_sandbox::should_fallback_to_inline_windows_sandbox_setup(
+                    &err,
+                ) =>
+            {
+                crate::event_log::log(
+                    "worker_windows_sandbox_prepare_end",
+                    serde_json::json!({
+                        "status": "inline_fallback",
+                        "error": err,
+                    }),
+                );
+                self.windows_sandbox_launch = None;
+                return Ok(None);
+            }
+            Err(err) => return Err(WorkerError::Sandbox(err)),
+        };
         crate::event_log::log(
             "worker_windows_sandbox_prepare_end",
             serde_json::json!({
@@ -6632,6 +6668,37 @@ mod tests {
             WINDOWS_IPC_CONNECT_MAX_WAIT <= Duration::from_secs(120),
             "windows IPC connect max wait should fail fast, got {:?}",
             WINDOWS_IPC_CONNECT_MAX_WAIT
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_prepare_access_denied_falls_back_to_inline_launch() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(Some(
+            "failed to prepare writable ACL on 'C:\\workspace': SetNamedSecurityInfoW failed: 5"
+                .to_string(),
+        ));
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let result = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "access-denied prepare failures should fall back to inline wrapper setup, got: {result:?}"
+        );
+        assert!(
+            manager.windows_sandbox_launch.is_none(),
+            "fallback path should not cache a prepared launch after access-denied prep"
         );
     }
 }

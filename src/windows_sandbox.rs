@@ -13,6 +13,10 @@ use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -30,7 +34,7 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
@@ -180,6 +184,25 @@ impl WrapperForwarderState {
             done: AtomicBool::new(false),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_sandbox_launch_test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+fn prepare_sandbox_launch_test_error() -> &'static Mutex<Option<String>> {
+    static TEST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    TEST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn set_prepare_sandbox_launch_test_error(error: Option<String>) {
+    *prepare_sandbox_launch_test_error()
+        .lock()
+        .expect("prepare sandbox launch test error mutex poisoned") = error;
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -382,15 +405,15 @@ fn resolve_launch_capability_sids(
 ) -> Result<LaunchCapabilitySids, String> {
     match prepared_capability_sid {
         Some(value) => {
-            if let Some(session_temp_dir) = session_temp_dir {
-                let expected_filesystem_sid =
-                    stable_cap_sid_string(policy, sandbox_policy_cwd, session_temp_dir);
-                if value != expected_filesystem_sid {
-                    return Err(
-                        "prepared capability SID did not match expected workspace identity"
-                            .to_string(),
-                    );
-                }
+            let session_temp_dir = session_temp_dir.ok_or_else(|| {
+                "prepared capability SID requires MCP_REPL_R_SESSION_TMPDIR".to_string()
+            })?;
+            let expected_filesystem_sid =
+                stable_cap_sid_string(policy, sandbox_policy_cwd, session_temp_dir);
+            if value != expected_filesystem_sid {
+                return Err(
+                    "prepared capability SID did not match expected workspace identity".to_string(),
+                );
             }
             Ok(LaunchCapabilitySids {
                 filesystem_sid: value.to_string(),
@@ -414,6 +437,12 @@ fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
         hash = hash.wrapping_mul(16_777_619);
     }
     hash.max(1)
+}
+
+pub(crate) fn should_fallback_to_inline_windows_sandbox_setup(error: &str) -> bool {
+    error.contains(&format!(
+        "SetNamedSecurityInfoW failed: {ERROR_ACCESS_DENIED}"
+    ))
 }
 
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
@@ -491,6 +520,15 @@ pub fn prepare_sandbox_launch(
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
 ) -> Result<PreparedSandboxLaunch, String> {
+    #[cfg(test)]
+    if let Some(error) = prepare_sandbox_launch_test_error()
+        .lock()
+        .expect("prepare sandbox launch test error mutex poisoned")
+        .clone()
+    {
+        return Err(error);
+    }
+
     validate_windows_policy(policy)?;
 
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
@@ -1772,6 +1810,11 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    fn env_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
     fn workspace_policy(
         writable_roots: Vec<PathBuf>,
         network_access: bool,
@@ -2155,6 +2198,25 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_sid_requires_session_temp_metadata() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let result = resolve_launch_capability_sids(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            None,
+            Some("S-1-5-21-1-2-3-4"),
+        );
+
+        assert!(
+            result.is_err(),
+            "prepared capability SID should require session temp metadata"
+        );
+    }
+
+    #[test]
     fn stable_capability_sid_changes_with_policy_workspace_or_session_temp_dir() {
         let tmp = tempdir().expect("tempdir");
         let cwd_a = tmp.path().join("workspace-a");
@@ -2226,6 +2288,7 @@ mod tests {
 
     #[test]
     fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         let session_temp_dir = tmp.path().join("session-temp");
@@ -2249,8 +2312,40 @@ mod tests {
             format!("Set-Content -LiteralPath '{}' -Value 'OK'", probe.display()),
         ];
 
+        let original_tmp = std::env::var_os("TMP");
+        let original_temp = std::env::var_os("TEMP");
+        let original_session_tmp = std::env::var_os(R_SESSION_TMPDIR_ENV);
+        unsafe {
+            std::env::set_var("TMP", &session_temp_dir);
+            std::env::set_var("TEMP", &session_temp_dir);
+            std::env::set_var(R_SESSION_TMPDIR_ENV, &session_temp_dir);
+        }
         let run_result =
             run_sandboxed_command(&policy, &cwd, &command, Some(prepared.capability_sid()));
+        match original_tmp {
+            Some(value) => unsafe {
+                std::env::set_var("TMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMP");
+            },
+        }
+        match original_temp {
+            Some(value) => unsafe {
+                std::env::set_var("TEMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TEMP");
+            },
+        }
+        match original_session_tmp {
+            Some(value) => unsafe {
+                std::env::set_var(R_SESSION_TMPDIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(R_SESSION_TMPDIR_ENV);
+            },
+        }
 
         unsafe {
             let sid = convert_string_sid_to_sid(prepared.capability_sid())
