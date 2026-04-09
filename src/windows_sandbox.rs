@@ -63,6 +63,7 @@ use windows_sys::Win32::Security::GetAce;
 use windows_sys::Win32::Security::GetAclInformation;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
+use windows_sys::Win32::Security::IsTokenRestricted;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SetTokenInformation;
@@ -457,6 +458,18 @@ fn resolve_launch_capability_sids(
     }
 }
 
+unsafe fn validate_prepared_capability_sid_context(
+    base_token: HANDLE,
+    prepared_capability_sid: Option<&str>,
+) -> Result<(), String> {
+    if prepared_capability_sid.is_some() && IsTokenRestricted(base_token) != 0 {
+        return Err(
+            "prepared capability SID cannot be reused from restricted base token".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
     let mut hash = 2_166_136_261u32 ^ seed;
     for byte in bytes {
@@ -641,6 +654,16 @@ fn run_sandboxed_command_with_env_map(
         };
 
         let base_token = get_current_token_for_restriction()?;
+        if let Err(err) =
+            validate_prepared_capability_sid_context(base_token, prepared_capability_sid)
+        {
+            CloseHandle(base_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
+            LocalFree(psid_capability as HLOCAL);
+            return Err(err);
+        }
         let mut restricted_capability_sids = vec![psid_capability];
         if launch_sid_is_distinct {
             restricted_capability_sids.push(psid_launch);
@@ -1136,7 +1159,9 @@ fn copy_wrapper_output(
             Ok(count) => {
                 let write_result = {
                     let _write_guard = state.begin_write();
-                    let result = wrapper_output.write_all(&buffer[..count]);
+                    let result = wrapper_output
+                        .write_all(&buffer[..count])
+                        .and_then(|_| wrapper_output.flush());
                     if result.is_ok() {
                         state
                             .bytes_copied
@@ -1927,6 +1952,35 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingWriterState {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    struct RecordingWriter {
+        state: Arc<Mutex<RecordingWriterState>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.state
+                .lock()
+                .expect("recording writer state mutex")
+                .bytes
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.state
+                .lock()
+                .expect("recording writer state mutex")
+                .flush_count += 1;
+            Ok(())
+        }
+    }
+
     #[test]
     fn drain_wrapper_forwarder_waits_while_progress_continues() {
         let state = Arc::new(WrapperForwarderState::new());
@@ -2026,6 +2080,29 @@ mod tests {
         assert!(
             !finished_before_cleanup,
             "drain should return before a blocked write finishes"
+        );
+    }
+
+    #[test]
+    fn copy_wrapper_output_flushes_after_each_chunk() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, b"prompt> ").expect("write payload");
+
+        let state = WrapperForwarderState::new();
+        let writer_state = Arc::new(Mutex::new(RecordingWriterState::default()));
+        let writer = RecordingWriter {
+            state: Arc::clone(&writer_state),
+        };
+
+        let input = File::open(&payload_path).expect("open payload");
+        copy_wrapper_output(input, writer, &state);
+
+        let recorded = writer_state.lock().expect("recording writer state mutex");
+        assert_eq!(recorded.bytes, b"prompt> ");
+        assert!(
+            recorded.flush_count >= 2,
+            "forwarded output should flush each chunk as well as the final stream flush"
         );
     }
 
@@ -2551,6 +2628,31 @@ mod tests {
             probe.is_file(),
             "expected sandboxed command to recreate probe file after tempdir reset"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_capability_sid_is_rejected_for_restricted_base_token() {
+        unsafe {
+            let random_sid = make_random_sid_string();
+            let psid_random =
+                convert_string_sid_to_sid(&random_sid).expect("random SID should convert");
+            let base_token = get_current_token_for_restriction().expect("current token");
+            let restricted_token = create_restricted_token_for_policy(base_token, &[psid_random])
+                .expect("restricted token");
+            CloseHandle(base_token);
+            LocalFree(psid_random as HLOCAL);
+
+            let result = validate_prepared_capability_sid_context(
+                restricted_token,
+                Some("S-1-5-21-1-2-3-4"),
+            );
+            CloseHandle(restricted_token);
+            assert!(
+                matches!(result, Err(ref err) if err.contains("prepared capability SID")),
+                "expected restricted-token prepared launch reuse to be rejected, got: {result:?}"
+            );
+        }
     }
 
     #[test]
