@@ -2672,21 +2672,6 @@ impl WorkerManager {
             );
             match refresh_result {
                 Ok(()) => {}
-                Err(err)
-                    if crate::windows_sandbox::should_fallback_to_inline_windows_sandbox_setup(
-                        &err,
-                    ) =>
-                {
-                    crate::event_log::log(
-                        "worker_windows_sandbox_refresh_end",
-                        serde_json::json!({
-                            "status": "inline_fallback",
-                            "error": err,
-                        }),
-                    );
-                    self.windows_sandbox_launch = None;
-                    return Ok(None);
-                }
                 Err(err) => return Err(WorkerError::Sandbox(err)),
             }
             return Ok(self.windows_sandbox_launch.clone());
@@ -2702,21 +2687,6 @@ impl WorkerManager {
         );
         let prepared = match prepared {
             Ok(prepared) => prepared,
-            Err(err)
-                if crate::windows_sandbox::should_fallback_to_inline_windows_sandbox_setup(
-                    &err,
-                ) =>
-            {
-                crate::event_log::log(
-                    "worker_windows_sandbox_prepare_end",
-                    serde_json::json!({
-                        "status": "inline_fallback",
-                        "error": err,
-                    }),
-                );
-                self.windows_sandbox_launch = None;
-                return Ok(None);
-            }
             Err(err) => return Err(WorkerError::Sandbox(err)),
         };
         crate::event_log::log(
@@ -6673,7 +6643,7 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_sandbox_prepare_access_denied_falls_back_to_inline_launch() {
+    fn windows_sandbox_prepare_access_denied_fails_fast() {
         let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
@@ -6693,12 +6663,16 @@ mod tests {
         crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
 
         assert!(
-            matches!(result, Ok(None)),
-            "access-denied prepare failures should fall back to inline wrapper setup, got: {result:?}"
+            matches!(
+                result,
+                Err(WorkerError::Sandbox(ref message))
+                    if message.contains("SetNamedSecurityInfoW failed: 5")
+            ),
+            "access-denied prepare failures should abort launch preparation, got: {result:?}"
         );
         assert!(
             manager.windows_sandbox_launch.is_none(),
-            "fallback path should not cache a prepared launch after access-denied prep"
+            "failed launch preparation should not cache a prepared launch"
         );
     }
 }

@@ -35,7 +35,7 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
@@ -429,12 +429,6 @@ fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
         hash = hash.wrapping_mul(16_777_619);
     }
     hash.max(1)
-}
-
-pub(crate) fn should_fallback_to_inline_windows_sandbox_setup(error: &str) -> bool {
-    error.contains(&format!(
-        "SetNamedSecurityInfoW failed: {ERROR_ACCESS_DENIED}"
-    ))
 }
 
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
