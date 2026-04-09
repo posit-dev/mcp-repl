@@ -457,13 +457,15 @@ fn sandbox_acl_env_map(session_temp_dir: &Path) -> HashMap<String, String> {
 
 fn prepared_launch_acl_paths(launch: &PreparedSandboxLaunch) -> AllowDenyPaths {
     let env_map = sandbox_acl_env_map(&launch.session_temp_dir);
-    compute_allow_deny_paths(
+    let mut paths = compute_allow_deny_paths(
         &launch.policy,
         &launch.sandbox_policy_cwd,
         &launch.sandbox_policy_cwd,
         Some(&launch.session_temp_dir),
         &env_map,
-    )
+    );
+    paths.allow.remove(&launch.session_temp_dir);
+    paths
 }
 
 unsafe fn apply_prepared_launch_acl_state(
@@ -676,6 +678,23 @@ pub fn run_sandboxed_command(
                     }
                 }
                 crate::diagnostics::startup_log("windows-sandbox: deny ACLs applied");
+            }
+        } else if let Some(session_temp_dir) = session_temp_dir.as_deref() {
+            match add_allow_ace(session_temp_dir, psid_launch) {
+                Ok(true) => acl_guards.push((session_temp_dir.to_path_buf(), psid_launch)),
+                Ok(false) => {}
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(format!(
+                        "failed to apply session temp dir ACL to '{}': {err}",
+                        session_temp_dir.display()
+                    ));
+                }
             }
         }
 
@@ -2232,6 +2251,41 @@ mod tests {
             second.capability_sid(),
             "stable filesystem SID should be reused across per-session temp dirs"
         );
+    }
+
+    #[test]
+    fn prepared_launch_does_not_share_session_temp_dir_access() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_a = tmp.path().join("session-temp-a");
+        let session_temp_b = tmp.path().join("session-temp-b");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_a =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_a).expect("prepare launch a");
+        let prepared_b =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_b).expect("prepare launch b");
+
+        unsafe {
+            let sid_a = convert_string_sid_to_sid(prepared_a.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_allow_ace(&session_temp_b, sid_a),
+                "prepared capability SID should not grant access to a different session temp dir"
+            );
+            LocalFree(sid_a as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared_b.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    session_temp_a.as_path(),
+                    session_temp_b.as_path(),
+                ],
+            );
+        }
     }
 
     #[test]
