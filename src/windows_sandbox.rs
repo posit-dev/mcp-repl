@@ -178,6 +178,7 @@ struct WrapperStdioForwarders {
 struct WrapperForwarderState {
     bytes_copied: AtomicU64,
     done: AtomicBool,
+    write_in_progress: AtomicBool,
 }
 
 impl WrapperForwarderState {
@@ -185,7 +186,25 @@ impl WrapperForwarderState {
         Self {
             bytes_copied: AtomicU64::new(0),
             done: AtomicBool::new(false),
+            write_in_progress: AtomicBool::new(false),
         }
+    }
+
+    fn begin_write(&self) -> WrapperWriteGuard<'_> {
+        self.write_in_progress.store(true, Ordering::Release);
+        WrapperWriteGuard {
+            write_in_progress: &self.write_in_progress,
+        }
+    }
+}
+
+struct WrapperWriteGuard<'a> {
+    write_in_progress: &'a AtomicBool,
+}
+
+impl Drop for WrapperWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.write_in_progress.store(false, Ordering::Release);
     }
 }
 
@@ -1060,17 +1079,27 @@ fn copy_wrapper_output(
         match child_output.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                if wrapper_output.write_all(&buffer[..count]).is_err() {
+                let write_result = {
+                    let _write_guard = state.begin_write();
+                    let result = wrapper_output.write_all(&buffer[..count]);
+                    if result.is_ok() {
+                        state
+                            .bytes_copied
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                    result
+                };
+                if write_result.is_err() {
                     break;
                 }
-                state
-                    .bytes_copied
-                    .fetch_add(count as u64, Ordering::Relaxed);
             }
             Err(_) => break,
         }
     }
-    let _ = wrapper_output.flush();
+    {
+        let _write_guard = state.begin_write();
+        let _ = wrapper_output.flush();
+    }
     state.done.store(true, Ordering::Release);
 }
 
@@ -1099,6 +1128,11 @@ fn drain_wrapper_forwarder_with_timeouts(
         if state.done.load(Ordering::Acquire) {
             let _ = handle.join();
             return;
+        }
+
+        if state.write_in_progress.load(Ordering::Acquire) {
+            thread::sleep(poll_interval);
+            continue;
         }
 
         let now = Instant::now();
@@ -1805,6 +1839,7 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1823,6 +1858,27 @@ mod tests {
             network_access,
             exclude_tmpdir_env_var,
             exclude_slash_tmp: false,
+        }
+    }
+
+    struct BlockingWriter {
+        entered: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.entered.store(true, Ordering::Release);
+            let (lock, cvar) = &*self.release;
+            let mut released = lock.lock().expect("blocking writer release mutex");
+            while !*released {
+                released = cvar.wait(released).expect("blocking writer release mutex");
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1871,6 +1927,61 @@ mod tests {
 
         assert!(start.elapsed() < Duration::from_millis(80));
         thread::sleep(Duration::from_millis(120));
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_waits_for_blocked_write_to_finish() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, vec![b'x'; 8192]).expect("write payload");
+
+        let state = Arc::new(WrapperForwarderState::new());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let thread_state = Arc::clone(&state);
+        let writer = BlockingWriter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let handle = thread::spawn(move || {
+            let input = File::open(&payload_path).expect("open payload");
+            copy_wrapper_output(input, writer, &thread_state);
+        });
+
+        while !entered.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let release_gate = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let (lock, cvar) = &*release_gate;
+            let mut released = lock.lock().expect("release mutex");
+            *released = true;
+            cvar.notify_all();
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+        );
+
+        let elapsed = start.elapsed();
+        let finished_before_cleanup = state.done.load(Ordering::Acquire);
+        releaser.join().expect("releaser thread should not panic");
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "drain should wait for blocked writes to finish"
+        );
+        assert!(
+            finished_before_cleanup,
+            "forwarder should finish before drain returns"
+        );
     }
 
     #[test]
