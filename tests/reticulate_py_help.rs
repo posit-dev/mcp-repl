@@ -15,6 +15,17 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn should_skip_reticulate_py_help_output(text: &str) -> bool {
+    text.contains("[repl] reticulate not installed")
+        || text.contains("[repl] reticulate python unavailable")
+        || text.trim() == ">"
+}
+
+#[test]
+fn prompt_only_reticulate_output_is_skipped() {
+    assert!(should_skip_reticulate_py_help_output(">"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered() -> TestResult<()> {
     // Known Windows failure tracked in docs/futurework/stdin-transport-single-owner.md.
@@ -50,9 +61,7 @@ async fn reticulate_py_help_is_rendered() -> TestResult<()> {
         .await?;
     let text = result_text(&result);
 
-    if text.contains("[repl] reticulate not installed")
-        || text.contains("[repl] reticulate python unavailable")
-    {
+    if should_skip_reticulate_py_help_output(&text) {
         session.cancel().await?;
         return Ok(());
     }
