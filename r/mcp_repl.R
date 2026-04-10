@@ -730,7 +730,11 @@ local({
       return(invisible(NULL))
     }
 
-    .mcp_repl_plot_process_changes(reason)
+    has_recording <- !is.null(st$current_id) &&
+      exists(st$current_id, envir = st$recordings, inherits = FALSE)
+    if (has_recording) {
+      .mcp_repl_plot_process_changes(reason)
+    }
     is_grid <- identical(reason, "before.grid.newpage")
     is_new_page <- if (is_grid) {
       TRUE

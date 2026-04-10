@@ -33,6 +33,17 @@ fn busy_response(text: &str) -> bool {
         || text.contains("input discarded while worker busy")
 }
 
+fn image_payload_lengths(result: &rmcp::model::CallToolResult) -> Vec<usize> {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Image(image) => Some(image.data.len()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
@@ -150,5 +161,47 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
         "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "plot(1:10)\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy during plot; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let images = image_payload_lengths(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected the first base plot to emit one image, got {} images: {text:?}",
+        images.len()
+    );
+    assert!(
+        images[0] > 1_000,
+        "expected the first base plot image payload to be non-trivial, got {} base64 bytes",
+        images[0]
+    );
+
+    session.cancel().await?;
     Ok(())
 }
