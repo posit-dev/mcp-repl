@@ -1961,6 +1961,17 @@ mod tests {
         }
     }
 
+    fn prepared_launch_workspace_tempdir() -> tempfile::TempDir {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("windows-sandbox-tests");
+        std::fs::create_dir_all(&root).expect("create prepared launch workspace test root");
+        tempfile::Builder::new()
+            .prefix("prepared-launch-")
+            .tempdir_in(&root)
+            .expect("prepared launch workspace tempdir")
+    }
+
     #[cfg(target_os = "windows")]
     fn remove_junction(path: &Path) {
         if !path.exists() {
@@ -2596,10 +2607,11 @@ mod tests {
 
     #[test]
     fn stable_capability_sid_ignores_session_temp_dir() {
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let session_temp_a = tmp.path().join("session-temp-a");
-        let session_temp_b = tmp.path().join("session-temp-b");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_a = session_root.path().join("session-temp-a");
+        let session_temp_b = session_root.path().join("session-temp-b");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
@@ -2625,11 +2637,21 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_workspace_tempdir_avoids_system_temp_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        assert!(
+            !workspace.path().starts_with(std::env::temp_dir()),
+            "prepared-launch workspace tests should avoid system temp roots so ACL setup does not depend on TEMP DACLs"
+        );
+    }
+
+    #[test]
     fn prepared_launch_does_not_share_session_temp_dir_access() {
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let session_temp_a = tmp.path().join("session-temp-a");
-        let session_temp_b = tmp.path().join("session-temp-b");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_a = session_root.path().join("session-temp-a");
+        let session_temp_b = session_root.path().join("session-temp-b");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
@@ -2872,9 +2894,10 @@ mod tests {
 
     #[test]
     fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let session_temp_dir = tmp.path().join("session-temp");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
             .expect("prepare session temp dir");
@@ -3142,10 +3165,11 @@ mod tests {
 
     #[test]
     fn prepared_launch_refresh_reapplies_allow_acl_to_recreated_writable_root() {
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let extra_root = tmp.path().join("extra");
-        let session_temp_dir = tmp.path().join("session-temp");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let session_temp_dir = session_root.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         std::fs::create_dir_all(&extra_root).expect("extra dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
@@ -3182,10 +3206,11 @@ mod tests {
 
     #[test]
     fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
         let git_dir = cwd.join(".git");
-        let session_temp_dir = tmp.path().join("session-temp");
+        let session_temp_dir = session_root.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
             .expect("prepare session temp dir");
