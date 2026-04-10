@@ -1614,6 +1614,16 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
     Ok(true)
 }
 
+fn deny_write_mask() -> u32 {
+    FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD
+}
+
 unsafe fn dacl_size_info(dacl: *mut ACL) -> Option<ACL_SIZE_INFORMATION> {
     if dacl.is_null() {
         return None;
@@ -1661,13 +1671,7 @@ unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool 
     let Some(info) = dacl_size_info(dacl) else {
         return false;
     };
-    let deny_write_mask = FILE_GENERIC_WRITE
-        | FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | DELETE
-        | FILE_DELETE_CHILD;
+    let mut denied_mask = 0;
     for index in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
         if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
@@ -1678,11 +1682,11 @@ unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool 
             continue;
         }
         let denied = &*(ace as *const ACCESS_DENIED_ACE);
-        if EqualSid(ace_sid_ptr(ace), sid) != 0 && (denied.Mask & deny_write_mask) != 0 {
-            return true;
+        if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+            denied_mask |= denied.Mask;
         }
     }
-    false
+    (denied_mask & deny_write_mask()) == deny_write_mask()
 }
 
 unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
@@ -3330,6 +3334,117 @@ mod tests {
         has_ace
     }
 
+    fn expected_write_deny_mask() -> u32 {
+        FILE_GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | FILE_DELETE_CHILD
+    }
+
+    unsafe fn path_write_deny_mask(path: &Path, sid: *mut c_void) -> u32 {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return 0;
+        }
+
+        let mut mask = 0;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let denied = &*(ace as *const ACCESS_DENIED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+                    mask |= denied.Mask;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        mask
+    }
+
+    unsafe fn add_custom_deny_ace(path: &Path, sid: *mut c_void, mask: u32) -> Result<(), String> {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+        }
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        };
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions = mask;
+        explicit.grfAccessMode = DENY_ACCESS;
+        explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+        explicit.Trustee = trustee;
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+        if set_acl_code != ERROR_SUCCESS {
+            if !security_descriptor.is_null() {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+            return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+        }
+
+        let set_security_code = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if set_security_code != ERROR_SUCCESS {
+            return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+        }
+        Ok(())
+    }
+
     unsafe fn revoke_capability_sid_paths(capability_sid: &str, paths: &[&Path]) {
         let sid = convert_string_sid_to_sid(capability_sid).expect("capability SID should convert");
         for path in paths {
@@ -3411,6 +3526,42 @@ mod tests {
                 prepared.capability_sid(),
                 &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
             );
+        }
+    }
+
+    #[test]
+    fn add_deny_write_ace_upgrades_partial_deny_acl_for_same_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let protected_dir = tmp.path().join("protected");
+        std::fs::create_dir_all(&protected_dir).expect("protected dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            let partial_mask = FILE_WRITE_DATA | DELETE;
+            add_custom_deny_ace(&protected_dir, sid, partial_mask)
+                .expect("partial deny ACE should be installed");
+            assert_eq!(
+                path_write_deny_mask(&protected_dir, sid) & expected_write_deny_mask(),
+                partial_mask,
+                "test setup should start with only a partial deny mask"
+            );
+
+            let added =
+                add_deny_write_ace(&protected_dir, sid).expect("full deny ACE should be applied");
+
+            assert!(
+                added,
+                "partial deny ACEs should be treated as incomplete and upgraded"
+            );
+            assert_eq!(
+                path_write_deny_mask(&protected_dir, sid) & expected_write_deny_mask(),
+                expected_write_deny_mask(),
+                "full sandbox write deny mask should be present after upgrade"
+            );
+
+            revoke_deny_write_ace(&protected_dir, sid);
+            LocalFree(sid as HLOCAL);
         }
     }
 

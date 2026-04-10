@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -9,6 +10,20 @@ use std::thread;
 use std::time::Duration;
 
 use common::TestResult;
+
+#[test]
+fn suite_server_lock_name_is_scoped_to_checkout() {
+    let repo_a = PathBuf::from(r"C:\repo-a");
+    let repo_b = PathBuf::from(r"D:\repo-b");
+
+    let name_a = common::suite_server_lock_name_for_tests(&repo_a);
+    let name_b = common::suite_server_lock_name_for_tests(&repo_b);
+
+    assert_ne!(
+        name_a, name_b,
+        "distinct checkout roots should not share the same Windows suite lock name"
+    );
+}
 
 #[test]
 fn suite_server_lock_allows_reentrant_acquire_within_process() -> TestResult<()> {

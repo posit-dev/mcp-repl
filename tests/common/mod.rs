@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -50,12 +50,42 @@ struct WindowsSuiteServerLockState {
 }
 
 #[cfg(windows)]
+fn windows_suite_server_lock_path_seed(repo_root: &Path) -> String {
+    let normalized = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut seed = normalized.to_string_lossy().into_owned();
+    seed.make_ascii_lowercase();
+    seed
+}
+
+#[cfg(windows)]
+fn windows_suite_server_lock_hash(seed: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in seed.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(windows)]
+fn windows_suite_server_mutex_name_for_checkout(repo_root: &Path) -> String {
+    let seed = windows_suite_server_lock_path_seed(repo_root);
+    let hash = windows_suite_server_lock_hash(&seed);
+    format!("{WINDOWS_TEST_SERVER_MUTEX_NAME}_{hash:016x}")
+}
+
+#[cfg(windows)]
 fn windows_suite_server_mutex_name_wide() -> Vec<u16> {
-    let mut name: Vec<u16> = OsStr::new(WINDOWS_TEST_SERVER_MUTEX_NAME)
-        .encode_wide()
-        .collect();
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let name = windows_suite_server_mutex_name_for_checkout(&repo_root);
+    let mut name: Vec<u16> = OsStr::new(&name).encode_wide().collect();
     name.push(0);
     name
+}
+
+#[cfg(windows)]
+pub(crate) fn suite_server_lock_name_for_tests(repo_root: &Path) -> String {
+    windows_suite_server_mutex_name_for_checkout(repo_root)
 }
 
 #[cfg(windows)]
