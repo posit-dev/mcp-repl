@@ -6,6 +6,8 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
+#[cfg(windows)]
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use regex_lite::Regex;
@@ -40,6 +42,13 @@ struct WindowsSuiteServerSemaphore {
 }
 
 #[cfg(windows)]
+#[derive(Default)]
+struct WindowsSuiteServerLockState {
+    local_refcount: usize,
+    semaphore: Option<WindowsSuiteServerSemaphore>,
+}
+
+#[cfg(windows)]
 impl WindowsSuiteServerSemaphore {
     fn acquire() -> TestResult<Self> {
         let mut name: Vec<u16> = OsStr::new(WINDOWS_TEST_SERVER_SEMAPHORE_NAME)
@@ -68,6 +77,12 @@ impl WindowsSuiteServerSemaphore {
 }
 
 #[cfg(windows)]
+fn windows_suite_server_lock_state() -> &'static Mutex<WindowsSuiteServerLockState> {
+    static STATE: OnceLock<Mutex<WindowsSuiteServerLockState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WindowsSuiteServerLockState::default()))
+}
+
+#[cfg(windows)]
 impl Drop for WindowsSuiteServerSemaphore {
     fn drop(&mut self) {
         let handle = self.handle as *mut std::ffi::c_void;
@@ -79,14 +94,21 @@ impl Drop for WindowsSuiteServerSemaphore {
 }
 
 #[cfg(windows)]
-pub(crate) struct SuiteServerLockToken(WindowsSuiteServerSemaphore);
+pub(crate) struct SuiteServerLockToken;
 
 #[cfg(not(windows))]
 pub(crate) struct SuiteServerLockToken;
 
 #[cfg(windows)]
 fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
-    WindowsSuiteServerSemaphore::acquire().map(SuiteServerLockToken)
+    let mut state = windows_suite_server_lock_state()
+        .lock()
+        .map_err(|_| std::io::Error::other("windows suite server lock mutex poisoned"))?;
+    if state.local_refcount == 0 {
+        state.semaphore = Some(WindowsSuiteServerSemaphore::acquire()?);
+    }
+    state.local_refcount += 1;
+    Ok(SuiteServerLockToken)
 }
 
 #[cfg(not(windows))]
@@ -101,7 +123,23 @@ pub(crate) fn acquire_suite_server_lock_for_tests() -> TestResult<SuiteServerLoc
 
 #[cfg(windows)]
 impl Drop for SuiteServerLockToken {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        let semaphore = {
+            let mut state = windows_suite_server_lock_state()
+                .lock()
+                .expect("windows suite server lock mutex poisoned");
+            if state.local_refcount == 0 {
+                return;
+            }
+            state.local_refcount -= 1;
+            if state.local_refcount == 0 {
+                state.semaphore.take()
+            } else {
+                None
+            }
+        };
+        drop(semaphore);
+    }
 }
 
 #[cfg(not(windows))]

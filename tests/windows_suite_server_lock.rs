@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::TestResult;
 
 #[test]
-fn suite_server_lock_waits_on_each_acquire() -> TestResult<()> {
+fn suite_server_lock_allows_reentrant_acquire_within_process() -> TestResult<()> {
     let first = common::acquire_suite_server_lock_for_tests()?;
     let started = Arc::new(AtomicBool::new(false));
     let acquired = Arc::new(AtomicBool::new(false));
@@ -30,15 +30,17 @@ fn suite_server_lock_waits_on_each_acquire() -> TestResult<()> {
     while !started.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(5));
     }
-    thread::sleep(Duration::from_millis(50));
-    assert!(
-        !acquired.load(Ordering::SeqCst),
-        "second suite lock acquisition should wait until the first token is dropped"
-    );
+    let reentrant = rx.recv_timeout(Duration::from_millis(200)).is_ok();
 
     drop(first);
-    rx.recv_timeout(Duration::from_secs(2))
-        .expect("second lock should acquire after the first is released");
+    if !reentrant {
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("second lock should acquire after the first is released");
+    }
     waiter.join().expect("waiter thread should join");
+    assert!(
+        acquired.load(Ordering::SeqCst) && reentrant,
+        "same-process suite lock acquisition should not block behind an existing token"
+    );
     Ok(())
 }
