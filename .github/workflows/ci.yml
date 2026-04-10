@@ -81,7 +81,7 @@ jobs:
           & ".\\target\\release\\mcp-repl.exe" --help | Out-Null
 
       - name: Package release archive
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))) && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -92,7 +92,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
 
       - name: Package release archive (windows)
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))) && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $packageDir = "dist/mcp-repl-${{ matrix.target }}"
@@ -105,7 +105,7 @@ jobs:
           Pop-Location
 
       - name: Upload packaged artifact
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')))
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
