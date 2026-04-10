@@ -740,8 +740,19 @@ fn prepared_launch_allow_targets(
 
         targets.push(path.clone());
 
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|err| format!("symlink_metadata failed for '{}': {err}", path.display()))?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && path == root => {
+                // Let add_allow_ace() materialize a declared writable root that does not exist yet.
+                continue;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "symlink_metadata failed for '{}': {err}",
+                    path.display()
+                ));
+            }
+        };
         if !metadata.is_dir() {
             continue;
         }
@@ -3803,6 +3814,44 @@ mod tests {
                 &[
                     cwd.as_path(),
                     extra_root.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_prepare_applies_allow_acl_to_missing_writable_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let missing_root = workspace.path().join("missing-root");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                missing_root.is_dir(),
+                "prepare should create missing writable roots"
+            );
+            assert!(
+                path_has_allow_ace(&missing_root, sid),
+                "prepare should apply allow ACEs to writable roots declared before they exist"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    missing_root.as_path(),
                     session_temp_dir.as_path(),
                 ],
             );
