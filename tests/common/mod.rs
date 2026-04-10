@@ -507,7 +507,6 @@ pub struct McpTestSession {
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
     backend: TestBackend,
-    _suite_lock: SuiteServerLockToken,
 }
 
 impl McpTestSession {
@@ -1241,12 +1240,12 @@ pub async fn spawn_server_with_args_env(
 
     let server_pid = transport.id();
     let service = TestClient.serve(transport).await?;
+    drop(suite_lock);
     Ok(McpTestSession {
         service,
         steps: Vec::new(),
         server_pid,
         backend,
-        _suite_lock: suite_lock,
     })
 }
 

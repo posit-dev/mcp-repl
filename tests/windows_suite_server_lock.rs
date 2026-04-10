@@ -105,3 +105,37 @@ fn suite_server_lock_recovers_after_abandoned_owner() -> TestResult<()> {
     waiter.join().expect("waiter thread should join");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn suite_server_lock_does_not_block_second_live_session() -> TestResult<()> {
+    let first = common::spawn_server_with_files().await?;
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let result: TestResult<()> = runtime.block_on(async {
+            let session = common::spawn_server_with_files().await?;
+            session.cancel().await?;
+            Ok(())
+        });
+        tx.send(result).expect("second spawn result");
+    });
+
+    let second_result = rx.recv_timeout(Duration::from_secs(10));
+    if let Ok(result) = second_result {
+        first.cancel().await?;
+        waiter.join().expect("waiter thread should join");
+        result?;
+        return Ok(());
+    }
+
+    first.cancel().await?;
+    let eventual = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second spawn should unblock after the first session shuts down");
+    waiter.join().expect("waiter thread should join");
+    eventual?;
+    Err("second server spawn blocked while the first live session still held the suite lock".into())
+}

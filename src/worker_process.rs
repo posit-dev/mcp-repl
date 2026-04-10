@@ -865,9 +865,33 @@ impl WorkerManager {
             return Ok(reply);
         }
 
+        let page_bytes = pager::resolve_page_bytes(page_bytes_override);
+        if text.is_empty() {
+            if self.pending_request
+                || self.output.has_pending_output()
+                || self.settled_pending_completion.is_some()
+            {
+                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            if self.pager.is_active()
+                && let Some(reply) = self.handle_pager_command(&text)
+            {
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            let reply = self.build_idle_poll_reply_pager();
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+
         if self.pager.is_active() {
             let trimmed = text.trim();
-            if trimmed.is_empty() || trimmed.starts_with(':') {
+            if trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
                     let reply = self.finalize_reply(reply);
                     self.maybe_reset_after_session_end();
@@ -879,7 +903,6 @@ impl WorkerManager {
             }
         }
 
-        let page_bytes = pager::resolve_page_bytes(page_bytes_override);
         if let Err(err) = self.ensure_process() {
             let input_context = self.prepare_input_context_pager(&text, echo_input);
             let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
@@ -890,21 +913,6 @@ impl WorkerManager {
         self.output.start_capture();
         self.maybe_emit_guardrail_notice();
         self.resolve_timeout_marker();
-        if text.is_empty() {
-            if self.pending_request
-                || self.output.has_pending_output()
-                || self.settled_pending_completion.is_some()
-            {
-                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
-                return Ok(reply);
-            }
-            let reply = self.build_idle_poll_reply_pager();
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
         if self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
@@ -6294,6 +6302,52 @@ mod tests {
         assert!(
             manager.settled_pending_completion.is_none(),
             "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn pager_empty_input_polls_pending_output_before_pager_commands() {
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b"line0001\nline0002\nline0003\nline0004\n",
+            false,
+            ContentOrigin::Worker,
+        );
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        manager
+            .output_timeline
+            .append_text(b"detached\n", false, ContentOrigin::Worker);
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(16),
+                true,
+            )
+            .expect("empty poll reply");
+
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+        assert!(
+            text.contains("detached\n"),
+            "expected empty input to poll newly appended output before pager navigation, got: {text:?}"
         );
     }
 

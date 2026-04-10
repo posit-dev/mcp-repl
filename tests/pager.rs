@@ -384,3 +384,88 @@ async fn pager_windows_smoke() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i)); flush.console(); Sys.sleep(1.0)",
+            Some(0.1),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if !initial_text.contains("<<repl status: busy") || !initial_text.contains("--More--") {
+        eprintln!("pager did not stay busy with an active footer in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let poll = session
+        .write_stdin_raw_unterminated_with("", Some(0.1))
+        .await?;
+    let poll_text = result_text(&poll);
+    if backend_unavailable(&poll_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        poll_text.contains("<<repl status: busy"),
+        "expected empty poll to remain a busy follow-up while the request was still running, got: {poll_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_until_not_busy_does_not_return_while_pager_request_is_still_running() -> TestResult<()>
+{
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i)); flush.console(); Sys.sleep(2.0); cat('DONE\\n')",
+            Some(0.1),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if !initial_text.contains("<<repl status: busy") {
+        eprintln!("pager request settled before the helper could observe a busy reply; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = wait_until_not_busy(&mut session, initial).await?;
+    let follow_up = session.write_stdin_raw_with("1+1", Some(0.2)).await?;
+    let follow_up_text = result_text(&follow_up);
+    if backend_unavailable(&follow_up_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        !follow_up_text.contains("input discarded while worker busy")
+            && !follow_up_text.contains("<<repl status: busy"),
+        "expected wait_until_not_busy to return only after the running pager request settled, got: {follow_up_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
