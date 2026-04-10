@@ -248,6 +248,19 @@ pub(crate) fn set_prepare_sandbox_launch_test_error(error: Option<String>) {
         .expect("prepare sandbox launch test error mutex poisoned") = error;
 }
 
+#[cfg(test)]
+fn apply_prepared_launch_acl_state_test_error() -> &'static Mutex<Option<String>> {
+    static TEST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    TEST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn set_apply_prepared_launch_acl_state_test_error(error: Option<String>) {
+    *apply_prepared_launch_acl_state_test_error()
+        .lock()
+        .expect("apply prepared launch ACL state test error mutex poisoned") = error;
+}
+
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
 }
@@ -483,16 +496,45 @@ fn resolve_launch_capability_sids(
     }
 }
 
-unsafe fn validate_prepared_capability_sid_context(
+fn build_prepared_sandbox_launch(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    capability_sid: &str,
+) -> PreparedSandboxLaunch {
+    PreparedSandboxLaunch {
+        policy: policy.clone(),
+        sandbox_policy_cwd: canonicalize_or_identity(sandbox_policy_cwd),
+        session_temp_dir: canonicalize_or_identity(session_temp_dir),
+        capability_sid: capability_sid.to_string(),
+    }
+}
+
+fn normalize_prepared_capability_sid(
+    prepared_capability_sid: Option<&str>,
+    base_token_restricted: bool,
+) -> Option<&str> {
+    if prepared_capability_sid.is_some() && base_token_restricted {
+        None
+    } else {
+        prepared_capability_sid
+    }
+}
+
+unsafe fn effective_prepared_capability_sid(
     base_token: HANDLE,
     prepared_capability_sid: Option<&str>,
-) -> Result<(), String> {
-    if prepared_capability_sid.is_some() && IsTokenRestricted(base_token) != 0 {
-        return Err(
-            "prepared capability SID cannot be reused from restricted base token".to_string(),
+) -> Option<&str> {
+    let normalized = normalize_prepared_capability_sid(
+        prepared_capability_sid,
+        IsTokenRestricted(base_token) != 0,
+    );
+    if prepared_capability_sid.is_some() && normalized.is_none() {
+        crate::diagnostics::startup_log(
+            "windows-sandbox: prepared capability SID disabled because base token is already restricted",
         );
     }
-    Ok(())
+    normalized
 }
 
 fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
@@ -540,6 +582,15 @@ unsafe fn apply_prepared_launch_acl_state(
     sid: *mut c_void,
     action: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(error) = apply_prepared_launch_acl_state_test_error()
+        .lock()
+        .expect("apply prepared launch ACL state test error mutex poisoned")
+        .clone()
+    {
+        return Err(error);
+    }
+
     let paths = prepared_launch_acl_paths(launch);
     let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
 
@@ -576,6 +627,23 @@ unsafe fn apply_prepared_launch_acl_state(
     Ok(())
 }
 
+unsafe fn refresh_runtime_prepared_launch_acl_state(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    prepared_capability_sid: &str,
+    sid: *mut c_void,
+) -> Result<PreparedSandboxLaunch, String> {
+    let launch = build_prepared_sandbox_launch(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        prepared_capability_sid,
+    );
+    apply_prepared_launch_acl_state(&launch, sid, "refresh")?;
+    Ok(launch)
+}
+
 pub fn prepare_sandbox_launch(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
@@ -592,15 +660,9 @@ pub fn prepare_sandbox_launch(
 
     validate_windows_policy(policy)?;
 
-    let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
-    let canonical_session_temp_dir = canonicalize_or_identity(session_temp_dir);
-    let cap_sid = stable_cap_sid_string(policy, &canonical_cwd);
-    let launch = PreparedSandboxLaunch {
-        policy: policy.clone(),
-        sandbox_policy_cwd: canonical_cwd,
-        session_temp_dir: canonical_session_temp_dir,
-        capability_sid: cap_sid,
-    };
+    let cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+    let launch =
+        build_prepared_sandbox_launch(policy, sandbox_policy_cwd, session_temp_dir, &cap_sid);
 
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
@@ -666,6 +728,15 @@ fn run_sandboxed_command_with_env_map(
         let session_temp_dir =
             env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
+        let base_token = get_current_token_for_restriction()?;
+        let mut prepared_capability_sid =
+            effective_prepared_capability_sid(base_token, prepared_capability_sid);
+        if prepared_capability_sid.is_some() && session_temp_dir.is_none() {
+            crate::diagnostics::startup_log(
+                "windows-sandbox: prepared capability SID disabled because session temp dir is missing",
+            );
+            prepared_capability_sid = None;
+        }
         let capability_sids =
             resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
         let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
@@ -677,18 +748,6 @@ fn run_sandboxed_command_with_env_map(
         } else {
             psid_capability
         };
-
-        let base_token = get_current_token_for_restriction()?;
-        if let Err(err) =
-            validate_prepared_capability_sid_context(base_token, prepared_capability_sid)
-        {
-            CloseHandle(base_token);
-            if launch_sid_is_distinct {
-                LocalFree(psid_launch as HLOCAL);
-            }
-            LocalFree(psid_capability as HLOCAL);
-            return Err(err);
-        }
         let mut restricted_capability_sids = vec![psid_capability];
         if launch_sid_is_distinct {
             restricted_capability_sids.push(psid_launch);
@@ -710,7 +769,48 @@ fn run_sandboxed_command_with_env_map(
         let null_device_ace_applied = allow_null_device(psid_launch);
 
         let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
-        if prepared_capability_sid.is_none() {
+        if let Some(prepared_capability_sid) = prepared_capability_sid {
+            let refresh_result = refresh_runtime_prepared_launch_acl_state(
+                policy,
+                sandbox_policy_cwd,
+                session_temp_dir
+                    .as_deref()
+                    .expect("prepared capability SID requires session temp dir"),
+                prepared_capability_sid,
+                psid_capability,
+            );
+            if let Err(err) = refresh_result {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+            if let Some(session_temp_dir) = session_temp_dir.as_deref() {
+                match add_allow_ace(session_temp_dir, psid_launch) {
+                    Ok(true) => acl_guards.push((session_temp_dir.to_path_buf(), psid_launch)),
+                    Ok(false) => {}
+                    Err(err) => {
+                        cleanup_capability_acl_state(
+                            &acl_guards,
+                            psid_launch,
+                            null_device_ace_applied,
+                        );
+                        CloseHandle(restricted_token);
+                        if launch_sid_is_distinct {
+                            LocalFree(psid_launch as HLOCAL);
+                        }
+                        LocalFree(psid_capability as HLOCAL);
+                        return Err(format!(
+                            "failed to apply session temp dir ACL to '{}': {err}",
+                            session_temp_dir.display()
+                        ));
+                    }
+                }
+            }
+        } else {
             let paths = compute_allow_deny_paths(
                 policy,
                 sandbox_policy_cwd,
@@ -770,23 +870,6 @@ fn run_sandboxed_command_with_env_map(
                     }
                 }
                 crate::diagnostics::startup_log("windows-sandbox: deny ACLs applied");
-            }
-        } else if let Some(session_temp_dir) = session_temp_dir.as_deref() {
-            match add_allow_ace(session_temp_dir, psid_launch) {
-                Ok(true) => acl_guards.push((session_temp_dir.to_path_buf(), psid_launch)),
-                Ok(false) => {}
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(format!(
-                        "failed to apply session temp dir ACL to '{}': {err}",
-                        session_temp_dir.display()
-                    ));
-                }
             }
         }
 
@@ -2946,27 +3029,12 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn prepared_capability_sid_is_rejected_for_restricted_base_token() {
-        unsafe {
-            let random_sid = make_random_sid_string();
-            let psid_random =
-                convert_string_sid_to_sid(&random_sid).expect("random SID should convert");
-            let base_token = get_current_token_for_restriction().expect("current token");
-            let restricted_token = create_restricted_token_for_policy(base_token, &[psid_random])
-                .expect("restricted token");
-            CloseHandle(base_token);
-            LocalFree(psid_random as HLOCAL);
-
-            let result = validate_prepared_capability_sid_context(
-                restricted_token,
-                Some("S-1-5-21-1-2-3-4"),
-            );
-            CloseHandle(restricted_token);
-            assert!(
-                matches!(result, Err(ref err) if err.contains("prepared capability SID")),
-                "expected restricted-token prepared launch reuse to be rejected, got: {result:?}"
-            );
-        }
+    fn prepared_capability_sid_falls_back_for_restricted_base_token() {
+        let result = normalize_prepared_capability_sid(Some("S-1-5-21-1-2-3-4"), true);
+        assert!(
+            result.is_none(),
+            "expected restricted-token prepared launch reuse to fall back to inline ACL prep, got: {result:?}"
+        );
     }
 
     #[test]
@@ -3237,5 +3305,48 @@ mod tests {
                 &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
             );
         }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refreshes_acl_state_before_spawn() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        set_apply_prepared_launch_acl_state_test_error(Some(
+            "prepared launch runtime refresh invoked".to_string(),
+        ));
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        set_apply_prepared_launch_acl_state_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(ref err) if err.contains("prepared launch runtime refresh invoked")
+            ),
+            "prepared runtime should refresh stable ACL state before spawning the child, got: {result:?}"
+        );
     }
 }
