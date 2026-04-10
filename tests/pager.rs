@@ -4,6 +4,8 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
+#[cfg(windows)]
+use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -26,6 +28,33 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+#[cfg(windows)]
+async fn wait_until_not_busy(
+    session: &mut common::McpTestSession,
+    initial: rmcp::model::CallToolResult,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<repl status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(250)).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<repl status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
 #[cfg(not(windows))]
@@ -307,6 +336,7 @@ async fn pager_windows_smoke() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -323,6 +353,7 @@ async fn pager_windows_smoke() -> TestResult<()> {
     );
 
     let result = session.write_stdin_raw_with(":next", Some(60.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -338,6 +369,7 @@ async fn pager_windows_smoke() -> TestResult<()> {
     );
 
     let result = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
