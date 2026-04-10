@@ -151,6 +151,11 @@ struct CapabilityAclGuard {
     kind: CapabilityAclKind,
 }
 
+struct PreparedLaunchAclRestore {
+    path: PathBuf,
+    dacl: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSandboxLaunch {
     policy: SandboxPolicy,
@@ -283,10 +288,19 @@ pub(crate) fn set_add_deny_write_ace_test_error(error: Option<(usize, String)>) 
 }
 
 #[cfg(test)]
+pub(crate) fn set_prepared_launch_allow_targets_read_dir_test_error(
+    error: Option<(PathBuf, String)>,
+) {
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
+}
+
+#[cfg(test)]
 thread_local! {
     static PREPARE_SANDBOX_LAUNCH_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static ADD_DENY_WRITE_ACE_TEST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
+    static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR: RefCell<Option<(PathBuf, String)>> =
+        const { RefCell::new(None) };
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -658,20 +672,27 @@ unsafe fn apply_prepared_launch_acl_state(
     }
 
     let paths = prepared_launch_acl_paths(launch);
-    let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
+    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
     let denied_roots = canonicalized_paths(&paths.deny);
 
     for path in &paths.allow {
         for target in prepared_launch_allow_targets(path, &denied_roots)? {
+            let restore =
+                match capture_prepared_launch_acl_restore(&target, CapabilityAclKind::Allow) {
+                    Ok(restore) => restore,
+                    Err(err) => {
+                        cleanup_prepared_launch_acl_state(&acl_restores);
+                        return Err(format!(
+                            "failed to {action} writable ACL on '{}': {err}",
+                            target.display()
+                        ));
+                    }
+                };
             match add_allow_ace(&target, sid) {
-                Ok(true) => acl_guards.push(CapabilityAclGuard {
-                    path: target,
-                    sid,
-                    kind: CapabilityAclKind::Allow,
-                }),
+                Ok(true) => acl_restores.push(restore),
                 Ok(false) => {}
                 Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, sid, false);
+                    cleanup_prepared_launch_acl_state(&acl_restores);
                     return Err(format!(
                         "failed to {action} writable ACL on '{}': {err}",
                         target.display()
@@ -683,15 +704,21 @@ unsafe fn apply_prepared_launch_acl_state(
 
     if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
         for path in &paths.deny {
+            let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
+                Ok(restore) => restore,
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    return Err(format!(
+                        "failed to {action} deny ACL on '{}': {err}",
+                        path.display()
+                    ));
+                }
+            };
             match add_deny_write_ace(path, sid) {
-                Ok(true) => acl_guards.push(CapabilityAclGuard {
-                    path: path.clone(),
-                    sid,
-                    kind: CapabilityAclKind::Deny,
-                }),
+                Ok(true) => acl_restores.push(restore),
                 Ok(false) => {}
                 Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, sid, false);
+                    cleanup_prepared_launch_acl_state(&acl_restores);
                     return Err(format!(
                         "failed to {action} deny ACL on '{}': {err}",
                         path.display()
@@ -716,6 +743,21 @@ fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
 
 fn path_is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
+}
+
+fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    if let Some((expected_path, error)) =
+        PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| slot.borrow().clone())
+        && canonicalize_or_identity(path) == canonicalize_or_identity(&expected_path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            error,
+        ));
+    }
+
+    std::fs::read_dir(path)
 }
 
 fn prepared_launch_allow_targets(
@@ -746,22 +788,23 @@ fn prepared_launch_allow_targets(
                 // Let add_allow_ace() materialize a declared writable root that does not exist yet.
                 continue;
             }
-            Err(err) => {
-                return Err(format!(
-                    "symlink_metadata failed for '{}': {err}",
-                    path.display()
-                ));
+            Err(_) => {
+                continue;
             }
         };
         if !metadata.is_dir() {
             continue;
         }
 
-        let entries = std::fs::read_dir(&path)
-            .map_err(|err| format!("read_dir failed for '{}': {err}", path.display()))?;
+        let entries = match prepared_launch_allow_targets_read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
         for entry in entries {
-            let entry = entry
-                .map_err(|err| format!("read_dir entry failed for '{}': {err}", path.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
             stack.push(entry.path());
         }
     }
@@ -1187,6 +1230,65 @@ unsafe fn cleanup_capability_acl_state(
     }
     if null_device_ace_applied {
         revoke_null_device_ace(capability_sid);
+    }
+}
+
+unsafe fn capture_prepared_launch_acl_restore(
+    path: &Path,
+    kind: CapabilityAclKind,
+) -> Result<PreparedLaunchAclRestore, String> {
+    if matches!(kind, CapabilityAclKind::Allow) && !path.exists() {
+        std::fs::create_dir_all(path)
+            .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
+    }
+
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let snapshot = if dacl.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(dacl as *const u8, usize::from((*dacl).AclSize)).to_vec())
+    };
+
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+
+    Ok(PreparedLaunchAclRestore {
+        path: path.to_path_buf(),
+        dacl: snapshot,
+    })
+}
+
+unsafe fn cleanup_prepared_launch_acl_state(acl_restores: &[PreparedLaunchAclRestore]) {
+    for restore in acl_restores.iter().rev() {
+        let dacl = restore
+            .dacl
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |bytes| bytes.as_ptr() as *mut ACL);
+        let _ = SetNamedSecurityInfoW(
+            to_wide(&restore.path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        );
     }
 }
 
@@ -3528,6 +3630,47 @@ mod tests {
         has_ace
     }
 
+    unsafe fn path_has_any_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
     unsafe fn path_has_inheritable_allow_ace(path: &Path, sid: *mut c_void) -> bool {
         let mut security_descriptor: *mut c_void = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -4065,6 +4208,132 @@ mod tests {
                 "failed refresh should not leave a deny ACE on the failing path"
             );
             LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_preserves_preexisting_allow_acl_when_cleanup_rolls_back() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            revoke_ace(&cwd, sid);
+            add_custom_allow_ace(
+                &cwd,
+                sid,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+                0,
+            )
+            .expect("non-inheriting allow ACE should be installed");
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "test setup should keep a same-SID allow ACE on the writable root"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "test setup should start with a same-SID allow ACE that does not inherit"
+            );
+
+            std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+            set_add_deny_write_ace_test_error(Some((0, "injected deny ACL failure".to_string())));
+
+            let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+            set_add_deny_write_ace_test_error(None);
+
+            assert!(
+                matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+                "expected injected deny ACL failure, got: {result:?}"
+            );
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "failed refresh should preserve the preexisting same-SID allow ACE on earlier writable paths"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "failed refresh should restore the preexisting non-inheriting allow ACE instead of deleting it"
+            );
+
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_skips_unreadable_descendants_under_writable_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let unreadable_child = extra_root.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&unreadable_child).expect("nested dir");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            revoke_ace(&extra_root, sid);
+            assert!(
+                !path_has_allow_ace(&extra_root, sid),
+                "test setup should remove the stable allow ACE from the writable root"
+            );
+
+            set_prepared_launch_allow_targets_read_dir_test_error(Some((
+                unreadable_child.clone(),
+                "injected unreadable descendant".to_string(),
+            )));
+
+            let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+            set_prepared_launch_allow_targets_read_dir_test_error(None);
+
+            assert!(
+                result.is_ok(),
+                "refresh should skip unreadable descendants instead of aborting: {result:?}"
+            );
+            assert!(
+                path_has_allow_ace(&extra_root, sid),
+                "refresh should still apply allow ACEs to the writable root when a descendant cannot be enumerated"
+            );
+
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    unreadable_child.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
         }
     }
 
