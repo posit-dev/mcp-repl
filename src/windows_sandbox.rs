@@ -149,9 +149,11 @@ impl PreparedSandboxLaunch {
         sandbox_policy_cwd: &Path,
         session_temp_dir: &Path,
     ) -> bool {
+        let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
         self.policy == *policy
-            && self.sandbox_policy_cwd == canonicalize_or_identity(sandbox_policy_cwd)
+            && self.sandbox_policy_cwd == canonical_cwd
             && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
+            && self.capability_sid == stable_cap_sid_string(policy, sandbox_policy_cwd)
     }
 }
 
@@ -409,13 +411,7 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
         } => {
             let mut canonical_roots = writable_roots
                 .iter()
-                .map(|root| {
-                    if root.is_absolute() {
-                        stable_sid_seed_path(root)
-                    } else {
-                        stable_sid_seed_path_buf(canonical_cwd.join(root))
-                    }
-                })
+                .map(|root| stable_sid_seed_path(&canonical_cwd.join(root)))
                 .collect::<Vec<_>>();
             canonical_roots.sort();
             canonical_roots.dedup();
@@ -1945,6 +1941,8 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(target_os = "windows")]
+    use std::process::Command;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1959,6 +1957,52 @@ mod tests {
             exclude_tmpdir_env_var,
             exclude_slash_tmp: false,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn remove_junction(path: &Path) {
+        if !path.exists() {
+            return;
+        }
+
+        if std::fs::remove_dir(path).is_ok() {
+            return;
+        }
+
+        let output = Command::new("cmd")
+            .args(["/C", "rmdir", &path.to_string_lossy()])
+            .output()
+            .expect("spawn rmdir");
+        assert!(
+            output.status.success(),
+            "failed to remove junction '{}': stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create_junction(path: &Path, target: &Path) {
+        remove_junction(path);
+        let output = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &path.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .expect("spawn mklink");
+        assert!(
+            output.status.success(),
+            "failed to create junction '{}' -> '{}': stdout={} stderr={}",
+            path.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     struct BlockingWriter {
@@ -2631,6 +2675,72 @@ mod tests {
         assert_ne!(base, with_root);
         assert_ne!(base, with_network);
         assert_ne!(base, with_tmp_exclusion);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stable_capability_sid_changes_when_relative_writable_root_target_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let target_a = tmp.path().join("target-a");
+        let target_b = tmp.path().join("target-b");
+        let linked_root = cwd.join("linked-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&target_a).expect("target a dir");
+        std::fs::create_dir_all(&target_b).expect("target b dir");
+
+        create_junction(&linked_root, &target_a);
+        let policy = workspace_policy(vec![PathBuf::from("linked-root")], false, false);
+        let first = stable_cap_sid_string(&policy, &cwd);
+
+        remove_junction(&linked_root);
+        create_junction(&linked_root, &target_b);
+        let second = stable_cap_sid_string(&policy, &cwd);
+
+        remove_junction(&linked_root);
+
+        assert_ne!(
+            first, second,
+            "stable SID should change when a relative writable root resolves to a different target"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_launch_matches_rejects_relative_writable_root_target_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        let target_a = tmp.path().join("target-a");
+        let target_b = tmp.path().join("target-b");
+        let linked_root = cwd.join("linked-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+        std::fs::create_dir_all(&target_a).expect("target a dir");
+        std::fs::create_dir_all(&target_b).expect("target b dir");
+
+        create_junction(&linked_root, &target_a);
+        let policy = workspace_policy(vec![PathBuf::from("linked-root")], false, false);
+        let launch = PreparedSandboxLaunch {
+            policy: policy.clone(),
+            sandbox_policy_cwd: canonicalize_or_identity(&cwd),
+            session_temp_dir: canonicalize_or_identity(&session_temp_dir),
+            capability_sid: stable_cap_sid_string(&policy, &cwd),
+        };
+        assert!(
+            launch.matches(&policy, &cwd, &session_temp_dir),
+            "launch should match before the relative writable root target changes"
+        );
+
+        remove_junction(&linked_root);
+        create_junction(&linked_root, &target_b);
+
+        assert!(
+            !launch.matches(&policy, &cwd, &session_temp_dir),
+            "launch should stop matching once a relative writable root resolves elsewhere"
+        );
+
+        remove_junction(&linked_root);
     }
 
     #[test]
