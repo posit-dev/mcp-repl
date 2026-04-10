@@ -160,6 +160,39 @@ async fn wait_until_file_contains_via_polls(
     .into())
 }
 
+async fn wait_until_busy_follow_up_discloses_transcript_path(
+    session: &mut common::McpTestSession,
+    input: &str,
+    timeout_secs: f64,
+) -> TestResult<Option<PathBuf>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        let reply = session
+            .write_stdin_raw_with(input, Some(timeout_secs))
+            .await?;
+        let text = result_text(&reply);
+        let is_busy = text.contains("input discarded while worker busy")
+            || text.contains("<<repl status: busy");
+        if let Some(path) = bundle_transcript_path(&text) {
+            if is_busy {
+                return Ok(Some(path));
+            }
+            return Ok(None);
+        }
+        if !is_busy {
+            return Ok(None);
+        }
+        last_text = text;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(
+        format!("busy follow-up never disclosed a transcript path before timeout: {last_text:?}")
+            .into(),
+    )
+}
+
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -828,18 +861,17 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
     );
 
     sleep(test_delay_ms(260, 700)).await;
-    let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
-    let busy_text = result_text(&busy_follow_up);
-    if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<repl status: busy")
-    {
+    let Some(transcript_path) = wait_until_busy_follow_up_discloses_transcript_path(
+        &mut session,
+        "1+1",
+        test_timeout_secs(0.1, 0.3),
+    )
+    .await?
+    else {
         eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
         session.cancel().await?;
         return Ok(());
-    }
-    let transcript_path = bundle_transcript_path(&busy_text).unwrap_or_else(|| {
-        panic!("expected busy follow-up spill to disclose a transcript path, got: {busy_text:?}")
-    });
+    };
     let spilled_text = fs::read_to_string(&transcript_path)?;
 
     assert!(
@@ -903,22 +935,19 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
     );
 
     sleep(test_delay_ms(260, 700)).await;
-    let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
-    let busy_text = result_text(&busy_follow_up);
-    if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<repl status: busy")
-    {
+    let Some(transcript_path) = wait_until_busy_follow_up_discloses_transcript_path(
+        &mut session,
+        "1+1",
+        test_timeout_secs(0.1, 0.3),
+    )
+    .await?
+    else {
         eprintln!(
             "write_stdin_behavior pager busy follow-up completed without a busy marker; skipping"
         );
         session.cancel().await?;
         return Ok(());
-    }
-    let transcript_path = bundle_transcript_path(&busy_text).unwrap_or_else(|| {
-        panic!(
-            "expected pager busy follow-up spill to disclose a transcript path, got: {busy_text:?}"
-        )
-    });
+    };
     let spilled_text = fs::read_to_string(&transcript_path)?;
 
     assert!(

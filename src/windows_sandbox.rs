@@ -29,9 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(test)]
-use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
 #[cfg(test)]
-use windows_sys::Win32::Foundation::GetHandleInformation;
+use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
@@ -97,6 +97,8 @@ use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
+#[cfg(test)]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -2790,31 +2792,81 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn dropping_wrapper_child_stdio_closes_all_pipe_handles() {
-        unsafe fn dropped_handle_is_invalid(handle: HANDLE) -> bool {
-            let mut flags = 0;
-            let ok = GetHandleInformation(handle, &mut flags);
-            ok == 0 && GetLastError() == ERROR_INVALID_HANDLE
+        fn write_end_reports_closed_peer(mut probe: File, label: &str) {
+            let err = probe
+                .write_all(b"x")
+                .expect_err("write probe should fail once the pipe peer is dropped");
+            let raw = err.raw_os_error().map(|code| code as u32);
+            assert!(
+                err.kind() == io::ErrorKind::BrokenPipe
+                    || matches!(raw, Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA)),
+                "{label} should observe a broken pipe after dropping wrapper stdio, got: {err}"
+            );
         }
 
-        for _ in 0..8 {
+        unsafe fn read_end_reports_closed_peer(probe: File, label: &str) {
+            let ok = PeekNamedPipe(
+                probe.as_raw_handle() as HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let err = GetLastError();
+            assert!(
+                ok == 0 && matches!(err, ERROR_BROKEN_PIPE | ERROR_NO_DATA),
+                "{label} should observe a disconnected pipe after dropping wrapper stdio, got ok={ok} err={err}"
+            );
+        }
+
+        {
             let stdio =
                 unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
-            let handles = [
-                stdio.stdin_write.as_raw_handle() as HANDLE,
-                stdio.stdout_read.as_raw_handle() as HANDLE,
-                stdio.stderr_read.as_raw_handle() as HANDLE,
-                stdio.child_stdin.as_raw_handle() as HANDLE,
-                stdio.child_stdout.as_raw_handle() as HANDLE,
-                stdio.child_stderr.as_raw_handle() as HANDLE,
-            ];
+            let stdin_write_probe = stdio.stdin_write.try_clone().expect("clone stdin write");
             drop(stdio);
-
-            for (index, handle) in handles.into_iter().enumerate() {
-                assert!(
-                    unsafe { dropped_handle_is_invalid(handle) },
-                    "dropping wrapper stdio should close handle #{index} ({handle:p})"
-                );
+            write_end_reports_closed_peer(stdin_write_probe, "stdin write handle");
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stdin_probe = stdio.child_stdin.try_clone().expect("clone child stdin");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(child_stdin_probe, "child stdin handle");
             }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let stdout_read_probe = stdio.stdout_read.try_clone().expect("clone stdout read");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(stdout_read_probe, "stdout read handle");
+            }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stdout_probe = stdio.child_stdout.try_clone().expect("clone child stdout");
+            drop(stdio);
+            write_end_reports_closed_peer(child_stdout_probe, "child stdout handle");
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let stderr_read_probe = stdio.stderr_read.try_clone().expect("clone stderr read");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(stderr_read_probe, "stderr read handle");
+            }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stderr_probe = stdio.child_stderr.try_clone().expect("clone child stderr");
+            drop(stdio);
+            write_end_reports_closed_peer(child_stderr_probe, "child stderr handle");
         }
     }
 
