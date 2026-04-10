@@ -96,10 +96,53 @@ cargo install --git https://github.com/posit-dev/mcp-repl --tag v0.1.0 --locked
 
 This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
 
+#### Install prebuilt binaries
+
+Stable installs use the latest non-prerelease GitHub Release. Dev installs use the rolling `dev` prerelease.
+
+Linux / macOS stable:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh | sh
+```
+
+Linux / macOS dev:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh | sh -s -- --dev
+```
+
+Windows PowerShell stable:
+
+```powershell
+irm https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1 | iex
+Install-McpRepl
+```
+
+Windows PowerShell dev:
+
+```powershell
+irm https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1 | iex
+Install-McpRepl -Dev
+```
+
+#### Download prebuilt stable binaries
+
+Stable release page:
+
+- `https://github.com/posit-dev/mcp-repl/releases/latest`
+
+Stable asset URLs:
+
+- Linux x86_64 (glibc build produced on Ubuntu 22.04): `https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-unknown-linux-gnu.tar.gz`
+- macOS arm64: `https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-aarch64-apple-darwin.tar.gz`
+- Windows x86_64 (experimental): `https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-pc-windows-msvc.zip`
+
 #### Download prebuilt dev binaries
 
 The rolling `dev` prerelease publishes the newest available `main` build at stable URLs:
 
+- Dev release page: `https://github.com/posit-dev/mcp-repl/releases/tag/dev`
 - Linux x86_64 (glibc build produced on Ubuntu 22.04): `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz`
 - macOS arm64: `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz`
 - Windows x86_64 (experimental): `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip`

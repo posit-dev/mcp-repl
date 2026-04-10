@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -79,7 +81,7 @@ jobs:
           & ".\\target\\release\\mcp-repl.exe" --help | Out-Null
 
       - name: Package release archive
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -90,7 +92,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
 
       - name: Package release archive (windows)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $packageDir = "dist/mcp-repl-${{ matrix.target }}"
@@ -103,7 +105,7 @@ jobs:
           Pop-Location
 
       - name: Upload packaged artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
@@ -254,3 +256,62 @@ jobs:
         if: steps.publish_guard.outputs.should_publish == 'true'
         shell: bash
         run: gh release upload dev dist/* --clobber
+
+  publish-stable:
+    name: publish-stable
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: checks
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify packaged asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_assets=(
+            mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+            mcp-repl-aarch64-apple-darwin.tar.gz
+            mcp-repl-x86_64-pc-windows-msvc.zip
+          )
+          for asset in "${expected_assets[@]}"; do
+            test -f "dist/$asset"
+          done
+          actual_count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$actual_count" = "3"
+
+      - name: Write SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              mcp-repl-x86_64-unknown-linux-gnu.tar.gz \
+              mcp-repl-aarch64-apple-darwin.tar.gz \
+              mcp-repl-x86_64-pc-windows-msvc.zip \
+              > SHA256SUMS.txt
+          )
+
+      - name: Create or update stable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --latest
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes --latest
+          fi

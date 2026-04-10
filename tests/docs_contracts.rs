@@ -63,6 +63,8 @@ fn plans_layout_exists() {
         "docs/plans/active",
         "docs/plans/completed",
         "docs/plans/tech-debt.md",
+        "scripts/install.sh",
+        "scripts/install.ps1",
     ] {
         assert_exists(&root.join(required));
     }
@@ -73,6 +75,12 @@ fn readme_documents_dev_binary_download_contract() {
     let readme = read(&repo_root().join("README.md"));
 
     for required in [
+        "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh",
+        "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1",
+        "https://github.com/posit-dev/mcp-repl/releases/latest",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-aarch64-apple-darwin.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-pc-windows-msvc.zip",
         "Download prebuilt dev binaries",
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz",
@@ -91,6 +99,9 @@ fn ci_workflow_defines_dev_release_contract() {
 
     for required in [
         "publish-dev:",
+        "publish-stable:",
+        "tags:",
+        "- 'v*'",
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
@@ -100,6 +111,7 @@ fn ci_workflow_defines_dev_release_contract() {
         "SHA256SUMS.txt",
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
+        "gh release create \"${GITHUB_REF_NAME}\" dist/*",
     ] {
         assert!(
             workflow.contains(required),
