@@ -4,7 +4,9 @@
 
 A Windows bug exposed a broader design issue in the embedded worker model: stdin should have a single owner inside the worker process.
 
-The immediate Windows hang is now mitigated by pausing the worker's background stdin reader while a request is active. The remaining follow-up is broader than that point fix: tighten the general stdin transport model so future interpreters fit the same design cleanly.
+This repo has already pulled forward a narrow mitigation from that future work: pause the worker's background stdin reader while a request is active so another runtime is not competing with a blocked reader on fd `0`.
+
+The remaining follow-up is broader than that point fix. We still need to tighten the general stdin transport model so future interpreters fit the same design cleanly and stdin ownership is structural rather than incidental.
 
 ## Why This Matters
 
@@ -15,7 +17,16 @@ The immediate Windows hang is now mitigated by pausing the worker's background s
 
 ## Current Scope
 
-This repo now avoids the immediate Windows deadlock by stopping the background stdin reader from blocking on fd `0` while a request is running. We still want to keep stdin as the primary request channel for worker payloads and address the broader stdin ownership / transport shape in a dedicated follow-up refactor.
+This repo now avoids the immediate Windows deadlock by stopping the background stdin reader from blocking on fd `0` while a request is running.
+
+That mitigation should be treated as an initial slice, not the completion of this item:
+
+- It reduces simultaneous stdin readers during active requests.
+- It does not yet make stdin ownership explicit end-to-end.
+- It does not remove the embedded R framing layer.
+- It does not yet establish the final request-envelope split between raw stdin payloads and IPC metadata.
+
+We still want to keep stdin as the primary request channel for worker payloads and address the broader stdin ownership / transport shape in a dedicated follow-up refactor.
 
 ## Intended Transport Model
 
@@ -48,5 +59,6 @@ The following patterns reproduced locally on Windows:
 - Keep stdin as the primary worker payload transport.
 - Refactor the worker so stdin has a single owner.
 - Avoid a permanently blocked background stdin reader while embedded runtimes may also inspect or wrap fd `0`.
+- Treat the current active-request pause as a temporary safety rail, not the final transport architecture.
 - Remove stdin framing for the embedded R worker and rely on IPC for request envelope metadata instead.
 - Prefer demand-driven reads from stdin, or another single-owner design, so future interpreters like Julia can fit the same transport model.
