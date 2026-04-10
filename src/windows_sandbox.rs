@@ -659,21 +659,24 @@ unsafe fn apply_prepared_launch_acl_state(
 
     let paths = prepared_launch_acl_paths(launch);
     let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
+    let denied_roots = canonicalized_paths(&paths.deny);
 
     for path in &paths.allow {
-        match add_allow_ace(path, sid) {
-            Ok(true) => acl_guards.push(CapabilityAclGuard {
-                path: path.clone(),
-                sid,
-                kind: CapabilityAclKind::Allow,
-            }),
-            Ok(false) => {}
-            Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, sid, false);
-                return Err(format!(
-                    "failed to {action} writable ACL on '{}': {err}",
-                    path.display()
-                ));
+        for target in prepared_launch_allow_targets(path, &denied_roots)? {
+            match add_allow_ace(&target, sid) {
+                Ok(true) => acl_guards.push(CapabilityAclGuard {
+                    path: target,
+                    sid,
+                    kind: CapabilityAclKind::Allow,
+                }),
+                Ok(false) => {}
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, sid, false);
+                    return Err(format!(
+                        "failed to {action} writable ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
             }
         }
     }
@@ -699,6 +702,60 @@ unsafe fn apply_prepared_launch_acl_state(
     }
 
     Ok(())
+}
+
+fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut canonicalized = paths
+        .iter()
+        .map(|path| canonicalize_or_identity(path))
+        .collect::<Vec<_>>();
+    canonicalized.sort();
+    canonicalized.dedup();
+    canonicalized
+}
+
+fn path_is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn prepared_launch_allow_targets(
+    root: &Path,
+    denied_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut targets = Vec::new();
+    let root_canonical = canonicalize_or_identity(root);
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = HashSet::new();
+
+    while let Some(path) = stack.pop() {
+        let canonical = canonicalize_or_identity(&path);
+        if !canonical.starts_with(&root_canonical)
+            || path_is_within_any_root(&canonical, denied_roots)
+        {
+            continue;
+        }
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        targets.push(path.clone());
+
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("symlink_metadata failed for '{}': {err}", path.display()))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let entries = std::fs::read_dir(&path)
+            .map_err(|err| format!("read_dir failed for '{}': {err}", path.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|err| format!("read_dir entry failed for '{}': {err}", path.display()))?;
+            stack.push(entry.path());
+        }
+    }
+
+    Ok(targets)
 }
 
 unsafe fn refresh_runtime_prepared_launch_acl_state(
@@ -1548,7 +1605,7 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
-    if dacl_has_allow_for_sid(dacl, sid) {
+    if dacl_has_allow_for_sid(dacl, sid, path.is_dir()) {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
@@ -1717,7 +1774,26 @@ unsafe fn ace_sid_ptr(ace: *mut c_void) -> *mut c_void {
     (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void
 }
 
-unsafe fn dacl_has_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+fn allow_ace_satisfies_requirements(mask: u32, ace_flags: u8, require_inheritance: bool) -> bool {
+    if (mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE))
+        != (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
+    {
+        return false;
+    }
+    if require_inheritance
+        && ((ace_flags & (CONTAINER_INHERIT_ACE as u8)) == 0
+            || (ace_flags & (OBJECT_INHERIT_ACE as u8)) == 0)
+    {
+        return false;
+    }
+    true
+}
+
+unsafe fn dacl_has_allow_for_sid(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    require_inheritance: bool,
+) -> bool {
     let Some(info) = dacl_size_info(dacl) else {
         return false;
     };
@@ -1732,8 +1808,7 @@ unsafe fn dacl_has_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
         if EqualSid(ace_sid_ptr(ace), sid) != 0
-            && (allowed.Mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE))
-                == (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
         {
             return true;
         }
@@ -3435,7 +3510,51 @@ mod tests {
         if code != ERROR_SUCCESS {
             return false;
         }
-        let has_ace = dacl_has_allow_for_sid(dacl, sid);
+        let has_ace = dacl_has_allow_for_sid(dacl, sid, path.is_dir());
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_inheritable_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
@@ -3514,6 +3633,71 @@ mod tests {
             LocalFree(security_descriptor as HLOCAL);
         }
         mask
+    }
+
+    unsafe fn add_custom_allow_ace(
+        path: &Path,
+        sid: *mut c_void,
+        mask: u32,
+        inheritance: u32,
+    ) -> Result<(), String> {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+        }
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        };
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions = mask;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance = inheritance;
+        explicit.Trustee = trustee;
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+        if set_acl_code != ERROR_SUCCESS {
+            if !security_descriptor.is_null() {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+            return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+        }
+
+        let set_security_code = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if set_security_code != ERROR_SUCCESS {
+            return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+        }
+        Ok(())
     }
 
     unsafe fn add_custom_deny_ace(path: &Path, sid: *mut c_void, mask: u32) -> Result<(), String> {
@@ -3693,6 +3877,98 @@ mod tests {
 
             revoke_deny_write_ace(&protected_dir, sid);
             LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn add_allow_ace_upgrades_non_inheriting_allow_acl_for_same_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let writable_dir = tmp.path().join("writable");
+        std::fs::create_dir_all(&writable_dir).expect("writable dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            add_custom_allow_ace(
+                &writable_dir,
+                sid,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+                0,
+            )
+            .expect("non-inheriting allow ACE should be installed");
+            assert!(
+                !path_has_inheritable_allow_ace(&writable_dir, sid),
+                "test setup should start with a same-SID allow ACE that does not inherit"
+            );
+
+            let added =
+                add_allow_ace(&writable_dir, sid).expect("inheriting allow ACE should be applied");
+
+            assert!(
+                added,
+                "non-inheriting allow ACEs should be treated as incomplete and upgraded"
+            );
+            assert!(
+                path_has_inheritable_allow_ace(&writable_dir, sid),
+                "refreshed writable roots should keep inheriting the capability SID"
+            );
+
+            revoke_ace(&writable_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_reapplies_allow_acl_to_existing_file_under_writable_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let nested = cwd.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = session_temp_dir.join("artifact.txt");
+        let moved_file = nested.join("artifact.txt");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let filesystem_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("filesystem capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            std::fs::write(&source_file, b"artifact").expect("temp artifact file");
+            add_allow_ace(&source_file, launch_sid).expect("launch-scoped allow ACE");
+            std::fs::rename(&source_file, &moved_file).expect("move artifact into writable root");
+            assert!(
+                !path_has_allow_ace(&moved_file, filesystem_sid),
+                "test setup should keep the temp-file ACL after the move into the writable root"
+            );
+
+            refresh_prepared_sandbox_launch_acl_state(&prepared)
+                .expect("refresh prepared launch ACL state");
+
+            assert!(
+                path_has_allow_ace(&moved_file, filesystem_sid),
+                "refresh should restore the stable filesystem ACE on files already under writable roots"
+            );
+
+            revoke_ace(&moved_file, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(filesystem_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
         }
     }
 
