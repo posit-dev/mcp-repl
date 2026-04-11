@@ -1347,6 +1347,17 @@ fn cleanup_restricted_file(path: &std::path::Path) {
 }
 
 #[cfg(target_os = "windows")]
+fn cleanup_restricted_path(path: &std::path::Path) {
+    let script = format!(
+        "$path = {}; if (Test-Path -LiteralPath $path) {{ icacls $path /reset /t /c | Out-Null; Remove-Item -LiteralPath $path -Force -Recurse -ErrorAction SilentlyContinue }}",
+        powershell_literal(&path.to_string_lossy())
+    );
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .status();
+}
+
+#[cfg(target_os = "windows")]
 fn unresolved_windows_sid_acl_entries(path: &std::path::Path) -> TestResult<Vec<String>> {
     let script = format!(
         r#"
@@ -2378,6 +2389,420 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_host_created_nested_workspace_file()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src").join("pkg");
+    let shared = nested_dir.join(format!(
+        "mcp-repl-sandbox-host-nested-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let shared_r = r_string(&shared.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session_a =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        cleanup_restricted_file(&shared);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&nested_dir)?;
+    std::fs::write(&shared, b"from host nested")?;
+
+    let mut session_b =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+
+    let shared_acl = unresolved_windows_sid_acl_entries(&shared)?;
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_OK\n")
+  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&shared);
+    cleanup_restricted_path(&nested_dir);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        shared_acl.contains(&expected_stable_sid),
+        "expected host-created nested workspace artifact to gain the stable prepared SID {expected_stable_sid} after a same-checkout launch refresh, got: {shared_acl:?}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_READ=from host nested"),
+        "expected older live session to read the host-created nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_WRITE_OK"),
+        "expected older live session to write the host-created nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_AFTER=from host nested|from session a"),
+        "expected older live session to read back its write on the host-created nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
+        "host-created nested workspace artifacts should stay shared across live same-checkout sessions, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_workspace_file()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src").join("pkg");
+    let shared = nested_dir.join(format!(
+        "mcp-repl-sandbox-host-renamed-nested-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let temp_root = tempfile::tempdir()?;
+    let host_temp = temp_root.path().join("host-temp.txt");
+    let shared_r = r_string(&shared.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session_a =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        cleanup_restricted_file(&shared);
+        cleanup_restricted_file(&host_temp);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&nested_dir)?;
+    std::fs::write(&host_temp, b"from host temp")?;
+    std::fs::rename(&host_temp, &shared)?;
+
+    let mut session_b =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        cleanup_restricted_file(&host_temp);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+
+    let shared_acl = unresolved_windows_sid_acl_entries(&shared)?;
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_OK\n")
+  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&shared);
+    cleanup_restricted_file(&host_temp);
+    cleanup_restricted_path(&nested_dir);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        shared_acl.contains(&expected_stable_sid),
+        "expected host temp-renamed nested workspace artifact to gain the stable prepared SID {expected_stable_sid} after a same-checkout launch refresh, got: {shared_acl:?}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_READ=from host temp"),
+        "expected older live session to read the host temp-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_WRITE_OK"),
+        "expected older live session to write the host temp-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_AFTER=from host temp|from session a"),
+        "expected older live session to read back its write on the host temp-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
+        "host temp-renamed nested workspace artifacts should stay shared across live same-checkout sessions, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_workspace_tree()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let src_dir = repo_root.join("src");
+    let nested_dir = src_dir.join("pkg");
+    let shared = nested_dir.join(format!(
+        "mcp-repl-sandbox-host-renamed-nested-tree-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let temp_root = tempfile::tempdir()?;
+    let host_pkg = temp_root.path().join("pkg");
+    let host_file = host_pkg.join(shared.file_name().expect("shared file name"));
+    let shared_r = r_string(&shared.to_string_lossy());
+    std::fs::create_dir_all(&src_dir)?;
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session_a =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        cleanup_restricted_path(&nested_dir);
+        cleanup_restricted_path(&src_dir);
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&host_pkg)?;
+    std::fs::write(&host_file, b"from moved host tree")?;
+    std::fs::rename(&host_pkg, &nested_dir)?;
+
+    let mut session_b =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_path(&nested_dir);
+        cleanup_restricted_path(&src_dir);
+        return Ok(());
+    }
+
+    let nested_dir_acl = unresolved_windows_sid_acl_entries(&nested_dir)?;
+    let shared_acl = unresolved_windows_sid_acl_entries(&shared)?;
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_OK\n")
+  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_path(&nested_dir);
+    cleanup_restricted_path(&src_dir);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        nested_dir_acl.contains(&expected_stable_sid),
+        "expected host-renamed nested workspace directory to gain the stable prepared SID {expected_stable_sid} after a same-checkout launch refresh, got: {nested_dir_acl:?}"
+    );
+    assert!(
+        shared_acl.contains(&expected_stable_sid),
+        "expected host-renamed nested workspace artifact to gain the stable prepared SID {expected_stable_sid} after a same-checkout launch refresh, got: {shared_acl:?}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_READ=from moved host tree"),
+        "expected older live session to read the host-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_WRITE_OK"),
+        "expected older live session to write the host-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_AFTER=from moved host tree|from session a"),
+        "expected older live session to read back its write on the host-renamed nested workspace artifact, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
+        "host-renamed nested workspace trees should stay shared across live same-checkout sessions, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_file_created_inside_host_renamed_nested_workspace_tree()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let src_dir = repo_root.join("src");
+    let nested_dir = src_dir.join("pkg");
+    let shared = nested_dir.join(format!(
+        "mcp-repl-sandbox-renamed-tree-host-file-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let temp_root = tempfile::tempdir()?;
+    let host_pkg = temp_root.path().join("pkg");
+    let shared_r = r_string(&shared.to_string_lossy());
+    std::fs::create_dir_all(&src_dir)?;
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session_a =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        cleanup_restricted_path(&nested_dir);
+        cleanup_restricted_path(&src_dir);
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&host_pkg)?;
+    std::fs::rename(&host_pkg, &nested_dir)?;
+    std::fs::write(&shared, b"from host file in renamed tree")?;
+
+    let mut session_b =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_path(&nested_dir);
+        cleanup_restricted_path(&src_dir);
+        return Ok(());
+    }
+
+    let nested_dir_acl = unresolved_windows_sid_acl_entries(&nested_dir)?;
+    let shared_acl = unresolved_windows_sid_acl_entries(&shared)?;
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_OK\n")
+  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_path(&nested_dir);
+    cleanup_restricted_path(&src_dir);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        nested_dir_acl.contains(&expected_stable_sid),
+        "expected the renamed nested workspace directory to keep the stable prepared SID {expected_stable_sid}, got: {nested_dir_acl:?}"
+    );
+    assert!(
+        shared_acl.contains(&expected_stable_sid),
+        "expected the host-created file inside the renamed nested workspace tree to gain the stable prepared SID {expected_stable_sid} after a same-checkout launch refresh, got: {shared_acl:?}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_READ=from host file in renamed tree"),
+        "expected older live session to read the host-created file inside the renamed nested workspace tree, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_WRITE_OK"),
+        "expected older live session to write the host-created file inside the renamed nested workspace tree, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_AFTER=from host file in renamed tree|from session a"),
+        "expected older live session to read back its write inside the renamed nested workspace tree, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
+        "host-created files inside renamed nested workspace trees should stay shared across live same-checkout sessions, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_direct_midrun_file_keeps_prepared_sid() -> TestResult<()> {
     let writable_root = tempfile::tempdir()?;
     let artifact = writable_root.path().join(format!(
@@ -2426,6 +2851,164 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
     assert!(
         before_cancel.contains(&expected_stable_sid),
         "expected a direct file created under a writable root to retain the stable prepared SID {expected_stable_sid}, got: {before_cancel:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_nested_workspace_tree()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src").join("pkg");
+    let artifact = nested_dir.join(format!(
+        "mcp-repl-sandbox-nested-exit-acl-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let nested_dir_r = r_string(&nested_dir.to_string_lossy());
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let create_code = format!(
+        r#"
+target_dir <- {nested_dir_r}
+target <- {artifact_r}
+dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines("nested exit", target)
+cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&artifact);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected sandboxed worker to create the nested workspace tree, got: {create_text}"
+    );
+
+    let before_cancel_dir = unresolved_windows_sid_acl_entries(&nested_dir)?;
+    let before_cancel_file = unresolved_windows_sid_acl_entries(&artifact)?;
+    let before_dir_non_stable = before_cancel_dir
+        .iter()
+        .filter(|sid| *sid != &expected_stable_sid)
+        .cloned()
+        .collect::<Vec<_>>();
+    let before_file_non_stable = before_cancel_file
+        .iter()
+        .filter(|sid| *sid != &expected_stable_sid)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !before_cancel_dir.contains(&expected_stable_sid)
+        || !before_cancel_file.contains(&expected_stable_sid)
+    {
+        eprintln!(
+            "prepared launch SID not active on this public Windows surface; skipping nested ACL teardown probe"
+        );
+        cleanup_restricted_file(&artifact);
+        cleanup_restricted_path(&nested_dir);
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let session_end = session
+        .write_stdin_raw_with("quit(\"no\")", Some(10.0))
+        .await?;
+    let session_end_text = collect_text(&session_end);
+    assert!(
+        session_end_text.contains("session ended")
+            || session_end_text.contains("ipc disconnected while waiting for request completion"),
+        "expected backend quit to end the worker session, got: {session_end_text}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (after_cancel_dir, after_cancel_file) = loop {
+        let current_dir = unresolved_windows_sid_acl_entries(&nested_dir)?;
+        let current_file = unresolved_windows_sid_acl_entries(&artifact)?;
+        let old_dir_launch_removed = before_dir_non_stable
+            .iter()
+            .all(|sid| !current_dir.contains(sid));
+        let old_file_launch_removed = before_file_non_stable
+            .iter()
+            .all(|sid| !current_file.contains(sid));
+        if current_dir.contains(&expected_stable_sid)
+            && current_file.contains(&expected_stable_sid)
+            && old_dir_launch_removed
+            && old_file_launch_removed
+        {
+            break (current_dir, current_file);
+        }
+        if std::time::Instant::now() >= deadline {
+            break (current_dir, current_file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+
+    cleanup_restricted_file(&artifact);
+    cleanup_restricted_path(&nested_dir);
+    session.cancel().await?;
+
+    let after_dir_non_stable = after_cancel_dir
+        .iter()
+        .filter(|sid| *sid != &expected_stable_sid)
+        .cloned()
+        .collect::<Vec<_>>();
+    let after_file_non_stable = after_cancel_file
+        .iter()
+        .filter(|sid| *sid != &expected_stable_sid)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert!(
+        !before_dir_non_stable.is_empty() || !before_file_non_stable.is_empty(),
+        "expected nested workspace ACLs to include launch-scoped SIDs before session exit, got dir={before_cancel_dir:?} file={before_cancel_file:?}"
+    );
+    if before_dir_non_stable
+        .iter()
+        .any(|sid| after_cancel_dir.contains(sid))
+        && after_cancel_dir
+            .iter()
+            .any(|sid| sid != &expected_stable_sid && !before_cancel_dir.contains(sid))
+    {
+        eprintln!(
+            "eager worker respawn re-applied a fresh launch SID before the old nested directory cleanup settled on this public Windows surface; skipping teardown probe"
+        );
+        return Ok(());
+    }
+    if before_file_non_stable
+        .iter()
+        .any(|sid| after_cancel_file.contains(sid))
+        && after_cancel_file
+            .iter()
+            .any(|sid| sid != &expected_stable_sid && !before_cancel_file.contains(sid))
+    {
+        eprintln!(
+            "eager worker respawn re-applied a fresh launch SID before the old nested file cleanup settled on this public Windows surface; skipping teardown probe"
+        );
+        return Ok(());
+    }
+    assert!(
+        after_dir_non_stable.is_empty(),
+        "expected session exit to remove launch-scoped SIDs from the nested workspace directory, got: {after_cancel_dir:?}"
+    );
+    assert!(
+        after_file_non_stable.is_empty(),
+        "expected session exit to remove launch-scoped SIDs from the nested workspace file, got: {after_cancel_file:?}"
     );
     Ok(())
 }

@@ -164,7 +164,6 @@ enum CapabilityAclKind {
 enum PreparedLaunchAllowScope {
     Recursive,
     RootsOnly,
-    RootsAndDirectChildren,
 }
 
 struct CapabilityAclGuard {
@@ -1016,9 +1015,7 @@ fn prepared_launch_allow_targets(
         }
 
         targets.push(path.clone());
-        if matches!(scope, PreparedLaunchAllowScope::RootsOnly)
-            || matches!(scope, PreparedLaunchAllowScope::RootsAndDirectChildren if depth >= 1)
-        {
+        if matches!(scope, PreparedLaunchAllowScope::RootsOnly) {
             continue;
         }
 
@@ -1126,7 +1123,7 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
         &launch,
         sid,
         "refresh",
-        PreparedLaunchAllowScope::RootsAndDirectChildren,
+        PreparedLaunchAllowScope::Recursive,
     )?;
     Ok(launch)
 }
@@ -1175,7 +1172,7 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
             launch,
             psid_capability,
             "refresh",
-            PreparedLaunchAllowScope::RootsAndDirectChildren,
+            PreparedLaunchAllowScope::Recursive,
         );
         LocalFree(psid_capability as HLOCAL);
         refresh_result
@@ -2615,10 +2612,10 @@ unsafe fn revoke_ace_with_result(path: &Path, sid: *mut c_void) -> Result<bool, 
             changed = true;
         }
     }
-    if !security_descriptor.is_null() {
-        LocalFree(security_descriptor as HLOCAL);
-    }
     if !changed {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
         return Ok(false);
     }
 
@@ -2631,6 +2628,9 @@ unsafe fn revoke_ace_with_result(path: &Path, sid: *mut c_void) -> Result<bool, 
         dacl,
         std::ptr::null_mut(),
     );
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
     if set_security_code != ERROR_SUCCESS {
         if set_security_code == ERROR_FILE_NOT_FOUND || set_security_code == ERROR_PATH_NOT_FOUND {
             return Ok(false);
@@ -4890,6 +4890,75 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_runtime_refresh_reapplies_allow_acl_to_scrubbed_nested_workspace_tree() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let src_dir = cwd.join("src");
+        let nested_dir = src_dir.join("pkg");
+        let artifact = nested_dir.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&src_dir).expect("workspace src dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        std::fs::create_dir_all(&nested_dir).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            revoke_ace(&nested_dir, stable_sid);
+            revoke_ace(&artifact, stable_sid);
+            assert!(
+                !path_has_any_allow_ace(&nested_dir, stable_sid),
+                "test setup should strip the stable SID from the nested workspace directory"
+            );
+            assert!(
+                !path_has_any_allow_ace(&artifact, stable_sid),
+                "test setup should strip the stable SID from the nested workspace file"
+            );
+
+            refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                stable_sid,
+            )
+            .expect("runtime refresh prepared ACL state");
+
+            assert!(
+                path_has_allow_ace(&nested_dir, stable_sid),
+                "runtime refresh should restore the stable allow ACE on scrubbed nested workspace directories"
+            );
+            assert!(
+                path_has_allow_ace(&artifact, stable_sid),
+                "runtime refresh should restore the stable allow ACE on scrubbed nested workspace files"
+            );
+
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    src_dir.as_path(),
+                    nested_dir.as_path(),
+                    artifact.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
@@ -5242,6 +5311,60 @@ mod tests {
             );
 
             revoke_ace(&artifact, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_launch_sid_from_nested_directory_tree() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let nested_dir = writable_root.join("nested");
+        let artifact = nested_dir.join("artifact.txt");
+        std::fs::create_dir_all(&nested_dir).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            add_allow_ace_with_options(&nested_dir, launch_sid, false, true)
+                .expect("launch nested dir allow ACE");
+            add_allow_ace_with_options(&artifact, launch_sid, false, false)
+                .expect("launch file allow ACE");
+            assert!(
+                path_has_any_allow_ace(&nested_dir, launch_sid),
+                "test setup should leave the launch SID on the nested directory"
+            );
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the launch SID on the nested file"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&nested_dir, launch_sid),
+                "cleanup should remove launch SID access from nested directories covered by a writable-root guard"
+            );
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove launch SID access from nested files covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&nested_dir, launch_sid);
             revoke_ace(&writable_root, launch_sid);
             LocalFree(launch_sid as HLOCAL);
         }
@@ -5602,15 +5725,16 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_runtime_refresh_scans_only_direct_writable_root_children() {
+    fn prepared_launch_runtime_refresh_scans_writable_root_descendants_recursively() {
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         let nested = cwd.join("nested");
+        let deeper = nested.join("deeper");
         let session_temp_dir = tmp.path().join("session-temp");
-        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::create_dir_all(&deeper).expect("nested dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
             .expect("prepare session temp dir");
 
@@ -5638,16 +5762,25 @@ mod tests {
             result.is_ok(),
             "runtime refresh should succeed for an existing writable root, got: {result:?}"
         );
-        let expected_read_dir_calls = vec![canonicalize_or_identity(&cwd)];
+        let expected_read_dir_calls = vec![
+            canonicalize_or_identity(&cwd),
+            canonicalize_or_identity(&nested),
+            canonicalize_or_identity(&deeper),
+        ];
         assert!(
             read_dir_calls == expected_read_dir_calls,
-            "runtime refresh should inspect only the writable root itself when looking for direct children, got: {read_dir_calls:?}"
+            "runtime refresh should inspect writable-root descendants recursively when refreshing prepared ACL state, got: {read_dir_calls:?}"
         );
 
         unsafe {
             revoke_capability_sid_paths(
                 &prepared_sid,
-                &[cwd.as_path(), nested.as_path(), session_temp_dir.as_path()],
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    deeper.as_path(),
+                    session_temp_dir.as_path(),
+                ],
             );
         }
     }
