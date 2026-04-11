@@ -1695,7 +1695,7 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
         &args.sandbox_policy,
         &args.sandbox_policy_cwd,
         &args.command,
-        args.prepared_capability_sid.as_deref(),
+        &args.prepared_capability_sid,
     )
 }
 
@@ -1703,7 +1703,7 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
 struct WindowsSandboxArgs {
     sandbox_policy_cwd: PathBuf,
     sandbox_policy: SandboxPolicy,
-    prepared_capability_sid: Option<String>,
+    prepared_capability_sid: String,
     command: Vec<String>,
 }
 
@@ -1765,6 +1765,8 @@ fn windows_sandbox_parse_args_from(raw_args: Vec<OsString>) -> Result<WindowsSan
     let sandbox_policy_cwd =
         sandbox_policy_cwd.ok_or_else(|| "missing --sandbox-policy-cwd".to_string())?;
     let sandbox_policy = sandbox_policy.ok_or_else(|| "missing --sandbox-policy".to_string())?;
+    let prepared_capability_sid =
+        prepared_capability_sid.ok_or_else(|| "missing --prepared-capability-sid".to_string())?;
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
@@ -2518,10 +2520,34 @@ mod tests {
         let parsed = windows_sandbox_parse_args_from(args).expect("windows sandbox args");
 
         assert_eq!(
-            parsed.prepared_capability_sid.as_deref(),
-            Some("S-1-5-21-1-2-3-4")
+            parsed.prepared_capability_sid.as_str(),
+            "S-1-5-21-1-2-3-4"
         );
         assert_eq!(parsed.command, vec!["worker".to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_parse_args_requires_prepared_capability_sid() {
+        let args = vec![
+            OsString::from("--windows-sandbox"),
+            OsString::from("--sandbox-policy-cwd"),
+            OsString::from("C:\\workspace"),
+            OsString::from("--sandbox-policy"),
+            OsString::from("{\"type\":\"workspace-write\"}"),
+            OsString::from("--"),
+            OsString::from("worker"),
+        ];
+
+        let err = match windows_sandbox_parse_args_from(args) {
+            Ok(_) => panic!("missing prepared capability sid should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("missing --prepared-capability-sid"),
+            "expected prepared-capability-sid requirement, got: {err}"
+        );
     }
 
     #[cfg(target_os = "linux")]

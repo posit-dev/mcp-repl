@@ -16,12 +16,12 @@
 
 - Add a parent-owned Windows setup cache keyed by sandbox policy, cwd, and session temp dir.
 - Prepare filesystem ACL state once per effective sandbox configuration and pass the prepared capability SID into the wrapper.
-- Keep the wrapper able to fall back to inline preparation when invoked directly without prepared state.
+- Keep the current Windows launcher entrypoint for this branch, but remove the legacy inline ACL fallback. Parent-prepared launch state is the only supported sandboxed worker path.
 
 ## Long-Term Direction
 
 - The end state should resemble the `codex` split between setup/refresh and launch, without introducing a persistent SID registry or other checked-in/local metadata files.
-- This phase is intentionally narrower than the full `codex` architecture: it keeps the existing token-launch wrapper and focuses first on removing launch-path ACL churn and double work.
+- A future follow-up may still expose a friendlier CLI launcher, but this branch stays scoped to the Windows-specific setup/refresh split.
 
 ## Phase Status
 
@@ -38,12 +38,12 @@
 ## Open Questions
 
 - Whether the parent-side cache should eventually own cleanup/revocation, or whether long-lived stable ACEs are acceptable for this model.
-- Whether direct `--windows-sandbox` invocation should remain a fully supported fallback path or become debug-only behavior.
+- How much of the current Windows test fault-injection harness should move out of `src/windows_sandbox.rs` once the launch path is simplified.
 
 ## Next Safe Slice
 
-- Decide whether to add an explicit cleanup tool for legacy Windows ACL buildup from older runs.
-- Add more repeated warm-start coverage for Windows worker respawn behavior.
+- Remove the launcher fallback path that computes ACLs inline when no prepared state is supplied.
+- Re-split stable prepared ACL application from launch-scoped overlay application so one helper is not serving all lifecycles.
 
 ## Stop Conditions
 
@@ -69,3 +69,4 @@
 - 2026-04-10: Prepared-launch refresh must repair existing non-denied descendants under writable roots, not just the root directories. Files moved from the session temp dir into the workspace keep their launch-scoped DACL across a same-volume rename and otherwise become inaccessible after the next worker respawn.
 - 2026-04-10: A same-SID allow ACE on a writable directory is only complete if it still inherits to children. Refresh must upgrade non-inheriting directory ACEs instead of treating them as cache hits.
 - 2026-04-08: Embedded-worker stdin ownership is tracked separately in `docs/futurework/stdin-transport-single-owner.md`. This branch did pull forward a narrow mitigation by pausing the background stdin reader during active requests, but the broader single-owner transport refactor remains deferred.
+- 2026-04-10: This branch stays Windows-only. Any friendlier cross-cutting launcher surface such as a `sandbox-exec` subcommand should be handled as a separate futurework item rather than folded into the Windows ACL refactor.

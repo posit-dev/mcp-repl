@@ -227,12 +227,6 @@ struct WrapperForwarderState {
     write_in_progress: AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WrapperStdioMode {
-    Inherit,
-    ForwardedPipes,
-}
-
 impl WrapperForwarderState {
     fn new() -> Self {
         Self {
@@ -247,14 +241,6 @@ impl WrapperForwarderState {
         WrapperWriteGuard {
             write_in_progress: &self.write_in_progress,
         }
-    }
-}
-
-fn wrapper_stdio_mode(prepared_capability_sid: Option<&str>) -> WrapperStdioMode {
-    if prepared_capability_sid.is_some() {
-        WrapperStdioMode::ForwardedPipes
-    } else {
-        WrapperStdioMode::Inherit
     }
 }
 
@@ -592,29 +578,19 @@ fn make_random_sid_string() -> String {
 fn resolve_launch_capability_sids(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
-    prepared_capability_sid: Option<&str>,
+    prepared_capability_sid: &str,
 ) -> Result<LaunchCapabilitySids, String> {
-    match prepared_capability_sid {
-        Some(value) => {
-            let expected_filesystem_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
-            if value != expected_filesystem_sid {
-                return Err(
-                    "prepared capability SID did not match expected workspace identity".to_string(),
-                );
-            }
-            Ok(LaunchCapabilitySids {
-                filesystem_sid: value.to_string(),
-                launch_sid: make_random_sid_string(),
-            })
-        }
-        None => {
-            let sid = make_random_sid_string();
-            Ok(LaunchCapabilitySids {
-                filesystem_sid: sid.clone(),
-                launch_sid: sid,
-            })
-        }
+    if prepared_capability_sid.is_empty() {
+        return Err("prepared capability SID is required".to_string());
     }
+    let expected_filesystem_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+    if prepared_capability_sid != expected_filesystem_sid {
+        return Err("prepared capability SID did not match expected workspace identity".to_string());
+    }
+    Ok(LaunchCapabilitySids {
+        filesystem_sid: prepared_capability_sid.to_string(),
+        launch_sid: make_random_sid_string(),
+    })
 }
 
 fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -> Vec<&str> {
@@ -669,33 +645,6 @@ fn build_prepared_sandbox_launch(
         session_temp_dir: canonicalize_or_identity(session_temp_dir),
         capability_sid: capability_sid.to_string(),
     }
-}
-
-fn normalize_prepared_capability_sid(
-    prepared_capability_sid: Option<&str>,
-    base_token_restricted: bool,
-) -> Option<&str> {
-    if prepared_capability_sid.is_some() && base_token_restricted {
-        None
-    } else {
-        prepared_capability_sid
-    }
-}
-
-unsafe fn effective_prepared_capability_sid(
-    base_token: HANDLE,
-    prepared_capability_sid: Option<&str>,
-) -> Option<&str> {
-    let normalized = normalize_prepared_capability_sid(
-        prepared_capability_sid,
-        IsTokenRestricted(base_token) != 0,
-    );
-    if prepared_capability_sid.is_some() && normalized.is_none() {
-        crate::diagnostics::startup_log(
-            "windows-sandbox: prepared capability SID disabled because base token is already restricted",
-        );
-    }
-    normalized
 }
 
 fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
@@ -1150,7 +1099,7 @@ pub fn run_sandboxed_command(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     command: &[String],
-    prepared_capability_sid: Option<&str>,
+    prepared_capability_sid: &str,
 ) -> Result<i32, String> {
     run_sandboxed_command_with_env_map(
         policy,
@@ -1165,7 +1114,7 @@ fn run_sandboxed_command_with_env_map(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     command: &[String],
-    prepared_capability_sid: Option<&str>,
+    prepared_capability_sid: &str,
     mut env_map: HashMap<String, String>,
 ) -> Result<i32, String> {
     if command.is_empty() {
@@ -1179,17 +1128,16 @@ fn run_sandboxed_command_with_env_map(
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
         }
-        let session_temp_dir =
-            env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
+        let session_temp_dir = env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| "prepared capability SID requires session temp dir".to_string())?;
 
         let base_token = get_current_token_for_restriction()?;
-        let mut prepared_capability_sid =
-            effective_prepared_capability_sid(base_token, prepared_capability_sid);
-        if prepared_capability_sid.is_some() && session_temp_dir.is_none() {
-            crate::diagnostics::startup_log(
-                "windows-sandbox: prepared capability SID disabled because session temp dir is missing",
+        if IsTokenRestricted(base_token) != 0 {
+            CloseHandle(base_token);
+            return Err(
+                "prepared capability SID requires an unrestricted base token".to_string(),
             );
-            prepared_capability_sid = None;
         }
         let capability_sids =
             resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
@@ -1236,200 +1184,104 @@ fn run_sandboxed_command_with_env_map(
         let null_device_ace_applied = allow_null_device(psid_launch);
 
         let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
-        if let Some(prepared_capability_sid) = prepared_capability_sid {
-            let refresh_result = refresh_runtime_prepared_launch_acl_state(
-                policy,
-                sandbox_policy_cwd,
-                session_temp_dir
-                    .as_deref()
-                    .expect("prepared capability SID requires session temp dir"),
-                prepared_capability_sid,
-                psid_capability,
-            );
-            let prepared_launch = match refresh_result {
-                Ok(launch) => launch,
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
+        let refresh_result = refresh_runtime_prepared_launch_acl_state(
+            policy,
+            sandbox_policy_cwd,
+            &session_temp_dir,
+            prepared_capability_sid,
+            psid_capability,
+        );
+        let prepared_launch = match refresh_result {
+            Ok(launch) => launch,
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
                 }
-            };
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+        };
 
-            let launch_acl_result = apply_runtime_launch_acl_state(&prepared_launch, psid_launch);
-            match launch_acl_result {
-                Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
+        let launch_acl_result = apply_runtime_launch_acl_state(&prepared_launch, psid_launch);
+        match launch_acl_result {
+            Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
                 }
-            }
-
-            if let Some(session_temp_dir) = session_temp_dir.as_deref() {
-                match add_inherit_only_allow_ace(session_temp_dir, psid_capability) {
-                    Ok(true) => acl_guards.push(CapabilityAclGuard {
-                        path: session_temp_dir.to_path_buf(),
-                        sid: psid_capability,
-                        kind: CapabilityAclKind::Allow,
-                    }),
-                    Ok(false) => {}
-                    Err(err) => {
-                        cleanup_capability_acl_state(
-                            &acl_guards,
-                            psid_launch,
-                            null_device_ace_applied,
-                        );
-                        CloseHandle(restricted_token);
-                        if launch_sid_is_distinct {
-                            LocalFree(psid_launch as HLOCAL);
-                        }
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(format!(
-                            "failed to apply session temp inherit-only ACL to '{}': {err}",
-                            session_temp_dir.display()
-                        ));
-                    }
-                }
-                match add_allow_ace(session_temp_dir, psid_launch) {
-                    Ok(true) => acl_guards.push(CapabilityAclGuard {
-                        path: session_temp_dir.to_path_buf(),
-                        sid: psid_launch,
-                        kind: CapabilityAclKind::Allow,
-                    }),
-                    Ok(false) => {}
-                    Err(err) => {
-                        cleanup_capability_acl_state(
-                            &acl_guards,
-                            psid_launch,
-                            null_device_ace_applied,
-                        );
-                        CloseHandle(restricted_token);
-                        if launch_sid_is_distinct {
-                            LocalFree(psid_launch as HLOCAL);
-                        }
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(format!(
-                            "failed to apply session temp dir ACL to '{}': {err}",
-                            session_temp_dir.display()
-                        ));
-                    }
-                }
-            }
-        } else {
-            let paths = compute_allow_deny_paths(
-                policy,
-                sandbox_policy_cwd,
-                sandbox_policy_cwd,
-                session_temp_dir.as_deref(),
-                &env_map,
-            );
-            crate::diagnostics::startup_log(format!(
-                "windows-sandbox: acl plan allow={} deny={}",
-                paths.allow.len(),
-                paths.deny.len()
-            ));
-            for path in &paths.allow {
-                match add_allow_ace(path, psid_capability) {
-                    Ok(true) => acl_guards.push(CapabilityAclGuard {
-                        path: path.clone(),
-                        sid: psid_capability,
-                        kind: CapabilityAclKind::Allow,
-                    }),
-                    Ok(false) => {}
-                    Err(err) => {
-                        cleanup_capability_acl_state(
-                            &acl_guards,
-                            psid_launch,
-                            null_device_ace_applied,
-                        );
-                        CloseHandle(restricted_token);
-                        if launch_sid_is_distinct {
-                            LocalFree(psid_launch as HLOCAL);
-                        }
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(format!(
-                            "failed to apply writable ACL to '{}': {err}",
-                            path.display()
-                        ));
-                    }
-                }
-            }
-            crate::diagnostics::startup_log("windows-sandbox: allow ACLs applied");
-            if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
-                for path in &paths.deny {
-                    match add_deny_write_ace(path, psid_capability) {
-                        Ok(true) => acl_guards.push(CapabilityAclGuard {
-                            path: path.clone(),
-                            sid: psid_capability,
-                            kind: CapabilityAclKind::Deny,
-                        }),
-                        Ok(false) => {}
-                        Err(err) => {
-                            cleanup_capability_acl_state(
-                                &acl_guards,
-                                psid_launch,
-                                null_device_ace_applied,
-                            );
-                            CloseHandle(restricted_token);
-                            if launch_sid_is_distinct {
-                                LocalFree(psid_launch as HLOCAL);
-                            }
-                            LocalFree(psid_capability as HLOCAL);
-                            return Err(format!(
-                                "failed to apply deny ACL to '{}': {err}",
-                                path.display()
-                            ));
-                        }
-                    }
-                }
-                crate::diagnostics::startup_log("windows-sandbox: deny ACLs applied");
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
             }
         }
 
-        let stdio_mode = wrapper_stdio_mode(prepared_capability_sid);
-        let stdio_pipes = match stdio_mode {
-            WrapperStdioMode::Inherit => None,
-            WrapperStdioMode::ForwardedPipes => {
-                let pipes = match create_wrapper_child_stdio() {
-                    Ok(pipes) => pipes,
-                    Err(err) => {
-                        cleanup_capability_acl_state(
-                            &acl_guards,
-                            psid_launch,
-                            null_device_ace_applied,
-                        );
-                        CloseHandle(restricted_token);
-                        if launch_sid_is_distinct {
-                            LocalFree(psid_launch as HLOCAL);
-                        }
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(err);
-                    }
-                };
-                crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
-                Some(pipes)
+        match add_inherit_only_allow_ace(&session_temp_dir, psid_capability) {
+            Ok(true) => acl_guards.push(CapabilityAclGuard {
+                path: session_temp_dir.clone(),
+                sid: psid_capability,
+                kind: CapabilityAclKind::Allow,
+            }),
+            Ok(false) => {}
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(format!(
+                    "failed to apply session temp inherit-only ACL to '{}': {err}",
+                    session_temp_dir.display()
+                ));
+            }
+        }
+        match add_allow_ace(&session_temp_dir, psid_launch) {
+            Ok(true) => acl_guards.push(CapabilityAclGuard {
+                path: session_temp_dir.clone(),
+                sid: psid_launch,
+                kind: CapabilityAclKind::Allow,
+            }),
+            Ok(false) => {}
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(format!(
+                    "failed to apply session temp dir ACL to '{}': {err}",
+                    session_temp_dir.display()
+                ));
+            }
+        }
+
+        let stdio_pipes = match create_wrapper_child_stdio() {
+            Ok(pipes) => pipes,
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
             }
         };
+        crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
         let spawn_result = create_process_as_user(
             restricted_token,
             command,
             sandbox_policy_cwd,
             &env_map,
-            stdio_pipes.as_ref().map(|pipes| {
-                (
-                    pipes.child_stdin.as_raw_handle() as HANDLE,
-                    pipes.child_stdout.as_raw_handle() as HANDLE,
-                    pipes.child_stderr.as_raw_handle() as HANDLE,
-                )
-            }),
+            Some((
+                stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
+            )),
         );
         let (proc_info, _startup_info) = match spawn_result {
             Ok(value) => value,
@@ -1445,7 +1297,7 @@ fn run_sandboxed_command_with_env_map(
             }
         };
         crate::diagnostics::startup_log("windows-sandbox: child spawned");
-        let stdio_forwarders = stdio_pipes.map(spawn_wrapper_stdio_forwarders);
+        let stdio_forwarders = spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -1476,17 +1328,15 @@ fn run_sandboxed_command_with_env_map(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
-            if let Some(WrapperStdioForwarders {
+            let WrapperStdioForwarders {
                 stdin_forwarder,
                 stdout_forwarder,
                 stderr_forwarder,
                 ..
-            }) = stdio_forwarders
-            {
-                drop(stdin_forwarder);
-                drop(stdout_forwarder);
-                drop(stderr_forwarder);
-            }
+            } = stdio_forwarders;
+            drop(stdin_forwarder);
+            drop(stdout_forwarder);
+            drop(stderr_forwarder);
             cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
@@ -1504,18 +1354,16 @@ fn run_sandboxed_command_with_env_map(
         if let Some(job) = job_handle {
             CloseHandle(job);
         }
-        if let Some(WrapperStdioForwarders {
+        let WrapperStdioForwarders {
             stdin_forwarder,
             stdout_forwarder,
             stderr_forwarder,
             stdout_state,
             stderr_state,
-        }) = stdio_forwarders
-        {
-            drop(stdin_forwarder);
-            drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
-            drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
-        }
+        } = stdio_forwarders;
+        drop(stdin_forwarder);
+        drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
+        drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
         cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
@@ -2275,10 +2123,6 @@ unsafe fn add_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> Result<bo
         return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
     }
     Ok(true)
-}
-
-unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
-    add_deny_write_ace_with_options(path, sid, true)
 }
 
 unsafe fn add_deny_write_ace_with_options(
@@ -3341,16 +3185,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_wrapper_launch_uses_inherited_stdio() {
-        assert_eq!(wrapper_stdio_mode(None), WrapperStdioMode::Inherit);
-    }
-
-    #[test]
-    fn prepared_wrapper_launch_uses_forwarded_pipes() {
-        assert_eq!(
-            wrapper_stdio_mode(Some("S-1-5-21-1-2-3-4")),
-            WrapperStdioMode::ForwardedPipes
-        );
+    fn windows_wrapper_launch_uses_forwarded_pipes() {
+        let pipes = unsafe { create_wrapper_child_stdio() }.expect("wrapper stdio pipes");
+        drop(pipes);
     }
 
     #[test]
@@ -3652,12 +3489,27 @@ mod tests {
         let resolved = resolve_launch_capability_sids(
             &workspace_policy(Vec::new(), false, false),
             &cwd,
-            Some(&expected),
+            &expected,
         )
         .expect("prepared launch SIDs");
 
         assert_eq!(resolved.filesystem_sid, expected);
         assert_ne!(resolved.launch_sid, resolved.filesystem_sid);
+    }
+
+    #[test]
+    fn resolve_launch_capability_sids_requires_prepared_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let result =
+            resolve_launch_capability_sids(&workspace_policy(Vec::new(), false, false), &cwd, "");
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("prepared capability SID is required")),
+            "expected launcher to require prepared state, got: {result:?}"
+        );
     }
 
     #[test]
@@ -3670,7 +3522,7 @@ mod tests {
         let result = resolve_launch_capability_sids(
             &workspace_policy(Vec::new(), false, false),
             &cwd,
-            Some(&expected),
+            &expected,
         );
 
         assert!(
@@ -3946,7 +3798,7 @@ mod tests {
 
         std::fs::create_dir_all(&late_root).expect("late root dir");
 
-        let resolved = resolve_launch_capability_sids(&policy, &cwd, Some(&prepared_sid));
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
         assert!(
             resolved.is_ok(),
             "prepared SID should remain valid after a declared absolute writable root is created"
@@ -3971,7 +3823,7 @@ mod tests {
 
         std::fs::create_dir_all(&late_root).expect("late root dir");
 
-        let resolved = resolve_launch_capability_sids(&policy, &cwd, Some(&prepared_sid));
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
         assert!(
             resolved.is_ok(),
             "prepared SID should remain valid after case-only path normalization changes"
@@ -4091,7 +3943,7 @@ mod tests {
             &policy,
             &cwd,
             &command,
-            Some(prepared.capability_sid()),
+            prepared.capability_sid(),
             env_map,
         );
 
@@ -4166,16 +4018,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("waiter should acquire once the first lock is released");
         waiter.join().expect("waiter should join");
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn prepared_capability_sid_falls_back_for_restricted_base_token() {
-        let result = normalize_prepared_capability_sid(Some("S-1-5-21-1-2-3-4"), true);
-        assert!(
-            result.is_none(),
-            "expected restricted-token prepared launch reuse to fall back to inline ACL prep, got: {result:?}"
-        );
     }
 
     #[test]
@@ -4872,8 +4714,8 @@ mod tests {
                 "test setup should start with only a partial deny mask"
             );
 
-            let added =
-                add_deny_write_ace(&protected_dir, sid).expect("full deny ACE should be applied");
+            let added = add_deny_write_ace_with_options(&protected_dir, sid, true)
+                .expect("full deny ACE should be applied");
 
             assert!(
                 added,
