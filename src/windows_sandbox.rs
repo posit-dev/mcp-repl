@@ -687,28 +687,49 @@ fn prepared_launch_acl_paths(launch: &PreparedSandboxLaunch) -> AllowDenyPaths {
     paths
 }
 
-unsafe fn apply_prepared_launch_acl_state(
-    launch: &PreparedSandboxLaunch,
+fn maybe_fail_apply_prepared_launch_acl_state_test() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        if let Some(error) =
+            APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| slot.borrow().clone())
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn maybe_record_acl_guard(
+    acl_guards: &mut Option<&mut Vec<CapabilityAclGuard>>,
+    changed: bool,
+    track_dir_guard: bool,
+    path: &Path,
+    sid: *mut c_void,
+    kind: CapabilityAclKind,
+) {
+    if let Some(guards) = acl_guards.as_deref_mut()
+        && (changed || track_dir_guard)
+    {
+        guards.push(CapabilityAclGuard {
+            path: path.to_path_buf(),
+            sid,
+            kind,
+        });
+    }
+}
+
+unsafe fn apply_allow_acl_targets(
+    allow_paths: &HashSet<PathBuf>,
+    denied_roots: &[PathBuf],
     sid: *mut c_void,
     action: &str,
-    allow_scope: PreparedLaunchAllowScope,
-    allow_inheritance: bool,
-    deny_inheritance: bool,
-    mut acl_guards: Option<&mut Vec<CapabilityAclGuard>>,
+    scope: PreparedLaunchAllowScope,
+    inherit_children: bool,
+    acl_restores: &mut Vec<PreparedLaunchAclRestore>,
+    acl_guards: &mut Option<&mut Vec<CapabilityAclGuard>>,
 ) -> Result<(), String> {
-    #[cfg(test)]
-    if let Some(error) =
-        APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| slot.borrow().clone())
-    {
-        return Err(error);
-    }
-
-    let paths = prepared_launch_acl_paths(launch);
-    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
-    let denied_roots = canonicalized_paths(&paths.deny);
-
-    for path in &paths.allow {
-        for target in prepared_launch_allow_targets(path, &denied_roots, allow_scope)? {
+    for path in allow_paths {
+        for target in prepared_launch_allow_targets(path, denied_roots, scope)? {
             let track_dir_guard = acl_guards.is_some()
                 && std::fs::symlink_metadata(&target)
                     .map(|metadata| metadata.is_dir())
@@ -721,30 +742,29 @@ unsafe fn apply_prepared_launch_acl_state(
                 Ok(Some(restore)) => restore,
                 Ok(None) => continue,
                 Err(err) => {
-                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    cleanup_prepared_launch_acl_state(acl_restores);
                     return Err(format!(
                         "failed to {action} writable ACL on '{}': {err}",
                         target.display()
                     ));
                 }
             };
-            match add_allow_ace_with_options(&target, sid, target == *path, allow_inheritance) {
+            match add_allow_ace_with_options(&target, sid, target == *path, inherit_children) {
                 Ok(changed) => {
-                    if let Some(ref mut guards) = acl_guards
-                        && (changed || track_dir_guard)
-                    {
-                        guards.push(CapabilityAclGuard {
-                            path: target.clone(),
-                            sid,
-                            kind: CapabilityAclKind::Allow,
-                        });
-                    }
+                    maybe_record_acl_guard(
+                        acl_guards,
+                        changed,
+                        track_dir_guard,
+                        &target,
+                        sid,
+                        CapabilityAclKind::Allow,
+                    );
                     if changed || !restore.materialized_dirs.is_empty() {
                         acl_restores.push(restore);
                     }
                 }
                 Err(err) => {
-                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    cleanup_prepared_launch_acl_state(acl_restores);
                     return Err(format!(
                         "failed to {action} writable ACL on '{}': {err}",
                         target.display()
@@ -753,112 +773,188 @@ unsafe fn apply_prepared_launch_acl_state(
             }
         }
     }
+    Ok(())
+}
 
-    if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
-        for path in &paths.deny {
+unsafe fn apply_deny_acl_targets(
+    policy: &SandboxPolicy,
+    deny_paths: &HashSet<PathBuf>,
+    sid: *mut c_void,
+    action: &str,
+    include_descendants: bool,
+    inherit_children: bool,
+    acl_restores: &mut Vec<PreparedLaunchAclRestore>,
+    acl_guards: &mut Option<&mut Vec<CapabilityAclGuard>>,
+) -> Result<(), String> {
+    if !matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
+        return Ok(());
+    }
+
+    for path in deny_paths {
+        let track_dir_guard = acl_guards.is_some()
+            && std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+        let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
+            Ok(Some(restore)) => restore,
+            Ok(None) => continue,
+            Err(err) => {
+                cleanup_prepared_launch_acl_state(acl_restores);
+                return Err(format!(
+                    "failed to {action} deny ACL on '{}': {err}",
+                    path.display()
+                ));
+            }
+        };
+        match add_deny_write_ace_with_options(path, sid, inherit_children) {
+            Ok(changed) => {
+                maybe_record_acl_guard(
+                    acl_guards,
+                    changed,
+                    track_dir_guard,
+                    path,
+                    sid,
+                    CapabilityAclKind::Deny,
+                );
+                if changed {
+                    acl_restores.push(restore);
+                }
+            }
+            Err(err) => {
+                cleanup_prepared_launch_acl_state(acl_restores);
+                return Err(format!(
+                    "failed to {action} deny ACL on '{}': {err}",
+                    path.display()
+                ));
+            }
+        }
+
+        if !include_descendants {
+            continue;
+        }
+
+        for target in prepared_launch_existing_targets(path)? {
+            if target == *path {
+                continue;
+            }
             let track_dir_guard = acl_guards.is_some()
-                && std::fs::symlink_metadata(path)
+                && std::fs::symlink_metadata(&target)
                     .map(|metadata| metadata.is_dir())
                     .unwrap_or(false);
-            let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
+            #[cfg(test)]
+            PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| {
+                if slot.borrow().as_ref().is_some_and(|expected| {
+                    canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
+                }) {
+                    let _ = std::fs::remove_file(&target);
+                    *slot.borrow_mut() = None;
+                }
+            });
+            let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
+                &target,
+                CapabilityAclKind::Deny,
+                false,
+            ) {
                 Ok(Some(restore)) => restore,
                 Ok(None) => continue,
                 Err(err) => {
-                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    cleanup_prepared_launch_acl_state(acl_restores);
                     return Err(format!(
-                        "failed to {action} deny ACL on '{}': {err}",
-                        path.display()
+                        "failed to {action} protected descendant deny ACL on '{}': {err}",
+                        target.display()
                     ));
                 }
             };
-            match add_deny_write_ace_with_options(path, sid, deny_inheritance) {
+            match add_deny_write_ace_with_options(&target, sid, inherit_children) {
                 Ok(changed) => {
-                    if let Some(ref mut guards) = acl_guards
-                        && (changed || track_dir_guard)
-                    {
-                        guards.push(CapabilityAclGuard {
-                            path: path.clone(),
-                            sid,
-                            kind: CapabilityAclKind::Deny,
-                        });
-                    }
+                    maybe_record_acl_guard(
+                        acl_guards,
+                        changed,
+                        track_dir_guard,
+                        &target,
+                        sid,
+                        CapabilityAclKind::Deny,
+                    );
                     if changed {
                         acl_restores.push(restore);
                     }
                 }
                 Err(err) => {
-                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    cleanup_prepared_launch_acl_state(acl_restores);
                     return Err(format!(
-                        "failed to {action} deny ACL on '{}': {err}",
-                        path.display()
+                        "failed to {action} protected descendant deny ACL on '{}': {err}",
+                        target.display()
                     ));
-                }
-            }
-
-            if matches!(allow_scope, PreparedLaunchAllowScope::RootsOnly) {
-                continue;
-            }
-
-            for target in prepared_launch_existing_targets(path)? {
-                if target == *path {
-                    continue;
-                }
-                let track_dir_guard = acl_guards.is_some()
-                    && std::fs::symlink_metadata(&target)
-                        .map(|metadata| metadata.is_dir())
-                        .unwrap_or(false);
-                #[cfg(test)]
-                PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| {
-                    if slot.borrow().as_ref().is_some_and(|expected| {
-                        canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
-                    }) {
-                        let _ = std::fs::remove_file(&target);
-                        *slot.borrow_mut() = None;
-                    }
-                });
-                let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
-                    &target,
-                    CapabilityAclKind::Deny,
-                    false,
-                ) {
-                    Ok(Some(restore)) => restore,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        cleanup_prepared_launch_acl_state(&acl_restores);
-                        return Err(format!(
-                            "failed to {action} protected descendant deny ACL on '{}': {err}",
-                            target.display()
-                        ));
-                    }
-                };
-                match add_deny_write_ace_with_options(&target, sid, deny_inheritance) {
-                    Ok(changed) => {
-                        if let Some(ref mut guards) = acl_guards
-                            && (changed || track_dir_guard)
-                        {
-                            guards.push(CapabilityAclGuard {
-                                path: target.clone(),
-                                sid,
-                                kind: CapabilityAclKind::Deny,
-                            });
-                        }
-                        if changed {
-                            acl_restores.push(restore);
-                        }
-                    }
-                    Err(err) => {
-                        cleanup_prepared_launch_acl_state(&acl_restores);
-                        return Err(format!(
-                            "failed to {action} protected descendant deny ACL on '{}': {err}",
-                            target.display()
-                        ));
-                    }
                 }
             }
         }
     }
-
     Ok(())
+}
+
+unsafe fn apply_prepared_workspace_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+    action: &str,
+) -> Result<(), String> {
+    maybe_fail_apply_prepared_launch_acl_state_test()?;
+    let paths = prepared_launch_acl_paths(launch);
+    let denied_roots = canonicalized_paths(&paths.deny);
+    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
+    let mut acl_guards = None;
+    apply_allow_acl_targets(
+        &paths.allow,
+        &denied_roots,
+        sid,
+        action,
+        PreparedLaunchAllowScope::RootsOnly,
+        false,
+        &mut acl_restores,
+        &mut acl_guards,
+    )?;
+    apply_deny_acl_targets(
+        &launch.policy,
+        &paths.deny,
+        sid,
+        action,
+        false,
+        false,
+        &mut acl_restores,
+        &mut acl_guards,
+    )
+}
+
+unsafe fn apply_runtime_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+) -> Result<Vec<CapabilityAclGuard>, String> {
+    maybe_fail_apply_prepared_launch_acl_state_test()?;
+    let paths = prepared_launch_acl_paths(launch);
+    let denied_roots = canonicalized_paths(&paths.deny);
+    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
+    let mut acl_guards = Vec::new();
+    let mut guard_sink = Some(&mut acl_guards);
+    apply_allow_acl_targets(
+        &paths.allow,
+        &denied_roots,
+        sid,
+        "apply launch",
+        PreparedLaunchAllowScope::Recursive,
+        true,
+        &mut acl_restores,
+        &mut guard_sink,
+    )?;
+    apply_deny_acl_targets(
+        &launch.policy,
+        &paths.deny,
+        sid,
+        "apply launch",
+        true,
+        true,
+        &mut acl_restores,
+        &mut guard_sink,
+    )?;
+    Ok(acl_guards)
 }
 
 fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
@@ -1004,33 +1100,8 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         prepared_capability_sid,
     );
     let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
-    apply_prepared_launch_acl_state(
-        &launch,
-        sid,
-        "refresh",
-        PreparedLaunchAllowScope::RootsOnly,
-        false,
-        false,
-        None,
-    )?;
+    apply_prepared_workspace_acl_state(&launch, sid, "refresh")?;
     Ok(launch)
-}
-
-unsafe fn apply_runtime_launch_acl_state(
-    launch: &PreparedSandboxLaunch,
-    sid: *mut c_void,
-) -> Result<Vec<CapabilityAclGuard>, String> {
-    let mut acl_guards = Vec::new();
-    apply_prepared_launch_acl_state(
-        launch,
-        sid,
-        "apply launch",
-        PreparedLaunchAllowScope::Recursive,
-        true,
-        true,
-        Some(&mut acl_guards),
-    )?;
-    Ok(acl_guards)
 }
 
 pub fn prepare_sandbox_launch(
@@ -1053,15 +1124,7 @@ pub fn prepare_sandbox_launch(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let apply_result = apply_prepared_launch_acl_state(
-            &launch,
-            psid_capability,
-            "prepare",
-            PreparedLaunchAllowScope::RootsOnly,
-            false,
-            false,
-            None,
-        );
+        let apply_result = apply_prepared_workspace_acl_state(&launch, psid_capability, "prepare");
         LocalFree(psid_capability as HLOCAL);
         apply_result?;
     }
@@ -1076,15 +1139,7 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let refresh_result = apply_prepared_launch_acl_state(
-            launch,
-            psid_capability,
-            "refresh",
-            PreparedLaunchAllowScope::RootsOnly,
-            false,
-            false,
-            None,
-        );
+        let refresh_result = apply_prepared_workspace_acl_state(launch, psid_capability, "refresh");
         LocalFree(psid_capability as HLOCAL);
         refresh_result
     }
