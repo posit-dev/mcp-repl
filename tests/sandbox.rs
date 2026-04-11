@@ -2,6 +2,8 @@ mod common;
 
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::process::Command;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -114,7 +116,7 @@ fn sandbox_state_workspace_write(network_access: bool) -> String {
     .to_string()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn sandbox_state_workspace_write_with_roots(
     network_access: bool,
     writable_roots: Vec<PathBuf>,
@@ -1318,6 +1320,137 @@ fn cleanup_restricted_file(path: &std::path::Path) {
 }
 
 #[cfg(target_os = "windows")]
+fn unresolved_windows_sid_acl_entries(path: &std::path::Path) -> TestResult<Vec<String>> {
+    let script = format!(
+        r#"
+$path = {}
+if (-not (Test-Path -LiteralPath $path)) {{
+  Write-Error "missing path: $path"
+  exit 1
+}}
+(Get-Acl -LiteralPath $path).Access |
+  ForEach-Object {{ $_.IdentityReference.Value }} |
+  Where-Object {{ $_ -match '^S-1-5-21-\d+-\d+-\d+-\d+$' }} |
+  Sort-Object -Unique
+"#,
+        powershell_literal(&path.to_string_lossy())
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read ACL entries for {}: status={} stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn scrub_unresolved_windows_sid_aces(path: &std::path::Path) -> TestResult<()> {
+    let script = format!(
+        r#"
+$path = {}
+if (-not (Test-Path -LiteralPath $path)) {{
+  Write-Error "missing path: $path"
+  exit 1
+}}
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+"#,
+        powershell_literal(&path.to_string_lossy())
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to scrub ACL entries for {}: status={} stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_canonicalize_or_identity(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_stable_sid_seed_path_buf(path: PathBuf) -> String {
+    let path = path.to_string_lossy();
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        let mut stable = format!(r"\\{rest}");
+        stable.make_ascii_lowercase();
+        return stable;
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        let mut stable = rest.to_string();
+        stable.make_ascii_lowercase();
+        return stable;
+    }
+    let mut stable = path.into_owned();
+    stable.make_ascii_lowercase();
+    stable
+}
+
+#[cfg(target_os = "windows")]
+fn windows_stable_sid_seed_path(path: &std::path::Path) -> String {
+    windows_stable_sid_seed_path_buf(windows_canonicalize_or_identity(path))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
+    let mut hash = 2_166_136_261u32 ^ seed;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_workspace_write_prepared_sid(writable_roots: &[PathBuf]) -> TestResult<String> {
+    let cwd = windows_canonicalize_or_identity(&std::env::current_dir()?);
+    let stable_cwd = windows_stable_sid_seed_path_buf(cwd.clone());
+    let mut canonical_roots = writable_roots
+        .iter()
+        .map(|root| windows_stable_sid_seed_path(&cwd.join(root)))
+        .collect::<Vec<_>>();
+    canonical_roots.sort();
+    canonical_roots.dedup();
+    let policy_seed = serde_json::json!({
+        "mode": "workspace-write",
+        "writable_roots": canonical_roots,
+        "network_access": false,
+        "exclude_tmpdir_env_var": false,
+        "exclude_slash_tmp": false,
+    });
+    let seed = format!(
+        "mcp-repl-windows-sandbox-v2\0{}\0{}",
+        stable_cwd, policy_seed,
+    );
+    let a = windows_stable_sid_word(seed.as_bytes(), 0x243f_6a88);
+    let b = windows_stable_sid_word(seed.as_bytes(), 0x85a3_08d3);
+    let c = windows_stable_sid_word(seed.as_bytes(), 0x1319_8a2e);
+    let d = windows_stable_sid_word(seed.as_bytes(), 0x0370_7344);
+    Ok(format!("S-1-5-21-{a}-{b}-{c}-{d}"))
+}
+
+#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_denials_windows() -> TestResult<()> {
     let Some(home) = windows_home_dir() else {
@@ -1707,6 +1840,199 @@ tryCatch({{
     assert!(
         !restored_text.contains("RESTORED_WRITE_ERROR:"),
         "file moved back out of .git stayed blocked after restart, got: {restored_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() -> TestResult<()> {
+    let writable_root = tempfile::tempdir()?;
+    let shared_dir = writable_root.path().join(format!(
+        "mcp-repl-sandbox-concurrent-dir-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let shared_dir_r = r_string(&shared_dir.to_string_lossy());
+    let shared = shared_dir.join("from-session-b.txt");
+    let shared_r = r_string(&shared.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    let state =
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
+    let mut session_a = spawn_server_with_sandbox_state(state.clone()).await?;
+    let mut session_b = spawn_server_with_sandbox_state(state).await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        return Ok(());
+    }
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        return Ok(());
+    }
+
+    let create_code = format!(
+        r#"
+target_dir <- {shared_dir_r}
+dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+cat("SESSION_A_DIR_OK=", dir.exists(target_dir), "\n", sep = "")
+"#
+    );
+    let create = session_a
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    assert!(
+        create_text.contains("SESSION_A_DIR_OK=TRUE"),
+        "expected first live session to create the shared workspace directory, got: {create_text}"
+    );
+
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  writeLines("from session b", target)
+  cat("SESSION_B_WRITE_OK\n")
+  cat("READ_BACK=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_B_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_b.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&shared);
+    let _ = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$path = {}; if (Test-Path -LiteralPath $path) {{ icacls $path /reset /t /c | Out-Null; Remove-Item -LiteralPath $path -Force -Recurse -ErrorAction SilentlyContinue }}",
+                powershell_literal(&shared_dir.to_string_lossy())
+            ),
+        ])
+        .status();
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        use_text.contains("SESSION_B_WRITE_OK"),
+        "expected older live session to write inside a directory created after it launched, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("READ_BACK=from session b"),
+        "expected second live session to read back its write inside the new directory, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_B_WRITE_ERROR:"),
+        "directories created in one live session should be writable from another same-checkout session, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_file() -> TestResult<()>
+{
+    let writable_root = tempfile::tempdir()?;
+    let artifact = writable_root.path().join(format!(
+        "mcp-repl-sandbox-midrun-acl-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    let expected_stable_sid =
+        windows_workspace_write_prepared_sid(&[writable_root.path().to_path_buf()])?;
+    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
+        false,
+        vec![writable_root.path().to_path_buf()],
+    ))
+    .await?;
+
+    let create_code = format!(
+        r#"
+target <- {artifact_r}
+writeLines("midrun", target)
+cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&artifact);
+        return Ok(());
+    }
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected sandboxed worker to create the mid-run artifact, got: {create_text}"
+    );
+
+    let before_cancel = unresolved_windows_sid_acl_entries(&artifact)?;
+    if !before_cancel.contains(&expected_stable_sid) {
+        eprintln!(
+            "prepared launch SID not active on this public Windows surface; skipping mid-run ACL teardown probe"
+        );
+        cleanup_restricted_file(&artifact);
+        session.cancel().await?;
+        return Ok(());
+    }
+    let session_end = session
+        .write_stdin_raw_with("quit(\"no\")", Some(10.0))
+        .await?;
+    let session_end_text = collect_text(&session_end);
+    assert!(
+        session_end_text.contains("session ended")
+            || session_end_text.contains("ipc disconnected while waiting for request completion"),
+        "expected backend quit to end the worker session, got: {session_end_text}"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after_cancel = unresolved_windows_sid_acl_entries(&artifact)?;
+    cleanup_restricted_file(&artifact);
+    session.cancel().await?;
+
+    assert!(
+        !before_cancel.is_empty(),
+        "expected a live sandbox-created file to carry at least one unresolved capability SID, got: {before_cancel:?}"
+    );
+    assert!(
+        !after_cancel.is_empty(),
+        "expected the artifact to keep sandbox ACL state after restart, got: {after_cancel:?}"
+    );
+    assert_ne!(
+        before_cancel, after_cancel,
+        "expected session shutdown to remove launch-scoped ACEs from files created mid-run; expected stable sid: {expected_stable_sid}; before={before_cancel:?}; after={after_cancel:?}"
+    );
+    assert!(
+        after_cancel.len() < before_cancel.len(),
+        "expected fewer unresolved capability SID ACEs after session shutdown, before={before_cancel:?} after={after_cancel:?}"
+    );
+    assert!(
+        after_cancel.contains(&expected_stable_sid),
+        "expected restarted artifact ACLs to retain the stable prepared SID {expected_stable_sid}, got: {after_cancel:?}"
     );
     Ok(())
 }

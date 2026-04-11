@@ -141,7 +141,7 @@ struct AllowDenyPaths {
     deny: HashSet<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CapabilityAclKind {
     Allow,
     Deny,
@@ -710,6 +710,10 @@ unsafe fn apply_prepared_launch_acl_state(
 
     for path in &paths.allow {
         for target in prepared_launch_allow_targets(path, &denied_roots, allow_scope)? {
+            let track_dir_guard = acl_guards.is_some()
+                && std::fs::symlink_metadata(&target)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false);
             let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                 &target,
                 CapabilityAclKind::Allow,
@@ -727,14 +731,16 @@ unsafe fn apply_prepared_launch_acl_state(
             };
             match add_allow_ace_with_options(&target, sid, target == *path, allow_inheritance) {
                 Ok(changed) => {
+                    if let Some(ref mut guards) = acl_guards
+                        && (changed || track_dir_guard)
+                    {
+                        guards.push(CapabilityAclGuard {
+                            path: target.clone(),
+                            sid,
+                            kind: CapabilityAclKind::Allow,
+                        });
+                    }
                     if changed || !restore.materialized_dirs.is_empty() {
-                        if changed && let Some(ref mut guards) = acl_guards {
-                            guards.push(CapabilityAclGuard {
-                                path: target.clone(),
-                                sid,
-                                kind: CapabilityAclKind::Allow,
-                            });
-                        }
                         acl_restores.push(restore);
                     }
                 }
@@ -751,6 +757,10 @@ unsafe fn apply_prepared_launch_acl_state(
 
     if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
         for path in &paths.deny {
+            let track_dir_guard = acl_guards.is_some()
+                && std::fs::symlink_metadata(path)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false);
             let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
                 Ok(Some(restore)) => restore,
                 Ok(None) => continue,
@@ -763,17 +773,20 @@ unsafe fn apply_prepared_launch_acl_state(
                 }
             };
             match add_deny_write_ace_with_options(path, sid, deny_inheritance) {
-                Ok(true) => {
-                    if let Some(ref mut guards) = acl_guards {
+                Ok(changed) => {
+                    if let Some(ref mut guards) = acl_guards
+                        && (changed || track_dir_guard)
+                    {
                         guards.push(CapabilityAclGuard {
                             path: path.clone(),
                             sid,
                             kind: CapabilityAclKind::Deny,
                         });
                     }
-                    acl_restores.push(restore);
+                    if changed {
+                        acl_restores.push(restore);
+                    }
                 }
-                Ok(false) => {}
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(&acl_restores);
                     return Err(format!(
@@ -791,6 +804,10 @@ unsafe fn apply_prepared_launch_acl_state(
                 if target == *path {
                     continue;
                 }
+                let track_dir_guard = acl_guards.is_some()
+                    && std::fs::symlink_metadata(&target)
+                        .map(|metadata| metadata.is_dir())
+                        .unwrap_or(false);
                 #[cfg(test)]
                 PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| {
                     if slot.borrow().as_ref().is_some_and(|expected| {
@@ -816,17 +833,20 @@ unsafe fn apply_prepared_launch_acl_state(
                     }
                 };
                 match add_deny_write_ace_with_options(&target, sid, deny_inheritance) {
-                    Ok(true) => {
-                        if let Some(ref mut guards) = acl_guards {
+                    Ok(changed) => {
+                        if let Some(ref mut guards) = acl_guards
+                            && (changed || track_dir_guard)
+                        {
                             guards.push(CapabilityAclGuard {
                                 path: target.clone(),
                                 sid,
                                 kind: CapabilityAclKind::Deny,
                             });
                         }
-                        acl_restores.push(restore);
+                        if changed {
+                            acl_restores.push(restore);
+                        }
                     }
-                    Ok(false) => {}
                     Err(err) => {
                         cleanup_prepared_launch_acl_state(&acl_restores);
                         return Err(format!(
@@ -1440,7 +1460,50 @@ unsafe fn cleanup_capability_acl_state(
     capability_sid: *mut c_void,
     null_device_ace_applied: bool,
 ) {
-    for guard in acl_guards {
+    let mut sorted_guards = acl_guards.iter().collect::<Vec<_>>();
+    sorted_guards.sort_by_key(|guard| guard.path.components().count());
+    let mut covered_allow_roots: Vec<PathBuf> = Vec::new();
+    let mut covered_deny_roots: Vec<PathBuf> = Vec::new();
+
+    for guard in sorted_guards {
+        let canonical = canonicalize_or_identity(&guard.path);
+        let covered_roots = match guard.kind {
+            CapabilityAclKind::Allow => &mut covered_allow_roots,
+            CapabilityAclKind::Deny => &mut covered_deny_roots,
+        };
+        if covered_roots.iter().any(|root| canonical.starts_with(root)) {
+            continue;
+        }
+
+        let is_dir = std::fs::symlink_metadata(&guard.path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            if let Ok(mut targets) = prepared_launch_existing_targets(&guard.path) {
+                match guard.kind {
+                    CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+                    CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+                }
+                targets.reverse();
+                for target in targets {
+                    if target == guard.path {
+                        continue;
+                    }
+                    match guard.kind {
+                        CapabilityAclKind::Allow => revoke_ace(&target, guard.sid),
+                        CapabilityAclKind::Deny => revoke_deny_write_ace(&target, guard.sid),
+                    }
+                }
+            } else {
+                match guard.kind {
+                    CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+                    CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+                }
+            }
+            covered_roots.push(canonical);
+            continue;
+        }
+
         match guard.kind {
             CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
             CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
@@ -4627,6 +4690,139 @@ mod tests {
                     session_temp_dir.as_path(),
                 ],
             );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_additional_writable_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = session_temp_dir.join("artifact.txt");
+        let moved_file = extra_root.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra root");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let filesystem_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("filesystem capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            std::fs::write(&source_file, b"artifact").expect("temp artifact file");
+            add_allow_ace(&source_file, launch_sid).expect("launch-scoped allow ACE");
+            std::fs::rename(&source_file, &moved_file)
+                .expect("move artifact into additional writable root");
+            assert!(
+                !path_has_allow_ace(&moved_file, filesystem_sid),
+                "test setup should not leave the stable filesystem ACE after the move into the additional writable root"
+            );
+
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
+
+            assert!(
+                path_has_allow_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should restore access on files already under additional writable roots"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            revoke_ace(&moved_file, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(filesystem_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_launch_sid_from_midrun_file_under_root_guard() {
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let artifact = writable_root.join("artifact.txt");
+        std::fs::create_dir_all(&writable_root).expect("writable root");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            add_allow_ace_with_options(&artifact, launch_sid, false, false)
+                .expect("launch file allow ACE");
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the launch SID on the mid-run artifact"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove launch SID access from descendants covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_inherited_launch_sid_from_midrun_file() {
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let artifact = writable_root.join("artifact.txt");
+        std::fs::create_dir_all(&writable_root).expect("writable root");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            std::fs::write(&artifact, b"artifact").expect("artifact file");
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the inherited launch SID on the mid-run artifact"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove inherited launch SID access from descendants covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
         }
     }
 
