@@ -1,6 +1,8 @@
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+#[cfg(windows)]
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -14,25 +16,72 @@ use crate::worker_protocol::WORKER_MODE_ARG;
 struct WorkerState {
     busy: AtomicBool,
     shutting_down: AtomicBool,
+    #[cfg(windows)]
+    stdin_read_in_progress: AtomicBool,
+    #[cfg(windows)]
+    stdin_wait: Mutex<()>,
+    #[cfg(windows)]
+    stdin_wait_cvar: Condvar,
 }
 
 impl WorkerState {
     fn try_mark_busy(&self) -> bool {
+        #[cfg(windows)]
+        {
+            let mut guard = self.stdin_wait.lock().unwrap();
+            while self.stdin_read_in_progress.load(Ordering::SeqCst) && !self.is_shutting_down() {
+                guard = self.stdin_wait_cvar.wait(guard).unwrap();
+            }
+            if self.is_shutting_down() {
+                return false;
+            }
+        }
         self.busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
     fn mark_idle(&self) {
+        #[cfg(windows)]
+        let _guard = self.stdin_wait.lock().unwrap();
         self.busy.store(false, Ordering::SeqCst);
+        #[cfg(windows)]
+        self.stdin_wait_cvar.notify_all();
     }
 
     fn begin_shutdown(&self) {
+        #[cfg(windows)]
+        let _guard = self.stdin_wait.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        self.stdin_wait_cvar.notify_all();
     }
 
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    #[cfg(windows)]
+    fn wait_until_stdin_read_allowed(&self) -> bool {
+        let mut guard = self.stdin_wait.lock().unwrap();
+        while (self.busy.load(Ordering::SeqCst)
+            || self.stdin_read_in_progress.load(Ordering::SeqCst))
+            && !self.is_shutting_down()
+        {
+            guard = self.stdin_wait_cvar.wait(guard).unwrap();
+        }
+        if self.is_shutting_down() {
+            return false;
+        }
+        self.stdin_read_in_progress.store(true, Ordering::SeqCst);
+        true
+    }
+
+    #[cfg(windows)]
+    fn finish_stdin_read(&self) {
+        let _guard = self.stdin_wait.lock().unwrap();
+        self.stdin_read_in_progress.store(false, Ordering::SeqCst);
+        self.stdin_wait_cvar.notify_all();
     }
 }
 
@@ -41,6 +90,12 @@ impl Default for WorkerState {
         Self {
             busy: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            #[cfg(windows)]
+            stdin_read_in_progress: AtomicBool::new(false),
+            #[cfg(windows)]
+            stdin_wait: Mutex::new(()),
+            #[cfg(windows)]
+            stdin_wait_cvar: Condvar::new(),
         }
     }
 }
@@ -141,8 +196,19 @@ fn stdin_loop(
     let mut reader = std::io::BufReader::new(stdin);
     let mut line = String::new();
     loop {
+        #[cfg(windows)]
+        {
+            // Embedded CPython can hang if another thread stays blocked on fd 0 while a request
+            // is active.
+            if !state.wait_until_stdin_read_allowed() {
+                break;
+            }
+        }
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader.read_line(&mut line);
+        #[cfg(windows)]
+        state.finish_stdin_read();
+        let bytes = bytes?;
         if bytes == 0 {
             state.begin_shutdown();
             if !crate::r_session::request_shutdown() {

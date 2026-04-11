@@ -2519,10 +2519,7 @@ mod tests {
 
         let parsed = windows_sandbox_parse_args_from(args).expect("windows sandbox args");
 
-        assert_eq!(
-            parsed.prepared_capability_sid.as_str(),
-            "S-1-5-21-1-2-3-4"
-        );
+        assert_eq!(parsed.prepared_capability_sid.as_str(), "S-1-5-21-1-2-3-4");
         assert_eq!(parsed.command, vec!["worker".to_string()]);
     }
 
