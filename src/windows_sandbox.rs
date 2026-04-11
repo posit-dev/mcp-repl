@@ -1,11 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(test)]
-use std::cell::RefCell;
+#[path = "windows_sandbox_test_support.rs"]
+mod test_support;
 use std::collections::HashMap;
 use std::collections::HashSet;
-#[cfg(test)]
-use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs::File;
@@ -20,8 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -120,6 +117,19 @@ use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+#[cfg(test)]
+use test_support::{
+    clear_prepared_launch_allow_targets_read_dir_calls, set_add_deny_write_ace_test_error,
+    set_prepared_launch_allow_targets_read_dir_test_error,
+    set_prepared_launch_deny_target_pre_apply_delete,
+    take_prepared_launch_allow_targets_read_dir_calls,
+};
+#[cfg(test)]
+pub(crate) use test_support::{
+    prepare_sandbox_launch_test_mutex, set_apply_prepared_launch_acl_state_test_error,
+    set_prepare_sandbox_launch_test_error,
+};
 
 const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
 const LUA_TOKEN: u32 = 0x04;
@@ -248,16 +258,6 @@ struct WrapperWriteGuard<'a> {
     write_in_progress: &'a AtomicBool,
 }
 
-#[cfg(test)]
-pub(crate) struct SandboxLaunchTestMutex {
-    inner: Mutex<()>,
-}
-
-#[cfg(test)]
-pub(crate) struct SandboxLaunchTestMutexGuard<'a> {
-    _guard: std::sync::MutexGuard<'a, ()>,
-}
-
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
@@ -271,101 +271,6 @@ impl Drop for PreparedLaunchAclLock {
             let _ = CloseHandle(self.handle);
         }
     }
-}
-
-#[cfg(test)]
-fn clear_windows_sandbox_test_state() {
-    PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
-    APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
-    ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| slot.borrow_mut().clear());
-    PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = None);
-}
-
-#[cfg(test)]
-impl SandboxLaunchTestMutex {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(()),
-        }
-    }
-
-    pub(crate) fn lock(&self) -> Result<SandboxLaunchTestMutexGuard<'_>, Infallible> {
-        let guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                self.inner.clear_poison();
-                poisoned.into_inner()
-            }
-        };
-        clear_windows_sandbox_test_state();
-        Ok(SandboxLaunchTestMutexGuard { _guard: guard })
-    }
-}
-
-#[cfg(test)]
-impl Drop for SandboxLaunchTestMutexGuard<'_> {
-    fn drop(&mut self) {
-        clear_windows_sandbox_test_state();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn prepare_sandbox_launch_test_mutex() -> &'static SandboxLaunchTestMutex {
-    static TEST_MUTEX: OnceLock<SandboxLaunchTestMutex> = OnceLock::new();
-    TEST_MUTEX.get_or_init(SandboxLaunchTestMutex::new)
-}
-
-#[cfg(test)]
-pub(crate) fn set_prepare_sandbox_launch_test_error(error: Option<String>) {
-    PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
-}
-
-#[cfg(test)]
-pub(crate) fn set_apply_prepared_launch_acl_state_test_error(error: Option<String>) {
-    APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
-}
-
-#[cfg(test)]
-pub(crate) fn set_add_deny_write_ace_test_error(error: Option<(usize, String)>) {
-    ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
-}
-
-#[cfg(test)]
-pub(crate) fn set_prepared_launch_allow_targets_read_dir_test_error(
-    error: Option<(PathBuf, String)>,
-) {
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
-}
-
-#[cfg(test)]
-pub(crate) fn clear_prepared_launch_allow_targets_read_dir_calls() {
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| slot.borrow_mut().clear());
-}
-
-#[cfg(test)]
-pub(crate) fn take_prepared_launch_allow_targets_read_dir_calls() -> Vec<PathBuf> {
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS
-        .with(|slot| std::mem::take(&mut *slot.borrow_mut()))
-}
-
-#[cfg(test)]
-pub(crate) fn set_prepared_launch_deny_target_pre_apply_delete(target: Option<PathBuf>) {
-    PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
-}
-
-#[cfg(test)]
-thread_local! {
-    static PREPARE_SANDBOX_LAUNCH_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
-    static APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
-    static ADD_DENY_WRITE_ACE_TEST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
-    static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR: RefCell<Option<(PathBuf, String)>> =
-        const { RefCell::new(None) };
-    static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS: RefCell<Vec<PathBuf>> =
-        const { RefCell::new(Vec::new()) };
-    static PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
-        const { RefCell::new(None) };
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -690,9 +595,7 @@ fn prepared_launch_acl_paths(launch: &PreparedSandboxLaunch) -> AllowDenyPaths {
 fn maybe_fail_apply_prepared_launch_acl_state_test() -> Result<(), String> {
     #[cfg(test)]
     {
-        if let Some(error) =
-            APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| slot.borrow().clone())
-        {
+        if let Some(error) = test_support::apply_prepared_launch_acl_state_test_error() {
             return Err(error);
         }
     }
@@ -842,14 +745,9 @@ unsafe fn apply_deny_acl_targets(
                     .map(|metadata| metadata.is_dir())
                     .unwrap_or(false);
             #[cfg(test)]
-            PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| {
-                if slot.borrow().as_ref().is_some_and(|expected| {
-                    canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
-                }) {
-                    let _ = std::fs::remove_file(&target);
-                    *slot.borrow_mut() = None;
-                }
-            });
+            if test_support::should_delete_prepared_launch_deny_target_before_apply(&target) {
+                let _ = std::fs::remove_file(&target);
+            }
             let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                 &target,
                 CapabilityAclKind::Deny,
@@ -973,15 +871,10 @@ fn path_is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 
 fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
     #[cfg(test)]
-    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| {
-        slot.borrow_mut().push(canonicalize_or_identity(path));
-    });
+    test_support::record_prepared_launch_allow_targets_read_dir_call(path);
 
     #[cfg(test)]
-    if let Some((expected_path, error)) =
-        PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| slot.borrow().clone())
-        && canonicalize_or_identity(path) == canonicalize_or_identity(&expected_path)
-    {
+    if let Some(error) = test_support::prepared_launch_allow_targets_read_dir_test_error(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             error,
@@ -1110,7 +1003,7 @@ pub fn prepare_sandbox_launch(
     session_temp_dir: &Path,
 ) -> Result<PreparedSandboxLaunch, String> {
     #[cfg(test)]
-    if let Some(error) = PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| slot.borrow().clone()) {
+    if let Some(error) = test_support::prepare_sandbox_launch_test_error() {
         return Err(error);
     }
 
@@ -2186,21 +2079,8 @@ unsafe fn add_deny_write_ace_with_options(
     inherit_children: bool,
 ) -> Result<bool, String> {
     #[cfg(test)]
-    {
-        let injected_error =
-            ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| match slot.borrow_mut().as_mut() {
-                Some((remaining_successes, error)) if *remaining_successes == 0 => {
-                    Some(Err(error.clone()))
-                }
-                Some((remaining_successes, _)) => {
-                    *remaining_successes -= 1;
-                    Some(Ok(()))
-                }
-                None => None,
-            });
-        if let Some(Err(error)) = injected_error {
-            return Err(error);
-        }
+    if let Some(Err(error)) = test_support::next_add_deny_write_ace_test_result() {
+        return Err(error);
     }
 
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();

@@ -38,7 +38,6 @@
 ## Open Questions
 
 - Whether the parent-side cache should eventually own cleanup/revocation, or whether long-lived stable ACEs are acceptable for this model.
-- How much of the current Windows test fault-injection harness should move out of `src/windows_sandbox.rs` once the launch path is simplified.
 
 ## Next Safe Slice
 
@@ -70,3 +69,4 @@
 - 2026-04-10: A same-SID allow ACE on a writable directory is only complete if it still inherits to children. Refresh must upgrade non-inheriting directory ACEs instead of treating them as cache hits.
 - 2026-04-10: Drop the embedded-worker stdin gating experiment from this branch. It broadens the change outside Windows sandbox setup/refresh and should come back only as a dedicated follow-up if still needed.
 - 2026-04-10: This branch stays Windows-only. Any friendlier cross-cutting launcher surface such as a `sandbox-exec` subcommand should be handled as a separate futurework item rather than folded into the Windows ACL refactor.
+- 2026-04-10: Keep the Windows fault-injection harness in a dedicated `src/windows_sandbox_test_support.rs` module so runtime ACL code and test-only state do not keep expanding the same file.
