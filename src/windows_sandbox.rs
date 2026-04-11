@@ -315,11 +315,6 @@ pub(crate) fn take_prepared_launch_allow_targets_read_dir_calls() -> Vec<PathBuf
 }
 
 #[cfg(test)]
-pub(crate) fn set_prepared_launch_allow_target_pre_apply_delete(target: Option<PathBuf>) {
-    PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
-}
-
-#[cfg(test)]
 pub(crate) fn set_prepared_launch_deny_target_pre_apply_delete(target: Option<PathBuf>) {
     PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
 }
@@ -333,8 +328,6 @@ thread_local! {
         const { RefCell::new(None) };
     static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS: RefCell<Vec<PathBuf>> =
         const { RefCell::new(Vec::new()) };
-    static PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
-        const { RefCell::new(None) };
     static PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
         const { RefCell::new(None) };
 }
@@ -700,6 +693,9 @@ unsafe fn apply_prepared_launch_acl_state(
     sid: *mut c_void,
     action: &str,
     allow_scope: PreparedLaunchAllowScope,
+    allow_inheritance: bool,
+    deny_inheritance: bool,
+    mut acl_guards: Option<&mut Vec<CapabilityAclGuard>>,
 ) -> Result<(), String> {
     #[cfg(test)]
     if let Some(error) =
@@ -714,15 +710,6 @@ unsafe fn apply_prepared_launch_acl_state(
 
     for path in &paths.allow {
         for target in prepared_launch_allow_targets(path, &denied_roots, allow_scope)? {
-            #[cfg(test)]
-            PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| {
-                if slot.borrow().as_ref().is_some_and(|expected| {
-                    canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
-                }) {
-                    let _ = std::fs::remove_file(&target);
-                    *slot.borrow_mut() = None;
-                }
-            });
             let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                 &target,
                 CapabilityAclKind::Allow,
@@ -738,9 +725,16 @@ unsafe fn apply_prepared_launch_acl_state(
                     ));
                 }
             };
-            match add_allow_ace_with_missing_policy(&target, sid, target == *path) {
+            match add_allow_ace_with_options(&target, sid, target == *path, allow_inheritance) {
                 Ok(changed) => {
                     if changed || !restore.materialized_dirs.is_empty() {
+                        if changed && let Some(ref mut guards) = acl_guards {
+                            guards.push(CapabilityAclGuard {
+                                path: target.clone(),
+                                sid,
+                                kind: CapabilityAclKind::Allow,
+                            });
+                        }
                         acl_restores.push(restore);
                     }
                 }
@@ -768,8 +762,17 @@ unsafe fn apply_prepared_launch_acl_state(
                     ));
                 }
             };
-            match add_deny_write_ace(path, sid) {
-                Ok(true) => acl_restores.push(restore),
+            match add_deny_write_ace_with_options(path, sid, deny_inheritance) {
+                Ok(true) => {
+                    if let Some(ref mut guards) = acl_guards {
+                        guards.push(CapabilityAclGuard {
+                            path: path.clone(),
+                            sid,
+                            kind: CapabilityAclKind::Deny,
+                        });
+                    }
+                    acl_restores.push(restore);
+                }
                 Ok(false) => {}
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(&acl_restores);
@@ -778,6 +781,10 @@ unsafe fn apply_prepared_launch_acl_state(
                         path.display()
                     ));
                 }
+            }
+
+            if matches!(allow_scope, PreparedLaunchAllowScope::RootsOnly) {
+                continue;
             }
 
             for target in prepared_launch_existing_targets(path)? {
@@ -808,8 +815,17 @@ unsafe fn apply_prepared_launch_acl_state(
                         ));
                     }
                 };
-                match add_deny_write_ace(&target, sid) {
-                    Ok(true) => acl_restores.push(restore),
+                match add_deny_write_ace_with_options(&target, sid, deny_inheritance) {
+                    Ok(true) => {
+                        if let Some(ref mut guards) = acl_guards {
+                            guards.push(CapabilityAclGuard {
+                                path: target.clone(),
+                                sid,
+                                kind: CapabilityAclKind::Deny,
+                            });
+                        }
+                        acl_restores.push(restore);
+                    }
                     Ok(false) => {}
                     Err(err) => {
                         cleanup_prepared_launch_acl_state(&acl_restores);
@@ -969,8 +985,33 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         prepared_capability_sid,
     );
     let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
-    apply_prepared_launch_acl_state(&launch, sid, "refresh", PreparedLaunchAllowScope::RootsOnly)?;
+    apply_prepared_launch_acl_state(
+        &launch,
+        sid,
+        "refresh",
+        PreparedLaunchAllowScope::RootsOnly,
+        false,
+        false,
+        None,
+    )?;
     Ok(launch)
+}
+
+unsafe fn apply_runtime_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+) -> Result<Vec<CapabilityAclGuard>, String> {
+    let mut acl_guards = Vec::new();
+    apply_prepared_launch_acl_state(
+        launch,
+        sid,
+        "apply launch",
+        PreparedLaunchAllowScope::Recursive,
+        true,
+        true,
+        Some(&mut acl_guards),
+    )?;
+    Ok(acl_guards)
 }
 
 pub fn prepare_sandbox_launch(
@@ -997,7 +1038,10 @@ pub fn prepare_sandbox_launch(
             &launch,
             psid_capability,
             "prepare",
-            PreparedLaunchAllowScope::Recursive,
+            PreparedLaunchAllowScope::RootsOnly,
+            false,
+            false,
+            None,
         );
         LocalFree(psid_capability as HLOCAL);
         apply_result?;
@@ -1017,7 +1061,10 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
             launch,
             psid_capability,
             "refresh",
-            PreparedLaunchAllowScope::Recursive,
+            PreparedLaunchAllowScope::RootsOnly,
+            false,
+            false,
+            None,
         );
         LocalFree(psid_capability as HLOCAL);
         refresh_result
@@ -1129,15 +1176,33 @@ fn run_sandboxed_command_with_env_map(
                 prepared_capability_sid,
                 psid_capability,
             );
-            if let Err(err) = refresh_result {
-                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                CloseHandle(restricted_token);
-                if launch_sid_is_distinct {
-                    LocalFree(psid_launch as HLOCAL);
+            let prepared_launch = match refresh_result {
+                Ok(launch) => launch,
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
                 }
-                LocalFree(psid_capability as HLOCAL);
-                return Err(err);
+            };
+
+            let launch_acl_result = apply_runtime_launch_acl_state(&prepared_launch, psid_launch);
+            match launch_acl_result {
+                Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
+                }
             }
+
             if let Some(session_temp_dir) = session_temp_dir.as_deref() {
                 match add_allow_ace(session_temp_dir, psid_launch) {
                     Ok(true) => acl_guards.push(CapabilityAclGuard {
@@ -1903,6 +1968,15 @@ unsafe fn add_allow_ace_with_missing_policy(
     sid: *mut c_void,
     materialize_missing_directory: bool,
 ) -> Result<bool, String> {
+    add_allow_ace_with_options(path, sid, materialize_missing_directory, true)
+}
+
+unsafe fn add_allow_ace_with_options(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+    inherit_children: bool,
+) -> Result<bool, String> {
     if !path.exists() {
         if !materialize_missing_directory {
             return Ok(false);
@@ -1926,11 +2000,23 @@ unsafe fn add_allow_ace_with_missing_policy(
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
-    if dacl_has_allow_for_sid(dacl, sid, path.is_dir()) {
+    if dacl_has_allow_for_sid_with_inheritance(dacl, sid, inherit_children && path.is_dir()) {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
         return Ok(false);
+    }
+    if !inherit_children && path.is_dir() && dacl_has_allow_for_sid(dacl, sid, false) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        revoke_ace_with_result(path, sid)?;
+        return add_allow_ace_with_options(
+            path,
+            sid,
+            materialize_missing_directory,
+            inherit_children,
+        );
     }
 
     let trustee = TRUSTEE_W {
@@ -1943,7 +2029,11 @@ unsafe fn add_allow_ace_with_missing_policy(
     let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
     explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
     explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.grfInheritance = if inherit_children {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
     explicit.Trustee = trustee;
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -1977,6 +2067,14 @@ unsafe fn add_allow_ace_with_missing_policy(
 }
 
 unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    add_deny_write_ace_with_options(path, sid, true)
+}
+
+unsafe fn add_deny_write_ace_with_options(
+    path: &Path,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> Result<bool, String> {
     #[cfg(test)]
     {
         let injected_error =
@@ -2010,11 +2108,18 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
-    if dacl_has_write_deny_for_sid(dacl, sid) {
+    if dacl_has_write_deny_for_sid_with_inheritance(dacl, sid, inherit_children) {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
         return Ok(false);
+    }
+    if !inherit_children && path.is_dir() && dacl_has_write_deny_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        revoke_deny_write_ace(path, sid);
+        return add_deny_write_ace_with_options(path, sid, inherit_children);
     }
 
     let trustee = TRUSTEE_W {
@@ -2033,7 +2138,11 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
         | DELETE
         | FILE_DELETE_CHILD;
     explicit.grfAccessMode = DENY_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.grfInheritance = if inherit_children {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
     explicit.Trustee = trustee;
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -2110,6 +2219,11 @@ fn allow_ace_satisfies_requirements(mask: u32, ace_flags: u8, require_inheritanc
     true
 }
 
+fn ace_has_container_and_object_inheritance(ace_flags: u8) -> bool {
+    (ace_flags & (CONTAINER_INHERIT_ACE as u8)) != 0
+        && (ace_flags & (OBJECT_INHERIT_ACE as u8)) != 0
+}
+
 unsafe fn dacl_has_allow_for_sid(
     dacl: *mut ACL,
     sid: *mut c_void,
@@ -2137,6 +2251,36 @@ unsafe fn dacl_has_allow_for_sid(
     false
 }
 
+unsafe fn dacl_has_allow_for_sid_with_inheritance(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) == 0
+            || !allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, false)
+        {
+            continue;
+        }
+        if ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children {
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
     let Some(info) = dacl_size_info(dacl) else {
         return false;
@@ -2157,6 +2301,34 @@ unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool 
         }
     }
     (denied_mask & deny_write_mask()) == deny_write_mask()
+}
+
+unsafe fn dacl_has_write_deny_for_sid_with_inheritance(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let denied = &*(ace as *const ACCESS_DENIED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && (denied.Mask & deny_write_mask()) == deny_write_mask()
+            && ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children
+        {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
@@ -4178,8 +4350,12 @@ mod tests {
             let sid = convert_string_sid_to_sid(prepared.capability_sid())
                 .expect("capability SID should convert");
             assert!(
-                path_has_allow_ace(&extra_root, sid),
+                path_has_any_allow_ace(&extra_root, sid),
                 "refresh should restore allow ACEs on recreated writable roots"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&extra_root, sid),
+                "stable refresh should restore writable roots with a non-inheriting allow ACE"
             );
             LocalFree(sid as HLOCAL);
             revoke_capability_sid_paths(
@@ -4216,8 +4392,12 @@ mod tests {
                 "prepare should create missing writable roots"
             );
             assert!(
-                path_has_allow_ace(&missing_root, sid),
+                path_has_any_allow_ace(&missing_root, sid),
                 "prepare should apply allow ACEs to writable roots declared before they exist"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&missing_root, sid),
+                "prepared writable roots should keep the stable allow ACE on the root only"
             );
             LocalFree(sid as HLOCAL);
             revoke_capability_sid_paths(
@@ -4267,7 +4447,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_refresh_applies_deny_acl_to_existing_file_under_protected_dir() {
+    fn prepared_launch_runtime_applies_deny_acl_to_existing_file_under_protected_dir() {
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4288,22 +4468,27 @@ mod tests {
         std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
 
         unsafe {
-            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
                 .expect("capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
             assert!(
-                path_has_allow_ace(&moved_file, sid),
-                "test setup should preserve the stable allow ACE on a file moved under .git"
+                !path_has_allow_ace(&moved_file, stable_sid),
+                "test setup should not leave the stable allow ACE on a file moved under .git"
             );
 
-            refresh_prepared_sandbox_launch_acl_state(&prepared)
-                .expect("refresh prepared launch ACL state");
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
 
             assert!(
-                path_has_write_deny_ace(&moved_file, sid),
-                "refresh should apply deny ACEs to existing protected descendants"
+                path_has_write_deny_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should apply deny ACEs to existing protected descendants"
             );
 
-            LocalFree(sid as HLOCAL);
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
             revoke_capability_sid_paths(
                 prepared.capability_sid(),
                 &[
@@ -4391,7 +4576,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_refresh_reapplies_allow_acl_to_existing_file_under_writable_root() {
+    fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_writable_root() {
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4418,17 +4603,18 @@ mod tests {
             std::fs::rename(&source_file, &moved_file).expect("move artifact into writable root");
             assert!(
                 !path_has_allow_ace(&moved_file, filesystem_sid),
-                "test setup should keep the temp-file ACL after the move into the writable root"
+                "test setup should not leave the stable filesystem ACE after the move into the writable root"
             );
 
-            refresh_prepared_sandbox_launch_acl_state(&prepared)
-                .expect("refresh prepared launch ACL state");
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
 
             assert!(
-                path_has_allow_ace(&moved_file, filesystem_sid),
-                "refresh should restore the stable filesystem ACE on files already under writable roots"
+                path_has_allow_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should restore access on files already under writable roots"
             );
 
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
             revoke_ace(&moved_file, launch_sid);
             LocalFree(launch_sid as HLOCAL);
             LocalFree(filesystem_sid as HLOCAL);
@@ -4464,7 +4650,7 @@ mod tests {
         let prepared =
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
 
-        set_prepared_launch_allow_target_pre_apply_delete(Some(artifact.clone()));
+        std::fs::remove_file(&artifact).expect("remove artifact before refresh");
         refresh_prepared_sandbox_launch_acl_state(&prepared)
             .expect("refresh prepared launch ACL state");
 
@@ -4510,20 +4696,27 @@ mod tests {
         let prepared =
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
 
-        set_prepared_launch_deny_target_pre_apply_delete(Some(artifact.clone()));
-        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
-        set_prepared_launch_deny_target_pre_apply_delete(None);
-
-        assert!(
-            result.is_ok(),
-            "refresh should ignore protected descendants that vanish before ACL snapshot: {result:?}"
-        );
-        assert!(
-            !artifact.exists(),
-            "test setup should delete the transient protected descendant before ACL snapshot"
-        );
-
         unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            set_prepared_launch_deny_target_pre_apply_delete(Some(artifact.clone()));
+            let result = apply_runtime_launch_acl_state(&prepared, launch_sid);
+            set_prepared_launch_deny_target_pre_apply_delete(None);
+
+            assert!(
+                result.is_ok(),
+                "runtime ACL application should ignore protected descendants that vanish before ACL snapshot"
+            );
+            assert!(
+                !artifact.exists(),
+                "test setup should delete the transient protected descendant before ACL snapshot"
+            );
+
+            if let Ok(launch_guards) = result {
+                cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            }
+            LocalFree(launch_sid as HLOCAL);
             revoke_capability_sid_paths(
                 prepared.capability_sid(),
                 &[
@@ -4702,11 +4895,14 @@ mod tests {
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
 
         unsafe {
-            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
                 .expect("capability SID should convert");
-            revoke_ace(&extra_root, sid);
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            revoke_ace(&extra_root, stable_sid);
             assert!(
-                !path_has_allow_ace(&extra_root, sid),
+                !path_has_any_allow_ace(&extra_root, stable_sid),
                 "test setup should remove the stable allow ACE from the writable root"
             );
 
@@ -4715,20 +4911,24 @@ mod tests {
                 "injected unreadable descendant".to_string(),
             )));
 
-            let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+            let result = apply_runtime_launch_acl_state(&prepared, launch_sid);
 
             set_prepared_launch_allow_targets_read_dir_test_error(None);
 
             assert!(
                 result.is_ok(),
-                "refresh should skip unreadable descendants instead of aborting: {result:?}"
+                "runtime ACL application should skip unreadable descendants instead of aborting"
             );
             assert!(
-                path_has_allow_ace(&extra_root, sid),
-                "refresh should still apply allow ACEs to the writable root when a descendant cannot be enumerated"
+                path_has_allow_ace(&extra_root, launch_sid),
+                "runtime ACL application should still apply allow ACEs to the writable root when a descendant cannot be enumerated"
             );
 
-            LocalFree(sid as HLOCAL);
+            if let Ok(launch_guards) = result {
+                cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            }
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
             revoke_capability_sid_paths(
                 prepared.capability_sid(),
                 &[
