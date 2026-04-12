@@ -43,7 +43,7 @@ use windows_sys::Win32::Foundation::WAIT_ABANDONED;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, LocalFree,
 };
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
@@ -768,6 +768,11 @@ fn maybe_record_acl_guard(
     }
 }
 
+fn should_skip_protected_descendant_deny_acl_error(err: &str) -> bool {
+    err.contains(&format!("failed: {ERROR_ACCESS_DENIED}"))
+        || err.to_ascii_lowercase().contains("access is denied")
+}
+
 unsafe fn apply_allow_acl_targets(
     allow_paths: &HashSet<PathBuf>,
     denied_roots: &[PathBuf],
@@ -917,6 +922,7 @@ unsafe fn apply_deny_acl_targets(
             ) {
                 Ok(Some(restore)) => restore,
                 Ok(None) => continue,
+                Err(err) if should_skip_protected_descendant_deny_acl_error(&err) => continue,
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(apply.acl_restores);
                     return Err(format!(
@@ -939,6 +945,7 @@ unsafe fn apply_deny_acl_targets(
                         apply.acl_restores.push(restore);
                     }
                 }
+                Err(err) if should_skip_protected_descendant_deny_acl_error(&err) => continue,
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(apply.acl_restores);
                     return Err(format!(
@@ -5931,6 +5938,59 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             !missing_root.exists(),
             "failed prepare should remove writable roots it had to materialize before the error"
         );
+    }
+
+    #[test]
+    fn prepared_launch_refresh_skips_access_denied_descendant_under_deny_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let codex_dir = cwd.join(".codex");
+        let protected_descendant = codex_dir.join("rules").join("git.rules");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(protected_descendant.parent().expect("descendant parent"))
+            .expect("create protected descendant parent");
+        std::fs::write(&protected_descendant, "protected").expect("create protected descendant");
+        set_add_deny_write_ace_test_error(Some((1, "SetNamedSecurityInfoW failed: 5".to_string())));
+
+        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            result.is_ok(),
+            "access-denied descendants under protected roots should be skipped instead of aborting refresh: {result:?}"
+        );
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_write_deny_ace(&codex_dir, sid),
+                "refresh should still apply the deny ACE to the protected root when a descendant is skipped"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    codex_dir.as_path(),
+                    protected_descendant.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
     }
 
     #[test]
