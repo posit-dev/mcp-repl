@@ -758,6 +758,8 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
     }
 }
 
+// Allocate the server-owned session temp root. Today SandboxState keeps this
+// path stable across worker respawns and resets it in place before each spawn.
 fn build_session_temp_dir_path() -> PathBuf {
     Builder::new()
         .prefix("mcp-repl-session-")
@@ -776,6 +778,9 @@ fn build_session_temp_dir_path() -> PathBuf {
         })
 }
 
+// Prepare the server-owned session temp dir for a fresh worker launch by
+// clearing any old contents and recreating the directory at the configured
+// path.
 pub(crate) fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::SessionTempDir(format!(
@@ -823,6 +828,8 @@ fn ensure_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
+// Reset the current session temp location in place. This intentionally keeps
+// the configured path stable even though the contents are per-launch.
 fn reset_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if let Err(err) = std::fs::remove_dir_all(path)
         && err.kind() != std::io::ErrorKind::NotFound

@@ -523,6 +523,10 @@ fn prepared_launch_refresh_scopes(
     (scope, scope)
 }
 
+// Windows implementation detail: this stable SID names prepared filesystem ACL
+// state for the current sandbox policy/cwd. It intentionally excludes the
+// session temp dir, because session temp is reset on every worker spawn and
+// receives per-launch ACL handling separately.
 fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
     let stable_cwd = stable_sid_seed_path_buf(canonical_cwd.clone());
@@ -580,6 +584,9 @@ fn make_random_sid_string() -> String {
     format!("S-1-5-21-{a}-{b}-{c}-{d}")
 }
 
+// The prepared filesystem SID is stable across respawns for the same prepared
+// filesystem state, while the launch SID is regenerated per worker process for
+// launch-scoped ACLs such as session-temp access.
 fn resolve_launch_capability_sids(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,

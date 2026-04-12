@@ -2370,6 +2370,11 @@ impl WorkerManager {
         Ok(())
     }
 
+    // Updates the server-side sandbox configuration. The new policy becomes
+    // effective in the worker only after the current process is recycled and a
+    // replacement worker is spawned. Session temp handling is separate: the
+    // server-owned temp dir is reset before each spawn, and today that reset
+    // reuses the same configured path in place.
     pub fn update_sandbox_state(
         &mut self,
         update: SandboxStateUpdate,
@@ -2396,6 +2401,9 @@ impl WorkerManager {
         self.sandbox_state = resolved_state;
         #[cfg(target_os = "windows")]
         if changed {
+            // Prepared Windows launch state is keyed to the effective worker
+            // sandbox configuration. Drop it before respawn so the next worker
+            // picks up the updated sandbox state.
             self.windows_sandbox_launch = None;
         }
         crate::event_log::log(
@@ -2537,6 +2545,9 @@ impl WorkerManager {
     }
 
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
+        // Start each worker with a clean server-owned session temp dir. The
+        // current implementation reuses the same configured path across
+        // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
@@ -2588,6 +2599,9 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
+        // Start each worker with a clean server-owned session temp dir. The
+        // current implementation reuses the same configured path across
+        // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
@@ -2680,6 +2694,9 @@ impl WorkerManager {
             )
         });
         if launch_matches {
+            // Reuse the prepared Windows launch only while the effective worker
+            // sandbox configuration still matches. Session temp ACLs are
+            // refreshed separately on each spawn after the temp dir reset.
             crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
                 self.windows_sandbox_launch
                     .as_ref()
