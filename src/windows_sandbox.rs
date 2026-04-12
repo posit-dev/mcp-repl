@@ -160,7 +160,7 @@ enum CapabilityAclKind {
     Deny,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreparedLaunchAllowScope {
     Recursive,
     RootsOnly,
@@ -509,6 +509,19 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
     let mut sid: *mut c_void = std::ptr::null_mut();
     let ok = ConvertStringSidToSidW(to_wide(value).as_ptr(), &mut sid);
     if ok != 0 { Some(sid) } else { None }
+}
+
+fn prepared_launch_refresh_scopes(
+    policy: &SandboxPolicy,
+    has_other_live_session: bool,
+) -> (PreparedLaunchAllowScope, PreparedLaunchAllowScope) {
+    let _ = policy;
+    let scope = if has_other_live_session {
+        PreparedLaunchAllowScope::Recursive
+    } else {
+        PreparedLaunchAllowScope::RootsAndDirectChildren
+    };
+    (scope, scope)
 }
 
 fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
@@ -987,8 +1000,8 @@ unsafe fn apply_prepared_workspace_acl_state(
         &paths.deny,
         sid,
         action,
-        false,
-        false,
+        true,
+        true,
         &mut apply,
     )
 }
@@ -1363,20 +1376,8 @@ fn run_sandboxed_command_with_env_map(
             let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
             let has_other_live_session =
                 prepared_launch_live_marker_count(prepared_capability_sid) > 0;
-            let has_extra_writable_roots = matches!(
-                policy,
-                SandboxPolicy::WorkspaceWrite { writable_roots, .. } if !writable_roots.is_empty()
-            );
-            let workspace_root_scope = if has_other_live_session && !has_extra_writable_roots {
-                PreparedLaunchAllowScope::Recursive
-            } else {
-                PreparedLaunchAllowScope::RootsAndDirectChildren
-            };
-            let extra_root_scope = if has_other_live_session {
-                PreparedLaunchAllowScope::Recursive
-            } else {
-                PreparedLaunchAllowScope::RootsAndDirectChildren
-            };
+            let (workspace_root_scope, extra_root_scope) =
+                prepared_launch_refresh_scopes(policy, has_other_live_session);
             let refresh_result = refresh_runtime_prepared_launch_acl_state_unlocked(
                 policy,
                 sandbox_policy_cwd,
@@ -5178,6 +5179,62 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_refresh_applies_stable_deny_acl_to_existing_file_under_protected_descendant()
+    {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let nested_dir = cwd.join("src");
+        let source_file = nested_dir.join("artifact.txt");
+        let hooks_dir = cwd.join(".git").join("hooks");
+        let moved_file = hooks_dir.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&nested_dir).expect("workspace nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::write(&source_file, b"artifact").expect("workspace artifact");
+        std::fs::create_dir_all(&hooks_dir).expect("protected descendant dir");
+        std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_write_deny_ace(&moved_file, stable_sid),
+                "test setup should start without a stable deny ACE on the protected descendant"
+            );
+
+            refresh_prepared_sandbox_launch_acl_state(&prepared)
+                .expect("refresh prepared launch ACL state");
+
+            assert!(
+                path_has_write_deny_ace(&moved_file, stable_sid),
+                "prepared refresh should apply stable deny ACEs to existing protected descendants"
+            );
+
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested_dir.as_path(),
+                    hooks_dir.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn add_deny_write_ace_upgrades_partial_deny_acl_for_same_sid() {
         let tmp = tempdir().expect("tempdir");
         let protected_dir = tmp.path().join("protected");
@@ -5912,6 +5969,81 @@ mod tests {
                     cwd.as_path(),
                     nested.as_path(),
                     deeper.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_scans_workspace_descendants_recursively_with_extra_writable_roots_for_live_sessions()
+     {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let nested = cwd.join("nested");
+        let deeper = nested.join("deeper");
+        let extra_root = tmp.path().join("extra-root");
+        let extra_nested = extra_root.join("nested");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&deeper).expect("workspace nested dir");
+        std::fs::create_dir_all(&extra_nested).expect("extra root nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let (workspace_root_scope, extra_root_scope) =
+            prepared_launch_refresh_scopes(&policy, true);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                workspace_root_scope,
+                extra_root_scope,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            matches!(workspace_root_scope, PreparedLaunchAllowScope::Recursive),
+            "same-checkout live sessions should keep the workspace root refresh recursive even when extra writable roots are configured, got: {workspace_root_scope:?}"
+        );
+        assert!(
+            matches!(extra_root_scope, PreparedLaunchAllowScope::Recursive),
+            "same-checkout live sessions should keep extra writable roots recursive, got: {extra_root_scope:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed with extra writable roots, got: {result:?}"
+        );
+        assert!(
+            read_dir_calls.contains(&canonicalize_or_identity(&nested))
+                && read_dir_calls.contains(&canonicalize_or_identity(&deeper)),
+            "runtime refresh should inspect workspace descendants recursively even when extra writable roots are configured, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    deeper.as_path(),
+                    extra_root.as_path(),
+                    extra_nested.as_path(),
                     session_temp_dir.as_path(),
                 ],
             );
