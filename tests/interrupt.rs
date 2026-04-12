@@ -205,6 +205,69 @@ async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input_on_windows()
+-> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let long_sleep = r#"
+tryCatch(
+  {
+    repeat Sys.sleep(0.5)
+  },
+  interrupt = function(e) cat("interrupt received\n")
+)
+"#;
+    let timeout_result = session.write_stdin_raw_with(long_sleep, Some(0.2)).await?;
+    let timeout_text = result_text(&timeout_result);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("\u{3}cat('AFTER_INTERRUPT\\n')", Some(5.0))
+            .await?,
+    );
+    loop {
+        if backend_unavailable(&text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        if !is_busy_response(&text) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            panic!("expected interrupt prefix to recover the worker in time, got: {text:?}");
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        text = result_text(&poll);
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("interrupt received"),
+        "expected interrupt handler output to be preserved, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_INTERRUPT"),
+        "expected remaining input after ctrl-c prefix to run, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
     let mut session = spawn_interrupt_session().await?;

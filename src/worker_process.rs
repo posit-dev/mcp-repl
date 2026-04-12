@@ -53,12 +53,18 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::io::AsRawHandle;
+#[cfg(target_family = "windows")]
+use std::os::windows::process::CommandExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
 #[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+#[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
@@ -292,7 +298,10 @@ impl BackendDriver for RBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        driver_interrupt(process)
+        if let Some(ipc) = process.ipc.get() {
+            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+        }
+        process.send_r_interrupt()
     }
 
     fn refresh_backend_info(
@@ -1998,11 +2007,13 @@ impl WorkerManager {
             }),
         );
         self.ensure_process()?;
-        if let Err(err) = self.driver.interrupt(
-            self.process
-                .as_mut()
-                .expect("worker process should be available"),
-        ) {
+        if self.pending_request
+            && let Err(err) = self.driver.interrupt(
+                self.process
+                    .as_mut()
+                    .expect("worker process should be available"),
+            )
+        {
             self.reset()?;
             crate::event_log::log(
                 "worker_interrupt_error",
@@ -2137,11 +2148,13 @@ impl WorkerManager {
             }),
         );
         self.ensure_process()?;
-        if let Err(err) = self.driver.interrupt(
-            self.process
-                .as_mut()
-                .expect("worker process should be available"),
-        ) {
+        if self.pending_request
+            && let Err(err) = self.driver.interrupt(
+                self.process
+                    .as_mut()
+                    .expect("worker process should be available"),
+            )
+        {
             self.reset()?;
             crate::event_log::log(
                 "worker_interrupt_error",
@@ -4500,6 +4513,7 @@ impl WorkerProcess {
         {
             command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
             command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "unix")]
@@ -4717,6 +4731,27 @@ impl WorkerProcess {
         {
             Ok(())
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        match self.child.try_wait()? {
+            Some(_) => Ok(()),
+            None => Err(WorkerError::Io(std::io::Error::last_os_error())),
+        }
+    }
+
+    #[cfg(not(target_family = "windows"))]
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        self.send_interrupt()
     }
 
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {

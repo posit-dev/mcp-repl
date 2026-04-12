@@ -26,7 +26,7 @@ use libr::{
 #[cfg(target_family = "windows")]
 use libr::{
     R_DefParamsEx, R_SetParams, R_common_command_line, Rboolean_FALSE, Rboolean_TRUE, Rstart,
-    UImode_RTerm, UserBreak, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
+    UImode_RTerm, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
 };
 #[cfg(target_family = "windows")]
 use std::mem::MaybeUninit;
@@ -176,20 +176,10 @@ pub(crate) fn request_interrupt() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
-    let should_interrupt = {
+    {
         let guard = state.inner.lock().unwrap();
         guard.active_request.is_some() || !guard.input_queue.is_empty()
-    };
-    if !should_interrupt {
-        return false;
     }
-
-    #[cfg(target_family = "windows")]
-    unsafe {
-        libr::set(UserBreak, Rboolean_TRUE);
-    }
-
-    true
 }
 
 fn run_session_on_current_thread(
