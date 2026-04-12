@@ -326,7 +326,7 @@ cat("MARKER_EXISTS=", file.exists({marker}), "\n", sep = "")
     }))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::McpTestSession> {
     let args = sandbox_args_from_state(&state)?;
     common::spawn_server_with_args_env_and_pager_page_chars(
@@ -1614,7 +1614,10 @@ async fn sandbox_denials_windows() -> TestResult<()> {
     let forbidden = home.join(format!("mcp-repl-denied-{nanos}.txt"));
     let forbidden_r = r_string(&forbidden.to_string_lossy());
 
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    // This test only needs an arbitrary writable workspace root; using a temp
+    // workspace avoids recursive ACL refreshes over the repo's build output.
+    let (mut session, _workspace, _cwd) =
+        spawn_server_with_sandbox_state_in_temp_cwd(sandbox_state_workspace_write(false)).await?;
     let code = format!(
         r#"
 target <- {forbidden_r}
