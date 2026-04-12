@@ -516,11 +516,8 @@ fn prepared_launch_refresh_scopes(
     has_other_live_session: bool,
 ) -> (PreparedLaunchAllowScope, PreparedLaunchAllowScope) {
     let _ = policy;
-    let scope = if has_other_live_session {
-        PreparedLaunchAllowScope::Recursive
-    } else {
-        PreparedLaunchAllowScope::RootsAndDirectChildren
-    };
+    let _ = has_other_live_session;
+    let scope = PreparedLaunchAllowScope::Recursive;
     (scope, scope)
 }
 
@@ -6048,6 +6045,22 @@ mod tests {
                 ],
             );
         }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_scopes_are_recursive_without_other_live_sessions() {
+        let policy = workspace_policy(Vec::new(), false, false);
+        let (workspace_root_scope, extra_root_scope) =
+            prepared_launch_refresh_scopes(&policy, false);
+
+        assert!(
+            matches!(workspace_root_scope, PreparedLaunchAllowScope::Recursive),
+            "single-session respawns should refresh workspace roots recursively, got: {workspace_root_scope:?}"
+        );
+        assert!(
+            matches!(extra_root_scope, PreparedLaunchAllowScope::Recursive),
+            "single-session respawns should refresh extra writable roots recursively, got: {extra_root_scope:?}"
+        );
     }
 
     #[test]

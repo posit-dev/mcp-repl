@@ -2171,6 +2171,93 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_restart_allows_host_created_file_under_nested_workspace_subdir()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src").join("pkg");
+    let host_created = nested_dir.join(format!(
+        "mcp-repl-sandbox-host-created-nested-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let host_created_r = r_string(&host_created.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready = session
+        .write_stdin_raw_with("cat('SESSION_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_text = collect_text(&ready);
+    if windows_sandbox_backend_unavailable(&ready_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&host_created);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    std::fs::create_dir_all(&nested_dir)?;
+    std::fs::write(&host_created, b"host before restart nested")?;
+
+    let mut restarted =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let current_acl = unresolved_windows_sid_acl_entries(&host_created)?;
+    let follow_up_code = format!(
+        r#"
+target <- {host_created_r}
+tryCatch({{
+  cat("READ_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "sandbox append"), target)
+  cat("WRITE_AFTER_OK\n")
+  cat("WRITE_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("WRITE_AFTER_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let follow_up = restarted
+        .write_stdin_raw_with(follow_up_code, Some(10.0))
+        .await?;
+    let follow_up_text = collect_text(&follow_up);
+
+    cleanup_restricted_file(&host_created);
+    cleanup_restricted_path(&nested_dir);
+    restarted.cancel().await?;
+
+    assert!(
+        current_acl.contains(&expected_stable_sid),
+        "expected restarted nested workspace artifact ACLs to include the stable prepared SID {expected_stable_sid}, got: {current_acl:?}"
+    );
+    assert!(
+        follow_up_text.contains("READ_AFTER=host before restart nested"),
+        "expected restarted worker to read the host-created nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER_OK"),
+        "expected restarted worker to write the host-created nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER=host before restart nested|sandbox append"),
+        "expected restarted worker to read back its write in the nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        !follow_up_text.contains("WRITE_AFTER_ERROR:"),
+        "host-created files under nested workspace subdirectories should stay writable after restart, got: {follow_up_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_nested_midrun_file_keeps_prepared_sid() -> TestResult<()> {
     let workspace = temp_workspace_root()?;
     let repo_root = workspace.path().to_path_buf();
@@ -2223,7 +2310,6 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() -> TestResult<()> {
     let writable_root = tempfile::tempdir()?;
@@ -3274,6 +3360,108 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
     assert!(
         after_file_non_stable.is_empty(),
         "expected session exit to remove launch-scoped SIDs from the nested workspace file, got: {after_cancel_file:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_restart_repairs_stable_acl_for_late_created_nested_workspace_tree()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src").join("pkg");
+    let artifact = nested_dir.join(format!(
+        "mcp-repl-sandbox-nested-restart-acl-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let nested_dir_r = r_string(&nested_dir.to_string_lossy());
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let create_code = format!(
+        r#"
+target_dir <- {nested_dir_r}
+target <- {artifact_r}
+dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines("nested restart", target)
+cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&artifact);
+        cleanup_restricted_path(&nested_dir);
+        return Ok(());
+    }
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected sandboxed worker to create the late-created nested workspace tree before restart, got: {create_text}"
+    );
+
+    let restart_and_follow_up = session
+        .write_stdin_raw_with(
+            format!(
+                "\u{4}target <- {artifact_r}\ntryCatch({{\n  cat(\"READ_AFTER=\", paste(readLines(target, warn = FALSE), collapse = \"|\"), \"\\n\", sep = \"\")\n  writeLines(c(readLines(target, warn = FALSE), \"after restart\"), target)\n  cat(\"WRITE_AFTER_OK\\n\")\n}}, error = function(e) {{\n  message(\"WRITE_AFTER_ERROR:\", conditionMessage(e))\n}})\n"
+            ),
+            Some(10.0),
+        )
+        .await?;
+    let follow_up_text = collect_text(&restart_and_follow_up);
+    assert!(
+        follow_up_text.contains("new session started"),
+        "expected worker restart notice, got: {follow_up_text}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (after_restart_dir, after_restart_file) = loop {
+        let current_dir = unresolved_windows_sid_acl_entries(&nested_dir)?;
+        let current_file = unresolved_windows_sid_acl_entries(&artifact)?;
+        if current_dir.contains(&expected_stable_sid) && current_file.contains(&expected_stable_sid)
+        {
+            break (current_dir, current_file);
+        }
+        if std::time::Instant::now() >= deadline {
+            break (current_dir, current_file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+
+    cleanup_restricted_file(&artifact);
+    cleanup_restricted_path(&nested_dir);
+    session.cancel().await?;
+
+    assert!(
+        after_restart_dir.contains(&expected_stable_sid),
+        "expected restart refresh to repair the late-created nested workspace directory to the stable prepared SID {expected_stable_sid}, got: {after_restart_dir:?}"
+    );
+    assert!(
+        after_restart_file.contains(&expected_stable_sid),
+        "expected restart refresh to repair the late-created nested workspace file to the stable prepared SID {expected_stable_sid}, got: {after_restart_file:?}"
+    );
+    assert!(
+        follow_up_text.contains("READ_AFTER=nested restart"),
+        "expected restarted worker to read the late-created nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER_OK"),
+        "expected restarted worker to write the late-created nested workspace file after repair, got: {follow_up_text}"
+    );
+    assert!(
+        !follow_up_text.contains("WRITE_AFTER_ERROR:"),
+        "late-created nested workspace artifacts should stay writable after restart, got: {follow_up_text}"
     );
     Ok(())
 }
