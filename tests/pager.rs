@@ -328,15 +328,20 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
     assert_snapshot_or_skip("pager_dedup_on_seek", &snapshot)
 }
 
-#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_windows_smoke() -> TestResult<()> {
+async fn pager_smoke() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let result = session
         .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
         .await?;
-    let result = wait_until_not_busy(&mut session, result).await?;
+    let result = common::wait_until_not_busy(
+        &mut session,
+        result,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -353,7 +358,13 @@ async fn pager_windows_smoke() -> TestResult<()> {
     );
 
     let result = session.write_stdin_raw_with(":next", Some(60.0)).await?;
-    let result = wait_until_not_busy(&mut session, result).await?;
+    let result = common::wait_until_not_busy(
+        &mut session,
+        result,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -369,7 +380,13 @@ async fn pager_windows_smoke() -> TestResult<()> {
     );
 
     let result = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
-    let result = wait_until_not_busy(&mut session, result).await?;
+    let result = common::wait_until_not_busy(
+        &mut session,
+        result,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");

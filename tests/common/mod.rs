@@ -447,6 +447,95 @@ fn normalized_test_timeout(timeout: Option<f64>) -> Option<f64> {
     }
 }
 
+pub(crate) fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub(crate) fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
+        || text.contains("worker io error: Broken pipe")
+        || text.contains("unable to initialize the JIT")
+        || text.contains("libR.so: cannot open shared object file")
+        || text.contains("options(\"defaultPackages\") was not found")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+pub(crate) fn is_busy_response(text: &str) -> bool {
+    text.contains("<<repl status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
+}
+
+pub(crate) async fn wait_until_not_busy(
+    session: &mut McpTestSession,
+    initial: rmcp::model::CallToolResult,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<repl status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(poll_interval).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<repl status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
+}
+
+pub(crate) async fn assert_eventually_contains(
+    session: &mut McpTestSession,
+    input: &str,
+    expected: &str,
+    label: &str,
+    attempt_timeout_secs: f64,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> TestResult<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_text = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let result = session
+            .write_stdin_raw_with(input, Some(attempt_timeout_secs))
+            .await?;
+        last_text = result_text(&result);
+        if backend_unavailable(&last_text) {
+            return Ok(false);
+        }
+        if last_text.contains(expected) {
+            return Ok(true);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    eprintln!("{label} did not stabilize: {last_text}");
+    Ok(false)
+}
+
 fn service_error_snapshot(err: &ServiceError) -> SnapshotServiceError {
     match err {
         ServiceError::McpError(error) => SnapshotServiceError::McpError {
