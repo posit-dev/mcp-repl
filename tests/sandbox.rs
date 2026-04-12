@@ -1968,6 +1968,96 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_do_not_share_session_temp_children()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let mut session_a =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let mut session_b =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        return Ok(());
+    }
+
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        return Ok(());
+    }
+
+    let create = session_a
+        .write_stdin_raw_with(
+            r#"
+target <- file.path(tempdir(), "mcp-repl-concurrent-session-temp.txt")
+writeLines("from session a temp", target)
+cat("SESSION_A_TEMPFILE=", target, "\n", sep = "")
+cat("SESSION_A_WRITE_OK=", file.exists(target), "\n", sep = "")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let create_text = collect_text(&create);
+    assert!(
+        create_text.contains("SESSION_A_WRITE_OK=TRUE"),
+        "expected first live session to create its session temp child, got: {create_text}"
+    );
+    let temp_child = PathBuf::from(
+        create_text
+            .lines()
+            .find_map(|line| line.strip_prefix("SESSION_A_TEMPFILE="))
+            .unwrap_or_default()
+            .trim(),
+    );
+    let temp_child_r = r_string(&temp_child.to_string_lossy());
+
+    let use_code = format!(
+        r#"
+target <- {temp_child_r}
+tryCatch({{
+  writeLines("from session b temp", target)
+  cat("SESSION_B_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SESSION_B_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_b.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&temp_child);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        use_text.contains("SESSION_B_ACCESS_ERROR:"),
+        "expected a concurrent same-checkout session to be denied write access to another session's temp child, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_B_WRITE_OK"),
+        "another same-checkout session unexpectedly wrote a per-session temp child, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_restart_unblocks_file_moved_out_of_git_dir() -> TestResult<()> {
     let workspace = temp_workspace_root_with_git_dir()?;
     let repo_root = workspace.path().to_path_buf();
@@ -2417,7 +2507,7 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_workspace_write_concurrent_sessions_share_temp_renamed_workspace_file()
+async fn sandbox_workspace_write_concurrent_sessions_respawn_repairs_temp_renamed_workspace_file()
 -> TestResult<()> {
     let writable_root = tempfile::tempdir()?;
     let workspace = temp_workspace_root()?;
@@ -2483,41 +2573,77 @@ cat("SESSION_B_TARGET_EXISTS=", file.exists(target), "\n", sep = "")
         "expected renamed temp artifact to exist in the workspace, got: {create_text}"
     );
 
-    let use_code = format!(
+    let before_respawn_code = format!(
         r#"
 target <- {shared_r}
 tryCatch({{
-  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
   writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
-  cat("SESSION_A_WRITE_OK\n")
-  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  cat("SESSION_A_WRITE_BEFORE_RESPAWN_OK\n")
 }}, error = function(e) {{
-  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+  message("SESSION_A_WRITE_BEFORE_RESPAWN_ERROR:", conditionMessage(e))
 }})
 "#
     );
-    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
-    let use_text = collect_text(&use_result);
+    let before_respawn = session_a
+        .write_stdin_raw_with(before_respawn_code, Some(10.0))
+        .await?;
+    let before_respawn_text = collect_text(&before_respawn);
+
+    let restart = session_a
+        .write_stdin_raw_with("quit(\"no\")", Some(10.0))
+        .await?;
+    let restart_text = collect_text(&restart);
+
+    let after_respawn_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ_AFTER_RESPAWN=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_AFTER_RESPAWN_OK\n")
+  cat("SESSION_A_AFTER_RESPAWN=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_AFTER_RESPAWN_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let after_respawn = session_a
+        .write_stdin_raw_with(after_respawn_code, Some(10.0))
+        .await?;
+    let after_respawn_text = collect_text(&after_respawn);
 
     cleanup_restricted_file(&shared);
     session_a.cancel().await?;
     session_b.cancel().await?;
 
     assert!(
-        use_text.contains("SESSION_A_READ=from session b temp"),
-        "expected older live session to read the temp-renamed workspace artifact, got: {use_text}"
+        before_respawn_text.contains("SESSION_A_WRITE_BEFORE_RESPAWN_ERROR:"),
+        "expected the already-live worker to need a respawn before writing the temp-renamed workspace artifact, got: {before_respawn_text}"
     );
     assert!(
-        use_text.contains("SESSION_A_WRITE_OK"),
-        "expected older live session to write the temp-renamed workspace artifact, got: {use_text}"
+        !before_respawn_text.contains("SESSION_A_WRITE_BEFORE_RESPAWN_OK"),
+        "expected the already-live worker to stay blocked on the temp-renamed workspace artifact until respawn, got: {before_respawn_text}"
     );
     assert!(
-        use_text.contains("SESSION_A_AFTER=from session b temp|from session a"),
-        "expected older live session to read back its write after the temp rename, got: {use_text}"
+        restart_text.contains("session ended")
+            || restart_text.contains("ipc disconnected while waiting for request completion"),
+        "expected quit(\"no\") to recycle the older live worker before the repair probe, got: {restart_text}"
     );
     assert!(
-        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
-        "temp-renamed workspace artifacts should stay shared across live same-checkout sessions, got: {use_text}"
+        after_respawn_text.contains("SESSION_A_READ_AFTER_RESPAWN=from session b temp"),
+        "expected the respawned worker to read the temp-renamed workspace artifact after refresh, got: {after_respawn_text}"
+    );
+    assert!(
+        after_respawn_text.contains("SESSION_A_WRITE_AFTER_RESPAWN_OK"),
+        "expected the respawned worker to write the temp-renamed workspace artifact after refresh, got: {after_respawn_text}"
+    );
+    assert!(
+        after_respawn_text.contains("SESSION_A_AFTER_RESPAWN=from session b temp|from session a"),
+        "expected the respawned worker to read back its write after refresh repaired the temp rename, got: {after_respawn_text}"
+    );
+    assert!(
+        !after_respawn_text.contains("SESSION_A_ACCESS_AFTER_RESPAWN_ERROR:"),
+        "temp-renamed workspace artifacts should become writable again after the worker respawns and refreshes ACLs, got: {after_respawn_text}"
     );
     Ok(())
 }

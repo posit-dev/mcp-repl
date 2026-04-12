@@ -602,10 +602,7 @@ fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -
     if capability_sids.launch_sid == capability_sids.filesystem_sid {
         vec![capability_sids.filesystem_sid.as_str()]
     } else {
-        vec![
-            capability_sids.filesystem_sid.as_str(),
-            capability_sids.launch_sid.as_str(),
-        ]
+        vec![capability_sids.launch_sid.as_str()]
     }
 }
 
@@ -1051,6 +1048,24 @@ unsafe fn apply_runtime_launch_acl_state_unlocked(
     Ok(acl_guards)
 }
 
+unsafe fn apply_session_temp_launch_acl(
+    session_temp_dir: &Path,
+    sid: *mut c_void,
+) -> Result<Option<CapabilityAclGuard>, String> {
+    match add_allow_ace(session_temp_dir, sid) {
+        Ok(true) => Ok(Some(CapabilityAclGuard {
+            path: session_temp_dir.to_path_buf(),
+            sid,
+            kind: CapabilityAclKind::Allow,
+        })),
+        Ok(false) => Ok(None),
+        Err(err) => Err(format!(
+            "failed to apply session temp dir ACL to '{}': {err}",
+            session_temp_dir.display()
+        )),
+    }
+}
+
 fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut canonicalized = paths
         .iter()
@@ -1433,13 +1448,9 @@ fn run_sandboxed_command_with_env_map(
             }
         };
 
-        match add_inherit_only_allow_ace(&session_temp_dir, psid_capability) {
-            Ok(true) => acl_guards.push(CapabilityAclGuard {
-                path: session_temp_dir.clone(),
-                sid: psid_capability,
-                kind: CapabilityAclKind::Allow,
-            }),
-            Ok(false) => {}
+        match apply_session_temp_launch_acl(&session_temp_dir, psid_launch) {
+            Ok(Some(guard)) => acl_guards.push(guard),
+            Ok(None) => {}
             Err(err) => {
                 cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(restricted_token);
@@ -1447,30 +1458,7 @@ fn run_sandboxed_command_with_env_map(
                     LocalFree(psid_launch as HLOCAL);
                 }
                 LocalFree(psid_capability as HLOCAL);
-                return Err(format!(
-                    "failed to apply session temp inherit-only ACL to '{}': {err}",
-                    session_temp_dir.display()
-                ));
-            }
-        }
-        match add_allow_ace(&session_temp_dir, psid_launch) {
-            Ok(true) => acl_guards.push(CapabilityAclGuard {
-                path: session_temp_dir.clone(),
-                sid: psid_launch,
-                kind: CapabilityAclKind::Allow,
-            }),
-            Ok(false) => {}
-            Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                CloseHandle(restricted_token);
-                if launch_sid_is_distinct {
-                    LocalFree(psid_launch as HLOCAL);
-                }
-                LocalFree(psid_capability as HLOCAL);
-                return Err(format!(
-                    "failed to apply session temp dir ACL to '{}': {err}",
-                    session_temp_dir.display()
-                ));
+                return Err(err);
             }
         }
 
@@ -2282,80 +2270,6 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     let set_acl_code =
         SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut new_dacl);
-    if set_acl_code != ERROR_SUCCESS {
-        if !security_descriptor.is_null() {
-            LocalFree(security_descriptor as HLOCAL);
-        }
-        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
-    }
-
-    let set_security_code = SetNamedSecurityInfoW(
-        to_wide(path).as_ptr() as *mut u16,
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        new_dacl,
-        std::ptr::null_mut(),
-    );
-    if !new_dacl.is_null() {
-        LocalFree(new_dacl as HLOCAL);
-    }
-    if !security_descriptor.is_null() {
-        LocalFree(security_descriptor as HLOCAL);
-    }
-    if set_security_code != ERROR_SUCCESS {
-        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
-    }
-    Ok(true)
-}
-
-unsafe fn add_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
-    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut dacl,
-        std::ptr::null_mut(),
-        &mut security_descriptor,
-    );
-    if code != ERROR_SUCCESS {
-        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
-    }
-    if dacl_has_inherit_only_allow_for_sid(dacl, sid) {
-        if !security_descriptor.is_null() {
-            LocalFree(security_descriptor as HLOCAL);
-        }
-        return Ok(false);
-    }
-    if dacl_has_explicit_allow_for_sid(dacl, sid, false) {
-        if !security_descriptor.is_null() {
-            LocalFree(security_descriptor as HLOCAL);
-        }
-        revoke_ace_with_result(path, sid)?;
-        return add_inherit_only_allow_ace(path, sid);
-    }
-
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: sid as *mut u16,
-    };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-    explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance =
-        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
-    explicit.Trustee = trustee;
-
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
     if set_acl_code != ERROR_SUCCESS {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
@@ -3906,7 +3820,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_runtime_reapplies_stable_sid_to_temp_file_renamed_into_workspace() {
+    fn prepared_launch_runtime_keeps_session_temp_children_launch_scoped() {
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -3926,38 +3840,38 @@ mod tests {
             let launch_sid_string = make_random_sid_string();
             let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
                 .expect("launch capability SID should convert");
-            assert!(
-                add_inherit_only_allow_ace(&session_temp_dir, stable_sid)
-                    .expect("apply inherit-only stable allow ACE to session temp dir"),
-                "runtime launch should add an inherit-only stable allow ACE to the session temp root"
-            );
-            assert!(
-                add_allow_ace(&session_temp_dir, launch_sid)
-                    .expect("apply launch allow ACE to session temp dir"),
-                "runtime launch should add the launch allow ACE to the session temp root"
-            );
-            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+            let mut launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
                 .expect("apply runtime launch ACL state");
+            if let Some(session_temp_guard) =
+                apply_session_temp_launch_acl(&session_temp_dir, launch_sid)
+                    .expect("apply session temp launch ACL")
+            {
+                launch_guards.push(session_temp_guard);
+            }
 
-            assert!(
-                path_has_inherit_only_allow_ace(&session_temp_dir, stable_sid),
-                "session temp root should retain the inherit-only stable allow ACE"
-            );
             assert!(
                 !path_has_allow_ace(&session_temp_dir, stable_sid),
                 "session temp root itself should not get a direct stable allow ACE"
             );
+            assert!(
+                !path_has_inherit_only_allow_ace(&session_temp_dir, stable_sid),
+                "session temp root should not retain an inherit-only stable allow ACE"
+            );
 
             std::fs::write(&temp_file, b"artifact").expect("temp artifact");
             assert!(
-                path_has_allow_ace(&temp_file, stable_sid),
-                "files created in the session temp dir should inherit the stable SID"
+                !path_has_allow_ace(&temp_file, stable_sid),
+                "files created in the session temp dir should stay off the shared stable SID"
+            );
+            assert!(
+                path_has_allow_ace(&temp_file, launch_sid),
+                "files created in the session temp dir should keep the launch SID"
             );
 
             std::fs::rename(&temp_file, &moved_file).expect("move temp artifact into workspace");
             assert!(
-                path_has_allow_ace(&moved_file, stable_sid),
-                "same-volume renames out of session temp should keep the stable SID on the artifact"
+                !path_has_allow_ace(&moved_file, stable_sid),
+                "same-volume renames out of session temp should not carry the shared stable SID onto the artifact"
             );
             assert!(
                 path_has_allow_ace(&moved_file, launch_sid),
@@ -3965,7 +3879,6 @@ mod tests {
             );
 
             cleanup_capability_acl_state(&launch_guards, launch_sid, false);
-            revoke_ace(&session_temp_dir, launch_sid);
             LocalFree(launch_sid as HLOCAL);
             LocalFree(stable_sid as HLOCAL);
             revoke_capability_sid_paths(
@@ -4264,7 +4177,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_default_dacl_includes_filesystem_and_launch_sids() {
+    fn prepared_launch_default_dacl_keeps_only_launch_sid() {
         let capability_sids = LaunchCapabilitySids {
             filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
             launch_sid: "S-1-5-21-5-6-7-8".to_string(),
@@ -4272,8 +4185,8 @@ mod tests {
 
         assert_eq!(
             default_dacl_capability_sid_strings(&capability_sids),
-            vec!["S-1-5-21-1-2-3-4", "S-1-5-21-5-6-7-8"],
-            "prepared launches should keep both the shared filesystem SID and per-launch SID in the token default DACL",
+            vec!["S-1-5-21-5-6-7-8"],
+            "prepared launches should keep only the per-launch SID in the token default DACL",
         );
     }
 
