@@ -165,12 +165,10 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::StdinWrite { .. }) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
-                        let _ = crate::r_session::request_interrupt();
                         crate::r_session::clear_pending_input();
                     }
                     Some(ServerToWorkerIpcMessage::SessionEnd) => {
                         state.begin_shutdown();
-                        let _ = crate::r_session::request_interrupt();
                         crate::r_session::clear_pending_input();
                         let _ = crate::r_session::request_shutdown();
                     }

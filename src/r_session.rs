@@ -172,16 +172,6 @@ pub(crate) fn complete_active_request_if_idle() -> bool {
     had_active
 }
 
-pub(crate) fn request_interrupt() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    {
-        let guard = state.inner.lock().unwrap();
-        guard.active_request.is_some() || !guard.input_queue.is_empty()
-    }
-}
-
 fn run_session_on_current_thread(
     requests: mpsc::Receiver<RRequest>,
     init: Arc<SessionInit>,
