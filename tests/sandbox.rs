@@ -1353,8 +1353,25 @@ fn windows_home_dir() -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 fn windows_sandbox_backend_unavailable(text: &str) -> bool {
     text.contains("CreateRestrictedToken failed: 87")
-        || text.contains("worker exited before IPC named pipe connection")
-        || text.contains("timed out waiting for IPC named pipe client connection")
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn named_pipe_connect_failures_are_not_treated_as_backend_unavailable() {
+    assert!(
+        !windows_sandbox_backend_unavailable("worker exited before IPC named pipe connection"),
+        "named-pipe connect failures should fail tests instead of skipping them"
+    );
+    assert!(
+        !windows_sandbox_backend_unavailable(
+            "timed out waiting for IPC named pipe client connection",
+        ),
+        "named-pipe connect timeouts should fail tests instead of skipping them"
+    );
+    assert!(
+        windows_sandbox_backend_unavailable("CreateRestrictedToken failed: 87"),
+        "unsupported restricted-token environments should still skip"
+    );
 }
 
 #[cfg(target_os = "windows")]
