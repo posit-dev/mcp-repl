@@ -468,9 +468,6 @@ pub(crate) fn backend_unavailable(text: &str) -> bool {
         || text.contains("unable to initialize the JIT")
         || text.contains("libR.so: cannot open shared object file")
         || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
 }
 
 pub(crate) fn is_busy_response(text: &str) -> bool {
@@ -478,6 +475,26 @@ pub(crate) fn is_busy_response(text: &str) -> bool {
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusyResponseKind {
+    NotBusy,
+    Running,
+    RejectedInput,
+}
+
+fn busy_response_kind(text: &str) -> BusyResponseKind {
+    if text.contains("input discarded while worker busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+    {
+        BusyResponseKind::RejectedInput
+    } else if text.contains("<<repl status: busy") {
+        BusyResponseKind::Running
+    } else {
+        BusyResponseKind::NotBusy
+    }
 }
 
 pub(crate) async fn wait_until_not_busy(
@@ -488,7 +505,7 @@ pub(crate) async fn wait_until_not_busy(
 ) -> TestResult<rmcp::model::CallToolResult> {
     let mut result = initial;
     let mut text = result_text(&result);
-    if !text.contains("<<repl status: busy") {
+    if busy_response_kind(&text) != BusyResponseKind::Running {
         return Ok(result);
     }
 
@@ -500,12 +517,51 @@ pub(crate) async fn wait_until_not_busy(
             .await?;
         text = result_text(&next);
         result = next;
-        if !text.contains("<<repl status: busy") {
+        if busy_response_kind(&text) != BusyResponseKind::Running {
             return Ok(result);
         }
     }
 
     Err(format!("worker remained busy after polling: {text:?}").into())
+}
+
+pub(crate) async fn wait_until_ready_with_input_retry(
+    session: &mut McpTestSession,
+    input: &str,
+    initial: rmcp::model::CallToolResult,
+    attempt_timeout_secs: f64,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match busy_response_kind(&text) {
+            BusyResponseKind::NotBusy => return Ok(result),
+            BusyResponseKind::Running => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("worker remained busy after polling: {text:?}").into());
+                }
+                tokio::time::sleep(poll_interval).await;
+                result = session
+                    .write_stdin_raw_unterminated_with("", Some(2.0))
+                    .await?;
+            }
+            // Re-send the original command when the server reported that it dropped the input.
+            BusyResponseKind::RejectedInput => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("worker kept rejecting input while busy: {text:?}").into());
+                }
+                tokio::time::sleep(poll_interval).await;
+                result = session
+                    .write_stdin_raw_with(input, Some(attempt_timeout_secs))
+                    .await?;
+            }
+        }
+        text = result_text(&result);
+    }
 }
 
 pub(crate) async fn assert_eventually_contains(
