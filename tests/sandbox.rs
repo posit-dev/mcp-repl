@@ -338,6 +338,40 @@ async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::Mc
 }
 
 #[cfg(target_os = "windows")]
+fn windows_test_temp_parent() -> TestResult<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("windows-sandbox-tests");
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+#[cfg(target_os = "windows")]
+fn temp_windows_test_root() -> TestResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix("sandbox-test-")
+        .tempdir_in(windows_test_temp_parent()?)?)
+}
+
+#[cfg(target_os = "windows")]
+fn merge_windows_checkout_temp_env(
+    mut env: Vec<(String, String)>,
+) -> TestResult<Vec<(String, String)>> {
+    let temp_root = windows_test_temp_parent()?.join("process-temp");
+    std::fs::create_dir_all(&temp_root)?;
+    let temp_root = temp_root.to_string_lossy().to_string();
+    for key in ["TEMP", "TMP", "TMPDIR"] {
+        if !env
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            env.push((key.to_string(), temp_root.clone()));
+        }
+    }
+    Ok(env)
+}
+
+#[cfg(target_os = "windows")]
 async fn spawn_server_with_sandbox_state_in_cwd(
     state: String,
     cwd: &Path,
@@ -345,7 +379,7 @@ async fn spawn_server_with_sandbox_state_in_cwd(
     let args = sandbox_args_from_state(&state)?;
     common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
         args,
-        Vec::new(),
+        merge_windows_checkout_temp_env(Vec::new())?,
         Some(cwd.to_path_buf()),
         SANDBOX_PAGER_PAGE_CHARS,
     )
@@ -361,7 +395,7 @@ async fn spawn_server_with_sandbox_state_and_env_in_cwd(
     let args = sandbox_args_from_state(&state)?;
     common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
         args,
-        env,
+        merge_windows_checkout_temp_env(env)?,
         Some(cwd.to_path_buf()),
         SANDBOX_PAGER_PAGE_CHARS,
     )
@@ -370,7 +404,24 @@ async fn spawn_server_with_sandbox_state_and_env_in_cwd(
 
 #[cfg(target_os = "windows")]
 fn temp_workspace_root() -> TestResult<tempfile::TempDir> {
-    Ok(tempfile::tempdir()?)
+    temp_windows_test_root()
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn temp_windows_test_root_is_checkout_scoped() -> TestResult<()> {
+    let temp = temp_windows_test_root()?;
+    let actual = std::fs::canonicalize(temp.path())?;
+    let expected_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("windows-sandbox-tests");
+    std::fs::create_dir_all(&expected_root)?;
+    let expected_root = std::fs::canonicalize(expected_root)?;
+    assert!(
+        actual.starts_with(&expected_root),
+        "expected Windows temp root to stay under the checkout-scoped test root; temp={actual:?} root={expected_root:?}"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -2568,9 +2619,10 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() -> TestResult<()> {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let shared_dir = writable_root.path().join(format!(
@@ -2677,7 +2729,7 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_respawn_repairs_temp_renamed_workspace_file()
 -> TestResult<()> {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let shared = writable_root.path().join(format!(
@@ -2820,7 +2872,7 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_direct_workspace_file() -> TestResult<()>
 {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let shared = writable_root.path().join(format!(
@@ -3017,7 +3069,7 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_workspace_tree_with_extra_writable_root()
 -> TestResult<()> {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let repo_root = workspace.path().to_path_buf();
     let src_dir = repo_root.join("src");
@@ -3029,7 +3081,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
             .unwrap_or_default()
             .as_nanos()
     ));
-    let temp_root = tempfile::tempdir()?;
+    let temp_root = temp_windows_test_root()?;
     let host_pkg = temp_root.path().join("pkg");
     let host_file = host_pkg.join(shared.file_name().expect("shared file name"));
     let shared_r = r_string(&shared.to_string_lossy());
@@ -3144,7 +3196,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
             .unwrap_or_default()
             .as_nanos()
     ));
-    let temp_root = tempfile::tempdir()?;
+    let temp_root = temp_windows_test_root()?;
     let host_temp = temp_root.path().join("host-temp.txt");
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(&repo_root)?;
@@ -3248,7 +3300,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
             .unwrap_or_default()
             .as_nanos()
     ));
-    let temp_root = tempfile::tempdir()?;
+    let temp_root = temp_windows_test_root()?;
     let host_pkg = temp_root.path().join("pkg");
     let host_file = host_pkg.join(shared.file_name().expect("shared file name"));
     let shared_r = r_string(&shared.to_string_lossy());
@@ -3356,7 +3408,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_file_created_inside_h
             .unwrap_or_default()
             .as_nanos()
     ));
-    let temp_root = tempfile::tempdir()?;
+    let temp_root = temp_windows_test_root()?;
     let host_pkg = temp_root.path().join("pkg");
     let shared_r = r_string(&shared.to_string_lossy());
     std::fs::create_dir_all(&src_dir)?;
@@ -3451,7 +3503,7 @@ tryCatch({{
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_direct_midrun_file_keeps_prepared_sid() -> TestResult<()> {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let artifact = writable_root.path().join(format!(
         "mcp-repl-sandbox-direct-midrun-acl-{}.txt",
         SystemTime::now()
@@ -3764,7 +3816,7 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_first_launch_accepts_missing_writable_root_parent_segment()
 -> TestResult<()> {
-    let writable_root_parent = tempfile::tempdir()?;
+    let writable_root_parent = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let actual_root = writable_root_parent.path().join("out");
@@ -3825,7 +3877,7 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_first_launch_accepts_temp_prefixed_writable_root_under_temp_root()
 -> TestResult<()> {
-    let temp_root = tempfile::tempdir()?;
+    let temp_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let writable_root = temp_root.path().join("mcp-repl-session-demo");
@@ -3917,7 +3969,7 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_file() -> TestResult<()>
 {
-    let writable_root = tempfile::tempdir()?;
+    let writable_root = temp_windows_test_root()?;
     let workspace = temp_workspace_root()?;
     let cwd = workspace.path().join("workspace");
     let artifact = writable_root.path().join(format!(

@@ -4473,9 +4473,11 @@ impl WorkerProcess {
             &crate::windows_sandbox::PreparedSandboxLaunch,
         >,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let mut prepared =
+        let prepared =
             prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
                 .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut prepared = prepared;
         #[cfg(target_os = "windows")]
         if let Some(prepared_windows_launch) = prepared_windows_launch {
             crate::sandbox::append_windows_prepared_capability_sid(

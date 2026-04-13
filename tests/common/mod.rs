@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;

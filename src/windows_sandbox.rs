@@ -3228,15 +3228,82 @@ mod tests {
         }
     }
 
-    fn prepared_launch_workspace_tempdir() -> tempfile::TempDir {
+    fn prepared_launch_test_root() -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("windows-sandbox-tests");
         std::fs::create_dir_all(&root).expect("create prepared launch workspace test root");
+        root
+    }
+
+    fn prepared_launch_workspace_tempdir() -> tempfile::TempDir {
+        let root = prepared_launch_test_root();
         tempfile::Builder::new()
             .prefix("prepared-launch-")
             .tempdir_in(&root)
             .expect("prepared launch workspace tempdir")
+    }
+
+    fn prepared_launch_session_root_tempdir() -> tempfile::TempDir {
+        let root = std::env::temp_dir();
+        std::fs::create_dir_all(&root).expect("create prepared launch session temp parent");
+        tempfile::Builder::new()
+            .prefix("prepared-launch-session-")
+            .tempdir_in(&root)
+            .expect("prepared launch session tempdir")
+    }
+
+    struct PreparedLaunchTempEnvGuard<'a> {
+        original_temp: Option<std::ffi::OsString>,
+        original_tmp: Option<std::ffi::OsString>,
+        original_tmpdir: Option<std::ffi::OsString>,
+        _lock: test_support::SandboxLaunchTestMutexGuard<'a>,
+    }
+
+    impl PreparedLaunchTempEnvGuard<'_> {
+        fn install() -> Self {
+            let lock = prepare_sandbox_launch_test_mutex()
+                .lock()
+                .expect("windows sandbox test mutex");
+            let temp_root = prepared_launch_test_root().join("process-temp");
+            std::fs::create_dir_all(&temp_root).expect("create prepared launch temp env root");
+            let original_temp = std::env::var_os("TEMP");
+            let original_tmp = std::env::var_os("TMP");
+            let original_tmpdir = std::env::var_os("TMPDIR");
+            unsafe {
+                std::env::set_var("TEMP", &temp_root);
+                std::env::set_var("TMP", &temp_root);
+                std::env::set_var("TMPDIR", &temp_root);
+            }
+            Self {
+                original_temp,
+                original_tmp,
+                original_tmpdir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PreparedLaunchTempEnvGuard<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original_temp {
+                    std::env::set_var("TEMP", value);
+                } else {
+                    std::env::remove_var("TEMP");
+                }
+                if let Some(value) = &self.original_tmp {
+                    std::env::set_var("TMP", value);
+                } else {
+                    std::env::remove_var("TMP");
+                }
+                if let Some(value) = &self.original_tmpdir {
+                    std::env::set_var("TMPDIR", value);
+                } else {
+                    std::env::remove_var("TMPDIR");
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -3958,8 +4025,9 @@ mod tests {
 
     #[test]
     fn prepared_launch_runtime_keeps_session_temp_children_launch_scoped() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
-        let session_root = tempdir().expect("session temp root");
+        let session_root = prepared_launch_session_root_tempdir();
         let cwd = workspace.path().join("workspace");
         let session_temp_dir = session_root.path().join("session-temp");
         let temp_file = session_temp_dir.join("artifact.txt");
@@ -5370,8 +5438,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_runtime_applies_deny_acl_to_existing_file_under_protected_dir() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
-        let session_root = tempdir().expect("session temp root");
+        let session_root = prepared_launch_session_root_tempdir();
         let cwd = workspace.path().join("workspace");
         let git_dir = cwd.join(".git");
         let session_temp_dir = session_root.path().join("session-temp");
@@ -5555,8 +5624,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_writable_root() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
-        let session_root = tempdir().expect("session temp root");
+        let session_root = prepared_launch_session_root_tempdir();
         let cwd = workspace.path().join("workspace");
         let nested = cwd.join("nested");
         let session_temp_dir = session_root.path().join("session-temp");
@@ -5610,8 +5680,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_additional_writable_root() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
-        let session_root = tempdir().expect("session temp root");
+        let session_root = prepared_launch_session_root_tempdir();
         let cwd = workspace.path().join("workspace");
         let extra_root = workspace.path().join("extra");
         let session_temp_dir = session_root.path().join("session-temp");
