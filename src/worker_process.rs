@@ -1682,7 +1682,7 @@ impl WorkerManager {
                     should_trim_echo_prefix(&completion.echo_events)
                 };
                 let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript);
+                    .or(fallback_input_transcript.clone());
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
@@ -1694,6 +1694,12 @@ impl WorkerManager {
                     },
                     &completion.protocol_warnings,
                 );
+                if completion.echo_events.is_empty() {
+                    let _ = trim_echo_prefix_after_leading_nonstdout_contents(
+                        &mut contents,
+                        fallback_input_transcript.as_deref(),
+                    );
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -3677,6 +3683,96 @@ fn maybe_trim_echo_prefix(
         }
         idx = idx.saturating_add(1);
     }
+}
+
+fn trim_echo_prefix_after_leading_nonstdout_contents(
+    contents: &mut Vec<WorkerContent>,
+    echo_prefix: Option<&str>,
+) -> bool {
+    let Some(echo_prefix) = echo_prefix else {
+        return false;
+    };
+    if echo_prefix.is_empty() {
+        return false;
+    }
+
+    let start_idx = contents
+        .iter()
+        .position(|content| {
+            matches!(
+                content,
+                WorkerContent::ContentText {
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(contents.len());
+    if start_idx >= contents.len() {
+        return false;
+    }
+
+    let mut remaining = echo_prefix;
+    for content in contents.iter().skip(start_idx) {
+        if remaining.is_empty() {
+            break;
+        }
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            return false;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            return false;
+        }
+        if remaining.len() >= text.len() {
+            if !remaining.starts_with(text.as_str()) {
+                return false;
+            }
+            remaining = &remaining[text.len()..];
+        } else {
+            if !text.starts_with(remaining) {
+                return false;
+            }
+            remaining = "";
+        }
+    }
+
+    if !remaining.is_empty() {
+        return false;
+    }
+
+    let mut idx = start_idx;
+    let mut remaining = echo_prefix;
+    while idx < contents.len() && !remaining.is_empty() {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText { text, .. } => {
+                if remaining.len() >= text.len() {
+                    remaining = &remaining[text.len()..];
+                    text.clear();
+                    true
+                } else {
+                    let updated = text[remaining.len()..].to_string();
+                    *text = updated;
+                    remaining = "";
+                    false
+                }
+            }
+            _ => return false,
+        };
+
+        if remove_current {
+            contents.remove(idx);
+            continue;
+        }
+        idx = idx.saturating_add(1);
+    }
+
+    true
 }
 
 fn trim_echo_prefix_in_output(
@@ -5727,6 +5823,27 @@ mod tests {
             vec![
                 WorkerContent::stdout("[1] 1\n"),
                 WorkerContent::server_stderr(format!("[repl] {warning}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_echo_prefix_after_leading_nonstdout_contents_removes_prompt_fallback_echo() {
+        let mut contents = vec![
+            WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+            WorkerContent::stdout("> x\n"),
+            WorkerContent::stdout("> "),
+        ];
+
+        let trimmed =
+            trim_echo_prefix_after_leading_nonstdout_contents(&mut contents, Some("> x\n"));
+
+        assert!(trimmed, "expected prompt fallback echo to be trimmed");
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+                WorkerContent::stdout("> "),
             ]
         );
     }
