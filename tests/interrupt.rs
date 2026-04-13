@@ -212,6 +212,8 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input_on_windo
     let mut session = spawn_interrupt_session().await?;
 
     let long_sleep = r#"
+cat("INTERRUPT_READY\n")
+flush.console()
 tryCatch(
   {
     repeat Sys.sleep(0.5)
@@ -230,6 +232,34 @@ tryCatch(
         timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready_text = timeout_text;
+    loop {
+        if backend_unavailable(&ready_text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        if ready_text.contains("INTERRUPT_READY") {
+            break;
+        }
+        if !is_busy_response(&ready_text) {
+            session.cancel().await?;
+            panic!(
+                "expected long-running request to reach user code before interrupt, got: {ready_text:?}"
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            session.cancel().await?;
+            panic!(
+                "expected long-running request to emit readiness marker before interrupt, got: {ready_text:?}"
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        ready_text = result_text(&poll);
+    }
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut text = result_text(
