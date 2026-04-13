@@ -26,7 +26,7 @@ use libr::{
 #[cfg(target_family = "windows")]
 use libr::{
     R_DefParamsEx, R_SetParams, R_common_command_line, Rboolean_FALSE, Rboolean_TRUE, Rstart,
-    UImode_RGui, UserBreak, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
+    UImode_RTerm, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
 };
 #[cfg(target_family = "windows")]
 use std::mem::MaybeUninit;
@@ -170,26 +170,6 @@ pub(crate) fn complete_active_request_if_idle() -> bool {
         complete_active_request(state, active, false);
     }
     had_active
-}
-
-pub(crate) fn request_interrupt() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let should_interrupt = {
-        let guard = state.inner.lock().unwrap();
-        guard.active_request.is_some() || !guard.input_queue.is_empty()
-    };
-    if !should_interrupt {
-        return false;
-    }
-
-    #[cfg(target_family = "windows")]
-    unsafe {
-        libr::set(UserBreak, Rboolean_TRUE);
-    }
-
-    true
 }
 
 fn run_session_on_current_thread(
@@ -508,7 +488,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         R_common_command_line(&mut c_args_len, c_args.as_mut_ptr(), params);
 
         (*params).R_Interactive = 1;
-        (*params).CharacterMode = UImode_RGui;
+        (*params).CharacterMode = UImode_RTerm;
         // Keep startup behavior aligned with R defaults. R_common_command_line
         // already adjusts these based on the provided command-line arguments.
         (*params).set_NoRenviron(Rboolean_FALSE);

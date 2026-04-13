@@ -1,24 +1,52 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+#[path = "windows_sandbox_test_support.rs"]
+mod test_support;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
+use std::fs::File;
+use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(test)]
+use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+#[cfg(test)]
+use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Foundation::WAIT_ABANDONED;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, LocalFree,
+};
+use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::AdjustTokenPrivileges;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -35,8 +63,13 @@ use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::DeleteAce;
+use windows_sys::Win32::Security::EqualSid;
+use windows_sys::Win32::Security::GetAce;
+use windows_sys::Win32::Security::GetAclInformation;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
+use windows_sys::Win32::Security::IsTokenRestricted;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SetTokenInformation;
@@ -49,6 +82,7 @@ use windows_sys::Win32::Security::TOKEN_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
+use windows_sys::Win32::Security::{ACCESS_DENIED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation};
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
@@ -58,26 +92,46 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
+use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
 use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
 use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+use windows_sys::Win32::System::Pipes::CreatePipe;
+#[cfg(test)]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+#[cfg(test)]
+use test_support::{
+    clear_prepared_launch_allow_targets_read_dir_calls, set_add_deny_write_ace_test_error,
+    set_prepared_launch_allow_targets_read_dir_test_error,
+    set_prepared_launch_deny_target_pre_apply_delete,
+    take_prepared_launch_allow_targets_read_dir_calls,
+};
+#[cfg(test)]
+pub(crate) use test_support::{
+    prepare_sandbox_launch_test_mutex, set_apply_prepared_launch_acl_state_test_error,
+    set_prepare_sandbox_launch_test_error,
+};
 
 const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
 const LUA_TOKEN: u32 = 0x04;
@@ -90,6 +144,12 @@ const DENY_ACCESS: i32 = 3;
 const REVOKE_ACCESS: i32 = 4;
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
+const INHERIT_ONLY_ACE: u8 = 0x08;
+const INHERITED_ACE: u8 = 0x10;
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
+const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -97,8 +157,185 @@ struct AllowDenyPaths {
     deny: HashSet<PathBuf>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapabilityAclKind {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedLaunchAllowScope {
+    Recursive,
+    RootsOnly,
+    RootsAndDirectChildren,
+}
+
+struct CapabilityAclGuard {
+    path: PathBuf,
+    sid: *mut c_void,
+    kind: CapabilityAclKind,
+}
+
+struct PreparedLaunchAclRestore {
+    path: PathBuf,
+    dacl: Option<Vec<u8>>,
+    materialized_dirs: Vec<PathBuf>,
+}
+
+struct PreparedLaunchAclApply<'restores, 'guards> {
+    acl_restores: &'restores mut Vec<PreparedLaunchAclRestore>,
+    acl_guards: &'guards mut Option<&'guards mut Vec<CapabilityAclGuard>>,
+}
+
+#[derive(Clone)]
+struct AllowAclTargetOptions {
+    scope: PreparedLaunchAllowScope,
+    inherit_children: bool,
+    add_inherit_only_allow_on_directories: bool,
+    skip_inherit_only_on_root: Option<PathBuf>,
+    session_temp_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSandboxLaunch {
+    policy: SandboxPolicy,
+    sandbox_policy_cwd: PathBuf,
+    session_temp_dir: PathBuf,
+    capability_sid: String,
+}
+
+impl PreparedSandboxLaunch {
+    pub fn capability_sid(&self) -> &str {
+        &self.capability_sid
+    }
+
+    pub fn matches(
+        &self,
+        policy: &SandboxPolicy,
+        sandbox_policy_cwd: &Path,
+        session_temp_dir: &Path,
+    ) -> bool {
+        let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+        self.policy == *policy
+            && self.sandbox_policy_cwd == canonical_cwd
+            && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
+            && self.capability_sid == stable_cap_sid_string(policy, sandbox_policy_cwd)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchCapabilitySids {
+    filesystem_sid: String,
+    launch_sid: String,
+}
+
+struct PreparedLaunchAclLock {
+    handle: HANDLE,
+}
+
+struct PreparedLaunchLiveMarker {
+    path: PathBuf,
+}
+
+struct WrapperChildStdio {
+    stdin_write: File,
+    stdout_read: File,
+    stderr_read: File,
+    child_stdin: File,
+    child_stdout: File,
+    child_stderr: File,
+}
+
+struct WrapperStdioForwarders {
+    stdin_forwarder: thread::JoinHandle<()>,
+    stdout_forwarder: thread::JoinHandle<()>,
+    stderr_forwarder: thread::JoinHandle<()>,
+    stdout_state: Arc<WrapperForwarderState>,
+    stderr_state: Arc<WrapperForwarderState>,
+}
+
+struct WrapperForwarderState {
+    bytes_copied: AtomicU64,
+    done: AtomicBool,
+    write_in_progress: AtomicBool,
+}
+
+impl WrapperForwarderState {
+    fn new() -> Self {
+        Self {
+            bytes_copied: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            write_in_progress: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_write(&self) -> WrapperWriteGuard<'_> {
+        self.write_in_progress.store(true, Ordering::Release);
+        WrapperWriteGuard {
+            write_in_progress: &self.write_in_progress,
+        }
+    }
+}
+
+struct WrapperWriteGuard<'a> {
+    write_in_progress: &'a AtomicBool,
+}
+
+struct ConsoleCtrlHandlerGuard {
+    handler: unsafe extern "system" fn(u32) -> i32,
+}
+
+impl Drop for WrapperWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.write_in_progress.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for ConsoleCtrlHandlerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetConsoleCtrlHandler(Some(self.handler), 0);
+        }
+    }
+}
+
+impl Drop for PreparedLaunchAclLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+impl Drop for PreparedLaunchLiveMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
+}
+
+unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
+    if event == CTRL_BREAK_EVENT { 1 } else { 0 }
+}
+
+fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, String> {
+    let ok = unsafe { SetConsoleCtrlHandler(Some(ignore_wrapper_ctrl_break), 1) };
+    if ok == 0 {
+        return Err(format!(
+            "SetConsoleCtrlHandler failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(ConsoleCtrlHandlerGuard {
+        handler: ignore_wrapper_ctrl_break,
+    })
 }
 
 fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -140,6 +377,94 @@ fn env_get_case_insensitive<'a>(
 
 fn canonicalize_or_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let mut prefix: Option<OsString> = None;
+    let mut has_root = false;
+    let mut leading_parents: Vec<OsString> = Vec::new();
+    let mut segments: Vec<OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !segments.is_empty() {
+                    segments.pop();
+                } else if !has_root {
+                    leading_parents.push(component.as_os_str().to_os_string());
+                }
+            }
+            Component::Normal(part) => segments.push(part.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(Path::new(r"\"));
+    }
+    for parent in leading_parents {
+        normalized.push(parent);
+    }
+    for segment in segments {
+        normalized.push(segment);
+    }
+    normalized
+}
+
+// Canonicalize any existing prefix so junction targets still influence the SID even when the
+// leaf path has not been materialized yet.
+fn canonicalize_or_normalize_stable_sid_path(path: &Path) -> PathBuf {
+    let normalized = lexically_normalize_path(path);
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical;
+    }
+
+    for ancestor in normalized.ancestors().skip(1) {
+        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = normalized.strip_prefix(ancestor)
+        {
+            return canonical_ancestor.join(suffix);
+        }
+    }
+
+    normalized
+}
+
+fn stable_sid_seed_path(path: &Path) -> String {
+    stable_sid_seed_path_buf(canonicalize_or_normalize_stable_sid_path(path))
+}
+
+fn stable_sid_seed_path_buf(path: PathBuf) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let path = path.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            let mut stable = format!(r"\\{rest}");
+            stable.make_ascii_lowercase();
+            return stable;
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            let mut stable = rest.to_string();
+            stable.make_ascii_lowercase();
+            return stable;
+        }
+        let mut stable = path.into_owned();
+        stable.make_ascii_lowercase();
+        stable
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 fn compute_allow_deny_paths(
@@ -219,7 +544,65 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
     if ok != 0 { Some(sid) } else { None }
 }
 
-fn make_random_cap_sid_string() -> String {
+fn prepared_launch_refresh_scopes(
+    policy: &SandboxPolicy,
+    has_other_live_session: bool,
+) -> (PreparedLaunchAllowScope, PreparedLaunchAllowScope) {
+    let _ = policy;
+    let _ = has_other_live_session;
+    let scope = PreparedLaunchAllowScope::Recursive;
+    (scope, scope)
+}
+
+// Windows implementation detail: this stable SID names prepared filesystem ACL
+// state for the current sandbox policy/cwd. It intentionally excludes the
+// session temp dir, because session temp is reset on every worker spawn and
+// receives per-launch ACL handling separately.
+fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
+    let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+    let stable_cwd = stable_sid_seed_path_buf(canonical_cwd.clone());
+    let policy_seed = match policy {
+        SandboxPolicy::ReadOnly => serde_json::json!({
+            "mode": "read-only",
+        }),
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        } => {
+            let mut canonical_roots = writable_roots
+                .iter()
+                .map(|root| stable_sid_seed_path(&canonical_cwd.join(root)))
+                .collect::<Vec<_>>();
+            canonical_roots.sort();
+            canonical_roots.dedup();
+            serde_json::json!({
+                "mode": "workspace-write",
+                "writable_roots": canonical_roots,
+                "network_access": network_access,
+                "exclude_tmpdir_env_var": exclude_tmpdir_env_var,
+                "exclude_slash_tmp": exclude_slash_tmp,
+            })
+        }
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+            serde_json::json!({
+                "mode": "unsupported",
+            })
+        }
+    };
+    let seed = format!(
+        "mcp-repl-windows-sandbox-v2\0{}\0{}",
+        stable_cwd, policy_seed,
+    );
+    let a = stable_sid_word(seed.as_bytes(), 0x243f_6a88);
+    let b = stable_sid_word(seed.as_bytes(), 0x85a3_08d3);
+    let c = stable_sid_word(seed.as_bytes(), 0x1319_8a2e);
+    let d = stable_sid_word(seed.as_bytes(), 0x0370_7344);
+    format!("S-1-5-21-{a}-{b}-{c}-{d}")
+}
+
+fn make_random_sid_string() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -232,12 +615,776 @@ fn make_random_cap_sid_string() -> String {
     format!("S-1-5-21-{a}-{b}-{c}-{d}")
 }
 
+// The prepared filesystem SID is stable across respawns for the same prepared
+// filesystem state, while the launch SID is regenerated per worker process for
+// launch-scoped ACLs such as session-temp access.
+fn resolve_launch_capability_sids(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    prepared_capability_sid: &str,
+) -> Result<LaunchCapabilitySids, String> {
+    if prepared_capability_sid.is_empty() {
+        return Err("prepared capability SID is required".to_string());
+    }
+    let expected_filesystem_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+    if prepared_capability_sid != expected_filesystem_sid {
+        return Err(
+            "prepared capability SID did not match expected workspace identity".to_string(),
+        );
+    }
+    Ok(LaunchCapabilitySids {
+        filesystem_sid: prepared_capability_sid.to_string(),
+        launch_sid: make_random_sid_string(),
+    })
+}
+
+fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -> Vec<&str> {
+    if capability_sids.launch_sid == capability_sids.filesystem_sid {
+        vec![capability_sids.filesystem_sid.as_str()]
+    } else {
+        vec![capability_sids.launch_sid.as_str()]
+    }
+}
+
+fn prepared_launch_capability_hash(capability_sid: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in capability_sid.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn prepared_launch_acl_lock_name(capability_sid: &str) -> String {
+    let hash = prepared_launch_capability_hash(capability_sid);
+    format!("Local\\mcp_repl_prepared_launch_acl_{hash:016x}")
+}
+
+fn prepared_launch_live_marker_dir(capability_sid: &str) -> PathBuf {
+    let hash = prepared_launch_capability_hash(capability_sid);
+    std::env::temp_dir().join(format!("mcp-repl-prepared-launch-live-{hash:016x}"))
+}
+
+fn prepared_launch_live_marker_count(capability_sid: &str) -> usize {
+    std::fs::read_dir(prepared_launch_live_marker_dir(capability_sid))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+fn create_prepared_launch_live_marker(
+    capability_sid: &str,
+    launch_sid: &str,
+) -> Result<PreparedLaunchLiveMarker, String> {
+    let marker_dir = prepared_launch_live_marker_dir(capability_sid);
+    std::fs::create_dir_all(&marker_dir).map_err(|err| {
+        format!(
+            "create_dir_all failed for prepared launch live marker dir '{}': {err}",
+            marker_dir.display()
+        )
+    })?;
+    let marker_path = marker_dir.join(format!(
+        "{}-{:016x}.marker",
+        std::process::id(),
+        prepared_launch_capability_hash(launch_sid),
+    ));
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)
+        .map_err(|err| {
+            format!(
+                "failed to create prepared launch live marker '{}': {err}",
+                marker_path.display()
+            )
+        })?;
+    Ok(PreparedLaunchLiveMarker { path: marker_path })
+}
+
+fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaunchAclLock, String> {
+    unsafe {
+        let name = to_wide(prepared_launch_acl_lock_name(capability_sid));
+        let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if handle.is_null() {
+            return Err(format!(
+                "CreateMutexW failed for prepared launch ACL lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let wait = WaitForSingleObject(handle, INFINITE);
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            CloseHandle(handle);
+            return Err(format!(
+                "WaitForSingleObject failed for prepared launch ACL lock: {wait}"
+            ));
+        }
+
+        Ok(PreparedLaunchAclLock { handle })
+    }
+}
+
+fn build_prepared_sandbox_launch(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    capability_sid: &str,
+) -> PreparedSandboxLaunch {
+    PreparedSandboxLaunch {
+        policy: policy.clone(),
+        sandbox_policy_cwd: canonicalize_or_identity(sandbox_policy_cwd),
+        session_temp_dir: canonicalize_or_identity(session_temp_dir),
+        capability_sid: capability_sid.to_string(),
+    }
+}
+
+fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
+    let mut hash = 2_166_136_261u32 ^ seed;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
+}
+
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
     match policy {
         SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             Err("windows sandbox runner only supports read-only/workspace-write".to_string())
         }
+    }
+}
+
+fn sandbox_acl_env_map(session_temp_dir: &Path) -> HashMap<String, String> {
+    let temp_dir = session_temp_dir.to_string_lossy().to_string();
+    HashMap::from([
+        ("TEMP".to_string(), temp_dir.clone()),
+        ("TMP".to_string(), temp_dir.clone()),
+        (R_SESSION_TMPDIR_ENV.to_string(), temp_dir),
+    ])
+}
+
+fn prepared_launch_acl_paths(launch: &PreparedSandboxLaunch) -> AllowDenyPaths {
+    let env_map = sandbox_acl_env_map(&launch.session_temp_dir);
+    let mut paths = compute_allow_deny_paths(
+        &launch.policy,
+        &launch.sandbox_policy_cwd,
+        &launch.sandbox_policy_cwd,
+        Some(&launch.session_temp_dir),
+        &env_map,
+    );
+    paths.allow.remove(&launch.session_temp_dir);
+    paths
+}
+
+fn maybe_fail_apply_prepared_launch_acl_state_test() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        if let Some(error) = test_support::apply_prepared_launch_acl_state_test_error() {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn maybe_record_acl_guard(
+    acl_guards: &mut Option<&mut Vec<CapabilityAclGuard>>,
+    changed: bool,
+    track_dir_guard: bool,
+    path: &Path,
+    sid: *mut c_void,
+    kind: CapabilityAclKind,
+) {
+    if let Some(guards) = acl_guards.as_deref_mut()
+        && (changed || track_dir_guard)
+    {
+        guards.push(CapabilityAclGuard {
+            path: path.to_path_buf(),
+            sid,
+            kind,
+        });
+    }
+}
+
+fn should_skip_protected_descendant_deny_acl_error(err: &str) -> bool {
+    err.contains(&format!("failed: {ERROR_ACCESS_DENIED}"))
+        || err.to_ascii_lowercase().contains("access is denied")
+}
+
+unsafe fn apply_allow_acl_targets(
+    allow_paths: &HashSet<PathBuf>,
+    denied_roots: &[PathBuf],
+    excluded_roots: &[PathBuf],
+    sid: *mut c_void,
+    action: &str,
+    options: AllowAclTargetOptions,
+    apply: &mut PreparedLaunchAclApply<'_, '_>,
+) -> Result<(), String> {
+    for path in allow_paths {
+        for target in prepared_launch_allow_targets(
+            path,
+            denied_roots,
+            excluded_roots,
+            &options.session_temp_dir,
+            options.scope,
+        )? {
+            let add_inherit_only_companion = options.add_inherit_only_allow_on_directories
+                && options
+                    .skip_inherit_only_on_root
+                    .as_ref()
+                    .is_none_or(|skip_root| canonicalize_or_identity(&target) != *skip_root);
+            let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
+                &target,
+                CapabilityAclKind::Allow,
+                target == *path,
+            ) {
+                Ok(Some(restore)) => restore,
+                Ok(None) => continue,
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(apply.acl_restores);
+                    return Err(format!(
+                        "failed to {action} writable ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
+            };
+            match add_allow_ace_with_options_and_inherit_only_companion(
+                &target,
+                sid,
+                target == *path,
+                options.inherit_children,
+                add_inherit_only_companion,
+            ) {
+                Ok(changed) => {
+                    let target_is_dir = std::fs::symlink_metadata(&target)
+                        .map(|metadata| metadata.is_dir())
+                        .unwrap_or(false);
+                    let track_dir_guard = apply.acl_guards.is_some() && target_is_dir;
+                    maybe_record_acl_guard(
+                        apply.acl_guards,
+                        changed,
+                        track_dir_guard,
+                        &target,
+                        sid,
+                        CapabilityAclKind::Allow,
+                    );
+                    if changed || !restore.materialized_dirs.is_empty() {
+                        apply.acl_restores.push(restore);
+                    }
+                }
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(apply.acl_restores);
+                    return Err(format!(
+                        "failed to {action} writable ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn apply_deny_acl_targets(
+    policy: &SandboxPolicy,
+    deny_paths: &HashSet<PathBuf>,
+    sid: *mut c_void,
+    action: &str,
+    include_descendants: bool,
+    inherit_children: bool,
+    apply: &mut PreparedLaunchAclApply<'_, '_>,
+) -> Result<(), String> {
+    if !matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
+        return Ok(());
+    }
+
+    for path in deny_paths {
+        let track_dir_guard = apply.acl_guards.is_some()
+            && std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+        let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
+            Ok(Some(restore)) => restore,
+            Ok(None) => continue,
+            Err(err) => {
+                cleanup_prepared_launch_acl_state(apply.acl_restores);
+                return Err(format!(
+                    "failed to {action} deny ACL on '{}': {err}",
+                    path.display()
+                ));
+            }
+        };
+        match add_deny_write_ace_with_options(path, sid, inherit_children) {
+            Ok(changed) => {
+                maybe_record_acl_guard(
+                    apply.acl_guards,
+                    changed,
+                    track_dir_guard,
+                    path,
+                    sid,
+                    CapabilityAclKind::Deny,
+                );
+                if changed {
+                    apply.acl_restores.push(restore);
+                }
+            }
+            Err(err) => {
+                cleanup_prepared_launch_acl_state(apply.acl_restores);
+                return Err(format!(
+                    "failed to {action} deny ACL on '{}': {err}",
+                    path.display()
+                ));
+            }
+        }
+
+        if !include_descendants {
+            continue;
+        }
+
+        for target in prepared_launch_existing_targets(path)? {
+            if target == *path {
+                continue;
+            }
+            let track_dir_guard = apply.acl_guards.is_some()
+                && std::fs::symlink_metadata(&target)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false);
+            #[cfg(test)]
+            if test_support::should_delete_prepared_launch_deny_target_before_apply(&target) {
+                let _ = std::fs::remove_file(&target);
+            }
+            let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
+                &target,
+                CapabilityAclKind::Deny,
+                false,
+            ) {
+                Ok(Some(restore)) => restore,
+                Ok(None) => continue,
+                Err(err) if should_skip_protected_descendant_deny_acl_error(&err) => continue,
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(apply.acl_restores);
+                    return Err(format!(
+                        "failed to {action} protected descendant deny ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
+            };
+            match add_deny_write_ace_with_options(&target, sid, inherit_children) {
+                Ok(changed) => {
+                    maybe_record_acl_guard(
+                        apply.acl_guards,
+                        changed,
+                        track_dir_guard,
+                        &target,
+                        sid,
+                        CapabilityAclKind::Deny,
+                    );
+                    if changed {
+                        apply.acl_restores.push(restore);
+                    }
+                }
+                Err(err) if should_skip_protected_descendant_deny_acl_error(&err) => continue,
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(apply.acl_restores);
+                    return Err(format!(
+                        "failed to {action} protected descendant deny ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn apply_prepared_workspace_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+    action: &str,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
+) -> Result<(), String> {
+    maybe_fail_apply_prepared_launch_acl_state_test()?;
+    let paths = prepared_launch_acl_paths(launch);
+    let denied_roots = canonicalized_paths(&paths.deny);
+    let excluded_roots = vec![canonicalize_or_identity(&launch.session_temp_dir)];
+    let (workspace_root_paths, extra_root_paths): (HashSet<PathBuf>, HashSet<PathBuf>) = paths
+        .allow
+        .into_iter()
+        .partition(|path| canonicalize_or_identity(path) == launch.sandbox_policy_cwd);
+    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
+    let mut acl_guards = None;
+    let mut apply = PreparedLaunchAclApply {
+        acl_restores: &mut acl_restores,
+        acl_guards: &mut acl_guards,
+    };
+    apply_allow_acl_targets(
+        &workspace_root_paths,
+        &denied_roots,
+        &excluded_roots,
+        sid,
+        action,
+        AllowAclTargetOptions {
+            scope: workspace_root_scope,
+            inherit_children: false,
+            add_inherit_only_allow_on_directories: true,
+            skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
+            session_temp_dir: launch.session_temp_dir.clone(),
+        },
+        &mut apply,
+    )?;
+    apply_allow_acl_targets(
+        &extra_root_paths,
+        &denied_roots,
+        &excluded_roots,
+        sid,
+        action,
+        AllowAclTargetOptions {
+            scope: extra_root_scope,
+            inherit_children: false,
+            add_inherit_only_allow_on_directories: true,
+            skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
+            session_temp_dir: launch.session_temp_dir.clone(),
+        },
+        &mut apply,
+    )?;
+    apply_deny_acl_targets(
+        &launch.policy,
+        &paths.deny,
+        sid,
+        action,
+        true,
+        true,
+        &mut apply,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn apply_runtime_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+) -> Result<Vec<CapabilityAclGuard>, String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
+    apply_runtime_launch_acl_state_unlocked(launch, sid)
+}
+
+unsafe fn apply_runtime_launch_acl_state_unlocked(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+) -> Result<Vec<CapabilityAclGuard>, String> {
+    maybe_fail_apply_prepared_launch_acl_state_test()?;
+    let paths = prepared_launch_acl_paths(launch);
+    let denied_roots = canonicalized_paths(&paths.deny);
+    let excluded_roots = vec![canonicalize_or_identity(&launch.session_temp_dir)];
+    let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
+    let mut acl_guards = Vec::new();
+    let mut guard_sink = Some(&mut acl_guards);
+    let mut apply = PreparedLaunchAclApply {
+        acl_restores: &mut acl_restores,
+        acl_guards: &mut guard_sink,
+    };
+    apply_allow_acl_targets(
+        &paths.allow,
+        &denied_roots,
+        &excluded_roots,
+        sid,
+        "apply launch",
+        AllowAclTargetOptions {
+            scope: PreparedLaunchAllowScope::Recursive,
+            inherit_children: true,
+            add_inherit_only_allow_on_directories: false,
+            skip_inherit_only_on_root: None,
+            session_temp_dir: launch.session_temp_dir.clone(),
+        },
+        &mut apply,
+    )?;
+    apply_deny_acl_targets(
+        &launch.policy,
+        &paths.deny,
+        sid,
+        "apply launch",
+        true,
+        true,
+        &mut apply,
+    )?;
+    Ok(acl_guards)
+}
+
+unsafe fn apply_session_temp_launch_acl(
+    session_temp_dir: &Path,
+    stable_sid: Option<*mut c_void>,
+    sid: *mut c_void,
+) -> Result<Option<CapabilityAclGuard>, String> {
+    let guard = match add_allow_ace(session_temp_dir, sid) {
+        Ok(true) => Some(CapabilityAclGuard {
+            path: session_temp_dir.to_path_buf(),
+            sid,
+            kind: CapabilityAclKind::Allow,
+        }),
+        Ok(false) => None,
+        Err(err) => Err(format!(
+            "failed to apply session temp dir ACL to '{}': {err}",
+            session_temp_dir.display()
+        ))?,
+    };
+    if let Some(stable_sid) = stable_sid {
+        revoke_ace_with_result(session_temp_dir, stable_sid).map_err(|err| {
+            format!(
+                "failed to strip shared stable ACL from session temp dir '{}': {err}",
+                session_temp_dir.display()
+            )
+        })?;
+        protect_current_dacl(session_temp_dir).map_err(|err| {
+            format!(
+                "failed to protect session temp dir ACL for '{}': {err}",
+                session_temp_dir.display()
+            )
+        })?;
+    }
+    Ok(guard)
+}
+
+fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut canonicalized = paths
+        .iter()
+        .map(|path| canonicalize_or_identity(path))
+        .collect::<Vec<_>>();
+    canonicalized.sort();
+    canonicalized.dedup();
+    canonicalized
+}
+
+fn path_is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn session_temp_tree_root(session_temp_dir: &Path) -> Option<PathBuf> {
+    session_temp_dir.parent().map(canonicalize_or_identity)
+}
+
+fn session_temp_root_subtree_to_skip(root: &Path, session_temp_dir: &Path) -> Option<PathBuf> {
+    let root_canonical = canonicalize_or_identity(root);
+    let session_temp_root = session_temp_tree_root(session_temp_dir)?;
+    (session_temp_root != root_canonical && session_temp_root.starts_with(&root_canonical))
+        .then_some(session_temp_root)
+}
+
+fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    test_support::record_prepared_launch_allow_targets_read_dir_call(path);
+
+    #[cfg(test)]
+    if let Some(error) = test_support::prepared_launch_allow_targets_read_dir_test_error(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            error,
+        ));
+    }
+
+    std::fs::read_dir(path)
+}
+
+fn prepared_launch_allow_targets(
+    root: &Path,
+    denied_roots: &[PathBuf],
+    excluded_roots: &[PathBuf],
+    session_temp_dir: &Path,
+    scope: PreparedLaunchAllowScope,
+) -> Result<Vec<PathBuf>, String> {
+    let mut targets = Vec::new();
+    let root_canonical = canonicalize_or_identity(root);
+    let skip_session_temp_root_subtree = session_temp_root_subtree_to_skip(root, session_temp_dir);
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = HashSet::new();
+
+    while let Some((path, depth)) = stack.pop() {
+        let canonical = canonicalize_or_identity(&path);
+        if !canonical.starts_with(&root_canonical)
+            || path_is_within_any_root(&canonical, denied_roots)
+            || path_is_within_any_root(&canonical, excluded_roots)
+            || skip_session_temp_root_subtree
+                .as_ref()
+                .is_some_and(|temp_root| canonical.starts_with(temp_root))
+        {
+            continue;
+        }
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        targets.push(path.clone());
+        if matches!(scope, PreparedLaunchAllowScope::RootsOnly)
+            || matches!(scope, PreparedLaunchAllowScope::RootsAndDirectChildren if depth >= 1)
+        {
+            continue;
+        }
+
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && path == root => {
+                // Let add_allow_ace() materialize a declared writable root that does not exist yet.
+                continue;
+            }
+            Err(_) => {
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let entries = match prepared_launch_allow_targets_read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+
+    Ok(targets)
+}
+
+fn prepared_launch_existing_targets(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let root_canonical = canonicalize_or_identity(root);
+    let mut targets = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = HashSet::new();
+
+    while let Some(path) = stack.pop() {
+        let canonical = canonicalize_or_identity(&path);
+        if !canonical.starts_with(&root_canonical) || !visited.insert(canonical) {
+            continue;
+        }
+
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+
+        targets.push(path.clone());
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let entries = match prepared_launch_allow_targets_read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            stack.push(entry.path());
+        }
+    }
+
+    Ok(targets)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn refresh_runtime_prepared_launch_acl_state(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    prepared_capability_sid: &str,
+    sid: *mut c_void,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
+) -> Result<PreparedSandboxLaunch, String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
+    refresh_runtime_prepared_launch_acl_state_unlocked(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        prepared_capability_sid,
+        sid,
+        workspace_root_scope,
+        extra_root_scope,
+    )
+}
+
+unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    prepared_capability_sid: &str,
+    sid: *mut c_void,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
+) -> Result<PreparedSandboxLaunch, String> {
+    let launch = build_prepared_sandbox_launch(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        prepared_capability_sid,
+    );
+    apply_prepared_workspace_acl_state(
+        &launch,
+        sid,
+        "refresh",
+        workspace_root_scope,
+        extra_root_scope,
+    )?;
+    Ok(launch)
+}
+
+pub fn prepare_sandbox_launch(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+) -> Result<PreparedSandboxLaunch, String> {
+    #[cfg(test)]
+    if let Some(error) = test_support::prepare_sandbox_launch_test_error() {
+        return Err(error);
+    }
+
+    validate_windows_policy(policy)?;
+
+    let cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
+    let launch =
+        build_prepared_sandbox_launch(policy, sandbox_policy_cwd, session_temp_dir, &cap_sid);
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
+
+    unsafe {
+        let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let apply_result = apply_prepared_workspace_acl_state(
+            &launch,
+            psid_capability,
+            "prepare",
+            PreparedLaunchAllowScope::RootsOnly,
+            PreparedLaunchAllowScope::RootsOnly,
+        );
+        LocalFree(psid_capability as HLOCAL);
+        apply_result?;
+    }
+
+    Ok(launch)
+}
+
+pub fn refresh_prepared_sandbox_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+) -> Result<(), String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
+    unsafe {
+        let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let refresh_result = apply_prepared_workspace_acl_state(
+            launch,
+            psid_capability,
+            "refresh",
+            PreparedLaunchAllowScope::RootsAndDirectChildren,
+            PreparedLaunchAllowScope::RootsAndDirectChildren,
+        );
+        LocalFree(psid_capability as HLOCAL);
+        refresh_result
     }
 }
 
@@ -250,6 +1397,23 @@ pub fn run_sandboxed_command(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     command: &[String],
+    prepared_capability_sid: &str,
+) -> Result<i32, String> {
+    run_sandboxed_command_with_env_map(
+        policy,
+        sandbox_policy_cwd,
+        command,
+        prepared_capability_sid,
+        std::env::vars().collect(),
+    )
+}
+
+fn run_sandboxed_command_with_env_map(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    command: &[String],
+    prepared_capability_sid: &str,
+    mut env_map: HashMap<String, String>,
 ) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
@@ -258,90 +1422,184 @@ pub fn run_sandboxed_command(
     validate_windows_policy(policy)?;
 
     unsafe {
-        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        crate::diagnostics::startup_log("windows-sandbox: begin");
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
         }
-        let session_temp_dir =
-            env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
-
-        let cap_sid = make_random_cap_sid_string();
-        let psid_capability = convert_string_sid_to_sid(&cap_sid)
-            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let session_temp_dir = env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| "prepared capability SID requires session temp dir".to_string())?;
 
         let base_token = get_current_token_for_restriction()?;
-        let token_result = create_restricted_token_for_policy(base_token, &[psid_capability]);
+        if IsTokenRestricted(base_token) != 0 {
+            CloseHandle(base_token);
+            return Err("prepared capability SID requires an unrestricted base token".to_string());
+        }
+        let _ctrl_handler_guard = install_wrapper_ctrl_break_handler()?;
+        let capability_sids =
+            resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
+        let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
+            .ok_or_else(|| "ConvertStringSidToSidW failed for filesystem SID".to_string())?;
+        let launch_sid_is_distinct = capability_sids.launch_sid != capability_sids.filesystem_sid;
+        let psid_launch = if launch_sid_is_distinct {
+            convert_string_sid_to_sid(&capability_sids.launch_sid)
+                .ok_or_else(|| "ConvertStringSidToSidW failed for launch SID".to_string())?
+        } else {
+            psid_capability
+        };
+        let mut restricted_capability_sids = vec![psid_capability];
+        if launch_sid_is_distinct {
+            restricted_capability_sids.push(psid_launch);
+        }
+        let mut default_dacl_capability_sids: Vec<*mut c_void> = Vec::new();
+        for sid in default_dacl_capability_sid_strings(&capability_sids) {
+            if sid == capability_sids.filesystem_sid.as_str() {
+                default_dacl_capability_sids.push(psid_capability);
+                continue;
+            }
+            if sid == capability_sids.launch_sid.as_str() {
+                default_dacl_capability_sids.push(psid_launch);
+            }
+        }
+        let token_result = create_restricted_token_for_policy(
+            base_token,
+            &restricted_capability_sids,
+            &default_dacl_capability_sids,
+        );
         CloseHandle(base_token);
         let restricted_token = match token_result {
             Ok(token) => token,
             Err(err) => {
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
         };
 
-        let null_device_ace_applied = allow_null_device(psid_capability);
+        let null_device_ace_applied = allow_null_device(psid_launch);
 
-        let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
-        let paths = compute_allow_deny_paths(
-            policy,
-            sandbox_policy_cwd,
-            sandbox_policy_cwd,
-            session_temp_dir.as_deref(),
-            &env_map,
-        );
-        for path in &paths.allow {
-            match add_allow_ace(path, psid_capability) {
-                Ok(true) => acl_guards.push((path.clone(), psid_capability)),
-                Ok(false) => {}
+        let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
+        let live_marker = {
+            let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
+            let has_other_live_session =
+                prepared_launch_live_marker_count(prepared_capability_sid) > 0;
+            let (workspace_root_scope, extra_root_scope) =
+                prepared_launch_refresh_scopes(policy, has_other_live_session);
+            let refresh_result = refresh_runtime_prepared_launch_acl_state_unlocked(
+                policy,
+                sandbox_policy_cwd,
+                &session_temp_dir,
+                prepared_capability_sid,
+                psid_capability,
+                workspace_root_scope,
+                extra_root_scope,
+            );
+            let prepared_launch = match refresh_result {
+                Ok(launch) => launch,
                 Err(err) => {
-                    cleanup_capability_acl_state(
-                        &acl_guards,
-                        psid_capability,
-                        null_device_ace_applied,
-                    );
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                     CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
                     LocalFree(psid_capability as HLOCAL);
-                    return Err(format!(
-                        "failed to apply writable ACL to '{}': {err}",
-                        path.display()
-                    ));
+                    return Err(err);
+                }
+            };
+
+            let marker_result = create_prepared_launch_live_marker(
+                prepared_capability_sid,
+                &capability_sids.launch_sid,
+            );
+            let marker = match marker_result {
+                Ok(marker) => marker,
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
+                }
+            };
+
+            let launch_acl_result =
+                apply_runtime_launch_acl_state_unlocked(&prepared_launch, psid_launch);
+            match launch_acl_result {
+                Ok(mut launch_acl_guards) => {
+                    acl_guards.append(&mut launch_acl_guards);
+                    Some(marker)
+                }
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
                 }
             }
-        }
-        if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
-            for path in &paths.deny {
-                match add_deny_write_ace(path, psid_capability) {
-                    Ok(true) => acl_guards.push((path.clone(), psid_capability)),
-                    Ok(false) => {}
-                    Err(err) => {
-                        cleanup_capability_acl_state(
-                            &acl_guards,
-                            psid_capability,
-                            null_device_ace_applied,
-                        );
-                        CloseHandle(restricted_token);
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(format!(
-                            "failed to apply deny ACL to '{}': {err}",
-                            path.display()
-                        ));
-                    }
+        };
+
+        let stable_session_temp_sid = launch_sid_is_distinct.then_some(psid_capability);
+        match apply_session_temp_launch_acl(&session_temp_dir, stable_session_temp_sid, psid_launch)
+        {
+            Ok(Some(guard)) => acl_guards.push(guard),
+            Ok(None) => {}
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
                 }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
             }
         }
 
-        let spawn_result =
-            create_process_as_user(restricted_token, command, sandbox_policy_cwd, &env_map);
+        let stdio_pipes = match create_wrapper_child_stdio() {
+            Ok(pipes) => pipes,
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+        };
+        crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
+        let spawn_result = create_process_as_user(
+            restricted_token,
+            command,
+            sandbox_policy_cwd,
+            &env_map,
+            Some((
+                stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
+            )),
+        );
         let (proc_info, _startup_info) = match spawn_result {
             Ok(value) => value,
             Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+                drop(stdio_pipes);
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
                 LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
         };
+        crate::diagnostics::startup_log("windows-sandbox: child spawned");
+        let stdio_forwarders = spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -353,10 +1611,13 @@ pub fn run_sandboxed_command(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
-            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+            cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
             LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "WaitForSingleObject failed: {}",
@@ -369,10 +1630,22 @@ pub fn run_sandboxed_command(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
-            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+            let WrapperStdioForwarders {
+                stdin_forwarder,
+                stdout_forwarder,
+                stderr_forwarder,
+                ..
+            } = stdio_forwarders;
+            drop(stdin_forwarder);
+            drop(stdout_forwarder);
+            drop(stderr_forwarder);
+            cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
             LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "GetExitCodeProcess failed: {}",
@@ -383,10 +1656,24 @@ pub fn run_sandboxed_command(
         if let Some(job) = job_handle {
             CloseHandle(job);
         }
-        cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+        let WrapperStdioForwarders {
+            stdin_forwarder,
+            stdout_forwarder,
+            stderr_forwarder,
+            stdout_state,
+            stderr_state,
+        } = stdio_forwarders;
+        drop(stdin_forwarder);
+        drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
+        drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
+        cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+        drop(live_marker);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
         CloseHandle(restricted_token);
+        if launch_sid_is_distinct {
+            LocalFree(psid_launch as HLOCAL);
+        }
         LocalFree(psid_capability as HLOCAL);
 
         Ok(exit_code as i32)
@@ -394,15 +1681,164 @@ pub fn run_sandboxed_command(
 }
 
 unsafe fn cleanup_capability_acl_state(
-    acl_guards: &[(PathBuf, *mut c_void)],
+    acl_guards: &[CapabilityAclGuard],
     capability_sid: *mut c_void,
     null_device_ace_applied: bool,
 ) {
-    for (path, sid) in acl_guards {
-        revoke_ace(path, *sid);
+    let mut sorted_guards = acl_guards.iter().collect::<Vec<_>>();
+    sorted_guards.sort_by_key(|guard| guard.path.components().count());
+    let mut covered_allow_roots: Vec<PathBuf> = Vec::new();
+    let mut covered_deny_roots: Vec<PathBuf> = Vec::new();
+
+    for guard in sorted_guards {
+        let canonical = canonicalize_or_identity(&guard.path);
+        let covered_roots = match guard.kind {
+            CapabilityAclKind::Allow => &mut covered_allow_roots,
+            CapabilityAclKind::Deny => &mut covered_deny_roots,
+        };
+        if covered_roots.iter().any(|root| canonical.starts_with(root)) {
+            continue;
+        }
+
+        let is_dir = std::fs::symlink_metadata(&guard.path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            if let Ok(mut targets) = prepared_launch_existing_targets(&guard.path) {
+                match guard.kind {
+                    CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+                    CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+                }
+                targets.reverse();
+                for target in targets {
+                    if target == guard.path {
+                        continue;
+                    }
+                    match guard.kind {
+                        CapabilityAclKind::Allow => revoke_ace(&target, guard.sid),
+                        CapabilityAclKind::Deny => revoke_deny_write_ace(&target, guard.sid),
+                    }
+                }
+            } else {
+                match guard.kind {
+                    CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+                    CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+                }
+            }
+            covered_roots.push(canonical);
+            continue;
+        }
+
+        match guard.kind {
+            CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+            CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+        }
     }
     if null_device_ace_applied {
         revoke_null_device_ace(capability_sid);
+    }
+}
+
+fn materialized_directory_chain(path: &Path) -> Vec<PathBuf> {
+    let mut materialized = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.exists() {
+            break;
+        }
+        materialized.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    materialized
+}
+
+fn cleanup_materialized_dirs(dirs: &[PathBuf]) {
+    for dir in dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+unsafe fn capture_prepared_launch_acl_restore(
+    path: &Path,
+    kind: CapabilityAclKind,
+) -> Result<Option<PreparedLaunchAclRestore>, String> {
+    capture_prepared_launch_acl_restore_with_missing_policy(path, kind, true)
+}
+
+unsafe fn capture_prepared_launch_acl_restore_with_missing_policy(
+    path: &Path,
+    kind: CapabilityAclKind,
+    materialize_missing_directory: bool,
+) -> Result<Option<PreparedLaunchAclRestore>, String> {
+    let mut materialized_dirs = Vec::new();
+    if matches!(kind, CapabilityAclKind::Allow) && !path.exists() {
+        if !materialize_missing_directory {
+            return Ok(None);
+        }
+        materialized_dirs = materialized_directory_chain(path);
+        std::fs::create_dir_all(path)
+            .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
+    }
+
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+            && !materialize_missing_directory
+        {
+            cleanup_materialized_dirs(&materialized_dirs);
+            return Ok(None);
+        }
+        cleanup_materialized_dirs(&materialized_dirs);
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let snapshot = if dacl.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(dacl as *const u8, usize::from((*dacl).AclSize)).to_vec())
+    };
+
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+
+    Ok(Some(PreparedLaunchAclRestore {
+        path: path.to_path_buf(),
+        dacl: snapshot,
+        materialized_dirs,
+    }))
+}
+
+unsafe fn cleanup_prepared_launch_acl_state(acl_restores: &[PreparedLaunchAclRestore]) {
+    for restore in acl_restores.iter().rev() {
+        let dacl = restore
+            .dacl
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |bytes| bytes.as_ptr() as *mut ACL);
+        let _ = SetNamedSecurityInfoW(
+            to_wide(&restore.path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        );
+        cleanup_materialized_dirs(&restore.materialized_dirs);
     }
 }
 
@@ -429,6 +1865,7 @@ unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
 unsafe fn create_restricted_token_for_policy(
     base_token: HANDLE,
     capability_sids: &[*mut c_void],
+    default_dacl_capability_sids: &[*mut c_void],
 ) -> Result<HANDLE, String> {
     if capability_sids.is_empty() {
         return Err("no capability SIDs provided".to_string());
@@ -477,10 +1914,10 @@ unsafe fn create_restricted_token_for_policy(
         return Err(format!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    let mut dacl_sids = Vec::with_capacity(capability_sids.len() + 2);
+    let mut dacl_sids = Vec::with_capacity(default_dacl_capability_sids.len() + 2);
     dacl_sids.push(psid_logon);
     dacl_sids.push(psid_everyone);
-    dacl_sids.extend_from_slice(capability_sids);
+    dacl_sids.extend_from_slice(default_dacl_capability_sids);
     set_default_dacl(new_token, &dacl_sids)?;
     enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
     Ok(new_token)
@@ -491,6 +1928,7 @@ unsafe fn create_process_as_user(
     argv: &[String],
     cwd: &Path,
     env_map: &HashMap<String, String>,
+    stdio: Option<(HANDLE, HANDLE, HANDLE)>,
 ) -> Result<(PROCESS_INFORMATION, STARTUPINFOW), String> {
     let cmdline_str = argv
         .iter()
@@ -504,7 +1942,22 @@ unsafe fn create_process_as_user(
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let desktop = to_wide("Winsta0\\Default");
     startup_info.lpDesktop = desktop.as_ptr() as *mut u16;
-    ensure_inheritable_stdio(&mut startup_info)?;
+    if let Some((stdin_handle, stdout_handle, stderr_handle)) = stdio {
+        for handle in [stdin_handle, stdout_handle, stderr_handle] {
+            if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(format!(
+                    "SetHandleInformation failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdInput = stdin_handle;
+        startup_info.hStdOutput = stdout_handle;
+        startup_info.hStdError = stderr_handle;
+    } else {
+        ensure_inheritable_stdio(&mut startup_info)?;
+    }
 
     let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
     let ok = CreateProcessAsUserW(
@@ -527,6 +1980,185 @@ unsafe fn create_process_as_user(
         ));
     }
     Ok((proc_info, startup_info))
+}
+
+unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
+    let mut child_stdin: HANDLE = std::ptr::null_mut();
+    let mut stdin_write: HANDLE = std::ptr::null_mut();
+    let mut stdout_read: HANDLE = std::ptr::null_mut();
+    let mut child_stdout: HANDLE = std::ptr::null_mut();
+    let mut stderr_read: HANDLE = std::ptr::null_mut();
+    let mut child_stderr: HANDLE = std::ptr::null_mut();
+
+    if CreatePipe(&mut child_stdin, &mut stdin_write, std::ptr::null_mut(), 0) == 0 {
+        return Err(format!(
+            "CreatePipe stdin failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if CreatePipe(&mut stdout_read, &mut child_stdout, std::ptr::null_mut(), 0) == 0 {
+        CloseHandle(child_stdin);
+        CloseHandle(stdin_write);
+        return Err(format!(
+            "CreatePipe stdout failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if CreatePipe(&mut stderr_read, &mut child_stderr, std::ptr::null_mut(), 0) == 0 {
+        CloseHandle(child_stdin);
+        CloseHandle(stdin_write);
+        CloseHandle(stdout_read);
+        CloseHandle(child_stdout);
+        return Err(format!(
+            "CreatePipe stderr failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    for handle in [child_stdin, child_stdout, child_stderr] {
+        if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            let err = format!(
+                "SetHandleInformation failed for child stdio handle: {}",
+                std::io::Error::last_os_error()
+            );
+            CloseHandle(child_stdin);
+            CloseHandle(stdin_write);
+            CloseHandle(stdout_read);
+            CloseHandle(child_stdout);
+            CloseHandle(stderr_read);
+            CloseHandle(child_stderr);
+            return Err(err);
+        }
+    }
+
+    Ok(WrapperChildStdio {
+        stdin_write: File::from_raw_handle(stdin_write as _),
+        stdout_read: File::from_raw_handle(stdout_read as _),
+        stderr_read: File::from_raw_handle(stderr_read as _),
+        child_stdin: File::from_raw_handle(child_stdin as _),
+        child_stdout: File::from_raw_handle(child_stdout as _),
+        child_stderr: File::from_raw_handle(child_stderr as _),
+    })
+}
+
+fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwarders {
+    let WrapperChildStdio {
+        stdin_write,
+        stdout_read,
+        stderr_read,
+        child_stdin: _,
+        child_stdout: _,
+        child_stderr: _,
+    } = stdio;
+
+    let stdin_forwarder = thread::spawn(move || {
+        let mut wrapper_stdin = io::stdin();
+        let mut child_stdin = stdin_write;
+        let _ = io::copy(&mut wrapper_stdin, &mut child_stdin);
+        let _ = child_stdin.flush();
+    });
+    let stdout_state = Arc::new(WrapperForwarderState::new());
+    let stdout_state_thread = Arc::clone(&stdout_state);
+    let stdout_forwarder = thread::spawn(move || {
+        copy_wrapper_output(stdout_read, io::stdout(), &stdout_state_thread);
+    });
+    let stderr_state = Arc::new(WrapperForwarderState::new());
+    let stderr_state_thread = Arc::clone(&stderr_state);
+    let stderr_forwarder = thread::spawn(move || {
+        copy_wrapper_output(stderr_read, io::stderr(), &stderr_state_thread);
+    });
+
+    WrapperStdioForwarders {
+        stdin_forwarder,
+        stdout_forwarder,
+        stderr_forwarder,
+        stdout_state,
+        stderr_state,
+    }
+}
+
+fn copy_wrapper_output(
+    mut child_output: File,
+    mut wrapper_output: impl Write,
+    state: &WrapperForwarderState,
+) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match child_output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let write_result = {
+                    let _write_guard = state.begin_write();
+                    let result = wrapper_output
+                        .write_all(&buffer[..count])
+                        .and_then(|_| wrapper_output.flush());
+                    if result.is_ok() {
+                        state
+                            .bytes_copied
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                    result
+                };
+                if write_result.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    {
+        let _write_guard = state.begin_write();
+        let _ = wrapper_output.flush();
+    }
+    state.done.store(true, Ordering::Release);
+}
+
+fn drain_wrapper_forwarder(handle: thread::JoinHandle<()>, state: &WrapperForwarderState) {
+    drain_wrapper_forwarder_with_timeouts(
+        handle,
+        state,
+        WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT,
+        WRAPPER_STDIO_DRAIN_MAX_WAIT,
+        WRAPPER_STDIO_DRAIN_POLL_INTERVAL,
+    );
+}
+
+fn drain_wrapper_forwarder_with_timeouts(
+    handle: thread::JoinHandle<()>,
+    state: &WrapperForwarderState,
+    idle_timeout: Duration,
+    max_wait: Duration,
+    poll_interval: Duration,
+) {
+    let start = Instant::now();
+    let mut last_progress = start;
+    let mut last_bytes = state.bytes_copied.load(Ordering::Relaxed);
+
+    loop {
+        if state.done.load(Ordering::Acquire) {
+            let _ = handle.join();
+            return;
+        }
+
+        let now = Instant::now();
+        let bytes = state.bytes_copied.load(Ordering::Relaxed);
+        if bytes != last_bytes {
+            last_bytes = bytes;
+            last_progress = now;
+        }
+        if state.write_in_progress.load(Ordering::Acquire) {
+            last_progress = now;
+        }
+
+        if now.duration_since(last_progress) >= idle_timeout
+            || now.duration_since(start) >= max_wait
+        {
+            drop(handle);
+            return;
+        }
+
+        thread::sleep(poll_interval);
+    }
 }
 
 unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
@@ -616,7 +2248,43 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    add_allow_ace_with_missing_policy(path, sid, true)
+}
+
+unsafe fn add_allow_ace_with_missing_policy(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+) -> Result<bool, String> {
+    add_allow_ace_with_options(path, sid, materialize_missing_directory, true)
+}
+
+unsafe fn add_allow_ace_with_options(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+    inherit_children: bool,
+) -> Result<bool, String> {
+    add_allow_ace_with_options_and_inherit_only_companion(
+        path,
+        sid,
+        materialize_missing_directory,
+        inherit_children,
+        false,
+    )
+}
+
+unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+    inherit_children: bool,
+    add_inherit_only_companion: bool,
+) -> Result<bool, String> {
     if !path.exists() {
+        if !materialize_missing_directory {
+            return Ok(false);
+        }
         std::fs::create_dir_all(path)
             .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
     }
@@ -636,6 +2304,35 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
+    let path_is_dir = path.is_dir();
+    let needs_direct_allow =
+        !dacl_has_allow_for_sid_with_inheritance(dacl, sid, inherit_children && path_is_dir);
+    let needs_inherit_only = add_inherit_only_companion
+        && path_is_dir
+        && !dacl_has_inherit_only_allow_for_sid(dacl, sid);
+    if !needs_direct_allow && !needs_inherit_only {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+    if needs_direct_allow
+        && !inherit_children
+        && path_is_dir
+        && dacl_has_explicit_allow_for_sid(dacl, sid, false)
+    {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        revoke_ace_with_result(path, sid)?;
+        return add_allow_ace_with_options_and_inherit_only_companion(
+            path,
+            sid,
+            materialize_missing_directory,
+            inherit_children,
+            add_inherit_only_companion,
+        );
+    }
 
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -644,14 +2341,34 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
         TrusteeType: TRUSTEE_IS_UNKNOWN,
         ptstrName: sid as *mut u16,
     };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-    explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    explicit.Trustee = trustee;
+    let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
+    if needs_direct_allow {
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions =
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance = if inherit_children {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        explicit.Trustee = trustee;
+        entries.push(explicit);
+    }
+    if needs_inherit_only {
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions =
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance =
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
+        explicit.Trustee = trustee;
+        entries.push(explicit);
+    }
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    let set_acl_code =
+        SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut new_dacl);
     if set_acl_code != ERROR_SUCCESS {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
@@ -680,7 +2397,16 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     Ok(true)
 }
 
-unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+unsafe fn add_deny_write_ace_with_options(
+    path: &Path,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> Result<bool, String> {
+    #[cfg(test)]
+    if let Some(Err(error)) = test_support::next_add_deny_write_ace_test_result() {
+        return Err(error);
+    }
+
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -695,6 +2421,19 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
     );
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+    if dacl_has_write_deny_for_sid_with_inheritance(dacl, sid, inherit_children) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+    if !inherit_children && path.is_dir() && dacl_has_write_deny_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        revoke_deny_write_ace(path, sid);
+        return add_deny_write_ace_with_options(path, sid, inherit_children);
     }
 
     let trustee = TRUSTEE_W {
@@ -713,7 +2452,11 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
         | DELETE
         | FILE_DELETE_CHILD;
     explicit.grfAccessMode = DENY_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.grfInheritance = if inherit_children {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
     explicit.Trustee = trustee;
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -746,7 +2489,334 @@ unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, Stri
     Ok(true)
 }
 
+fn deny_write_mask() -> u32 {
+    FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD
+}
+
+unsafe fn dacl_size_info(dacl: *mut ACL) -> Option<ACL_SIZE_INFORMATION> {
+    if dacl.is_null() {
+        return None;
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = GetAclInformation(
+        dacl as *const ACL,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    );
+    (ok != 0).then_some(info)
+}
+
+unsafe fn ace_sid_ptr(ace: *mut c_void) -> *mut c_void {
+    let base = ace as usize;
+    (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void
+}
+
+fn allow_ace_satisfies_requirements(mask: u32, ace_flags: u8, require_inheritance: bool) -> bool {
+    if (mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE))
+        != (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
+    {
+        return false;
+    }
+    if require_inheritance
+        && ((ace_flags & (CONTAINER_INHERIT_ACE as u8)) == 0
+            || (ace_flags & (OBJECT_INHERIT_ACE as u8)) == 0)
+    {
+        return false;
+    }
+    true
+}
+
+fn ace_has_container_and_object_inheritance(ace_flags: u8) -> bool {
+    (ace_flags & (CONTAINER_INHERIT_ACE as u8)) != 0
+        && (ace_flags & (OBJECT_INHERIT_ACE as u8)) != 0
+}
+
+#[cfg(test)]
+unsafe fn dacl_has_allow_for_sid(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    require_inheritance: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_explicit_allow_for_sid(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    require_inheritance: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0
+            || (header.AceFlags & INHERIT_ONLY_ACE) != 0
+            || (header.AceFlags & INHERITED_ACE) != 0
+        {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_allow_for_sid_with_inheritance(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) == 0
+            || !allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, false)
+        {
+            continue;
+        }
+        if ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_inherit_only_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) == 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    let mut denied_mask = 0;
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let denied = &*(ace as *const ACCESS_DENIED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+            denied_mask |= denied.Mask;
+        }
+    }
+    (denied_mask & deny_write_mask()) == deny_write_mask()
+}
+
+unsafe fn dacl_has_write_deny_for_sid_with_inheritance(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let denied = &*(ace as *const ACCESS_DENIED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && (denied.Mask & deny_write_mask()) == deny_write_mask()
+            && ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children
+        {
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
+    let _ = revoke_ace_with_result(path, sid);
+}
+
+unsafe fn revoke_ace_with_result(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let Some(info) = dacl_size_info(dacl) else {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    for index in (0..info.AceCount).rev() {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 {
+            continue;
+        }
+        if EqualSid(ace_sid_ptr(ace), sid) == 0 {
+            continue;
+        }
+        if DeleteAce(dacl, index) != 0 {
+            changed = true;
+        }
+    }
+    if !changed {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        dacl,
+        std::ptr::null_mut(),
+    );
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        if set_security_code == ERROR_FILE_NOT_FOUND || set_security_code == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
+unsafe fn protect_current_dacl(path: &Path) -> Result<(), String> {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        dacl,
+        std::ptr::null_mut(),
+    );
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(())
+}
+
+unsafe fn revoke_deny_write_ace(path: &Path, sid: *mut c_void) {
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -766,34 +2836,41 @@ unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
         return;
     }
 
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: sid as *mut u16,
+    let Some(info) = dacl_size_info(dacl) else {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return;
     };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = 0;
-    explicit.grfAccessMode = REVOKE_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    explicit.Trustee = trustee;
 
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
-    if set_acl_code == ERROR_SUCCESS {
+    let mut changed = false;
+    for index in (0..info.AceCount).rev() {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 {
+            continue;
+        }
+        if EqualSid(ace_sid_ptr(ace), sid) == 0 {
+            continue;
+        }
+        if DeleteAce(dacl, index) != 0 {
+            changed = true;
+        }
+    }
+
+    if changed {
         let _ = SetNamedSecurityInfoW(
             to_wide(path).as_ptr() as *mut u16,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            new_dacl,
+            dacl,
             std::ptr::null_mut(),
         );
-        if !new_dacl.is_null() {
-            LocalFree(new_dacl as HLOCAL);
-        }
     }
     if !security_descriptor.is_null() {
         LocalFree(security_descriptor as HLOCAL);
@@ -1132,6 +3209,10 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    #[cfg(target_os = "windows")]
+    use std::process::Command;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn workspace_policy(
@@ -1145,6 +3226,366 @@ mod tests {
             exclude_tmpdir_env_var,
             exclude_slash_tmp: false,
         }
+    }
+
+    fn prepared_launch_test_root() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("windows-sandbox-tests");
+        std::fs::create_dir_all(&root).expect("create prepared launch workspace test root");
+        root
+    }
+
+    fn prepared_launch_workspace_tempdir() -> tempfile::TempDir {
+        let root = prepared_launch_test_root();
+        tempfile::Builder::new()
+            .prefix("prepared-launch-")
+            .tempdir_in(&root)
+            .expect("prepared launch workspace tempdir")
+    }
+
+    fn prepared_launch_session_root_tempdir() -> tempfile::TempDir {
+        let root = std::env::temp_dir();
+        std::fs::create_dir_all(&root).expect("create prepared launch session temp parent");
+        tempfile::Builder::new()
+            .prefix("prepared-launch-session-")
+            .tempdir_in(&root)
+            .expect("prepared launch session tempdir")
+    }
+
+    struct PreparedLaunchTempEnvGuard<'a> {
+        original_temp: Option<std::ffi::OsString>,
+        original_tmp: Option<std::ffi::OsString>,
+        original_tmpdir: Option<std::ffi::OsString>,
+        _lock: test_support::SandboxLaunchTestMutexGuard<'a>,
+    }
+
+    impl PreparedLaunchTempEnvGuard<'_> {
+        fn install() -> Self {
+            let lock = prepare_sandbox_launch_test_mutex()
+                .lock()
+                .expect("windows sandbox test mutex");
+            let temp_root = prepared_launch_test_root().join("process-temp");
+            std::fs::create_dir_all(&temp_root).expect("create prepared launch temp env root");
+            let original_temp = std::env::var_os("TEMP");
+            let original_tmp = std::env::var_os("TMP");
+            let original_tmpdir = std::env::var_os("TMPDIR");
+            unsafe {
+                std::env::set_var("TEMP", &temp_root);
+                std::env::set_var("TMP", &temp_root);
+                std::env::set_var("TMPDIR", &temp_root);
+            }
+            Self {
+                original_temp,
+                original_tmp,
+                original_tmpdir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PreparedLaunchTempEnvGuard<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original_temp {
+                    std::env::set_var("TEMP", value);
+                } else {
+                    std::env::remove_var("TEMP");
+                }
+                if let Some(value) = &self.original_tmp {
+                    std::env::set_var("TMP", value);
+                } else {
+                    std::env::remove_var("TMP");
+                }
+                if let Some(value) = &self.original_tmpdir {
+                    std::env::set_var("TMPDIR", value);
+                } else {
+                    std::env::remove_var("TMPDIR");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn remove_junction(path: &Path) {
+        if !path.exists() {
+            return;
+        }
+
+        if std::fs::remove_dir(path).is_ok() {
+            return;
+        }
+
+        let output = Command::new("cmd")
+            .args(["/C", "rmdir", &path.to_string_lossy()])
+            .output()
+            .expect("spawn rmdir");
+        assert!(
+            output.status.success(),
+            "failed to remove junction '{}': stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create_junction(path: &Path, target: &Path) {
+        remove_junction(path);
+        let output = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &path.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .expect("spawn mklink");
+        assert!(
+            output.status.success(),
+            "failed to create junction '{}' -> '{}': stdout={} stderr={}",
+            path.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    struct BlockingWriter {
+        entered: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.entered.store(true, Ordering::Release);
+            let (lock, cvar) = &*self.release;
+            let mut released = lock.lock().expect("blocking writer release mutex");
+            while !*released {
+                released = cvar.wait(released).expect("blocking writer release mutex");
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWriterState {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    struct RecordingWriter {
+        state: Arc<Mutex<RecordingWriterState>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.state
+                .lock()
+                .expect("recording writer state mutex")
+                .bytes
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.state
+                .lock()
+                .expect("recording writer state mutex")
+                .flush_count += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_waits_while_progress_continues() {
+        let state = Arc::new(WrapperForwarderState::new());
+        let thread_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(20));
+                thread_state.bytes_copied.fetch_add(1024, Ordering::Relaxed);
+            }
+            thread_state.done.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(30),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+        );
+
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        assert!(state.done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_stops_after_idle_timeout_without_progress() {
+        let state = Arc::new(WrapperForwarderState::new());
+        let thread_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            thread_state.done.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        );
+
+        assert!(start.elapsed() < Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_stops_after_max_wait_for_blocked_write() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, vec![b'x'; 8192]).expect("write payload");
+
+        let state = Arc::new(WrapperForwarderState::new());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let thread_state = Arc::clone(&state);
+        let writer = BlockingWriter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let handle = thread::spawn(move || {
+            let input = File::open(&payload_path).expect("open payload");
+            copy_wrapper_output(input, writer, &thread_state);
+        });
+
+        while !entered.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let release_gate = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let (lock, cvar) = &*release_gate;
+            let mut released = lock.lock().expect("release mutex");
+            *released = true;
+            cvar.notify_all();
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+        );
+
+        let elapsed = start.elapsed();
+        let finished_before_cleanup = state.done.load(Ordering::Acquire);
+        releaser.join().expect("releaser thread should not panic");
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "drain should stop waiting once the blocked write exceeds the timeout"
+        );
+        assert!(
+            !finished_before_cleanup,
+            "drain should return before a blocked write finishes"
+        );
+    }
+
+    #[test]
+    fn drain_wrapper_forwarder_waits_for_inflight_write_before_idle_timeout() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, vec![b'x'; 8192]).expect("write payload");
+
+        let state = Arc::new(WrapperForwarderState::new());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let thread_state = Arc::clone(&state);
+        let writer = BlockingWriter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let handle = thread::spawn(move || {
+            let input = File::open(&payload_path).expect("open payload");
+            copy_wrapper_output(input, writer, &thread_state);
+        });
+
+        while !entered.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let release_gate = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let (lock, cvar) = &*release_gate;
+            let mut released = lock.lock().expect("release mutex");
+            *released = true;
+            cvar.notify_all();
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        );
+
+        let elapsed = start.elapsed();
+        let finished_before_release = state.done.load(Ordering::Acquire);
+        releaser.join().expect("releaser thread should not panic");
+        assert!(
+            finished_before_release,
+            "drain should keep waiting while a write is in progress and finishes before max_wait"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60),
+            "drain should not treat an in-flight write as idle"
+        );
+    }
+
+    #[test]
+    fn copy_wrapper_output_flushes_after_each_chunk() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, b"prompt> ").expect("write payload");
+
+        let state = WrapperForwarderState::new();
+        let writer_state = Arc::new(Mutex::new(RecordingWriterState::default()));
+        let writer = RecordingWriter {
+            state: Arc::clone(&writer_state),
+        };
+
+        let input = File::open(&payload_path).expect("open payload");
+        copy_wrapper_output(input, writer, &state);
+
+        let recorded = writer_state.lock().expect("recording writer state mutex");
+        assert_eq!(recorded.bytes, b"prompt> ");
+        assert!(
+            recorded.flush_count >= 2,
+            "forwarded output should flush each chunk as well as the final stream flush"
+        );
+    }
+
+    #[test]
+    fn windows_wrapper_launch_uses_forwarded_pipes() {
+        let pipes = unsafe { create_wrapper_child_stdio() }.expect("wrapper stdio pipes");
+        drop(pipes);
     }
 
     #[test]
@@ -1423,6 +3864,830 @@ mod tests {
     }
 
     #[test]
+    fn stable_capability_sid_is_deterministic_for_workspace_and_policy() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let first = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let second = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn prepared_launch_uses_distinct_launch_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+
+        let expected = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let resolved = resolve_launch_capability_sids(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &expected,
+        )
+        .expect("prepared launch SIDs");
+
+        assert_eq!(resolved.filesystem_sid, expected);
+        assert_ne!(resolved.launch_sid, resolved.filesystem_sid);
+    }
+
+    #[test]
+    fn resolve_launch_capability_sids_requires_prepared_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let result =
+            resolve_launch_capability_sids(&workspace_policy(Vec::new(), false, false), &cwd, "");
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("prepared capability SID is required")),
+            "expected launcher to require prepared state, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_sid_does_not_require_session_temp_metadata() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        let expected = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+
+        let result = resolve_launch_capability_sids(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &expected,
+        );
+
+        assert!(
+            result.is_ok(),
+            "prepared capability SID should not depend on session temp metadata"
+        );
+    }
+
+    #[test]
+    fn stable_capability_sid_changes_with_policy_or_workspace() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd_a = tmp.path().join("workspace-a");
+        let cwd_b = tmp.path().join("workspace-b");
+        std::fs::create_dir_all(&cwd_a).expect("workspace a dir");
+        std::fs::create_dir_all(&cwd_b).expect("workspace b dir");
+
+        let workspace_a =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_a);
+        let workspace_b =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_b);
+        let readonly_a = stable_cap_sid_string(&SandboxPolicy::ReadOnly, &cwd_a);
+
+        assert_ne!(workspace_a, workspace_b);
+        assert_ne!(workspace_a, readonly_a);
+    }
+
+    #[test]
+    fn stable_capability_sid_ignores_session_temp_dir() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_a = session_root.path().join("session-temp-a");
+        let session_temp_b = session_root.path().join("session-temp-b");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
+
+        let first = prepare_sandbox_launch(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &session_temp_a,
+        )
+        .expect("prepare launch a");
+        let second = prepare_sandbox_launch(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &session_temp_b,
+        )
+        .expect("prepare launch b");
+
+        assert_eq!(
+            first.capability_sid(),
+            second.capability_sid(),
+            "stable filesystem SID should be reused across per-session temp dirs"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_workspace_tempdir_avoids_system_temp_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        assert!(
+            !workspace.path().starts_with(std::env::temp_dir()),
+            "prepared-launch workspace tests should avoid system temp roots so ACL setup does not depend on TEMP DACLs"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_does_not_share_session_temp_dir_access() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_a = session_root.path().join("session-temp-a");
+        let session_temp_b = session_root.path().join("session-temp-b");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_a =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_a).expect("prepare launch a");
+        let prepared_b =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_b).expect("prepare launch b");
+
+        unsafe {
+            let sid_a = convert_string_sid_to_sid(prepared_a.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_allow_ace(&session_temp_b, sid_a),
+                "prepared capability SID should not grant access to a different session temp dir"
+            );
+            LocalFree(sid_a as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared_b.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    session_temp_a.as_path(),
+                    session_temp_b.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_keeps_session_temp_children_launch_scoped() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = prepared_launch_session_root_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let temp_file = session_temp_dir.join("artifact.txt");
+        let moved_file = cwd.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            let mut launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply runtime launch ACL state");
+            if let Some(session_temp_guard) =
+                apply_session_temp_launch_acl(&session_temp_dir, Some(stable_sid), launch_sid)
+                    .expect("apply session temp launch ACL")
+            {
+                launch_guards.push(session_temp_guard);
+            }
+
+            assert!(
+                !path_has_allow_ace(&session_temp_dir, stable_sid),
+                "session temp root itself should not get a direct stable allow ACE"
+            );
+            assert!(
+                !path_has_inherit_only_allow_ace(&session_temp_dir, stable_sid),
+                "session temp root should not retain an inherit-only stable allow ACE"
+            );
+
+            std::fs::write(&temp_file, b"artifact").expect("temp artifact");
+            assert!(
+                !path_has_allow_ace(&temp_file, stable_sid),
+                "files created in the session temp dir should stay off the shared stable SID"
+            );
+            assert!(
+                path_has_allow_ace(&temp_file, launch_sid),
+                "files created in the session temp dir should keep the launch SID"
+            );
+
+            std::fs::rename(&temp_file, &moved_file).expect("move temp artifact into workspace");
+            assert!(
+                !path_has_allow_ace(&moved_file, stable_sid),
+                "same-volume renames out of session temp should not carry the shared stable SID onto the artifact"
+            );
+            assert!(
+                path_has_allow_ace(&moved_file, launch_sid),
+                "same-volume renames out of session temp should keep the launch SID on the artifact"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    session_temp_dir.as_path(),
+                    temp_file.as_path(),
+                    moved_file.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_keeps_in_workspace_session_temp_children_launch_scoped() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let temp_root = cwd.join("temp-root");
+        let session_temp_dir = temp_root.join("mcp-repl-session-test");
+        let r_tempdir = session_temp_dir.join("Rtmp123");
+        let temp_file = r_tempdir.join("artifact.txt");
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let original_temp = std::env::var_os("TEMP");
+        let original_tmp = std::env::var_os("TMP");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_root).expect("temp root");
+        let scrub_script = format!(
+            r#"
+$path = '{}'
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+"#,
+            cwd.display()
+        );
+        let scrub_status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &scrub_script])
+            .status()
+            .expect("scrub workspace acl status");
+        assert!(scrub_status.success(), "workspace ACL scrub should succeed");
+        unsafe {
+            std::env::set_var("TEMP", &temp_root);
+            std::env::set_var("TMP", &temp_root);
+        }
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            let mut launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply runtime launch ACL state");
+            if let Some(session_temp_guard) =
+                apply_session_temp_launch_acl(&session_temp_dir, Some(stable_sid), launch_sid)
+                    .expect("apply session temp launch ACL")
+            {
+                launch_guards.push(session_temp_guard);
+            }
+
+            assert!(
+                !path_has_any_allow_ace(&session_temp_dir, stable_sid),
+                "in-workspace session temp roots should not keep the shared stable SID"
+            );
+
+            std::fs::create_dir_all(&r_tempdir).expect("nested R tempdir");
+            assert!(
+                !path_has_any_allow_ace(&r_tempdir, stable_sid),
+                "nested temp directories under an in-workspace session temp root should stay off the shared stable SID"
+            );
+
+            std::fs::write(&temp_file, b"artifact").expect("temp artifact");
+            assert!(
+                !path_has_any_allow_ace(&temp_file, stable_sid),
+                "files created in an in-workspace session temp tree should stay off the shared stable SID"
+            );
+            assert!(
+                path_has_allow_ace(&temp_file, launch_sid),
+                "files created in an in-workspace session temp tree should keep the launch SID"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    temp_root.as_path(),
+                    session_temp_dir.as_path(),
+                    r_tempdir.as_path(),
+                    temp_file.as_path(),
+                ],
+            );
+        }
+        match original_temp {
+            Some(value) => unsafe {
+                std::env::set_var("TEMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TEMP");
+            },
+        }
+        match original_tmp {
+            Some(value) => unsafe {
+                std::env::set_var("TMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMP");
+            },
+        }
+    }
+
+    #[test]
+    fn stable_capability_sid_changes_when_workspace_write_policy_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+
+        let base = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let with_root =
+            stable_cap_sid_string(&workspace_policy(vec![extra_root], false, false), &cwd);
+        let with_network = stable_cap_sid_string(&workspace_policy(Vec::new(), true, false), &cwd);
+        let with_tmp_exclusion =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, true), &cwd);
+
+        assert_ne!(base, with_root);
+        assert_ne!(base, with_network);
+        assert_ne!(base, with_tmp_exclusion);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stable_capability_sid_changes_when_relative_writable_root_target_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let target_a = tmp.path().join("target-a");
+        let target_b = tmp.path().join("target-b");
+        let linked_root = cwd.join("linked-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&target_a).expect("target a dir");
+        std::fs::create_dir_all(&target_b).expect("target b dir");
+
+        create_junction(&linked_root, &target_a);
+        let policy = workspace_policy(vec![PathBuf::from("linked-root")], false, false);
+        let first = stable_cap_sid_string(&policy, &cwd);
+
+        remove_junction(&linked_root);
+        create_junction(&linked_root, &target_b);
+        let second = stable_cap_sid_string(&policy, &cwd);
+
+        remove_junction(&linked_root);
+
+        assert_ne!(
+            first, second,
+            "stable SID should change when a relative writable root resolves to a different target"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_launch_matches_rejects_relative_writable_root_target_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        let target_a = tmp.path().join("target-a");
+        let target_b = tmp.path().join("target-b");
+        let linked_root = cwd.join("linked-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+        std::fs::create_dir_all(&target_a).expect("target a dir");
+        std::fs::create_dir_all(&target_b).expect("target b dir");
+
+        create_junction(&linked_root, &target_a);
+        let policy = workspace_policy(vec![PathBuf::from("linked-root")], false, false);
+        let launch = PreparedSandboxLaunch {
+            policy: policy.clone(),
+            sandbox_policy_cwd: canonicalize_or_identity(&cwd),
+            session_temp_dir: canonicalize_or_identity(&session_temp_dir),
+            capability_sid: stable_cap_sid_string(&policy, &cwd),
+        };
+        assert!(
+            launch.matches(&policy, &cwd, &session_temp_dir),
+            "launch should match before the relative writable root target changes"
+        );
+
+        remove_junction(&linked_root);
+        create_junction(&linked_root, &target_b);
+
+        assert!(
+            !launch.matches(&policy, &cwd, &session_temp_dir),
+            "launch should stop matching once a relative writable root resolves elsewhere"
+        );
+
+        remove_junction(&linked_root);
+    }
+
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let late_root = tmp.path().join("late-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![late_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(&late_root).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after a declared absolute writable root is created"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root_with_parent_segments() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let late_root = tmp.path().join("child").join("..").join("late-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![late_root], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(tmp.path().join("late-root")).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after parent-segment path normalization changes"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root_with_case_change() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let late_root = PathBuf::from(
+            tmp.path()
+                .join("late-root")
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+        );
+        let policy = workspace_policy(vec![late_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(&late_root).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after case-only path normalization changes"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dropping_wrapper_child_stdio_closes_all_pipe_handles() {
+        fn write_end_reports_closed_peer(mut probe: File, label: &str) {
+            let err = probe
+                .write_all(b"x")
+                .expect_err("write probe should fail once the pipe peer is dropped");
+            let raw = err.raw_os_error().map(|code| code as u32);
+            assert!(
+                err.kind() == io::ErrorKind::BrokenPipe
+                    || matches!(raw, Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA)),
+                "{label} should observe a broken pipe after dropping wrapper stdio, got: {err}"
+            );
+        }
+
+        unsafe fn read_end_reports_closed_peer(probe: File, label: &str) {
+            let ok = PeekNamedPipe(
+                probe.as_raw_handle() as HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let err = GetLastError();
+            assert!(
+                ok == 0 && matches!(err, ERROR_BROKEN_PIPE | ERROR_NO_DATA),
+                "{label} should observe a disconnected pipe after dropping wrapper stdio, got ok={ok} err={err}"
+            );
+        }
+
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let stdin_write_probe = stdio.stdin_write.try_clone().expect("clone stdin write");
+            drop(stdio);
+            write_end_reports_closed_peer(stdin_write_probe, "stdin write handle");
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stdin_probe = stdio.child_stdin.try_clone().expect("clone child stdin");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(child_stdin_probe, "child stdin handle");
+            }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let stdout_read_probe = stdio.stdout_read.try_clone().expect("clone stdout read");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(stdout_read_probe, "stdout read handle");
+            }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stdout_probe = stdio.child_stdout.try_clone().expect("clone child stdout");
+            drop(stdio);
+            write_end_reports_closed_peer(child_stdout_probe, "child stdout handle");
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let stderr_read_probe = stdio.stderr_read.try_clone().expect("clone stderr read");
+            drop(stdio);
+            unsafe {
+                read_end_reports_closed_peer(stderr_read_probe, "stderr read handle");
+            }
+        }
+        {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let child_stderr_probe = stdio.child_stderr.try_clone().expect("clone child stderr");
+            drop(stdio);
+            write_end_reports_closed_peer(child_stderr_probe, "child stderr handle");
+        }
+    }
+
+    #[test]
+    fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("reset session temp dir");
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        let probe = session_temp_dir.join("probe.txt");
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            format!("Set-Content -LiteralPath '{}' -Value 'OK'", probe.display()),
+        ];
+
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        env_map.extend(sandbox_acl_env_map(&session_temp_dir));
+        let run_result = run_sandboxed_command_with_env_map(
+            &policy,
+            &cwd,
+            &command,
+            prepared.capability_sid(),
+            env_map,
+        );
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            revoke_ace(&cwd, sid);
+            revoke_ace(&session_temp_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+
+        let status = run_result.expect("sandboxed command should run");
+        assert_eq!(status, 0);
+        assert!(
+            probe.is_file(),
+            "expected sandboxed command to recreate probe file after tempdir reset"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_default_dacl_keeps_only_launch_sid() {
+        let capability_sids = LaunchCapabilitySids {
+            filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
+            launch_sid: "S-1-5-21-5-6-7-8".to_string(),
+        };
+
+        assert_eq!(
+            default_dacl_capability_sid_strings(&capability_sids),
+            vec!["S-1-5-21-5-6-7-8"],
+            "prepared launches should keep only the per-launch SID in the token default DACL",
+        );
+    }
+
+    #[test]
+    fn sandboxed_command_keeps_in_workspace_temp_children_off_stable_sid() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let temp_root = cwd.join("temp-root");
+        let session_temp_dir = temp_root.join("mcp-repl-session-test");
+        let r_tempdir = session_temp_dir.join("Rtmp123");
+        let temp_file = r_tempdir.join("artifact.txt");
+        let original_temp = std::env::var_os("TEMP");
+        let original_tmp = std::env::var_os("TMP");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_root).expect("temp root");
+        unsafe {
+            std::env::set_var("TEMP", &temp_root);
+            std::env::set_var("TMP", &temp_root);
+        }
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            format!(
+                "$targetDir = $env:TEMP + '\\\\Rtmp123'; New-Item -ItemType Directory -Path $targetDir -Force | Out-Null; Set-Content -LiteralPath '{}' -Value 'OK'",
+                temp_file.display()
+            ),
+        ];
+
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        env_map.extend(sandbox_acl_env_map(&session_temp_dir));
+        let status = run_sandboxed_command_with_env_map(
+            &policy,
+            &cwd,
+            &command,
+            prepared.capability_sid(),
+            env_map,
+        )
+        .expect("sandboxed command should run");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            assert_eq!(status, 0);
+            assert!(
+                !path_has_any_allow_ace(&session_temp_dir, stable_sid),
+                "the session temp root should stay off the shared stable SID after a sandboxed launch"
+            );
+            assert!(
+                !path_has_any_allow_ace(&r_tempdir, stable_sid),
+                "nested temp directories should stay off the shared stable SID after a sandboxed launch"
+            );
+            assert!(
+                !path_has_any_allow_ace(&temp_file, stable_sid),
+                "nested temp files should stay off the shared stable SID after a sandboxed launch"
+            );
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    temp_root.as_path(),
+                    session_temp_dir.as_path(),
+                    r_tempdir.as_path(),
+                    temp_file.as_path(),
+                ],
+            );
+        }
+
+        match original_temp {
+            Some(value) => unsafe {
+                std::env::set_var("TEMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TEMP");
+            },
+        }
+        match original_tmp {
+            Some(value) => unsafe {
+                std::env::set_var("TMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMP");
+            },
+        }
+    }
+
+    #[test]
+    fn inline_launch_default_dacl_keeps_single_capability_sid() {
+        let capability_sids = LaunchCapabilitySids {
+            filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
+            launch_sid: "S-1-5-21-1-2-3-4".to_string(),
+        };
+
+        assert_eq!(
+            default_dacl_capability_sid_strings(&capability_sids),
+            vec!["S-1-5-21-1-2-3-4"],
+            "inline launches should keep using their single capability SID in the default DACL",
+        );
+    }
+
+    #[test]
+    fn prepared_launch_acl_lock_blocks_same_sid_until_release() {
+        let first = acquire_prepared_launch_acl_lock("S-1-5-21-1-2-3-4")
+            .expect("first prepared launch ACL lock");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let waiter = thread::spawn(move || {
+            let second = acquire_prepared_launch_acl_lock("S-1-5-21-1-2-3-4")
+                .expect("second prepared launch ACL lock");
+            acquired_tx
+                .send(())
+                .expect("lock acquisition should be reported");
+            drop(second);
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "same-SID prepared launch ACL work should serialize behind the first lock holder"
+        );
+
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should acquire once the first lock is released");
+        waiter.join().expect("waiter should join");
+    }
+
+    #[test]
+    fn runtime_launch_acl_state_blocks_same_sid_until_release() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let first = acquire_prepared_launch_acl_lock(prepared.capability_sid())
+            .expect("first prepared launch ACL lock");
+        let launch = prepared.clone();
+        let launch_sid_string = make_random_sid_string();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+
+        let waiter = thread::spawn(move || unsafe {
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            let guards = apply_runtime_launch_acl_state(&launch, launch_sid)
+                .expect("apply runtime launch ACL state");
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            applied_tx.send(()).expect("launch ACL application signal");
+        });
+
+        assert!(
+            applied_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "runtime launch ACL writes should serialize behind the prepared launch ACL lock"
+        );
+
+        drop(first);
+        applied_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime launch ACL work should continue once the lock is released");
+        waiter.join().expect("waiter should join");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), session_temp_dir.as_path()],
+            );
+            LocalFree(stable_sid as HLOCAL);
+        }
+    }
+
+    #[test]
     fn compute_allow_paths_denies_git_dir_inside_writable_root() {
         let tmp = tempdir().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
@@ -1560,5 +4825,1837 @@ mod tests {
                 .contains(&canonicalize_or_identity(&missing_root)),
             "declared writable root should remain allowed even before it exists"
         );
+    }
+
+    unsafe fn path_has_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+        let has_ace = dacl_has_allow_for_sid(dacl, sid, path.is_dir());
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_any_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_inheritable_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) == 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_write_deny_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+        let has_ace = dacl_has_write_deny_for_sid(dacl, sid);
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    fn expected_write_deny_mask() -> u32 {
+        FILE_GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | FILE_DELETE_CHILD
+    }
+
+    unsafe fn path_write_deny_mask(path: &Path, sid: *mut c_void) -> u32 {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return 0;
+        }
+
+        let mut mask = 0;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 1 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let denied = &*(ace as *const ACCESS_DENIED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+                    mask |= denied.Mask;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        mask
+    }
+
+    unsafe fn add_custom_allow_ace(
+        path: &Path,
+        sid: *mut c_void,
+        mask: u32,
+        inheritance: u32,
+    ) -> Result<(), String> {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+        }
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        };
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions = mask;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance = inheritance;
+        explicit.Trustee = trustee;
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+        if set_acl_code != ERROR_SUCCESS {
+            if !security_descriptor.is_null() {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+            return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+        }
+
+        let set_security_code = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if set_security_code != ERROR_SUCCESS {
+            return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+        }
+        Ok(())
+    }
+
+    unsafe fn add_custom_deny_ace(path: &Path, sid: *mut c_void, mask: u32) -> Result<(), String> {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+        }
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        };
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions = mask;
+        explicit.grfAccessMode = DENY_ACCESS;
+        explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+        explicit.Trustee = trustee;
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+        if set_acl_code != ERROR_SUCCESS {
+            if !security_descriptor.is_null() {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+            return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+        }
+
+        let set_security_code = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if set_security_code != ERROR_SUCCESS {
+            return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+        }
+        Ok(())
+    }
+
+    unsafe fn revoke_capability_sid_paths(capability_sid: &str, paths: &[&Path]) {
+        let sid = convert_string_sid_to_sid(capability_sid).expect("capability SID should convert");
+        for path in paths {
+            revoke_ace(path, sid);
+        }
+        LocalFree(sid as HLOCAL);
+    }
+
+    #[test]
+    fn prepared_launch_refresh_reapplies_allow_acl_to_recreated_writable_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::remove_dir_all(&extra_root).expect("remove extra root");
+        std::fs::create_dir_all(&extra_root).expect("recreate extra root");
+
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_any_allow_ace(&extra_root, sid),
+                "refresh should restore allow ACEs on recreated writable roots"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&extra_root, sid),
+                "stable refresh should restore writable roots with a non-inheriting allow ACE"
+            );
+            assert!(
+                path_has_inherit_only_allow_ace(&extra_root, sid),
+                "stable refresh should restore writable roots with an inherit-only ACE for future children"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_prepare_applies_allow_acl_to_missing_writable_root() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let missing_root = workspace.path().join("missing-root");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                missing_root.is_dir(),
+                "prepare should create missing writable roots"
+            );
+            assert!(
+                path_has_any_allow_ace(&missing_root, sid),
+                "prepare should apply allow ACEs to writable roots declared before they exist"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&missing_root, sid),
+                "prepared writable roots should keep the stable allow ACE on the root only"
+            );
+            assert!(
+                path_has_inherit_only_allow_ace(&missing_root, sid),
+                "prepared writable roots should also add an inherit-only stable ACE for future children"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    missing_root.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_reapplies_allow_acl_to_late_created_workspace_root_child() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let root_child = cwd.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        std::fs::write(&root_child, b"artifact").expect("late-created root child");
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "prepare should apply allow ACEs to the primary workspace root"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "prepared workspace roots should keep the stable allow ACE on the root only"
+            );
+            assert!(
+                !path_has_inherit_only_allow_ace(&cwd, sid),
+                "workspace roots should avoid inheriting the stable allow ACE onto brand-new root children"
+            );
+            assert!(
+                path_has_allow_ace(&root_child, sid),
+                "refresh should reapply the stable allow ACE to late-created root children that remain in the workspace"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    root_child.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_reapplies_allow_acl_to_scrubbed_nested_workspace_tree() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let src_dir = cwd.join("src");
+        let nested_dir = src_dir.join("pkg");
+        let artifact = nested_dir.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&src_dir).expect("workspace src dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        std::fs::create_dir_all(&nested_dir).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            revoke_ace(&nested_dir, stable_sid);
+            revoke_ace(&artifact, stable_sid);
+            assert!(
+                !path_has_any_allow_ace(&nested_dir, stable_sid),
+                "test setup should strip the stable SID from the nested workspace directory"
+            );
+            assert!(
+                !path_has_any_allow_ace(&artifact, stable_sid),
+                "test setup should strip the stable SID from the nested workspace file"
+            );
+
+            refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                stable_sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            )
+            .expect("runtime refresh prepared ACL state");
+
+            assert!(
+                path_has_allow_ace(&nested_dir, stable_sid),
+                "runtime refresh should restore the stable allow ACE on scrubbed nested workspace directories"
+            );
+            assert!(
+                path_has_allow_ace(&artifact, stable_sid),
+                "runtime refresh should restore the stable allow ACE on scrubbed nested workspace files"
+            );
+
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    src_dir.as_path(),
+                    nested_dir.as_path(),
+                    artifact.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_write_deny_ace(&git_dir, sid),
+                "refresh should apply deny ACEs to protected directories created after prepare"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_applies_deny_acl_to_existing_file_under_protected_dir() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = prepared_launch_session_root_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = session_temp_dir.join("artifact.txt");
+        let moved_file = git_dir.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+        std::fs::write(&source_file, b"artifact").expect("temp artifact file");
+        std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            assert!(
+                !path_has_allow_ace(&moved_file, stable_sid),
+                "test setup should not leave the stable allow ACE on a file moved under .git"
+            );
+
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
+
+            assert!(
+                path_has_write_deny_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should apply deny ACEs to existing protected descendants"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    git_dir.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_applies_stable_deny_acl_to_existing_file_under_protected_descendant()
+    {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let nested_dir = cwd.join("src");
+        let source_file = nested_dir.join("artifact.txt");
+        let hooks_dir = cwd.join(".git").join("hooks");
+        let moved_file = hooks_dir.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&nested_dir).expect("workspace nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::write(&source_file, b"artifact").expect("workspace artifact");
+        std::fs::create_dir_all(&hooks_dir).expect("protected descendant dir");
+        std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_write_deny_ace(&moved_file, stable_sid),
+                "test setup should start without a stable deny ACE on the protected descendant"
+            );
+
+            refresh_prepared_sandbox_launch_acl_state(&prepared)
+                .expect("refresh prepared launch ACL state");
+
+            assert!(
+                path_has_write_deny_ace(&moved_file, stable_sid),
+                "prepared refresh should apply stable deny ACEs to existing protected descendants"
+            );
+
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested_dir.as_path(),
+                    hooks_dir.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn add_deny_write_ace_upgrades_partial_deny_acl_for_same_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let protected_dir = tmp.path().join("protected");
+        std::fs::create_dir_all(&protected_dir).expect("protected dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            let partial_mask = FILE_WRITE_DATA | DELETE;
+            add_custom_deny_ace(&protected_dir, sid, partial_mask)
+                .expect("partial deny ACE should be installed");
+            assert_eq!(
+                path_write_deny_mask(&protected_dir, sid) & expected_write_deny_mask(),
+                partial_mask,
+                "test setup should start with only a partial deny mask"
+            );
+
+            let added = add_deny_write_ace_with_options(&protected_dir, sid, true)
+                .expect("full deny ACE should be applied");
+
+            assert!(
+                added,
+                "partial deny ACEs should be treated as incomplete and upgraded"
+            );
+            assert_eq!(
+                path_write_deny_mask(&protected_dir, sid) & expected_write_deny_mask(),
+                expected_write_deny_mask(),
+                "full sandbox write deny mask should be present after upgrade"
+            );
+
+            revoke_deny_write_ace(&protected_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn add_allow_ace_upgrades_non_inheriting_allow_acl_for_same_sid() {
+        let tmp = tempdir().expect("tempdir");
+        let writable_dir = tmp.path().join("writable");
+        std::fs::create_dir_all(&writable_dir).expect("writable dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            add_custom_allow_ace(
+                &writable_dir,
+                sid,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+                0,
+            )
+            .expect("non-inheriting allow ACE should be installed");
+            assert!(
+                !path_has_inheritable_allow_ace(&writable_dir, sid),
+                "test setup should start with a same-SID allow ACE that does not inherit"
+            );
+
+            let added =
+                add_allow_ace(&writable_dir, sid).expect("inheriting allow ACE should be applied");
+
+            assert!(
+                added,
+                "non-inheriting allow ACEs should be treated as incomplete and upgraded"
+            );
+            assert!(
+                path_has_inheritable_allow_ace(&writable_dir, sid),
+                "refreshed writable roots should keep inheriting the capability SID"
+            );
+
+            revoke_ace(&writable_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_writable_root() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = prepared_launch_session_root_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let nested = cwd.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = session_temp_dir.join("artifact.txt");
+        let moved_file = nested.join("artifact.txt");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let filesystem_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("filesystem capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            std::fs::write(&source_file, b"artifact").expect("temp artifact file");
+            add_allow_ace(&source_file, launch_sid).expect("launch-scoped allow ACE");
+            std::fs::rename(&source_file, &moved_file).expect("move artifact into writable root");
+            assert!(
+                !path_has_allow_ace(&moved_file, filesystem_sid),
+                "test setup should not leave the stable filesystem ACE after the move into the writable root"
+            );
+
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
+
+            assert!(
+                path_has_allow_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should restore access on files already under writable roots"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            revoke_ace(&moved_file, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(filesystem_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_applies_allow_acl_to_existing_file_under_additional_writable_root() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = prepared_launch_session_root_tempdir();
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = session_temp_dir.join("artifact.txt");
+        let moved_file = extra_root.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra root");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let filesystem_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("filesystem capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            std::fs::write(&source_file, b"artifact").expect("temp artifact file");
+            add_allow_ace(&source_file, launch_sid).expect("launch-scoped allow ACE");
+            std::fs::rename(&source_file, &moved_file)
+                .expect("move artifact into additional writable root");
+            assert!(
+                !path_has_allow_ace(&moved_file, filesystem_sid),
+                "test setup should not leave the stable filesystem ACE after the move into the additional writable root"
+            );
+
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply launch ACL state");
+
+            assert!(
+                path_has_allow_ace(&moved_file, launch_sid),
+                "runtime launch ACL state should restore access on files already under additional writable roots"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            revoke_ace(&moved_file, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(filesystem_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_launch_sid_from_midrun_file_under_root_guard() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let artifact = writable_root.join("artifact.txt");
+        std::fs::create_dir_all(&writable_root).expect("writable root");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            add_allow_ace_with_options(&artifact, launch_sid, false, false)
+                .expect("launch file allow ACE");
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the launch SID on the mid-run artifact"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove launch SID access from descendants covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_inherited_launch_sid_from_midrun_file() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let artifact = writable_root.join("artifact.txt");
+        std::fs::create_dir_all(&writable_root).expect("writable root");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            std::fs::write(&artifact, b"artifact").expect("artifact file");
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the inherited launch SID on the mid-run artifact"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove inherited launch SID access from descendants covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_acl_state_revokes_launch_sid_from_nested_directory_tree() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let writable_root = tmp.path().join("writable");
+        let nested_dir = writable_root.join("nested");
+        let artifact = nested_dir.join("artifact.txt");
+        std::fs::create_dir_all(&nested_dir).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            add_allow_ace_with_options(&writable_root, launch_sid, false, true)
+                .expect("launch root allow ACE");
+            add_allow_ace_with_options(&nested_dir, launch_sid, false, true)
+                .expect("launch nested dir allow ACE");
+            add_allow_ace_with_options(&artifact, launch_sid, false, false)
+                .expect("launch file allow ACE");
+            assert!(
+                path_has_any_allow_ace(&nested_dir, launch_sid),
+                "test setup should leave the launch SID on the nested directory"
+            );
+            assert!(
+                path_has_any_allow_ace(&artifact, launch_sid),
+                "test setup should leave the launch SID on the nested file"
+            );
+
+            let guards = vec![CapabilityAclGuard {
+                path: writable_root.clone(),
+                sid: launch_sid,
+                kind: CapabilityAclKind::Allow,
+            }];
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+
+            assert!(
+                !path_has_any_allow_ace(&nested_dir, launch_sid),
+                "cleanup should remove launch SID access from nested directories covered by a writable-root guard"
+            );
+            assert!(
+                !path_has_any_allow_ace(&artifact, launch_sid),
+                "cleanup should remove launch SID access from nested files covered by a writable-root guard"
+            );
+
+            revoke_ace(&artifact, launch_sid);
+            revoke_ace(&nested_dir, launch_sid);
+            revoke_ace(&writable_root, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_does_not_recreate_deleted_file_as_directory() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let nested = cwd.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let artifact = nested.join("artifact.txt");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::remove_file(&artifact).expect("remove artifact before refresh");
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        assert!(
+            !artifact.exists(),
+            "refresh should not recreate a disappeared file path"
+        );
+        assert!(
+            !artifact.is_dir(),
+            "refresh should not recreate a disappeared file path as a directory"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    artifact.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_skips_vanished_protected_descendant() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let artifact = git_dir.join("index.lock");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        std::fs::write(&artifact, b"lock").expect("artifact file");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            set_prepared_launch_deny_target_pre_apply_delete(Some(artifact.clone()));
+            let result = apply_runtime_launch_acl_state(&prepared, launch_sid);
+            set_prepared_launch_deny_target_pre_apply_delete(None);
+
+            assert!(
+                result.is_ok(),
+                "runtime ACL application should ignore protected descendants that vanish before ACL snapshot"
+            );
+            assert!(
+                !artifact.exists(),
+                "test setup should delete the transient protected descendant before ACL snapshot"
+            );
+
+            if let Ok(launch_guards) = result {
+                cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            }
+            LocalFree(launch_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    git_dir.as_path(),
+                    artifact.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_rolls_back_added_deny_acls_after_failure() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let codex_dir = cwd.join(".codex");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir after prepare");
+        set_add_deny_write_ace_test_error(Some((1, "injected deny ACL failure".to_string())));
+
+        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+            "expected injected deny ACL failure, got: {result:?}"
+        );
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_write_deny_ace(&git_dir, sid),
+                "failed refresh should roll back deny ACEs added earlier in the same pass"
+            );
+            assert!(
+                !path_has_write_deny_ace(&codex_dir, sid),
+                "failed refresh should not leave a deny ACE on the failing path"
+            );
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn prepare_sandbox_launch_removes_materialized_missing_writable_root_after_failure() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let missing_root = cwd.join("generated").join("missing-root");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, false);
+        set_add_deny_write_ace_test_error(Some((0, "injected deny ACL failure".to_string())));
+
+        let result = prepare_sandbox_launch(&policy, &cwd, &session_temp_dir);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+            "expected injected deny ACL failure, got: {result:?}"
+        );
+        assert!(
+            !missing_root.exists(),
+            "failed prepare should remove writable roots it had to materialize before the error"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_refresh_skips_access_denied_descendant_under_deny_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let codex_dir = cwd.join(".codex");
+        let protected_descendant = codex_dir.join("rules").join("git.rules");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(protected_descendant.parent().expect("descendant parent"))
+            .expect("create protected descendant parent");
+        std::fs::write(&protected_descendant, "protected").expect("create protected descendant");
+        set_add_deny_write_ace_test_error(Some((1, "SetNamedSecurityInfoW failed: 5".to_string())));
+
+        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            result.is_ok(),
+            "access-denied descendants under protected roots should be skipped instead of aborting refresh: {result:?}"
+        );
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_write_deny_ace(&codex_dir, sid),
+                "refresh should still apply the deny ACE to the protected root when a descendant is skipped"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    codex_dir.as_path(),
+                    protected_descendant.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_preserves_preexisting_allow_acl_when_cleanup_rolls_back() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            revoke_ace(&cwd, sid);
+            add_custom_allow_ace(
+                &cwd,
+                sid,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+                0,
+            )
+            .expect("non-inheriting allow ACE should be installed");
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "test setup should keep a same-SID allow ACE on the writable root"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "test setup should start with a same-SID allow ACE that does not inherit"
+            );
+
+            std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+            set_add_deny_write_ace_test_error(Some((0, "injected deny ACL failure".to_string())));
+
+            let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+            set_add_deny_write_ace_test_error(None);
+
+            assert!(
+                matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+                "expected injected deny ACL failure, got: {result:?}"
+            );
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "failed refresh should preserve the preexisting same-SID allow ACE on earlier writable paths"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "failed refresh should restore the preexisting non-inheriting allow ACE instead of deleting it"
+            );
+
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_skips_unreadable_descendants_under_writable_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra");
+        let unreadable_child = extra_root.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&unreadable_child).expect("nested dir");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            revoke_ace(&extra_root, stable_sid);
+            assert!(
+                !path_has_any_allow_ace(&extra_root, stable_sid),
+                "test setup should remove the stable allow ACE from the writable root"
+            );
+
+            set_prepared_launch_allow_targets_read_dir_test_error(Some((
+                unreadable_child.clone(),
+                "injected unreadable descendant".to_string(),
+            )));
+
+            let result = apply_runtime_launch_acl_state(&prepared, launch_sid);
+
+            set_prepared_launch_allow_targets_read_dir_test_error(None);
+
+            assert!(
+                result.is_ok(),
+                "runtime ACL application should skip unreadable descendants instead of aborting"
+            );
+            assert!(
+                path_has_allow_ace(&extra_root, launch_sid),
+                "runtime ACL application should still apply allow ACEs to the writable root when a descendant cannot be enumerated"
+            );
+
+            if let Ok(launch_guards) = result {
+                cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            }
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    unreadable_child.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refreshes_acl_state_before_spawn() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        set_apply_prepared_launch_acl_state_test_error(Some(
+            "prepared launch runtime refresh invoked".to_string(),
+        ));
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        set_apply_prepared_launch_acl_state_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(ref err) if err.contains("prepared launch runtime refresh invoked")
+            ),
+            "prepared runtime should refresh stable ACL state before spawning the child, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_scans_writable_root_descendants_recursively() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let nested = cwd.join("nested");
+        let deeper = nested.join("deeper");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&deeper).expect("nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed for an existing writable root, got: {result:?}"
+        );
+        let expected_read_dir_calls = vec![
+            canonicalize_or_identity(&cwd),
+            canonicalize_or_identity(&nested),
+            canonicalize_or_identity(&deeper),
+        ];
+        assert!(
+            read_dir_calls == expected_read_dir_calls,
+            "runtime refresh should inspect writable-root descendants recursively when refreshing prepared ACL state, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    deeper.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_skips_session_temp_subtrees_inside_workspace_roots() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let nested = cwd.join("nested");
+        let temp_root = cwd.join("temp-root");
+        let session_temp_dir = temp_root.join("session-temp");
+        let temp_nested = session_temp_dir.join("nested");
+        std::fs::create_dir_all(&nested).expect("workspace nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+        std::fs::create_dir_all(&temp_nested).expect("session temp nested dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed when the session temp dir lives inside the workspace, got: {result:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&session_temp_dir)),
+            "runtime refresh should skip the session temp subtree itself, got: {read_dir_calls:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&temp_root)),
+            "runtime refresh should skip the configured temp root subtree when it lives under the workspace, got: {read_dir_calls:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&temp_nested)),
+            "runtime refresh should not recurse into descendants under the session temp subtree, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    temp_root.as_path(),
+                    session_temp_dir.as_path(),
+                    temp_nested.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_skips_sibling_session_temp_trees_under_shared_temp_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let workspace_nested = cwd.join("nested");
+        let temp_root = cwd.join("temp-root");
+        let session_temp_dir = temp_root.join("mcp-repl-session-a");
+        let sibling_session_temp_dir = temp_root.join("mcp-repl-session-b");
+        let sibling_nested = sibling_session_temp_dir.join("nested");
+        let original_temp = std::env::var_os("TEMP");
+        let original_tmp = std::env::var_os("TMP");
+        std::fs::create_dir_all(&workspace_nested).expect("workspace nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+        crate::sandbox::prepare_session_temp_dir(&sibling_session_temp_dir)
+            .expect("prepare sibling session temp dir");
+        std::fs::create_dir_all(&sibling_nested).expect("sibling session temp nested dir");
+
+        unsafe {
+            std::env::set_var("TEMP", &session_temp_dir);
+            std::env::set_var("TMP", &session_temp_dir);
+        }
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        match original_temp {
+            Some(value) => unsafe {
+                std::env::set_var("TEMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TEMP");
+            },
+        }
+        match original_tmp {
+            Some(value) => unsafe {
+                std::env::set_var("TMP", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMP");
+            },
+        }
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed when sibling session temp trees share a temp root, got: {result:?}"
+        );
+        assert!(
+            read_dir_calls.contains(&canonicalize_or_identity(&cwd))
+                && read_dir_calls.contains(&canonicalize_or_identity(&workspace_nested)),
+            "runtime refresh should keep scanning non-temp workspace descendants, got: {read_dir_calls:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&temp_root)),
+            "runtime refresh should skip the shared temp root subtree when it lives inside the workspace, got: {read_dir_calls:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&sibling_session_temp_dir)),
+            "runtime refresh should not scan sibling session temp trees under the shared temp root, got: {read_dir_calls:?}"
+        );
+        assert!(
+            !read_dir_calls.contains(&canonicalize_or_identity(&sibling_nested)),
+            "runtime refresh should not descend into sibling session temp children, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[
+                    cwd.as_path(),
+                    workspace_nested.as_path(),
+                    temp_root.as_path(),
+                    session_temp_dir.as_path(),
+                    sibling_session_temp_dir.as_path(),
+                    sibling_nested.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_scans_workspace_descendants_recursively_with_extra_writable_roots_for_live_sessions()
+     {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let nested = cwd.join("nested");
+        let deeper = nested.join("deeper");
+        let extra_root = tmp.path().join("extra-root");
+        let extra_nested = extra_root.join("nested");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&deeper).expect("workspace nested dir");
+        std::fs::create_dir_all(&extra_nested).expect("extra root nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let (workspace_root_scope, extra_root_scope) =
+            prepared_launch_refresh_scopes(&policy, true);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                workspace_root_scope,
+                extra_root_scope,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            matches!(workspace_root_scope, PreparedLaunchAllowScope::Recursive),
+            "same-checkout live sessions should keep the workspace root refresh recursive even when extra writable roots are configured, got: {workspace_root_scope:?}"
+        );
+        assert!(
+            matches!(extra_root_scope, PreparedLaunchAllowScope::Recursive),
+            "same-checkout live sessions should keep extra writable roots recursive, got: {extra_root_scope:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed with extra writable roots, got: {result:?}"
+        );
+        assert!(
+            read_dir_calls.contains(&canonicalize_or_identity(&nested))
+                && read_dir_calls.contains(&canonicalize_or_identity(&deeper)),
+            "runtime refresh should inspect workspace descendants recursively even when extra writable roots are configured, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    deeper.as_path(),
+                    extra_root.as_path(),
+                    extra_nested.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_scopes_are_recursive_without_other_live_sessions() {
+        let policy = workspace_policy(Vec::new(), false, false);
+        let (workspace_root_scope, extra_root_scope) =
+            prepared_launch_refresh_scopes(&policy, false);
+
+        assert!(
+            matches!(workspace_root_scope, PreparedLaunchAllowScope::Recursive),
+            "single-session respawns should refresh workspace roots recursively, got: {workspace_root_scope:?}"
+        );
+        assert!(
+            matches!(extra_root_scope, PreparedLaunchAllowScope::Recursive),
+            "single-session respawns should refresh extra writable roots recursively, got: {extra_root_scope:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_test_mutex_recovers_after_panic_and_clears_hook_state() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = prepare_sandbox_launch_test_mutex()
+                .lock()
+                .expect("windows sandbox test mutex");
+            set_apply_prepared_launch_acl_state_test_error(Some(
+                "leaked test hook should be cleared after panic".to_string(),
+            ));
+            panic!("intentional panic to simulate an earlier test failure");
+        });
+
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex should recover after panic");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        assert!(
+            result.is_ok(),
+            "poison recovery should also clear leaked test hooks before the next test, got: {result:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[cwd.as_path(), session_temp_dir.as_path()],
+            );
+        }
     }
 }

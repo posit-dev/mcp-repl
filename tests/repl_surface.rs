@@ -1,8 +1,12 @@
 mod common;
 
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::RawContent;
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -31,6 +35,28 @@ fn busy_response(text: &str) -> bool {
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
+}
+
+fn image_payload_lengths(result: &rmcp::model::CallToolResult) -> Vec<usize> {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Image(image) => Some(image.data.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"((?:[A-Za-z]:\\|/)[^\r\n]+?events\.log)")
+            .expect("events-log regex should compile")
+    });
+    re.captures(text)
+        .and_then(|captures| captures.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -150,5 +176,142 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
         "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "plot(1:10)\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy during plot; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let images = image_payload_lengths(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected the first base plot to emit one image, got {} images: {text:?}",
+        images.len()
+    );
+    assert!(
+        images[0] > 1_000,
+        "expected the first base plot image payload to be non-trivial, got {} base64 bytes",
+        images[0]
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multiple_base_plots_in_one_reply_emit_each_image() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "for (i in 1:4) plot(1:10, main = sprintf(\"plot%03d\", i))\n",
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy during multi-plot request; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let images = image_payload_lengths(&result);
+    assert!(
+        events_log_path(&text).is_none(),
+        "did not expect a four-plot reply to use an output bundle, got: {text:?}"
+    );
+    assert_eq!(
+        images.len(),
+        4,
+        "expected one inline image per plot page when four plots are produced, got {} images: {text:?}",
+        images.len()
+    );
+    assert!(
+        images.iter().all(|len| *len > 1_000),
+        "expected every inline plot image payload to be non-trivial, got lengths {images:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn base_plots_above_inline_limit_use_bundle_and_keep_two_anchors() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "for (i in 1:6) plot(1:10, main = sprintf(\"plot%03d\", i))\n",
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy during six-plot request; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let events_log = events_log_path(&text)
+        .unwrap_or_else(|| panic!("expected six-plot reply to disclose events.log, got: {text:?}"));
+    let events = fs::read_to_string(&events_log)?;
+    let image_events = events.lines().filter(|line| line.starts_with("I ")).count();
+    let images = image_payload_lengths(&result);
+
+    assert_eq!(
+        image_events, 6,
+        "expected output bundle to preserve all six plot pages, got {image_events} image events: {events:?}"
+    );
+    assert_eq!(
+        images.len(),
+        2,
+        "expected replies above the inline image limit to keep only two anchor images inline, got {} images: {text:?}",
+        images.len()
+    );
+    assert!(
+        images.iter().all(|len| *len > 1_000),
+        "expected both inline anchor image payloads to be non-trivial, got lengths {images:?}"
+    );
+
+    session.cancel().await?;
     Ok(())
 }

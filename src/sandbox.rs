@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -482,6 +484,57 @@ pub struct PreparedCommand {
     pub denial_logger: Option<DenialLogger>,
 }
 
+#[cfg(target_family = "unix")]
+fn configure_embedded_r_runtime_env(env: &mut HashMap<String, String>) {
+    let Some(r_home) = embedded_r_home() else {
+        return;
+    };
+
+    env.entry("R_HOME".to_string())
+        .or_insert_with(|| r_home.to_string_lossy().to_string());
+
+    let lib_dir = r_home.join("lib");
+    if !lib_dir.try_exists().unwrap_or(false) {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    prepend_env_path(env, "LD_LIBRARY_PATH", &lib_dir);
+    #[cfg(target_os = "macos")]
+    prepend_env_path(env, "DYLD_FALLBACK_LIBRARY_PATH", &lib_dir);
+}
+
+#[cfg(target_family = "unix")]
+fn embedded_r_home() -> Option<&'static PathBuf> {
+    static R_HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    R_HOME
+        .get_or_init(|| harp::command::r_home_setup().ok())
+        .as_ref()
+}
+
+#[cfg(target_family = "unix")]
+fn prepend_env_path(env: &mut HashMap<String, String>, key: &str, prefix: &Path) {
+    let mut paths = vec![prefix.to_path_buf()];
+    let existing = env
+        .get(key)
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os(key));
+
+    if let Some(existing) = existing {
+        for path in std::env::split_paths(&existing) {
+            if !paths.iter().any(|candidate| candidate == &path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    let value = match std::env::join_paths(paths) {
+        Ok(joined) => joined.to_string_lossy().to_string(),
+        Err(_) => prefix.to_string_lossy().to_string(),
+    };
+    env.insert(key.to_string(), value);
+}
+
 pub fn prepare_worker_command(
     program: &Path,
     args: Vec<String>,
@@ -519,7 +572,7 @@ pub fn prepare_worker_command(
         },
     );
 
-    prepare_session_temp_dir(&state.session_temp_dir)?;
+    ensure_session_temp_dir(&state.session_temp_dir)?;
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
@@ -538,6 +591,9 @@ pub fn prepare_worker_command(
             );
         }
     }
+
+    #[cfg(target_family = "unix")]
+    configure_embedded_r_runtime_env(&mut env);
 
     if !state.sandbox_policy.requires_sandbox() {
         return Ok(PreparedCommand {
@@ -756,6 +812,8 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
     }
 }
 
+// Allocate the server-owned session temp root. Today SandboxState keeps this
+// path stable across worker respawns and resets it in place before each spawn.
 fn build_session_temp_dir_path() -> PathBuf {
     Builder::new()
         .prefix("mcp-repl-session-")
@@ -774,7 +832,10 @@ fn build_session_temp_dir_path() -> PathBuf {
         })
 }
 
-fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
+// Prepare the server-owned session temp dir for a fresh worker launch by
+// clearing any old contents and recreating the directory at the configured
+// path.
+pub(crate) fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::SessionTempDir(format!(
             "session temp dir is not absolute: {}",
@@ -794,6 +855,36 @@ fn prepare_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
             "refusing to use a temp dir without parent".to_string(),
         ));
     }
+    reset_session_temp_dir(path)
+}
+
+fn ensure_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
+    if !path.is_absolute() {
+        return Err(SandboxError::SessionTempDir(format!(
+            "session temp dir is not absolute: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let base_tmp = std::env::temp_dir();
+    if !path.starts_with(&base_tmp) {
+        return Err(SandboxError::SessionTempDir(format!(
+            "session temp dir outside system temp: {} (base: {})",
+            path.to_string_lossy(),
+            base_tmp.to_string_lossy()
+        )));
+    }
+    if path.parent().is_none() {
+        return Err(SandboxError::SessionTempDir(
+            "refusing to use a temp dir without parent".to_string(),
+        ));
+    }
+    std::fs::create_dir_all(path).map_err(|err| SandboxError::SessionTempDir(err.to_string()))?;
+    Ok(())
+}
+
+// Reset the current session temp location in place. This intentionally keeps
+// the configured path stable even though the contents are per-launch.
+fn reset_session_temp_dir(path: &Path) -> Result<(), SandboxError> {
     if let Err(err) = std::fs::remove_dir_all(path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
@@ -1665,6 +1756,7 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
         &args.sandbox_policy,
         &args.sandbox_policy_cwd,
         &args.command,
+        &args.prepared_capability_sid,
     )
 }
 
@@ -1672,16 +1764,23 @@ fn windows_sandbox_main_impl() -> Result<i32, String> {
 struct WindowsSandboxArgs {
     sandbox_policy_cwd: PathBuf,
     sandbox_policy: SandboxPolicy,
+    prepared_capability_sid: String,
     command: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
 fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
+    windows_sandbox_parse_args_from(std::env::args_os().skip(1).collect())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sandbox_parse_args_from(raw_args: Vec<OsString>) -> Result<WindowsSandboxArgs, String> {
     let mut sandbox_policy_cwd: Option<PathBuf> = None;
     let mut sandbox_policy: Option<SandboxPolicy> = None;
+    let mut prepared_capability_sid: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
 
-    let mut args = std::env::args_os().skip(1).peekable();
+    let mut args = raw_args.into_iter().peekable();
     while let Some(arg) = args.next() {
         if arg == "--windows-sandbox" {
             continue;
@@ -1706,6 +1805,17 @@ fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
             );
             continue;
         }
+        if arg == "--prepared-capability-sid" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --prepared-capability-sid".to_string())?;
+            prepared_capability_sid = Some(
+                value
+                    .into_string()
+                    .map_err(|_| "--prepared-capability-sid must be valid UTF-8".to_string())?,
+            );
+            continue;
+        }
         if arg == "--" {
             command.extend(args.map(|value| value.to_string_lossy().to_string()));
             break;
@@ -1716,6 +1826,8 @@ fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
     let sandbox_policy_cwd =
         sandbox_policy_cwd.ok_or_else(|| "missing --sandbox-policy-cwd".to_string())?;
     let sandbox_policy = sandbox_policy.ok_or_else(|| "missing --sandbox-policy".to_string())?;
+    let prepared_capability_sid =
+        prepared_capability_sid.ok_or_else(|| "missing --prepared-capability-sid".to_string())?;
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
@@ -1723,8 +1835,23 @@ fn windows_sandbox_parse_args() -> Result<WindowsSandboxArgs, String> {
     Ok(WindowsSandboxArgs {
         sandbox_policy_cwd,
         sandbox_policy,
+        prepared_capability_sid,
         command,
     })
+}
+
+#[cfg(target_os = "windows")]
+pub fn append_windows_prepared_capability_sid(
+    args: &mut Vec<String>,
+    capability_sid: &str,
+) -> Result<(), String> {
+    let separator_index = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| "windows sandbox args missing command separator".to_string())?;
+    args.insert(separator_index, "--prepared-capability-sid".to_string());
+    args.insert(separator_index + 1, capability_sid.to_string());
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2209,6 +2336,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepare_worker_command_preserves_existing_session_tempdir_contents() {
+        let session_temp_dir = std::env::temp_dir().join(format!(
+            "mcp-repl-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        prepare_session_temp_dir(&session_temp_dir).expect("prepare session temp dir");
+        let marker = session_temp_dir.join("marker.txt");
+        std::fs::write(&marker, "keep").expect("write marker");
+
+        let state = SandboxState {
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        let _ = prepare_worker_command(Path::new("echo"), vec!["ok".to_string()], &state)
+            .expect("prepare worker command");
+
+        assert!(
+            marker.exists(),
+            "prepare_worker_command should not reset the session temp dir"
+        );
+
+        std::fs::remove_file(&marker).expect("remove marker");
+        std::fs::remove_dir_all(&session_temp_dir).expect("cleanup session temp dir");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn proxy_loopback_ports_from_env_extracts_loopback_endpoints() {
@@ -2374,6 +2531,83 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn append_windows_prepared_capability_sid_inserts_before_command_separator() {
+        let mut args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+            "--sandbox-policy".to_string(),
+            "{\"type\":\"workspace-write\"}".to_string(),
+            "--".to_string(),
+            "worker".to_string(),
+        ];
+
+        append_windows_prepared_capability_sid(&mut args, "S-1-5-21-1-2-3-4")
+            .expect("prepared capability sid should insert");
+
+        assert_eq!(
+            args,
+            vec![
+                "--windows-sandbox".to_string(),
+                "--sandbox-policy-cwd".to_string(),
+                "C:\\workspace".to_string(),
+                "--sandbox-policy".to_string(),
+                "{\"type\":\"workspace-write\"}".to_string(),
+                "--prepared-capability-sid".to_string(),
+                "S-1-5-21-1-2-3-4".to_string(),
+                "--".to_string(),
+                "worker".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_parse_args_accepts_prepared_capability_sid() {
+        let args = vec![
+            OsString::from("--windows-sandbox"),
+            OsString::from("--sandbox-policy-cwd"),
+            OsString::from("C:\\workspace"),
+            OsString::from("--sandbox-policy"),
+            OsString::from("{\"type\":\"workspace-write\"}"),
+            OsString::from("--prepared-capability-sid"),
+            OsString::from("S-1-5-21-1-2-3-4"),
+            OsString::from("--"),
+            OsString::from("worker"),
+        ];
+
+        let parsed = windows_sandbox_parse_args_from(args).expect("windows sandbox args");
+
+        assert_eq!(parsed.prepared_capability_sid.as_str(), "S-1-5-21-1-2-3-4");
+        assert_eq!(parsed.command, vec!["worker".to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_parse_args_requires_prepared_capability_sid() {
+        let args = vec![
+            OsString::from("--windows-sandbox"),
+            OsString::from("--sandbox-policy-cwd"),
+            OsString::from("C:\\workspace"),
+            OsString::from("--sandbox-policy"),
+            OsString::from("{\"type\":\"workspace-write\"}"),
+            OsString::from("--"),
+            OsString::from("worker"),
+        ];
+
+        let err = match windows_sandbox_parse_args_from(args) {
+            Ok(_) => panic!("missing prepared capability sid should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("missing --prepared-capability-sid"),
+            "expected prepared-capability-sid requirement, got: {err}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_bwrap_env_does_not_override_explicit_false() {
@@ -2382,14 +2616,16 @@ mod tests {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }
 
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: Vec::new(),
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
         };
-        state.use_linux_sandbox_bwrap = false;
 
         let prepared =
             prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
@@ -2407,6 +2643,44 @@ mod tests {
         assert!(
             !prepared.args.contains(&"--use-bwrap-sandbox".to_string()),
             "explicit false override should disable bwrap even when env enables it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_includes_r_runtime_library_path() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        let r_home = embedded_r_home().expect("embedded R home should be discoverable");
+        let r_home_text = r_home.to_string_lossy().to_string();
+        let lib_dir = r_home.join("lib");
+        let ld_library_path = prepared
+            .env
+            .get("LD_LIBRARY_PATH")
+            .expect("LD_LIBRARY_PATH should be set for embedded R workers");
+        let path_entries: Vec<PathBuf> =
+            std::env::split_paths(&std::ffi::OsString::from(ld_library_path)).collect();
+
+        assert_eq!(
+            prepared.env.get("R_HOME"),
+            Some(&r_home_text),
+            "prepared command should pass through the detected R_HOME"
+        );
+        assert_eq!(
+            path_entries.first(),
+            Some(&lib_dir),
+            "embedded R library dir should be first in LD_LIBRARY_PATH"
+        );
+        assert!(
+            path_entries.iter().any(|entry| entry == &lib_dir),
+            "embedded R library dir should be present in LD_LIBRARY_PATH"
         );
     }
 

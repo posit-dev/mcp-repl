@@ -3,32 +3,6 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
-#[cfg(windows)]
-use rmcp::model::RawContent;
-
-#[cfg(windows)]
-fn result_text(result: &rmcp::model::CallToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|item| match &item.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-#[cfg(windows)]
-fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with status")
-        || text.contains("unable to initialize the JIT")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
-}
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
@@ -141,25 +115,8 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with status")
-        || text.contains("worker exited with signal")
-        || text.contains("unable to initialize the JIT")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
-        || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains("worker io error: Broken pipe")
-}
-
-#[cfg(windows)]
 fn initial_plot_command_completed(text: &str) -> bool {
-    text.contains("plots_done")
-        || text.contains("<<repl status: busy")
-        || text.contains("--More-- (")
+    text.contains("plots_done") || common::is_busy_response(text) || text.contains("--More-- (")
 }
 
 #[cfg(not(windows))]
@@ -204,7 +161,7 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     } else {
         snapshot.render_transcript()
     };
-    if backend_unavailable(&rendered) || backend_unavailable(&transcript) {
+    if common::backend_unavailable(&rendered) || common::backend_unavailable(&transcript) {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         return Ok(());
     }
@@ -216,39 +173,8 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     Ok(())
 }
 
-#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
-    use tokio::time::{Duration, Instant, sleep};
-
-    async fn assert_eventually_contains(
-        session: &mut common::McpTestSession,
-        input: &str,
-        expected: &str,
-    ) -> TestResult<bool> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
-            let text = result_text(&result);
-            if backend_unavailable(&text) {
-                return Ok(false);
-            }
-            if text.contains(expected) {
-                return Ok(true);
-            }
-            if text.contains("<<repl status: busy")
-                || text.contains("worker is busy")
-                || text.contains("request already running")
-                || text.contains("input discarded while worker busy")
-            {
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        Ok(false)
-    }
-
+async fn restart_interrupt_plot_smoke() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let result = session
@@ -257,8 +183,8 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
             Some(30.0),
         )
         .await?;
-    let text = result_text(&result);
-    if backend_unavailable(&text) {
+    let text = common::result_text(&result);
+    if common::backend_unavailable(&text) {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
@@ -268,7 +194,17 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
     }
 
     let _ = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
-    if !assert_eventually_contains(&mut session, "1+1", "2").await? {
+    if !common::assert_eventually_contains(
+        &mut session,
+        "1+1",
+        "2",
+        "refactor_coverage restart recovery",
+        10.0,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(50),
+    )
+    .await?
+    {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
@@ -278,7 +214,17 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
         .write_stdin_raw_with("Sys.sleep(5)", Some(0.2))
         .await?;
     let _ = session.write_stdin_raw_with("\u{3}", Some(10.0)).await?;
-    if !assert_eventually_contains(&mut session, "1+1", "2").await? {
+    if !common::assert_eventually_contains(
+        &mut session,
+        "1+1",
+        "2",
+        "refactor_coverage interrupt recovery",
+        10.0,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(50),
+    )
+    .await?
+    {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());

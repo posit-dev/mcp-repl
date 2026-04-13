@@ -205,6 +205,99 @@ async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input_on_windows()
+-> TestResult<()> {
+    let mut session = spawn_interrupt_session().await?;
+
+    let long_sleep = r#"
+cat("INTERRUPT_READY\n")
+flush.console()
+tryCatch(
+  {
+    repeat Sys.sleep(0.5)
+  },
+  interrupt = function(e) cat("interrupt received\n")
+)
+"#;
+    let timeout_result = session.write_stdin_raw_with(long_sleep, Some(0.2)).await?;
+    let timeout_text = result_text(&timeout_result);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready_text = timeout_text;
+    loop {
+        if backend_unavailable(&ready_text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        if ready_text.contains("INTERRUPT_READY") {
+            break;
+        }
+        if !is_busy_response(&ready_text) {
+            session.cancel().await?;
+            panic!(
+                "expected long-running request to reach user code before interrupt, got: {ready_text:?}"
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            session.cancel().await?;
+            panic!(
+                "expected long-running request to emit readiness marker before interrupt, got: {ready_text:?}"
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        ready_text = result_text(&poll);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("\u{3}cat('AFTER_INTERRUPT\\n')", Some(5.0))
+            .await?,
+    );
+    loop {
+        if backend_unavailable(&text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        if !is_busy_response(&text) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            panic!("expected interrupt prefix to recover the worker in time, got: {text:?}");
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        text = result_text(&poll);
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("interrupt received"),
+        "expected interrupt handler output to be preserved, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_INTERRUPT"),
+        "expected remaining input after ctrl-c prefix to run, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
     let mut session = spawn_interrupt_session().await?;
@@ -281,6 +374,33 @@ async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
     assert!(
         text.contains("AFTER_RESET"),
         "expected follow-up output after restart prefix, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_d_prefix_in_files_mode_separates_restart_notice_from_output() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{4}cat('AFTER_RESET\\n')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) || text.contains("worker exited with status") {
+        eprintln!("restart prefix in files mode did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("[repl] new session started\nAFTER_RESET"),
+        "expected ctrl-d files reply to preserve a newline between restart notice and output, got: {text:?}"
     );
 
     session.cancel().await?;

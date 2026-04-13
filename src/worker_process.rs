@@ -53,12 +53,18 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::io::AsRawHandle;
+#[cfg(target_family = "windows")]
+use std::os::windows::process::CommandExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
 #[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+#[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
@@ -195,7 +201,6 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
-
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
@@ -293,7 +298,10 @@ impl BackendDriver for RBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        driver_interrupt(process)
+        if let Some(ipc) = process.ipc.get() {
+            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+        }
+        process.send_r_interrupt()
     }
 
     fn refresh_backend_info(
@@ -559,6 +567,8 @@ pub struct WorkerManager {
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
+    #[cfg(target_os = "windows")]
+    windows_sandbox_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
     oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
     output: OutputBuffer,
@@ -632,6 +642,8 @@ impl WorkerManager {
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,
+            #[cfg(target_os = "windows")]
+            windows_sandbox_launch: None,
             oversized_output,
             pending_output_tape: PendingOutputTape::new(),
             output: OutputBuffer::default(),
@@ -862,7 +874,9 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        if self.pager.is_active() {
+        let page_bytes = pager::resolve_page_bytes(page_bytes_override);
+        let empty_input = text.is_empty();
+        if !empty_input && self.pager.is_active() {
             let trimmed = text.trim();
             if trimmed.is_empty() || trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
@@ -876,18 +890,10 @@ impl WorkerManager {
             }
         }
 
-        let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_pager(&text, echo_input);
-            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
-        self.output.start_capture();
-        self.maybe_emit_guardrail_notice();
-        self.resolve_timeout_marker();
-        if text.is_empty() {
+        if empty_input {
+            self.output.start_capture();
+            self.maybe_emit_guardrail_notice();
+            self.resolve_timeout_marker();
             if self.pending_request
                 || self.output.has_pending_output()
                 || self.settled_pending_completion.is_some()
@@ -897,6 +903,28 @@ impl WorkerManager {
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
+            if self.pager.is_active()
+                && let Some(reply) = self.handle_pager_command(&text)
+            {
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+        }
+
+        if let Err(err) = self.ensure_process() {
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        if !empty_input {
+            self.output.start_capture();
+            self.maybe_emit_guardrail_notice();
+            self.resolve_timeout_marker();
+        }
+        if empty_input {
             let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
@@ -1654,7 +1682,7 @@ impl WorkerManager {
                     should_trim_echo_prefix(&completion.echo_events)
                 };
                 let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript);
+                    .or(fallback_input_transcript.clone());
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
@@ -1666,6 +1694,12 @@ impl WorkerManager {
                     },
                     &completion.protocol_warnings,
                 );
+                if completion.echo_events.is_empty() {
+                    let _ = trim_echo_prefix_after_leading_nonstdout_contents(
+                        &mut contents,
+                        fallback_input_transcript.as_deref(),
+                    );
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1979,11 +2013,13 @@ impl WorkerManager {
             }),
         );
         self.ensure_process()?;
-        if let Err(err) = self.driver.interrupt(
-            self.process
-                .as_mut()
-                .expect("worker process should be available"),
-        ) {
+        if self.pending_request
+            && let Err(err) = self.driver.interrupt(
+                self.process
+                    .as_mut()
+                    .expect("worker process should be available"),
+            )
+        {
             self.reset()?;
             crate::event_log::log(
                 "worker_interrupt_error",
@@ -2118,11 +2154,13 @@ impl WorkerManager {
             }),
         );
         self.ensure_process()?;
-        if let Err(err) = self.driver.interrupt(
-            self.process
-                .as_mut()
-                .expect("worker process should be available"),
-        ) {
+        if self.pending_request
+            && let Err(err) = self.driver.interrupt(
+                self.process
+                    .as_mut()
+                    .expect("worker process should be available"),
+            )
+        {
             self.reset()?;
             crate::event_log::log(
                 "worker_interrupt_error",
@@ -2351,6 +2389,11 @@ impl WorkerManager {
         Ok(())
     }
 
+    // Updates the server-side sandbox configuration. The new policy becomes
+    // effective in the worker only after the current process is recycled and a
+    // replacement worker is spawned. Session temp handling is separate: the
+    // server-owned temp dir is reset before each spawn, and today that reset
+    // reuses the same configured path in place.
     pub fn update_sandbox_state(
         &mut self,
         update: SandboxStateUpdate,
@@ -2375,6 +2418,13 @@ impl WorkerManager {
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
         self.sandbox_state = resolved_state;
+        #[cfg(target_os = "windows")]
+        if changed {
+            // Prepared Windows launch state is keyed to the effective worker
+            // sandbox configuration. Drop it before respawn so the next worker
+            // picks up the updated sandbox state.
+            self.windows_sandbox_launch = None;
+        }
         crate::event_log::log(
             "worker_sandbox_state_update",
             serde_json::json!({
@@ -2514,17 +2564,28 @@ impl WorkerManager {
     }
 
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
+        // Start each worker with a clean server-owned session temp dir. The
+        // current implementation reuses the same configured path across
+        // respawns and wipes/recreates it in place before launch.
+        crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        #[cfg(target_os = "windows")]
+        let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
-            self.oversized_output,
-            self.pending_output_tape.clone(),
-            self.output_timeline.clone(),
-            self.guardrail.clone(),
+            WorkerSpawnContext {
+                oversized_output: self.oversized_output,
+                pending_output_tape: self.pending_output_tape.clone(),
+                output_timeline: self.output_timeline.clone(),
+                guardrail: self.guardrail.clone(),
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch,
+            },
         )?;
         let ipc = process
             .ipc
@@ -2557,17 +2618,28 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
+        // Start each worker with a clean server-owned session temp dir. The
+        // current implementation reuses the same configured path across
+        // respawns and wipes/recreates it in place before launch.
+        crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        #[cfg(target_os = "windows")]
+        let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
-            self.oversized_output,
-            self.pending_output_tape.clone(),
-            self.output_timeline.clone(),
-            self.guardrail.clone(),
+            WorkerSpawnContext {
+                oversized_output: self.oversized_output,
+                pending_output_tape: self.pending_output_tape.clone(),
+                output_timeline: self.output_timeline.clone(),
+                guardrail: self.guardrail.clone(),
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch,
+            },
         )?;
         let ipc = process
             .ipc
@@ -2622,6 +2694,59 @@ impl WorkerManager {
         let now = std::time::Instant::now();
         self.last_spawn = Some(now);
         self.spawn_count = self.spawn_count.saturating_add(1);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn ensure_windows_sandbox_launch(
+        &mut self,
+    ) -> Result<Option<crate::windows_sandbox::PreparedSandboxLaunch>, WorkerError> {
+        if self.backend != Backend::R || !self.sandbox_state.sandbox_policy.requires_sandbox() {
+            self.windows_sandbox_launch = None;
+            return Ok(None);
+        }
+
+        let launch_matches = self.windows_sandbox_launch.as_ref().is_some_and(|launch| {
+            launch.matches(
+                &self.sandbox_state.sandbox_policy,
+                &self.sandbox_state.sandbox_cwd,
+                &self.sandbox_state.session_temp_dir,
+            )
+        });
+        if launch_matches {
+            // Reuse the prepared Windows launch only while the effective worker
+            // sandbox configuration still matches. Session temp ACLs are
+            // refreshed separately on each spawn after the temp dir reset.
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                self.windows_sandbox_launch
+                    .as_ref()
+                    .expect("matching launch must exist"),
+            )
+            .map_err(WorkerError::Sandbox)?;
+            return Ok(self.windows_sandbox_launch.clone());
+        }
+
+        crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state)
+        });
+        let prepared = crate::windows_sandbox::prepare_sandbox_launch(
+            &self.sandbox_state.sandbox_policy,
+            &self.sandbox_state.sandbox_cwd,
+            &self.sandbox_state.session_temp_dir,
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => return Err(WorkerError::Sandbox(err)),
+        };
+        crate::event_log::log(
+            "worker_windows_sandbox_prepare_end",
+            serde_json::json!({
+                "status": "ok",
+                "capability_sid": prepared.capability_sid(),
+            }),
+        );
+        self.windows_sandbox_launch = Some(prepared);
+
+        Ok(self.windows_sandbox_launch.clone())
     }
 
     fn resolve_timeout_marker(&mut self) {
@@ -3560,6 +3685,96 @@ fn maybe_trim_echo_prefix(
     }
 }
 
+fn trim_echo_prefix_after_leading_nonstdout_contents(
+    contents: &mut Vec<WorkerContent>,
+    echo_prefix: Option<&str>,
+) -> bool {
+    let Some(echo_prefix) = echo_prefix else {
+        return false;
+    };
+    if echo_prefix.is_empty() {
+        return false;
+    }
+
+    let start_idx = contents
+        .iter()
+        .position(|content| {
+            matches!(
+                content,
+                WorkerContent::ContentText {
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(contents.len());
+    if start_idx >= contents.len() {
+        return false;
+    }
+
+    let mut remaining = echo_prefix;
+    for content in contents.iter().skip(start_idx) {
+        if remaining.is_empty() {
+            break;
+        }
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            return false;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            return false;
+        }
+        if remaining.len() >= text.len() {
+            if !remaining.starts_with(text.as_str()) {
+                return false;
+            }
+            remaining = &remaining[text.len()..];
+        } else {
+            if !text.starts_with(remaining) {
+                return false;
+            }
+            remaining = "";
+        }
+    }
+
+    if !remaining.is_empty() {
+        return false;
+    }
+
+    let mut idx = start_idx;
+    let mut remaining = echo_prefix;
+    while idx < contents.len() && !remaining.is_empty() {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText { text, .. } => {
+                if remaining.len() >= text.len() {
+                    remaining = &remaining[text.len()..];
+                    text.clear();
+                    true
+                } else {
+                    let updated = text[remaining.len()..].to_string();
+                    *text = updated;
+                    remaining = "";
+                    false
+                }
+            }
+            _ => return false,
+        };
+
+        if remove_current {
+            contents.remove(idx);
+            continue;
+        }
+        idx = idx.saturating_add(1);
+    }
+
+    true
+}
+
 fn trim_echo_prefix_in_output(
     output: &OutputBuffer,
     echo_prefix: Option<&str>,
@@ -3994,6 +4209,19 @@ fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply 
     if let Some(prompt_text) = prompt.as_deref() {
         strip_trailing_prompt(&mut contents, prompt_text);
     }
+    if let Some(WorkerContent::ContentText {
+        text: prefix_text, ..
+    }) = contents.last_mut()
+        && let Some(WorkerContent::ContentText {
+            text: suffix_text, ..
+        }) = suffix_contents.first()
+        && !prefix_text.is_empty()
+        && !suffix_text.is_empty()
+        && !prefix_text.ends_with('\n')
+        && !suffix_text.starts_with('\n')
+    {
+        prefix_text.push('\n');
+    }
     contents.extend(suffix_contents);
     WorkerReply::Output {
         contents,
@@ -4083,6 +4311,15 @@ struct SpawnedWorker {
     stderr_reader: Option<OutputReader>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
+}
+
+struct WorkerSpawnContext {
+    oversized_output: OversizedOutputMode,
+    pending_output_tape: PendingOutputTape,
+    output_timeline: OutputTimeline,
+    guardrail: GuardrailShared,
+    #[cfg(target_os = "windows")]
+    prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
 
 struct OutputReader {
@@ -4205,11 +4442,17 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        oversized_output: OversizedOutputMode,
-        pending_output_tape: PendingOutputTape,
-        output_timeline: OutputTimeline,
-        guardrail: GuardrailShared,
+        context: WorkerSpawnContext,
     ) -> Result<Self, WorkerError> {
+        let WorkerSpawnContext {
+            oversized_output,
+            pending_output_tape,
+            output_timeline,
+            guardrail,
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch,
+        } = context;
+
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
@@ -4233,6 +4476,8 @@ impl WorkerProcess {
                 sandbox_state,
                 live_output.clone(),
                 &mut ipc_server,
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch.as_ref(),
             )?,
             Backend::Python => {
                 Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
@@ -4320,10 +4565,23 @@ impl WorkerProcess {
         sandbox_state: &SandboxState,
         live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
+        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
+            &crate::windows_sandbox::PreparedSandboxLaunch,
+        >,
     ) -> Result<SpawnedWorker, WorkerError> {
         let prepared =
             prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
                 .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut prepared = prepared;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = prepared_windows_launch {
+            crate::sandbox::append_windows_prepared_capability_sid(
+                &mut prepared.args,
+                prepared_windows_launch.capability_sid(),
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         let session_tmpdir = prepared
             .env
             .get(R_SESSION_TMPDIR_ENV)
@@ -4353,6 +4611,7 @@ impl WorkerProcess {
         {
             command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
             command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "unix")]
@@ -4570,6 +4829,27 @@ impl WorkerProcess {
         {
             Ok(())
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        match self.child.try_wait()? {
+            Some(_) => Ok(()),
+            None => Err(WorkerError::Io(std::io::Error::last_os_error())),
+        }
+    }
+
+    #[cfg(not(target_family = "windows"))]
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        self.send_interrupt()
     }
 
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
@@ -5341,11 +5621,11 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, ensure_output_ring,
         reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5355,6 +5635,12 @@ mod tests {
     fn env_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
+        crate::output_capture::output_ring_test_mutex()
+            .lock()
+            .expect("output ring test lock")
     }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
@@ -5379,6 +5665,14 @@ mod tests {
     fn sleeping_test_child() -> Child {
         Command::new("sh")
             .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "windows")]
+    fn sleeping_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn sleeping test child")
     }
@@ -5416,6 +5710,21 @@ mod tests {
             guardrail_thread_handle: None,
             #[cfg(target_os = "macos")]
             denial_logger: None,
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn test_worker_process(child: Child) -> WorkerProcess {
+        let (stdin_tx, _stdin_rx) = mpsc::channel();
+        WorkerProcess {
+            child,
+            stdin_tx,
+            session_tmpdir: None,
+            ipc: IpcHandle::new(),
+            stdout_reader: None,
+            stderr_reader: None,
+            expected_exit: false,
+            exit_status: None,
         }
     }
 
@@ -5514,6 +5823,27 @@ mod tests {
             vec![
                 WorkerContent::stdout("[1] 1\n"),
                 WorkerContent::server_stderr(format!("[repl] {warning}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_echo_prefix_after_leading_nonstdout_contents_removes_prompt_fallback_echo() {
+        let mut contents = vec![
+            WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+            WorkerContent::stdout("> x\n"),
+            WorkerContent::stdout("> "),
+        ];
+
+        let trimmed =
+            trim_echo_prefix_after_leading_nonstdout_contents(&mut contents, Some("> x\n"));
+
+        assert!(trimmed, "expected prompt fallback echo to be trimmed");
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+                WorkerContent::stdout("> "),
             ]
         );
     }
@@ -5619,16 +5949,16 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_request_end_event() {
+    fn completion_waits_for_request_end_when_primary_prompt_reappears() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server);
+        driver_on_input_start("value <- readline(prompt = \"> \")", &server);
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
-            line: "1+1\n".to_string(),
+            line: "value <- readline(prompt = \"> \")\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
@@ -5637,13 +5967,46 @@ mod tests {
         let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
         assert!(
             matches!(result, Err(WorkerError::Timeout(_))),
-            "expected timeout before request-end"
+            "expected timeout before request-end when a nested prompt reuses the primary prompt text"
         );
 
         let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected completion after request-end");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(
+            completion.echo_events[0].line,
+            "value <- readline(prompt = \"> \")\n"
+        );
+    }
+
+    #[test]
+    fn completion_still_waits_when_only_continuation_prompt_arrives() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+\n1", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "+ ".to_string(),
+        });
+
+        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
+        assert!(
+            matches!(result, Err(WorkerError::Timeout(_))),
+            "expected timeout before request-end when only a continuation prompt is visible"
+        );
+
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        assert_eq!(completion.prompt.as_deref(), Some("+ "));
     }
 
     #[test]
@@ -6106,6 +6469,7 @@ mod tests {
 
     #[test]
     fn pager_prepare_input_context_trims_echo_from_settled_completion() {
+        let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -6148,17 +6512,170 @@ mod tests {
     }
 
     #[test]
-    fn pager_output_capture_skips_pending_output_tape() {
-        let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+    fn pager_empty_input_polls_pending_output_before_pager_commands() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
-        let output = OutputBuffer::default();
-        output.start_capture();
+        reset_last_reply_marker_offset();
 
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b"line0001\nline0002\nline0003\nline0004\n",
+            false,
+            ContentOrigin::Worker,
+        );
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        manager
+            .output_timeline
+            .append_text(b"detached\n", false, ContentOrigin::Worker);
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(16),
+                true,
+            )
+            .expect("empty poll reply");
+
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+        assert!(
+            text.contains("detached\n"),
+            "expected empty input to poll newly appended output before pager navigation, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pager_empty_input_advances_page_after_worker_exit() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
+
+        manager.output.start_capture();
+        let output = (1..=24).map(|n| format!("L{n:04}\n")).collect::<String>();
+        manager
+            .output_timeline
+            .append_text(output.as_bytes(), false, ContentOrigin::Worker);
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        {
+            let process = manager.process.as_mut().expect("worker process");
+            process.child.kill().expect("kill test child");
+            process.exit_status = Some(process.child.wait().expect("wait test child"));
+        }
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(16),
+                true,
+            )
+            .expect("empty pager reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.finish_exited();
+        }
+
+        assert!(
+            text.contains("L0002")
+                || text.contains("L0003")
+                || text.contains("L0010")
+                || text.contains("L0014"),
+            "expected blank pager input to advance to the next page after worker exit, got: {text:?}"
+        );
+        assert!(
+            !text.contains("worker io error:"),
+            "expected pager navigation instead of a respawn error after worker exit, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pager_empty_input_preserves_idle_guardrail_notice() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(GuardrailEvent {
+                message: "[repl] worker was idle; new session started\n".to_string(),
+                was_busy: false,
+            });
+        }
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(256),
+                true,
+            )
+            .expect("empty poll reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            text.contains("[repl] worker was idle; new session started"),
+            "expected empty pager polls to preserve idle guardrail restart notices, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pager_output_capture_skips_pending_output_tape() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
             tape.clone(),
-            OutputTimeline::new(output_ring),
+            OutputTimeline::new(output_ring.clone()),
         );
         capture.append_text(b"pager output\n", TextStream::Stdout);
         capture.append_image(IpcPlotImage {
@@ -6173,9 +6690,25 @@ mod tests {
             tape.drain_final_snapshot().events.is_empty(),
             "pager mode should not mirror text, images, or sideband events into the pending tape"
         );
+        let output_end = output_ring.end_offset();
+        let output_range = output_ring.read_range(0, output_end);
         assert!(
-            output.end_offset().unwrap_or(0) > 0,
+            output_end > 0,
             "pager mode should still append text to the output timeline"
+        );
+        assert_eq!(
+            output_range.bytes, b"pager output\n",
+            "pager mode should keep stdout text in the output timeline"
+        );
+        assert!(
+            output_range.events.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    OutputEventKind::Image { id, mime_type, .. }
+                    if id == "img-1" && mime_type == "image/png"
+                )
+            }),
+            "pager mode should keep image events in the output timeline"
         );
     }
 
@@ -6533,6 +7066,85 @@ mod tests {
             WINDOWS_IPC_CONNECT_MAX_WAIT <= Duration::from_secs(120),
             "windows IPC connect max wait should fail fast, got {:?}",
             WINDOWS_IPC_CONNECT_MAX_WAIT
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_prepare_access_denied_fails_fast() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(Some(
+            "failed to prepare writable ACL on 'C:\\workspace': SetNamedSecurityInfoW failed: 5"
+                .to_string(),
+        ));
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let result = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkerError::Sandbox(ref message))
+                    if message.contains("SetNamedSecurityInfoW failed: 5")
+            ),
+            "access-denied prepare failures should abort launch preparation, got: {result:?}"
+        );
+        assert!(
+            manager.windows_sandbox_launch.is_none(),
+            "failed launch preparation should not cache a prepared launch"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_cache_hit_refreshes_prepared_launch_acl_state_before_reuse() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        let first = manager
+            .ensure_windows_sandbox_launch()
+            .expect("initial launch preparation should succeed");
+        assert!(
+            first.is_some(),
+            "initial launch preparation should populate the prepared-launch cache"
+        );
+
+        crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(Some(
+            "cache hit should refresh ACL state".to_string(),
+        ));
+
+        let second = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(None);
+
+        assert!(
+            matches!(
+                second,
+                Err(WorkerError::Sandbox(ref err))
+                    if err.contains("cache hit should refresh ACL state")
+            ),
+            "cache hits should refresh ACL state before reusing the prepared launch, got: {second:?}"
+        );
+        assert_eq!(
+            manager.windows_sandbox_launch, first,
+            "cache-hit refresh failures should preserve the cached launch for later retries"
         );
     }
 }
