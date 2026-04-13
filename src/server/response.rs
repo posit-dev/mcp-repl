@@ -1956,6 +1956,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
     let last_image_idx = items
         .iter()
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
+    let single_image = first_image_idx.is_some() && last_image_idx == first_image_idx;
     let mut out = Vec::new();
     let (first_anchor, last_anchor) = match bundle.next_image_number {
         0 => (None, None),
@@ -1983,6 +1984,18 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         bundle,
         displayed_anchor_count,
     )));
+    if single_image {
+        let tail_text = collect_non_overlapping_suffix_text_before(
+            items,
+            Some(items.len()),
+            &head_text,
+            PRE_LAST_TEXT_BUDGET + POST_LAST_TEXT_BUDGET,
+        );
+        if !tail_text.is_empty() {
+            out.push(Content::text(tail_text));
+        }
+        return out;
+    }
     let pre_last_text = if last_image_idx == first_image_idx {
         collect_non_overlapping_suffix_text_before(
             items,
@@ -2026,6 +2039,7 @@ fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
     let last_image_idx = items
         .iter()
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
+    let single_image = first_image_idx.is_some() && last_image_idx == first_image_idx;
     let mut out = Vec::new();
 
     let head_text = collect_prefix_text(
@@ -2044,6 +2058,18 @@ fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
     out.push(Content::text(build_output_bundle_unavailable_notice(
         count_images(items),
     )));
+    if single_image {
+        let tail_text = collect_non_overlapping_suffix_text_before(
+            items,
+            Some(items.len()),
+            &head_text,
+            PRE_LAST_TEXT_BUDGET + POST_LAST_TEXT_BUDGET,
+        );
+        if !tail_text.is_empty() {
+            out.push(Content::text(tail_text));
+        }
+        return out;
+    }
     let pre_last_text = if last_image_idx == first_image_idx {
         collect_non_overlapping_suffix_text_before(
             items,
@@ -2097,7 +2123,7 @@ fn render_active_bundle_contents(
         }
     } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
-        Ok(compact_output_bundle_items(&append.retained_items, active))
+        Ok(compact_output_bundle_items(bundle_items, active))
     } else if text_should_spill(spill_worker_text_chars) {
         active.disclosed = true;
         Ok(compact_text_bundle_items(
@@ -2202,8 +2228,10 @@ fn compact_reply_items_with_new_bundle(
                 if text_only {
                     let retained_worker_text = worker_text_from_items(&append.retained_items);
                     compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
-                } else {
+                } else if append.omitted_this_reply {
                     compact_output_bundle_items(&append.retained_items, &bundle)
+                } else {
+                    compact_output_bundle_items(reply_bundle_items, &bundle)
                 }
             }
             Err(err) => {
