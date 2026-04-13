@@ -75,6 +75,8 @@ Optional `bwrap` stage:
 
 - `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
 - `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
+- if an inherited `codexLinuxSandboxExe` helper dies before backend info arrives,
+  `mcp-repl` retries once with its built-in Linux sandbox.
 - if `bwrap` is requested but worker startup dies before backend info arrives,
   `mcp-repl` retries once without `bwrap` and continues.
 
