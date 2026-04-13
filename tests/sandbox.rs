@@ -348,9 +348,11 @@ fn windows_test_temp_parent() -> TestResult<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn temp_windows_test_root() -> TestResult<tempfile::TempDir> {
-    Ok(tempfile::Builder::new()
+    let temp = tempfile::Builder::new()
         .prefix("sandbox-test-")
-        .tempdir_in(windows_test_temp_parent()?)?)
+        .tempdir_in(windows_test_temp_parent()?)?;
+    scrub_unresolved_windows_sid_aces(temp.path())?;
+    Ok(temp)
 }
 
 #[cfg(target_os = "windows")]
@@ -1454,23 +1456,38 @@ fn cleanup_restricted_path(path: &std::path::Path) {
 
 #[cfg(target_os = "windows")]
 fn unresolved_windows_sid_acl_entries(path: &std::path::Path) -> TestResult<Vec<String>> {
+    unresolved_windows_sid_acl_entries_with_psmodulepath(path, None)
+}
+
+#[cfg(target_os = "windows")]
+fn unresolved_windows_sid_acl_entries_with_psmodulepath(
+    path: &std::path::Path,
+    psmodulepath: Option<&str>,
+) -> TestResult<Vec<String>> {
     let script = format!(
         r#"
 $path = {}
-if (-not (Test-Path -LiteralPath $path)) {{
+if ([System.IO.Directory]::Exists($path)) {{
+  $acl = [System.IO.Directory]::GetAccessControl($path)
+}} elseif ([System.IO.File]::Exists($path)) {{
+  $acl = [System.IO.File]::GetAccessControl($path)
+}} else {{
   Write-Error "missing path: $path"
   exit 1
 }}
-(Get-Acl -LiteralPath $path).Access |
+$acl.Access |
   ForEach-Object {{ $_.IdentityReference.Value }} |
   Where-Object {{ $_ -match '^S-1-5-21-\d+-\d+-\d+-\d+$' }} |
   Sort-Object -Unique
 "#,
         powershell_literal(&path.to_string_lossy())
     );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &script])
-        .output()?;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-Command", &script]);
+    if let Some(psmodulepath) = psmodulepath {
+        command.env("PSModulePath", psmodulepath);
+    }
+    let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
             "failed to read ACL entries for {}: status={} stderr={}",
@@ -1486,6 +1503,20 @@ if (-not (Test-Path -LiteralPath $path)) {{
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn unresolved_windows_sid_acl_entries_work_without_powershell_module_autoload() -> TestResult<()> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+    let entries = unresolved_windows_sid_acl_entries_with_psmodulepath(&path, Some(""))?;
+
+    assert!(
+        !entries.is_empty(),
+        "expected ACL reader to resolve at least one SID entry when PSModulePath is empty"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1705,16 +1736,10 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_restart_blocks_file_moved_outside_writable_root() -> TestResult<()>
 {
-    let Some(home) = windows_home_dir() else {
-        eprintln!("USERPROFILE/HOMEDRIVE+HOMEPATH unavailable; skipping");
-        return Ok(());
-    };
-    if !home.is_dir() {
-        eprintln!("home directory is unavailable; skipping");
-        return Ok(());
-    }
-
     let workspace = temp_workspace_root()?;
+    // Keep the target on the checkout volume so the test exercises ACL refresh
+    // behavior rather than failing early on cross-device rename.
+    let outside_root = temp_windows_test_root()?;
     let repo_root = workspace.path().to_path_buf();
     let source = repo_root.join(format!(
         "mcp-repl-sandbox-outbound-source-{}.txt",
@@ -1723,7 +1748,7 @@ async fn sandbox_workspace_write_restart_blocks_file_moved_outside_writable_root
             .unwrap_or_default()
             .as_nanos()
     ));
-    let target = home.join(format!(
+    let target = outside_root.path().join(format!(
         "mcp-repl-sandbox-outbound-target-{}.txt",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1797,6 +1822,7 @@ tryCatch({{
 
     cleanup_restricted_file(&source);
     cleanup_restricted_file(&target);
+    cleanup_restricted_path(outside_root.path());
     session.cancel().await?;
 
     assert!(
