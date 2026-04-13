@@ -38,6 +38,8 @@ pub enum SandboxError {
     SessionTempDir(String),
     #[cfg(target_os = "macos")]
     SeatbeltMissing,
+    #[cfg(target_os = "linux")]
+    LinuxSandbox(String),
     #[cfg(target_os = "windows")]
     WindowsSandbox(String),
 }
@@ -51,6 +53,10 @@ impl std::fmt::Display for SandboxError {
             #[cfg(target_os = "macos")]
             SandboxError::SeatbeltMissing => {
                 write!(f, "seatbelt sandbox executable not found")
+            }
+            #[cfg(target_os = "linux")]
+            SandboxError::LinuxSandbox(message) => {
+                write!(f, "linux sandbox error: {message}")
             }
             #[cfg(target_os = "windows")]
             SandboxError::WindowsSandbox(message) => {
@@ -361,7 +367,6 @@ fn resolve_gitdir_from_file(dot_git: &Path) -> Option<PathBuf> {
 pub struct SandboxState {
     pub sandbox_policy: SandboxPolicy,
     pub sandbox_cwd: PathBuf,
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub use_linux_sandbox_bwrap: bool,
     pub managed_network_policy: ManagedNetworkPolicy,
     pub session_temp_dir: PathBuf,
@@ -418,9 +423,9 @@ pub struct SandboxStateUpdate {
     #[serde(default)]
     pub sandbox_cwd: Option<PathBuf>,
     #[serde(default)]
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    #[serde(default)]
     pub use_linux_sandbox_bwrap: Option<bool>,
+    #[serde(default)]
+    pub use_legacy_landlock: Option<bool>,
 }
 
 pub fn initial_sandbox_state_update() -> Option<SandboxStateUpdate> {
@@ -441,11 +446,10 @@ impl SandboxState {
         if let Some(cwd) = update.sandbox_cwd {
             next.sandbox_cwd = cwd;
         }
-        if let Some(exe) = update.codex_linux_sandbox_exe {
-            next.codex_linux_sandbox_exe = Some(exe);
-        }
         if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
             next.use_linux_sandbox_bwrap = use_bwrap;
+        } else if let Some(use_legacy_landlock) = update.use_legacy_landlock {
+            next.use_linux_sandbox_bwrap = !use_legacy_landlock;
         }
         let changed = next != *self;
         *self = next;
@@ -456,7 +460,6 @@ impl SandboxState {
 impl Default for SandboxState {
     fn default() -> Self {
         let sandbox_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        let codex_linux_sandbox_exe = None;
         let session_temp_dir = build_session_temp_dir_path();
         Self {
             sandbox_policy: SandboxPolicy::WorkspaceWrite {
@@ -466,7 +469,6 @@ impl Default for SandboxState {
                 exclude_slash_tmp: false,
             },
             sandbox_cwd,
-            codex_linux_sandbox_exe,
             use_linux_sandbox_bwrap: false,
             managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
@@ -687,10 +689,8 @@ pub fn prepare_worker_command(
             state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
-        let sandbox_program = state
-            .codex_linux_sandbox_exe
-            .clone()
-            .unwrap_or_else(|| program.to_path_buf());
+        let sandbox_program =
+            std::env::current_exe().map_err(|err| SandboxError::LinuxSandbox(err.to_string()))?;
         Ok(PreparedCommand {
             program: sandbox_program,
             args: sandbox_args,
@@ -2339,6 +2339,10 @@ mod tests {
             SandboxError::SeatbeltMissing => {
                 panic!("unexpected error: SeatbeltMissing")
             }
+            #[cfg(target_os = "linux")]
+            SandboxError::LinuxSandbox(message) => {
+                panic!("unexpected error: {message}")
+            }
             #[cfg(target_os = "windows")]
             SandboxError::WindowsSandbox(message) => {
                 panic!("unexpected error: {message}")
@@ -2654,6 +2658,84 @@ mod tests {
         assert!(
             !prepared.args.contains(&"--use-bwrap-sandbox".to_string()),
             "explicit false override should disable bwrap even when env enables it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_uses_internal_linux_sandbox_launcher() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        assert_eq!(
+            prepared.program,
+            std::env::current_exe().expect("current exe"),
+            "Linux sandboxed workers should always launch through mcp-repl's internal helper"
+        );
+        assert_eq!(
+            prepared.arg0.as_deref(),
+            Some("codex-linux-sandbox"),
+            "Linux sandboxed workers should set arg0 for internal helper dispatch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_state_update_use_legacy_landlock_maps_to_internal_bwrap_mode() {
+        let mut state = SandboxState {
+            use_linux_sandbox_bwrap: true,
+            ..SandboxState::default()
+        };
+
+        let changed = state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: None,
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: Some(true),
+        });
+        assert!(
+            changed,
+            "expected legacy-landlock update to modify sandbox state"
+        );
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "legacy Landlock updates should disable mcp-repl's internal bwrap stage"
+        );
+
+        let changed = state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: None,
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: Some(false),
+        });
+        assert!(
+            changed,
+            "expected non-legacy update to modify sandbox state"
+        );
+        assert!(
+            state.use_linux_sandbox_bwrap,
+            "non-legacy updates should re-enable mcp-repl's internal bwrap stage"
         );
     }
 

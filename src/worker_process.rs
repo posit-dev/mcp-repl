@@ -165,9 +165,6 @@ const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 const LINUX_BWRAP_FALLBACK_NOTICE: &str =
     "[repl] Linux bubblewrap sandbox unavailable; continuing without bwrap\n";
-#[cfg(target_os = "linux")]
-const LINUX_EXTERNAL_SANDBOX_FALLBACK_NOTICE: &str =
-    "[repl] External Linux sandbox helper unavailable; continuing with built-in sandbox\n";
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -551,10 +548,6 @@ fn worker_context_event_payload(
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
-        "codex_linux_sandbox_exe": sandbox_state
-            .codex_linux_sandbox_exe
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string()),
         "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
         "managed_network_policy": {
             "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
@@ -2594,9 +2587,6 @@ impl WorkerManager {
                 match self.spawn_process_files_once() {
                     Ok(process) => return Ok(process),
                     Err(err) => {
-                        if self.maybe_retry_spawn_without_external_linux_sandbox(&err, false) {
-                            continue;
-                        }
                         if self.maybe_retry_spawn_without_linux_bwrap(&err, false) {
                             continue;
                         }
@@ -2670,11 +2660,6 @@ impl WorkerManager {
                 match self.spawn_process_with_pager_once(preserve_pager) {
                     Ok(process) => return Ok(process),
                     Err(err) => {
-                        if self
-                            .maybe_retry_spawn_without_external_linux_sandbox(&err, preserve_pager)
-                        {
-                            continue;
-                        }
                         if self.maybe_retry_spawn_without_linux_bwrap(&err, preserve_pager) {
                             continue;
                         }
@@ -2740,53 +2725,6 @@ impl WorkerManager {
             }),
         );
         Ok(process)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn maybe_retry_spawn_without_external_linux_sandbox(
-        &mut self,
-        err: &WorkerError,
-        preserve_pager: bool,
-    ) -> bool {
-        let Some(helper_path) = self.sandbox_state.codex_linux_sandbox_exe.clone() else {
-            return false;
-        };
-        if !linux_sandbox_startup_retryable(err) {
-            return false;
-        }
-
-        crate::event_log::log(
-            "worker_spawn_retry_without_external_linux_sandbox",
-            serde_json::json!({
-                "backend": format!("{:?}", self.backend),
-                "error": err.to_string(),
-                "helper_path": helper_path.to_string_lossy().to_string(),
-            }),
-        );
-
-        self.sandbox_state.codex_linux_sandbox_exe = None;
-        self.sandbox_defaults.codex_linux_sandbox_exe = None;
-        if let Some(inherited_state) = self.inherited_sandbox_state.as_mut() {
-            inherited_state.codex_linux_sandbox_exe = None;
-        }
-
-        match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.reset_output_state_files(true);
-                self.pending_output_tape
-                    .append_stdout_status_line(LINUX_EXTERNAL_SANDBOX_FALLBACK_NOTICE.as_bytes());
-            }
-            OversizedOutputMode::Pager => {
-                self.reset_output_state_pager(true, preserve_pager);
-                self.output_timeline.append_text(
-                    LINUX_EXTERNAL_SANDBOX_FALLBACK_NOTICE.as_bytes(),
-                    false,
-                    ContentOrigin::Server,
-                );
-            }
-        }
-
-        true
     }
 
     #[cfg(target_os = "linux")]
@@ -7057,56 +6995,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_external_sandbox_startup_retry_disables_helper_and_announces_fallback() {
-        let mut manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Files,
-        )
-        .expect("worker manager");
-        let helper = PathBuf::from("/tmp/codex-linux-sandbox");
-        manager.sandbox_state.codex_linux_sandbox_exe = Some(helper.clone());
-        manager.sandbox_defaults.codex_linux_sandbox_exe = Some(helper.clone());
-        manager.inherited_sandbox_state = Some(SandboxState {
-            codex_linux_sandbox_exe: Some(helper),
-            ..manager.sandbox_state.clone()
-        });
-
-        let retry = manager.maybe_retry_spawn_without_external_linux_sandbox(
-            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
-            false,
-        );
-
-        assert!(
-            retry,
-            "expected backend-info disconnect to trigger external helper fallback"
-        );
-        assert!(
-            manager.sandbox_state.codex_linux_sandbox_exe.is_none(),
-            "expected effective sandbox state to disable external helper after fallback"
-        );
-        assert!(
-            manager.sandbox_defaults.codex_linux_sandbox_exe.is_none(),
-            "expected sandbox defaults to disable external helper after fallback"
-        );
-        assert!(
-            manager
-                .inherited_sandbox_state
-                .as_ref()
-                .is_some_and(|state| state.codex_linux_sandbox_exe.is_none()),
-            "expected inherited sandbox state to disable external helper after fallback"
-        );
-
-        let snapshot = manager.pending_output_tape.drain_final_snapshot();
-        let text = contents_text(&snapshot.format_contents().contents);
-        assert!(
-            text.contains("continuing with built-in sandbox"),
-            "expected fallback notice in visible output, got: {text:?}"
-        );
-    }
-
     #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
         let _guard = env_test_mutex().lock().expect("env mutex");
@@ -7152,8 +7040,8 @@ mod tests {
                 SandboxStateUpdate {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
                     sandbox_cwd: None,
-                    codex_linux_sandbox_exe: None,
                     use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
                 },
                 Duration::from_millis(1),
             )
