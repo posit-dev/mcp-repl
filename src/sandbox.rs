@@ -484,6 +484,57 @@ pub struct PreparedCommand {
     pub denial_logger: Option<DenialLogger>,
 }
 
+#[cfg(target_family = "unix")]
+fn configure_embedded_r_runtime_env(env: &mut HashMap<String, String>) {
+    let Some(r_home) = embedded_r_home() else {
+        return;
+    };
+
+    env.entry("R_HOME".to_string())
+        .or_insert_with(|| r_home.to_string_lossy().to_string());
+
+    let lib_dir = r_home.join("lib");
+    if !lib_dir.try_exists().unwrap_or(false) {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    prepend_env_path(env, "LD_LIBRARY_PATH", &lib_dir);
+    #[cfg(target_os = "macos")]
+    prepend_env_path(env, "DYLD_FALLBACK_LIBRARY_PATH", &lib_dir);
+}
+
+#[cfg(target_family = "unix")]
+fn embedded_r_home() -> Option<&'static PathBuf> {
+    static R_HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    R_HOME
+        .get_or_init(|| harp::command::r_home_setup().ok())
+        .as_ref()
+}
+
+#[cfg(target_family = "unix")]
+fn prepend_env_path(env: &mut HashMap<String, String>, key: &str, prefix: &Path) {
+    let mut paths = vec![prefix.to_path_buf()];
+    let existing = env
+        .get(key)
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os(key));
+
+    if let Some(existing) = existing {
+        for path in std::env::split_paths(&existing) {
+            if !paths.iter().any(|candidate| candidate == &path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    let value = match std::env::join_paths(paths) {
+        Ok(joined) => joined.to_string_lossy().to_string(),
+        Err(_) => prefix.to_string_lossy().to_string(),
+    };
+    env.insert(key.to_string(), value);
+}
+
 pub fn prepare_worker_command(
     program: &Path,
     args: Vec<String>,
@@ -540,6 +591,9 @@ pub fn prepare_worker_command(
             );
         }
     }
+
+    #[cfg(target_family = "unix")]
+    configure_embedded_r_runtime_env(&mut env);
 
     if !state.sandbox_policy.requires_sandbox() {
         return Ok(PreparedCommand {
@@ -2562,14 +2616,16 @@ mod tests {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }
 
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: Vec::new(),
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
         };
-        state.use_linux_sandbox_bwrap = false;
 
         let prepared =
             prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
@@ -2587,6 +2643,44 @@ mod tests {
         assert!(
             !prepared.args.contains(&"--use-bwrap-sandbox".to_string()),
             "explicit false override should disable bwrap even when env enables it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_includes_r_runtime_library_path() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        let r_home = embedded_r_home().expect("embedded R home should be discoverable");
+        let r_home_text = r_home.to_string_lossy().to_string();
+        let lib_dir = r_home.join("lib");
+        let ld_library_path = prepared
+            .env
+            .get("LD_LIBRARY_PATH")
+            .expect("LD_LIBRARY_PATH should be set for embedded R workers");
+        let path_entries: Vec<PathBuf> =
+            std::env::split_paths(&std::ffi::OsString::from(ld_library_path)).collect();
+
+        assert_eq!(
+            prepared.env.get("R_HOME"),
+            Some(&r_home_text),
+            "prepared command should pass through the detected R_HOME"
+        );
+        assert_eq!(
+            path_entries.first(),
+            Some(&lib_dir),
+            "embedded R library dir should be first in LD_LIBRARY_PATH"
+        );
+        assert!(
+            path_entries.iter().any(|entry| entry == &lib_dir),
+            "embedded R library dir should be present in LD_LIBRARY_PATH"
         );
     }
 
