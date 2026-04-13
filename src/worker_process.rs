@@ -162,6 +162,9 @@ const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(target_os = "linux")]
+const LINUX_BWRAP_FALLBACK_NOTICE: &str =
+    "[repl] Linux bubblewrap sandbox unavailable; continuing without bwrap\n";
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -545,10 +548,6 @@ fn worker_context_event_payload(
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
-        "codex_linux_sandbox_exe": sandbox_state
-            .codex_linux_sandbox_exe
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string()),
         "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
         "managed_network_policy": {
             "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
@@ -1106,6 +1105,12 @@ impl WorkerManager {
             },
             &completion.protocol_warnings,
         );
+        if !timed_out && !trim_enabled {
+            let _ = trim_matching_echo_event_suffix_from_contents(
+                &mut contents,
+                &completion.echo_events,
+            );
+        }
         if !timed_out && completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
             let prompt_variants = fallback_prompt_variants(
                 completion.prompt.as_deref(),
@@ -1314,6 +1319,12 @@ impl WorkerManager {
                 },
                 &completion.protocol_warnings,
             );
+            if !trim_enabled {
+                let _ = trim_matching_echo_event_suffix_from_contents(
+                    &mut contents,
+                    &completion.echo_events,
+                );
+            }
             if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
                 let prompt_variants = fallback_prompt_variants(
                     completion.prompt.as_deref(),
@@ -1542,6 +1553,12 @@ impl WorkerManager {
                     },
                     &completion.protocol_warnings,
                 );
+                if !trim_enabled {
+                    let _ = trim_matching_echo_event_suffix_from_contents(
+                        &mut contents,
+                        &completion.echo_events,
+                    );
+                }
                 if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
                     let prompt_variants = fallback_prompt_variants(
                         completion.prompt.as_deref(),
@@ -2564,6 +2581,25 @@ impl WorkerManager {
     }
 
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
+        #[cfg(target_os = "linux")]
+        {
+            loop {
+                match self.spawn_process_files_once() {
+                    Ok(process) => return Ok(process),
+                    Err(err) => {
+                        if self.maybe_retry_spawn_without_linux_bwrap(&err, false) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.spawn_process_files_once()
+    }
+
+    fn spawn_process_files_once(&mut self) -> Result<WorkerProcess, WorkerError> {
         // Start each worker with a clean server-owned session temp dir. The
         // current implementation reuses the same configured path across
         // respawns and wipes/recreates it in place before launch.
@@ -2618,6 +2654,28 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
+        #[cfg(target_os = "linux")]
+        {
+            loop {
+                match self.spawn_process_with_pager_once(preserve_pager) {
+                    Ok(process) => return Ok(process),
+                    Err(err) => {
+                        if self.maybe_retry_spawn_without_linux_bwrap(&err, preserve_pager) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.spawn_process_with_pager_once(preserve_pager)
+    }
+
+    fn spawn_process_with_pager_once(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<WorkerProcess, WorkerError> {
         // Start each worker with a clean server-owned session temp dir. The
         // current implementation reuses the same configured path across
         // respawns and wipes/recreates it in place before launch.
@@ -2667,6 +2725,49 @@ impl WorkerManager {
             }),
         );
         Ok(process)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn maybe_retry_spawn_without_linux_bwrap(
+        &mut self,
+        err: &WorkerError,
+        preserve_pager: bool,
+    ) -> bool {
+        if !self.sandbox_state.use_linux_sandbox_bwrap || !linux_sandbox_startup_retryable(err) {
+            return false;
+        }
+
+        crate::event_log::log(
+            "worker_spawn_retry_without_bwrap",
+            serde_json::json!({
+                "backend": format!("{:?}", self.backend),
+                "error": err.to_string(),
+            }),
+        );
+
+        self.sandbox_state.use_linux_sandbox_bwrap = false;
+        self.sandbox_defaults.use_linux_sandbox_bwrap = false;
+        if let Some(inherited_state) = self.inherited_sandbox_state.as_mut() {
+            inherited_state.use_linux_sandbox_bwrap = false;
+        }
+
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.reset_output_state_files(true);
+                self.pending_output_tape
+                    .append_stdout_status_line(LINUX_BWRAP_FALLBACK_NOTICE.as_bytes());
+            }
+            OversizedOutputMode::Pager => {
+                self.reset_output_state_pager(true, preserve_pager);
+                self.output_timeline.append_text(
+                    LINUX_BWRAP_FALLBACK_NOTICE.as_bytes(),
+                    false,
+                    ContentOrigin::Server,
+                );
+            }
+        }
+
+        true
     }
 
     fn seed_last_prompt_from_process(&mut self, process: &WorkerProcess) {
@@ -3626,8 +3727,15 @@ fn maybe_trim_echo_prefix(
     let Some(echo_prefix) = echo_prefix else {
         return;
     };
+    let _ = trim_matching_echo_prefix_from_contents(contents, echo_prefix);
+}
+
+fn trim_matching_echo_prefix_from_contents(
+    contents: &mut Vec<WorkerContent>,
+    echo_prefix: &str,
+) -> bool {
     if echo_prefix.is_empty() {
-        return;
+        return false;
     }
 
     let mut remaining = echo_prefix;
@@ -3636,26 +3744,26 @@ fn maybe_trim_echo_prefix(
             break;
         }
         let WorkerContent::ContentText { text, stream, .. } = content else {
-            return;
+            return false;
         };
         if !matches!(stream, TextStream::Stdout) {
-            return;
+            return false;
         }
         if remaining.len() >= text.len() {
             if !remaining.starts_with(text.as_str()) {
-                return;
+                return false;
             }
             remaining = &remaining[text.len()..];
         } else {
             if !text.starts_with(remaining) {
-                return;
+                return false;
             }
             remaining = "";
         }
     }
 
     if !remaining.is_empty() {
-        return;
+        return false;
     }
 
     let mut remaining = echo_prefix;
@@ -3674,7 +3782,7 @@ fn maybe_trim_echo_prefix(
                     false
                 }
             }
-            _ => return,
+            _ => return false,
         };
 
         if remove_current {
@@ -3683,6 +3791,26 @@ fn maybe_trim_echo_prefix(
         }
         idx = idx.saturating_add(1);
     }
+
+    true
+}
+
+fn trim_matching_echo_event_suffix_from_contents(
+    contents: &mut Vec<WorkerContent>,
+    echo_events: &[IpcEchoEvent],
+) -> bool {
+    for start in 0..echo_events.len() {
+        if !should_drop_echo_only_contents(&echo_events[start..]) {
+            continue;
+        }
+        let Some(echo_prefix) = echo_transcript_from_events(&echo_events[start..]) else {
+            continue;
+        };
+        if trim_matching_echo_prefix_from_contents(contents, &echo_prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 fn trim_echo_prefix_after_leading_nonstdout_contents(
@@ -5297,6 +5425,18 @@ fn maybe_report_sandbox_exec_failure(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
+    match err {
+        WorkerError::Protocol(message) => {
+            message.contains("ipc disconnected while waiting for backend info")
+                || message.contains("worker session ended before backend info")
+                || message.contains("worker process exited immediately")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(target_family = "unix")]
 fn set_cloexec(fd: RawFd, enabled: bool) -> Result<(), WorkerError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -5930,6 +6070,44 @@ mod tests {
         assert_eq!(text_spans[0].start_byte, 0);
         assert_eq!(text_spans[0].end_byte, 38);
         assert!(!text_spans[0].is_stderr);
+    }
+
+    #[test]
+    fn trim_matching_echo_event_suffix_from_contents_trims_late_top_level_echo() {
+        let mut contents = vec![WorkerContent::worker_stdout(
+            "> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY\n> ",
+        )];
+
+        let trimmed = trim_matching_echo_event_suffix_from_contents(
+            &mut contents,
+            &[
+                echo_event("> ", "cat(\"HEAD_ONLY\\n\")\n"),
+                echo_event("> ", "flush.console()\n"),
+                echo_event("> ", "cat(\"TAIL_ONLY\\n\")\n"),
+            ],
+        );
+
+        assert!(trimmed, "expected late top-level echo to be trimmed");
+        assert_eq!(contents_text(&contents), "TAIL_ONLY\n> ");
+    }
+
+    #[test]
+    fn trim_matching_echo_event_suffix_from_contents_preserves_non_repl_prompts() {
+        let mut contents = vec![WorkerContent::worker_stdout("FIRST> alpha\nSECOND> ")];
+
+        let trimmed = trim_matching_echo_event_suffix_from_contents(
+            &mut contents,
+            &[
+                echo_event("FIRST> ", "alpha\n"),
+                echo_event("SECOND> ", "beta\n"),
+            ],
+        );
+
+        assert!(
+            !trimmed,
+            "did not expect non-REPL readline prompts to be trimmed"
+        );
+        assert_eq!(contents_text(&contents), "FIRST> alpha\nSECOND> ");
     }
 
     #[test]
@@ -6768,6 +6946,55 @@ mod tests {
         assert!(result.is_ok(), "WorkerManager::new should not panic");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_disables_bwrap_and_announces_fallback() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.sandbox_state.use_linux_sandbox_bwrap = true;
+        manager.sandbox_defaults.use_linux_sandbox_bwrap = true;
+        manager.inherited_sandbox_state = Some(SandboxState {
+            use_linux_sandbox_bwrap: true,
+            ..manager.sandbox_state.clone()
+        });
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+
+        assert!(
+            retry,
+            "expected backend-info disconnect to trigger bwrap fallback"
+        );
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "expected effective sandbox state to disable bwrap after fallback"
+        );
+        assert!(
+            !manager.sandbox_defaults.use_linux_sandbox_bwrap,
+            "expected sandbox defaults to disable bwrap after fallback"
+        );
+        assert!(
+            manager
+                .inherited_sandbox_state
+                .as_ref()
+                .is_some_and(|state| !state.use_linux_sandbox_bwrap),
+            "expected inherited sandbox state to disable bwrap after fallback"
+        );
+
+        let snapshot = manager.pending_output_tape.drain_final_snapshot();
+        let text = contents_text(&snapshot.format_contents().contents);
+        assert!(
+            text.contains("continuing without bwrap"),
+            "expected fallback notice in visible output, got: {text:?}"
+        );
+    }
+
     #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
         let _guard = env_test_mutex().lock().expect("env mutex");
@@ -6813,8 +7040,8 @@ mod tests {
                 SandboxStateUpdate {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
                     sandbox_cwd: None,
-                    codex_linux_sandbox_exe: None,
                     use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
                 },
                 Duration::from_millis(1),
             )
