@@ -75,7 +75,8 @@ Optional `bwrap` stage:
 
 - `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
 - `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
-- if `bwrap` is requested but unavailable, worker startup fails fast.
+- if `bwrap` is requested but worker startup dies before backend info arrives,
+  `mcp-repl` retries once without `bwrap` and continues.
 
 ## Windows behavior (experimental)
 

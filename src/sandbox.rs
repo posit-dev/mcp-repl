@@ -2301,6 +2301,16 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, OnceLock};
+
+    #[cfg(target_os = "linux")]
+    fn linux_bwrap_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("linux bwrap env lock poisoned")
+    }
 
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
@@ -2611,6 +2621,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_bwrap_env_does_not_override_explicit_false() {
+        let _guard = linux_bwrap_env_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
@@ -2687,6 +2698,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
+        let _guard = linux_bwrap_env_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");

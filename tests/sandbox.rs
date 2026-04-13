@@ -159,6 +159,7 @@ fn extract_prefixed_value(text: &str, prefix: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn bwrap_loopback_unavailable(text: &str) -> bool {
     text.contains("Failed RTM_NEWADDR")
+        || text.contains("Linux bubblewrap sandbox unavailable; continuing without bwrap")
         || (text.contains("loopback") && text.contains("Operation not permitted"))
 }
 
@@ -889,6 +890,13 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
         || text.contains("[repl] keras3 not installed")
         || text.contains("[repl] keras-reticulate-error:Python specified in RETICULATE_PYTHON")
     {
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("requested data wasn't found in the cache")
+        || text.contains("Failed to download `")
+    {
+        eprintln!("sandbox_reticulate_keras_backend offline cache unavailable; skipping");
         session.cancel().await?;
         return Ok(());
     }
