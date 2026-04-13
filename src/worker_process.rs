@@ -5529,7 +5529,7 @@ mod tests {
         reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5539,6 +5539,12 @@ mod tests {
     fn env_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
+        crate::output_capture::output_ring_test_mutex()
+            .lock()
+            .expect("output ring test lock")
     }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
@@ -6346,6 +6352,7 @@ mod tests {
 
     #[test]
     fn pager_prepare_input_context_trims_echo_from_settled_completion() {
+        let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -6389,6 +6396,7 @@ mod tests {
 
     #[test]
     fn pager_empty_input_polls_pending_output_before_pager_commands() {
+        let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -6436,6 +6444,7 @@ mod tests {
 
     #[test]
     fn pager_empty_input_advances_page_after_worker_exit() {
+        let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -6496,6 +6505,7 @@ mod tests {
 
     #[test]
     fn pager_empty_input_preserves_idle_guardrail_notice() {
+        let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();

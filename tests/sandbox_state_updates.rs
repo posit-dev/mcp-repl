@@ -126,6 +126,33 @@ async fn spawn_server_retry_with_env_vars(
     }))
 }
 
+async fn spawn_server_with_files_retry_with_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<common::McpTestSession> {
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for _ in 0..3 {
+        match common::spawn_server_with_files_env_vars(env_vars.clone()).await {
+            Ok(session) => return Ok(session),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains(
+                    "failed to create session temp dir: The directory is not empty. (os error 145)",
+                ) {
+                    last_error = Some(err);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "failed to spawn files-mode server after temp-dir retries".to_string(),
+        )
+    }))
+}
+
 enum SandboxUpdateKind {
     Request,
     Notification,
@@ -190,7 +217,10 @@ async fn assert_sandbox_update_clears_stale_timeout_bundle(
     }
 
     let temp = tempdir()?;
-    let mut session = spawn_server_retry_with_env_vars(vec![(
+    // Transcript-path assertions are part of the files-mode surface. The
+    // default pager mode can satisfy the same timeout semantics without
+    // deterministically disclosing a transcript path before the restart.
+    let mut session = spawn_server_with_files_retry_with_env_vars(vec![(
         "TMPDIR".to_string(),
         temp.path().display().to_string(),
     )])

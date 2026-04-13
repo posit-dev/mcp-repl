@@ -2208,7 +2208,7 @@ mod tests {
         ensure_output_ring, reset_output_ring,
     };
     use crate::worker_protocol::TextStream;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     struct OutputPagerFixture {
         _guard: MutexGuard<'static, ()>,
@@ -2258,8 +2258,7 @@ mod tests {
     }
 
     fn output_ring_test_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::output_capture::output_ring_test_mutex()
             .lock()
             .expect("output ring test lock")
     }
