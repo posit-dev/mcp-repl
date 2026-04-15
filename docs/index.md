@@ -28,6 +28,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
+- `docs/futurework/rscript-backed-plot-reference-tests.md`: future direction for validating R plot images against `Rscript` renders instead of snapshotting image content.
 - `docs/futurework/stdin-transport-single-owner.md`: deferred design for making worker stdin ownership explicit instead of relying on a Windows-only gate.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 
