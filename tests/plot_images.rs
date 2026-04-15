@@ -7,8 +7,8 @@ use common::{TestResult, spawn_server_with_files, spawn_server_with_files_env_va
 use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
-use std::io::Write;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -292,7 +292,10 @@ fn reference_image_script_lines(name: &str) -> Option<Vec<&'static str>> {
     let plot_lines = match name {
         "base_plot" => vec!["plot(1:10)"],
         "base_plot_update" => vec!["plot(1:10)", "lines(4:8, 4:8)"],
-        "grid_plot" => vec!["grid::grid.newpage()", "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))"],
+        "grid_plot" => vec![
+            "grid::grid.newpage()",
+            "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
+        ],
         "grid_plot_update" => vec![
             "grid::grid.newpage()",
             "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
@@ -437,10 +440,7 @@ fn render_plot_transcript(snapshot: &PlotTranscriptSnapshot) -> String {
                 "=== reference {} via {}\n",
                 reference.name, reference.command
             ));
-            out.push_str(&format!(
-                "=== env {}=<REFERENCE_PNG>\n",
-                reference.env_var
-            ));
+            out.push_str(&format!("=== env {}=<REFERENCE_PNG>\n", reference.env_var));
             out.push_str("=== script\n");
             for line in &reference.script {
                 out.push_str(&format!("===   {line}\n"));
