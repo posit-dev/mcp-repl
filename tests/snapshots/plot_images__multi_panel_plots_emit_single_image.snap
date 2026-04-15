@@ -11,7 +11,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128",
+            "data": "blake3:<multi_panel_plot>",
             "mimeType": "image/png"
           },
           {
@@ -20,6 +20,18 @@ expression: serialized
           }
         ],
         "isError": false
+      },
+      "reference": {
+        "name": "multi_panel_plot",
+        "command": "Rscript --vanilla -",
+        "envVar": "MCP_REPL_TEST_PNG_DEST",
+        "script": [
+          "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
+          "par(mfrow = c(2, 1))",
+          "plot(1:10)",
+          "plot(10:1)",
+          "grDevices::dev.off()"
+        ]
       }
     },
     {

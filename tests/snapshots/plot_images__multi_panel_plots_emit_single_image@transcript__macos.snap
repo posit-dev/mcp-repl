@@ -5,7 +5,15 @@ expression: transcript
 == transcript ==
 1) r_repl
 >>> par(mfrow = c(2, 1)); plot(1:10); plot(10:1)
-<<< [image/png blake3:f767760a51c634506c4f219b749ff8aeb7f26e4fbe2ce6aa7b37f4564a76c23b]
+<<< [image/png blake3:<multi_panel_plot>]
+=== reference multi_panel_plot via Rscript --vanilla -
+=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
+=== script
+===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)
+===   par(mfrow = c(2, 1))
+===   plot(1:10)
+===   plot(10:1)
+===   grDevices::dev.off()
 
 2) r_repl
 >>> 1+1

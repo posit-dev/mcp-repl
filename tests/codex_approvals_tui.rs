@@ -70,7 +70,7 @@ mod unix_impl {
             ExecSnapshotMode::Plain => "",
         };
         let shell_script = format!(
-            "codex exec {mode_flag}--sandbox workspace-write --skip-git-repo-check --cd {} {} 2>&1",
+            "codex exec {mode_flag}--sandbox workspace-write --skip-git-repo-check --cd {} {}",
             sh_single_quote(&env.workspace.display().to_string()),
             sh_single_quote(&prompt),
         );
@@ -399,7 +399,7 @@ mod unix_impl {
     fn render_exec_snapshot(
         mode: ExecSnapshotMode,
         stdout: &str,
-        stderr: &str,
+        _stderr: &str,
         workspace: &Path,
         codex_home: &Path,
     ) -> TestResult<String> {
@@ -414,19 +414,6 @@ mod unix_impl {
         });
 
         for line in stdout.lines() {
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let normalized = normalize_exec_text(trimmed, workspace, codex_home);
-            if normalized.is_empty() {
-                continue;
-            }
-            out.push_str(&normalized);
-            out.push('\n');
-        }
-
-        for line in stderr.lines() {
             let trimmed = line.trim_end();
             if trimmed.is_empty() {
                 continue;
@@ -457,17 +444,6 @@ mod unix_impl {
         if text.contains(
             "Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces.",
         ) {
-            return String::new();
-        }
-        if text.contains("ERROR codex_api::endpoint::responses_websocket:")
-            || text.contains("WARN codex_core::session_startup_prewarm:")
-            || text
-                .contains("WARN codex_core::codex: stream disconnected - retrying sampling request")
-            || text.contains("WARN codex_core::client: falling back to HTTP")
-            || text.starts_with("Reconnecting... ")
-            || text.contains(r#""type":"error","message":"Reconnecting... "#)
-            || text.contains("Falling back from WebSockets to HTTPS transport.")
-        {
             return String::new();
         }
         let workspace_display = workspace.display().to_string();
@@ -680,24 +656,6 @@ mod unix_impl {
     }
 
     #[test]
-    fn normalize_exec_text_drops_timestamped_websocket_error_lines() {
-        let workspace = Path::new("/tmp/workspace");
-        let codex_home = Path::new("/tmp/codex-home");
-        let input = "2026-03-20T20:26:18.707303Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found, url: ws://127.0.0.1:64598/v1/responses";
-        let normalized = normalize_exec_text(input, workspace, codex_home);
-        assert_eq!(normalized, "");
-    }
-
-    #[test]
-    fn normalize_exec_text_drops_reconnect_json_lines() {
-        let workspace = Path::new("/tmp/workspace");
-        let codex_home = Path::new("/tmp/codex-home");
-        let input = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: ws://127.0.0.1:64598/v1/responses)"}"#;
-        let normalized = normalize_exec_text(input, workspace, codex_home);
-        assert_eq!(normalized, "");
-    }
-
-    #[test]
     fn normalize_exec_text_drops_stdin_status_line() {
         let workspace = Path::new("/tmp/workspace");
         let codex_home = Path::new("/tmp/codex-home");
@@ -707,6 +665,22 @@ mod unix_impl {
             codex_home,
         );
         assert_eq!(normalized, "");
+    }
+
+    #[test]
+    fn render_exec_snapshot_ignores_stderr() -> TestResult<()> {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let snapshot = render_exec_snapshot(
+            ExecSnapshotMode::Plain,
+            "visible stdout\n",
+            "warning on stderr\n",
+            workspace,
+            codex_home,
+        )?;
+        assert!(snapshot.contains("visible stdout"));
+        assert!(!snapshot.contains("warning on stderr"));
+        Ok(())
     }
 
     fn codex_config(mcp_repl: &Path, repo_root: &Path, openai_base_url: &str) -> String {

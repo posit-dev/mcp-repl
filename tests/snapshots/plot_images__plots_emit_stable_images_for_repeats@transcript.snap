@@ -5,11 +5,23 @@ expression: transcript
 == transcript ==
 1) r_repl
 >>> plot(1:10)
-<<< [image/png blake3:0694aafd9f8fc0744e7029b187c1ab182d061a4f180319772a19794be32ebf98]
+<<< [image/png blake3:<base_plot>]
+=== reference base_plot via Rscript --vanilla -
+=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
+=== script
+===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)
+===   plot(1:10)
+===   grDevices::dev.off()
 
 2) r_repl
 >>> plot(1:10)
-<<< [image/png blake3:0694aafd9f8fc0744e7029b187c1ab182d061a4f180319772a19794be32ebf98]
+<<< [image/png blake3:<base_plot>]
+=== reference base_plot via Rscript --vanilla -
+=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
+=== script
+===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)
+===   plot(1:10)
+===   grDevices::dev.off()
 
 3) r_repl
 >>> 1+1
