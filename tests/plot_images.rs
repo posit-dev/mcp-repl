@@ -8,7 +8,9 @@ use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
@@ -24,6 +26,17 @@ struct PlotStepSnapshot {
     tool: String,
     input: String,
     response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<ReferenceImageSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReferenceImageSnapshot {
+    name: String,
+    command: String,
+    #[serde(rename = "envVar")]
+    env_var: String,
+    script: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,7 +126,7 @@ fn any_backend_unavailable(results: &[&CallToolResult]) -> bool {
         .any(|result| backend_unavailable(&result_text(result)))
 }
 
-fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
+fn response_snapshot(result: &CallToolResult, reference_name: Option<&str>) -> serde_json::Value {
     let mut value = serde_json::to_value(result)
         .unwrap_or_else(|_| serde_json::json!({"error": "failed to serialize response"}));
     if let Some(content) = value
@@ -129,35 +142,24 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
                 continue;
             }
 
-            let mime_type = item
-                .get("mimeType")
-                .and_then(|value| value.as_str())
-                .unwrap_or("image")
-                .to_string();
-
-            if let Some(data) = item.get_mut("data")
-                && let Some(encoded) = data.as_str()
-            {
-                let summary = snapshot_image_data(&mime_type, encoded);
-                *data = serde_json::Value::String(summary);
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            if let Some(reference_name) = reference_name {
+                object.insert(
+                    "data".to_string(),
+                    serde_json::Value::String(format!("blake3:<{reference_name}>")),
+                );
+            } else {
+                object.remove("data");
             }
         }
     }
     value
 }
 
-fn snapshot_image_data(mime_type: &str, encoded: &str) -> String {
-    if mime_type == "image/png"
-        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes())
-        && let Some((width, height)) = png_dimensions(&bytes)
-    {
-        return format!("{width}x{height}");
-    }
-    "<binary>".to_string()
-}
-
 fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
-    let snapshot = response_snapshot(result);
+    let snapshot = response_snapshot(result, None);
     let content = snapshot
         .get("content")
         .and_then(|value| value.as_array())
@@ -177,10 +179,19 @@ fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
 }
 
 fn step_snapshot(input: &str, result: &CallToolResult) -> PlotStepSnapshot {
+    step_snapshot_with_reference(input, result, None)
+}
+
+fn step_snapshot_with_reference(
+    input: &str,
+    result: &CallToolResult,
+    reference_name: Option<&str>,
+) -> PlotStepSnapshot {
     PlotStepSnapshot {
         tool: "r_repl".to_string(),
         input: input.to_string(),
-        response: response_snapshot(result),
+        response: response_snapshot(result, reference_name),
+        reference: reference_name.map(reference_image_snapshot),
     }
 }
 
@@ -274,33 +285,73 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-fn reference_image_script(name: &str, path: &std::path::Path) -> Option<String> {
-    let plot_code = match name {
-        "base_plot" => "plot(1:10)",
-        "base_plot_update" => "plot(1:10); lines(4:8, 4:8)",
-        "base_plot_multi_panel" => "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)",
-        "grid_plot" => "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
-        "grid_plot_update" => {
-            "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9)); grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))"
-        }
+const REFERENCE_IMAGE_DEST_ENV: &str = "MCP_REPL_TEST_PNG_DEST";
+const REFERENCE_IMAGE_COMMAND: &str = "Rscript --vanilla -";
+
+fn reference_image_script_lines(name: &str) -> Option<Vec<&'static str>> {
+    let plot_lines = match name {
+        "base_plot" => vec!["plot(1:10)"],
+        "base_plot_update" => vec!["plot(1:10)", "lines(4:8, 4:8)"],
+        "multi_panel_plot" => vec!["par(mfrow = c(2, 1))", "plot(1:10)", "plot(10:1)"],
+        "grid_plot" => vec![
+            "grid::grid.newpage()",
+            "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
+        ],
+        "grid_plot_update" => vec![
+            "grid::grid.newpage()",
+            "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
+            "grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))",
+        ],
         _ => return None,
     };
-    let path = path.display().to_string();
-    let path = path.replace('\\', "\\\\").replace('"', "\\\"");
-    Some(format!(
-        "grDevices::png(filename = \"{path}\", width = 800, height = 600, res = 96); {plot_code}; grDevices::dev.off()"
-    ))
+
+    let mut lines = vec![
+        r#"grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)"#,
+    ];
+    lines.extend(plot_lines);
+    lines.push("grDevices::dev.off()");
+    Some(lines)
+}
+
+fn reference_image_script(name: &str) -> Option<String> {
+    let lines = reference_image_script_lines(name)?;
+    Some(format!("{}\n", lines.join("\n")))
+}
+
+fn reference_image_snapshot(name: &str) -> ReferenceImageSnapshot {
+    let Some(script) = reference_image_script_lines(name) else {
+        panic!("no Rscript generator registered for reference image {name}");
+    };
+    ReferenceImageSnapshot {
+        name: name.to_string(),
+        command: REFERENCE_IMAGE_COMMAND.to_string(),
+        env_var: REFERENCE_IMAGE_DEST_ENV.to_string(),
+        script: script.into_iter().map(str::to_string).collect(),
+    }
 }
 
 fn regenerate_reference_image(name: &str, path: &std::path::Path) {
-    let Some(script) = reference_image_script(name, path) else {
+    let Some(script) = reference_image_script(name) else {
         panic!("no Rscript generator registered for reference image {name}");
     };
-    let status = std::process::Command::new("Rscript")
-        .arg("-e")
-        .arg(script)
-        .status()
+    let mut child = Command::new("Rscript")
+        .arg("--vanilla")
+        .arg("-")
+        .env(REFERENCE_IMAGE_DEST_ENV, path)
+        .stdin(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|err| panic!("failed to run Rscript for {name}: {err}"));
+    let mut stdin = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("failed to open Rscript stdin for {name}"));
+    stdin
+        .write_all(script.as_bytes())
+        .unwrap_or_else(|err| panic!("failed to write reference script for {name}: {err}"));
+    drop(stdin);
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| panic!("failed to wait for Rscript for {name}: {err}"));
     assert!(
         status.success(),
         "Rscript failed while generating reference image {name}"
@@ -382,6 +433,18 @@ fn render_plot_transcript(snapshot: &PlotTranscriptSnapshot) -> String {
         for line in plot_response_lines(&step.response) {
             out.push_str(&format!("<<< {line}\n"));
         }
+
+        if let Some(reference) = &step.reference {
+            out.push_str(&format!(
+                "=== reference {} via {}\n",
+                reference.name, reference.command
+            ));
+            out.push_str(&format!("=== env {}=<REFERENCE_PNG>\n", reference.env_var));
+            out.push_str("=== script\n");
+            for line in &reference.script {
+                out.push_str(&format!("===   {line}\n"));
+            }
+        }
     }
 
     out.trim_end().to_string()
@@ -416,10 +479,10 @@ fn plot_response_lines(response: &serde_json::Value) -> Vec<String> {
                     .get("mimeType")
                     .and_then(|value| value.as_str())
                     .unwrap_or("image");
-                let data = item
-                    .get("data")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("data");
+                let Some(data) = item.get("data").and_then(|value| value.as_str()) else {
+                    lines.push(format!("[{mime_type}]"));
+                    continue;
+                };
                 lines.push(format!("[{mime_type} {data}]"));
             }
             Some("audio") => {
@@ -468,13 +531,21 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
 
     let plot_input = "plot(1:10)";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &plot_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &plot_result,
+        Some("base_plot"),
+    ));
 
     let update_input = "lines(4:8, 4:8)";
     let update_result = session
         .write_stdin_raw_with(update_input, Some(30.0))
         .await?;
-    steps.push(step_snapshot(update_input, &update_result));
+    steps.push(step_snapshot_with_reference(
+        update_input,
+        &update_result,
+        Some("base_plot_update"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -541,9 +612,17 @@ async fn plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
     let plot_input = "plot(1:10)";
     let first_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &first_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &first_result,
+        Some("base_plot"),
+    ));
     let second_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &second_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &second_result,
+        Some("base_plot"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -607,7 +686,11 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 
     let plot_input = "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &plot_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &plot_result,
+        Some("multi_panel_plot"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -640,7 +723,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
         "expected multi-panel plot to emit a single image update"
     );
     assert_eq!(plot_images[0].mime_type, "image/png");
-    assert_reference_image("base_plot_multi_panel", &plot_images[0].bytes);
+    assert_reference_image("multi_panel_plot", &plot_images[0].bytes);
 
     let snapshot = PlotTranscriptSnapshot { steps };
     assert_plot_snapshot_pair("multi_panel_plots_emit_single_image", &snapshot)?;
@@ -726,13 +809,21 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &plot_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &plot_result,
+        Some("grid_plot"),
+    ));
 
     let update_input = "grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))";
     let update_result = session
         .write_stdin_raw_with(update_input, Some(30.0))
         .await?;
-    steps.push(step_snapshot(update_input, &update_result));
+    steps.push(step_snapshot_with_reference(
+        update_input,
+        &update_result,
+        Some("grid_plot_update"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -799,9 +890,17 @@ async fn grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
     let first_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &first_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &first_result,
+        Some("grid_plot"),
+    ));
     let second_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &second_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &second_result,
+        Some("grid_plot"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;

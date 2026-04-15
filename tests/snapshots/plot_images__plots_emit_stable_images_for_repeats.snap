@@ -11,7 +11,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "800x600",
+            "data": "blake3:<base_plot>",
             "mimeType": "image/png"
           },
           {
@@ -20,6 +20,16 @@ expression: serialized
           }
         ],
         "isError": false
+      },
+      "reference": {
+        "name": "base_plot",
+        "command": "Rscript --vanilla -",
+        "envVar": "MCP_REPL_TEST_PNG_DEST",
+        "script": [
+          "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
+          "plot(1:10)",
+          "grDevices::dev.off()"
+        ]
       }
     },
     {
@@ -29,7 +39,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "800x600",
+            "data": "blake3:<base_plot>",
             "mimeType": "image/png"
           },
           {
@@ -38,6 +48,16 @@ expression: serialized
           }
         ],
         "isError": false
+      },
+      "reference": {
+        "name": "base_plot",
+        "command": "Rscript --vanilla -",
+        "envVar": "MCP_REPL_TEST_PNG_DEST",
+        "script": [
+          "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
+          "plot(1:10)",
+          "grDevices::dev.off()"
+        ]
       }
     },
     {
