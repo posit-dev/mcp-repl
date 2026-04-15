@@ -685,11 +685,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 
     let plot_input = "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot_with_reference(
-        plot_input,
-        &plot_result,
-        Some("grid_plot"),
-    ));
+    steps.push(step_snapshot(plot_input, &plot_result));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -806,7 +802,11 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &plot_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &plot_result,
+        Some("grid_plot"),
+    ));
 
     let update_input = "grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))";
     let update_result = session
