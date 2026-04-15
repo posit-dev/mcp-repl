@@ -292,6 +292,7 @@ fn reference_image_script_lines(name: &str) -> Option<Vec<&'static str>> {
     let plot_lines = match name {
         "base_plot" => vec!["plot(1:10)"],
         "base_plot_update" => vec!["plot(1:10)", "lines(4:8, 4:8)"],
+        "multi_panel_plot" => vec!["par(mfrow = c(2, 1))", "plot(1:10)", "plot(10:1)"],
         "grid_plot" => vec![
             "grid::grid.newpage()",
             "grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
@@ -685,7 +686,11 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 
     let plot_input = "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)";
     let plot_result = session.write_stdin_raw_with(plot_input, Some(30.0)).await?;
-    steps.push(step_snapshot(plot_input, &plot_result));
+    steps.push(step_snapshot_with_reference(
+        plot_input,
+        &plot_result,
+        Some("multi_panel_plot"),
+    ));
 
     let noop_input = "1+1";
     let noop_result = session.write_stdin_raw_with(noop_input, Some(30.0)).await?;
@@ -717,6 +722,8 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
         1,
         "expected multi-panel plot to emit a single image update"
     );
+    assert_eq!(plot_images[0].mime_type, "image/png");
+    assert_reference_image("multi_panel_plot", &plot_images[0].bytes);
 
     let snapshot = PlotTranscriptSnapshot { steps };
     assert_plot_snapshot_pair("multi_panel_plots_emit_single_image", &snapshot)?;

@@ -102,6 +102,7 @@ fn plot_reference_snapshots_show_reference_scripts() {
     for name in [
         "plot_images__plots_emit_images_and_updates.snap",
         "plot_images__plots_emit_stable_images_for_repeats.snap",
+        "plot_images__multi_panel_plots_emit_single_image.snap",
         "plot_images__grid_plots_emit_images_and_updates.snap",
         "plot_images__grid_plots_emit_stable_images_for_repeats.snap",
     ] {
@@ -128,6 +129,7 @@ fn plot_reference_snapshots_show_reference_scripts() {
     for name in [
         "plot_images__plots_emit_images_and_updates@transcript.snap",
         "plot_images__plots_emit_stable_images_for_repeats@transcript.snap",
+        "plot_images__multi_panel_plots_emit_single_image@transcript.snap",
         "plot_images__grid_plots_emit_images_and_updates@transcript.snap",
         "plot_images__grid_plots_emit_stable_images_for_repeats@transcript.snap",
     ] {
@@ -184,7 +186,7 @@ fn grid_plot_snapshots_show_reference_for_initial_and_updated_images() {
 }
 
 #[test]
-fn multi_panel_plot_snapshots_do_not_claim_a_reference_render() {
+fn multi_panel_plot_snapshots_show_reference_render() {
     let snapshots_dir = repo_root().join("tests/snapshots");
     for name in [
         "plot_images__multi_panel_plots_emit_single_image.snap",
@@ -192,12 +194,12 @@ fn multi_panel_plot_snapshots_do_not_claim_a_reference_render() {
     ] {
         let contents = read(&snapshots_dir.join(name));
         assert!(
-            !contents.contains("\"reference\": {"),
-            "multi-panel plot snapshot should not embed a reference render: {name}"
+            contents.contains("\"data\": \"blake3:<multi_panel_plot>\""),
+            "multi-panel plot snapshot should expose the reference placeholder: {name}"
         );
         assert!(
-            !contents.contains("blake3:<grid_plot>"),
-            "multi-panel plot snapshot should not borrow the grid plot placeholder: {name}"
+            contents.contains("\"reference\": {"),
+            "multi-panel plot snapshot should embed a reference render: {name}"
         );
     }
 
@@ -207,12 +209,12 @@ fn multi_panel_plot_snapshots_do_not_claim_a_reference_render() {
     ] {
         let contents = read(&snapshots_dir.join(name));
         assert!(
-            !contents.contains("=== reference "),
-            "multi-panel transcript should not embed a reference render: {name}"
+            contents.contains("=== reference multi_panel_plot via Rscript --vanilla -"),
+            "multi-panel transcript should embed the reference render: {name}"
         );
         assert!(
-            !contents.contains("blake3:<grid_plot>"),
-            "multi-panel transcript should not borrow the grid plot placeholder: {name}"
+            contents.contains("blake3:<multi_panel_plot>"),
+            "multi-panel transcript should expose the reference placeholder: {name}"
         );
     }
 }
