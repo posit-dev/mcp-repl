@@ -247,6 +247,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> quit(\"no\")"
+    },
+    {
+      "type": "text",
       "text": "[repl] session ended"
     }
   ]
@@ -313,6 +317,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> quit()"
+    },
+    {
+      "type": "text",
       "text": "[repl] session ended"
     }
   ]
@@ -377,6 +385,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> quit(\"yes\")"
+    },
     {
       "type": "text",
       "text": "[repl] session ended"

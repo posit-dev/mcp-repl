@@ -607,7 +607,7 @@ async fn python_multiline_block() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
+async fn python_multiline_block_keeps_echo_without_sideband_events() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
@@ -618,7 +618,7 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     let text = result_text(&result);
     if is_busy_response(&text) {
         eprintln!(
-            "python_multiline_block_does_not_echo_input_in_visible_reply remained busy; skipping"
+            "python_multiline_block_keeps_echo_without_sideband_events remained busy; skipping"
         );
         session.cancel().await?;
         return Ok(());
@@ -629,12 +629,12 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
 
     assert!(visible.contains("3"), "expected 3, got: {visible:?}");
     assert!(
-        !visible.contains("def f():"),
-        "did not expect the multiline function definition to echo back, got: {visible:?}"
+        visible.contains("def f():"),
+        "expected the multiline function definition to remain visible without sideband echo events, got: {visible:?}"
     );
     assert!(
-        !visible.contains("return 3"),
-        "did not expect the multiline body to echo back, got: {visible:?}"
+        visible.contains("return 3"),
+        "expected the multiline body to remain visible without sideband echo events, got: {visible:?}"
     );
     Ok(())
 }
@@ -1082,37 +1082,24 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
             return Err("worker stayed busy after interrupt".into());
         }
 
-        let result = session.write_stdin_raw_with("1+1", Some(0.5)).await?;
-        let text = result_text(&result);
-        if text.contains("worker is busy") || text.contains("request already running") {
-            sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-        assert!(
-            text.contains("2"),
-            "expected evaluation after interrupt, got: {text:?}"
-        );
-        break;
-    }
-
-    let deadline = interrupt_recovery_deadline();
-    loop {
-        if Instant::now() >= deadline {
-            session.cancel().await?;
-            return Err("worker stayed busy before tail-marker probe".into());
-        }
-
-        let marker_result = session
-            .write_stdin_raw_with("globals().get('x_tail_marker', 'MISSING')", Some(0.5))
+        let probe_result = session
+            .write_stdin_raw_with(
+                "(1 + 1, globals().get('x_tail_marker', 'MISSING'))",
+                Some(0.5),
+            )
             .await?;
-        let marker_text = result_text(&marker_result);
-        if is_busy_response(&marker_text) {
+        let probe_text = result_text(&probe_result);
+        if is_busy_response(&probe_text) {
             sleep(Duration::from_millis(50)).await;
             continue;
         }
         assert!(
-            marker_text.contains("'MISSING'"),
-            "expected buffered tail assignment to be discarded, got: {marker_text:?}"
+            probe_text.contains("2"),
+            "expected evaluation after interrupt, got: {probe_text:?}"
+        );
+        assert!(
+            probe_text.contains("'MISSING'"),
+            "expected buffered tail assignment to be discarded, got: {probe_text:?}"
         );
         break;
     }

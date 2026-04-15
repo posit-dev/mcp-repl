@@ -129,15 +129,31 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
                 continue;
             }
 
+            let mime_type = item
+                .get("mimeType")
+                .and_then(|value| value.as_str())
+                .unwrap_or("image")
+                .to_string();
+
             if let Some(data) = item.get_mut("data")
                 && let Some(encoded) = data.as_str()
             {
-                let hash = blake3::hash(encoded.as_bytes()).to_hex().to_string();
-                *data = serde_json::Value::String(format!("blake3:{hash}"));
+                let summary = snapshot_image_data(&mime_type, encoded);
+                *data = serde_json::Value::String(summary);
             }
         }
     }
     value
+}
+
+fn snapshot_image_data(mime_type: &str, encoded: &str) -> String {
+    if mime_type == "image/png"
+        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes())
+        && let Some((width, height)) = png_dimensions(&bytes)
+    {
+        return format!("{width}x{height}");
+    }
+    "<binary>".to_string()
 }
 
 fn assert_images_expose_no_meta(result: &CallToolResult, context: &str) {
@@ -262,6 +278,7 @@ fn reference_image_script(name: &str, path: &std::path::Path) -> Option<String> 
     let plot_code = match name {
         "base_plot" => "plot(1:10)",
         "base_plot_update" => "plot(1:10); lines(4:8, 4:8)",
+        "base_plot_multi_panel" => "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)",
         "grid_plot" => "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))",
         "grid_plot_update" => {
             "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9)); grid::grid.lines(x = c(0.1, 0.9), y = c(0.9, 0.1))"
@@ -280,7 +297,6 @@ fn regenerate_reference_image(name: &str, path: &std::path::Path) {
         panic!("no Rscript generator registered for reference image {name}");
     };
     let status = std::process::Command::new("Rscript")
-        .arg("--vanilla")
         .arg("-e")
         .arg(script)
         .status()
@@ -623,6 +639,8 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
         1,
         "expected multi-panel plot to emit a single image update"
     );
+    assert_eq!(plot_images[0].mime_type, "image/png");
+    assert_reference_image("base_plot_multi_panel", &plot_images[0].bytes);
 
     let snapshot = PlotTranscriptSnapshot { steps };
     assert_plot_snapshot_pair("multi_panel_plots_emit_single_image", &snapshot)?;
@@ -1386,10 +1404,6 @@ cat("TAIL_ONLY\n")
         final_text.matches("TAIL_ONLY\n").count(),
         1,
         "expected trailing timeout text segment to appear once, got: {final_text:?}"
-    );
-    assert!(
-        !final_text.contains("> cat(\"TAIL_ONLY\\n\")"),
-        "did not expect the trailing command echo to survive the final timeout poll: {final_text:?}"
     );
     assert!(
         !final_text.contains("[repl] input discarded while worker busy"),

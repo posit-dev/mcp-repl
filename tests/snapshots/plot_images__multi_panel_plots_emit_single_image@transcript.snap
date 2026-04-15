@@ -5,7 +5,7 @@ expression: transcript
 == transcript ==
 1) r_repl
 >>> par(mfrow = c(2, 1)); plot(1:10); plot(10:1)
-<<< [image/png blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128]
+<<< [image/png 800x600]
 
 2) r_repl
 >>> 1+1
