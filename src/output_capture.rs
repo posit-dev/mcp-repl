@@ -60,6 +60,12 @@ pub(crate) fn reset_last_reply_marker_offset() {
     LAST_REPLY_MARKER_OFFSET.store(u64::MAX, Ordering::SeqCst);
 }
 
+#[cfg(test)]
+pub(crate) fn output_ring_test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,

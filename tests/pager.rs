@@ -4,10 +4,6 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
-#[cfg(windows)]
-use std::time::Duration;
-#[cfg(windows)]
-use tokio::time::sleep;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -19,32 +15,6 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-#[cfg(windows)]
-fn pager_request_is_still_busy(text: &str) -> bool {
-    text.contains("<<repl status: busy") || text.contains("input discarded while worker busy")
-}
-
-#[cfg(windows)]
-async fn write_pager_command_with_poll(
-    session: &mut common::McpTestSession,
-    input: &str,
-    timeout_secs: f64,
-) -> Result<rmcp::model::CallToolResult, rmcp::service::ServiceError> {
-    let mut result = session
-        .write_stdin_raw_with(input, Some(timeout_secs))
-        .await?;
-    let mut text = result_text(&result);
-    for _ in 0..4 {
-        if !pager_request_is_still_busy(&text) {
-            return Ok(result);
-        }
-        sleep(Duration::from_secs(1)).await;
-        result = session.write_stdin_raw_with("", Some(15.0)).await?;
-        text = result_text(&result);
-    }
-    Ok(result)
 }
 
 #[cfg(windows)]
@@ -329,15 +299,20 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
     assert_snapshot_or_skip("pager_dedup_on_seek", &snapshot)
 }
 
-#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_windows_smoke() -> TestResult<()> {
+async fn pager_smoke() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
-    let result = write_pager_command_with_poll(
+    let initial = session
+        .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
+        .await?;
+    let result = common::wait_until_ready_with_input_retry(
         &mut session,
         "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))",
+        initial,
         120.0,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
     )
     .await?;
     let text = result_text(&result);
@@ -355,7 +330,16 @@ async fn pager_windows_smoke() -> TestResult<()> {
         "expected pager footer, got: {text:?}"
     );
 
-    let result = write_pager_command_with_poll(&mut session, ":next", 60.0).await?;
+    let initial = session.write_stdin_raw_with(":next", Some(60.0)).await?;
+    let result = common::wait_until_ready_with_input_retry(
+        &mut session,
+        ":next",
+        initial,
+        60.0,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -370,7 +354,16 @@ async fn pager_windows_smoke() -> TestResult<()> {
         "expected next page output, got: {text:?}"
     );
 
-    let result = write_pager_command_with_poll(&mut session, ":/L0031", 60.0).await?;
+    let initial = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
+    let result = common::wait_until_ready_with_input_retry(
+        &mut session,
+        ":/L0031",
+        initial,
+        60.0,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -380,6 +373,195 @@ async fn pager_windows_smoke() -> TestResult<()> {
     assert!(
         text.contains("L0031") || text.contains("next match"),
         "expected search guidance/output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestResult<()> {
+    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        80,
+    )
+    .await?;
+
+    let result = session
+        .write_stdin_raw_unterminated_with("", Some(1.0))
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "expected initial empty pager input to surface worker startup failure, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let initial = session
+        .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
+        .await?;
+    let result = common::wait_until_ready_with_input_retry(
+        &mut session,
+        "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))",
+        initial,
+        120.0,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0001"),
+        "expected first page output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected pager footer, got: {text:?}"
+    );
+
+    let initial = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    let result = common::wait_until_ready_with_input_retry(
+        &mut session,
+        input,
+        initial,
+        60.0,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0002")
+            || text.contains("L0003")
+            || text.contains("L0010")
+            || text.contains("L0014"),
+        "expected blank pager input to advance to the next page, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--") || text.contains("(END"),
+        "expected pager output after blank pager input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
+    assert_blank_pager_input_advances_page("   ").await
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_empty_input_advances_page() -> TestResult<()> {
+    assert_blank_pager_input_advances_page("").await
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i)); flush.console(); Sys.sleep(1.0)",
+            Some(0.1),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if !initial_text.contains("<<repl status: busy") || !initial_text.contains("--More--") {
+        eprintln!("pager did not stay busy with an active footer in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let poll = session
+        .write_stdin_raw_unterminated_with("", Some(0.1))
+        .await?;
+    let poll_text = result_text(&poll);
+    if backend_unavailable(&poll_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        poll_text.contains("<<repl status: busy"),
+        "expected empty poll to remain a busy follow-up while the request was still running, got: {poll_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_until_not_busy_does_not_return_while_pager_request_is_still_running() -> TestResult<()>
+{
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i)); flush.console(); Sys.sleep(2.0); cat('DONE\\n')",
+            Some(0.1),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if !initial_text.contains("<<repl status: busy") {
+        eprintln!("pager request settled before the helper could observe a busy reply; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = common::wait_until_not_busy(
+        &mut session,
+        initial,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    let follow_up = session.write_stdin_raw_with("1+1", Some(0.2)).await?;
+    let follow_up_text = result_text(&follow_up);
+    if backend_unavailable(&follow_up_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        !follow_up_text.contains("input discarded while worker busy")
+            && !follow_up_text.contains("<<repl status: busy"),
+        "expected wait_until_not_busy to return only after the running pager request settled, got: {follow_up_text:?}"
     );
 
     session.cancel().await?;

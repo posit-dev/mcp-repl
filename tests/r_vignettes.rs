@@ -5,6 +5,7 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::sync::{Mutex, OnceLock};
+use tokio::time::{Duration, Instant, sleep};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -33,6 +34,32 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+async fn wait_until_not_busy(
+    session: &mut common::McpTestSession,
+    initial: rmcp::model::CallToolResult,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<repl status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(250)).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<repl status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn vignette_prints_contents_in_console() -> TestResult<()> {
     let _guard = test_mutex()
@@ -46,6 +73,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
             Some(60.0),
         )
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_vignettes backend unavailable in this environment; skipping");
@@ -85,6 +113,7 @@ async fn browse_vignettes_prints_text_listing() -> TestResult<()> {
             Some(60.0),
         )
         .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_vignettes backend unavailable in this environment; skipping");

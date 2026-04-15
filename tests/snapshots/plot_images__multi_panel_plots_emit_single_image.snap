@@ -11,7 +11,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "blake3:d10529d949733ba6ce8ef0d591129e26da42a908d7e2a20bb474705b4360a6f8",
+            "data": "blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128",
             "mimeType": "image/png"
           },
           {

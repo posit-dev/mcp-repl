@@ -1,10 +1,14 @@
 #![allow(dead_code)]
 
 use std::error::Error;
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+#[cfg(windows)]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use regex_lite::Regex;
 use rmcp::ServiceExt;
@@ -18,12 +22,191 @@ use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0},
+    System::Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
+};
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
+#[cfg(windows)]
+const WINDOWS_TEST_SERVER_MUTEX_NAME: &str = "Local\\mcp_repl_test_server_mutex";
+
+#[cfg(windows)]
+struct WindowsSuiteServerMutexOwner {
+    release_tx: std::sync::mpsc::Sender<()>,
+    join_handle: std::thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+fn windows_suite_server_lock_path_seed(repo_root: &Path) -> String {
+    let normalized = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut seed = normalized.to_string_lossy().into_owned();
+    seed.make_ascii_lowercase();
+    seed
+}
+
+#[cfg(windows)]
+fn windows_suite_server_lock_hash(seed: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in seed.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(windows)]
+fn windows_suite_server_mutex_name_for_checkout(repo_root: &Path) -> String {
+    let seed = windows_suite_server_lock_path_seed(repo_root);
+    let hash = windows_suite_server_lock_hash(&seed);
+    format!("{WINDOWS_TEST_SERVER_MUTEX_NAME}_{hash:016x}")
+}
+
+#[cfg(windows)]
+fn windows_suite_server_mutex_name_wide() -> Vec<u16> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let name = windows_suite_server_mutex_name_for_checkout(&repo_root);
+    let mut name: Vec<u16> = OsStr::new(&name).encode_wide().collect();
+    name.push(0);
+    name
+}
+
+#[cfg(windows)]
+pub(crate) fn suite_server_lock_name_for_tests(repo_root: &Path) -> String {
+    windows_suite_server_mutex_name_for_checkout(repo_root)
+}
+
+#[cfg(windows)]
+fn acquire_windows_suite_server_mutex_handle() -> TestResult<usize> {
+    let name = windows_suite_server_mutex_name_wide();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(std::io::Error::other(format!("unexpected mutex wait result: {wait}")).into());
+    }
+
+    Ok(handle as usize)
+}
+
+#[cfg(windows)]
+fn release_windows_suite_server_mutex_handle(handle: usize) {
+    let handle = handle as *mut std::ffi::c_void;
+    unsafe {
+        let _ = ReleaseMutex(handle);
+        let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+fn close_windows_suite_server_mutex_handle(handle: usize) {
+    let handle = handle as *mut std::ffi::c_void;
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+impl WindowsSuiteServerMutexOwner {
+    fn start() -> TestResult<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let join_handle = std::thread::spawn(move || {
+            let handle = match acquire_windows_suite_server_mutex_handle() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                release_windows_suite_server_mutex_handle(handle);
+                return;
+            }
+            let _ = release_rx.recv();
+            release_windows_suite_server_mutex_handle(handle);
+        });
+
+        ready_rx.recv().map_err(|_| {
+            std::io::Error::other("suite lock owner thread exited before acquiring")
+        })??;
+
+        Ok(Self {
+            release_tx,
+            join_handle,
+        })
+    }
+
+    fn release(self) {
+        let _ = self.release_tx.send(());
+        let _ = self.join_handle.join();
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn acquire_suite_server_lock_handle_for_tests() -> TestResult<usize> {
+    acquire_windows_suite_server_mutex_handle()
+}
+
+#[cfg(windows)]
+pub(crate) fn release_suite_server_lock_handle_for_tests(handle: usize) {
+    release_windows_suite_server_mutex_handle(handle);
+}
+
+#[cfg(windows)]
+pub(crate) fn close_suite_server_lock_handle_for_tests(handle: usize) {
+    close_windows_suite_server_mutex_handle(handle);
+}
+
+#[cfg(windows)]
+pub(crate) struct SuiteServerLockToken {
+    owner: Option<WindowsSuiteServerMutexOwner>,
+}
+
+#[cfg(not(windows))]
+pub(crate) struct SuiteServerLockToken;
+
+#[cfg(windows)]
+fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
+    Ok(SuiteServerLockToken {
+        owner: Some(WindowsSuiteServerMutexOwner::start()?),
+    })
+}
+
+#[cfg(not(windows))]
+fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
+    Ok(SuiteServerLockToken)
+}
+
+#[cfg(windows)]
+pub(crate) fn acquire_suite_server_lock_for_tests() -> TestResult<SuiteServerLockToken> {
+    acquire_suite_server_lock()
+}
+
+#[cfg(windows)]
+impl Drop for SuiteServerLockToken {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.release();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for SuiteServerLockToken {
+    fn drop(&mut self) {}
+}
 
 #[cfg(target_os = "macos")]
 pub fn sandbox_exec_available() -> bool {
@@ -264,6 +447,151 @@ fn normalized_test_timeout(timeout: Option<f64>) -> Option<f64> {
     {
         timeout
     }
+}
+
+pub(crate) fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub(crate) fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
+        || text.contains("worker io error: Broken pipe")
+        || text.contains("unable to initialize the JIT")
+        || text.contains("libR.so: cannot open shared object file")
+        || text.contains("options(\"defaultPackages\") was not found")
+}
+
+pub(crate) fn is_busy_response(text: &str) -> bool {
+    text.contains("<<repl status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusyResponseKind {
+    NotBusy,
+    Running,
+    RejectedInput,
+}
+
+fn busy_response_kind(text: &str) -> BusyResponseKind {
+    if text.contains("input discarded while worker busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+    {
+        BusyResponseKind::RejectedInput
+    } else if text.contains("<<repl status: busy") {
+        BusyResponseKind::Running
+    } else {
+        BusyResponseKind::NotBusy
+    }
+}
+
+pub(crate) async fn wait_until_not_busy(
+    session: &mut McpTestSession,
+    initial: rmcp::model::CallToolResult,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if busy_response_kind(&text) != BusyResponseKind::Running {
+        return Ok(result);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(poll_interval).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if busy_response_kind(&text) != BusyResponseKind::Running {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
+}
+
+pub(crate) async fn wait_until_ready_with_input_retry(
+    session: &mut McpTestSession,
+    input: &str,
+    initial: rmcp::model::CallToolResult,
+    attempt_timeout_secs: f64,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match busy_response_kind(&text) {
+            BusyResponseKind::NotBusy => return Ok(result),
+            BusyResponseKind::Running => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("worker remained busy after polling: {text:?}").into());
+                }
+                tokio::time::sleep(poll_interval).await;
+                result = session
+                    .write_stdin_raw_unterminated_with("", Some(2.0))
+                    .await?;
+            }
+            // Re-send the original command when the server reported that it dropped the input.
+            BusyResponseKind::RejectedInput => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("worker kept rejecting input while busy: {text:?}").into());
+                }
+                tokio::time::sleep(poll_interval).await;
+                result = session
+                    .write_stdin_raw_with(input, Some(attempt_timeout_secs))
+                    .await?;
+            }
+        }
+        text = result_text(&result);
+    }
+}
+
+pub(crate) async fn assert_eventually_contains(
+    session: &mut McpTestSession,
+    input: &str,
+    expected: &str,
+    label: &str,
+    attempt_timeout_secs: f64,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> TestResult<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_text = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let result = session
+            .write_stdin_raw_with(input, Some(attempt_timeout_secs))
+            .await?;
+        last_text = result_text(&result);
+        if backend_unavailable(&last_text) {
+            return Ok(false);
+        }
+        if last_text.contains(expected) {
+            return Ok(true);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    eprintln!("{label} did not stabilize: {last_text}");
+    Ok(false)
 }
 
 fn service_error_snapshot(err: &ServiceError) -> SnapshotServiceError {
@@ -1017,6 +1345,15 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env_and_cwd_and_pager_page_chars(args, env_vars, None, page_bytes).await
+}
+
+pub async fn spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
+    page_bytes: u64,
+) -> TestResult<McpTestSession> {
     let mut args = args;
     args.push("--oversized-output".to_string());
     args.push("pager".to_string());
@@ -1025,13 +1362,22 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
         page_bytes.to_string(),
     ));
-    spawn_server_with_args_env(args, env_vars).await
+    spawn_server_with_args_env_and_cwd(args, env_vars, cwd).await
 }
 
 pub async fn spawn_server_with_args_env(
     args: Vec<String>,
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env_and_cwd(args, env_vars, None).await
+}
+
+pub async fn spawn_server_with_args_env_and_cwd(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
+) -> TestResult<McpTestSession> {
+    let suite_lock = acquire_suite_server_lock()?;
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
     let backend = parse_backend_from_args(&args);
@@ -1044,12 +1390,16 @@ pub async fn spawn_server_with_args_env(
         args.push("--sandbox".to_string());
         args.push("danger-full-access".to_string());
     }
+    let current_dir = cwd;
     let transport = TokioChildProcess::new(Command::new(exe).configure(|cmd| {
         cmd.env_remove("R_PROFILE_USER");
         cmd.env_remove("R_PROFILE_SITE");
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
+        if let Some(cwd) = &current_dir {
+            cmd.current_dir(cwd);
+        }
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);
@@ -1058,6 +1408,7 @@ pub async fn spawn_server_with_args_env(
 
     let server_pid = transport.id();
     let service = TestClient.serve(transport).await?;
+    drop(suite_lock);
     Ok(McpTestSession {
         service,
         steps: Vec::new(),

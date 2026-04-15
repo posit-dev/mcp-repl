@@ -510,6 +510,7 @@ local({
   .mcp_repl_plot_state$counter <- 0L
   .mcp_repl_plot_state$current_id <- NULL
   .mcp_repl_plot_state$next_is_new <- TRUE
+  .mcp_repl_plot_state$page_open_seen <- FALSE
   .mcp_repl_plot_state$recordings <- new.env(parent = emptyenv())
   .mcp_repl_plot_state$in_render <- FALSE
   .mcp_repl_plot_state$initialized <- FALSE
@@ -730,17 +731,22 @@ local({
       return(invisible(NULL))
     }
 
-    .mcp_repl_plot_process_changes(reason)
     is_grid <- identical(reason, "before.grid.newpage")
     is_new_page <- if (is_grid) {
       TRUE
     } else {
       isTRUE(par("page"))
     }
+    has_recording <- !is.null(st$current_id) &&
+      exists(st$current_id, envir = st$recordings, inherits = FALSE)
+    if (has_recording || isTRUE(st$page_open_seen)) {
+      .mcp_repl_plot_process_changes(reason)
+    }
 
     if (is_new_page) {
       st$current_id <- .mcp_repl_new_plot_id()
       st$next_is_new <- TRUE
+      st$page_open_seen <- TRUE
       st$recordings <- new.env(parent = emptyenv())
     } else {
       st$next_is_new <- FALSE
@@ -749,10 +755,16 @@ local({
   }
 
   .mcp_repl_plot_task_callback <- function(expr, value, ok, visible) {
+    st <- .mcp_repl_plot_state
     if (!isTRUE(ok)) {
       try(.Call("mcp_repl_clear_pending_input"), silent = TRUE)
     }
-    .mcp_repl_plot_process_changes("task_callback")
+    has_recording <- !is.null(st$current_id) &&
+      exists(st$current_id, envir = st$recordings, inherits = FALSE)
+    if (isTRUE(st$page_open_seen) || has_recording) {
+      .mcp_repl_plot_process_changes("task_callback")
+    }
+    st$page_open_seen <- FALSE
     TRUE
   }
 

@@ -15,8 +15,19 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn should_skip_reticulate_py_help_output(text: &str) -> bool {
+    text.contains("[repl] reticulate not installed")
+        || text.contains("[repl] reticulate python unavailable")
+        || text.trim() == ">"
+}
+
+#[test]
+fn prompt_only_reticulate_output_is_skipped() {
+    assert!(should_skip_reticulate_py_help_output(">"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
+async fn reticulate_py_help_is_rendered() -> TestResult<()> {
     let mut session = common::spawn_server_with_files().await?;
 
     let result = session
@@ -45,21 +56,17 @@ async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
         .await?;
     let text = result_text(&result);
 
-    if text.contains("[repl] reticulate not installed")
-        || text.contains("[repl] reticulate python unavailable")
-    {
+    if should_skip_reticulate_py_help_output(&text) {
         session.cancel().await?;
         return Ok(());
     }
-    if text.trim() == ">" {
-        eprintln!("reticulate::py_help() produced no REPL output in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
     assert!(
         text.to_ascii_lowercase().contains("help"),
         "expected reticulate::py_help() output, got: {text:?}"
+    );
+    assert!(
+        text.contains("Return the number of items"),
+        "expected reticulate::py_help() doc text, got: {text:?}"
     );
     assert!(
         !text.contains("--More--"),
