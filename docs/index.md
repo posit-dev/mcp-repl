@@ -7,6 +7,7 @@ checked-in execution plans without relying on stale notes.
 ## Start Here
 
 - `docs/architecture.md`: current subsystem map for the CLI, server, worker, sandbox, and output surfaces.
+- `docs/output_timeline.md`: server-side model for merging text pipes and sideband events into visible reply order.
 - `docs/testing.md`: public validation surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and client-driven sandbox updates.
@@ -28,6 +29,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
+- `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
 - `docs/futurework/stdin-transport-single-owner.md`: deferred design for making worker stdin ownership explicit instead of relying on a Windows-only gate.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 

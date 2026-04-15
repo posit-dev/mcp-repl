@@ -9,6 +9,7 @@ mod install;
 mod ipc;
 mod output_capture;
 mod output_stream;
+mod output_timeline;
 mod oversized_output;
 mod pager;
 mod pending_output_tape;

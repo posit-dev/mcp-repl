@@ -1005,13 +1005,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(
-        &plot_id,
-        &mime_type,
-        &data,
-        is_new,
-        crate::output_stream::stdout_bytes_written(),
-    );
+    ipc::emit_plot_image(&plot_id, &mime_type, &data, is_new);
 
     Ok(())
 }

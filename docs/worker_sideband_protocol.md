@@ -55,10 +55,8 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 - Marks the end of output for the request. This is the primary completion signal.
 
 `plot_image`
-- `{ "type": "plot_image", "id": <string>, "mime_type": <string>, "data": <base64>, "is_new": <bool>, "stdout_bytes_before": <u64> }`
+- `{ "type": "plot_image", "id": <string>, "mime_type": <string>, "data": <base64>, "is_new": <bool> }`
 - Image payload for plot updates.
-- `stdout_bytes_before` is the worker stdout byte count at emission time so the server can place
-  the image before later stdout text even when the two channels arrive out of order.
 
 `session_end`
 - `{ "type": "session_end" }`
