@@ -48,6 +48,23 @@ fn image_payload_lengths(result: &rmcp::model::CallToolResult) -> Vec<usize> {
         .collect()
 }
 
+fn first_image_index(result: &rmcp::model::CallToolResult) -> Option<usize> {
+    result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+}
+
+fn first_text_index_containing(
+    result: &rmcp::model::CallToolResult,
+    needle: &str,
+) -> Option<usize> {
+    result.content.iter().position(|item| match &item.raw {
+        RawContent::Text(text) => text.text.contains(needle),
+        _ => false,
+    })
+}
+
 fn events_log_path(text: &str) -> Option<PathBuf> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -85,6 +102,70 @@ async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
     }
 
     assert!(text.contains("2"), "expected 2 in output, got: {text:?}");
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
+    let mut session = common::spawn_server().await?;
+
+    let result = session
+        .write_stdin_raw_with("plot(1:10)\ncat('done\\n')", Some(30.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let done_idx =
+        first_text_index_containing(&result, "done").ok_or("expected done text in reply")?;
+    assert!(
+        image_idx < done_idx,
+        "expected plot image before later stdout, got content order: {:?}",
+        result.content
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .write_stdin_raw_with("plot(1:10)\ncat('done\\n')", Some(30.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let done_idx =
+        first_text_index_containing(&result, "done").ok_or("expected done text in reply")?;
+    assert!(
+        image_idx < done_idx,
+        "expected plot image before later stdout, got content order: {:?}",
+        result.content
+    );
+
     session.cancel().await?;
     Ok(())
 }

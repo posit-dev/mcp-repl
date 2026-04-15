@@ -104,6 +104,8 @@ pub enum WorkerToServerIpcMessage {
         mime_type: String,
         data: String,
         is_new: bool,
+        #[serde(default)]
+        stdout_bytes_before: u64,
     },
     /// Emitted exactly when the backend knows the logical request has consumed all queued input.
     /// No later `ReadlineResult` should follow for that same request.
@@ -144,6 +146,7 @@ pub struct IpcPlotImage {
     pub mime_type: String,
     pub data: String,
     pub is_new: bool,
+    pub stdout_bytes_before: u64,
 }
 
 #[derive(Default, Clone)]
@@ -302,6 +305,7 @@ impl ServerIpcConnection {
                             mime_type,
                             data,
                             is_new,
+                            stdout_bytes_before,
                         } => {
                             if let Some(handler) = plot_handler.as_ref() {
                                 handler(IpcPlotImage {
@@ -309,6 +313,7 @@ impl ServerIpcConnection {
                                     mime_type,
                                     data,
                                     is_new,
+                                    stdout_bytes_before,
                                 });
                             } else {
                                 let mut guard = reader_inbox.lock().unwrap();
@@ -317,6 +322,7 @@ impl ServerIpcConnection {
                                     mime_type,
                                     data,
                                     is_new,
+                                    stdout_bytes_before,
                                 });
                                 reader_cvar.notify_all();
                             }
@@ -1323,13 +1329,20 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
     }
 }
 
-pub fn emit_plot_image(id: &str, mime_type: &str, data: &str, is_new: bool) {
+pub fn emit_plot_image(
+    id: &str,
+    mime_type: &str,
+    data: &str,
+    is_new: bool,
+    stdout_bytes_before: u64,
+) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
             id: id.to_string(),
             mime_type: mime_type.to_string(),
             data: data.to_string(),
             is_new,
+            stdout_bytes_before,
         });
     }
 }

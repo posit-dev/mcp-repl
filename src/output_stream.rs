@@ -1,8 +1,12 @@
 use std::cell::Cell;
 use std::io::{self, Write};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicU64, Ordering},
+};
 
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+static STDOUT_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static OUTPUT_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -50,7 +54,9 @@ pub(crate) fn write_stdout_bytes(bytes: &[u8]) {
     with_output_lock(|| {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
-        let _ = write_all_bytes(&mut stdout, bytes);
+        if write_all_bytes(&mut stdout, bytes).is_ok() {
+            STDOUT_BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
     });
 }
 
@@ -87,4 +93,8 @@ fn write_all_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+pub(crate) fn stdout_bytes_written() -> u64 {
+    STDOUT_BYTES_WRITTEN.load(Ordering::Relaxed)
 }

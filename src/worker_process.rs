@@ -143,9 +143,16 @@ impl LiveOutputCapture {
             image.mime_type.clone(),
             image.data.clone(),
             image.is_new,
+            image.stdout_bytes_before,
         );
         if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(image.id, image.mime_type, image.data, image.is_new);
+            tape.append_image(
+                image.id,
+                image.mime_type,
+                image.data,
+                image.is_new,
+                image.stdout_bytes_before,
+            );
         }
     }
 
@@ -6861,6 +6868,7 @@ mod tests {
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
+            stdout_bytes_before: 0,
         });
         capture.append_sideband(PendingSidebandKind::RequestEnd);
 

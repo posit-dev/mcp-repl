@@ -43,13 +43,13 @@ response:
   "is_error": false,
   "content": [
     {
-      "type": "text",
-      "text": "plots_done"
-    },
-    {
       "type": "image",
       "mime_type": "image/png",
       "data_len": 0
+    },
+    {
+      "type": "text",
+      "text": "plots_done"
     },
     {
       "type": "text",

@@ -101,17 +101,16 @@ impl OutputTimeline {
         self.ring.append_bytes(&payload, true, origin);
     }
 
-    pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
-        let offset = self.ring.end_offset();
-        self.ring.append_event(
-            offset,
-            OutputEventKind::Image {
-                id,
-                data,
-                mime_type,
-                is_new,
-            },
-        );
+    pub(crate) fn append_image(
+        &self,
+        id: String,
+        mime_type: String,
+        data: String,
+        is_new: bool,
+        stdout_bytes_before: u64,
+    ) {
+        self.ring
+            .append_image_event(id, mime_type, data, is_new, stdout_bytes_before);
     }
 }
 
@@ -220,6 +219,7 @@ struct OutputRingInner {
     end_offset: u64,
     buffered_bytes: usize,
     buffered_event_bytes: usize,
+    worker_stdout_bytes: u64,
 }
 
 struct OutputChunk {
@@ -228,6 +228,7 @@ struct OutputChunk {
     range: Range<usize>,
     is_stderr: bool,
     origin: ContentOrigin,
+    worker_stdout_start: Option<u64>,
 }
 
 struct OutputSlice {
@@ -305,6 +306,7 @@ impl OutputRing {
                 end_offset: 0,
                 buffered_bytes: 0,
                 buffered_event_bytes: 0,
+                worker_stdout_bytes: 0,
             }),
         }
     }
@@ -347,6 +349,13 @@ impl OutputRing {
                 .end_offset
                 .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
             guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
+            let worker_stdout_start = (!is_stderr && origin == ContentOrigin::Worker)
+                .then_some(guard.worker_stdout_bytes);
+            if worker_stdout_start.is_some() {
+                guard.worker_stdout_bytes = guard
+                    .worker_stdout_bytes
+                    .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
+            }
 
             for idx in newline_indices {
                 let offset = start_offset.saturating_add((idx + 1) as u64);
@@ -359,6 +368,7 @@ impl OutputRing {
                 range: 0..bytes_len,
                 is_stderr,
                 origin,
+                worker_stdout_start,
             });
         }
 
@@ -376,6 +386,7 @@ impl OutputRing {
         guard.chunks.is_empty() && guard.events.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
         let event_bytes = event_size_bytes(&kind);
@@ -385,6 +396,39 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = offset.max(guard.start_offset);
+        if dropped.dropped_any() {
+            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+            event_offset = event_offset.max(guard.start_offset);
+        }
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    pub(crate) fn append_image_event(
+        &self,
+        id: String,
+        mime_type: String,
+        data: String,
+        is_new: bool,
+        stdout_bytes_before: u64,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        let kind = OutputEventKind::Image {
+            id,
+            data,
+            mime_type,
+            is_new,
+        };
+        let event_bytes = event_size_bytes(&kind);
+        if event_bytes > self.capacity_bytes {
+            return;
+        }
+
+        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+        let mut event_offset = resolve_worker_stdout_offset(&guard, stdout_bytes_before);
         if dropped.dropped_any() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
@@ -480,6 +524,7 @@ impl OutputRing {
         guard.end_offset = 0;
         guard.buffered_bytes = 0;
         guard.buffered_event_bytes = 0;
+        guard.worker_stdout_bytes = 0;
     }
 
     fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
@@ -736,9 +781,36 @@ fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
     bytes
 }
 
+fn resolve_worker_stdout_offset(guard: &OutputRingInner, stdout_bytes_before: u64) -> u64 {
+    let mut last_worker_stdout_end = guard.start_offset;
+    for chunk in &guard.chunks {
+        let Some(worker_stdout_start) = chunk.worker_stdout_start else {
+            continue;
+        };
+        let chunk_len = chunk.range.len() as u64;
+        let worker_stdout_end = worker_stdout_start.saturating_add(chunk_len);
+        let chunk_end_offset = chunk.start_offset.saturating_add(chunk_len);
+        if stdout_bytes_before <= worker_stdout_end {
+            let within_chunk = stdout_bytes_before
+                .saturating_sub(worker_stdout_start)
+                .min(chunk_len);
+            return chunk
+                .start_offset
+                .saturating_add(within_chunk)
+                .max(guard.start_offset);
+        }
+        last_worker_stdout_end = chunk_end_offset;
+    }
+
+    last_worker_stdout_end
+        .max(guard.start_offset)
+        .min(guard.end_offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker_protocol::WorkerContent;
 
     #[test]
     fn output_ring_truncates_instead_of_blocking() {
@@ -911,5 +983,31 @@ mod tests {
             }
             last_start = range.start_offset;
         }
+    }
+
+    #[test]
+    fn image_anchor_resolves_before_later_stdout_bytes() {
+        let ring = OutputRing::with_capacity(256);
+        ring.append_bytes(b"done\n", false, ContentOrigin::Worker);
+        ring.append_image_event(
+            "plot-1".to_string(),
+            "image/png".to_string(),
+            "img".to_string(),
+            true,
+            0,
+        );
+
+        let end = ring.end_offset();
+        let contents = crate::pager::contents_from_output_range(ring.read_range(0, end));
+
+        assert!(
+            matches!(contents.first(), Some(WorkerContent::ContentImage { id, .. }) if id == "plot-1"),
+            "expected anchored image before later stdout, got: {contents:?}"
+        );
+        assert_eq!(
+            contents.get(1),
+            Some(&WorkerContent::worker_stdout("done\n")),
+            "expected stdout after anchored image, got: {contents:?}"
+        );
     }
 }

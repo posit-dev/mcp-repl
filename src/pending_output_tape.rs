@@ -16,6 +16,7 @@ struct PendingOutputTapeInner {
     events: VecDeque<PendingOutputEvent>,
     stdout_tail: PendingTextTail,
     stderr_tail: PendingTextTail,
+    worker_stdout_bytes: u64,
     pending_echo_prefix: String,
     last_rendered_text: Option<RenderedTextState>,
 }
@@ -25,6 +26,7 @@ struct PendingTextTail {
     bytes: Vec<u8>,
     origin: Option<ContentOrigin>,
     start_seq: Option<u64>,
+    worker_stdout_start: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +37,8 @@ pub(crate) enum PendingOutputEvent {
         origin: ContentOrigin,
         bytes: Vec<u8>,
         terminated: bool,
+        worker_stdout_start: Option<u64>,
+        worker_stdout_end: Option<u64>,
     },
     Image {
         seq: u64,
@@ -42,6 +46,7 @@ pub(crate) enum PendingOutputEvent {
         mime_type: String,
         id: String,
         is_new: bool,
+        stdout_bytes_before: u64,
     },
     Sideband {
         seq: u64,
@@ -158,7 +163,14 @@ impl PendingOutputTape {
         );
     }
 
-    pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
+    pub(crate) fn append_image(
+        &self,
+        id: String,
+        mime_type: String,
+        data: String,
+        is_new: bool,
+        stdout_bytes_before: u64,
+    ) {
         let mut guard = self
             .inner
             .lock()
@@ -167,7 +179,7 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stdout, false);
         flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
-        append_event(
+        append_image_event(
             &mut guard,
             PendingOutputEvent::Image {
                 seq,
@@ -175,6 +187,7 @@ impl PendingOutputTape {
                 mime_type,
                 id,
                 is_new,
+                stdout_bytes_before,
             },
         );
     }
@@ -281,15 +294,25 @@ impl PendingOutputTape {
         {
             flush_tail(&mut guard, stream, true);
         }
+        let is_worker_stdout =
+            matches!(stream, TextStream::Stdout) && matches!(origin, ContentOrigin::Worker);
         if tail_mut(&mut guard, stream).bytes.is_empty() {
             let seq = next_seq(&mut guard);
-            tail_mut(&mut guard, stream).start_seq = Some(seq);
+            let worker_stdout_start = is_worker_stdout.then_some(guard.worker_stdout_bytes);
+            let tail = tail_mut(&mut guard, stream);
+            tail.start_seq = Some(seq);
+            tail.worker_stdout_start = worker_stdout_start;
         }
         let tail = tail_mut(&mut guard, stream);
         if tail.origin.is_none() {
             tail.origin = Some(origin);
         }
         tail.bytes.extend_from_slice(bytes);
+        if is_worker_stdout {
+            guard.worker_stdout_bytes = guard
+                .worker_stdout_bytes
+                .saturating_add(bytes.len().try_into().unwrap_or(u64::MAX));
+        }
         commit_complete_lines(&mut guard, stream);
     }
 }
@@ -642,13 +665,15 @@ fn append_complete_bytes(
             origin,
             bytes: bytes.to_vec(),
             terminated: bytes.ends_with(b"\n"),
+            worker_stdout_start: None,
+            worker_stdout_end: None,
         },
     );
 }
 
 fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream) {
     loop {
-        let (seq, origin, line, tail_empty) = {
+        let (seq, origin, line, tail_empty, worker_stdout_start, worker_stdout_end) = {
             let tail = tail_mut(inner, stream);
             let Some(newline_idx) = tail.bytes.iter().position(|byte| *byte == b'\n') else {
                 break;
@@ -660,12 +685,23 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
                 .origin
                 .expect("text tail should record origin while bytes are buffered");
             let line = tail.bytes.drain(..=newline_idx).collect::<Vec<u8>>();
+            let worker_stdout_start = tail.worker_stdout_start;
+            let worker_stdout_end = worker_stdout_start
+                .map(|start| start.saturating_add(line.len().try_into().unwrap_or(u64::MAX)));
             let tail_empty = tail.bytes.is_empty();
             if tail_empty {
                 tail.origin = None;
                 tail.start_seq = None;
+                tail.worker_stdout_start = None;
             }
-            (seq, origin, line, tail_empty)
+            (
+                seq,
+                origin,
+                line,
+                tail_empty,
+                worker_stdout_start,
+                worker_stdout_end,
+            )
         };
         append_event(
             inner,
@@ -675,17 +711,21 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
                 origin,
                 bytes: line,
                 terminated: true,
+                worker_stdout_start,
+                worker_stdout_end,
             },
         );
         if !tail_empty {
             let next = next_seq(inner);
-            tail_mut(inner, stream).start_seq = Some(next);
+            let tail = tail_mut(inner, stream);
+            tail.start_seq = Some(next);
+            tail.worker_stdout_start = worker_stdout_end;
         }
     }
 }
 
 fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_incomplete: bool) {
-    let (seq, origin, bytes, tail_empty) = {
+    let (seq, origin, bytes, tail_empty, worker_stdout_start, worker_stdout_end) = {
         let tail = tail_mut(inner, stream);
         if tail.bytes.is_empty() {
             return;
@@ -704,12 +744,23 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_inco
             .origin
             .expect("text tail should record origin while bytes are buffered");
         let bytes = tail.bytes.drain(..flush_len).collect::<Vec<u8>>();
+        let worker_stdout_start = tail.worker_stdout_start;
+        let worker_stdout_end = worker_stdout_start
+            .map(|start| start.saturating_add(bytes.len().try_into().unwrap_or(u64::MAX)));
         let tail_empty = tail.bytes.is_empty();
         if tail_empty {
             tail.origin = None;
             tail.start_seq = None;
+            tail.worker_stdout_start = None;
         }
-        (seq, origin, bytes, tail_empty)
+        (
+            seq,
+            origin,
+            bytes,
+            tail_empty,
+            worker_stdout_start,
+            worker_stdout_end,
+        )
     };
     append_event(
         inner,
@@ -719,11 +770,15 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_inco
             origin,
             bytes,
             terminated: false,
+            worker_stdout_start,
+            worker_stdout_end,
         },
     );
     if !tail_empty {
         let next = next_seq(inner);
-        tail_mut(inner, stream).start_seq = Some(next);
+        let tail = tail_mut(inner, stream);
+        tail.start_seq = Some(next);
+        tail.worker_stdout_start = worker_stdout_end;
     }
 }
 
@@ -739,6 +794,96 @@ fn append_event(inner: &mut PendingOutputTapeInner, event: PendingOutputEvent) {
         .position(|existing| existing.seq() > seq)
         .unwrap_or(inner.events.len());
     inner.events.insert(idx, event);
+}
+
+fn append_image_event(inner: &mut PendingOutputTapeInner, event: PendingOutputEvent) {
+    let PendingOutputEvent::Image {
+        stdout_bytes_before,
+        ..
+    } = event
+    else {
+        append_event(inner, event);
+        return;
+    };
+
+    let mut idx = 0usize;
+    while idx < inner.events.len() {
+        let Some(existing) = inner.events.get(idx).cloned() else {
+            break;
+        };
+        let PendingOutputEvent::TextFragment {
+            seq,
+            stream: TextStream::Stdout,
+            origin: ContentOrigin::Worker,
+            bytes,
+            terminated,
+            worker_stdout_start: Some(worker_stdout_start),
+            worker_stdout_end: Some(worker_stdout_end),
+        } = existing
+        else {
+            idx = idx.saturating_add(1);
+            continue;
+        };
+
+        if stdout_bytes_before <= worker_stdout_start {
+            inner.events.insert(idx, event);
+            return;
+        }
+
+        if stdout_bytes_before >= worker_stdout_end {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        let split_at = stdout_bytes_before
+            .saturating_sub(worker_stdout_start)
+            .try_into()
+            .unwrap_or(bytes.len());
+        if !can_split_text_fragment(&bytes, split_at) {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        inner.events.remove(idx);
+        let before_bytes = bytes[..split_at].to_vec();
+        let after_bytes = bytes[split_at..].to_vec();
+        let mut insert_at = idx;
+        if !before_bytes.is_empty() {
+            inner.events.insert(
+                insert_at,
+                PendingOutputEvent::TextFragment {
+                    seq,
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    bytes: before_bytes,
+                    terminated: false,
+                    worker_stdout_start: Some(worker_stdout_start),
+                    worker_stdout_end: Some(stdout_bytes_before),
+                },
+            );
+            insert_at = insert_at.saturating_add(1);
+        }
+        inner.events.insert(insert_at, event);
+        insert_at = insert_at.saturating_add(1);
+        if !after_bytes.is_empty() {
+            let after_seq = next_seq(inner);
+            inner.events.insert(
+                insert_at,
+                PendingOutputEvent::TextFragment {
+                    seq: after_seq,
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    bytes: after_bytes,
+                    terminated,
+                    worker_stdout_start: Some(stdout_bytes_before),
+                    worker_stdout_end: Some(worker_stdout_end),
+                },
+            );
+        }
+        return;
+    }
+
+    append_event(inner, event);
 }
 
 fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u8]> {
@@ -801,6 +946,13 @@ fn flushable_prefix_len(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
+fn can_split_text_fragment(bytes: &[u8], split_at: usize) -> bool {
+    split_at == 0
+        || split_at >= bytes.len()
+        || (std::str::from_utf8(&bytes[..split_at]).is_ok()
+            && std::str::from_utf8(&bytes[split_at..]).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +973,8 @@ mod tests {
                     origin: ContentOrigin::Worker,
                     bytes: b"abc".to_vec(),
                     terminated: false,
+                    worker_stdout_start: Some(0),
+                    worker_stdout_end: Some(3),
                 },
                 PendingOutputEvent::TextFragment {
                     seq: 1,
@@ -828,6 +982,8 @@ mod tests {
                     origin: ContentOrigin::Worker,
                     bytes: b"boom\n".to_vec(),
                     terminated: true,
+                    worker_stdout_start: None,
+                    worker_stdout_end: None,
                 },
             ]
         );
@@ -955,6 +1111,8 @@ mod tests {
                     origin: ContentOrigin::Server,
                     bytes: b"[repl] guardrail".to_vec(),
                     terminated: false,
+                    worker_stdout_start: None,
+                    worker_stdout_end: None,
                 },
                 PendingOutputEvent::TextFragment {
                     seq: 1,
@@ -962,6 +1120,8 @@ mod tests {
                     origin: ContentOrigin::Worker,
                     bytes: b"ok\n".to_vec(),
                     terminated: true,
+                    worker_stdout_start: Some(0),
+                    worker_stdout_end: Some(3),
                 },
             ]
         );
@@ -1142,6 +1302,7 @@ mod tests {
             "image/png".to_string(),
             "AA==".to_string(),
             true,
+            1,
         );
         tape.append_stdout_bytes(&[0xA9, b'\n']);
 
@@ -1226,6 +1387,8 @@ mod tests {
                     origin: ContentOrigin::Worker,
                     bytes: vec![0xC3],
                     terminated: false,
+                    worker_stdout_start: Some(0),
+                    worker_stdout_end: Some(1),
                 },
                 PendingOutputEvent::TextFragment {
                     seq: 1,
@@ -1233,6 +1396,8 @@ mod tests {
                     origin: ContentOrigin::Server,
                     bytes: b"\n[repl] session ended\n".to_vec(),
                     terminated: true,
+                    worker_stdout_start: None,
+                    worker_stdout_end: None,
                 },
             ]
         );
@@ -1254,6 +1419,8 @@ mod tests {
                     origin: ContentOrigin::Server,
                     bytes: vec![0xC3],
                     terminated: false,
+                    worker_stdout_start: None,
+                    worker_stdout_end: None,
                 },
                 PendingOutputEvent::TextFragment {
                     seq: 1,
@@ -1261,7 +1428,37 @@ mod tests {
                     origin: ContentOrigin::Worker,
                     bytes: b"boom\n".to_vec(),
                     terminated: true,
+                    worker_stdout_start: None,
+                    worker_stdout_end: None,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn image_anchor_inserts_before_later_stdout_fragment() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            0,
+        );
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::stdout("done\n"),
             ]
         );
     }
