@@ -464,6 +464,9 @@ mod unix_impl {
             || text
                 .contains("WARN codex_core::codex: stream disconnected - retrying sampling request")
             || text.contains("WARN codex_core::client: falling back to HTTP")
+            || text.contains(
+                "WARN codex_core::plugins::manager: failed to warm featured plugin ids cache",
+            )
             || text.starts_with("Reconnecting... ")
             || text.contains(r#""type":"error","message":"Reconnecting... "#)
             || text.contains("Falling back from WebSockets to HTTPS transport.")
@@ -693,6 +696,15 @@ mod unix_impl {
         let workspace = Path::new("/tmp/workspace");
         let codex_home = Path::new("/tmp/codex-home");
         let input = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 404 Not Found: {\"error\":\"unsupported\"}, url: ws://127.0.0.1:64598/v1/responses)"}"#;
+        let normalized = normalize_exec_text(input, workspace, codex_home);
+        assert_eq!(normalized, "");
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_plugin_warmup_warning_lines() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let input = r#"2026-04-15T03:17:41.295729Z WARN codex_core::plugins::manager: failed to warm featured plugin ids cache error=remote plugin sync request to https://chatgpt.com/backend-api/plugins/featured failed with status 401 Unauthorized: {"detail":"Unauthorized"}"#;
         let normalized = normalize_exec_text(input, workspace, codex_home);
         assert_eq!(normalized, "");
     }

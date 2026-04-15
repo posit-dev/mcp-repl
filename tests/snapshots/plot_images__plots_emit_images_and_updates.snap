@@ -11,7 +11,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "blake3:0694aafd9f8fc0744e7029b187c1ab182d061a4f180319772a19794be32ebf98",
+            "data": "blake3:<base_plot>",
             "mimeType": "image/png"
           },
           {
@@ -20,6 +20,18 @@ expression: serialized
           }
         ],
         "isError": false
+      },
+      "reference": {
+        "name": "base_plot",
+        "command": "Rscript --vanilla -",
+        "envVar": "MCP_REPL_TEST_PNG_DEST",
+        "script": [
+          "dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")",
+          "stopifnot(nzchar(dest))",
+          "grDevices::png(filename = dest, width = 800, height = 600, res = 96)",
+          "plot(1:10)",
+          "grDevices::dev.off()"
+        ]
       }
     },
     {
@@ -29,7 +41,7 @@ expression: serialized
         "content": [
           {
             "type": "image",
-            "data": "blake3:360038e3039ff204ea7387e588961dc5e0c2cac15c840f78a7c1c8f3e8c9a0c0",
+            "data": "blake3:<base_plot_update>",
             "mimeType": "image/png"
           },
           {
@@ -38,6 +50,19 @@ expression: serialized
           }
         ],
         "isError": false
+      },
+      "reference": {
+        "name": "base_plot_update",
+        "command": "Rscript --vanilla -",
+        "envVar": "MCP_REPL_TEST_PNG_DEST",
+        "script": [
+          "dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")",
+          "stopifnot(nzchar(dest))",
+          "grDevices::png(filename = dest, width = 800, height = 600, res = 96)",
+          "plot(1:10)",
+          "lines(4:8, 4:8)",
+          "grDevices::dev.off()"
+        ]
       }
     },
     {

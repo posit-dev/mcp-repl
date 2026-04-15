@@ -5,11 +5,28 @@ expression: transcript
 == transcript ==
 1) r_repl
 >>> plot(1:10)
-<<< [image/png blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c]
+<<< [image/png blake3:<base_plot>]
+=== reference base_plot via Rscript --vanilla -
+=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
+=== script
+===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")
+===   stopifnot(nzchar(dest))
+===   grDevices::png(filename = dest, width = 800, height = 600, res = 96)
+===   plot(1:10)
+===   grDevices::dev.off()
 
 2) r_repl
 >>> lines(4:8, 4:8)
-<<< [image/png blake3:397871e52656cc5b0883b57c200ded44fb60ca1d264683ffb13e6bfd4e96ad85]
+<<< [image/png blake3:<base_plot_update>]
+=== reference base_plot_update via Rscript --vanilla -
+=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
+=== script
+===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")
+===   stopifnot(nzchar(dest))
+===   grDevices::png(filename = dest, width = 800, height = 600, res = 96)
+===   plot(1:10)
+===   lines(4:8, 4:8)
+===   grDevices::dev.off()
 
 3) r_repl
 >>> 1+1

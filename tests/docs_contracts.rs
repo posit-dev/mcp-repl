@@ -95,3 +95,53 @@ fn plot_image_snapshots_do_not_expose_mcp_console_meta() {
         );
     }
 }
+
+#[test]
+fn plot_reference_snapshots_show_reference_scripts() {
+    let snapshots_dir = repo_root().join("tests/snapshots");
+    for name in [
+        "plot_images__plots_emit_images_and_updates.snap",
+        "plot_images__plots_emit_stable_images_for_repeats.snap",
+        "plot_images__grid_plots_emit_images_and_updates.snap",
+        "plot_images__grid_plots_emit_stable_images_for_repeats.snap",
+    ] {
+        let contents = read(&snapshots_dir.join(name));
+        assert!(
+            contents.contains("\"data\": \"blake3:<"),
+            "plot snapshot should expose a canonical image placeholder: {name}"
+        );
+        assert!(
+            contents.contains("\"command\": \"Rscript --vanilla -\""),
+            "plot snapshot should expose the reference command: {name}"
+        );
+        assert!(
+            contents.contains("\"envVar\": \"MCP_REPL_TEST_PNG_DEST\""),
+            "plot snapshot should expose the reference env var: {name}"
+        );
+        assert!(
+            contents.contains(r#""dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")""#),
+            "plot snapshot should expose the reference script body: {name}"
+        );
+    }
+
+    for name in [
+        "plot_images__plots_emit_images_and_updates@transcript.snap",
+        "plot_images__plots_emit_stable_images_for_repeats@transcript.snap",
+        "plot_images__grid_plots_emit_images_and_updates@transcript.snap",
+        "plot_images__grid_plots_emit_stable_images_for_repeats@transcript.snap",
+    ] {
+        let contents = read(&snapshots_dir.join(name));
+        assert!(
+            contents.contains("=== reference "),
+            "plot transcript snapshot should expose the reference command: {name}"
+        );
+        assert!(
+            contents.contains("=== env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>"),
+            "plot transcript snapshot should expose the reference env var: {name}"
+        );
+        assert!(
+            contents.contains(r#"===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")"#),
+            "plot transcript snapshot should expose the reference script body: {name}"
+        );
+    }
+}
