@@ -305,9 +305,7 @@ fn reference_image_script_lines(name: &str) -> Option<Vec<&'static str>> {
     };
 
     let mut lines = vec![
-        r#"dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")"#,
-        "stopifnot(nzchar(dest))",
-        "grDevices::png(filename = dest, width = 800, height = 600, res = 96)",
+        r#"grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)"#,
     ];
     lines.extend(plot_lines);
     lines.push("grDevices::dev.off()");

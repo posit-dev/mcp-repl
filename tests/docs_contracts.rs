@@ -119,7 +119,8 @@ fn plot_reference_snapshots_show_reference_scripts() {
             "plot snapshot should expose the reference env var: {name}"
         );
         assert!(
-            contents.contains(r#""dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")""#),
+            contents
+                .contains(r#""grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")"#),
             "plot snapshot should expose the reference script body: {name}"
         );
     }
@@ -140,7 +141,9 @@ fn plot_reference_snapshots_show_reference_scripts() {
             "plot transcript snapshot should expose the reference env var: {name}"
         );
         assert!(
-            contents.contains(r#"===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")"#),
+            contents.contains(
+                r#"===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST")"#
+            ),
             "plot transcript snapshot should expose the reference script body: {name}"
         );
     }

@@ -26,9 +26,7 @@ expression: serialized
         "command": "Rscript --vanilla -",
         "envVar": "MCP_REPL_TEST_PNG_DEST",
         "script": [
-          "dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")",
-          "stopifnot(nzchar(dest))",
-          "grDevices::png(filename = dest, width = 800, height = 600, res = 96)",
+          "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
           "plot(1:10)",
           "grDevices::dev.off()"
         ]
@@ -56,9 +54,7 @@ expression: serialized
         "command": "Rscript --vanilla -",
         "envVar": "MCP_REPL_TEST_PNG_DEST",
         "script": [
-          "dest <- Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\")",
-          "stopifnot(nzchar(dest))",
-          "grDevices::png(filename = dest, width = 800, height = 600, res = 96)",
+          "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
           "plot(1:10)",
           "grDevices::dev.off()"
         ]

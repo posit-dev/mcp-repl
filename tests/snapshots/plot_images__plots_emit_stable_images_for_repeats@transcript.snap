@@ -9,9 +9,7 @@ expression: transcript
 === reference base_plot via Rscript --vanilla -
 === env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
 === script
-===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")
-===   stopifnot(nzchar(dest))
-===   grDevices::png(filename = dest, width = 800, height = 600, res = 96)
+===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)
 ===   plot(1:10)
 ===   grDevices::dev.off()
 
@@ -21,9 +19,7 @@ expression: transcript
 === reference base_plot via Rscript --vanilla -
 === env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
 === script
-===   dest <- Sys.getenv("MCP_REPL_TEST_PNG_DEST")
-===   stopifnot(nzchar(dest))
-===   grDevices::png(filename = dest, width = 800, height = 600, res = 96)
+===   grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)
 ===   plot(1:10)
 ===   grDevices::dev.off()
 
