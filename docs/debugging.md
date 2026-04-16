@@ -79,7 +79,7 @@ Useful environment variables:
 
 ## External wire trace proxy
 
-The built-in event log only sees what reaches `mcp-repl` after startup. If you need the exact stdio traffic between an MCP client and the server, use the external proxy in [scripts/mcp-stdio-trace.py](/Users/tomasz/github/posit-dev/mcp-repl/scripts/mcp-stdio-trace.py).
+The built-in event log only sees what reaches `mcp-repl` after startup. If you need the exact stdio traffic between an MCP client and the server, use the external proxy in [scripts/mcp-stdio-trace.py](/Users/tomasz/github/t-kalinowski/mcp-repl/scripts/mcp-stdio-trace.py).
 
 What it does:
 

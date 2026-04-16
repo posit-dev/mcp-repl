@@ -4,6 +4,8 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
+#[cfg(windows)]
+use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -26,6 +28,33 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+#[cfg(windows)]
+async fn wait_until_not_busy(
+    session: &mut common::McpTestSession,
+    initial: rmcp::model::CallToolResult,
+) -> TestResult<rmcp::model::CallToolResult> {
+    let mut result = initial;
+    let mut text = result_text(&result);
+    if !text.contains("<<repl status: busy") {
+        return Ok(result);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(250)).await;
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        text = result_text(&next);
+        result = next;
+        if !text.contains("<<repl status: busy") {
+            return Ok(result);
+        }
+    }
+
+    Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
 #[cfg(not(windows))]
@@ -303,14 +332,12 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
 async fn pager_smoke() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
-    let initial = session
+    let result = session
         .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
         .await?;
-    let result = common::wait_until_ready_with_input_retry(
+    let result = common::wait_until_not_busy(
         &mut session,
-        "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))",
-        initial,
-        120.0,
+        result,
         std::time::Duration::from_millis(250),
         std::time::Duration::from_secs(30),
     )
@@ -330,12 +357,10 @@ async fn pager_smoke() -> TestResult<()> {
         "expected pager footer, got: {text:?}"
     );
 
-    let initial = session.write_stdin_raw_with(":next", Some(60.0)).await?;
-    let result = common::wait_until_ready_with_input_retry(
+    let result = session.write_stdin_raw_with(":next", Some(60.0)).await?;
+    let result = common::wait_until_not_busy(
         &mut session,
-        ":next",
-        initial,
-        60.0,
+        result,
         std::time::Duration::from_millis(250),
         std::time::Duration::from_secs(30),
     )
@@ -354,12 +379,10 @@ async fn pager_smoke() -> TestResult<()> {
         "expected next page output, got: {text:?}"
     );
 
-    let initial = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
-    let result = common::wait_until_ready_with_input_retry(
+    let result = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
+    let result = common::wait_until_not_busy(
         &mut session,
-        ":/L0031",
-        initial,
-        60.0,
+        result,
         std::time::Duration::from_millis(250),
         std::time::Duration::from_secs(30),
     )
@@ -406,18 +429,10 @@ async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestR
 async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
-    let initial = session
+    let result = session
         .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
         .await?;
-    let result = common::wait_until_ready_with_input_retry(
-        &mut session,
-        "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))",
-        initial,
-        120.0,
-        std::time::Duration::from_millis(250),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -433,16 +448,8 @@ async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
         "expected pager footer, got: {text:?}"
     );
 
-    let initial = session.write_stdin_raw_with(input, Some(60.0)).await?;
-    let result = common::wait_until_ready_with_input_retry(
-        &mut session,
-        input,
-        initial,
-        60.0,
-        std::time::Duration::from_millis(250),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("pager backend unavailable in this environment; skipping");
@@ -543,13 +550,7 @@ async fn wait_until_not_busy_does_not_return_while_pager_request_is_still_runnin
         return Ok(());
     }
 
-    let _ = common::wait_until_not_busy(
-        &mut session,
-        initial,
-        std::time::Duration::from_millis(250),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
+    let _ = wait_until_not_busy(&mut session, initial).await?;
     let follow_up = session.write_stdin_raw_with("1+1", Some(0.2)).await?;
     let follow_up_text = result_text(&follow_up);
     if backend_unavailable(&follow_up_text) {

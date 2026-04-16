@@ -116,10 +116,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> Sys.sleep(5)"
-    },
-    {
-      "type": "text",
       "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]

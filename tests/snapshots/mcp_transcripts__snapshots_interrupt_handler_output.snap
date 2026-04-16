@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat(\"interrupt received\\n\"))"
-    },
-    {
-      "type": "text",
       "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]

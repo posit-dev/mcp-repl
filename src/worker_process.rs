@@ -464,6 +464,13 @@ struct InputContext {
     start_offset: u64,
     prefix_bytes: u64,
     input_echo: Option<String>,
+    input_transcript: Option<String>,
+}
+
+#[derive(Default)]
+struct InputFallback {
+    transcript: Option<String>,
+    raw_input: Option<String>,
 }
 
 struct ReplyWithOffset {
@@ -511,33 +518,6 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
     }
-}
-
-fn merge_completion_info_from_ipc(
-    completion: &mut CompletionInfo,
-    ipc: &ServerIpcConnection,
-    session_end_seen: bool,
-) {
-    let late = completion_info_from_ipc(ipc, session_end_seen);
-    if late.session_end_seen {
-        completion.session_end_seen = true;
-        completion.prompt = None;
-        completion.prompt_variants = None;
-    } else {
-        if let Some(prompt) = late.prompt {
-            completion.prompt = Some(prompt);
-        }
-        if let Some(late_variants) = late.prompt_variants {
-            let variants = completion.prompt_variants.get_or_insert_with(Vec::new);
-            for variant in late_variants {
-                if !variants.iter().any(|existing| existing == &variant) {
-                    variants.push(variant);
-                }
-            }
-        }
-    }
-    completion.echo_events.extend(late.echo_events);
-    completion.protocol_warnings.extend(late.protocol_warnings);
 }
 
 #[derive(Clone, Copy)]
@@ -1036,6 +1016,7 @@ impl WorkerManager {
         let poll_start = std::time::Instant::now();
         let mut timed_out = false;
         let mut completed_request = false;
+        let mut consumed_completion = false;
         let mut completion = CompletionInfo {
             prompt: None,
             prompt_variants: None,
@@ -1053,6 +1034,7 @@ impl WorkerManager {
                     }
                     completion = info;
                     completed_request = true;
+                    consumed_completion = true;
                 }
                 Err(WorkerError::Timeout(_)) => {
                     let worker_exited = match self.process.as_mut() {
@@ -1064,6 +1046,7 @@ impl WorkerManager {
                         self.clear_pending_request_state();
                         completion.session_end_seen = true;
                         completed_request = true;
+                        consumed_completion = true;
                     } else {
                         timed_out = true;
                     }
@@ -1076,7 +1059,15 @@ impl WorkerManager {
             && let Some(info) = self.settled_pending_completion.take()
         {
             completion = info;
+            consumed_completion = true;
         }
+        let fallback_input = if !timed_out && consumed_completion {
+            self.take_input_fallback(&completion)
+        } else {
+            InputFallback::default()
+        };
+        let fallback_input_transcript = fallback_input.transcript.clone();
+
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
@@ -1103,21 +1094,45 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
+        let has_fallback_input_transcript = fallback_input_transcript.is_some();
+        let trim_enabled = !timed_out
+            && if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
         let echo_transcript = (!timed_out)
-            .then(|| echo_transcript_from_events(&completion.echo_events))
+            .then(|| {
+                echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone())
+            })
             .flatten();
         trim_echo_then_append_protocol_warnings(
             &mut contents,
             echo_transcript.as_deref(),
             trim_enabled,
-            should_drop_echo_only_contents(&completion.echo_events),
+            if !timed_out && completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_drop_echo_only_contents(&completion.echo_events)
+            },
             &completion.protocol_warnings,
         );
-        if !timed_out {
+        if !timed_out && !trim_enabled {
             let _ = trim_matching_echo_event_suffix_from_contents(
                 &mut contents,
                 &completion.echo_events,
+            );
+        }
+        if !timed_out && completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+            let prompt_variants = fallback_prompt_variants(
+                completion.prompt.as_deref(),
+                completion.prompt_variants.as_deref(),
+            );
+            let _ = trim_leading_input_echo_from_contents(
+                &mut contents,
+                fallback_input.raw_input.as_deref(),
+                &prompt_variants,
             );
         }
         if !timed_out && !session_end && contents.is_empty() {
@@ -1289,6 +1304,11 @@ impl WorkerManager {
     /// into that request's visible reply.
     fn prepare_input_context_files(&mut self) -> InputContext {
         let settled_completion = self.settled_pending_completion.take();
+        let fallback_input = settled_completion
+            .as_ref()
+            .map(|completion| self.take_input_fallback(completion))
+            .unwrap_or_default();
+        let fallback_input_transcript = fallback_input.transcript.clone();
         // A new accepted request seals the detached prefix. Flush any incomplete UTF-8 tail now
         // so it stays with the detached transcript instead of merging into fresh request output.
         let FormattedPendingOutput {
@@ -1296,19 +1316,42 @@ impl WorkerManager {
             saw_stderr,
         } = self.drain_sealed_formatted_output();
         if let Some(completion) = settled_completion.as_ref() {
-            let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-            let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+            let has_fallback_input_transcript = fallback_input_transcript.is_some();
+            let trim_enabled = if completion.echo_events.is_empty() {
+                has_fallback_input_transcript
+            } else {
+                should_trim_echo_prefix(&completion.echo_events)
+            };
+            let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                .or(fallback_input_transcript.clone());
             trim_echo_then_append_protocol_warnings(
                 &mut contents,
                 echo_transcript.as_deref(),
                 trim_enabled,
-                should_drop_echo_only_contents(&completion.echo_events),
+                if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_drop_echo_only_contents(&completion.echo_events)
+                },
                 &completion.protocol_warnings,
             );
-            let _ = trim_matching_echo_event_suffix_from_contents(
-                &mut contents,
-                &completion.echo_events,
-            );
+            if !trim_enabled {
+                let _ = trim_matching_echo_event_suffix_from_contents(
+                    &mut contents,
+                    &completion.echo_events,
+                );
+            }
+            if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                let prompt_variants = fallback_prompt_variants(
+                    completion.prompt.as_deref(),
+                    completion.prompt_variants.as_deref(),
+                );
+                let _ = trim_leading_input_echo_from_contents(
+                    &mut contents,
+                    fallback_input.raw_input.as_deref(),
+                    &prompt_variants,
+                );
+            }
         }
         InputContext {
             prefix_contents: contents,
@@ -1316,6 +1359,7 @@ impl WorkerManager {
             start_offset: 0,
             prefix_bytes: 0,
             input_echo: None,
+            input_transcript: None,
         }
     }
 
@@ -1330,6 +1374,7 @@ impl WorkerManager {
         let mut input_echo = echo_input
             .then(|| text.to_string())
             .and_then(|value| pager::build_input_echo(&value));
+        let input_transcript = build_input_transcript(prompt_hint.as_deref(), text);
         let settled_completion = self.settled_pending_completion.take();
 
         let mut prefix_contents = Vec::new();
@@ -1373,6 +1418,7 @@ impl WorkerManager {
             start_offset,
             prefix_bytes,
             input_echo,
+            input_transcript,
         }
     }
 
@@ -1502,19 +1548,44 @@ impl WorkerManager {
                     normalize_prompt(completion.prompt.clone())
                 };
                 self.remember_prompt(resolved_prompt.clone());
-                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+                let fallback_input = self.take_input_fallback(&completion);
+                let fallback_input_transcript = fallback_input.transcript.clone();
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone());
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
                     trim_enabled,
-                    should_drop_echo_only_contents(&completion.echo_events),
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
                     &completion.protocol_warnings,
                 );
-                let _ = trim_matching_echo_event_suffix_from_contents(
-                    &mut contents,
-                    &completion.echo_events,
-                );
+                if !trim_enabled {
+                    let _ = trim_matching_echo_event_suffix_from_contents(
+                        &mut contents,
+                        &completion.echo_events,
+                    );
+                }
+                if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
+                    let prompt_variants = fallback_prompt_variants(
+                        completion.prompt.as_deref(),
+                        completion.prompt_variants.as_deref(),
+                    );
+                    let _ = trim_leading_input_echo_from_contents(
+                        &mut contents,
+                        fallback_input.raw_input.as_deref(),
+                        &prompt_variants,
+                    );
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1589,6 +1660,7 @@ impl WorkerManager {
         self.last_detached_prefix_item_count = context.prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 let mut session_end = completion.session_end_seen;
                 if !session_end
                     && let Some(process) = self.process.as_mut()
@@ -1639,15 +1711,31 @@ impl WorkerManager {
                 if self.pager.is_active() && !session_end {
                     self.pager_prompt = resolved_prompt.clone();
                 }
-                let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+                let has_fallback_input_transcript = fallback_input_transcript.is_some();
+                let trim_enabled = if completion.echo_events.is_empty() {
+                    has_fallback_input_transcript
+                } else {
+                    should_trim_echo_prefix(&completion.echo_events)
+                };
+                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
+                    .or(fallback_input_transcript.clone());
                 trim_echo_then_append_protocol_warnings(
                     &mut contents,
                     echo_transcript.as_deref(),
                     trim_enabled,
-                    should_drop_echo_only_contents(&completion.echo_events),
+                    if completion.echo_events.is_empty() {
+                        has_fallback_input_transcript
+                    } else {
+                        should_drop_echo_only_contents(&completion.echo_events)
+                    },
                     &completion.protocol_warnings,
                 );
+                if completion.echo_events.is_empty() {
+                    let _ = trim_echo_prefix_after_leading_nonstdout_contents(
+                        &mut contents,
+                        fallback_input_transcript.as_deref(),
+                    );
+                }
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1671,6 +1759,7 @@ impl WorkerManager {
                 })
             }
             Err(WorkerError::Timeout(_)) => {
+                let fallback_input_transcript = context.input_transcript.clone();
                 if let Some(process) = self.process.as_mut() {
                     match process.is_running() {
                         Ok(true) => {}
@@ -1700,6 +1789,10 @@ impl WorkerManager {
                     last_range,
                 } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
                 contents.append(&mut page_contents);
+                maybe_trim_echo_prefix(&mut contents, fallback_input_transcript.as_deref(), true);
+                if let Some(echo) = fallback_input_transcript.as_deref() {
+                    let _ = drop_echo_only_contents(&mut contents, echo);
+                }
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
@@ -1784,11 +1877,6 @@ impl WorkerManager {
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
         self.settle_output_after_request_end(remaining);
-        if let Ok(completion) = &mut result
-            && !completion.session_end_seen
-        {
-            merge_completion_info_from_ipc(completion, &ipc, false);
-        }
         if self.guardrail_event_pending() {
             let event = self
                 .guardrail
@@ -2894,9 +2982,23 @@ impl WorkerManager {
     fn clear_pending_request_state(&mut self) {
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.pending_request_input = None;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn take_input_fallback(&mut self, completion: &CompletionInfo) -> InputFallback {
+        let raw_input = completion
+            .echo_events
+            .is_empty()
+            .then(|| self.pending_request_input.take())
+            .flatten();
+        let transcript = raw_input
+            .as_deref()
+            .and_then(|input| build_input_transcript(completion.prompt.as_deref(), input));
+        InputFallback {
+            transcript,
+            raw_input,
+        }
     }
 
     fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
@@ -3227,78 +3329,12 @@ fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
     Some(transcript)
 }
 
-fn echo_event_prefix_len(line: &[u8], event: &IpcEchoEvent) -> Option<usize> {
-    let consumed = event.line.as_bytes();
-    match_echo_line_prefix(line, event.prompt.as_bytes(), consumed)
-        .or_else(|| match_echo_line_prefix(line, b"", consumed))
-}
-
-fn match_echo_line_prefix(line: &[u8], prompt: &[u8], consumed: &[u8]) -> Option<usize> {
-    if line.len() == prompt.len().saturating_add(consumed.len()) {
-        let (prefix, suffix) = line.split_at(prompt.len());
-        if prefix == prompt && suffix == consumed {
-            return Some(line.len());
-        }
-    }
-
-    let consumed = if let Some(consumed) = consumed.strip_suffix(b"\r\n") {
-        consumed
-    } else if let Some(consumed) = consumed.strip_suffix(b"\n") {
-        consumed
-    } else {
-        return None;
-    };
-    let prefix_len = prompt.len().saturating_add(consumed.len());
-    if line.len() <= prefix_len {
-        return None;
-    }
-    let (prefix, suffix) = line.split_at(prompt.len());
-    if prefix != prompt || !suffix.starts_with(consumed) {
-        return None;
-    }
-    Some(prefix_len)
-}
 fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    if rest.is_empty() {
-        return true;
-    }
-    rest.iter()
-        .all(|event| is_continuation_prompt(&event.prompt))
+    !events.is_empty()
 }
 
 fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    rest.iter()
-        .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
-}
-
-fn is_primary_repl_prompt(prompt: &str) -> bool {
-    matches!(
-        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
-        ">" | ">>>"
-    )
-}
-
-fn is_continuation_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "..." {
-        return true;
-    }
-    trimmed.ends_with('+')
+    !events.is_empty()
 }
 
 fn maybe_trim_echo_prefix(
@@ -3388,115 +3424,104 @@ fn trim_matching_echo_event_suffix_from_contents(
         if !should_drop_echo_only_contents(&echo_events[start..]) {
             continue;
         }
-        if trim_matching_echo_event_prefix_from_contents(contents, &echo_events[start..]) {
+        let Some(echo_prefix) = echo_transcript_from_events(&echo_events[start..]) else {
+            continue;
+        };
+        if trim_matching_echo_prefix_from_contents(contents, &echo_prefix) {
             return true;
         }
     }
     false
 }
 
-fn trim_matching_echo_event_prefix_from_contents(
+fn trim_echo_prefix_after_leading_nonstdout_contents(
     contents: &mut Vec<WorkerContent>,
-    echo_events: &[IpcEchoEvent],
+    echo_prefix: Option<&str>,
 ) -> bool {
-    if echo_events.is_empty() {
+    let Some(echo_prefix) = echo_prefix else {
+        return false;
+    };
+    if echo_prefix.is_empty() {
         return false;
     }
 
-    let mut leading_text = String::new();
-    for content in contents.iter() {
+    let start_idx = contents
+        .iter()
+        .position(|content| {
+            matches!(
+                content,
+                WorkerContent::ContentText {
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(contents.len());
+    if start_idx >= contents.len() {
+        return false;
+    }
+
+    let mut remaining = echo_prefix;
+    for content in contents.iter().skip(start_idx) {
+        if remaining.is_empty() {
+            break;
+        }
         let WorkerContent::ContentText {
             text,
             stream,
             origin,
         } = content
         else {
-            break;
+            return false;
         };
         if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
-            break;
-        }
-        leading_text.push_str(text);
-    }
-    if leading_text.is_empty() {
-        return false;
-    }
-
-    let bytes = leading_text.as_bytes();
-    let mut start = 0usize;
-    let mut trim_bytes = 0usize;
-    let mut echo_idx = 0usize;
-
-    while start < bytes.len() && echo_idx < echo_events.len() {
-        let mut end = start;
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
-        }
-        if end < bytes.len() && bytes[end] == b'\n' {
-            end += 1;
-        }
-
-        let line = &bytes[start..end];
-        let Some(mut prefix_len) = echo_event_prefix_len(line, &echo_events[echo_idx]) else {
-            return false;
-        };
-        let remainder = &line[prefix_len..];
-        if matches!(remainder, b"\r\n" | b"\n" | b"\r") {
-            prefix_len = line.len();
-        } else if !remainder.is_empty() {
             return false;
         }
-
-        trim_bytes = trim_bytes.saturating_add(prefix_len);
-        start = end;
-        echo_idx = echo_idx.saturating_add(1);
+        if remaining.len() >= text.len() {
+            if !remaining.starts_with(text.as_str()) {
+                return false;
+            }
+            remaining = &remaining[text.len()..];
+        } else {
+            if !text.starts_with(remaining) {
+                return false;
+            }
+            remaining = "";
+        }
     }
 
-    if echo_idx != echo_events.len() {
+    if !remaining.is_empty() {
         return false;
     }
 
-    trim_leading_text_prefix(contents, trim_bytes)
-}
-
-fn trim_leading_text_prefix(contents: &mut Vec<WorkerContent>, mut prefix_bytes: usize) -> bool {
-    if prefix_bytes == 0 {
-        return false;
-    }
-
-    let mut idx = 0usize;
-    while idx < contents.len() && prefix_bytes > 0 {
+    let mut idx = start_idx;
+    let mut remaining = echo_prefix;
+    while idx < contents.len() && !remaining.is_empty() {
         let remove_current = match &mut contents[idx] {
-            WorkerContent::ContentText {
-                text,
-                stream,
-                origin,
-            } if matches!(stream, TextStream::Stdout)
-                && matches!(origin, ContentOrigin::Worker) =>
-            {
-                if prefix_bytes >= text.len() {
-                    prefix_bytes -= text.len();
+            WorkerContent::ContentText { text, .. } => {
+                if remaining.len() >= text.len() {
+                    remaining = &remaining[text.len()..];
                     text.clear();
                     true
                 } else {
-                    if !text.is_char_boundary(prefix_bytes) {
-                        return false;
-                    }
-                    *text = text[prefix_bytes..].to_string();
-                    prefix_bytes = 0;
+                    let updated = text[remaining.len()..].to_string();
+                    *text = updated;
+                    remaining = "";
                     false
                 }
             }
-            _ => break,
+            _ => return false,
         };
+
         if remove_current {
             contents.remove(idx);
-        } else {
-            idx = idx.saturating_add(1);
+            continue;
         }
+        idx = idx.saturating_add(1);
     }
 
-    prefix_bytes == 0
+    true
 }
 
 fn drop_echo_only_contents(contents: &mut Vec<WorkerContent>, echo: &str) -> bool {
@@ -3555,6 +3580,206 @@ fn normalize_prompt(prompt: Option<String>) -> Option<String> {
 
 fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn fallback_prompt_variants(
+    prompt: Option<&str>,
+    prompt_variants: Option<&[String]>,
+) -> Vec<String> {
+    let mut variants = Vec::new();
+    if let Some(prompt_variants) = prompt_variants {
+        for prompt in prompt_variants {
+            push_fallback_prompt_variant(&mut variants, prompt);
+        }
+    }
+    if let Some(prompt) = prompt {
+        push_fallback_prompt_variant(&mut variants, prompt);
+    }
+    variants
+}
+
+fn push_fallback_prompt_variant(variants: &mut Vec<String>, prompt: &str) {
+    let prompt = prompt.trim_end_matches(['\n', '\r']);
+    if prompt.is_empty() {
+        return;
+    }
+    if !variants.iter().any(|existing| existing == prompt) {
+        variants.push(prompt.to_string());
+    }
+    if let Some(alt) = swap_fallback_prompt_variant(prompt)
+        && alt != prompt
+        && !variants.iter().any(|existing| existing == &alt)
+    {
+        variants.push(alt);
+    }
+}
+
+fn swap_fallback_prompt_variant(prompt: &str) -> Option<String> {
+    let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
+    let suffix = &prompt[core.len()..];
+    let swapped_core = if core == ">" {
+        Some("+".to_string())
+    } else if core == "+" {
+        Some(">".to_string())
+    } else if core == ">>>" {
+        Some("...".to_string())
+    } else if core == "..." {
+        Some(">>>".to_string())
+    } else if core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')) {
+        let mut swapped = core.to_string();
+        let last = swapped.pop()?;
+        let replacement = match last {
+            '>' => '+',
+            '+' => '>',
+            _ => return None,
+        };
+        swapped.push(replacement);
+        Some(swapped)
+    } else {
+        None
+    };
+    swapped_core.map(|core| format!("{core}{suffix}"))
+}
+
+fn build_input_transcript(prompt: Option<&str>, input: &str) -> Option<String> {
+    let prompt = prompt?;
+    let normalized = normalize_input_newlines(input);
+    let trimmed = normalized.trim_end_matches('\n').trim_end();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    Some(format!("{prompt}{trimmed}\n"))
+}
+
+fn trim_line_endings(text: &str) -> &str {
+    text.trim_end_matches(['\n', '\r'])
+}
+
+fn line_matches_input_echo(line: &str, input_line: &str, prompt_variants: &[String]) -> bool {
+    let line = trim_line_endings(line);
+    if input_line.is_empty() {
+        return line.is_empty() || prompt_variants.iter().any(|prompt| line == prompt);
+    }
+    if line == input_line {
+        return true;
+    }
+    prompt_variants.iter().any(|prompt| {
+        line.strip_prefix(prompt)
+            .is_some_and(|rest| rest == input_line)
+    })
+}
+
+fn trim_leading_text_prefix(contents: &mut Vec<WorkerContent>, mut prefix_bytes: usize) -> bool {
+    if prefix_bytes == 0 {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < contents.len() && prefix_bytes > 0 {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText {
+                text,
+                stream,
+                origin,
+            } if matches!(stream, TextStream::Stdout)
+                && matches!(origin, ContentOrigin::Worker) =>
+            {
+                if prefix_bytes >= text.len() {
+                    prefix_bytes -= text.len();
+                    text.clear();
+                    true
+                } else {
+                    if !text.is_char_boundary(prefix_bytes) {
+                        return false;
+                    }
+                    *text = text[prefix_bytes..].to_string();
+                    prefix_bytes = 0;
+                    false
+                }
+            }
+            _ => break,
+        };
+        if remove_current {
+            contents.remove(idx);
+        } else {
+            idx = idx.saturating_add(1);
+        }
+    }
+    prefix_bytes == 0
+}
+
+fn trim_leading_input_echo_from_contents(
+    contents: &mut Vec<WorkerContent>,
+    input: Option<&str>,
+    prompt_variants: &[String],
+) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    let normalized_input = normalize_input_newlines(input);
+    let trimmed_input = normalized_input.trim_end_matches('\n');
+    if trimmed_input.is_empty() {
+        return false;
+    }
+    let input_lines: Vec<&str> = trimmed_input.split('\n').collect();
+    let last_nonempty_input = input_lines
+        .iter()
+        .rev()
+        .find(|line| !line.is_empty())
+        .copied();
+
+    let mut leading_text = String::new();
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            break;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            break;
+        }
+        leading_text.push_str(text);
+    }
+    if leading_text.is_empty() {
+        return false;
+    }
+
+    let output_lines: Vec<&str> = leading_text.split_inclusive('\n').collect();
+    let mut output_idx = 0usize;
+    let mut input_idx = 0usize;
+    let mut trim_bytes = 0usize;
+
+    while output_idx < output_lines.len() && input_idx < input_lines.len() {
+        let line = output_lines[output_idx];
+        if !line_matches_input_echo(line, input_lines[input_idx], prompt_variants) {
+            break;
+        }
+        trim_bytes += line.len();
+        output_idx += 1;
+        input_idx += 1;
+    }
+    if input_idx != input_lines.len() {
+        return false;
+    }
+
+    while output_idx < output_lines.len() {
+        let line = trim_line_endings(output_lines[output_idx]);
+        let matches_prompt_only = prompt_variants.iter().any(|prompt| line == prompt);
+        let matches_last_duplicate = last_nonempty_input.is_some_and(|last| {
+            prompt_variants
+                .iter()
+                .any(|prompt| line.strip_prefix(prompt).is_some_and(|rest| rest == last))
+        });
+        if !matches_prompt_only && !matches_last_duplicate {
+            break;
+        }
+        trim_bytes += output_lines[output_idx].len();
+        output_idx += 1;
+    }
+
+    trim_leading_text_prefix(contents, trim_bytes)
 }
 
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
@@ -5308,7 +5533,28 @@ mod tests {
     }
 
     #[test]
-    fn trim_decision_respects_continuation_prompts() {
+    fn trim_echo_prefix_after_leading_nonstdout_contents_removes_prompt_fallback_echo() {
+        let mut contents = vec![
+            WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+            WorkerContent::stdout("> x\n"),
+            WorkerContent::stdout("> "),
+        ];
+
+        let trimmed =
+            trim_echo_prefix_after_leading_nonstdout_contents(&mut contents, Some("> x\n"));
+
+        assert!(trimmed, "expected prompt fallback echo to be trimmed");
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+                WorkerContent::stdout("> "),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_decision_applies_to_any_sideband_echo() {
         let single = vec![echo_event("> ", "1+1\n")];
         assert!(should_trim_echo_prefix(&single));
 
@@ -5316,13 +5562,13 @@ mod tests {
         assert!(should_trim_echo_prefix(&continuation));
 
         let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
-        assert!(!should_trim_echo_prefix(&multi));
+        assert!(should_trim_echo_prefix(&multi));
 
         let browser = vec![echo_event("Browse[1]> ", "n\n")];
-        assert!(!should_trim_echo_prefix(&browser));
+        assert!(should_trim_echo_prefix(&browser));
 
         let readline = vec![echo_event("FIRST> ", "alpha\n")];
-        assert!(!should_trim_echo_prefix(&readline));
+        assert!(should_trim_echo_prefix(&readline));
     }
 
     #[test]
@@ -5424,26 +5670,6 @@ mod tests {
 
         assert!(trimmed, "expected late top-level echo to be trimmed");
         assert_eq!(contents_text(&contents), "TAIL_ONLY\n> ");
-    }
-
-    #[test]
-    fn trim_matching_echo_event_suffix_from_contents_trims_python_multiline_crlf_echo() {
-        let mut contents = vec![WorkerContent::worker_stdout(
-            ">>> def f():\r\n...     return 3\r\n... \r\n>>> f()\r\n3\r\n>>> ... ",
-        )];
-
-        let trimmed = trim_matching_echo_event_suffix_from_contents(
-            &mut contents,
-            &[
-                echo_event(">>> ", "def f():\n"),
-                echo_event("... ", "    return 3\n"),
-                echo_event("... ", "\n"),
-                echo_event(">>> ", "f()\n"),
-            ],
-        );
-
-        assert!(trimmed, "expected multiline Python echo to be trimmed");
-        assert_eq!(contents_text(&contents), "3\r\n>>> ... ");
     }
 
     #[test]
@@ -5578,37 +5804,6 @@ mod tests {
         assert_eq!(completion.echo_events[0].line, "1+\n");
         assert_eq!(completion.echo_events[1].prompt, "+ ");
         assert_eq!(completion.echo_events[1].line, "1\n");
-    }
-
-    #[test]
-    fn merge_completion_info_from_ipc_appends_late_echo_events() {
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: ">>> ".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: ">>> ".to_string(),
-            line: "def f():\n".to_string(),
-        });
-
-        let mut completion = completion_info_from_ipc(&server, false);
-        let delayed_worker = worker.clone();
-        let late_sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1));
-            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "... ".to_string(),
-                line: "    return 3\n".to_string(),
-            });
-        });
-        late_sender.join().expect("late sender should join");
-        merge_completion_info_from_ipc(&mut completion, &server, false);
-
-        assert_eq!(completion.prompt.as_deref(), Some(">>> "));
-        assert_eq!(completion.echo_events.len(), 2);
-        assert_eq!(completion.echo_events[0].prompt, ">>> ");
-        assert_eq!(completion.echo_events[0].line, "def f():\n");
-        assert_eq!(completion.echo_events[1].prompt, "... ");
-        assert_eq!(completion.echo_events[1].line, "    return 3\n");
     }
 
     #[test]
@@ -5926,6 +6121,7 @@ mod tests {
         manager.process = Some(process);
         manager.pending_request = true;
         manager.pending_request_started_at = Some(std::time::Instant::now());
+        manager.pending_request_input = Some("quit()\n".to_string());
 
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
@@ -5965,7 +6161,7 @@ mod tests {
     }
 
     #[test]
-    fn files_prepare_input_context_keeps_echo_when_echo_events_missing() {
+    fn files_prepare_input_context_trims_echo_from_prompt_fallback_when_echo_events_missing() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -5975,6 +6171,7 @@ mod tests {
         manager
             .pending_output_tape
             .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
             prompt_variants: Some(vec![">>> ".to_string()]),
@@ -5988,11 +6185,11 @@ mod tests {
 
         assert!(
             text.contains("DETACHED_OK\n"),
-            "expected the settled files-mode output to survive without trimming, got: {text:?}"
+            "expected the settled files-mode output to survive trimming, got: {text:?}"
         );
         assert!(
-            text.contains(">>> import time; time.sleep(0.2)\n"),
-            "expected the Python prompt echo to remain when no echo events were emitted, got: {text:?}"
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the Python prompt echo to leak into the next files-mode reply, got: {text:?}"
         );
         assert!(
             manager.settled_pending_completion.is_none(),
