@@ -1,0 +1,15 @@
+---
+source: tests/write_stdin_batch.rs
+expression: transcript
+---
+== session: files_multidrain_plot_then_later_stdout ==
+1) r_repl timeout_ms=200
+>>> plot(1:10)
+>>> Sys.sleep(2)
+>>> cat('done\n')
+<<< [image/png len=0]
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
+
+2) r_repl timeout_ms=10000
+>>> 
+<<< done

@@ -31,6 +31,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 ### Output, images, and debug surfaces
 
 - `src/pending_output_tape.rs` and `src/output_stream.rs` stage worker text and images until reply sealing.
+- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, and how request completion only gates final-reply cleanup rather than ordering.
 - `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates oversized-output bundle directories with lazily materialized `transcript.txt`, `events.log`, and `images/`, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
 - `src/pager/` implements the pager-mode oversized-output path used by bare CLI defaults and explicit `--oversized-output pager` installs.
 - `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.

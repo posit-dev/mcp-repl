@@ -13,8 +13,8 @@ expression: transcript
 >>> 
 >>> plot(5:1, type = "l")
 >>> cat("plots_done\n")
-<<< plots_done
 <<< [image/png len=0]
+<<< plots_done
 
 3) r_repl
 >>> 

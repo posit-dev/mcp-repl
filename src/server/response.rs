@@ -58,6 +58,7 @@ struct ActiveOutputBundle {
     id: u64,
     paths: OutputBundlePaths,
     next_image_number: usize,
+    current_image_id: Option<String>,
     current_image_history_number: usize,
     history_image_count: usize,
     transcript_bytes: usize,
@@ -121,9 +122,9 @@ impl ReplyItem {
 
 #[derive(Clone)]
 struct ReplyImage {
+    id: String,
     data: String,
     mime_type: String,
-    is_new: bool,
 }
 
 #[derive(Clone)]
@@ -490,7 +491,11 @@ impl ResponseState {
         staged_timeout_output: Option<StagedTimeoutOutput>,
     ) -> FollowUpDetachedPrefix {
         if let Some(active) = active_timeout_bundle {
-            return self.render_follow_up_detached_prefix_with_active_bundle(material, active);
+            return self.render_follow_up_detached_prefix_with_active_bundle(
+                material,
+                active,
+                material.detached_prefix_worker_text.chars().count(),
+            );
         }
 
         let detached_prefix_image_count = count_images(&material.detached_prefix_items);
@@ -531,8 +536,11 @@ impl ResponseState {
             if use_output_bundle || text_should_spill(combined_worker_text_chars) {
                 match self.materialize_staged_timeout_output(&staged, None) {
                     Ok(active) => {
-                        return self
-                            .render_follow_up_detached_prefix_with_active_bundle(material, active);
+                        return self.render_follow_up_detached_prefix_with_active_bundle(
+                            material,
+                            active,
+                            combined_worker_text_chars,
+                        );
                     }
                     Err(err) => {
                         eprintln!("dropping output-bundle setup after output-bundle error: {err}");
@@ -625,6 +633,7 @@ impl ResponseState {
         &mut self,
         material: &ReplyMaterial,
         mut active: ActiveOutputBundle,
+        spill_worker_text_chars: usize,
     ) -> FollowUpDetachedPrefix {
         let contents = if material.detached_prefix_items.is_empty() {
             Vec::new()
@@ -634,7 +643,7 @@ impl ResponseState {
                 &mut active,
                 &material.detached_prefix_items,
                 &material.detached_prefix_inline_items,
-                material.detached_prefix_worker_text.chars().count(),
+                spill_worker_text_chars,
             ) {
                 Ok(contents) => contents,
                 Err(err) => {
@@ -955,6 +964,7 @@ impl OutputStore {
                 images_history_dir,
             },
             next_image_number: 0,
+            current_image_id: None,
             current_image_history_number: 0,
             history_image_count: 0,
             transcript_bytes: 0,
@@ -1432,7 +1442,10 @@ impl ActiveOutputBundle {
             self.materialize_events_log(store)?;
         }
         let extension = image_extension(&image.mime_type);
-        let starts_new_image = image.is_new || self.next_image_number == 0;
+        let starts_new_image = match self.current_image_id.as_deref() {
+            None => true,
+            Some(current_id) => current_id != image.id,
+        };
         let image_number = if starts_new_image {
             self.next_image_number.saturating_add(1)
         } else {
@@ -1510,6 +1523,7 @@ impl ActiveOutputBundle {
             self.pre_index_image_paths.push(history_rel_path);
         }
         self.next_image_number = image_number;
+        self.current_image_id = Some(image.id.clone());
         self.current_image_history_number = history_number;
         self.history_image_count = self.history_image_count.saturating_add(1);
         Ok(Some(ReplyItem::Image(image.clone())))
@@ -1771,16 +1785,16 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
             WorkerContent::ContentImage {
                 data,
                 mime_type,
-                // Intentionally drop worker image ids here. The public tool surface emits plain
-                // image items without mcpConsole metadata, and the plot-image tests assert that
-                // repeated renders stay metadata-free.
-                id: _,
-                is_new,
+                // Preserve the worker image id internally so same-plot updates stay grouped
+                // within a reply or output bundle. The public content surface still emits plain
+                // images without mcpConsole metadata.
+                id,
+                is_new: _,
             } => {
                 let item = ReplyItem::Image(ReplyImage {
+                    id,
                     data,
                     mime_type,
-                    is_new,
                 });
                 if is_detached_prefix {
                     detached_prefix_items.push(item.clone());
@@ -2659,12 +2673,14 @@ fn collapse_image_updates(items: Vec<ReplyItem>) -> Vec<ReplyItem> {
     let mut group_for_index: Vec<Option<usize>> = vec![None; items.len()];
     let mut last_in_group: Vec<usize> = Vec::new();
     let mut current_group: Option<usize> = None;
+    let mut current_image_id: Option<&str> = None;
 
     for (idx, item) in items.iter().enumerate() {
         if let ReplyItem::Image(image) = item {
-            if image.is_new || current_group.is_none() {
+            if current_group.is_none() || current_image_id != Some(image.id.as_str()) {
                 current_group = Some(last_in_group.len());
                 last_in_group.push(idx);
+                current_image_id = Some(image.id.as_str());
             }
             let group = current_group.expect("image group should be set");
             group_for_index[idx] = Some(group);
@@ -2826,9 +2842,9 @@ mod tests {
         assert!(matches!(first, Some(ReplyItem::WorkerText { text, .. }) if text == "a"));
 
         let image = ReplyImage {
+            id: "image-1".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
             mime_type: "image/png".to_string(),
-            is_new: true,
         };
         let retained_image = bundle
             .append_image(&mut store, &image)
@@ -2894,6 +2910,69 @@ mod tests {
         assert!(
             !transcript.contains("FOLLOWUP_OK"),
             "did not expect follow-up reply to be appended to detached prefix bundle: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn cumulative_small_detached_prefix_and_follow_up_spill_on_follow_up_input() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let detached_prefix = format!(
+            "DETACHED_START\n{}\nDETACHED_END\n",
+            "x".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+        let follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "y".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+
+        assert!(
+            !super::text_should_spill(detached_prefix.chars().count()),
+            "expected detached prefix alone to stay under the hard spill threshold"
+        );
+        assert!(
+            !super::text_should_spill(follow_up.chars().count()),
+            "expected follow-up reply alone to stay under the hard spill threshold"
+        );
+        assert!(
+            super::text_should_spill(
+                detached_prefix
+                    .chars()
+                    .count()
+                    .saturating_add(follow_up.chars().count())
+            ),
+            "expected the combined detached prefix and follow-up reply to exceed the hard spill threshold"
+        );
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout(follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected detached prefix transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            text.contains("FOLLOW_UP_START") && text.contains("FOLLOW_UP_END"),
+            "expected the fresh follow-up reply to stay visible, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("DETACHED_START") && transcript.contains("DETACHED_END"),
+            "expected the detached prefix to spill, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOW_UP_START"),
+            "did not expect the fresh follow-up reply in the detached-prefix transcript: {transcript:?}"
         );
     }
 
@@ -3350,6 +3429,52 @@ mod tests {
     }
 
     #[test]
+    fn repeated_image_updates_stay_grouped_by_id_even_if_is_new_resets() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                    },
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([1_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                    },
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([2_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                    },
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let images = result_images(&result);
+
+        assert_eq!(
+            images.len(),
+            1,
+            "expected same-id image updates to stay collapsed inline even if is_new resets"
+        );
+        assert_eq!(
+            images[0],
+            vec![2_u8],
+            "expected inline anchor to use the final same-id image state"
+        );
+    }
+
+    #[test]
     fn timed_out_follow_up_reply_gets_its_own_active_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let mut bundle = state
@@ -3429,9 +3554,9 @@ mod tests {
             .expect("timeout bundle should initialize");
         for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
             let image = ReplyImage {
+                id: format!("image-{index}"),
                 data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                 mime_type: "image/png".to_string(),
-                is_new: true,
             };
             let retained = bundle
                 .append_image(&mut state.output_store, &image)
@@ -3493,9 +3618,9 @@ mod tests {
             .expect("sizing bundle should initialize");
         for index in 0..(super::IMAGE_OUTPUT_BUNDLE_THRESHOLD - 1) {
             let image = ReplyImage {
+                id: format!("image-{index}"),
                 data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                 mime_type: "image/png".to_string(),
-                is_new: true,
             };
             let retained = sizing_bundle
                 .append_image(&mut sizing_state.output_store, &image)
@@ -3525,9 +3650,9 @@ mod tests {
             .expect("timeout bundle should initialize");
         for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
             let image = ReplyImage {
+                id: format!("image-{index}"),
                 data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                 mime_type: "image/png".to_string(),
-                is_new: true,
             };
             let _ = bundle
                 .append_image(&mut state.output_store, &image)
@@ -3571,9 +3696,9 @@ mod tests {
             .expect("timeout bundle should initialize");
         for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
             let image = ReplyImage {
+                id: format!("image-{index}"),
                 data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                 mime_type: "image/png".to_string(),
-                is_new: true,
             };
             let retained = bundle
                 .append_image(&mut state.output_store, &image)
@@ -3813,6 +3938,72 @@ mod tests {
         assert!(
             !transcript.contains("DONE\n"),
             "did not expect fresh follow-up output in the detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_timeout_bundle_spills_when_detached_prefix_and_follow_up_cross_threshold() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let timed_out = format!(
+            "SMALL_START\n{}\nSMALL_END\n",
+            "s".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+        let follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "f".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(timed_out.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        assert!(
+            disclosed_path(&result_text(&first), "transcript.txt").is_none(),
+            "did not expect the initial under-threshold timed-out reply to disclose a bundle path"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the initial timed-out reply to keep hidden timeout state"
+        );
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(timed_out),
+                    WorkerContent::worker_stdout(follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&second);
+        let transcript_path = disclosed_path(&text, "transcript.txt").unwrap_or_else(|| {
+            panic!(
+                "expected a transcript path once cumulative follow-up output spilled, got: {text:?}"
+            )
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            text.contains("FOLLOW_UP_START") && text.contains("FOLLOW_UP_END"),
+            "expected the fresh follow-up reply to remain visible, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+            "expected the detached timeout prefix in the transcript, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOW_UP_START"),
+            "did not expect the fresh follow-up reply in the detached-prefix transcript: {transcript:?}"
         );
     }
 
@@ -4430,9 +4621,9 @@ mod tests {
                 .append_image(
                     &mut sizing_state.output_store,
                     &ReplyImage {
+                        id: format!("image-{index}"),
                         data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                         mime_type: "image/png".to_string(),
-                        is_new: true,
                     },
                 )
                 .expect("initial image should append");
@@ -4447,10 +4638,10 @@ mod tests {
                 .append_image(
                     &mut sizing_state.output_store,
                     &ReplyImage {
+                        id: format!("image-{}", initial_image_count + offset),
                         data: base64::engine::general_purpose::STANDARD
                             .encode([(initial_image_count + offset) as u8]),
                         mime_type: "image/png".to_string(),
-                        is_new: true,
                     },
                 )
                 .expect("sizing image should append");
@@ -4475,9 +4666,9 @@ mod tests {
                 .append_image(
                     &mut state.output_store,
                     &ReplyImage {
+                        id: format!("image-{index}"),
                         data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
                         mime_type: "image/png".to_string(),
-                        is_new: true,
                     },
                 )
                 .expect("initial image should append");
@@ -4703,14 +4894,14 @@ mod tests {
         let first_bytes = vec![0_u8];
         let last_bytes = vec![1_u8];
         let first = ReplyImage {
+            id: "plot-1".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&first_bytes),
             mime_type: "image/png".to_string(),
-            is_new: true,
         };
         let last = ReplyImage {
+            id: "plot-1".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&last_bytes),
             mime_type: "image/png".to_string(),
-            is_new: false,
         };
         let retained_first = bundle
             .append_image(&mut store, &first)
@@ -4745,9 +4936,9 @@ mod tests {
         assert!(matches!(worker_text, Some(ReplyItem::WorkerText { text, .. }) if text == "a"));
 
         let image = ReplyImage {
+            id: "image-1".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
             mime_type: "image/png".to_string(),
-            is_new: true,
         };
         let retained_image = bundle
             .append_image(&mut store, &image)
@@ -4789,9 +4980,9 @@ mod tests {
             .new_bundle()
             .expect("bundle should initialize");
         let image = ReplyImage {
+            id: "image-1".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
             mime_type: "image/png".to_string(),
-            is_new: true,
         };
         let retained_image = bundle
             .append_image(&mut state.output_store, &image)

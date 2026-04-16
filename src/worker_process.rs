@@ -27,11 +27,14 @@ use crate::ipc::{
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
+#[cfg(test)]
+use crate::output_capture::OutputRange;
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTextSpan,
-    OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputTextSpan, OutputTimeline,
+    ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
+use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
@@ -143,9 +146,16 @@ impl LiveOutputCapture {
             image.mime_type.clone(),
             image.data.clone(),
             image.is_new,
+            image.readline_results_seen,
         );
         if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(image.id, image.mime_type, image.data, image.is_new);
+            tape.append_image(
+                image.id,
+                image.mime_type,
+                image.data,
+                image.is_new,
+                image.readline_results_seen,
+            );
         }
     }
 
@@ -626,6 +636,9 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_manager_created", || {
             worker_context_event_payload(backend, &sandbox_state)
         });
+        if !awaiting_initial_sandbox_state_update {
+            crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
+        }
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -1122,6 +1135,9 @@ impl WorkerManager {
                 &prompt_variants,
             );
         }
+        if !timed_out && !session_end && contents.is_empty() {
+            contents.push(idle_status_content());
+        }
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1603,6 +1619,9 @@ impl WorkerManager {
                     }
                 }
 
+                if self.should_settle_multiline_r_timeout() {
+                    self.settle_output_after_timeout();
+                }
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
                 let mut contents = context.prefix_contents;
@@ -1877,6 +1896,55 @@ impl WorkerManager {
             return;
         }
         let stable_needed = Duration::from_millis(15).min(total);
+        self.settle_output_until_stable(total, stable_needed);
+    }
+
+    fn settle_output_after_timeout(&self) {
+        let total = Duration::from_millis(2500);
+        let stable_needed = Duration::from_millis(40);
+        let poll = Duration::from_millis(5);
+        let start = std::time::Instant::now();
+        let baseline = self.pending_output_tape.current_settle_state();
+        let mut last_seq = baseline.progress_seq;
+        let mut ready = baseline.has_image;
+        let mut stable_for = Duration::from_millis(0);
+        while start.elapsed() < total {
+            thread::sleep(poll);
+            let now = self.pending_output_tape.current_settle_state();
+            if !ready
+                && (now.has_image || now.readline_results_seen > baseline.readline_results_seen)
+            {
+                ready = true;
+                stable_for = Duration::from_millis(0);
+                last_seq = now.progress_seq;
+                continue;
+            }
+            if now.progress_seq == last_seq {
+                stable_for = stable_for.saturating_add(poll);
+                if ready && stable_for >= stable_needed {
+                    return;
+                }
+            } else {
+                last_seq = now.progress_seq;
+                stable_for = Duration::from_millis(0);
+            }
+        }
+    }
+
+    fn should_settle_multiline_r_timeout(&self) -> bool {
+        if self.backend != Backend::R {
+            return false;
+        }
+        self.pending_request_input
+            .as_deref()
+            .map(|input| input.trim_end_matches(['\r', '\n']).contains('\n'))
+            .unwrap_or(false)
+    }
+
+    fn settle_output_until_stable(&self, total: Duration, stable_needed: Duration) {
+        if total.is_zero() {
+            return;
+        }
         let poll = Duration::from_millis(5);
         let start = std::time::Instant::now();
 
@@ -2537,7 +2605,7 @@ impl WorkerManager {
     fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
         self.pending_output_tape
             .drain_final_snapshot()
-            .format_contents()
+            .format_contents_for_reply()
     }
 
     fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
@@ -3090,18 +3158,22 @@ fn snapshot_after_completion(
     target_bytes: u64,
     completion: &CompletionInfo,
 ) -> CompletionSnapshot {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    if !trim_enabled {
+    if !completion.echo_events.is_empty() {
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let (bytes, events, text_spans) =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &completion.echo_events,
+            0,
+            &prompt_variants,
+            EchoCollapseMode::CollapseForFinalReply,
+        );
         let snapshot = snapshot_page_with_images_from_collapsed(
-            bytes,
-            events,
-            text_spans,
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
             end_offset,
             target_bytes,
         );
@@ -3111,17 +3183,8 @@ fn snapshot_after_completion(
         };
     }
 
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-    if let Some(echo) = echo_transcript.as_deref() {
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-
-    let mut snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
-    maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
+    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+    let snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
     CompletionSnapshot {
         snapshot,
         saw_stderr,
@@ -3134,18 +3197,24 @@ fn take_range_from_ring_after_completion(
     end_offset: u64,
     completion: &CompletionInfo,
 ) -> FormattedPendingOutput {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-
-    if !trim_enabled {
+    if !completion.echo_events.is_empty() {
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let (bytes, events, text_spans) =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-        let mut contents =
-            pager::contents_from_collapsed_output(bytes, events, text_spans, end_offset);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &completion.echo_events,
+            0,
+            &prompt_variants,
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let mut contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            end_offset,
+        );
         append_protocol_warnings(&mut contents, &completion.protocol_warnings);
         return FormattedPendingOutput {
             contents,
@@ -3153,20 +3222,9 @@ fn take_range_from_ring_after_completion(
         };
     }
 
-    if let Some(echo) = echo_transcript.as_deref() {
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
     let mut contents = pager::take_range_from_ring(output, end_offset);
-    trim_echo_then_append_protocol_warnings(
-        &mut contents,
-        echo_transcript.as_deref(),
-        trim_enabled,
-        should_drop_echo_only_contents(&completion.echo_events),
-        &completion.protocol_warnings,
-    );
+    append_protocol_warnings(&mut contents, &completion.protocol_warnings);
     FormattedPendingOutput {
         contents,
         saw_stderr,
@@ -3204,6 +3262,7 @@ fn collect_image_groups(
                 mime_type,
                 id,
                 is_new,
+                ..
             } => (
                 *is_new,
                 WorkerContent::ContentImage {
@@ -3270,450 +3329,12 @@ fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
     Some(transcript)
 }
 
-fn echo_event_prefix_len(line: &[u8], event: &IpcEchoEvent) -> Option<usize> {
-    let prompt = event.prompt.as_bytes();
-    let consumed = event.line.as_bytes();
-    if line.len() == prompt.len().saturating_add(consumed.len()) {
-        let (prefix, suffix) = line.split_at(prompt.len());
-        if prefix == prompt && suffix == consumed {
-            return Some(line.len());
-        }
-    }
-
-    let consumed = if let Some(consumed) = consumed.strip_suffix(b"\r\n") {
-        consumed
-    } else if let Some(consumed) = consumed.strip_suffix(b"\n") {
-        consumed
-    } else {
-        return None;
-    };
-    let prefix_len = prompt.len().saturating_add(consumed.len());
-    if line.len() <= prefix_len {
-        return None;
-    }
-    let (prefix, suffix) = line.split_at(prompt.len());
-    if prefix != prompt || !suffix.starts_with(consumed) {
-        return None;
-    }
-    Some(prefix_len)
-}
-
-#[derive(Default)]
-struct PendingEchoRun {
-    lines: usize,
-    bytes: usize,
-    head: Option<Vec<u8>>,
-    tail: Option<Vec<u8>>,
-}
-
-impl PendingEchoRun {
-    fn push(&mut self, line: &[u8]) {
-        self.lines = self.lines.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(line.len());
-        if self.head.is_none() {
-            self.head = Some(line.to_vec());
-        }
-        self.tail = Some(line.to_vec());
-    }
-
-    fn take(&mut self) -> PendingEchoRun {
-        std::mem::take(self)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.lines == 0
-    }
-}
-
-fn strip_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
-    let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
-        end -= 1;
-    }
-    &bytes[..end]
-}
-
-fn is_ascii_whitespace_only(bytes: &[u8]) -> bool {
-    bytes.iter().all(|b| b.is_ascii_whitespace())
-}
-
-fn prompt_variants_bytes(prompt_variants: &[String]) -> Vec<Vec<u8>> {
-    prompt_variants
-        .iter()
-        .filter_map(|prompt| {
-            let trimmed = prompt.trim_end_matches(['\n', '\r']);
-            (!trimmed.is_empty()).then_some(trimmed.as_bytes().to_vec())
-        })
-        .collect()
-}
-
-fn is_prompt_only_fragment(bytes: &[u8], prompt_variants: &[Vec<u8>]) -> bool {
-    let trimmed = strip_trailing_newlines_bytes(bytes);
-    if trimmed.is_empty() {
-        return false;
-    }
-    prompt_variants.iter().any(|p| p.as_slice() == trimmed)
-}
-
-fn summarize_middle(text: &str, head_chars: usize, tail_chars: usize) -> String {
-    let total = text.chars().count();
-    if total <= head_chars.saturating_add(tail_chars).saturating_add(8) {
-        return text.to_string();
-    }
-    let head = text.chars().take(head_chars).collect::<String>();
-    let tail = text
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{head} .... [ELIDED] .... {tail}")
-}
-
-fn summarize_echo_line_for_marker(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(strip_trailing_newlines_bytes(bytes));
-    summarize_middle(&text, 80, 40)
-}
-
-fn summarize_echo_line_for_output(bytes: &[u8]) -> Vec<u8> {
-    const MAX_CHARS: usize = 220;
-    let had_newline = bytes.ends_with(b"\n");
-    let text = String::from_utf8_lossy(strip_trailing_newlines_bytes(bytes));
-    let summarized = if text.chars().count() > MAX_CHARS {
-        summarize_middle(&text, 120, 60)
-    } else {
-        text.to_string()
-    };
-    let mut out = summarized.into_bytes();
-    if had_newline {
-        out.push(b'\n');
-    }
-    out
-}
-
-fn collapse_echo_with_attribution(
-    range: OutputRange,
-    echo_events: &[IpcEchoEvent],
-    prompt_variants: &[String],
-) -> (Vec<u8>, Vec<(u64, OutputEventKind)>, Vec<OutputTextSpan>) {
-    use std::cell::Cell;
-
-    const ECHO_MARKER_MIN_BYTES: usize = 512;
-
-    let mut out_bytes: Vec<u8> = Vec::new();
-    let mut out_events: Vec<(u64, OutputEventKind)> = Vec::new();
-    let mut out_text_spans: Vec<OutputTextSpan> = Vec::new();
-
-    let prompt_variants = prompt_variants_bytes(prompt_variants);
-    let mut pending = PendingEchoRun::default();
-    let mut echo_idx = 0usize;
-    let saw_substantive_output = Cell::new(false);
-
-    let base_offset = range.start_offset;
-    let end_offset = range.end_offset;
-    let bytes = range.bytes;
-    let text_spans = range.text_spans;
-
-    // Convert ring offsets to byte indices within `bytes`.
-    let mut events: Vec<(usize, OutputEventKind)> = range
-        .events
-        .into_iter()
-        .filter_map(|event| {
-            if event.offset < base_offset || event.offset > end_offset {
-                return None;
-            }
-            let rel = event.offset.saturating_sub(base_offset) as usize;
-            Some((rel.min(bytes.len()), event.kind))
-        })
-        .collect();
-    events.sort_by_key(|(offset, _)| *offset);
-
-    let mut flush_pending = |out_bytes: &mut Vec<u8>,
-                             out_text_spans: &mut Vec<OutputTextSpan>,
-                             pending: &mut PendingEchoRun| {
-        if pending.is_empty() {
-            return;
-        }
-        let pending = pending.take();
-        if !saw_substantive_output.get() {
-            return;
-        }
-        let head = pending.head.as_deref().unwrap_or_default();
-        let tail = pending.tail.as_deref().unwrap_or_default();
-        if pending.lines >= 2 || pending.bytes >= ECHO_MARKER_MIN_BYTES {
-            let head_snip = summarize_echo_line_for_marker(head);
-            let tail_snip = summarize_echo_line_for_marker(tail);
-            let marker = format!(
-                "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
-                pending.lines, pending.bytes, head_snip, tail_snip
-            );
-            append_text_with_span(
-                out_bytes,
-                out_text_spans,
-                marker.as_bytes(),
-                false,
-                ContentOrigin::Worker,
-            );
-        } else {
-            append_text_with_span(
-                out_bytes,
-                out_text_spans,
-                &summarize_echo_line_for_output(tail),
-                false,
-                ContentOrigin::Worker,
-            );
-        }
-    };
-
-    let mut cursor = 0usize;
-    for (event_offset, kind) in events {
-        let event_offset = event_offset.min(bytes.len());
-        if event_offset > cursor {
-            consume_text_segment_with_spans(
-                &bytes[cursor..event_offset],
-                cursor,
-                &text_spans,
-                echo_events,
-                &mut echo_idx,
-                &prompt_variants,
-                &mut pending,
-                &saw_substantive_output,
-                &mut flush_pending,
-                &mut out_bytes,
-                &mut out_text_spans,
-            );
-            cursor = event_offset;
-        }
-
-        // Image events can race with stdout capture and land at slightly different byte offsets.
-        // Treat text events as hard boundaries, but avoid splitting echo runs on image markers.
-        if matches!(kind, OutputEventKind::Text { .. }) {
-            flush_pending(&mut out_bytes, &mut out_text_spans, &mut pending);
-        }
-        out_events.push((out_bytes.len() as u64, kind));
-    }
-
-    if cursor < bytes.len() {
-        consume_text_segment_with_spans(
-            &bytes[cursor..],
-            cursor,
-            &text_spans,
-            echo_events,
-            &mut echo_idx,
-            &prompt_variants,
-            &mut pending,
-            &saw_substantive_output,
-            &mut flush_pending,
-            &mut out_bytes,
-            &mut out_text_spans,
-        );
-    }
-
-    // Drop any trailing echo-only run (no output followed it).
-    (out_bytes, out_events, out_text_spans)
-}
-
-fn append_text_with_span(
-    out_bytes: &mut Vec<u8>,
-    out_text_spans: &mut Vec<OutputTextSpan>,
-    bytes: &[u8],
-    is_stderr: bool,
-    origin: ContentOrigin,
-) {
-    if bytes.is_empty() {
-        return;
-    }
-    let start_byte = out_bytes.len();
-    out_bytes.extend_from_slice(bytes);
-    let end_byte = out_bytes.len();
-    if let Some(last) = out_text_spans.last_mut()
-        && last.is_stderr == is_stderr
-        && last.origin == origin
-        && last.end_byte == start_byte
-    {
-        last.end_byte = end_byte;
-    } else {
-        out_text_spans.push(OutputTextSpan {
-            start_byte,
-            end_byte,
-            is_stderr,
-            origin,
-        });
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn consume_text_segment_with_spans(
-    segment: &[u8],
-    segment_start: usize,
-    text_spans: &[OutputTextSpan],
-    echo_events: &[IpcEchoEvent],
-    echo_idx: &mut usize,
-    prompt_variants: &[Vec<u8>],
-    pending: &mut PendingEchoRun,
-    saw_substantive_output: &std::cell::Cell<bool>,
-    flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
-    out_bytes: &mut Vec<u8>,
-    out_text_spans: &mut Vec<OutputTextSpan>,
-) {
-    let segment_end = segment_start.saturating_add(segment.len());
-    let mut cursor = segment_start;
-    for span in text_spans {
-        if span.end_byte <= segment_start {
-            continue;
-        }
-        if span.start_byte >= segment_end {
-            break;
-        }
-        let start = span.start_byte.max(segment_start);
-        let end = span.end_byte.min(segment_end);
-        if cursor < start {
-            consume_text_segment(
-                &segment[cursor - segment_start..start - segment_start],
-                false,
-                ContentOrigin::Worker,
-                echo_events,
-                echo_idx,
-                prompt_variants,
-                pending,
-                saw_substantive_output,
-                flush_pending,
-                out_bytes,
-                out_text_spans,
-            );
-        }
-        consume_text_segment(
-            &segment[start - segment_start..end - segment_start],
-            span.is_stderr,
-            span.origin,
-            echo_events,
-            echo_idx,
-            prompt_variants,
-            pending,
-            saw_substantive_output,
-            flush_pending,
-            out_bytes,
-            out_text_spans,
-        );
-        cursor = end;
-    }
-    if cursor < segment_end {
-        consume_text_segment(
-            &segment[cursor - segment_start..],
-            false,
-            ContentOrigin::Worker,
-            echo_events,
-            echo_idx,
-            prompt_variants,
-            pending,
-            saw_substantive_output,
-            flush_pending,
-            out_bytes,
-            out_text_spans,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn consume_text_segment(
-    segment: &[u8],
-    is_stderr: bool,
-    origin: ContentOrigin,
-    echo_events: &[IpcEchoEvent],
-    echo_idx: &mut usize,
-    prompt_variants: &[Vec<u8>],
-    pending: &mut PendingEchoRun,
-    saw_substantive_output: &std::cell::Cell<bool>,
-    flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
-    out_bytes: &mut Vec<u8>,
-    out_text_spans: &mut Vec<OutputTextSpan>,
-) {
-    let mut start = 0usize;
-    while start < segment.len() {
-        let mut end = start;
-        while end < segment.len() && segment[end] != b'\n' {
-            end += 1;
-        }
-        if end < segment.len() && segment[end] == b'\n' {
-            end += 1;
-        }
-        let line = &segment[start..end];
-        start = end;
-
-        let echo_prefix = if *echo_idx < echo_events.len() {
-            echo_event_prefix_len(line, &echo_events[*echo_idx])
-        } else {
-            None
-        };
-        if let Some(prefix_len) = echo_prefix {
-            pending.push(&line[..prefix_len]);
-            *echo_idx = echo_idx.saturating_add(1);
-            if prefix_len == line.len() {
-                continue;
-            }
-        }
-
-        let line = if let Some(prefix_len) = echo_prefix {
-            &line[prefix_len..]
-        } else {
-            line
-        };
-
-        let substantive =
-            !is_ascii_whitespace_only(line) && !is_prompt_only_fragment(line, prompt_variants);
-        if substantive {
-            flush_pending(out_bytes, out_text_spans, pending);
-        }
-        append_text_with_span(out_bytes, out_text_spans, line, is_stderr, origin);
-        if substantive {
-            saw_substantive_output.set(true);
-        }
-    }
-}
-
 fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    if rest.is_empty() {
-        return true;
-    }
-    rest.iter()
-        .all(|event| is_continuation_prompt(&event.prompt))
+    !events.is_empty()
 }
 
 fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    rest.iter()
-        .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
-}
-
-fn is_primary_repl_prompt(prompt: &str) -> bool {
-    matches!(
-        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
-        ">" | ">>>"
-    )
-}
-
-fn is_continuation_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "..." {
-        return true;
-    }
-    trimmed.ends_with('+')
+    !events.is_empty()
 }
 
 fn maybe_trim_echo_prefix(
@@ -3900,62 +3521,6 @@ fn trim_echo_prefix_after_leading_nonstdout_contents(
         idx = idx.saturating_add(1);
     }
 
-    true
-}
-
-fn trim_echo_prefix_in_output(
-    output: &OutputBuffer,
-    echo_prefix: Option<&str>,
-    trim_enabled: bool,
-) -> bool {
-    if !trim_enabled {
-        return false;
-    }
-    let Some(echo_prefix) = echo_prefix else {
-        return false;
-    };
-    if echo_prefix.is_empty() {
-        return false;
-    }
-    let start_offset = output.current_offset().unwrap_or(0);
-    let end_offset = output.end_offset().unwrap_or(start_offset);
-    let prefix_len = echo_prefix.len() as u64;
-    if start_offset.saturating_add(prefix_len) > end_offset {
-        return false;
-    }
-    let range = output.read_range(start_offset, start_offset.saturating_add(prefix_len));
-    if !range.events.is_empty() {
-        return false;
-    }
-    if range.bytes != echo_prefix.as_bytes() {
-        return false;
-    }
-    output.advance_offset_to(start_offset.saturating_add(prefix_len));
-    true
-}
-
-fn drop_echo_only_output(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    echo: &str,
-) -> bool {
-    if echo.is_empty() {
-        return false;
-    }
-    let total_len = end_offset.saturating_sub(start_offset);
-    let echo_len = echo.len() as u64;
-    if total_len != echo_len {
-        return false;
-    }
-    let range = output.read_range(start_offset, end_offset);
-    if !range.events.is_empty() {
-        return false;
-    }
-    if range.bytes != echo.as_bytes() {
-        return false;
-    }
-    output.advance_offset_to(end_offset);
     true
 }
 
@@ -5989,7 +5554,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_decision_respects_continuation_prompts() {
+    fn trim_decision_applies_to_any_sideband_echo() {
         let single = vec![echo_event("> ", "1+1\n")];
         assert!(should_trim_echo_prefix(&single));
 
@@ -5997,13 +5562,13 @@ mod tests {
         assert!(should_trim_echo_prefix(&continuation));
 
         let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
-        assert!(!should_trim_echo_prefix(&multi));
+        assert!(should_trim_echo_prefix(&multi));
 
         let browser = vec![echo_event("Browse[1]> ", "n\n")];
-        assert!(!should_trim_echo_prefix(&browser));
+        assert!(should_trim_echo_prefix(&browser));
 
         let readline = vec![echo_event("FIRST> ", "alpha\n")];
-        assert!(!should_trim_echo_prefix(&readline));
+        assert!(should_trim_echo_prefix(&readline));
     }
 
     #[test]
@@ -6021,22 +5586,30 @@ mod tests {
             }],
         };
 
-        let (bytes, events, text_spans) = collapse_echo_with_attribution(
+        let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            0,
             &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
         );
 
-        assert_eq!(String::from_utf8(bytes).expect("utf8"), "[1] 2\n> ");
-        assert!(events.is_empty(), "did not expect sideband events");
         assert_eq!(
-            text_spans.len(),
+            String::from_utf8(collapsed.bytes).expect("utf8"),
+            "[1] 2\n> "
+        );
+        assert!(
+            collapsed.events.is_empty(),
+            "did not expect sideband events"
+        );
+        assert_eq!(
+            collapsed.text_spans.len(),
             1,
             "expected collapsed output to stay in one stdout span"
         );
-        assert_eq!(text_spans[0].start_byte, 0);
-        assert_eq!(text_spans[0].end_byte, 8);
-        assert!(!text_spans[0].is_stderr);
+        assert_eq!(collapsed.text_spans[0].start_byte, 0);
+        assert_eq!(collapsed.text_spans[0].end_byte, 8);
+        assert!(!collapsed.text_spans[0].is_stderr);
     }
 
     #[test]
@@ -6054,22 +5627,30 @@ mod tests {
             }],
         };
 
-        let (bytes, events, text_spans) =
-            collapse_echo_with_attribution(range, &[echo_event("> ", "x\n")], &["> ".to_string()]);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
 
         assert_eq!(
-            String::from_utf8(bytes).expect("utf8"),
+            String::from_utf8(collapsed.bytes).expect("utf8"),
             "stderr: Error: object 'x' not found\n> "
         );
-        assert!(events.is_empty(), "did not expect sideband events");
+        assert!(
+            collapsed.events.is_empty(),
+            "did not expect sideband events"
+        );
         assert_eq!(
-            text_spans.len(),
+            collapsed.text_spans.len(),
             1,
             "expected collapsed output to stay in one stdout span"
         );
-        assert_eq!(text_spans[0].start_byte, 0);
-        assert_eq!(text_spans[0].end_byte, 38);
-        assert!(!text_spans[0].is_stderr);
+        assert_eq!(collapsed.text_spans[0].start_byte, 0);
+        assert_eq!(collapsed.text_spans[0].end_byte, 38);
+        assert!(!collapsed.text_spans[0].is_stderr);
     }
 
     #[test]
@@ -6092,7 +5673,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_matching_echo_event_suffix_from_contents_preserves_non_repl_prompts() {
+    fn trim_matching_echo_event_suffix_from_contents_keeps_unmatched_prompt_tail() {
         let mut contents = vec![WorkerContent::worker_stdout("FIRST> alpha\nSECOND> ")];
 
         let trimmed = trim_matching_echo_event_suffix_from_contents(
@@ -6105,7 +5686,7 @@ mod tests {
 
         assert!(
             !trimmed,
-            "did not expect non-REPL readline prompts to be trimmed"
+            "did not expect partial prompt transcript to be trimmed without an exact match"
         );
         assert_eq!(contents_text(&contents), "FIRST> alpha\nSECOND> ");
     }
@@ -6646,6 +6227,91 @@ mod tests {
     }
 
     #[test]
+    fn files_nonfinal_drain_preserves_echo_only_input() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected an in-flight files-mode drain to keep the echoed command visible"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+        manager.pending_output_tape.append_stdout_bytes(b"start\n");
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("start\n")],
+            "expected worker output to hide the leading timed-out REPL echo again"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+
+        let context = manager.prepare_input_context_files();
+
+        assert_eq!(
+            context.prefix_contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
+        );
+    }
+
+    #[test]
     fn pager_prepare_input_context_trims_echo_from_settled_completion() {
         let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
@@ -6861,6 +6527,7 @@ mod tests {
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
+            readline_results_seen: 0,
         });
         capture.append_sideband(PendingSidebandKind::RequestEnd);
 

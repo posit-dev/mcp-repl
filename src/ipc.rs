@@ -144,6 +144,7 @@ pub struct IpcPlotImage {
     pub mime_type: String,
     pub data: String,
     pub is_new: bool,
+    pub readline_results_seen: usize,
 }
 
 #[derive(Default, Clone)]
@@ -303,12 +304,17 @@ impl ServerIpcConnection {
                             data,
                             is_new,
                         } => {
+                            let readline_results_seen = {
+                                let guard = reader_inbox.lock().unwrap();
+                                guard.readline_result_count as usize
+                            };
                             if let Some(handler) = plot_handler.as_ref() {
                                 handler(IpcPlotImage {
                                     id,
                                     mime_type,
                                     data,
                                     is_new,
+                                    readline_results_seen,
                                 });
                             } else {
                                 let mut guard = reader_inbox.lock().unwrap();
