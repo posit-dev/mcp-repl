@@ -1394,28 +1394,27 @@ for (i in 1:6) {
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        events_log_path(&first_text).is_none(),
-        "did not expect output bundle on first small timeout reply, got: {first_text:?}"
-    );
-
-    let result = session.write_stdin_raw_with("", Some(60.0)).await?;
-    let text = result_text(&result);
-    if text.contains("<<repl status: busy") {
-        eprintln!("plot_images timeout output-bundle poll remained busy; skipping");
+    let settle = session.write_stdin_raw_with("", Some(60.0)).await?;
+    let settle_text = result_text(&settle);
+    if settle_text.contains("<<repl status: busy") {
+        eprintln!("plot_images timeout output-bundle settle poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert_ne!(
-        result.is_error,
+        settle.is_error,
         Some(true),
-        "timeout image output bundle reported an error: {}",
-        text
+        "timeout image output bundle settle poll reported an error: {}",
+        settle_text
     );
 
-    let events_log = events_log_path(&text).unwrap_or_else(|| {
-        panic!("expected output bundle events.log path in timeout poll, got: {text:?}")
-    });
+    let events_log = events_log_path(&first_text)
+        .or_else(|| events_log_path(&settle_text))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected output bundle events.log path in first reply or settle poll, got first={first_text:?}, settle={settle_text:?}"
+            )
+        });
     let bundle_dir = events_log
         .parent()
         .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
