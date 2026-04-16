@@ -20,6 +20,7 @@ pub(crate) enum EchoCollapseMode {
 pub(crate) fn collapse_echo_with_attribution(
     range: OutputRange,
     echo_events: &[IpcEchoEvent],
+    echo_event_base: usize,
     prompt_variants: &[String],
     mode: EchoCollapseMode,
 ) -> CollapsedOutput {
@@ -53,9 +54,13 @@ pub(crate) fn collapse_echo_with_attribution(
                 OutputEventKind::Image {
                     readline_results_seen,
                     ..
-                } if readline_results_seen < echo_events.len() => {
+                } if (echo_event_base > 0 && readline_results_seen <= echo_event_base)
+                    || readline_results_seen.saturating_sub(echo_event_base)
+                        < echo_events.len() =>
+                {
+                    let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
                     anchored_images
-                        .entry(readline_results_seen)
+                        .entry(anchor_idx)
                         .or_default()
                         .push(event.kind);
                     None
@@ -148,7 +153,13 @@ pub(crate) fn collapse_echo_with_attribution(
             cursor = event_offset;
         }
 
-        discard_pending_for_event(&mut pending);
+        match &kind {
+            OutputEventKind::Text { .. } => {
+                saw_substantive_output.set(true);
+                flush_pending(&mut out_bytes, &mut out_text_spans, &mut pending);
+            }
+            _ => discard_pending_for_event(&mut pending),
+        }
         out_events.push((out_bytes.len() as u64, kind));
     }
 
@@ -576,6 +587,7 @@ mod tests {
                 echo_event("> ", "plot(1:10)\n"),
                 echo_event("> ", "cat('done\\n')\n"),
             ],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
         );
@@ -631,6 +643,7 @@ mod tests {
                 echo_event("> ", "plot(1:10)\n"),
                 echo_event("> ", "cat('done\\n')\n"),
             ],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::Preserve,
         );
@@ -674,6 +687,7 @@ mod tests {
         let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("> ", "Sys.sleep(5)\n")],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::Preserve,
         );
@@ -706,6 +720,7 @@ mod tests {
         let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("FIRST> ", "alpha\n"), echo_event("SECOND> ", "")],
+            0,
             &["FIRST> ".to_string(), "SECOND> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
         );
@@ -747,6 +762,7 @@ mod tests {
         let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("> ", "plot(1:10)\n")],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::Preserve,
         );
@@ -765,6 +781,52 @@ mod tests {
                 id: "plot-1".to_string(),
                 is_new: true,
             }]
+        );
+    }
+
+    #[test]
+    fn text_events_flush_pending_echo_before_notice() {
+        let bytes = b"> y500 <- 500\n".to_vec();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: vec![OutputEvent {
+                offset: 14,
+                kind: OutputEventKind::Text {
+                    text: "[repl] output truncated (older output dropped)\n".to_string(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Server,
+                },
+            }],
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 14,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "y500 <- 500\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            14,
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stdout("> y500 <- 500\n"),
+                WorkerContent::server_stdout("[repl] output truncated (older output dropped)\n"),
+            ]
         );
     }
 }

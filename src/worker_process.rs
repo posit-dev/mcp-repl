@@ -3108,6 +3108,7 @@ fn snapshot_after_completion(
         let collapsed = collapse_echo_with_attribution(
             range,
             &completion.echo_events,
+            0,
             &prompt_variants,
             EchoCollapseMode::CollapseForFinalReply,
         );
@@ -3146,6 +3147,7 @@ fn take_range_from_ring_after_completion(
         let collapsed = collapse_echo_with_attribution(
             range,
             &completion.echo_events,
+            0,
             &prompt_variants,
             EchoCollapseMode::CollapseForFinalReply,
         );
@@ -5529,6 +5531,7 @@ mod tests {
         let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
         );
@@ -5569,6 +5572,7 @@ mod tests {
         let collapsed = collapse_echo_with_attribution(
             range,
             &[echo_event("> ", "x\n")],
+            0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
         );

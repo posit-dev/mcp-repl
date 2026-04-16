@@ -3,6 +3,7 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 #[cfg(not(windows))]
@@ -110,6 +111,44 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
         .await?;
 
     assert_snapshot_or_skip("write_stdin_timeout_then_busy_then_recovers", &snapshot)
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestResult<()> {
+    let mut snapshot = McpSnapshot::new();
+
+    snapshot
+        .files_session(
+            "files_multidrain_plot_then_later_stdout",
+            mcp_session!(|session| {
+                session
+                    .call_tool(
+                        session.repl_tool_name(),
+                        json!({
+                            "input": "plot(1:10)\nSys.sleep(2)\ncat('done\\n')\n",
+                            "timeout_ms": 200
+                        }),
+                    )
+                    .await;
+                session
+                    .call_tool(
+                        session.repl_tool_name(),
+                        json!({
+                            "input": "",
+                            "timeout_ms": 10000
+                        }),
+                    )
+                    .await;
+                Ok(())
+            }),
+        )
+        .await?;
+
+    assert_snapshot_or_skip(
+        "write_stdin_files_multidrain_plot_then_later_stdout_snapshot",
+        &snapshot,
+    )
 }
 
 #[cfg(not(windows))]

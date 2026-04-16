@@ -20,6 +20,7 @@ struct PendingOutputTapeInner {
     events: VecDeque<PendingOutputEvent>,
     stdout_tail: PendingTextTail,
     stderr_tail: PendingTextTail,
+    drained_readline_results: usize,
     pending_echo_prefix: String,
     last_rendered_text: Option<RenderedTextState>,
 }
@@ -75,6 +76,7 @@ pub(crate) enum PendingSidebandKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PendingOutputSnapshot {
     pub events: Vec<PendingOutputEvent>,
+    readline_result_base: usize,
     leading_echo_prefix: Option<String>,
     prior_rendered_text: Option<RenderedTextState>,
 }
@@ -262,6 +264,22 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
         let prior_rendered_text = guard.last_rendered_text;
         let events: Vec<_> = guard.events.drain(..).collect();
+        let readline_result_base = guard.drained_readline_results;
+        let drained_readline_results = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    PendingOutputEvent::Sideband {
+                        kind: PendingSidebandKind::ReadlineResult { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        guard.drained_readline_results = guard
+            .drained_readline_results
+            .saturating_add(drained_readline_results);
         // `pending_echo_prefix` only carries trim-eligible REPL echo that was
         // observed sideband-first in an earlier drain. Current-snapshot echo is
         // resolved from the mixed text/event timeline below.
@@ -281,9 +299,13 @@ impl PendingOutputTape {
                 guard.pending_echo_prefix.clear();
             }
         }
+        if snapshot_crossed_request_boundary(&events) {
+            guard.drained_readline_results = 0;
+        }
         guard.last_rendered_text = rendered_text_state_after(events.iter(), prior_rendered_text);
         PendingOutputSnapshot {
             events,
+            readline_result_base,
             leading_echo_prefix,
             prior_rendered_text,
         }
@@ -336,7 +358,13 @@ impl PendingOutputSnapshot {
             saw_stderr,
         } = self.rendered_output();
         let source_end = range.end_offset;
-        let collapsed = collapse_echo_with_attribution(range, &echo_events, &prompt_variants, mode);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &echo_events,
+            self.readline_result_base,
+            &prompt_variants,
+            mode,
+        );
         let mut contents = pager::contents_from_collapsed_output(
             collapsed.bytes,
             collapsed.events,
@@ -461,10 +489,19 @@ fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[Pe
             ..
         } = event
         {
+            if !is_trim_eligible_carryover_prompt(prompt) {
+                continue;
+            }
             echo_prefix.push_str(prompt);
             echo_prefix.push_str(line);
         }
     }
+}
+
+fn is_trim_eligible_carryover_prompt(prompt: &str) -> bool {
+    let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
+    matches!(core, ">" | "+" | ">>>" | "...")
+        || (core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')))
 }
 
 fn snapshot_has_no_visible_text(events: &[PendingOutputEvent]) -> bool {
@@ -1459,6 +1496,71 @@ mod tests {
         assert_eq!(
             snapshot.format_contents_for_reply().contents,
             vec![WorkerContent::stdout("SECOND> ")]
+        );
+    }
+
+    #[test]
+    fn reply_format_anchors_image_after_earlier_readline_drain() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "cat('done\\n')\n".to_string(),
+        });
+
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents_for_reply().contents,
+            vec![
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::stdout("done\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_prompt_carryover_does_not_trim_real_output() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "FIRST> ".to_string(),
+            line: "alpha\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"FIRST> alpha\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("FIRST> alpha\n")]
         );
     }
 
