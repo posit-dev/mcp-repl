@@ -11,28 +11,6 @@ pub(crate) struct CollapsedOutput {
     pub text_spans: Vec<OutputTextSpan>,
 }
 
-pub(crate) fn is_primary_repl_prompt(prompt: &str) -> bool {
-    matches!(
-        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
-        ">" | ">>>"
-    )
-}
-
-pub(crate) fn is_continuation_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "..." {
-        return true;
-    }
-    trimmed.ends_with('+')
-}
-
-pub(crate) fn is_trim_eligible_readline_prompt(prompt: &str) -> bool {
-    is_primary_repl_prompt(prompt) || is_continuation_prompt(prompt)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EchoCollapseMode {
     Preserve,
@@ -137,6 +115,15 @@ pub(crate) fn collapse_echo_with_attribution(
         }
     };
 
+    let discard_pending_for_event = |pending: &mut PendingEchoRun| {
+        if pending.is_empty() {
+            saw_substantive_output.set(true);
+            return;
+        }
+        pending.take();
+        saw_substantive_output.set(true);
+    };
+
     let mut cursor = 0usize;
     for (event_offset, kind) in events {
         let event_offset = event_offset.min(bytes.len());
@@ -161,9 +148,7 @@ pub(crate) fn collapse_echo_with_attribution(
             cursor = event_offset;
         }
 
-        if matches!(kind, OutputEventKind::Text { .. }) {
-            flush_pending(&mut out_bytes, &mut out_text_spans, &mut pending);
-        }
+        discard_pending_for_event(&mut pending);
         out_events.push((out_bytes.len() as u64, kind));
     }
 
@@ -188,6 +173,7 @@ pub(crate) fn collapse_echo_with_attribution(
     }
 
     while let Some((_, images)) = anchored_images.pop_first() {
+        discard_pending_for_event(&mut pending);
         for image in images {
             out_events.push((out_bytes.len() as u64, image));
         }
@@ -506,23 +492,9 @@ fn consume_text_segment(
         };
         if let Some(prefix_len) = echo_prefix {
             flush_anchored_images(*echo_idx, anchored_images, out_bytes, out_events);
-            let can_collapse = is_trim_eligible_readline_prompt(&echo_events[*echo_idx].prompt);
             match mode {
-                EchoCollapseMode::Preserve => {
-                    if can_collapse && !saw_substantive_output.get() {
-                        pending.push(&line[..prefix_len]);
-                    } else {
-                        append_text_with_span(
-                            out_bytes,
-                            out_text_spans,
-                            &line[..prefix_len],
-                            is_stderr,
-                            origin,
-                        );
-                    }
-                }
-                EchoCollapseMode::CollapseForFinalReply => {
-                    if can_collapse {
+                EchoCollapseMode::Preserve | EchoCollapseMode::CollapseForFinalReply => {
+                    if !saw_substantive_output.get() {
                         pending.push(&line[..prefix_len]);
                     } else {
                         append_text_with_span(
@@ -744,9 +716,55 @@ mod tests {
             21,
         );
 
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn preserve_mode_drops_pending_echo_once_image_arrives() {
+        let bytes = b"> plot(1:10)\n".to_vec();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: vec![OutputEvent {
+                offset: 13,
+                kind: OutputEventKind::Image {
+                    data: "img".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "plot-1".to_string(),
+                    is_new: true,
+                    readline_results_seen: 1,
+                },
+            }],
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 13,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "plot(1:10)\n")],
+            &["> ".to_string()],
+            EchoCollapseMode::Preserve,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            13,
+        );
+
         assert_eq!(
             contents,
-            vec![WorkerContent::stdout("FIRST> alpha\nSECOND> ")]
+            vec![WorkerContent::ContentImage {
+                data: "img".to_string(),
+                mime_type: "image/png".to_string(),
+                id: "plot-1".to_string(),
+                is_new: true,
+            }]
         );
     }
 }

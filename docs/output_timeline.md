@@ -62,6 +62,24 @@ request is still in flight. In particular:
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
 
+Echo matching must be driven by the sideband facts themselves:
+
+- `readline_start` supplies the prompt text the worker actually showed
+- `readline_result` is emitted by the worker, but it describes the exact
+  prompt text and input line that `readline` consumed and echoed
+- the server should match and collapse those exact sideband facts
+- the server should not parse visible output looking for prompt shapes such as
+  `>`, `...`, or `Browse[n]>`
+
+That matching is only opportunistic:
+
+- the stdout/stderr pipes remain the authoritative visible text stream
+- forked children, spawned subprocesses, or other writers may interleave with
+  or corrupt what would otherwise have been a clean echoed line
+- if exact sideband-to-stdout matching fails or becomes ambiguous, the server
+  should degrade softly to raw captured stdout/stderr for that region, without
+  eliding echo or inventing a cleaned-up transcript
+
 ## Ownership split
 
 - The worker is responsible for running the normal backend REPL and reporting the

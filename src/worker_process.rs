@@ -34,10 +34,7 @@ use crate::output_capture::{
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
-use crate::output_timeline::{
-    EchoCollapseMode, collapse_echo_with_attribution, is_continuation_prompt,
-    is_primary_repl_prompt,
-};
+use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
@@ -3103,8 +3100,7 @@ fn snapshot_after_completion(
     target_bytes: u64,
     completion: &CompletionInfo,
 ) -> CompletionSnapshot {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    if !trim_enabled {
+    if !completion.echo_events.is_empty() {
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
@@ -3128,17 +3124,8 @@ fn snapshot_after_completion(
         };
     }
 
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-    if let Some(echo) = echo_transcript.as_deref() {
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-
-    let mut snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
-    maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
+    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+    let snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
     CompletionSnapshot {
         snapshot,
         saw_stderr,
@@ -3151,10 +3138,7 @@ fn take_range_from_ring_after_completion(
     end_offset: u64,
     completion: &CompletionInfo,
 ) -> FormattedPendingOutput {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-
-    if !trim_enabled {
+    if !completion.echo_events.is_empty() {
         let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
@@ -3178,20 +3162,9 @@ fn take_range_from_ring_after_completion(
         };
     }
 
-    if let Some(echo) = echo_transcript.as_deref() {
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
+    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
     let mut contents = pager::take_range_from_ring(output, end_offset);
-    trim_echo_then_append_protocol_warnings(
-        &mut contents,
-        echo_transcript.as_deref(),
-        trim_enabled,
-        should_drop_echo_only_contents(&completion.echo_events),
-        &completion.protocol_warnings,
-    );
+    append_protocol_warnings(&mut contents, &completion.protocol_warnings);
     FormattedPendingOutput {
         contents,
         saw_stderr,
@@ -3297,28 +3270,11 @@ fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
 }
 
 fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    if rest.is_empty() {
-        return true;
-    }
-    rest.iter()
-        .all(|event| is_continuation_prompt(&event.prompt))
+    !events.is_empty()
 }
 
 fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
-    let Some((first, rest)) = events.split_first() else {
-        return false;
-    };
-    if !is_primary_repl_prompt(&first.prompt) {
-        return false;
-    }
-    rest.iter()
-        .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
+    !events.is_empty()
 }
 
 fn maybe_trim_echo_prefix(
@@ -3505,62 +3461,6 @@ fn trim_echo_prefix_after_leading_nonstdout_contents(
         idx = idx.saturating_add(1);
     }
 
-    true
-}
-
-fn trim_echo_prefix_in_output(
-    output: &OutputBuffer,
-    echo_prefix: Option<&str>,
-    trim_enabled: bool,
-) -> bool {
-    if !trim_enabled {
-        return false;
-    }
-    let Some(echo_prefix) = echo_prefix else {
-        return false;
-    };
-    if echo_prefix.is_empty() {
-        return false;
-    }
-    let start_offset = output.current_offset().unwrap_or(0);
-    let end_offset = output.end_offset().unwrap_or(start_offset);
-    let prefix_len = echo_prefix.len() as u64;
-    if start_offset.saturating_add(prefix_len) > end_offset {
-        return false;
-    }
-    let range = output.read_range(start_offset, start_offset.saturating_add(prefix_len));
-    if !range.events.is_empty() {
-        return false;
-    }
-    if range.bytes != echo_prefix.as_bytes() {
-        return false;
-    }
-    output.advance_offset_to(start_offset.saturating_add(prefix_len));
-    true
-}
-
-fn drop_echo_only_output(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    echo: &str,
-) -> bool {
-    if echo.is_empty() {
-        return false;
-    }
-    let total_len = end_offset.saturating_sub(start_offset);
-    let echo_len = echo.len() as u64;
-    if total_len != echo_len {
-        return false;
-    }
-    let range = output.read_range(start_offset, end_offset);
-    if !range.events.is_empty() {
-        return false;
-    }
-    if range.bytes != echo.as_bytes() {
-        return false;
-    }
-    output.advance_offset_to(end_offset);
     true
 }
 
@@ -5594,7 +5494,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_decision_respects_continuation_prompts() {
+    fn trim_decision_applies_to_any_sideband_echo() {
         let single = vec![echo_event("> ", "1+1\n")];
         assert!(should_trim_echo_prefix(&single));
 
@@ -5602,13 +5502,13 @@ mod tests {
         assert!(should_trim_echo_prefix(&continuation));
 
         let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
-        assert!(!should_trim_echo_prefix(&multi));
+        assert!(should_trim_echo_prefix(&multi));
 
         let browser = vec![echo_event("Browse[1]> ", "n\n")];
-        assert!(!should_trim_echo_prefix(&browser));
+        assert!(should_trim_echo_prefix(&browser));
 
         let readline = vec![echo_event("FIRST> ", "alpha\n")];
-        assert!(!should_trim_echo_prefix(&readline));
+        assert!(should_trim_echo_prefix(&readline));
     }
 
     #[test]
@@ -5711,7 +5611,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_matching_echo_event_suffix_from_contents_preserves_non_repl_prompts() {
+    fn trim_matching_echo_event_suffix_from_contents_keeps_unmatched_prompt_tail() {
         let mut contents = vec![WorkerContent::worker_stdout("FIRST> alpha\nSECOND> ")];
 
         let trimmed = trim_matching_echo_event_suffix_from_contents(
@@ -5724,7 +5624,7 @@ mod tests {
 
         assert!(
             !trimmed,
-            "did not expect non-REPL readline prompts to be trimmed"
+            "did not expect partial prompt transcript to be trimmed without an exact match"
         );
         assert_eq!(contents_text(&contents), "FIRST> alpha\nSECOND> ");
     }

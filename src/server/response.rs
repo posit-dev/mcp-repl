@@ -490,7 +490,11 @@ impl ResponseState {
         staged_timeout_output: Option<StagedTimeoutOutput>,
     ) -> FollowUpDetachedPrefix {
         if let Some(active) = active_timeout_bundle {
-            return self.render_follow_up_detached_prefix_with_active_bundle(material, active);
+            return self.render_follow_up_detached_prefix_with_active_bundle(
+                material,
+                active,
+                material.detached_prefix_worker_text.chars().count(),
+            );
         }
 
         let detached_prefix_image_count = count_images(&material.detached_prefix_items);
@@ -531,8 +535,11 @@ impl ResponseState {
             if use_output_bundle || text_should_spill(combined_worker_text_chars) {
                 match self.materialize_staged_timeout_output(&staged, None) {
                     Ok(active) => {
-                        return self
-                            .render_follow_up_detached_prefix_with_active_bundle(material, active);
+                        return self.render_follow_up_detached_prefix_with_active_bundle(
+                            material,
+                            active,
+                            combined_worker_text_chars,
+                        );
                     }
                     Err(err) => {
                         eprintln!("dropping output-bundle setup after output-bundle error: {err}");
@@ -625,6 +632,7 @@ impl ResponseState {
         &mut self,
         material: &ReplyMaterial,
         mut active: ActiveOutputBundle,
+        spill_worker_text_chars: usize,
     ) -> FollowUpDetachedPrefix {
         let contents = if material.detached_prefix_items.is_empty() {
             Vec::new()
@@ -634,7 +642,7 @@ impl ResponseState {
                 &mut active,
                 &material.detached_prefix_items,
                 &material.detached_prefix_inline_items,
-                material.detached_prefix_worker_text.chars().count(),
+                spill_worker_text_chars,
             ) {
                 Ok(contents) => contents,
                 Err(err) => {
@@ -2898,6 +2906,69 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_small_detached_prefix_and_follow_up_spill_on_follow_up_input() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let detached_prefix = format!(
+            "DETACHED_START\n{}\nDETACHED_END\n",
+            "x".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+        let follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "y".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+
+        assert!(
+            !super::text_should_spill(detached_prefix.chars().count()),
+            "expected detached prefix alone to stay under the hard spill threshold"
+        );
+        assert!(
+            !super::text_should_spill(follow_up.chars().count()),
+            "expected follow-up reply alone to stay under the hard spill threshold"
+        );
+        assert!(
+            super::text_should_spill(
+                detached_prefix
+                    .chars()
+                    .count()
+                    .saturating_add(follow_up.chars().count())
+            ),
+            "expected the combined detached prefix and follow-up reply to exceed the hard spill threshold"
+        );
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout(follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected detached prefix transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            text.contains("FOLLOW_UP_START") && text.contains("FOLLOW_UP_END"),
+            "expected the fresh follow-up reply to stay visible, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("DETACHED_START") && transcript.contains("DETACHED_END"),
+            "expected the detached prefix to spill, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOW_UP_START"),
+            "did not expect the fresh follow-up reply in the detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
     fn detached_prefix_timeout_poll_preserves_later_timeout_bundle_state() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let detached_prefix = format!(
@@ -3813,6 +3884,72 @@ mod tests {
         assert!(
             !transcript.contains("DONE\n"),
             "did not expect fresh follow-up output in the detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_timeout_bundle_spills_when_detached_prefix_and_follow_up_cross_threshold() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let timed_out = format!(
+            "SMALL_START\n{}\nSMALL_END\n",
+            "s".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+        let follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "f".repeat(super::INLINE_TEXT_BUDGET + 200)
+        );
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(timed_out.clone())],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        assert!(
+            disclosed_path(&result_text(&first), "transcript.txt").is_none(),
+            "did not expect the initial under-threshold timed-out reply to disclose a bundle path"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the initial timed-out reply to keep hidden timeout state"
+        );
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(timed_out),
+                    WorkerContent::worker_stdout(follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&second);
+        let transcript_path = disclosed_path(&text, "transcript.txt").unwrap_or_else(|| {
+            panic!(
+                "expected a transcript path once cumulative follow-up output spilled, got: {text:?}"
+            )
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            text.contains("FOLLOW_UP_START") && text.contains("FOLLOW_UP_END"),
+            "expected the fresh follow-up reply to remain visible, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+            "expected the detached timeout prefix in the transcript, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOW_UP_START"),
+            "did not expect the fresh follow-up reply in the detached-prefix transcript: {transcript:?}"
         );
     }
 

@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ipc::IpcEchoEvent;
 use crate::output_capture::{OutputEvent, OutputEventKind, OutputRange, OutputTextSpan};
-use crate::output_timeline::{
-    EchoCollapseMode, collapse_echo_with_attribution, is_trim_eligible_readline_prompt,
-};
+use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::pager;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
@@ -462,7 +460,6 @@ fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[Pe
             kind: PendingSidebandKind::ReadlineResult { prompt, line },
             ..
         } = event
-            && is_trim_eligible_readline_prompt(prompt)
         {
             echo_prefix.push_str(prompt);
             echo_prefix.push_str(line);
@@ -505,7 +502,10 @@ fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str)
             ..
         } = event
         else {
-            if matches!(event, PendingOutputEvent::Sideband { .. }) {
+            if matches!(
+                event,
+                PendingOutputEvent::Sideband { .. } | PendingOutputEvent::Image { .. }
+            ) {
                 continue;
             }
             return (matched_bytes, false);
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn non_repl_readline_transcripts_stay_visible_in_reply_format() {
+    fn reply_format_trims_matched_readline_result_but_keeps_unmatched_prompt() {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(b"FIRST> alpha\nSECOND> ");
@@ -1458,7 +1458,47 @@ mod tests {
         let snapshot = tape.drain_snapshot();
         assert_eq!(
             snapshot.format_contents_for_reply().contents,
-            vec![WorkerContent::stdout("FIRST> alpha\nSECOND> ")]
+            vec![WorkerContent::stdout("SECOND> ")]
+        );
+    }
+
+    #[test]
+    fn image_only_intermediate_snapshot_preserves_carried_echo_prefix() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::ContentImage {
+                data: "AA==".to_string(),
+                mime_type: "image/png".to_string(),
+                id: "img-1".to_string(),
+                is_new: true,
+            }]
+        );
+
+        tape.append_stdout_bytes(b"> plot(1:10)\ndone\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout("done\n")]
         );
     }
 }
