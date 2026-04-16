@@ -759,6 +759,11 @@ local({
     if (!isTRUE(ok)) {
       try(.Call("mcp_repl_clear_pending_input"), silent = TRUE)
     }
+    # The current MCP plot capture path finalizes emission from the task
+    # callback, so a single grouped top-level expression such as
+    # `local({ plot(...); Sys.sleep(...); ... })` does not surface its image
+    # until that whole expression returns, even though an interactive R device
+    # would already be showing the plot.
     has_recording <- !is.null(st$current_id) &&
       exists(st$current_id, envir = st$recordings, inherits = FALSE)
     if (isTRUE(st$page_open_seen) || has_recording) {

@@ -1653,6 +1653,7 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
             mime_type,
             id,
             is_new,
+            ..
         } => WorkerContent::ContentImage {
             data: data.clone(),
             mime_type: mime_type.clone(),
@@ -2394,6 +2395,7 @@ mod tests {
                     data: "a".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
+                    readline_results_seen: 0,
                 },
             },
             OutputEvent {
@@ -2403,6 +2405,7 @@ mod tests {
                     data: "b".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
+                    readline_results_seen: 0,
                 },
             },
             OutputEvent {
@@ -2412,6 +2415,7 @@ mod tests {
                     data: "c".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
+                    readline_results_seen: 0,
                 },
             },
         ];

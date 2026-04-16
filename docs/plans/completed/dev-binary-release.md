@@ -8,9 +8,9 @@
 
 ## Status
 
-- State: active
-- Last updated: 2026-04-08
-- Current phase: implementation
+- State: completed
+- Last updated: 2026-04-16
+- Current phase: complete
 
 ## Current Direction
 
@@ -26,8 +26,8 @@
 ## Phase Status
 
 - Phase 0: completed
-- Phase 1: active
-- Phase 2: pending
+- Phase 1: completed
+- Phase 2: completed
 
 ## Locked Decisions
 
@@ -42,7 +42,7 @@
 
 ## Next Safe Slice
 
-- Add stable tag publishing and installer scripts that target the same archive layout already used for the `dev` channel.
+- Monitor the first live `dev` and stable release runs and expand platform coverage only if the current contract proves too narrow.
 
 ## Stop Conditions
 
@@ -54,3 +54,4 @@
 - 2026-04-08: Chose a single-workflow design so the existing PR/main validation path and the release paths stay coupled.
 - 2026-04-08: Chose a docs contract test as the first red-green slice because the public change is distribution-facing rather than a Rust API change.
 - 2026-04-08: Added tag-based stable publishing and installer scripts rather than switching to a separate release action.
+- 2026-04-16: Marked the plan completed after the workflow, installer scripts, README contract, and docs contract tests all landed together.

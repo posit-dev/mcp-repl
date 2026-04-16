@@ -394,7 +394,7 @@ async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_non_repl_readline_transcripts() -> TestResult<()> {
+async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -417,12 +417,12 @@ async fn write_stdin_preserves_non_repl_readline_transcripts() -> TestResult<()>
     let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
     let second_text = result_text(&second);
     assert!(
-        second_text.contains("FIRST> alpha"),
-        "expected first readline transcript in follow-up reply, got: {second_text:?}"
+        !second_text.contains("FIRST> alpha"),
+        "did not expect matched readline transcript in follow-up reply, got: {second_text:?}"
     );
     assert!(
         second_text.contains("SECOND> "),
-        "expected second readline prompt after the first answer, got: {second_text:?}"
+        "expected the unmatched second readline prompt after the first answer, got: {second_text:?}"
     );
 
     let third = session.write_stdin_raw_with("beta", Some(30.0)).await?;
@@ -436,8 +436,8 @@ async fn write_stdin_preserves_non_repl_readline_transcripts() -> TestResult<()>
     session.cancel().await?;
 
     assert!(
-        transcript.contains("SECOND> beta"),
-        "expected second readline transcript in transcript.txt, got: {transcript:?}"
+        !transcript.contains("SECOND> beta"),
+        "did not expect matched readline transcript in transcript.txt, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),

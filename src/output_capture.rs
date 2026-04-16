@@ -101,17 +101,16 @@ impl OutputTimeline {
         self.ring.append_bytes(&payload, true, origin);
     }
 
-    pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
-        let offset = self.ring.end_offset();
-        self.ring.append_event(
-            offset,
-            OutputEventKind::Image {
-                id,
-                data,
-                mime_type,
-                is_new,
-            },
-        );
+    pub(crate) fn append_image(
+        &self,
+        id: String,
+        mime_type: String,
+        data: String,
+        is_new: bool,
+        readline_results_seen: usize,
+    ) {
+        self.ring
+            .append_image_event(id, mime_type, data, is_new, readline_results_seen);
     }
 }
 
@@ -278,6 +277,7 @@ pub(crate) enum OutputEventKind {
         data: String,
         mime_type: String,
         is_new: bool,
+        readline_results_seen: usize,
     },
     Text {
         text: String,
@@ -376,6 +376,7 @@ impl OutputRing {
         guard.chunks.is_empty() && guard.events.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
         let event_bytes = event_size_bytes(&kind);
@@ -385,6 +386,40 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = offset.max(guard.start_offset);
+        if dropped.dropped_any() {
+            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+            event_offset = event_offset.max(guard.start_offset);
+        }
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    pub(crate) fn append_image_event(
+        &self,
+        id: String,
+        mime_type: String,
+        data: String,
+        is_new: bool,
+        readline_results_seen: usize,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        let kind = OutputEventKind::Image {
+            id,
+            data,
+            mime_type,
+            is_new,
+            readline_results_seen,
+        };
+        let event_bytes = event_size_bytes(&kind);
+        if event_bytes > self.capacity_bytes {
+            return;
+        }
+
+        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+        let mut event_offset = guard.end_offset.max(guard.start_offset);
         if dropped.dropped_any() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
@@ -709,6 +744,7 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             mime_type,
             id,
             is_new: _,
+            readline_results_seen: _,
         } => data
             .len()
             .saturating_add(mime_type.len())
@@ -771,6 +807,7 @@ mod tests {
                     data,
                     mime_type: format!("image/{idx}"),
                     is_new: true,
+                    readline_results_seen: 0,
                 },
             );
         }
@@ -827,6 +864,7 @@ mod tests {
                 data: "img".to_string(),
                 mime_type: "image/png".to_string(),
                 is_new: true,
+                readline_results_seen: 0,
             },
         );
 

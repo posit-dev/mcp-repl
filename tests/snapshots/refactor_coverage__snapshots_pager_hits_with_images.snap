@@ -23,7 +23,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 10.5%, @0..293/2778)"
+      "text": "--More-- (Np, 11.0%, @0..293/2656)"
     }
   ]
 }
@@ -47,7 +47,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 11.0%, @293..307/2778)"
+      "text": "--More-- (Np, 11.5%, @293..307/2656)"
     }
   ]
 }
@@ -75,7 +75,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 21.6%, @307..601/2778)"
+      "text": "--More-- (Np, 22.6%, @307..601/2656)"
     }
   ]
 }
@@ -95,11 +95,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "#1 @895 Title\n  > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = \"l\"); tail: > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
+      "text": "#1 @919 Title\n  > > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 37.2%, @895..1035/2778)"
+      "text": "--More-- (Np, 36.6%, @919..974/2656)"
     }
   ]
 }

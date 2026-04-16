@@ -1,11 +1,30 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 use tokio::time::{Duration, Instant, sleep};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    lock_mutex(test_mutex())
+}
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -1052,6 +1071,7 @@ print("parent ready")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };

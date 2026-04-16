@@ -372,17 +372,10 @@ pub struct SandboxState {
     pub session_temp_dir: PathBuf,
 }
 
-pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
-    crate::event_log::log(
-        "sandbox_policy_update_received",
-        serde_json::json!({
-            "policy": policy,
-        }),
-    );
+fn append_sandbox_state_log_line(payload: &serde_json::Value) {
     let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
         return;
     };
-    let payload = serde_json::to_string(policy).unwrap_or_else(|_| format!("{policy:?}"));
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -390,6 +383,33 @@ pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
     {
         let _ = writeln!(file, "{payload}");
     }
+}
+
+pub fn log_initial_sandbox_policy(policy: &SandboxPolicy) {
+    crate::event_log::log(
+        "sandbox_policy_initial",
+        serde_json::json!({
+            "policy": policy,
+        }),
+    );
+    append_sandbox_state_log_line(&serde_json::json!({
+        "kind": "initial-policy",
+        "policy": policy,
+    }));
+}
+
+pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
+    crate::event_log::log(
+        "sandbox_policy_update_received",
+        serde_json::json!({
+            "policy": policy,
+        }),
+    );
+    append_sandbox_state_log_line(&serde_json::to_value(policy).unwrap_or_else(|_| {
+        serde_json::json!({
+            "debug": format!("{policy:?}"),
+        })
+    }));
 }
 
 pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>) {
@@ -400,20 +420,10 @@ pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>)
             "params": params,
         }),
     );
-    let Some(path) = crate::debug_logs::log_path("sandbox-state.jsonl") else {
-        return;
-    };
-    let payload = serde_json::json!({
+    append_sandbox_state_log_line(&serde_json::json!({
         "method": method,
         "params": params,
-    });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{payload}");
-    }
+    }));
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
