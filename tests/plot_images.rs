@@ -1498,14 +1498,35 @@ cat("TAIL_ONLY\n")
         events_log_path(&final_text).is_some(),
         "expected output bundle disclosure in final timeout poll, got: {final_text:?}"
     );
+    let events_log = events_log_path(&bundled_text)
+        .or_else(|| events_log_path(&final_text))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected output bundle disclosure in bundled or final poll, got bundled={bundled_text:?}, final={final_text:?}"
+            )
+        });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+
     assert_eq!(
-        final_text.matches("TAIL_ONLY\n").count(),
+        transcript.matches("HEAD_ONLY\n").count(),
         1,
-        "expected trailing timeout text segment to appear once, got: {final_text:?}"
+        "expected transcript.txt to retain the earlier prefix text once, got: {transcript:?}"
+    );
+    assert_eq!(
+        transcript.matches("TAIL_ONLY\n").count(),
+        1,
+        "expected transcript.txt to retain the trailing timeout text once, got: {transcript:?}"
     );
     assert!(
         !final_text.contains("> cat(\"TAIL_ONLY\\n\")"),
         "did not expect the trailing command echo to survive the final timeout poll: {final_text:?}"
+    );
+    assert!(
+        final_text.contains("TAIL_ONLY\n") || final_text.contains("<<repl status: idle>>"),
+        "expected final timeout poll to either return inline tail text or settle idle, got: {final_text:?}"
     );
     assert!(
         !final_text.contains("[repl] input discarded while worker busy"),
