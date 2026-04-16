@@ -100,11 +100,8 @@ fn ci_workflow_defines_dev_release_contract() {
     for required in [
         "publish-dev:",
         "publish-stable:",
-        "workflow_dispatch:",
-        "stable_tag:",
-        "backfill-stable:",
         "tags:",
-        "- 'v*'",
+        "- 'v*.*.*'",
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
@@ -115,15 +112,25 @@ fn ci_workflow_defines_dev_release_contract() {
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
         "gh release create \"${RELEASE_TAG}\" dist/*",
-        "!contains(github.ref_name, '-')",
+        "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        "github.event_name == 'push' && github.ref_type == 'tag'",
+        "^v[0-9]+(\\.[0-9]+){2}$",
+        "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
+        "-F draft=false",
+        "-F prerelease=false",
         "make_latest=\"${latest_flag}\"",
-        "ref: ${{ inputs.stable_tag }}",
-        "git rev-parse \"refs/tags/${{ inputs.stable_tag }}\" >/dev/null",
     ] {
         assert!(
             workflow.contains(required),
             "missing {required} in .github/workflows/ci.yml"
+        );
+    }
+
+    for forbidden in ["workflow_dispatch:", "stable_tag:", "backfill-stable:"] {
+        assert!(
+            !workflow.contains(forbidden),
+            "did not expect {forbidden} in .github/workflows/ci.yml"
         );
     }
 }
