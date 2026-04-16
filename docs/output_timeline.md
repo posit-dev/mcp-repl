@@ -37,6 +37,31 @@ changes what must stay buffered between tool calls.
 - `src/worker_process.rs` reads ranges from that ring, collapses echoed input,
   and then asks `src/pager/` to page the resulting mixed text/image stream.
 
+## Timeline vs completion
+
+The important design split is not "files mode vs pager mode". It is:
+
+- timeline resolution: reconstruct the visible output order from text plus
+  sideband facts
+- completion cleanup: once the server knows a request has finished, trim echoed
+  input, append protocol warnings, and restore the final prompt
+
+Timeline resolution must not depend on request completion. For example, the
+server does not need to wait for completion to know that a `plot_image` event
+belongs before a later `readline_result` echo. That ordering fact is already
+present in the mixed timeline.
+
+Completion matters only for reply cleanup choices that are unsafe while a
+request is still in flight. In particular:
+
+- timed-out or otherwise non-final drains must preserve echoed input so the user
+  can still see what is running
+- completed replies may trim or drop echo-only content once the server knows the
+  request is settled
+
+The intent is one true visible timeline per output surface, with completion used
+only as a later presentation step.
+
 ## Ownership split
 
 - The worker is responsible for running the normal backend REPL and reporting the

@@ -11,10 +11,17 @@ pub(crate) struct CollapsedOutput {
     pub text_spans: Vec<OutputTextSpan>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EchoCollapseMode {
+    Preserve,
+    CollapseForFinalReply,
+}
+
 pub(crate) fn collapse_echo_with_attribution(
     range: OutputRange,
     echo_events: &[IpcEchoEvent],
     prompt_variants: &[String],
+    mode: EchoCollapseMode,
 ) -> CollapsedOutput {
     const ECHO_MARKER_MIN_BYTES: usize = 512;
 
@@ -121,6 +128,7 @@ pub(crate) fn collapse_echo_with_attribution(
                 &prompt_variants,
                 &mut pending,
                 &saw_substantive_output,
+                mode,
                 &mut flush_pending,
                 &mut anchored_images,
                 &mut out_bytes,
@@ -147,6 +155,7 @@ pub(crate) fn collapse_echo_with_attribution(
             &prompt_variants,
             &mut pending,
             &saw_substantive_output,
+            mode,
             &mut flush_pending,
             &mut anchored_images,
             &mut out_bytes,
@@ -331,6 +340,7 @@ fn consume_text_segment_with_spans(
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
     saw_substantive_output: &Cell<bool>,
+    mode: EchoCollapseMode,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     anchored_images: &mut BTreeMap<usize, Vec<OutputEventKind>>,
     out_bytes: &mut Vec<u8>,
@@ -364,6 +374,7 @@ fn consume_text_segment_with_spans(
                 prompt_variants,
                 pending,
                 saw_substantive_output,
+                mode,
                 flush_pending,
                 anchored_images,
                 out_bytes,
@@ -381,6 +392,7 @@ fn consume_text_segment_with_spans(
             prompt_variants,
             pending,
             saw_substantive_output,
+            mode,
             flush_pending,
             anchored_images,
             out_bytes,
@@ -400,6 +412,7 @@ fn consume_text_segment_with_spans(
             prompt_variants,
             pending,
             saw_substantive_output,
+            mode,
             flush_pending,
             anchored_images,
             out_bytes,
@@ -420,6 +433,7 @@ fn consume_text_segment(
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
     saw_substantive_output: &Cell<bool>,
+    mode: EchoCollapseMode,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     anchored_images: &mut BTreeMap<usize, Vec<OutputEventKind>>,
     out_bytes: &mut Vec<u8>,
@@ -451,7 +465,16 @@ fn consume_text_segment(
         };
         if let Some(prefix_len) = echo_prefix {
             flush_anchored_images(*echo_idx, anchored_images, out_bytes, out_events);
-            pending.push(&line[..prefix_len]);
+            match mode {
+                EchoCollapseMode::Preserve => append_text_with_span(
+                    out_bytes,
+                    out_text_spans,
+                    &line[..prefix_len],
+                    is_stderr,
+                    origin,
+                ),
+                EchoCollapseMode::CollapseForFinalReply => pending.push(&line[..prefix_len]),
+            }
             *echo_idx = echo_idx.saturating_add(1);
             if prefix_len == line.len() {
                 continue;
@@ -522,6 +545,7 @@ mod tests {
                 echo_event("> ", "cat('done\\n')\n"),
             ],
             &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
         );
         let contents = pager::contents_from_collapsed_output(
             collapsed.bytes,
@@ -540,6 +564,62 @@ mod tests {
                     is_new: true,
                 },
                 WorkerContent::stdout("done\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserve_mode_keeps_echo_while_anchoring_image_before_later_input() {
+        let bytes = b"> plot(1:10)\n> cat('done\\n')\ndone\n".to_vec();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: vec![OutputEvent {
+                offset: 34,
+                kind: OutputEventKind::Image {
+                    data: "img".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "plot-1".to_string(),
+                    is_new: true,
+                    readline_results_seen: 1,
+                },
+            }],
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 34,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[
+                echo_event("> ", "plot(1:10)\n"),
+                echo_event("> ", "cat('done\\n')\n"),
+            ],
+            &["> ".to_string()],
+            EchoCollapseMode::Preserve,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            34,
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stdout("> plot(1:10)\n"),
+                WorkerContent::ContentImage {
+                    data: "img".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "plot-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::stdout("> cat('done\\n')\ndone\n"),
             ]
         );
     }

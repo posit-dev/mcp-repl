@@ -34,7 +34,7 @@ use crate::output_capture::{
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
-use crate::output_timeline::collapse_echo_with_attribution;
+use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
@@ -2541,9 +2541,7 @@ impl WorkerManager {
     }
 
     fn drain_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_snapshot()
-            .format_contents_for_reply()
+        self.pending_output_tape.drain_snapshot().format_contents()
     }
 
     fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
@@ -2555,7 +2553,7 @@ impl WorkerManager {
     fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
         self.pending_output_tape
             .drain_sealed_snapshot()
-            .format_contents_for_reply()
+            .format_contents()
     }
 
     fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
@@ -3108,8 +3106,12 @@ fn snapshot_after_completion(
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let collapsed =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &completion.echo_events,
+            &prompt_variants,
+            EchoCollapseMode::CollapseForFinalReply,
+        );
         let snapshot = snapshot_page_with_images_from_collapsed(
             collapsed.bytes,
             collapsed.events,
@@ -3154,8 +3156,12 @@ fn take_range_from_ring_after_completion(
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let collapsed =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &completion.echo_events,
+            &prompt_variants,
+            EchoCollapseMode::CollapseForFinalReply,
+        );
         let mut contents = pager::contents_from_collapsed_output(
             collapsed.bytes,
             collapsed.events,
@@ -5639,6 +5645,7 @@ mod tests {
             range,
             &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
             &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
         );
 
         assert_eq!(
@@ -5674,8 +5681,12 @@ mod tests {
             }],
         };
 
-        let collapsed =
-            collapse_echo_with_attribution(range, &[echo_event("> ", "x\n")], &["> ".to_string()]);
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x\n")],
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
 
         assert_eq!(
             String::from_utf8(collapsed.bytes).expect("utf8"),
@@ -6265,6 +6276,62 @@ mod tests {
             contents_text(&second.prefix_contents),
             "\\xA9\n",
             "expected the next request output to stay split after the detached prefix was sealed"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_preserves_echo_only_input() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected an in-flight files-mode drain to keep the echoed command visible"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+
+        let context = manager.prepare_input_context_files();
+
+        assert_eq!(
+            context.prefix_contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
         );
     }
 

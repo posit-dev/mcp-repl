@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ipc::IpcEchoEvent;
 use crate::output_capture::{OutputEvent, OutputEventKind, OutputRange, OutputTextSpan};
-use crate::output_timeline::collapse_echo_with_attribution;
+use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::pager;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
@@ -262,12 +262,13 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
         let prior_rendered_text = guard.last_rendered_text;
         let events: Vec<_> = guard.events.drain(..).collect();
-        append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
         let leading_echo_prefix =
             (!guard.pending_echo_prefix.is_empty()).then(|| guard.pending_echo_prefix.clone());
-        if let Some(echo_prefix) = leading_echo_prefix.as_deref() {
+        append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
+        if !guard.pending_echo_prefix.is_empty() {
+            let echo_prefix = guard.pending_echo_prefix.clone();
             let (matched_bytes, keep_remaining_suffix) =
-                leading_echo_match_progress(&events, echo_prefix);
+                leading_echo_match_progress(&events, &echo_prefix);
             if keep_remaining_suffix
                 && !(snapshot_has_no_visible_text(&events)
                     && snapshot_crossed_request_boundary(&events))
@@ -316,75 +317,23 @@ impl PendingOutputTape {
 }
 
 impl PendingOutputSnapshot {
-    #[cfg(test)]
     pub(crate) fn format_contents(&self) -> FormattedPendingOutput {
-        let mut formatted = FormattedPendingOutput::default();
-        let mut last_rendered_text = self.prior_rendered_text;
-        for event in &self.events {
-            match event {
-                PendingOutputEvent::TextFragment {
-                    stream,
-                    origin,
-                    bytes,
-                    terminated,
-                    ..
-                } => {
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    if matches!(stream, TextStream::Stderr) {
-                        formatted.saw_stderr = true;
-                    }
-                    let rendered = render_bytes(bytes);
-                    if rendered.is_empty() {
-                        continue;
-                    }
-                    let text = if matches!(stream, TextStream::Stderr) {
-                        render_stderr_text(last_rendered_text, *origin, rendered)
-                    } else {
-                        rendered
-                    };
-                    push_text(&mut formatted.contents, *stream, *origin, text);
-                    last_rendered_text = Some(RenderedTextState {
-                        stream: *stream,
-                        origin: *origin,
-                        terminated: *terminated,
-                    });
-                }
-                PendingOutputEvent::Image {
-                    data,
-                    mime_type,
-                    id,
-                    is_new,
-                    ..
-                } => {
-                    formatted.contents.push(WorkerContent::ContentImage {
-                        data: data.clone(),
-                        mime_type: mime_type.clone(),
-                        id: id.clone(),
-                        is_new: *is_new,
-                    });
-                    last_rendered_text = None;
-                }
-                PendingOutputEvent::Sideband { .. } => {}
-            }
-        }
-        maybe_trim_leading_echo_prefix(
-            self.leading_echo_prefix.as_deref(),
-            &mut formatted.contents,
-        );
-        formatted
+        self.format_contents_with_mode(EchoCollapseMode::Preserve)
     }
 
     pub(crate) fn format_contents_for_reply(&self) -> FormattedPendingOutput {
+        self.format_contents_with_mode(EchoCollapseMode::CollapseForFinalReply)
+    }
+
+    fn format_contents_with_mode(&self, mode: EchoCollapseMode) -> FormattedPendingOutput {
         let RenderedPendingOutput {
             range,
             echo_events,
             prompt_variants,
             saw_stderr,
-        } = self.rendered_output_for_reply();
+        } = self.rendered_output();
         let source_end = range.end_offset;
-        let collapsed = collapse_echo_with_attribution(range, &echo_events, &prompt_variants);
+        let collapsed = collapse_echo_with_attribution(range, &echo_events, &prompt_variants, mode);
         let mut contents = pager::contents_from_collapsed_output(
             collapsed.bytes,
             collapsed.events,
@@ -398,7 +347,7 @@ impl PendingOutputSnapshot {
         }
     }
 
-    fn rendered_output_for_reply(&self) -> RenderedPendingOutput {
+    fn rendered_output(&self) -> RenderedPendingOutput {
         let mut bytes = Vec::new();
         let mut text_spans = Vec::new();
         let mut events = Vec::new();
@@ -661,34 +610,6 @@ fn common_prefix_len(left: &str, right: &str) -> usize {
         matched = matched.saturating_add(lch.len_utf8());
     }
     matched
-}
-
-#[cfg(test)]
-fn push_text(
-    contents: &mut Vec<WorkerContent>,
-    stream: TextStream,
-    origin: ContentOrigin,
-    text: String,
-) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(WorkerContent::ContentText {
-        text: existing,
-        stream: existing_stream,
-        origin: existing_origin,
-    }) = contents.last_mut()
-        && *existing_stream == stream
-        && *existing_origin == origin
-    {
-        existing.push_str(&text);
-        return;
-    }
-    contents.push(WorkerContent::ContentText {
-        text,
-        stream,
-        origin,
-    });
 }
 
 fn append_rendered_text(
@@ -1481,6 +1402,45 @@ mod tests {
                     is_new: true,
                 },
                 WorkerContent::stdout("done\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nonfinal_format_preserves_echo_while_anchoring_image_before_later_input() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "cat('done\\n')\n".to_string(),
+        });
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![
+                WorkerContent::stdout("> plot(1:10)\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::stdout("> cat('done\\n')\ndone\n"),
             ]
         );
     }
