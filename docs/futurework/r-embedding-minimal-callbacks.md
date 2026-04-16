@@ -73,6 +73,20 @@ So this simplification should be evaluated explicitly as a product tradeoff:
 - But Windows is not a separate product question: the simplification goal still
   applies there, even if the implementation cannot be identical.
 
+## Relationship To Advisory Write Metadata
+
+This note is about making the embedding layer do less.
+
+If some worker-owned write callbacks remain, a separate question is whether they
+should emit advisory IPC metadata about worker-owned writes for ordering or
+diagnostic purposes. That direction is tracked separately in
+`docs/futurework/advisory-worker-write-observations.md`.
+
+The two questions should stay separate:
+
+- reducing callback ownership,
+- enriching metadata from the callbacks that remain.
+
 ## Possible Follow-On Slices
 
 - Prototype a Unix startup path that overrides only `ReadConsole`.
