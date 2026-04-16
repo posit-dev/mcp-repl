@@ -35,13 +35,9 @@ expression: transcript
 <<< TMPDIR_SET=TRUE
 <<< TMPDIR_MATCH=TRUE
 <<< TEMPDIR_UNDER_TMPDIR=TRUE
-<<< [repl] echoed input elided: 7 lines (222 bytes); head: > marker <- file.path(tempdir(), "mcp-repl-snapshot.txt"); tail: + })
 <<< TEMPDIR_MARKER_OK
-<<< [repl] echoed input elided: 7 lines (167 bytes); head: > tf <- tempfile(); tail: + })
 <<< TEMPFILE_OK
-<<< [repl] echoed input elided: 2 lines (98 bytes); head: > unlink(tf); tail: > cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
 <<< TEMPDIR_LIST=mcp-repl-snapshot.txt
-<<< [repl] echoed input elided: 7 lines (243 bytes); head: > root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-snapshot-root.txt"); tail: + })
 <<< ROOT_MARKER_OK
 <<< ROOT_MARKER_EXISTS=TRUE
 

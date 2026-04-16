@@ -20,7 +20,7 @@ Each startup creates a fresh session directory under that root. `mcp-repl` write
 - `events.jsonl` with startup metadata, tool calls, and sandbox custom request events
 - `startup.log` for server-side startup trace lines
 - `worker-startup.log` for worker-side startup trace lines
-- `sandbox-state.jsonl` for sandbox policy and sandbox-state update payloads
+- `sandbox-state.jsonl` for the initial effective sandbox policy plus later sandbox policy/update payloads
 
 Example:
 

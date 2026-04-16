@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 #[cfg(not(windows))]
@@ -6,8 +8,25 @@ use common::TestResult;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(not(windows))]
 use tokio::time::{Duration, sleep};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    lock_mutex(test_mutex())
+}
 
 fn collect_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -116,6 +135,7 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut snapshot = McpSnapshot::new();
 
     snapshot

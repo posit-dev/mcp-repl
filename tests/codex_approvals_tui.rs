@@ -1535,24 +1535,35 @@ tryCatch({
         }
 
         if has_user_marker(body, WORKSPACE_WRITE_MARKER) {
-            return queue_tool_call(state, state.workspace_write_tool_args.clone());
+            return queue_tool_call(body, state, state.workspace_write_tool_args.clone());
         }
         if has_user_marker(body, FULL_ACCESS_MARKER)
             && let Some(tool_args) = state.full_access_tool_args.clone()
         {
-            return queue_tool_call(state, tool_args);
+            return queue_tool_call(body, state, tool_args);
         }
         response_body_with_items(vec![message_item("ready")], "resp-ready")
     }
 
-    fn queue_tool_call(state: &mut MockState, tool_args: String) -> String {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockToolCallSpec {
+        name: String,
+        namespace: Option<String>,
+    }
+
+    fn queue_tool_call(request: &Value, state: &mut MockState, tool_args: String) -> String {
         let ordinal = state.next_call_ordinal;
         state.next_call_ordinal += 1;
         let call_id = format!("call-{ordinal}");
         state.pending_call_id = Some(call_id.clone());
         state.pending_call_ordinal = Some(ordinal);
+        let tool_call =
+            resolve_tool_call_spec(request, &state.tool_name).unwrap_or_else(|| MockToolCallSpec {
+                name: state.tool_name.clone(),
+                namespace: None,
+            });
         response_body_with_items(
-            vec![function_call_item(&state.tool_name, &call_id, &tool_args)],
+            vec![function_call_item(&tool_call, &call_id, &tool_args)],
             &format!("resp-call-{ordinal}"),
         )
     }
@@ -1574,12 +1585,49 @@ tryCatch({
         body
     }
 
-    fn function_call_item(tool_name: &str, call_id: &str, args: &str) -> Value {
-        serde_json::json!({
+    fn function_call_item(tool: &MockToolCallSpec, call_id: &str, args: &str) -> Value {
+        let mut item = serde_json::json!({
             "type": "function_call",
-            "name": tool_name,
+            "name": tool.name,
             "arguments": args,
             "call_id": call_id,
+        });
+        if let Some(namespace) = &tool.namespace {
+            item["namespace"] = serde_json::Value::String(namespace.clone());
+        }
+        item
+    }
+
+    fn resolve_tool_call_spec(request: &Value, legacy_tool_name: &str) -> Option<MockToolCallSpec> {
+        let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
+        let tools = request.get("tools")?.as_array()?;
+        let namespaced_tool_present = tools.iter().any(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("namespace")
+                && tool.get("name").and_then(Value::as_str) == Some(namespace)
+                && tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| {
+                        children.iter().any(|child| {
+                            child.get("type").and_then(Value::as_str) == Some("function")
+                                && child.get("name").and_then(Value::as_str) == Some(name)
+                        })
+                    })
+        });
+        namespaced_tool_present.then(|| MockToolCallSpec {
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+        })
+    }
+
+    fn split_legacy_tool_name(legacy_tool_name: &str) -> Option<(&str, &str)> {
+        let split = legacy_tool_name.rfind("__")?;
+        let namespace_end = split + 2;
+        (namespace_end < legacy_tool_name.len()).then(|| {
+            (
+                &legacy_tool_name[..namespace_end],
+                &legacy_tool_name[namespace_end..],
+            )
         })
     }
 
@@ -1649,6 +1697,38 @@ tryCatch({
             }
         }
         outputs
+    }
+
+    #[test]
+    fn resolve_tool_call_spec_prefers_namespace_shape_when_present() {
+        let request = serde_json::json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__r__",
+                "tools": [{
+                    "type": "function",
+                    "name": "repl",
+                }],
+            }],
+        });
+        assert_eq!(
+            resolve_tool_call_spec(&request, "mcp__r__repl"),
+            Some(MockToolCallSpec {
+                name: "repl".to_string(),
+                namespace: Some("mcp__r__".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_tool_call_spec_falls_back_when_namespace_shape_absent() {
+        let request = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "name": "mcp__r__repl",
+            }],
+        });
+        assert_eq!(resolve_tool_call_spec(&request, "mcp__r__repl"), None);
     }
 }
 

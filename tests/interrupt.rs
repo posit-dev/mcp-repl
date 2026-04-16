@@ -1,9 +1,28 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use common::TestResult;
 use rmcp::model::{CallToolResult, RawContent};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant, sleep};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    lock_mutex(test_mutex())
+}
 
 fn result_text(result: &CallToolResult) -> String {
     result
@@ -66,6 +85,7 @@ fn backend_unavailable(text: &str) -> bool {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = spawn_interrupt_session().await?;
 
     let timeout_result = session
@@ -130,6 +150,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = spawn_interrupt_session().await?;
 
     let timeout_result = session
@@ -169,6 +190,7 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = spawn_interrupt_session().await?;
 
     let long_sleep =
@@ -300,6 +322,7 @@ tryCatch(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = spawn_interrupt_session().await?;
 
     let _ = session.write_stdin_raw_with("x <- 1", Some(5.0)).await?;
@@ -351,6 +374,7 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = spawn_interrupt_session().await?;
 
     let result = session
@@ -382,6 +406,7 @@ async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ctrl_d_prefix_in_files_mode_separates_restart_notice_from_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let mut session = common::spawn_server_with_files().await?;
 
     let result = session

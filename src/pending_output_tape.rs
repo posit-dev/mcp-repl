@@ -87,6 +87,13 @@ pub(crate) struct FormattedPendingOutput {
     pub saw_stderr: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingOutputSettleState {
+    pub progress_seq: u64,
+    pub readline_results_seen: usize,
+    pub has_image: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderedTextState {
     stream: TextStream,
@@ -241,6 +248,35 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         guard.progress_seq
+    }
+
+    pub(crate) fn current_settle_state(&self) -> PendingOutputSettleState {
+        let guard = self
+            .inner
+            .lock()
+            .expect("pending output tape mutex poisoned");
+        let pending_readline_results = guard
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    PendingOutputEvent::Sideband {
+                        kind: PendingSidebandKind::ReadlineResult { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        let has_image = guard
+            .events
+            .iter()
+            .any(|event| matches!(event, PendingOutputEvent::Image { .. }));
+        PendingOutputSettleState {
+            progress_seq: guard.progress_seq,
+            readline_results_seen: guard.drained_readline_results + pending_readline_results,
+            has_image,
+        }
     }
 
     pub(crate) fn drain_snapshot(&self) -> PendingOutputSnapshot {

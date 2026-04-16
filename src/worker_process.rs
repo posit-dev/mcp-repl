@@ -636,6 +636,9 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_manager_created", || {
             worker_context_event_payload(backend, &sandbox_state)
         });
+        if !awaiting_initial_sandbox_state_update {
+            crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
+        }
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -1132,6 +1135,9 @@ impl WorkerManager {
                 &prompt_variants,
             );
         }
+        if !timed_out && !session_end && contents.is_empty() {
+            contents.push(idle_status_content());
+        }
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1613,6 +1619,9 @@ impl WorkerManager {
                     }
                 }
 
+                if self.should_settle_multiline_r_timeout() {
+                    self.settle_output_after_timeout();
+                }
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
                 let mut contents = context.prefix_contents;
@@ -1887,6 +1896,55 @@ impl WorkerManager {
             return;
         }
         let stable_needed = Duration::from_millis(15).min(total);
+        self.settle_output_until_stable(total, stable_needed);
+    }
+
+    fn settle_output_after_timeout(&self) {
+        let total = Duration::from_millis(2500);
+        let stable_needed = Duration::from_millis(40);
+        let poll = Duration::from_millis(5);
+        let start = std::time::Instant::now();
+        let baseline = self.pending_output_tape.current_settle_state();
+        let mut last_seq = baseline.progress_seq;
+        let mut ready = baseline.has_image;
+        let mut stable_for = Duration::from_millis(0);
+        while start.elapsed() < total {
+            thread::sleep(poll);
+            let now = self.pending_output_tape.current_settle_state();
+            if !ready
+                && (now.has_image || now.readline_results_seen > baseline.readline_results_seen)
+            {
+                ready = true;
+                stable_for = Duration::from_millis(0);
+                last_seq = now.progress_seq;
+                continue;
+            }
+            if now.progress_seq == last_seq {
+                stable_for = stable_for.saturating_add(poll);
+                if ready && stable_for >= stable_needed {
+                    return;
+                }
+            } else {
+                last_seq = now.progress_seq;
+                stable_for = Duration::from_millis(0);
+            }
+        }
+    }
+
+    fn should_settle_multiline_r_timeout(&self) -> bool {
+        if self.backend != Backend::R {
+            return false;
+        }
+        self.pending_request_input
+            .as_deref()
+            .map(|input| input.trim_end_matches(['\r', '\n']).contains('\n'))
+            .unwrap_or(false)
+    }
+
+    fn settle_output_until_stable(&self, total: Duration, stable_needed: Duration) {
+        if total.is_zero() {
+            return;
+        }
         let poll = Duration::from_millis(5);
         let start = std::time::Instant::now();
 
