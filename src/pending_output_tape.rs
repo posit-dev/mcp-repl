@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::ipc::IpcEchoEvent;
 use crate::output_capture::{OutputEvent, OutputEventKind, OutputRange, OutputTextSpan};
-use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
+use crate::output_timeline::{
+    EchoCollapseMode, collapse_echo_with_attribution, is_trim_eligible_readline_prompt,
+};
 use crate::pager;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
@@ -262,6 +264,9 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
         let prior_rendered_text = guard.last_rendered_text;
         let events: Vec<_> = guard.events.drain(..).collect();
+        // `pending_echo_prefix` only carries trim-eligible REPL echo that was
+        // observed sideband-first in an earlier drain. Current-snapshot echo is
+        // resolved from the mixed text/event timeline below.
         let leading_echo_prefix =
             (!guard.pending_echo_prefix.is_empty()).then(|| guard.pending_echo_prefix.clone());
         append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
@@ -481,13 +486,6 @@ fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
             }
         )
     })
-}
-
-fn is_trim_eligible_readline_prompt(prompt: &str) -> bool {
-    matches!(
-        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
-        ">" | "+" | ">>>" | "..."
-    )
 }
 
 fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str) -> (usize, bool) {
@@ -1407,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn nonfinal_format_preserves_echo_while_anchoring_image_before_later_input() {
+    fn nonfinal_format_drops_leading_repl_echo_once_output_arrives() {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(b"> plot(1:10)\n");
@@ -1433,15 +1431,34 @@ mod tests {
         assert_eq!(
             snapshot.format_contents().contents,
             vec![
-                WorkerContent::stdout("> plot(1:10)\n"),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
                     mime_type: "image/png".to_string(),
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::stdout("> cat('done\\n')\ndone\n"),
+                WorkerContent::stdout("done\n"),
             ]
+        );
+    }
+
+    #[test]
+    fn non_repl_readline_transcripts_stay_visible_in_reply_format() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"FIRST> alpha\nSECOND> ");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "FIRST> ".to_string(),
+            line: "alpha\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::ReadlineStart {
+            prompt: "SECOND> ".to_string(),
+        });
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents_for_reply().contents,
+            vec![WorkerContent::stdout("FIRST> alpha\nSECOND> ")]
         );
     }
 }

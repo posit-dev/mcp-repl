@@ -34,7 +34,10 @@ use crate::output_capture::{
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
-use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
+use crate::output_timeline::{
+    EchoCollapseMode, collapse_echo_with_attribution, is_continuation_prompt,
+    is_primary_repl_prompt,
+};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
@@ -3318,24 +3321,6 @@ fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
         .all(|event| is_primary_repl_prompt(&event.prompt) || is_continuation_prompt(&event.prompt))
 }
 
-fn is_primary_repl_prompt(prompt: &str) -> bool {
-    matches!(
-        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
-        ">" | ">>>"
-    )
-}
-
-fn is_continuation_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "..." {
-        return true;
-    }
-    trimmed.ends_with('+')
-}
-
 fn maybe_trim_echo_prefix(
     contents: &mut Vec<WorkerContent>,
     echo_prefix: Option<&str>,
@@ -6304,6 +6289,35 @@ mod tests {
             formatted.contents,
             vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
             "expected an in-flight files-mode drain to keep the echoed command visible"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+            });
+        manager.pending_output_tape.append_stdout_bytes(b"start\n");
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("start\n")],
+            "expected worker output to hide the leading timed-out REPL echo again"
         );
     }
 

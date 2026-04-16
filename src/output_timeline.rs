@@ -11,6 +11,28 @@ pub(crate) struct CollapsedOutput {
     pub text_spans: Vec<OutputTextSpan>,
 }
 
+pub(crate) fn is_primary_repl_prompt(prompt: &str) -> bool {
+    matches!(
+        prompt.trim_end_matches(|ch: char| ch.is_whitespace()),
+        ">" | ">>>"
+    )
+}
+
+pub(crate) fn is_continuation_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == "..." {
+        return true;
+    }
+    trimmed.ends_with('+')
+}
+
+pub(crate) fn is_trim_eligible_readline_prompt(prompt: &str) -> bool {
+    is_primary_repl_prompt(prompt) || is_continuation_prompt(prompt)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EchoCollapseMode {
     Preserve,
@@ -171,6 +193,23 @@ pub(crate) fn collapse_echo_with_attribution(
         }
     }
 
+    // In-flight replies keep echo-only input visible so the user can still see
+    // what is running. Once any substantive output appeared, the leading REPL
+    // echo was already dropped when that output arrived.
+    if matches!(mode, EchoCollapseMode::Preserve)
+        && !pending.is_empty()
+        && !saw_substantive_output.get()
+    {
+        let pending = pending.take();
+        append_text_with_span(
+            &mut out_bytes,
+            &mut out_text_spans,
+            &pending.raw,
+            false,
+            ContentOrigin::Worker,
+        );
+    }
+
     CollapsedOutput {
         bytes: out_bytes,
         events: out_events,
@@ -184,12 +223,14 @@ struct PendingEchoRun {
     bytes: usize,
     head: Option<Vec<u8>>,
     tail: Option<Vec<u8>>,
+    raw: Vec<u8>,
 }
 
 impl PendingEchoRun {
     fn push(&mut self, line: &[u8]) {
         self.lines = self.lines.saturating_add(1);
         self.bytes = self.bytes.saturating_add(line.len());
+        self.raw.extend_from_slice(line);
         if self.head.is_none() {
             self.head = Some(line.to_vec());
         }
@@ -465,15 +506,34 @@ fn consume_text_segment(
         };
         if let Some(prefix_len) = echo_prefix {
             flush_anchored_images(*echo_idx, anchored_images, out_bytes, out_events);
+            let can_collapse = is_trim_eligible_readline_prompt(&echo_events[*echo_idx].prompt);
             match mode {
-                EchoCollapseMode::Preserve => append_text_with_span(
-                    out_bytes,
-                    out_text_spans,
-                    &line[..prefix_len],
-                    is_stderr,
-                    origin,
-                ),
-                EchoCollapseMode::CollapseForFinalReply => pending.push(&line[..prefix_len]),
+                EchoCollapseMode::Preserve => {
+                    if can_collapse && !saw_substantive_output.get() {
+                        pending.push(&line[..prefix_len]);
+                    } else {
+                        append_text_with_span(
+                            out_bytes,
+                            out_text_spans,
+                            &line[..prefix_len],
+                            is_stderr,
+                            origin,
+                        );
+                    }
+                }
+                EchoCollapseMode::CollapseForFinalReply => {
+                    if can_collapse {
+                        pending.push(&line[..prefix_len]);
+                    } else {
+                        append_text_with_span(
+                            out_bytes,
+                            out_text_spans,
+                            &line[..prefix_len],
+                            is_stderr,
+                            origin,
+                        );
+                    }
+                }
             }
             *echo_idx = echo_idx.saturating_add(1);
             if prefix_len == line.len() {
@@ -612,15 +672,81 @@ mod tests {
         assert_eq!(
             contents,
             vec![
-                WorkerContent::stdout("> plot(1:10)\n"),
                 WorkerContent::ContentImage {
                     data: "img".to_string(),
                     mime_type: "image/png".to_string(),
                     id: "plot-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::stdout("> cat('done\\n')\ndone\n"),
+                WorkerContent::stdout("done\n"),
             ]
+        );
+    }
+
+    #[test]
+    fn preserve_mode_keeps_echo_only_repl_input_visible() {
+        let bytes = b"> Sys.sleep(5)\n".to_vec();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 14,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "Sys.sleep(5)\n")],
+            &["> ".to_string()],
+            EchoCollapseMode::Preserve,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            14,
+        );
+
+        assert_eq!(contents, vec![WorkerContent::stdout("> Sys.sleep(5)\n")]);
+    }
+
+    #[test]
+    fn collapse_for_final_reply_preserves_non_repl_readline_transcript() {
+        let bytes = b"FIRST> alpha\nSECOND> ".to_vec();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 21,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("FIRST> ", "alpha\n"), echo_event("SECOND> ", "")],
+            &["FIRST> ".to_string(), "SECOND> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            21,
+        );
+
+        assert_eq!(
+            contents,
+            vec![WorkerContent::stdout("FIRST> alpha\nSECOND> ")]
         );
     }
 }
