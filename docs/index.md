@@ -29,6 +29,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
+- `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
 - `docs/futurework/stdin-transport-single-owner.md`: deferred design for making worker stdin ownership explicit instead of relying on a Windows-only gate.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
