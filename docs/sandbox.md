@@ -86,6 +86,10 @@ Optional `bwrap` stage:
 
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
 - Python backend is currently unavailable on Windows (it requires a Unix PTY).
-- `read-only` and `workspace-write` are enforced by the Windows sandbox runner.
+- `read-only` and `workspace-write` use a two-stage Windows sandbox model:
+  - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
+  - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
+- Worker spawn refreshes prepared workspace ACL coverage before launch.
+- The per-session temp directory stays launch-scoped and is not shared through the stable workspace SID; the same configured path may be reused across respawns, but it is reset before each fresh worker launch.
 - `danger-full-access` and `external-sandbox` run without built-in sandbox enforcement.
 - Some Windows environments may not support the restricted-token setup required by sandboxed modes.
