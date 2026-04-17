@@ -66,10 +66,6 @@ pub fn sandbox_plan_requests_inherited_state(plan: &SandboxCliPlan) -> bool {
     })
 }
 
-pub fn is_missing_inherited_sandbox_state_error(message: &str) -> bool {
-    message == MISSING_INHERITED_SANDBOX_STATE_MESSAGE
-}
-
 pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation, String> {
     let (raw_key, raw_value) = raw
         .split_once('=')

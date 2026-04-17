@@ -470,7 +470,7 @@ async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> TestResult<()> {
+async fn sandbox_inherit_without_state_update_falls_back_on_first_tool_call() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
@@ -479,27 +479,47 @@ async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> Tes
             .await?;
     let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
     let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected missing sandbox-state error, got: {text}"
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect missing sandbox-state error, got: {text}"
+    );
+    assert!(
+        text.contains("2"),
+        "expected successful fallback evaluation, got: {text}"
     );
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_update_errors_on_repl_reset() -> TestResult<()> {
+async fn sandbox_inherit_without_state_update_falls_back_on_repl_reset() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
     let mut session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
+    let first = session.write_stdin_raw_with("x <- 42", Some(10.0)).await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     let result = session.call_tool_raw("repl_reset", json!({})).await?;
     let text = collect_text(&result);
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected missing sandbox-state error, got: {text}"
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect missing sandbox-state error, got: {text}"
+    );
+    assert!(
+        text.contains("new session started"),
+        "expected repl_reset to succeed under fallback policy, got: {text}"
     );
     session.cancel().await?;
     Ok(())

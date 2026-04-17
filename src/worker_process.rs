@@ -43,8 +43,7 @@ use crate::sandbox::{
 };
 use crate::sandbox_cli::{
     MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
-    is_missing_inherited_sandbox_state_error, resolve_effective_sandbox_state_with_defaults,
-    sandbox_plan_requests_inherited_state,
+    resolve_effective_sandbox_state_with_defaults, sandbox_plan_requests_inherited_state,
 };
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
@@ -607,38 +606,37 @@ impl WorkerManager {
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let mut inherited_state = sandbox_defaults.clone();
         let mut inherited_update_received = false;
+        let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
             inherited_state.apply_update(update);
             inherited_update_received = true;
         }
         let inherited = if inherited_update_received {
             Some(&inherited_state)
+        } else if plan_requests_inherited_state {
+            Some(&sandbox_defaults)
         } else {
             None
         };
-        let (sandbox_state, awaiting_initial_sandbox_state_update) =
-            match resolve_effective_sandbox_state_with_defaults(
-                &sandbox_plan,
-                inherited,
-                &sandbox_defaults,
-            ) {
-                Ok(state) => (state, false),
-                Err(err)
-                    if sandbox_plan_requests_inherited_state(&sandbox_plan)
-                        && is_missing_inherited_sandbox_state_error(&err) =>
-                {
-                    // Allow MCP initialize to complete; first tool call will fail fast
-                    // unless the client sends codex/sandbox-state/update.
-                    (sandbox_defaults.clone(), true)
-                }
-                Err(err) => return Err(WorkerError::Sandbox(err)),
-            };
+        let using_inherit_fallback = plan_requests_inherited_state && !inherited_update_received;
+        let sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &sandbox_plan,
+            inherited,
+            &sandbox_defaults,
+        )
+        .map_err(WorkerError::Sandbox)?;
         crate::event_log::log_lazy("worker_manager_created", || {
             worker_context_event_payload(backend, &sandbox_state)
         });
-        if !awaiting_initial_sandbox_state_update {
-            crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
+        if using_inherit_fallback {
+            crate::event_log::log(
+                "worker_sandbox_state_inherit_fallback",
+                serde_json::json!({
+                    "reason": "missing_initial_client_state",
+                }),
+            );
         }
+        crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -650,7 +648,7 @@ impl WorkerManager {
             backend,
             process: None,
             sandbox_plan,
-            awaiting_initial_sandbox_state_update,
+            awaiting_initial_sandbox_state_update: false,
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,

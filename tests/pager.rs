@@ -403,7 +403,7 @@ async fn pager_smoke() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestResult<()> {
+async fn pager_empty_input_starts_worker_with_inherit_fallback() -> TestResult<()> {
     let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
         vec!["--sandbox".to_string(), "inherit".to_string()],
         Vec::new(),
@@ -416,12 +416,30 @@ async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestR
         .await?;
     let text = result_text(&result);
 
-    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected initial empty pager input to surface worker startup failure, got: {text:?}"
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect initial empty pager input to surface sandbox-state failure, got: {text:?}"
     );
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "empty pager input should not error"
+    );
+    assert!(
+        text.contains("<<repl status: idle>>"),
+        "expected idle status on empty pager input, got: {text:?}"
+    );
+    assert!(
+        text.contains(">"),
+        "expected prompt on empty pager input, got: {text:?}"
+    );
+    session.cancel().await?;
     Ok(())
 }
 
