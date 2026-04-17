@@ -4,7 +4,7 @@
   edition     = "2024"
   publish     = false
   description = "MCP server exposing a long-lived interactive REPL runtime (R or Python backend) over stdio."
-  repository  = "https://github.com/t-kalinowski/mcp-repl"
+  repository  = "https://github.com/posit-dev/mcp-repl"
   license     = "Apache-2.0"
 
 [[bin]]
