@@ -86,6 +86,7 @@ fn readme_documents_dev_binary_download_contract() {
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz",
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip",
         "binaries do not bundle R or Python",
+        "glibc 2.35+",
         "glibc build produced on Ubuntu 22.04",
         "**Windows**: experimental",
     ] {

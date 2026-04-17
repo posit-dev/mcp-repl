@@ -112,6 +112,8 @@ Linux / macOS dev:
 curl -fsSL https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh | sh -s -- --dev
 ```
 
+Linux x86_64 prebuilt binaries require glibc 2.35+ (Ubuntu 22.04-compatible). The shell installer rejects obviously old glibc when it can detect it and verifies the extracted binary before installing.
+
 Windows PowerShell stable:
 
 ```powershell
