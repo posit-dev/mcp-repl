@@ -3655,10 +3655,24 @@ fn trim_line_endings(text: &str) -> &str {
     text.trim_end_matches(['\n', '\r'])
 }
 
+fn is_partial_prompt_fragment(prompt: &str, fragment: &str) -> bool {
+    !fragment.is_empty()
+        && fragment != prompt
+        && !fragment.chars().all(char::is_whitespace)
+        && prompt.ends_with(fragment)
+}
+
+fn line_is_prompt_only_fragment(line: &str, prompt_variants: &[String]) -> bool {
+    let line = trim_line_endings(line);
+    prompt_variants
+        .iter()
+        .any(|prompt| line == prompt || is_partial_prompt_fragment(prompt, line))
+}
+
 fn line_matches_input_echo(line: &str, input_line: &str, prompt_variants: &[String]) -> bool {
     let line = trim_line_endings(line);
     if input_line.is_empty() {
-        return line.is_empty() || prompt_variants.iter().any(|prompt| line == prompt);
+        return line.is_empty() || line_is_prompt_only_fragment(line, prompt_variants);
     }
     if line == input_line {
         return true;
@@ -3666,6 +3680,9 @@ fn line_matches_input_echo(line: &str, input_line: &str, prompt_variants: &[Stri
     prompt_variants.iter().any(|prompt| {
         line.strip_prefix(prompt)
             .is_some_and(|rest| rest == input_line)
+            || line
+                .strip_suffix(input_line)
+                .is_some_and(|fragment| is_partial_prompt_fragment(prompt, fragment))
     })
 }
 
@@ -3766,12 +3783,9 @@ fn trim_leading_input_echo_from_contents(
 
     while output_idx < output_lines.len() {
         let line = trim_line_endings(output_lines[output_idx]);
-        let matches_prompt_only = prompt_variants.iter().any(|prompt| line == prompt);
-        let matches_last_duplicate = last_nonempty_input.is_some_and(|last| {
-            prompt_variants
-                .iter()
-                .any(|prompt| line.strip_prefix(prompt).is_some_and(|rest| rest == last))
-        });
+        let matches_prompt_only = line_is_prompt_only_fragment(line, prompt_variants);
+        let matches_last_duplicate = last_nonempty_input
+            .is_some_and(|last| line_matches_input_echo(line, last, prompt_variants));
         if !matches_prompt_only && !matches_last_duplicate {
             break;
         }
@@ -5689,6 +5703,53 @@ mod tests {
             "did not expect partial prompt transcript to be trimmed without an exact match"
         );
         assert_eq!(contents_text(&contents), "FIRST> alpha\nSECOND> ");
+    }
+
+    #[test]
+    fn trim_leading_input_echo_from_contents_trims_python_multiline_echo() {
+        let mut contents = vec![WorkerContent::worker_stdout(
+            ">>> def f():\r\n...     return 3\r\n... \r\n>>> f()\r\n3\r\n>>> ",
+        )];
+
+        let trimmed = trim_leading_input_echo_from_contents(
+            &mut contents,
+            Some("def f():\n    return 3\n\nf()"),
+            &[">>> ".to_string(), "... ".to_string()],
+        );
+
+        assert!(trimmed, "expected multiline Python echo to be trimmed");
+        assert_eq!(contents_text(&contents), "3\r\n>>> ");
+    }
+
+    #[test]
+    fn trim_leading_input_echo_from_contents_trims_python_multiline_echo_after_partial_prompt() {
+        let mut contents = vec![WorkerContent::worker_stdout(
+            "> def f():\r\n...     return 3\r\n... \r\n>>> f()\r\n3\r\n>>> ... ",
+        )];
+
+        let trimmed = trim_leading_input_echo_from_contents(
+            &mut contents,
+            Some("def f():\n    return 3\n\nf()"),
+            &[">>> ".to_string(), "... ".to_string()],
+        );
+
+        assert!(
+            trimmed,
+            "expected fallback trim to tolerate a stale partial Python prompt fragment"
+        );
+        let text = contents_text(&contents);
+        assert!(
+            text.contains("3\r\n"),
+            "expected evaluation result, got: {text:?}"
+        );
+        assert!(
+            !text.contains("def f():"),
+            "did not expect the multiline definition to survive trimming, got: {text:?}"
+        );
+        assert!(
+            !text.contains("return 3"),
+            "did not expect the multiline body to survive trimming, got: {text:?}"
+        );
     }
 
     #[test]
