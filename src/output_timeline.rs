@@ -323,10 +323,8 @@ fn echo_event_prefix_len(line: &[u8], event: &IpcEchoEvent) -> Option<usize> {
 
     let consumed = if let Some(consumed) = consumed.strip_suffix(b"\r\n") {
         consumed
-    } else if let Some(consumed) = consumed.strip_suffix(b"\n") {
-        consumed
     } else {
-        return None;
+        consumed.strip_suffix(b"\n")?
     };
     let prefix_len = prompt.len().saturating_add(consumed.len());
     if line.len() <= prefix_len {
