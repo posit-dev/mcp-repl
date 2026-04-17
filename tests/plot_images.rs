@@ -238,6 +238,13 @@ fn parse_text_event_rows(events: &str) -> Vec<TextEventRow> {
         .collect()
 }
 
+fn parse_image_event_paths(events: &str) -> Vec<PathBuf> {
+    events
+        .lines()
+        .filter_map(|line| line.strip_prefix("I ").map(PathBuf::from))
+        .collect()
+}
+
 fn advance_visible_lines(
     text: &str,
     visible_lines: usize,
@@ -1609,7 +1616,7 @@ for (i in 1:6) {
   plot(1:10, main = sprintf("plot%03d", i))
 }
 flush.console()
-Sys.sleep(1)
+Sys.sleep(2)
 "#;
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     if any_backend_unavailable(&[&first]) {
@@ -1618,7 +1625,7 @@ Sys.sleep(1)
         return Ok(());
     }
 
-    sleep(Duration::from_millis(600)).await;
+    sleep(Duration::from_millis(400)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
     if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
@@ -1633,7 +1640,21 @@ Sys.sleep(1)
     let bundle_dir = events_log
         .parent()
         .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
-    fs::remove_file(bundle_dir.join("images/001.png"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let image_paths = parse_image_event_paths(&events);
+    let first_image_history = image_paths
+        .first()
+        .map(|path| bundle_dir.join(path))
+        .unwrap_or_else(|| panic!("expected first image entry in events.log, got: {events:?}"));
+    let first_image_extension = first_image_history
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_else(|| {
+            panic!("expected extension for first image path, got: {first_image_history:?}")
+        });
+    let first_image_alias = bundle_dir.join(format!("images/001.{first_image_extension}"));
+    fs::remove_file(&first_image_history)?;
+    fs::remove_file(&first_image_alias)?;
 
     let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
     let damaged_text = result_text(&damaged);
