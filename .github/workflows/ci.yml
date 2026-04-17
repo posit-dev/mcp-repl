@@ -99,7 +99,7 @@ jobs:
         if: matrix.os == 'windows-2022'
         shell: pwsh
         run: |
-          & ".\\target\\release\\mcp-repl.exe" --help | Out-Null
+          .\target\release\mcp-repl.exe --help
 
       - name: Package release archive
         if: (steps.release_channel.outputs.publish_dev == 'true' || steps.release_channel.outputs.publish_stable == 'true') && matrix.os != 'windows-2022'
