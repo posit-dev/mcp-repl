@@ -124,7 +124,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "-F draft=false",
         "-F prerelease=\"${prerelease_flag}\"",
         "--prerelease",
-        "make_latest=\"${latest_flag}\"",
+        "-f make_latest=false",
+        "-f make_latest=\"${latest_flag}\"",
     ] {
         assert!(
             workflow.contains(required),
@@ -138,6 +139,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "backfill-stable:",
         "- 'v*.*.*'",
         "publish-stable:",
+        "-F make_latest=false",
+        "-F make_latest=\"${latest_flag}\"",
     ] {
         assert!(
             !workflow.contains(forbidden),
