@@ -48,7 +48,7 @@ fn first_line_number(text: &str) -> Option<u32> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn where_does_not_advance_cursor() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(60).await?;
+    let session = common::spawn_server_with_pager_page_chars(60).await?;
 
     let initial = session
         .write_stdin_raw_with("for (i in 1:60) cat(sprintf(\"L%04d\\n\", i))", Some(30.0))

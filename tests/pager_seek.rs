@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn seek_parses_offset_and_percent() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(36).await?;
+    let session = common::spawn_server_with_pager_page_chars(36).await?;
 
     let setup = session
         .write_stdin_raw_with("for (i in 1:100) cat(sprintf(\"L%04d\\n\", i))", Some(30.0))

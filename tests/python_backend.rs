@@ -82,7 +82,7 @@ async fn start_python_session_with_env_vars(
         return Ok(None);
     }
 
-    let mut session = common::spawn_server_with_args_env(
+    let session = common::spawn_server_with_args_env(
         vec![
             "--interpreter".to_string(),
             "python".to_string(),
@@ -187,7 +187,7 @@ print("ipc background ready")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_smoke() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -216,7 +216,7 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
         "import os\ntry:\n    del os.register_at_fork\nexcept AttributeError:\n    pass\n",
     )?;
 
-    let Some(mut session) = start_python_session_with_env_vars(vec![(
+    let Some(session) = start_python_session_with_env_vars(vec![(
         "PYTHONPATH".to_string(),
         temp.path().display().to_string(),
     )])
@@ -241,7 +241,7 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_files_mode()
 -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -338,7 +338,7 @@ os.fdopen = _wrapped_fdopen
 "#,
     )?;
 
-    let Some(mut session) = start_python_session_with_env_vars(vec![
+    let Some(session) = start_python_session_with_env_vars(vec![
         ("PYTHONPATH".to_string(), temp.path().display().to_string()),
         (
             "MCP_REPL_FORK_CLOSE_MARKER".to_string(),
@@ -426,7 +426,7 @@ async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_respawn_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -538,7 +538,7 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -606,7 +606,7 @@ print("ipc respawn armed")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_multiline_block() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -627,7 +627,7 @@ async fn python_multiline_block() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -660,7 +660,7 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_input_roundtrip() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -708,7 +708,7 @@ async fn python_input_roundtrip() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_busy_discards_input() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -730,7 +730,7 @@ async fn python_busy_discards_input() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_stderr_merged_into_output() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -755,7 +755,7 @@ async fn python_stderr_merged_into_output() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -801,7 +801,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -871,7 +871,7 @@ print("parent ready")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -923,7 +923,7 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -984,7 +984,7 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1072,7 +1072,7 @@ print("parent ready")
 #[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1143,7 +1143,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_multistatement_payload_completes() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1165,7 +1165,7 @@ async fn python_multistatement_payload_completes() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_exception_reported_in_output() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1187,7 +1187,7 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_pdb_roundtrip() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1220,7 +1220,7 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 

@@ -24,14 +24,17 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset_name: mcp-repl-x86_64-unknown-linux-gnu.tar.gz
             artifact_name: release-x86_64-unknown-linux-gnu
+            codex_asset_name: codex-x86_64-unknown-linux-musl.tar.gz
           - os: macos-15
             target: aarch64-apple-darwin
             asset_name: mcp-repl-aarch64-apple-darwin.tar.gz
             artifact_name: release-aarch64-apple-darwin
+            codex_asset_name: codex-aarch64-apple-darwin.tar.gz
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             asset_name: mcp-repl-x86_64-pc-windows-msvc.zip
             artifact_name: release-x86_64-pc-windows-msvc
+            codex_asset_name: codex-x86_64-pc-windows-msvc.exe.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -88,28 +91,51 @@ jobs:
         run: cargo test -j 1 -- --test-threads=1
 
       - name: Install Codex CLI
-        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os != 'windows-2022' }}
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          codex-home: ${{ runner.temp }}/codex-action-home
-          safety-strategy: drop-sudo
+        if: matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_path="${RUNNER_TEMP}/${{ matrix.codex_asset_name }}"
+          install_dir="${RUNNER_TEMP}/codex-install"
+          bin_dir="${RUNNER_TEMP}/codex-bin"
+          curl -fsSL "https://github.com/openai/codex/releases/latest/download/${{ matrix.codex_asset_name }}" -o "$archive_path"
+          rm -rf "$install_dir" "$bin_dir"
+          mkdir -p "$install_dir" "$bin_dir"
+          tar -xzf "$archive_path" -C "$install_dir"
+          codex_bin="$(find "$install_dir" -maxdepth 1 -type f -name 'codex-*' | head -n 1)"
+          test -n "$codex_bin"
+          install "$codex_bin" "$bin_dir/codex"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          "$bin_dir/codex" --version
 
       - name: Install Codex CLI (windows)
-        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os == 'windows-2022' }}
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          codex-home: ${{ runner.temp }}/codex-action-home
-          safety-strategy: unsafe
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          $archivePath = Join-Path $env:RUNNER_TEMP "${{ matrix.codex_asset_name }}"
+          $installDir = Join-Path $env:RUNNER_TEMP "codex-install"
+          $binDir = Join-Path $env:RUNNER_TEMP "codex-bin"
+          Invoke-WebRequest -Uri "https://github.com/openai/codex/releases/latest/download/${{ matrix.codex_asset_name }}" -OutFile $archivePath
+          Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $binDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          Expand-Archive -Path $archivePath -DestinationPath $installDir -Force
+          $codexBin = Get-ChildItem -Path $installDir -Filter 'codex-*.exe' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $codexBin) {
+            throw "failed to locate extracted codex binary"
+          }
+          Copy-Item $codexBin (Join-Path $binDir 'codex.exe')
+          Add-Content -Path $env:GITHUB_PATH -Value $binDir
+          & (Join-Path $binDir 'codex.exe') --version
 
       - name: cargo test (real codex integrations)
-        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os != 'windows-2022' }}
-        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
+        if: matrix.os != 'windows-2022'
+        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
 
       - name: cargo test (real codex integrations, windows serial)
-        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os == 'windows-2022' }}
-        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
+        if: matrix.os == 'windows-2022'
+        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

@@ -90,7 +90,7 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_commands_are_handled_server_side() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
         .write_stdin_raw_with(
@@ -151,7 +151,7 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
         .write_stdin_raw_with(
@@ -404,7 +404,7 @@ async fn pager_smoke() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> TestResult<()> {
-    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+    let session = common::spawn_server_with_args_env_and_pager_page_chars(
         vec!["--sandbox".to_string(), "inherit".to_string()],
         Vec::new(),
         80,
@@ -440,7 +440,7 @@ async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> Test
 
 #[cfg(windows)]
 async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+    let session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let result = session
         .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
@@ -500,7 +500,7 @@ async fn pager_empty_input_advances_page() -> TestResult<()> {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+    let session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let initial = session
         .write_stdin_raw_with(
@@ -543,7 +543,7 @@ async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_until_not_busy_does_not_return_while_pager_request_is_still_running() -> TestResult<()>
 {
-    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+    let session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let initial = session
         .write_stdin_raw_with(

@@ -188,7 +188,7 @@ command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
 # --sandbox inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent before the first tool call, mcp-repl fails closed with an error.
+# The first tool call waits briefly for the initial update, then mcp-repl fails closed if none arrives.
 args = [
   "--sandbox", "inherit",
   "--oversized-output", "files",
@@ -204,7 +204,7 @@ command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
 # --sandbox inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent before the first tool call, mcp-repl fails closed with an error.
+# The first tool call waits briefly for the initial update, then mcp-repl fails closed if none arrives.
 args = [
   "--sandbox", "inherit",
   "--oversized-output", "files",

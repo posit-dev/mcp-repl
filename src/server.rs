@@ -11,7 +11,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) mod response;
 #[cfg(test)]
@@ -28,7 +28,7 @@ use self::timeouts::{
 use crate::backend::Backend;
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
-use crate::sandbox_cli::SandboxCliPlan;
+use crate::sandbox_cli::{SandboxCliPlan, sandbox_plan_requests_inherited_state};
 use crate::worker_process::{WorkerError, WorkerManager};
 
 #[cfg(test)]
@@ -54,6 +54,7 @@ fn repl_tool_description_for_backend(
 
 #[derive(Clone)]
 struct SharedServer {
+    accepts_sandbox_state_updates: bool,
     state: Arc<Mutex<ServerState>>,
 }
 
@@ -69,7 +70,9 @@ impl SharedServer {
         sandbox_plan: SandboxCliPlan,
         oversized_output: OversizedOutputMode,
     ) -> Result<Self, WorkerError> {
+        let accepts_sandbox_state_updates = sandbox_plan_requests_inherited_state(&sandbox_plan);
         Ok(Self {
+            accepts_sandbox_state_updates,
             state: Arc::new(Mutex::new(ServerState {
                 worker: WorkerManager::new(backend, sandbox_plan, oversized_output)?,
                 response: ResponseState::new()?,
@@ -80,6 +83,10 @@ impl SharedServer {
 
     fn state(&self) -> Arc<Mutex<ServerState>> {
         Arc::clone(&self.state)
+    }
+
+    fn accepts_sandbox_state_updates(&self) -> bool {
+        self.accepts_sandbox_state_updates
     }
 
     /// Runs a closure with exclusive access to the combined worker/response state.
@@ -98,6 +105,72 @@ impl SharedServer {
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
+    async fn wait_for_initial_sandbox_state_update(
+        &self,
+        timeout: Duration,
+        tool_name: &'static str,
+    ) -> Result<Duration, McpError> {
+        if !self.accepts_sandbox_state_updates() {
+            return Ok(timeout);
+        }
+
+        if !self
+            .run_state(|state| state.worker.awaiting_initial_sandbox_state_update())
+            .await?
+        {
+            return Ok(timeout);
+        }
+
+        let wait_budget = timeout.min(SANDBOX_UPDATE_TIMEOUT);
+        if wait_budget.is_zero() {
+            return Ok(timeout);
+        }
+
+        crate::event_log::log(
+            "sandbox_state_wait_begin",
+            json!({
+                "tool": tool_name,
+                "timeout_ms": timeout.as_millis(),
+                "wait_budget_ms": wait_budget.as_millis(),
+            }),
+        );
+
+        let started_at = Instant::now();
+        loop {
+            if !self
+                .run_state(|state| state.worker.awaiting_initial_sandbox_state_update())
+                .await?
+            {
+                let elapsed = started_at.elapsed();
+                crate::event_log::log(
+                    "sandbox_state_wait_end",
+                    json!({
+                        "tool": tool_name,
+                        "status": "updated",
+                        "elapsed_ms": elapsed.as_millis(),
+                    }),
+                );
+                return Ok(timeout.saturating_sub(elapsed));
+            }
+
+            let elapsed = started_at.elapsed();
+            if elapsed >= wait_budget {
+                crate::event_log::log(
+                    "sandbox_state_wait_end",
+                    json!({
+                        "tool": tool_name,
+                        "status": "timed_out",
+                        "elapsed_ms": elapsed.as_millis(),
+                    }),
+                );
+                return Ok(timeout.saturating_sub(elapsed));
+            }
+
+            let remaining = wait_budget.saturating_sub(elapsed);
+            tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+        }
+    }
+
     /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
     /// The response layer needs `pending_request` after the worker call to decide transcript reuse.
     async fn run_write_input(
@@ -105,6 +178,9 @@ impl SharedServer {
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
+        let timeout = self
+            .wait_for_initial_sandbox_state_update(timeout, "repl")
+            .await?;
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         self.run_state(move |state| {
@@ -159,6 +235,15 @@ impl SharedServer {
                 request.method,
                 None,
             ));
+        }
+        if !self.accepts_sandbox_state_updates() {
+            crate::event_log::log(
+                "sandbox_state_request_ignored",
+                json!({
+                    "reason": "sandbox_inherit_not_enabled",
+                }),
+            );
+            return Ok(CustomResult::new(json!({})));
         }
 
         let update = request
@@ -216,6 +301,15 @@ impl SharedServer {
         );
         crate::sandbox::log_sandbox_state_event(&notification.method, notification.params.as_ref());
         if notification.method != SANDBOX_STATE_METHOD {
+            return;
+        }
+        if !self.accepts_sandbox_state_updates() {
+            crate::event_log::log(
+                "sandbox_state_notification_ignored",
+                json!({
+                    "reason": "sandbox_inherit_not_enabled",
+                }),
+            );
             return;
         }
 
@@ -292,14 +386,16 @@ impl SharedServer {
     }
 }
 
-fn server_info() -> ServerInfo {
-    ServerInfo::new(
+fn server_info(advertise_sandbox_capabilities: bool) -> ServerInfo {
+    let capabilities = if advertise_sandbox_capabilities {
         ServerCapabilities::builder()
             .enable_tools()
             .enable_experimental_with(sandbox_capabilities())
-            .build(),
-    )
-    .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .build()
+    } else {
+        ServerCapabilities::builder().enable_tools().build()
+    };
+    ServerInfo::new(capabilities).with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
 
 #[derive(Clone, Copy)]
@@ -384,7 +480,7 @@ macro_rules! define_backend_tool_server {
             }
 
             fn get_info(&self) -> ServerInfo {
-                server_info()
+                server_info(self.shared.accepts_sandbox_state_updates())
             }
 
             fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
@@ -420,6 +516,10 @@ macro_rules! define_backend_tool_server {
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
+                let timeout = self
+                    .shared
+                    .wait_for_initial_sandbox_state_update(timeout, "repl_reset")
+                    .await?;
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
                     .shared

@@ -740,7 +740,7 @@ impl McpTestSession {
     }
 
     pub async fn call_tool_raw(
-        &mut self,
+        &self,
         tool: impl Into<String>,
         arguments: Value,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
@@ -765,7 +765,7 @@ impl McpTestSession {
     }
 
     pub async fn write_stdin_raw_with(
-        &mut self,
+        &self,
         input: impl Into<String>,
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
@@ -788,7 +788,7 @@ impl McpTestSession {
     }
 
     pub async fn write_stdin_raw_unterminated_with(
-        &mut self,
+        &self,
         input: impl Into<String>,
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
@@ -807,7 +807,7 @@ impl McpTestSession {
     }
 
     pub async fn send_custom_request(
-        &mut self,
+        &self,
         method: impl Into<String>,
         params: Value,
     ) -> Result<(), ServiceError> {
@@ -817,7 +817,7 @@ impl McpTestSession {
     }
 
     pub async fn send_custom_notification(
-        &mut self,
+        &self,
         method: impl Into<String>,
         params: Value,
     ) -> Result<(), ServiceError> {

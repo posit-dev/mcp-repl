@@ -28,7 +28,7 @@ fn prompt_only_reticulate_output_is_skipped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(

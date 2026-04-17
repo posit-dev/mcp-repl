@@ -86,7 +86,7 @@ fn backend_unavailable(text: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let timeout_result = session
         .write_stdin_raw_with("Sys.sleep(30)", Some(0.5))
@@ -151,7 +151,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let timeout_result = session
         .write_stdin_raw_with("Sys.sleep(30)", Some(0.5))
@@ -191,7 +191,7 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let long_sleep =
         r#"tryCatch({ Sys.sleep(30) }, interrupt = function(e) cat("interrupt received\n"))"#;
@@ -231,7 +231,7 @@ async fn pager_ctrl_c_prefix_preserves_interrupt_output() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input_on_windows()
 -> TestResult<()> {
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let long_sleep = r#"
 cat("INTERRUPT_READY\n")
@@ -323,7 +323,7 @@ tryCatch(
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let _ = session.write_stdin_raw_with("x <- 1", Some(5.0)).await?;
 
@@ -375,7 +375,7 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_interrupt_session().await?;
+    let session = spawn_interrupt_session().await?;
 
     let result = session
         .write_stdin_raw_with("\u{4}print('AFTER_RESET')", Some(10.0))
@@ -407,7 +407,7 @@ async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn ctrl_d_prefix_in_files_mode_separates_restart_notice_from_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with("\u{4}cat('AFTER_RESET\\n')", Some(10.0))

@@ -179,7 +179,7 @@ async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestR
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let first = session
         .write_stdin_raw_with(
@@ -274,7 +274,7 @@ async fn write_stdin_pager_hits() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_recovers_after_error() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
     let _ = session
         .write_stdin_raw_with("stop('boom')", Some(10.0))
         .await?;
@@ -302,7 +302,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let input = (1..=2_000)
         .map(|idx| format!("x{idx} <- {idx}\n"))
@@ -334,7 +334,7 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let mut input = String::new();
     for idx in 1..=1_000 {

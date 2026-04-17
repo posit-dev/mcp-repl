@@ -687,6 +687,10 @@ impl WorkerManager {
         self.ensure_process()
     }
 
+    pub fn awaiting_initial_sandbox_state_update(&self) -> bool {
+        self.awaiting_initial_sandbox_state_update
+    }
+
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
     pub fn pending_request(&self) -> bool {
         self.pending_request

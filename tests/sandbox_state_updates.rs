@@ -104,7 +104,12 @@ async fn spawn_server_retry_with_env_vars(
 ) -> TestResult<common::McpTestSession> {
     let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for _ in 0..3 {
-        match common::spawn_server_with_env_vars(env_vars.clone()).await {
+        match common::spawn_server_with_args_env(
+            vec!["--sandbox".to_string(), "inherit".to_string()],
+            env_vars.clone(),
+        )
+        .await
+        {
             Ok(session) => return Ok(session),
             Err(err) => {
                 let message = err.to_string();
@@ -131,7 +136,17 @@ async fn spawn_server_with_files_retry_with_env_vars(
 ) -> TestResult<common::McpTestSession> {
     let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for _ in 0..3 {
-        match common::spawn_server_with_files_env_vars(env_vars.clone()).await {
+        match common::spawn_server_with_args_env(
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--oversized-output".to_string(),
+                "files".to_string(),
+            ],
+            env_vars.clone(),
+        )
+        .await
+        {
             Ok(session) => return Ok(session),
             Err(err) => {
                 let message = err.to_string();
@@ -398,7 +413,9 @@ async fn sandbox_state_update_applies_full_access_policy() -> TestResult<()> {
     }
     let target = std::env::temp_dir().join("mcp-repl-sandbox-state-update.txt");
     let _ = std::fs::remove_file(&target);
-    let mut session = common::spawn_server().await?;
+    let session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
     session
         .send_custom_request(SANDBOX_STATE_METHOD, sandbox_full_access_params())
         .await?;
@@ -436,11 +453,13 @@ tryCatch({
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_capability_advertised() -> TestResult<()> {
+async fn sandbox_state_capability_advertised_with_inherit() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let session = spawn_server_retry().await?;
+    let session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
     let info = session.server_info().ok_or_else(|| {
         let message = "missing server info from initialize".to_string();
         Box::<dyn std::error::Error + Send + Sync>::from(message)
@@ -458,6 +477,29 @@ async fn sandbox_state_capability_advertised() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_capability_hidden_without_inherit() -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let session = common::spawn_server().await?;
+    let info = session.server_info().ok_or_else(|| {
+        let message = "missing server info from initialize".to_string();
+        Box::<dyn std::error::Error + Send + Sync>::from(message)
+    })?;
+    let advertised = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key("codex/sandbox-state"));
+    assert!(
+        !advertised,
+        "did not expect sandbox state capability without `--sandbox inherit`: {info:?}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
@@ -469,12 +511,96 @@ async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn assert_sandbox_update_ignored_without_inherit(kind: SandboxUpdateKind) -> TestResult<()> {
+    if !common::sandbox_exec_available() {
+        eprintln!("sandbox-exec unavailable; skipping");
+        return Ok(());
+    }
+    if std::env::var_os("CODEX_SANDBOX").is_some() {
+        return Ok(());
+    }
+    let target = std::env::temp_dir().join("mcp-repl-sandbox-state-ignored.txt");
+    let _ = std::fs::remove_file(&target);
+    let session = common::spawn_server().await?;
+    let first = session.write_stdin_raw_with("x <- 42", Some(10.0)).await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    match kind {
+        SandboxUpdateKind::Request => {
+            session
+                .send_custom_request(SANDBOX_STATE_METHOD, sandbox_full_access_params())
+                .await?;
+        }
+        SandboxUpdateKind::Notification => {
+            session
+                .send_custom_notification(SANDBOX_STATE_METHOD, sandbox_full_access_params())
+                .await?;
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
+        .map_err(|err| format!("failed to encode target path: {err}"))?;
+    let code = r#"
+cat(sprintf("X_EXISTS:%s\n", exists("x")))
+target <- __TARGET__
+tryCatch({
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}, error = function(e) {
+  message("WRITE_ERROR:", conditionMessage(e))
+})
+"#
+    .replace("__TARGET__", &target_literal);
+    let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        let _ = std::fs::remove_file(&target);
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("X_EXISTS:TRUE"),
+        "expected ignored sandbox update not to reset the session, got: {text}"
+    );
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected ignored sandbox update to preserve workspace-write restrictions, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "did not expect ignored sandbox update to grant full access, got: {text}"
+    );
+    let _ = std::fs::remove_file(&target);
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_update_request_is_ignored_without_inherit() -> TestResult<()> {
+    assert_sandbox_update_ignored_without_inherit(SandboxUpdateKind::Request).await
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_update_notification_is_ignored_without_inherit() -> TestResult<()> {
+    assert_sandbox_update_ignored_without_inherit(SandboxUpdateKind::Notification).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_without_state_update_fails_on_first_tool_call() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let mut session =
+    let session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
     let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
@@ -497,11 +623,47 @@ async fn sandbox_inherit_without_state_update_fails_on_first_tool_call() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_first_tool_call_succeeds_when_initial_state_update_arrives()
+-> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
+    let (result, update_result) =
+        tokio::join!(session.write_stdin_raw_with("1+1", Some(2.0)), async {
+            sleep(Duration::from_millis(50)).await;
+            session
+                .send_custom_request(SANDBOX_STATE_METHOD, sandbox_update_params(true))
+                .await
+        });
+    let result = result?;
+    update_result?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("2"),
+        "expected the first tool call to succeed once sandbox state arrives, got: {text}"
+    );
+    assert!(
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect missing sandbox-state error after delayed update, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_without_state_update_fails_on_repl_reset() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let mut session =
+    let session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
             .await?;
     let first = session.write_stdin_raw_with("x <- 42", Some(10.0)).await?;

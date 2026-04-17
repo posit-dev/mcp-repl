@@ -896,6 +896,7 @@ responses_websockets = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
+args = ["--sandbox", "inherit"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
@@ -2049,7 +2050,6 @@ mod linux {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2060,7 +2060,6 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2071,13 +2070,11 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2093,7 +2090,6 @@ mod macos {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2104,7 +2100,6 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2115,13 +2110,11 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2137,7 +2130,6 @@ mod windows {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2147,7 +2139,6 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires real codex binary"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
