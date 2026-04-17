@@ -9,9 +9,9 @@
 
 ## Status
 
-- State: active
+- State: completed
 - Last updated: 2026-04-17
-- Current phase: implementation
+- Current phase: completed
 
 ## Current Direction
 
@@ -38,12 +38,12 @@
   - Define the one-way contract and the bounded in-memory preview state.
 - Phase 1: completed
   - Add cached image-preview state to `ActiveOutputBundle` and remove old-image rereads from later reply rendering.
-- Phase 2: pending
-  - Add cached text head/tail preview state and stop reconstructing later previews from spilled file state.
-- Phase 3: pending
-  - Replace tests that depend on disk rereads with tests for the one-way contract.
-- Phase 4: pending
-  - Run full validation and update plan status for any remaining follow-on work.
+- Phase 2: completed
+  - Confirm that later text replies already render from in-memory retained reply items and do not reread `transcript.txt`.
+- Phase 3: completed
+  - Replace reread-oriented regressions with one-way contract coverage for deleted bundle image and transcript files.
+- Phase 4: completed
+  - Run full validation and close the initiative.
 
 ## Locked Decisions
 
@@ -55,18 +55,11 @@
 
 ## Open Questions
 
-- What exact text preview state should be cached in memory?
-  - Likely one bounded head window plus one bounded tail window, but the final shape should preserve current preview wording and stream ordering.
-- Should the preview cache live only on `ActiveOutputBundle`, or should `StagedTimeoutOutput` also keep a lightweight preview summary before a bundle is materialized?
-- When an output-bundle directory or subdirectory disappears mid-session, what minimal recreation behavior is worth supporting for continued appends without expanding this slice into generic filesystem recovery logic?
-- Can image preview caching reuse the existing `ReplyImage` payloads directly, or should it store a more compact internal representation?
+- None for this slice.
 
 ## Next Safe Slice
 
-- Decide whether the text-preview slice is needed at all.
-- If text preview caching is needed, start that slice only after confirming that the remaining text path still violates the one-way contract in a user-visible way.
-- Decide whether text preview caching is needed purely for architectural consistency or whether the current text spill path is already sufficiently one-way.
-- If text caching is needed, define the exact bounded head/tail representation before changing text compaction behavior.
+- None. The planned work is complete.
 
 ## Stop Conditions
 
@@ -82,3 +75,4 @@
 - 2026-04-17: Kept the public bundle layout unchanged for this initiative so the refactor can land without redefining the client-facing files-mode contract.
 - 2026-04-17: Began the image-preview implementation by caching the first-history and latest image previews on `ActiveOutputBundle` and moving the public regression toward “later replies do not depend on old bundle image files remaining on disk”.
 - 2026-04-17: Completed the image-preview slice. Later image-bundle replies now render from cached preview images in memory instead of rereading old image files from the bundle directory.
+- 2026-04-17: Confirmed the text spill path already satisfied the one-way contract for visible replies. Later text replies render from in-memory retained reply items, and a new public regression now covers transcript deletion and recreation without replaying previously spilled text.
