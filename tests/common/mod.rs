@@ -1056,7 +1056,7 @@ fn normalize_snapshot_text(text: &str) -> String {
     }
 
     let mut out = String::new();
-    for line in stdout_lines.into_iter().chain(stderr_lines.into_iter()) {
+    for line in stdout_lines.into_iter().chain(stderr_lines) {
         out.push_str(&line);
     }
     out

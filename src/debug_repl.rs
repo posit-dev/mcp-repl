@@ -67,11 +67,7 @@ pub(crate) fn run(
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
-    loop {
-        let Some(line) = read_line(&mut stdin)? else {
-            break;
-        };
-
+    while let Some(line) = read_line(&mut stdin)? {
         if is_exact_command(&line, "INTERRUPT") {
             let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT);
             render_visible_reply(

@@ -5,18 +5,22 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+#[cfg(not(windows))]
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(not(windows))]
 use tokio::time::{Duration, sleep};
 
+#[cfg(not(windows))]
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(not(windows))]
 fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -24,6 +28,7 @@ fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     }
 }
 
+#[cfg(not(windows))]
 fn lock_test_mutex() -> MutexGuard<'static, ()> {
     lock_mutex(test_mutex())
 }
