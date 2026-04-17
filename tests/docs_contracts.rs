@@ -186,6 +186,13 @@ fn release_backfill_workflow_defines_manual_tag_publish_contract() {
         "group: publish-dev",
         "refs/heads/main",
         "github.event_name == 'push'",
+        "name: cargo check",
+        "name: cargo build\n        run: cargo build",
+        "name: cargo clippy",
+        "name: cargo test (skip client integrations)",
+        "name: cargo test (windows serial, skip client integrations)",
+        "name: cargo +nightly fmt",
+        "Install nightly rustfmt",
     ] {
         assert!(
             !workflow.contains(forbidden),

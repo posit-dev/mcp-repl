@@ -48,34 +48,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          components: clippy, rustfmt
           rustflags: ""
-
-      - name: Install nightly rustfmt
-        run: rustup toolchain install nightly --profile minimal --component rustfmt
 
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
-
-      - name: cargo check
-        run: cargo check
-
-      - name: cargo build
-        run: cargo build
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: cargo test (skip client integrations)
-        if: matrix.os != 'windows-2022'
-        run: cargo test -- --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
-
-      - name: cargo test (windows serial, skip client integrations)
-        if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 -- --test-threads=1 --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
-
-      - name: cargo +nightly fmt
-        run: cargo +nightly fmt --all -- --check
 
       - name: cargo build --release
         run: cargo build --release --locked
