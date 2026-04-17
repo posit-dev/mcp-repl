@@ -18,11 +18,13 @@ mod unix_impl {
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
+    use toml_edit::DocumentMut;
     use vt100::Parser;
 
     const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
+    const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
     struct IsolatedCodexEnv {
@@ -44,6 +46,78 @@ mod unix_impl {
 
     pub(super) async fn run_codex_exec_initial_sandbox_state_plain() -> TestResult<String> {
         run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Plain).await
+    }
+
+    pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
+            return Ok(());
+        }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(());
+        }
+
+        let tool_args = tool_args_for_code("1+1");
+        let mock_server =
+            MockResponsesServer::start_with_first_user_turn_tool_call(tool_name(), tool_args)
+                .await?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env_for_install(&mock_server.base_url())?;
+
+        run_mcp_repl_install_for_codex_r(&mcp_repl, &env.codex_home)?;
+        assert_codex_install_wrote_r_inherit_config(&env.codex_home, &mcp_repl)?;
+
+        let prompt = INSTALL_SCRIPTED_TOOL_CALL_MARKER.to_string();
+        let shell_script = format!(
+            "codex exec --json --sandbox workspace-write --skip-git-repo-check --cd {} {}",
+            sh_single_quote(&env.workspace.display().to_string()),
+            sh_single_quote(&prompt),
+        );
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
+        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
+        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "C");
+        cmd.arg("-c");
+        cmd.arg(shell_script);
+        cmd.current_dir(&env.workspace);
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        let outputs = mock_server.function_call_outputs().await;
+        if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
+            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            return Ok(());
+        }
+        if !output.status.success() {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "codex exec with installed config failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+
+        assert_exec_output_contains_tool_call(&stdout, "r", "repl", "1+1\n")?;
+
+        let saw_result = outputs.iter().any(|out| out.contains("[1] 2"));
+        if !saw_result {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected installed codex config to run r repl and return 2\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     async fn run_codex_exec_initial_sandbox_state_for_mode(
@@ -296,9 +370,8 @@ mod unix_impl {
             .is_ok()
     }
 
-    fn create_isolated_codex_env(
-        mcp_repl: &Path,
-        openai_base_url: &str,
+    fn create_isolated_codex_env_with_config(
+        build_config: impl FnOnce(&Path) -> String,
     ) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
         let workspace = temp_dir.path().join("workspace");
@@ -320,7 +393,7 @@ mod unix_impl {
         let debug_dir = temp_dir.path().join("debug");
         std::fs::create_dir_all(&debug_dir)?;
 
-        let config = codex_config(mcp_repl, &workspace, openai_base_url);
+        let config = build_config(&workspace);
         std::fs::write(codex_home.join("config.toml"), config)?;
 
         Ok(IsolatedCodexEnv {
@@ -328,6 +401,23 @@ mod unix_impl {
             workspace,
             codex_home,
             debug_dir,
+        })
+    }
+
+    fn create_isolated_codex_env(
+        mcp_repl: &Path,
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_config(mcp_repl, workspace, openai_base_url)
+        })
+    }
+
+    fn create_isolated_codex_env_for_install(
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_install_base_config(workspace, openai_base_url)
         })
     }
 
@@ -651,6 +741,55 @@ mod unix_impl {
         Err("unable to locate mcp-repl test binary".into())
     }
 
+    fn run_mcp_repl_install_for_codex_r(mcp_repl: &Path, codex_home: &Path) -> TestResult<()> {
+        let output = std::process::Command::new(mcp_repl)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .arg("--interpreter")
+            .arg("r")
+            .env("CODEX_HOME", codex_home)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "mcp-repl install --client codex --interpreter r failed with status {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            status = output.status
+        )
+        .into())
+    }
+
+    fn assert_codex_install_wrote_r_inherit_config(
+        codex_home: &Path,
+        mcp_repl: &Path,
+    ) -> TestResult<()> {
+        let config_path = codex_home.join("config.toml");
+        let text = std::fs::read_to_string(&config_path)?;
+        let doc = text.parse::<DocumentMut>()?;
+        let expected_command = mcp_repl.to_string_lossy().to_string();
+        assert_eq!(
+            doc["mcp_servers"]["r"]["command"].as_str(),
+            Some(expected_command.as_str()),
+            "expected install to register the current mcp-repl executable"
+        );
+        let r_args = doc["mcp_servers"]["r"]["args"]
+            .as_array()
+            .ok_or_else(|| "expected mcp_servers.r.args array".to_string())?;
+        let has_sandbox_inherit = r_args
+            .iter()
+            .zip(r_args.iter().skip(1))
+            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+        assert!(
+            has_sandbox_inherit,
+            "expected installed Codex config to include `--sandbox inherit`"
+        );
+        Ok(())
+    }
+
     fn tool_name() -> String {
         "mcp__r__repl".to_string()
     }
@@ -714,6 +853,39 @@ responses_websockets = false
 [mcp_servers.r]
 command = "{mcp_repl}"
 env_vars = ["MCP_REPL_DEBUG_DIR"]
+[projects."{repo_root}"]
+trust_level = "trusted"
+"#,
+        )
+    }
+
+    fn codex_install_base_config(repo_root: &Path, openai_base_url: &str) -> String {
+        let repo_root = toml_escape(&repo_root.display().to_string());
+        let openai_base_url = toml_escape(openai_base_url);
+        format!(
+            r#"model_provider = "mock-openai"
+disable_paste_burst = true
+project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[notice]
+hide_full_access_warning = true
+
+[tui]
+alternate_screen = "never"
+animations = false
+
+[features]
+steer = true
+remote_models = true
+responses_websockets = false
+
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
@@ -1299,6 +1471,7 @@ tryCatch({
         tool_name: String,
         workspace_write_tool_args: String,
         full_access_tool_args: Option<String>,
+        first_user_turn_tool_args: Option<String>,
         requests: Vec<Value>,
         request_paths: Vec<String>,
         next_call_ordinal: usize,
@@ -1312,12 +1485,41 @@ tryCatch({
             workspace_write_tool_args: String,
             full_access_tool_args: Option<String>,
         ) -> TestResult<Self> {
+            Self::start_with_options(
+                tool_name,
+                workspace_write_tool_args,
+                full_access_tool_args,
+                None,
+            )
+            .await
+        }
+
+        async fn start_with_first_user_turn_tool_call(
+            tool_name: String,
+            first_user_turn_tool_args: String,
+        ) -> TestResult<Self> {
+            Self::start_with_options(
+                tool_name,
+                String::new(),
+                None,
+                Some(first_user_turn_tool_args),
+            )
+            .await
+        }
+
+        async fn start_with_options(
+            tool_name: String,
+            workspace_write_tool_args: String,
+            full_access_tool_args: Option<String>,
+            first_user_turn_tool_args: Option<String>,
+        ) -> TestResult<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
             let state = Arc::new(tokio::sync::Mutex::new(MockState {
                 tool_name,
                 workspace_write_tool_args,
                 full_access_tool_args,
+                first_user_turn_tool_args,
                 requests: Vec::new(),
                 request_paths: Vec::new(),
                 next_call_ordinal: 1,
@@ -1534,6 +1736,12 @@ tryCatch({
             );
         }
 
+        if has_user_message(body)
+            && let Some(tool_args) = state.first_user_turn_tool_args.take()
+        {
+            return queue_tool_call(body, state, tool_args);
+        }
+
         if has_user_marker(body, WORKSPACE_WRITE_MARKER) {
             return queue_tool_call(body, state, state.workspace_write_tool_args.clone());
         }
@@ -1667,6 +1875,16 @@ tryCatch({
             .unwrap_or(false)
     }
 
+    fn has_user_message(body: &Value) -> bool {
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            return false;
+        };
+        items.iter().rev().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+    }
+
     fn has_function_call_output(body: &Value, call_id: &str) -> bool {
         let Some(items) = body.get("input").and_then(Value::as_array) else {
             return false;
@@ -1697,6 +1915,50 @@ tryCatch({
             }
         }
         outputs
+    }
+
+    fn assert_exec_output_contains_tool_call(
+        stdout: &str,
+        server: &str,
+        tool: &str,
+        input: &str,
+    ) -> TestResult<()> {
+        let mut saw_json = false;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            saw_json = true;
+            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let Some(item) = event.get("item") else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("mcp_tool_call") {
+                continue;
+            }
+            let Some(arguments) = item.get("arguments") else {
+                continue;
+            };
+            if item.get("server").and_then(Value::as_str) == Some(server)
+                && item.get("tool").and_then(Value::as_str) == Some(tool)
+                && arguments.get("input").and_then(Value::as_str) == Some(input)
+            {
+                return Ok(());
+            }
+        }
+
+        let json_note = if saw_json {
+            "saw json events, but not the expected mcp tool call"
+        } else {
+            "stdout did not contain json events"
+        };
+        Err(format!(
+            "expected codex exec output to include {server}.{tool} with input {input:?}; {json_note}\nstdout:\n{stdout}"
+        )
+        .into())
     }
 
     #[test]
@@ -1757,6 +2019,11 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -1789,6 +2056,11 @@ mod macos {
         }
         insta::assert_snapshot!("codex_exec_initial_sandbox_state_plain", snapshot);
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
