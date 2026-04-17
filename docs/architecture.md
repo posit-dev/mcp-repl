@@ -25,7 +25,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Sandbox and process isolation
 
-- `src/sandbox.rs`, `src/sandbox_cli.rs`, and `src/windows_sandbox.rs` implement OS-level sandboxing, writable-root policy, and client-driven sandbox updates.
+- `src/sandbox.rs`, `src/sandbox_cli.rs`, and `src/windows_sandbox.rs` implement OS-level sandboxing, writable-root policy, and Codex per-tool-call sandbox metadata handling.
 - The sideband and sandbox contracts are documented in `docs/sandbox.md` and `docs/worker_sideband_protocol.md`.
 
 ### Output, images, and debug surfaces

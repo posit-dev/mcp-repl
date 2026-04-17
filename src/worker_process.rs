@@ -571,7 +571,6 @@ pub struct WorkerManager {
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
-    awaiting_initial_sandbox_state_update: bool,
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
@@ -605,30 +604,18 @@ impl WorkerManager {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
-        let mut inherited_state = sandbox_defaults.clone();
-        let mut inherited_update_received = false;
-        if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
-            inherited_state.apply_update(update);
-            inherited_update_received = true;
-        }
-        let awaiting_initial_sandbox_state_update =
-            plan_requests_inherited_state && !inherited_update_received;
-        let sandbox_state = if awaiting_initial_sandbox_state_update {
+        let sandbox_state = if plan_requests_inherited_state {
             sandbox_defaults.clone()
         } else {
-            resolve_effective_sandbox_state_with_defaults(
-                &sandbox_plan,
-                inherited_update_received.then_some(&inherited_state),
-                &sandbox_defaults,
-            )
-            .map_err(WorkerError::Sandbox)?
+            resolve_effective_sandbox_state_with_defaults(&sandbox_plan, None, &sandbox_defaults)
+                .map_err(WorkerError::Sandbox)?
         };
-        if awaiting_initial_sandbox_state_update {
+        if plan_requests_inherited_state {
             crate::event_log::log(
                 "worker_manager_created",
                 serde_json::json!({
                     "backend": format!("{backend:?}"),
-                    "awaiting_initial_sandbox_state_update": true,
+                    "awaiting_initial_tool_call_sandbox_state_meta": true,
                 }),
             );
         } else {
@@ -648,8 +635,7 @@ impl WorkerManager {
             backend,
             process: None,
             sandbox_plan,
-            awaiting_initial_sandbox_state_update,
-            inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
+            inherited_sandbox_state: None,
             sandbox_defaults,
             sandbox_state,
             #[cfg(target_os = "windows")]
@@ -681,14 +667,15 @@ impl WorkerManager {
     }
 
     pub fn warm_start(&mut self) -> Result<(), WorkerError> {
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Ok(());
         }
         self.ensure_process()
     }
 
-    pub fn awaiting_initial_sandbox_state_update(&self) -> bool {
-        self.awaiting_initial_sandbox_state_update
+    fn missing_inherited_sandbox_state(&self) -> bool {
+        sandbox_plan_requests_inherited_state(&self.sandbox_plan)
+            && self.inherited_sandbox_state.is_none()
     }
 
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
@@ -2217,7 +2204,7 @@ impl WorkerManager {
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2374,7 +2361,7 @@ impl WorkerManager {
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2400,7 +2387,7 @@ impl WorkerManager {
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2432,7 +2419,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2459,7 +2446,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2476,11 +2463,11 @@ impl WorkerManager {
         Ok(())
     }
 
-    // Updates the server-side sandbox configuration. The new policy becomes
-    // effective in the worker only after the current process is recycled and a
-    // replacement worker is spawned. Session temp handling is separate: the
-    // server-owned temp dir is reset before each spawn, and today that reset
-    // reuses the same configured path in place.
+    // Replaces the inherited sandbox snapshot for this tool call. The new
+    // policy becomes effective in the worker only after the current process is
+    // recycled and a replacement worker is spawned. Session temp handling is
+    // separate: the server-owned temp dir is reset before each spawn, and
+    // today that reset reuses the same configured path in place.
     pub fn update_sandbox_state(
         &mut self,
         update: SandboxStateUpdate,
@@ -2489,10 +2476,7 @@ impl WorkerManager {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
-        let mut inherited_state = self
-            .inherited_sandbox_state
-            .clone()
-            .unwrap_or_else(|| self.sandbox_defaults.clone());
+        let mut inherited_state = self.sandbox_defaults.clone();
         inherited_state.apply_update(update);
         let resolved_state = resolve_effective_sandbox_state_with_defaults(
             &self.sandbox_plan,
@@ -2500,8 +2484,7 @@ impl WorkerManager {
             &self.sandbox_defaults,
         )
         .map_err(WorkerError::Sandbox)?;
-        let awaiting_before = self.awaiting_initial_sandbox_state_update;
-        self.awaiting_initial_sandbox_state_update = false;
+        let missing_before = self.missing_inherited_sandbox_state();
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
         self.sandbox_state = resolved_state;
@@ -2521,7 +2504,7 @@ impl WorkerManager {
             }),
         );
         if !changed {
-            if awaiting_before && self.process.is_none() {
+            if missing_before && self.process.is_none() {
                 match self.oversized_output {
                     OversizedOutputMode::Files => self.reset_output_state_files(true),
                     OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
@@ -6666,23 +6649,7 @@ mod tests {
 
     #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
-        let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
-        let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
-        let initial = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
-            }
-        })
-        .to_string();
-        unsafe {
-            std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, initial);
-        }
-
         let plan = crate::sandbox_cli::SandboxCliPlan {
             operations: vec![
                 crate::sandbox_cli::SandboxCliOperation::SetMode(
@@ -6699,6 +6666,22 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        manager
+            .update_sandbox_state(
+                SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                        writable_roots: Vec::new(),
+                        network_access: false,
+                        exclude_tmpdir_env_var: false,
+                        exclude_slash_tmp: false,
+                    },
+                    sandbox_cwd: None,
+                    use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
+                },
+                Duration::from_millis(1),
+            )
+            .expect("initial inherited sandbox state");
         let inherited_before = manager
             .inherited_sandbox_state
             .clone()
@@ -6724,15 +6707,6 @@ mod tests {
             Some(inherited_before),
             "failed updates must not mutate inherited sandbox baseline"
         );
-
-        match original_initial {
-            Some(value) => unsafe {
-                std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
-            },
-        }
     }
 
     #[test]

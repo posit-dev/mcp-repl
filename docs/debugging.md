@@ -17,10 +17,10 @@ Enable per-startup JSONL logs with either:
 
 Each startup creates a fresh session directory under that root. `mcp-repl` writes:
 
-- `events.jsonl` with startup metadata, tool calls, and sandbox custom request events
+- `events.jsonl` with startup metadata, tool calls, and parsed sandbox metadata events
 - `startup.log` for server-side startup trace lines
 - `worker-startup.log` for worker-side startup trace lines
-- `sandbox-state.jsonl` for the initial effective sandbox policy plus later sandbox policy/update payloads
+- `sandbox-state.jsonl` for the initial effective sandbox policy plus later tool-call sandbox metadata and effective policy updates
 
 Example:
 
@@ -43,7 +43,7 @@ MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --interpreter python
 
 ## MCP and sandbox tracing
 
-These switches are useful when the client is sending custom sandbox updates or when the sandbox policy is the thing you are debugging.
+These switches are useful when the client is sending Codex sandbox metadata or when the sandbox policy is the thing you are debugging.
 
 - `MCP_REPL_DEBUG_DIR=/path/to/debug-root` writes `sandbox-state.jsonl` inside the session directory
 - `MCP_REPL_KEEP_SESSION_TMPDIR=1` keeps the worker session temp directory after exit so you can inspect it

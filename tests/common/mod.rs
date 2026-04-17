@@ -15,7 +15,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientNotification, ClientRequest, CustomNotification, CustomRequest,
-    RawContent,
+    Meta, RawContent,
 };
 use rmcp::service::ServiceError;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -744,6 +744,15 @@ impl McpTestSession {
         tool: impl Into<String>,
         arguments: Value,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.call_tool_raw_with_meta(tool, arguments, None).await
+    }
+
+    pub async fn call_tool_raw_with_meta(
+        &self,
+        tool: impl Into<String>,
+        arguments: Value,
+        meta: Option<Value>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let tool = tool.into();
         let request_tool = normalize_tool_name_for_request(&tool).to_string();
         let arguments = match arguments {
@@ -756,10 +765,19 @@ impl McpTestSession {
                 )));
             }
         };
-        let request = match arguments {
+        let mut request = match arguments {
             Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
             None => CallToolRequestParams::new(request_tool),
         };
+        if let Some(meta) = meta {
+            let Value::Object(meta_map) = meta else {
+                return Err(ServiceError::McpError(rmcp::ErrorData::invalid_params(
+                    "tool metadata must be a JSON object",
+                    None,
+                )));
+            };
+            request.meta = Some(Meta(meta_map.into_iter().collect()));
+        }
 
         self.service.call_tool(request).await
     }
@@ -768,6 +786,15 @@ impl McpTestSession {
         &self,
         input: impl Into<String>,
         timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_with_meta(input, timeout, None).await
+    }
+
+    pub async fn write_stdin_raw_with_meta(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+        meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
         if !input.is_empty() && !input.ends_with('\n') {
@@ -783,7 +810,7 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_with_meta(self.repl_tool_name(), Value::Object(args), meta)
             .await
     }
 
@@ -791,6 +818,16 @@ impl McpTestSession {
         &self,
         input: impl Into<String>,
         timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_unterminated_with_meta(input, timeout, None)
+            .await
+    }
+
+    pub async fn write_stdin_raw_unterminated_with_meta(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+        meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let input = input.into();
         let timeout = normalized_test_timeout(timeout);
@@ -802,7 +839,7 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_with_meta(self.repl_tool_name(), Value::Object(args), meta)
             .await
     }
 

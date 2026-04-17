@@ -461,7 +461,7 @@ mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|pytho
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
 --oversized-output: choose oversized-output handling (pager: default legacy modal pager; files: spill oversized replies to files)\n\
---sandbox: base sandbox mode (inherit requires client sandbox update)\n\
+--sandbox: base sandbox mode (inherit requires client tool-call sandbox metadata)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\

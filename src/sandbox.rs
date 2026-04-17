@@ -17,8 +17,7 @@ use url::Url;
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
-pub const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
-pub const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
+pub const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_REPL_ALLOWED_DOMAINS";
 pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_REPL_DENIED_DOMAINS";
 #[cfg(target_os = "macos")]
@@ -27,7 +26,6 @@ pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_
 pub const R_SESSION_TMPDIR_ENV: &str = "MCP_REPL_R_SESSION_TMPDIR";
 #[cfg(target_os = "macos")]
 pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_REPL_SANDBOX_LOG_DENIALS";
-pub const INITIAL_SANDBOX_STATE_ENV: &str = "MCP_REPL_INITIAL_SANDBOX_STATE";
 #[cfg(target_os = "linux")]
 pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_REPL_USE_LINUX_BWRAP";
 #[cfg(target_os = "linux")]
@@ -412,17 +410,16 @@ pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
     }));
 }
 
-pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>) {
+pub fn log_sandbox_state_meta(meta: &serde_json::Value) {
     crate::event_log::log(
-        "sandbox_state_event_received",
+        "sandbox_state_meta_received",
         serde_json::json!({
-            "method": method,
-            "params": params,
+            "meta": meta,
         }),
     );
     append_sandbox_state_log_line(&serde_json::json!({
-        "method": method,
-        "params": params,
+        "kind": "tool-call-meta",
+        "meta": meta,
     }));
 }
 
@@ -438,15 +435,54 @@ pub struct SandboxStateUpdate {
     pub use_legacy_landlock: Option<bool>,
 }
 
-pub fn initial_sandbox_state_update() -> Option<SandboxStateUpdate> {
-    let raw = std::env::var(INITIAL_SANDBOX_STATE_ENV).ok()?;
-    match serde_json::from_str::<SandboxStateUpdate>(&raw) {
-        Ok(update) => Some(update),
-        Err(err) => {
-            eprintln!("Invalid initial sandbox state: {err}");
-            None
-        }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSandboxStateMeta {
+    pub sandbox_policy: SandboxPolicy,
+    #[serde(default)]
+    pub codex_linux_sandbox_exe: Option<PathBuf>,
+    pub sandbox_cwd: PathBuf,
+    #[serde(default)]
+    pub use_legacy_landlock: bool,
+}
+
+pub fn sandbox_state_update_from_codex_meta(
+    meta: &serde_json::Value,
+) -> Result<SandboxStateUpdate, String> {
+    let parsed = serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
+        .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?;
+
+    if !parsed.sandbox_cwd.is_absolute() {
+        return Err(format!(
+            "Codex sandbox metadata requires an absolute sandboxCwd, got: {}",
+            parsed.sandbox_cwd.display()
+        ));
     }
+
+    #[cfg(target_os = "linux")]
+    let use_linux_sandbox_bwrap = {
+        let use_bwrap = !parsed.use_legacy_landlock;
+        if use_bwrap
+            && parsed.sandbox_policy.requires_sandbox()
+            && parsed.codex_linux_sandbox_exe.is_none()
+        {
+            return Err(
+                "Codex sandbox metadata omitted codexLinuxSandboxExe for a sandboxed Linux policy"
+                    .to_string(),
+            );
+        }
+        Some(use_bwrap)
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let use_linux_sandbox_bwrap = None;
+
+    Ok(SandboxStateUpdate {
+        sandbox_policy: parsed.sandbox_policy,
+        sandbox_cwd: Some(parsed.sandbox_cwd),
+        use_linux_sandbox_bwrap,
+        use_legacy_landlock: None,
+    })
 }
 
 impl SandboxState {

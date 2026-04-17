@@ -247,11 +247,7 @@ mod unix_impl {
             "danger-full-access",
             Duration::from_secs(20),
         )?;
-        wait_for_log_contains(
-            &env.debug_dir,
-            "codex/sandbox-state/update",
-            Duration::from_secs(20),
-        )?;
+        wait_for_log_contains(&env.debug_dir, "tool-call-meta", Duration::from_secs(20))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
