@@ -236,7 +236,7 @@ Notes:
 
 Default sandbox policy is `workspace-write` with network disabled.
 Write access includes the working area and temp paths required by the worker (exact roots vary by OS/policy).
-On Windows, sandbox enforcement is still under active development and is not yet fully functional/reliable across environments.
+On Windows, the experimental R sandbox uses parent-prepared workspace ACL state plus launch-scoped session-temp ACLs. Some environments still reject the restricted-token setup required by sandboxed modes.
 
 See `docs/sandbox.md` for precise behavior, runtime updates, and OS-specific details.
 
