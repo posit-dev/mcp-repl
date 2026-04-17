@@ -99,9 +99,11 @@ fn ci_workflow_defines_dev_release_contract() {
 
     for required in [
         "publish-dev:",
-        "publish-stable:",
+        "publish-release:",
         "tags:",
-        "- 'v*.*.*'",
+        "- 'v[0-9]+.[0-9]+.[0-9]+'",
+        "- 'v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*'",
+        "- '!v*\\+*'",
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
@@ -112,13 +114,15 @@ fn ci_workflow_defines_dev_release_contract() {
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
         "gh release create \"${RELEASE_TAG}\" dist/*",
+        "github.event_name == 'pull_request'",
         "github.event_name == 'push' && github.ref == 'refs/heads/main'",
         "github.event_name == 'push' && github.ref_type == 'tag'",
-        "^v[0-9]+(\\.[0-9]+){2}$",
+        "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
         "-F draft=false",
-        "-F prerelease=false",
+        "-F prerelease=\"${prerelease_flag}\"",
+        "--prerelease",
         "make_latest=\"${latest_flag}\"",
     ] {
         assert!(
@@ -127,7 +131,13 @@ fn ci_workflow_defines_dev_release_contract() {
         );
     }
 
-    for forbidden in ["workflow_dispatch:", "stable_tag:", "backfill-stable:"] {
+    for forbidden in [
+        "workflow_dispatch:",
+        "stable_tag:",
+        "backfill-stable:",
+        "- 'v*.*.*'",
+        "publish-stable:",
+    ] {
         assert!(
             !workflow.contains(forbidden),
             "did not expect {forbidden} in .github/workflows/ci.yml"
