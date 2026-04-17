@@ -1602,7 +1602,8 @@ Sys.sleep(1)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()> {
+async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappear() -> TestResult<()>
+{
     let temp = tempdir()?;
     let session = spawn_server_with_files_env_vars(vec![(
         "TMPDIR".to_string(),
@@ -1613,6 +1614,11 @@ async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()>
     let input = r#"
 Sys.sleep(0.25)
 for (i in 1:6) {
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+flush.console()
+Sys.sleep(1)
+for (i in 7:8) {
   plot(1:10, main = sprintf("plot%03d", i))
 }
 flush.console()
@@ -1653,20 +1659,29 @@ Sys.sleep(2)
             panic!("expected extension for first image path, got: {first_image_history:?}")
         });
     let first_image_alias = bundle_dir.join(format!("images/001.{first_image_extension}"));
+    let last_image_alias = bundle_dir.join(format!("images/006.{first_image_extension}"));
     fs::remove_file(&first_image_history)?;
     fs::remove_file(&first_image_alias)?;
+    fs::remove_file(&last_image_alias)?;
 
+    sleep(Duration::from_millis(900)).await;
     let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
     let damaged_text = result_text(&damaged);
+    let damaged_images = extract_images(&damaged);
     assert_ne!(
         damaged.is_error,
         Some(true),
-        "missing anchor image poll reported an error: {}",
+        "bundle-file deletion poll reported an error: {}",
         damaged_text
     );
     assert!(
         damaged_text.contains("events.log"),
-        "expected damaged anchor poll to keep disclosing the output bundle, got: {damaged_text:?}"
+        "expected bundle-file deletion poll to keep disclosing the output bundle, got: {damaged_text:?}"
+    );
+    assert_eq!(
+        damaged_images.len(),
+        2,
+        "expected bundle-file deletion poll to keep inline preview images from memory, got {damaged_images:?}"
     );
 
     let mut settled_text = damaged_text;
@@ -1683,7 +1698,7 @@ Sys.sleep(2)
 
     assert!(
         follow_up_text.contains("[1] 2"),
-        "expected session to stay alive after anchor image deletion, got: {follow_up_text:?}"
+        "expected session to stay alive after bundle-file deletion, got: {follow_up_text:?}"
     );
 
     Ok(())

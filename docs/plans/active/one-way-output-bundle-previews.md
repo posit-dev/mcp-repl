@@ -11,7 +11,7 @@
 
 - State: active
 - Last updated: 2026-04-17
-- Current phase: planning
+- Current phase: implementation
 
 ## Current Direction
 
@@ -34,9 +34,9 @@
 
 ## Phase Status
 
-- Phase 0: active
+- Phase 0: completed
   - Define the one-way contract and the bounded in-memory preview state.
-- Phase 1: pending
+- Phase 1: completed
   - Add cached image-preview state to `ActiveOutputBundle` and remove old-image rereads from later reply rendering.
 - Phase 2: pending
   - Add cached text head/tail preview state and stop reconstructing later previews from spilled file state.
@@ -63,11 +63,10 @@
 
 ## Next Safe Slice
 
-- Add explicit preview-cache fields to `ActiveOutputBundle`.
-- Update `append_image()` to maintain first/last preview images in memory when writing new image files.
-- Change `compact_output_bundle_items()` so it renders later image previews from the in-memory cache instead of `load_output_bundle_*` disk reads.
-- Add focused unit coverage in `src/server/response.rs` that proves later reply rendering does not depend on old bundle image files remaining on disk.
-- After the image path is one-way, plan the text-preview cache slice separately inside this same document before changing text compaction behavior.
+- Decide whether the text-preview slice is needed at all.
+- If text preview caching is needed, start that slice only after confirming that the remaining text path still violates the one-way contract in a user-visible way.
+- Decide whether text preview caching is needed purely for architectural consistency or whether the current text spill path is already sufficiently one-way.
+- If text caching is needed, define the exact bounded head/tail representation before changing text compaction behavior.
 
 ## Stop Conditions
 
@@ -81,3 +80,5 @@
 - 2026-04-17: Decided that files-mode output bundles should be one-way from memory to disk. Disk is the server-owned history surface; memory owns the bounded preview needed for later replies.
 - 2026-04-17: Scoped the first implementation slice to image preview caching, because the current image bundle reply path still rereads previously written files from disk.
 - 2026-04-17: Kept the public bundle layout unchanged for this initiative so the refactor can land without redefining the client-facing files-mode contract.
+- 2026-04-17: Began the image-preview implementation by caching the first-history and latest image previews on `ActiveOutputBundle` and moving the public regression toward “later replies do not depend on old bundle image files remaining on disk”.
+- 2026-04-17: Completed the image-preview slice. Later image-bundle replies now render from cached preview images in memory instead of rereading old image files from the bundle directory.
