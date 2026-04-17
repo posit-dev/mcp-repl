@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
-const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy until an update arrives.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent before the first tool call, mcp-repl fails closed with an error.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 

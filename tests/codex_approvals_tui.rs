@@ -2,29 +2,37 @@ mod common;
 
 use common::TestResult;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod unix_impl {
     use super::{TestResult, common};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::Value;
     use std::collections::BTreeMap;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::io::{ErrorKind, Read, Write};
     use std::net::SocketAddr;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use toml_edit::DocumentMut;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use vt100::Parser;
 
     const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
     struct IsolatedCodexEnv {
@@ -64,26 +72,18 @@ mod unix_impl {
                 .await?;
         let mcp_repl = resolve_mcp_repl_path()?;
         let env = create_isolated_codex_env_for_install(&mock_server.base_url())?;
+        let sandbox_mode = codex_exec_sandbox_mode();
 
         run_mcp_repl_install_for_codex_r(&mcp_repl, &env.codex_home)?;
         assert_codex_install_wrote_r_inherit_config(&env.codex_home, &mcp_repl)?;
 
-        let prompt = INSTALL_SCRIPTED_TOOL_CALL_MARKER.to_string();
-        let shell_script = format!(
-            "codex exec --json --sandbox workspace-write --skip-git-repo-check --cd {} {}",
-            sh_single_quote(&env.workspace.display().to_string()),
-            sh_single_quote(&prompt),
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            INSTALL_SCRIPTED_TOOL_CALL_MARKER,
+            sandbox_mode,
+            Some("--json"),
         );
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
-        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
-        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("LANG", "C");
-        cmd.arg("-c");
-        cmd.arg(shell_script);
-        cmd.current_dir(&env.workspace);
 
         let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
         let stdout = String::from_utf8(output.stdout)
@@ -137,27 +137,18 @@ mod unix_impl {
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
         let mcp_repl = resolve_mcp_repl_path()?;
         let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
+        let sandbox_mode = codex_exec_sandbox_mode();
 
-        let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
-        let mode_flag = match mode {
-            ExecSnapshotMode::Json => "--json ",
-            ExecSnapshotMode::Plain => "",
-        };
-        let shell_script = format!(
-            "codex exec {mode_flag}--sandbox workspace-write --skip-git-repo-check --cd {} {}",
-            sh_single_quote(&env.workspace.display().to_string()),
-            sh_single_quote(&prompt),
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
+            sandbox_mode,
+            match mode {
+                ExecSnapshotMode::Json => Some("--json"),
+                ExecSnapshotMode::Plain => None,
+            },
         );
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
-        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
-        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("LANG", "C");
-        cmd.arg("-c");
-        cmd.arg(shell_script);
-        cmd.current_dir(&env.workspace);
 
         let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
         let stdout = String::from_utf8(output.stdout)
@@ -179,7 +170,11 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -193,6 +188,7 @@ mod unix_impl {
         render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
         if !full_access_test_enabled() {
             eprintln!(
@@ -312,6 +308,7 @@ mod unix_impl {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn full_access_test_enabled() -> bool {
         std::env::var_os(FULL_ACCESS_TEST_ENV).is_some()
     }
@@ -421,12 +418,55 @@ mod unix_impl {
         })
     }
 
+    fn codex_exec_sandbox_mode() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "danger-full-access"
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            "workspace-write"
+        }
+    }
+
+    fn codex_exec_expected_sandbox_log() -> &'static str {
+        codex_exec_sandbox_mode()
+    }
+
+    fn codex_exec_command(
+        env: &IsolatedCodexEnv,
+        base_url: &str,
+        prompt: &str,
+        sandbox_mode: &str,
+        mode_flag: Option<&str>,
+    ) -> std::process::Command {
+        let mut cmd = std::process::Command::new("codex");
+        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
+        cmd.env("CODEX_OSS_BASE_URL", base_url);
+        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "C");
+        cmd.arg("exec");
+        if let Some(flag) = mode_flag {
+            cmd.arg(flag);
+        }
+        cmd.arg("--sandbox");
+        cmd.arg(sandbox_mode);
+        cmd.arg("--skip-git-repo-check");
+        cmd.arg("--cd");
+        cmd.arg(&env.workspace);
+        cmd.arg(prompt);
+        cmd.current_dir(&env.workspace);
+        cmd
+    }
+
     fn run_command_with_timeout(
         mut cmd: std::process::Command,
         timeout: Duration,
     ) -> TestResult<std::process::Output> {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         cmd.process_group(0);
         let mut child = cmd.spawn()?;
         let mut stdout_reader = child
@@ -457,10 +497,13 @@ mod unix_impl {
                 break status;
             }
             if Instant::now() >= deadline {
-                let pid = child.id() as i32;
-                // Ensure the timeout path tears down the whole subtree (shell + codex + children).
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    let pid = child.id() as i32;
+                    // Ensure the timeout path tears down the whole subtree (codex + children).
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -663,6 +706,7 @@ mod unix_impl {
         out
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn sh_single_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -901,6 +945,7 @@ trust_level = "trusted"
             .to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn outside_workspace_probe_code() -> TestResult<String> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -926,6 +971,7 @@ tryCatch({
         .to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn normalize_screen(screen: &str) -> String {
         fn is_prompt_line(line: &str) -> bool {
             line.as_bytes().starts_with(&[0xE2, 0x80, 0xBA])
@@ -1115,6 +1161,7 @@ tryCatch({
         normalized.join("\n").trim_end().to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn scrub_seconds(line: &str) -> String {
         let mut out = String::with_capacity(line.len());
         let mut chars = line.chars().peekable();
@@ -1228,6 +1275,7 @@ tryCatch({
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn detect_cursor_request(
         chunk: &[u8],
         carry: &mut Vec<u8>,
@@ -1251,6 +1299,7 @@ tryCatch({
         carry.extend_from_slice(&data[keep..]);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct CodexPtyDriver {
         child: Box<dyn portable_pty::Child + Send>,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -1260,6 +1309,7 @@ tryCatch({
         _slave: Box<dyn portable_pty::SlavePty + Send>,
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl CodexPtyDriver {
         fn spawn(
             codex_home: &Path,
@@ -1999,6 +2049,7 @@ mod linux {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2009,6 +2060,7 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2019,11 +2071,13 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2039,6 +2093,7 @@ mod macos {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2049,6 +2104,7 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2059,11 +2115,13 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2075,8 +2133,22 @@ mod macos {
 }
 
 #[cfg(target_os = "windows")]
-#[test]
-fn codex_exec_initial_sandbox_state_windows_stub() -> TestResult<()> {
-    eprintln!("codex exec sandbox state test is not implemented on Windows; skipping");
-    Ok(())
+mod windows {
+    use super::TestResult;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
+    async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real codex binary"]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
 }

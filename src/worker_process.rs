@@ -604,39 +604,39 @@ impl WorkerManager {
     ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
+        let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
         let mut inherited_state = sandbox_defaults.clone();
         let mut inherited_update_received = false;
-        let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
             inherited_state.apply_update(update);
             inherited_update_received = true;
         }
-        let inherited = if inherited_update_received {
-            Some(&inherited_state)
-        } else if plan_requests_inherited_state {
-            Some(&sandbox_defaults)
+        let awaiting_initial_sandbox_state_update =
+            plan_requests_inherited_state && !inherited_update_received;
+        let sandbox_state = if awaiting_initial_sandbox_state_update {
+            sandbox_defaults.clone()
         } else {
-            None
+            resolve_effective_sandbox_state_with_defaults(
+                &sandbox_plan,
+                inherited_update_received.then_some(&inherited_state),
+                &sandbox_defaults,
+            )
+            .map_err(WorkerError::Sandbox)?
         };
-        let using_inherit_fallback = plan_requests_inherited_state && !inherited_update_received;
-        let sandbox_state = resolve_effective_sandbox_state_with_defaults(
-            &sandbox_plan,
-            inherited,
-            &sandbox_defaults,
-        )
-        .map_err(WorkerError::Sandbox)?;
-        crate::event_log::log_lazy("worker_manager_created", || {
-            worker_context_event_payload(backend, &sandbox_state)
-        });
-        if using_inherit_fallback {
+        if awaiting_initial_sandbox_state_update {
             crate::event_log::log(
-                "worker_sandbox_state_inherit_fallback",
+                "worker_manager_created",
                 serde_json::json!({
-                    "reason": "missing_initial_client_state",
+                    "backend": format!("{backend:?}"),
+                    "awaiting_initial_sandbox_state_update": true,
                 }),
             );
+        } else {
+            crate::event_log::log_lazy("worker_manager_created", || {
+                worker_context_event_payload(backend, &sandbox_state)
+            });
+            crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
-        crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -648,7 +648,7 @@ impl WorkerManager {
             backend,
             process: None,
             sandbox_plan,
-            awaiting_initial_sandbox_state_update: false,
+            awaiting_initial_sandbox_state_update,
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
             sandbox_state,

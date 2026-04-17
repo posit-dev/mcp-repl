@@ -79,13 +79,37 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: cargo test (skip client integrations)
+      - name: cargo test
         if: matrix.os != 'windows-2022'
-        run: cargo test -- --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
+        run: cargo test
 
-      - name: cargo test (windows serial, skip client integrations)
+      - name: cargo test (windows serial)
         if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 -- --test-threads=1 --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
+        run: cargo test -j 1 -- --test-threads=1
+
+      - name: Install Codex CLI
+        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os != 'windows-2022' }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-home: ${{ runner.temp }}/codex-action-home
+          safety-strategy: drop-sudo
+
+      - name: Install Codex CLI (windows)
+        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os == 'windows-2022' }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-home: ${{ runner.temp }}/codex-action-home
+          safety-strategy: unsafe
+
+      - name: cargo test (real codex integrations)
+        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os != 'windows-2022' }}
+        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
+
+      - name: cargo test (real codex integrations, windows serial)
+        if: ${{ secrets.OPENAI_API_KEY != '' && matrix.os == 'windows-2022' }}
+        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

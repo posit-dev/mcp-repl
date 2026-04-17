@@ -12,8 +12,8 @@ When no CLI sandbox mode is provided, the default is:
 
 When `--sandbox inherit` is used, the client must send a sandbox update
 (`codex/sandbox-state/update`) to override the worker sandbox policy for the session.
-If no update is provided, `mcp-repl` falls back to its internal default policy
-until an update arrives.
+If no update is provided before the first tool call, `mcp-repl` fails closed with
+`--sandbox inherit requested but no client sandbox state was provided`.
 
 The worker also gets a per-session temp directory, exported as:
 
