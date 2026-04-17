@@ -1,7 +1,7 @@
 mod common;
 
 use common::TestResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::env;
 use std::ffi::OsString;
@@ -14,6 +14,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_NAME: &str = "claude_live_integration";
+const INSTALL_SNAPSHOT_NAME: &str = "claude_live_install_integration";
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLAUDE_MODEL: &str = "haiku";
 const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
@@ -25,10 +26,25 @@ const CLAUDE_PROMPT: &str = "Use the mcp__r__repl tool exactly once. Send this e
 struct StagedClaudeEnv {
     _temp_dir: tempfile::TempDir,
     workspace: PathBuf,
-    home: PathBuf,
+    runtime_home: PathBuf,
     settings_path: PathBuf,
     mcp_config_path: PathBuf,
     child_env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeAuthStatus {
+    #[serde(rename = "loggedIn")]
+    logged_in: bool,
+    #[serde(rename = "apiProvider")]
+    api_provider: String,
+}
+
+#[derive(Debug)]
+struct ClaudeRuntime {
+    home: PathBuf,
+    child_env: Vec<(String, String)>,
+    settings_env: JsonMap<String, JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +104,32 @@ fn claude_live_integration() -> TestResult<()> {
     Ok(())
 }
 
+#[test]
+fn claude_live_install_integration() -> TestResult<()> {
+    if !claude_available() {
+        eprintln!("claude not found on PATH; skipping");
+        return Ok(());
+    }
+
+    let mcp_repl = resolve_mcp_repl_path()?;
+    let Some(staged) = stage_claude_install_env(&mcp_repl)? else {
+        return Ok(());
+    };
+
+    assert_installed_claude_config(&staged)?;
+
+    let snapshot = run_claude_snapshot(&staged)?;
+    let rendered = serde_json::to_string_pretty(&snapshot)?;
+    insta::assert_snapshot!(INSTALL_SNAPSHOT_NAME, rendered);
+
+    let transcript = render_transcript(&snapshot);
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(INSTALL_SNAPSHOT_NAME, transcript);
+    });
+
+    Ok(())
+}
+
 fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
     if !claude_available() {
         eprintln!("claude not found on PATH; skipping");
@@ -99,6 +141,10 @@ fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
         return Ok(None);
     };
 
+    Ok(Some(run_claude_snapshot(&staged)?))
+}
+
+fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
     let mut cmd = Command::new("claude");
     cmd.env_clear();
     if let Some(path) = env::var_os("PATH") {
@@ -107,7 +153,7 @@ fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
     if let Some(tmpdir) = env::var_os("TMPDIR") {
         cmd.env("TMPDIR", tmpdir);
     }
-    cmd.env("HOME", &staged.home);
+    cmd.env("HOME", &staged.runtime_home);
     for (key, value) in &staged.child_env {
         cmd.env(key, value);
     }
@@ -147,7 +193,8 @@ fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
         .into());
     }
 
-    parse_snapshot(stdout.trim(), &staged.workspace)
+    parse_snapshot(stdout.trim(), &staged.workspace)?
+        .ok_or_else(|| "Claude snapshot unexpectedly missing".into())
 }
 
 fn claude_available() -> bool {
@@ -268,22 +315,9 @@ fn stage_claude_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEnv>> {
     let settings_path = temp_dir.path().join("settings.json");
     let mcp_config_path = temp_dir.path().join("mcp.json");
 
-    let mut child_env = Vec::new();
-    let mut settings_env = JsonMap::new();
-
-    if let Some(api_key) = nonempty_env("ANTHROPIC_API_KEY") {
-        child_env.push(("ANTHROPIC_API_KEY".to_string(), api_key));
-    } else {
-        let host_settings_env = load_host_claude_settings_env()?;
-        let Some(bedrock_env) = stage_bedrock_env(&home, &host_settings_env)? else {
-            eprintln!("no supported Claude auth staging available; skipping");
-            return Ok(None);
-        };
-        for (key, value) in bedrock_env {
-            child_env.push((key.clone(), value.clone()));
-            settings_env.insert(key, JsonValue::String(value));
-        }
-    }
+    let Some(runtime) = resolve_claude_runtime(&home)? else {
+        return Ok(None);
+    };
 
     let settings_root = JsonValue::Object(JsonMap::from_iter([
         (
@@ -297,7 +331,7 @@ fn stage_claude_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEnv>> {
                 JsonValue::Array(vec![JsonValue::String("mcp__r__*".to_string())]),
             )])),
         ),
-        ("env".to_string(), JsonValue::Object(settings_env)),
+        ("env".to_string(), JsonValue::Object(runtime.settings_env)),
     ]));
     fs::write(
         &settings_path,
@@ -330,11 +364,203 @@ fn stage_claude_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEnv>> {
     Ok(Some(StagedClaudeEnv {
         _temp_dir: temp_dir,
         workspace,
-        home,
+        runtime_home: runtime.home,
         settings_path,
         mcp_config_path,
-        child_env,
+        child_env: runtime.child_env,
     }))
+}
+
+fn stage_claude_install_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEnv>> {
+    let temp_dir = tempfile::tempdir()?;
+    let workspace = temp_dir.path().join("workspace");
+    let home = temp_dir.path().join("home");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&home)?;
+
+    install_claude_config(mcp_repl, &home)?;
+
+    let settings_path = home.join(".claude/settings.json");
+    let mcp_config_path = home.join(".claude.json");
+    let Some(runtime) = resolve_claude_runtime(&home)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(StagedClaudeEnv {
+        _temp_dir: temp_dir,
+        workspace,
+        runtime_home: runtime.home,
+        settings_path,
+        mcp_config_path,
+        child_env: runtime.child_env,
+    }))
+}
+
+fn install_claude_config(mcp_repl: &Path, home: &Path) -> TestResult<()> {
+    let mut cmd = Command::new(mcp_repl);
+    cmd.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmpdir) = env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    cmd.env("HOME", home);
+    cmd.arg("install");
+    cmd.arg("--client");
+    cmd.arg("claude");
+    cmd.arg("--interpreter");
+    cmd.arg("r");
+
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "mcp-repl install --client claude failed with status {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status = output.status
+    )
+    .into())
+}
+
+fn resolve_claude_runtime(temp_home: &Path) -> TestResult<Option<ClaudeRuntime>> {
+    if let Some(api_key) = nonempty_env("ANTHROPIC_API_KEY") {
+        return Ok(Some(ClaudeRuntime {
+            home: temp_home.to_path_buf(),
+            child_env: vec![("ANTHROPIC_API_KEY".to_string(), api_key)],
+            settings_env: JsonMap::new(),
+        }));
+    }
+
+    let host_settings_env = load_host_claude_settings_env()?;
+    if let Some(bedrock_env) = stage_bedrock_env(temp_home, &host_settings_env)? {
+        let child_env = bedrock_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let settings_env = JsonMap::from_iter(
+            bedrock_env
+                .into_iter()
+                .map(|(key, value)| (key, JsonValue::String(value))),
+        );
+        return Ok(Some(ClaudeRuntime {
+            home: temp_home.to_path_buf(),
+            child_env,
+            settings_env,
+        }));
+    }
+
+    if claude_subscription_available()? {
+        // First-party Claude auth is tied to host-local state, so keep the config isolated by
+        // passing explicit temp settings/MCP files while running the CLI under the host home.
+        return Ok(Some(ClaudeRuntime {
+            home: host_home_dir()?,
+            child_env: Vec::new(),
+            settings_env: JsonMap::new(),
+        }));
+    }
+
+    eprintln!("no supported Claude auth staging available; skipping");
+    Ok(None)
+}
+
+fn claude_subscription_available() -> TestResult<bool> {
+    let mut cmd = Command::new("claude");
+    cmd.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmpdir) = env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    cmd.env("HOME", host_home_dir()?);
+    cmd.arg("auth");
+    cmd.arg("status");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output()?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("claude auth status stdout was not valid UTF-8: {err}"))?;
+    let status: ClaudeAuthStatus = serde_json::from_str(stdout.trim()).map_err(|err| {
+        format!("failed to parse claude auth status JSON: {err}\nstdout:\n{stdout}")
+    })?;
+    Ok(output.status.success() && status.logged_in && status.api_provider == "firstParty")
+}
+
+fn assert_installed_claude_config(staged: &StagedClaudeEnv) -> TestResult<()> {
+    let raw_config = fs::read_to_string(&staged.mcp_config_path)?;
+    let config_root: JsonValue = serde_json::from_str(&raw_config)?;
+    let servers = config_root
+        .get("mcpServers")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "installed Claude config missing mcpServers object: {}",
+                staged.mcp_config_path.display()
+            )
+        })?;
+    if servers.len() != 1 || !servers.contains_key("r") {
+        return Err(format!(
+            "expected installed Claude config to contain only the r server, found: {:?}",
+            servers.keys().collect::<Vec<_>>()
+        )
+        .into());
+    }
+
+    let args = servers
+        .get("r")
+        .and_then(|server| server.get("args"))
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "installed Claude r server missing args array".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "installed Claude args must be strings".to_string())
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_arg_pair(&args, "--sandbox", "workspace-write")?;
+    assert_arg_pair(&args, "--oversized-output", "files")?;
+    assert_arg_pair(&args, "--interpreter", "r")?;
+
+    let raw_settings = fs::read_to_string(&staged.settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&raw_settings)?;
+    let allow = settings_root
+        .get("permissions")
+        .and_then(|permissions| permissions.get("allow"))
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "installed Claude settings missing permissions.allow array: {}",
+                staged.settings_path.display()
+            )
+        })?;
+    if !allow
+        .iter()
+        .any(|value| value.as_str().is_some_and(|value| value == "mcp__r__*"))
+    {
+        return Err("installed Claude settings missing mcp__r__* permission".into());
+    }
+
+    Ok(())
+}
+
+fn assert_arg_pair(args: &[String], flag: &str, expected: &str) -> TestResult<()> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if iter.next().is_some_and(|value| value == expected) {
+                return Ok(());
+            }
+            break;
+        }
+    }
+    Err(format!("missing argument pair {flag} {expected} in {:?}", args).into())
 }
 
 fn stage_bedrock_env(

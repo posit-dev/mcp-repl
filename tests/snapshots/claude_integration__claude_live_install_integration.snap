@@ -1,0 +1,35 @@
+---
+source: tests/claude_integration.rs
+expression: rendered
+---
+{
+  "command": "$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json --tools \"\"",
+  "prompt": "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CLAUDE_MCP_OK\\n\") Then answer with exactly DONE, with no punctuation or extra text.",
+  "init": {
+    "cwd": "<WORKSPACE>",
+    "tools": [
+      "mcp__r__repl",
+      "mcp__r__repl_reset"
+    ],
+    "mcp_servers": [
+      {
+        "name": "r",
+        "status": "connected"
+      }
+    ],
+    "model": "haiku",
+    "permission_mode": "dontAsk"
+  },
+  "tool_call": {
+    "name": "mcp__r__repl",
+    "input": "cat(\"CLAUDE_MCP_OK\\n\")"
+  },
+  "tool_result": "CLAUDE_MCP_OK\n",
+  "final_text": "DONE",
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "result": "DONE",
+    "stop_reason": "end_turn"
+  }
+}
