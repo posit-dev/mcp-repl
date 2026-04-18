@@ -5315,6 +5315,10 @@ mod tests {
         reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
+    #[cfg(target_os = "linux")]
+    use crate::sandbox::sandbox_state_update_from_codex_meta;
+    #[cfg(target_os = "linux")]
+    use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
@@ -6644,6 +6648,70 @@ mod tests {
         assert!(
             text.contains("continuing without bwrap"),
             "expected fallback notice in visible output, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_stays_disabled_after_followup_codex_meta_update() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .update_sandbox_state(
+                SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                        writable_roots: Vec::new(),
+                        network_access: false,
+                        exclude_tmpdir_env_var: false,
+                        exclude_slash_tmp: false,
+                    },
+                    sandbox_cwd: Some(std::env::temp_dir()),
+                    use_linux_sandbox_bwrap: Some(true),
+                    use_legacy_landlock: None,
+                },
+                Duration::from_millis(1),
+            )
+            .expect("initial sandbox state");
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "test setup should start with bwrap enabled"
+        );
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+        assert!(retry, "expected startup failure to disable bwrap");
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            },
+            "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
+        }))
+        .expect("Codex sandbox metadata");
+        manager
+            .update_sandbox_state(update, Duration::from_millis(1))
+            .expect("follow-up sandbox state");
+
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "follow-up Codex metadata should preserve the local no-bwrap fallback"
         );
     }
 

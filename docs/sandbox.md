@@ -74,8 +74,8 @@ Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock
 - default Linux worker setup disables network unless explicitly enabled.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; client-provided
   helper executable paths are ignored.
-- inherited `useLegacyLandlock` metadata is translated onto `mcp-repl`'s
-  internal `bwrap` on/off choice.
+- Codex sandbox metadata does not control `mcp-repl`'s optional internal
+  `bwrap` stage. That remains a local best-effort setting.
 
 Optional `bwrap` stage:
 

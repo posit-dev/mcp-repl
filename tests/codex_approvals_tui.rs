@@ -1627,9 +1627,6 @@ tryCatch({
                     }
                     *text = normalize_wire_string(text, workspace, codex_home);
                 }
-                Value::Null if path.last().is_some_and(|key| key == "codexLinuxSandboxExe") => {
-                    *value = Value::String("<CODEX_LINUX_SANDBOX_EXE>".to_string());
-                }
                 Value::Null => {}
                 _ => {}
             }
@@ -1637,6 +1634,25 @@ tryCatch({
 
         let mut path = Vec::new();
         normalize_inner(value, &mut path, workspace, codex_home);
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_preserves_null_codex_linux_sandbox_exe() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "codexLinuxSandboxExe": null
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "codexLinuxSandboxExe": null
+            }),
+            "wire snapshots should preserve a null Codex Linux helper path"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

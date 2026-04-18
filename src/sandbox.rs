@@ -459,28 +459,12 @@ pub fn sandbox_state_update_from_codex_meta(
         ));
     }
 
-    #[cfg(target_os = "linux")]
-    let use_linux_sandbox_bwrap = {
-        let use_bwrap = !parsed.use_legacy_landlock;
-        if use_bwrap
-            && parsed.sandbox_policy.requires_sandbox()
-            && parsed.codex_linux_sandbox_exe.is_none()
-        {
-            return Err(
-                "Codex sandbox metadata omitted codexLinuxSandboxExe for a sandboxed Linux policy"
-                    .to_string(),
-            );
-        }
-        Some(use_bwrap)
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let use_linux_sandbox_bwrap = None;
-
     Ok(SandboxStateUpdate {
         sandbox_policy: parsed.sandbox_policy,
         sandbox_cwd: Some(parsed.sandbox_cwd),
-        use_linux_sandbox_bwrap,
+        // Codex reports how its own Linux helper is configured, but mcp-repl's
+        // optional bwrap stage is a separate local best-effort knob.
+        use_linux_sandbox_bwrap: None,
         use_legacy_landlock: None,
     })
 }
@@ -2343,6 +2327,7 @@ mod macos_denials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[cfg(target_os = "macos")]
     use std::collections::HashMap;
     use std::path::Path;
@@ -2736,52 +2721,26 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn sandbox_state_update_use_legacy_landlock_maps_to_internal_bwrap_mode() {
-        let mut state = SandboxState {
-            use_linux_sandbox_bwrap: true,
-            ..SandboxState::default()
-        };
-
-        let changed = state.apply_update(SandboxStateUpdate {
-            sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
+    fn codex_sandbox_state_meta_does_not_force_internal_linux_bwrap() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "danger-full-access"
             },
-            sandbox_cwd: None,
-            use_linux_sandbox_bwrap: None,
-            use_legacy_landlock: Some(true),
-        });
-        assert!(
-            changed,
-            "expected legacy-landlock update to modify sandbox state"
-        );
-        assert!(
-            !state.use_linux_sandbox_bwrap,
-            "legacy Landlock updates should disable mcp-repl's internal bwrap stage"
-        );
-
-        let changed = state.apply_update(SandboxStateUpdate {
-            sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
+                serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
+            } else {
+                serde_json::Value::Null
             },
-            sandbox_cwd: None,
-            use_linux_sandbox_bwrap: None,
-            use_legacy_landlock: Some(false),
-        });
+        }))
+        .expect("codex sandbox metadata");
+
         assert!(
-            changed,
-            "expected non-legacy update to modify sandbox state"
-        );
-        assert!(
-            state.use_linux_sandbox_bwrap,
-            "non-legacy updates should re-enable mcp-repl's internal bwrap stage"
+            update.use_linux_sandbox_bwrap.is_none(),
+            "Codex tool-call metadata should not force mcp-repl's internal best-effort bwrap mode"
         );
     }
 

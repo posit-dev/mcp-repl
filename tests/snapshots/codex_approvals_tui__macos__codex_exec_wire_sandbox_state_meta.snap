@@ -49,7 +49,7 @@ expression: snapshot
               "exclude_tmpdir_env_var": false,
               "exclude_slash_tmp": false
             },
-            "codexLinuxSandboxExe": "<CODEX_LINUX_SANDBOX_EXE>",
+            "codexLinuxSandboxExe": null,
             "sandboxCwd": "<WORKSPACE>",
             "useLegacyLandlock": false
           }
