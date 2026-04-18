@@ -126,7 +126,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "-F draft=false",
         "-F prerelease=\"${prerelease_flag}\"",
         "--prerelease",
-        "make_latest=\"${latest_flag}\"",
+        "-f make_latest=false",
+        "-f make_latest=\"${latest_flag}\"",
     ] {
         assert!(
             workflow.contains(required),
@@ -140,6 +141,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "backfill-stable:",
         "- 'v*.*.*'",
         "publish-stable:",
+        "-F make_latest=false",
+        "-F make_latest=\"${latest_flag}\"",
         "CODEX_VERSION:",
         "openai/codex-action",
         "secrets.OPENAI_API_KEY",
@@ -152,6 +155,58 @@ fn ci_workflow_defines_dev_release_contract() {
         assert!(
             !workflow.contains(forbidden),
             "did not expect {forbidden} in .github/workflows/ci.yml"
+        );
+    }
+}
+
+#[test]
+fn release_backfill_workflow_defines_manual_tag_publish_contract() {
+    let workflow = read(&repo_root().join(".github/workflows/release-backfill.yml"));
+
+    for required in [
+        "workflow_dispatch:",
+        "release_tag:",
+        "Existing semver tag to publish, for example v0.1.0",
+        "required: true",
+        "type: string",
+        "ubuntu-22.04",
+        "macos-15",
+        "windows-2022",
+        "ref: ${{ env.RELEASE_TAG }}",
+        "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+        "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "mcp-repl-aarch64-apple-darwin.tar.gz",
+        "mcp-repl-x86_64-pc-windows-msvc.zip",
+        "SHA256SUMS.txt",
+        "gh release upload \"${RELEASE_TAG}\" dist/* --clobber",
+        "gh release create \"${RELEASE_TAG}\" dist/*",
+        "--generate-notes",
+        "--prerelease",
+        "-f make_latest=\"${latest_flag}\"",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/release-backfill.yml"
+        );
+    }
+
+    for forbidden in [
+        "branches:",
+        "publish-dev:",
+        "group: publish-dev",
+        "refs/heads/main",
+        "github.event_name == 'push'",
+        "name: cargo check",
+        "name: cargo build\n        run: cargo build",
+        "name: cargo clippy",
+        "name: cargo test (skip client integrations)",
+        "name: cargo test (windows serial, skip client integrations)",
+        "name: cargo +nightly fmt",
+        "Install nightly rustfmt",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "did not expect {forbidden} in .github/workflows/release-backfill.yml"
         );
     }
 }

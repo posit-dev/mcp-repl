@@ -1,0 +1,214 @@
+name: Release Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing semver tag to publish, for example v0.1.0
+        required: true
+        type: string
+
+jobs:
+  checks:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_name: mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+            artifact_name: release-x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset_name: mcp-repl-aarch64-apple-darwin.tar.gz
+            artifact_name: release-aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset_name: mcp-repl-x86_64-pc-windows-msvc.zip
+            artifact_name: release-x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+          git rev-parse "refs/tags/${RELEASE_TAG}" >/dev/null
+
+      - name: Set up Rust (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Smoke test release binary
+        if: matrix.os != 'windows-2022'
+        run: ./target/release/mcp-repl --help
+
+      - name: Smoke test release binary (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          .\target\release\mcp-repl.exe --help
+
+      - name: Package release archive
+        if: matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="dist/mcp-repl-${{ matrix.target }}"
+          mkdir -p "$package_dir"
+          cp target/release/mcp-repl "$package_dir/mcp-repl"
+          cp README.md LICENSE "$package_dir/"
+          tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
+
+      - name: Package release archive (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          $packageDir = "dist/mcp-repl-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/release/mcp-repl.exe" "$packageDir/mcp-repl.exe"
+          Copy-Item "README.md" "$packageDir/README.md"
+          Copy-Item "LICENSE" "$packageDir/LICENSE"
+          Push-Location "dist"
+          Compress-Archive -Path "mcp-repl-${{ matrix.target }}" -DestinationPath "${{ matrix.asset_name }}" -Force
+          Pop-Location
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish-release:
+    name: publish-release
+    needs: checks
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Validate release tag
+        id: release_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release tag must be final semver like v0.1.0 or prerelease semver like v0.1.0-rc1" >&2
+            exit 1
+          fi
+          git rev-parse "refs/tags/${RELEASE_TAG}" >/dev/null
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify packaged asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_assets=(
+            mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+            mcp-repl-aarch64-apple-darwin.tar.gz
+            mcp-repl-x86_64-pc-windows-msvc.zip
+          )
+          for asset in "${expected_assets[@]}"; do
+            test -f "dist/$asset"
+          done
+          actual_count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$actual_count" = "3"
+
+      - name: Write SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              mcp-repl-x86_64-unknown-linux-gnu.tar.gz \
+              mcp-repl-aarch64-apple-darwin.tar.gz \
+              mcp-repl-x86_64-pc-windows-msvc.zip \
+              > SHA256SUMS.txt
+          )
+
+      - name: Decide whether this tag should be latest
+        id: latest_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.release_tag.outputs.prerelease }}" = "true" ]; then
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest_final_tag="$(git tag --list 'v*.*.*' | grep -E '^v[0-9]+(\.[0-9]+){2}$' | sort -V | tail -n 1)"
+          if [ "$newest_final_tag" = "${RELEASE_TAG}" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update tag release
+        shell: bash
+        run: |
+          set -euo pipefail
+          prerelease_flag="${{ steps.release_tag.outputs.prerelease }}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)"
+            latest_flag=false
+            if [ "${{ steps.latest_guard.outputs.is_latest }}" = "true" ]; then
+              latest_flag=true
+            fi
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -F tag_name="${RELEASE_TAG}" \
+              -F name="${RELEASE_TAG}" \
+              -F draft=false \
+              -F prerelease="${prerelease_flag}" \
+              -f make_latest="${latest_flag}" \
+              >/dev/null
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            latest_args=("--latest=false")
+            prerelease_args=()
+            if [ "${{ steps.latest_guard.outputs.is_latest }}" = "true" ]; then
+              latest_args=("--latest")
+            fi
+            if [ "${prerelease_flag}" = "true" ]; then
+              prerelease_args=("--prerelease")
+            fi
+            gh release create "${RELEASE_TAG}" dist/* --title "${RELEASE_TAG}" --generate-notes "${prerelease_args[@]}" "${latest_args[@]}"
+          fi

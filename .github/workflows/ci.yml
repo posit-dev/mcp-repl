@@ -284,7 +284,7 @@ jobs:
               -F body=@RELEASE_NOTES.md \
               -F draft=false \
               -F prerelease=true \
-              -F make_latest=false \
+              -f make_latest=false \
               >/dev/null
           else
             gh api \
@@ -297,7 +297,7 @@ jobs:
               -F body=@RELEASE_NOTES.md \
               -F draft=false \
               -F prerelease=true \
-              -F make_latest=false \
+              -f make_latest=false \
               >/dev/null
           fi
 
@@ -408,7 +408,7 @@ jobs:
               -F name="${RELEASE_TAG}" \
               -F draft=false \
               -F prerelease="${prerelease_flag}" \
-              -F make_latest="${latest_flag}" \
+              -f make_latest="${latest_flag}" \
               >/dev/null
             gh release upload "${RELEASE_TAG}" dist/* --clobber
           else
