@@ -170,19 +170,29 @@ impl SharedServer {
             let raw_input = input;
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
-            let sandbox_state_result = match &sandbox_state_update {
-                Ok(update) => {
-                    // A timed-out request still owns empty-input polls and busy
-                    // follow-ups. Don't let newer sandbox metadata tear down
-                    // that worker before the in-flight request settles.
-                    if state.worker.pending_request() {
-                        Ok(())
-                    } else {
-                        SharedServer::apply_tool_call_sandbox_state(state, update.clone())
+            let sandbox_state_result = if raw_input.is_empty() {
+                // Empty-input polls do not execute fresh code. Let the worker
+                // drain pending output or report the current state without
+                // interpreting per-tool-call sandbox metadata.
+                Ok(())
+            } else {
+                // A timed-out request still owns busy follow-ups, but a fresh
+                // non-empty call after that request has already settled must
+                // run under the current tool call's sandbox metadata.
+                state.worker.refresh_timeout_marker();
+                match &sandbox_state_update {
+                    Ok(update) => {
+                        if state.worker.pending_request() {
+                            Ok(())
+                        } else {
+                            SharedServer::apply_tool_call_sandbox_state(state, update.clone())
+                        }
                     }
+                    Err(WorkerError::Sandbox(message)) => {
+                        Err(WorkerError::Sandbox(message.clone()))
+                    }
+                    Err(err) => Err(WorkerError::Sandbox(err.to_string())),
                 }
-                Err(WorkerError::Sandbox(message)) => Err(WorkerError::Sandbox(message.clone())),
-                Err(err) => Err(WorkerError::Sandbox(err.to_string())),
             };
             if let Err(err) = sandbox_state_result {
                 let pending_request_after = state.worker.pending_request();

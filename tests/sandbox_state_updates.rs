@@ -185,6 +185,14 @@ flush.console()
 "#
 }
 
+fn timeout_then_done_code() -> &'static str {
+    r#"
+Sys.sleep(0.2)
+cat("DONE\n")
+flush.console()
+"#
+}
+
 fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
     let mut sessions = fs::read_dir(debug_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -364,6 +372,48 @@ async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResu
     assert!(
         poll_text.contains("TAIL"),
         "expected empty poll to continue draining the original request, got: {poll_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-settle-fresh-call")?;
+    let target = scratch.path().join("fresh-call-write.txt");
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_done_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("WRITE_OK"),
+        "expected fresh follow-up call to apply current sandbox metadata, got: {second_text}"
+    );
+    assert!(
+        !second_text.contains("WRITE_ERROR:"),
+        "did not expect stale settled timeout state to keep the old sandbox, got: {second_text}"
     );
     session.cancel().await?;
     Ok(())

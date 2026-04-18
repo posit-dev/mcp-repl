@@ -2946,6 +2946,10 @@ impl WorkerManager {
         self.resolve_timeout_marker_with_wait(Duration::from_millis(0));
     }
 
+    pub fn refresh_timeout_marker(&mut self) {
+        self.resolve_timeout_marker();
+    }
+
     fn resolve_timeout_marker_with_wait(&mut self, wait: Duration) {
         if !self.pending_request {
             return;
