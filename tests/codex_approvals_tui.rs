@@ -56,6 +56,79 @@ mod unix_impl {
         run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Plain).await
     }
 
+    pub(super) async fn run_codex_exec_wire_sandbox_state_meta() -> TestResult<String> {
+        if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
+            return Ok(String::new());
+        }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(String::new());
+        }
+        let Some(python_program) = common::python_program() else {
+            eprintln!("python not found on PATH; skipping");
+            return Ok(String::new());
+        };
+
+        let tool_args = tool_args_for_code(&sandbox_run_code());
+        let mock_server =
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let trace_script = resolve_trace_script_path()?;
+        let env = create_isolated_codex_env_with_trace(
+            &mcp_repl,
+            &trace_script,
+            python_program,
+            &mock_server.base_url(),
+        )?;
+        let sandbox_mode = codex_exec_sandbox_mode();
+
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
+            sandbox_mode,
+            None,
+        );
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        let outputs = mock_server.function_call_outputs().await;
+        if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
+            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            return Ok(String::new());
+        }
+        if !output.status.success() {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "codex exec failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
+        let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
+        if !saw_write_ok {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected workspace-write call to succeed\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
+
+        render_wire_snapshot(&env.debug_dir, &env.workspace, &env.codex_home)
+    }
+
     pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         if !codex_available() {
             eprintln!("codex not found on PATH; skipping");
@@ -403,6 +476,23 @@ mod unix_impl {
     ) -> TestResult<IsolatedCodexEnv> {
         create_isolated_codex_env_with_config(|workspace| {
             codex_config(mcp_repl, workspace, openai_base_url)
+        })
+    }
+
+    fn create_isolated_codex_env_with_trace(
+        mcp_repl: &Path,
+        trace_script: &Path,
+        python_program: &str,
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_traced_config(
+                mcp_repl,
+                trace_script,
+                python_program,
+                workspace,
+                openai_base_url,
+            )
         })
     }
 
@@ -900,6 +990,52 @@ trust_level = "trusted"
         )
     }
 
+    fn codex_traced_config(
+        mcp_repl: &Path,
+        trace_script: &Path,
+        python_program: &str,
+        repo_root: &Path,
+        openai_base_url: &str,
+    ) -> String {
+        let python_program = toml_escape(python_program);
+        let trace_script = toml_escape(&trace_script.display().to_string());
+        let mcp_repl = toml_escape(&mcp_repl.display().to_string());
+        let repo_root = toml_escape(&repo_root.display().to_string());
+        let openai_base_url = toml_escape(openai_base_url);
+        format!(
+            r#"model_provider = "mock-openai"
+disable_paste_burst = true
+project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[notice]
+hide_full_access_warning = true
+
+[tui]
+alternate_screen = "never"
+animations = false
+
+[features]
+steer = true
+remote_models = true
+responses_websockets = false
+
+[mcp_servers.r]
+command = "{python_program}"
+args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit"]
+env_vars = ["MCP_REPL_DEBUG_DIR"]
+[projects."{repo_root}"]
+trust_level = "trusted"
+"#,
+        )
+    }
+
     fn codex_install_base_config(repo_root: &Path, openai_base_url: &str) -> String {
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
@@ -966,6 +1102,17 @@ tryCatch({
             "input": format!("{r_code}\n"),
         })
         .to_string()
+    }
+
+    fn resolve_trace_script_path() -> TestResult<PathBuf> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("mcp-stdio-trace.py");
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!("missing trace proxy script at {}", path.display()).into())
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1270,6 +1417,226 @@ tryCatch({
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn latest_wire_log_path(debug_dir: &Path) -> Option<PathBuf> {
+        let mut sessions = std::fs::read_dir(debug_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions.last().map(|session| session.join("wire.jsonl"))
+    }
+
+    fn render_wire_snapshot(
+        debug_dir: &Path,
+        workspace: &Path,
+        codex_home: &Path,
+    ) -> TestResult<String> {
+        let wire_path = latest_wire_log_path(debug_dir)
+            .ok_or_else(|| "missing wire.jsonl trace output".to_string())?;
+        let contents = std::fs::read_to_string(&wire_path)?;
+        let frames = extract_wire_messages(&contents)?;
+
+        let initialize_request = frames
+            .iter()
+            .find(|(stream, message)| *stream == "stdin" && message["method"] == "initialize")
+            .map(|(_, message)| message.clone())
+            .ok_or_else(|| format!("missing initialize request in {}", wire_path.display()))?;
+        let initialize_id = initialize_request.get("id").cloned();
+        let initialize_response = matching_response(&frames, initialize_id.as_ref(), |message| {
+            message
+                .get("result")
+                .and_then(|result| result.get("capabilities"))
+                .is_some()
+        })
+        .ok_or_else(|| format!("missing initialize response in {}", wire_path.display()))?;
+
+        let tools_call_request = frames
+            .iter()
+            .find(|(stream, message)| *stream == "stdin" && message["method"] == "tools/call")
+            .map(|(_, message)| message.clone())
+            .ok_or_else(|| format!("missing tools/call request in {}", wire_path.display()))?;
+        let tools_call_id = tools_call_request.get("id").cloned();
+        let tools_call_response = matching_response(&frames, tools_call_id.as_ref(), |message| {
+            message
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .is_some()
+        })
+        .ok_or_else(|| format!("missing tools/call response in {}", wire_path.display()))?;
+
+        let mut snapshot = serde_json::json!({
+            "client_to_server": {
+                "initialize": simplify_wire_request(&initialize_request),
+                "tools_call": simplify_wire_request(&tools_call_request),
+            },
+            "server_to_client": {
+                "initialize": simplify_wire_response(&initialize_response),
+                "tools_call": simplify_wire_response(&tools_call_response),
+            }
+        });
+        normalize_wire_snapshot_value(&mut snapshot, workspace, codex_home);
+        Ok(serde_json::to_string_pretty(&snapshot)?)
+    }
+
+    fn extract_wire_messages(contents: &str) -> TestResult<Vec<(String, Value)>> {
+        let mut frames = Vec::new();
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let record: Value = serde_json::from_str(line)?;
+            if record["event"] != "stream_chunk" {
+                continue;
+            }
+            let Some(stream) = record
+                .get("payload")
+                .and_then(|payload| payload.get("stream"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if stream != "stdin" && stream != "stdout" {
+                continue;
+            }
+            let Some(text_as_json) = record
+                .get("payload")
+                .and_then(|payload| payload.get("text_as_json"))
+            else {
+                continue;
+            };
+            match text_as_json {
+                Value::Array(items) => {
+                    for item in items {
+                        if item.is_object() {
+                            frames.push((stream.to_string(), item.clone()));
+                        }
+                    }
+                }
+                Value::Object(_) => frames.push((stream.to_string(), text_as_json.clone())),
+                _ => {}
+            }
+        }
+        Ok(frames)
+    }
+
+    fn matching_response(
+        frames: &[(String, Value)],
+        expected_id: Option<&Value>,
+        fallback: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        if let Some(expected_id) = expected_id
+            && let Some(message) = frames.iter().find_map(|(stream, message)| {
+                (*stream == "stdout" && message.get("id") == Some(expected_id))
+                    .then_some(message.clone())
+            })
+        {
+            return Some(message);
+        }
+        frames.iter().find_map(|(stream, message)| {
+            (*stream == "stdout" && fallback(message)).then_some(message.clone())
+        })
+    }
+
+    fn simplify_wire_request(message: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": message.get("jsonrpc").cloned().unwrap_or(Value::Null),
+            "method": message.get("method").cloned().unwrap_or(Value::Null),
+            "params": message.get("params").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    fn simplify_wire_response(message: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": message.get("jsonrpc").cloned().unwrap_or(Value::Null),
+            "result": message.get("result").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    fn normalize_wire_snapshot_value(value: &mut Value, workspace: &Path, codex_home: &Path) {
+        fn path_matches(path: &[String], suffix: &[&str]) -> bool {
+            path.len() >= suffix.len()
+                && path[path.len() - suffix.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+
+        fn normalize_wire_string(text: &str, workspace: &Path, codex_home: &Path) -> String {
+            let mut normalized = normalize_temp_paths(&normalize_codex_home_path(text));
+            let workspace_display = workspace.display().to_string();
+            let workspace_private = format!("/private{workspace_display}");
+            let codex_home_display = codex_home.display().to_string();
+            let codex_home_private = format!("/private{codex_home_display}");
+            for (needle, replacement) in [
+                (&workspace_private, "<WORKSPACE>"),
+                (&workspace_display, "<WORKSPACE>"),
+                (&codex_home_private, "<CODEX_HOME>"),
+                (&codex_home_display, "<CODEX_HOME>"),
+            ] {
+                normalized = normalized.replace(needle, replacement);
+            }
+            normalized
+        }
+
+        fn normalize_inner(
+            value: &mut Value,
+            path: &mut Vec<String>,
+            workspace: &Path,
+            codex_home: &Path,
+        ) {
+            match value {
+                Value::Object(map) => {
+                    let original = std::mem::take(map);
+                    for (key, mut child) in original {
+                        let normalized_key = normalize_wire_string(&key, workspace, codex_home);
+                        path.push(normalized_key.clone());
+                        normalize_inner(&mut child, path, workspace, codex_home);
+                        path.pop();
+                        map.insert(normalized_key, child);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        path.push("[]".to_string());
+                        normalize_inner(item, path, workspace, codex_home);
+                        path.pop();
+                    }
+                }
+                Value::String(text) => {
+                    if path_matches(path, &["clientInfo", "version"])
+                        || path_matches(path, &["serverInfo", "version"])
+                    {
+                        *text = "<VERSION>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "session_id") {
+                        *text = "<SESSION_ID>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "turn_id") {
+                        *text = "<TURN_ID>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "sandbox") {
+                        *text = "<SANDBOX_BACKEND>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "codexLinuxSandboxExe") {
+                        *text = "<CODEX_LINUX_SANDBOX_EXE>".to_string();
+                        return;
+                    }
+                    *text = normalize_wire_string(text, workspace, codex_home);
+                }
+                Value::Null if path.last().is_some_and(|key| key == "codexLinuxSandboxExe") => {
+                    *value = Value::String("<CODEX_LINUX_SANDBOX_EXE>".to_string());
+                }
+                Value::Null => {}
+                _ => {}
+            }
+        }
+
+        let mut path = Vec::new();
+        normalize_inner(value, &mut path, workspace, codex_home);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2066,6 +2433,16 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_wire_sandbox_state_meta", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
@@ -2102,6 +2479,16 @@ mod macos {
             return Ok(());
         }
         insta::assert_snapshot!("codex_exec_initial_sandbox_state_plain", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_wire_sandbox_state_meta", snapshot);
         Ok(())
     }
 
