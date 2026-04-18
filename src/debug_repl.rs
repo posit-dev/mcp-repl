@@ -107,6 +107,7 @@ pub(crate) fn run(
                 server_timeout,
                 None,
                 false,
+                false,
             );
             render_visible_reply(
                 response.as_mut(),
@@ -145,6 +146,7 @@ pub(crate) fn run(
             server_timeout,
             None,
             false,
+            false,
         );
         render_visible_reply(
             response.as_mut(),
@@ -178,6 +180,7 @@ fn wait_for_initial_prompt(
         server_timeout,
         None,
         false,
+        false,
     )?;
     while !reply_has_prompt(&last_reply) && Instant::now() < deadline {
         thread::sleep(INITIAL_PROMPT_POLL_INTERVAL);
@@ -186,6 +189,7 @@ fn wait_for_initial_prompt(
             DEFAULT_WRITE_STDIN_TIMEOUT,
             server_timeout,
             None,
+            false,
             false,
         )?;
     }

@@ -33,6 +33,8 @@ use crate::sandbox_cli::{
 };
 use crate::worker_process::{WorkerError, WorkerManager};
 
+const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
+
 #[cfg(test)]
 fn repl_tool_description_for_backend(
     backend: Backend,
@@ -111,7 +113,14 @@ impl SharedServer {
         &self,
         meta: &Meta,
     ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
-        if !self.accepts_sandbox_state_meta() {
+        Self::sandbox_state_update_for_tool_call_meta(self.accepts_sandbox_state_meta(), meta)
+    }
+
+    fn sandbox_state_update_for_tool_call_meta(
+        accepts_sandbox_state_meta: bool,
+        meta: &Meta,
+    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
+        if !accepts_sandbox_state_meta {
             return Ok(None);
         }
 
@@ -164,34 +173,44 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let sandbox_state_update = self.sandbox_state_update_for_tool_call(&meta);
+        let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
         self.run_state(move |state| {
             let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
             let raw_input = input;
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
+            state.worker.refresh_timeout_marker();
+            let parse_tool_call_sandbox_state = || {
+                SharedServer::sandbox_state_update_for_tool_call_meta(
+                    accepts_sandbox_state_meta,
+                    &meta,
+                )
+            };
             let sandbox_state_result = if raw_input.is_empty() {
-                // Empty-input polls do not execute fresh code. Let the worker
-                // drain pending output or report the current state without
-                // interpreting per-tool-call sandbox metadata.
-                Ok(())
+                // Empty-input polls may need the current tool call's metadata
+                // only when they must spawn a worker to answer the call.
+                match state.worker.empty_input_requires_spawn() {
+                    Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
+                        SharedServer::apply_tool_call_sandbox_state(state, update)
+                    }),
+                    Ok(false) => Ok(()),
+                    Err(err) => Err(err),
+                }
             } else {
                 // A timed-out request still owns busy follow-ups, but a fresh
                 // non-empty call after that request has already settled must
                 // run under the current tool call's sandbox metadata.
-                state.worker.refresh_timeout_marker();
-                match &sandbox_state_update {
-                    Ok(update) => {
-                        if state.worker.pending_request() {
-                            Ok(())
-                        } else {
-                            SharedServer::apply_tool_call_sandbox_state(state, update.clone())
-                        }
-                    }
-                    Err(WorkerError::Sandbox(message)) => {
-                        Err(WorkerError::Sandbox(message.clone()))
-                    }
-                    Err(err) => Err(WorkerError::Sandbox(err.to_string())),
+                if state.worker.pending_request() {
+                    state
+                        .worker
+                        .refresh_timeout_marker_with_wait(BUSY_FOLLOW_UP_RECHECK_WAIT);
+                }
+                if state.worker.pending_request() {
+                    Ok(())
+                } else {
+                    parse_tool_call_sandbox_state().and_then(|update| {
+                        SharedServer::apply_tool_call_sandbox_state(state, update)
+                    })
                 }
             };
             if let Err(err) = sandbox_state_result {
@@ -216,6 +235,7 @@ impl SharedServer {
                 server_timeout,
                 None,
                 false,
+                true,
             );
             let pending_request_after = state.worker.pending_request();
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();

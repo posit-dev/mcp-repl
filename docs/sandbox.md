@@ -16,12 +16,14 @@ truth for the tool call that is about to run. If it is missing or malformed,
 `mcp-repl` fails closed with
 `--sandbox inherit requested but no client sandbox state was provided`.
 
-For `repl`, empty-input polls are an exception: they do not execute new code, so
-they ignore per-call sandbox metadata and continue draining the existing timed-out
-request. Non-empty `repl` calls resolve any stale timeout marker first, then apply
-the current call's sandbox metadata before executing fresh code. If a timed-out
-request is still genuinely in flight, follow-up calls continue servicing that
-request instead of switching sandboxes mid-flight.
+For `repl`, empty-input polls ignore per-call sandbox metadata when they can be
+answered from existing state, such as draining a timed-out request or returning an
+idle prompt from an already-running worker. If an empty-input call must spawn a
+worker to answer the call, `mcp-repl` applies the current tool call's sandbox
+metadata before that spawn. Non-empty `repl` calls resolve any stale timeout
+marker first, then apply the current call's sandbox metadata before executing
+fresh code. If a timed-out request is still genuinely in flight, follow-up calls
+continue servicing that request instead of switching sandboxes mid-flight.
 
 The worker also gets a per-session temp directory, exported as:
 

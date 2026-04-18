@@ -67,7 +67,7 @@
 - `mcp-repl` now advertises `codex/sandbox-state-meta` only when `--sandbox inherit` is configured.
 - `repl_reset` derives inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]`.
 - Non-empty `repl` calls derive inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]` before executing fresh code.
-- Empty-input `repl` polls do not execute new code and ignore per-call sandbox metadata while draining the existing timed-out request.
+- Empty-input `repl` polls ignore per-call sandbox metadata when they can be answered from existing state, but they still apply the current tool call's metadata before spawning a worker to answer an idle call on a fresh session.
 - When a prior timed-out request has already settled, `mcp-repl` resolves the stale timeout marker before deciding whether a new non-empty `repl` call is still just a busy follow-up.
 - Missing or malformed metadata fails closed with the existing inherit error path.
 - Explicit non-`inherit` sandbox modes ignore Codex metadata.
@@ -85,7 +85,7 @@
 
 - Current Codex source and live traces both showed the old async update protocol was obsolete for the current release line.
 - The migration stayed intentionally single-path: no compatibility layer for older Codex builds.
-- Follow-up review fixes tightened the runtime sequencing so sandbox metadata is applied only for fresh execution, not for empty-input polls that are only draining prior output.
+- Follow-up review fixes tightened the runtime sequencing so sandbox metadata is applied only for fresh execution or worker spawn, not for empty-input polls that are only draining prior output or using an already-running idle session.
 
 ## Decision Log
 
@@ -93,4 +93,4 @@
 - 2026-04-17: Locked `--sandbox inherit` to remain fail-closed. Missing or malformed Codex sandbox metadata must reject the tool call.
 - 2026-04-17: Chose per-tool-call `_meta["codex/sandbox-state-meta"]` as the source of truth after inspecting current Codex source and live traces.
 - 2026-04-17: Completed the repo migration and verification against the real current Codex integration tests.
-- 2026-04-18: Clarified the shipped contract for `repl`: empty-input polls ignore per-call sandbox metadata, while fresh non-empty calls resolve stale timeout markers and then apply the current call's sandbox metadata before executing new code.
+- 2026-04-18: Clarified the shipped contract for `repl`: empty-input polls ignore per-call sandbox metadata only when they can be answered from existing state, while fresh non-empty calls resolve stale timeout markers and then apply the current call's sandbox metadata before executing new code.

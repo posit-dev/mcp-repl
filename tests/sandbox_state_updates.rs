@@ -193,6 +193,16 @@ flush.console()
 "#
 }
 
+fn timeout_then_done_code_after(wait_secs: f64) -> String {
+    format!(
+        r#"
+Sys.sleep({wait_secs:.3})
+cat("DONE\n")
+flush.console()
+"#
+    )
+}
+
 fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
     let mut sessions = fs::read_dir(debug_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -310,6 +320,32 @@ async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("<<repl status: idle>>"),
+        "expected empty inherit repl call with metadata to return idle status, got: {text}"
+    );
+    assert!(
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect empty inherit repl call with metadata to fail closed, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_follow_up_ignores_new_state_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
@@ -416,6 +452,53 @@ async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles(
         "did not expect stale settled timeout state to keep the old sandbox, got: {second_text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> TestResult<()> {
+    let _guard = test_guard();
+    for delay_ms in [90_u64, 100, 110, 120, 130, 140, 150, 160] {
+        let scratch = repo_scratch_dir(&format!("sandbox-busy-recheck-{delay_ms}"))?;
+        let target = scratch
+            .path()
+            .join(format!("stale-follow-up-{delay_ms}.txt"));
+        let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+        let first = session
+            .write_stdin_raw_with_meta(
+                timeout_then_done_code_after(0.22),
+                Some(0.05),
+                Some(workspace_write_meta(scratch.path())),
+            )
+            .await?;
+        let first_text = collect_text(&first);
+        if backend_unavailable(&first_text) {
+            eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+        let second = session
+            .write_stdin_raw_with_meta(
+                write_file_code(&target)?,
+                Some(10.0),
+                Some(read_only_meta(scratch.path())),
+            )
+            .await?;
+        let second_text = collect_text(&second);
+        assert!(
+            !second_text.contains("WRITE_OK"),
+            "did not expect stale sandbox execution after busy follow-up at delay {delay_ms}ms, got: {second_text}"
+        );
+        assert!(
+            !target.exists(),
+            "did not expect follow-up to create {} at delay {delay_ms}ms",
+            target.display()
+        );
+        session.cancel().await?;
+    }
     Ok(())
 }
 

@@ -689,8 +689,39 @@ impl WorkerManager {
         self.pending_request
     }
 
+    pub fn refresh_timeout_marker_with_wait(&mut self, wait: Duration) {
+        self.resolve_timeout_marker_with_wait(wait);
+    }
+
+    pub fn empty_input_requires_spawn(&mut self) -> Result<bool, WorkerError> {
+        if self.empty_input_uses_existing_state() {
+            return Ok(false);
+        }
+        let needs_spawn = match self.process.as_mut() {
+            Some(process) => !process.is_running()?,
+            None => true,
+        };
+        Ok(needs_spawn)
+    }
+
     pub fn detached_prefix_item_count(&self) -> usize {
         self.last_detached_prefix_item_count
+    }
+
+    fn empty_input_uses_existing_state(&self) -> bool {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_request
+                    || self.pending_output_tape.has_pending()
+                    || self.settled_pending_completion.is_some()
+            }
+            OversizedOutputMode::Pager => {
+                self.pending_request
+                    || self.output.has_pending_output()
+                    || self.settled_pending_completion.is_some()
+                    || self.pager.is_active()
+            }
+        }
     }
 
     fn reset_preserving_detached_prefix_item_count(&mut self) -> Result<(), WorkerError> {
@@ -717,17 +748,22 @@ impl WorkerManager {
         server_timeout: Duration,
         page_bytes_override: Option<u64>,
         echo_input: bool,
+        pending_state_prechecked: bool,
     ) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.write_stdin_files(text, worker_timeout, server_timeout)
-            }
+            OversizedOutputMode::Files => self.write_stdin_files(
+                text,
+                worker_timeout,
+                server_timeout,
+                pending_state_prechecked,
+            ),
             OversizedOutputMode::Pager => self.write_stdin_pager(
                 text,
                 worker_timeout,
                 server_timeout,
                 page_bytes_override,
                 echo_input,
+                pending_state_prechecked,
             ),
         }
     }
@@ -738,6 +774,7 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
+        pending_state_prechecked: bool,
     ) -> Result<WorkerReply, WorkerError> {
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
@@ -750,8 +787,12 @@ impl WorkerManager {
                 return Ok(control_reply);
             }
             let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
-            let remaining_reply =
-                self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout)?;
+            let remaining_reply = self.write_stdin_files(
+                remaining.to_string(),
+                worker_timeout,
+                server_timeout,
+                false,
+            )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
@@ -775,16 +816,12 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_files();
-            let reply = self.build_reply_from_worker_error_files(&err, input_context);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
+        let empty_input = text.is_empty();
         self.maybe_emit_guardrail_notice();
-        self.resolve_timeout_marker();
-        if text.is_empty() {
+        if !pending_state_prechecked {
+            self.resolve_timeout_marker();
+        }
+        if empty_input {
             if self.pending_request
                 || self.pending_output_tape.has_pending()
                 || self.settled_pending_completion.is_some()
@@ -794,21 +831,35 @@ impl WorkerManager {
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
+            if let Err(err) = self.ensure_process() {
+                let input_context = self.prepare_input_context_files();
+                let reply = self.build_reply_from_worker_error_files(&err, input_context);
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
             let reply = self.build_idle_poll_reply_files();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
-        if !text.is_empty() && self.pending_request {
+        if !pending_state_prechecked && self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
-        if !text.is_empty() && self.pending_request {
+        if self.pending_request {
             let mut reply = self.poll_pending_output_files(worker_timeout)?;
             let detached_prefix_item_count = match &reply.reply {
                 WorkerReply::Output { contents, .. } => contents.len(),
             };
             self.last_detached_prefix_item_count = detached_prefix_item_count;
             mark_busy_follow_up_reply(&mut reply.reply);
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        if let Err(err) = self.ensure_process() {
+            let input_context = self.prepare_input_context_files();
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -838,6 +889,7 @@ impl WorkerManager {
         server_timeout: Duration,
         page_bytes_override: Option<u64>,
         echo_input: bool,
+        pending_state_prechecked: bool,
     ) -> Result<WorkerReply, WorkerError> {
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
@@ -856,6 +908,7 @@ impl WorkerManager {
                 server_timeout,
                 page_bytes_override,
                 echo_input,
+                false,
             )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
@@ -900,7 +953,9 @@ impl WorkerManager {
         if empty_input {
             self.output.start_capture();
             self.maybe_emit_guardrail_notice();
-            self.resolve_timeout_marker();
+            if !pending_state_prechecked {
+                self.resolve_timeout_marker();
+            }
             if self.pending_request
                 || self.output.has_pending_output()
                 || self.settled_pending_completion.is_some()
@@ -929,7 +984,9 @@ impl WorkerManager {
         if !empty_input {
             self.output.start_capture();
             self.maybe_emit_guardrail_notice();
-            self.resolve_timeout_marker();
+            if !pending_state_prechecked {
+                self.resolve_timeout_marker();
+            }
         }
         if empty_input {
             let reply = self.build_idle_poll_reply_pager();
@@ -937,7 +994,7 @@ impl WorkerManager {
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
-        if self.pending_request {
+        if !pending_state_prechecked && self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
         if self.pending_request {
@@ -5969,6 +6026,7 @@ mod tests {
                 Duration::ZERO,
                 None,
                 false,
+                false,
             )
             .expect("reply");
 
@@ -6424,6 +6482,7 @@ mod tests {
                 Duration::from_millis(0),
                 Some(16),
                 true,
+                false,
             )
             .expect("empty poll reply");
 
@@ -6474,6 +6533,7 @@ mod tests {
                 Duration::from_millis(0),
                 Some(16),
                 true,
+                false,
             )
             .expect("empty pager reply");
         let WorkerReply::Output { contents, .. } = reply;
@@ -6529,6 +6589,7 @@ mod tests {
                 Duration::from_millis(0),
                 Some(256),
                 true,
+                false,
             )
             .expect("empty poll reply");
         let WorkerReply::Output { contents, .. } = reply;
