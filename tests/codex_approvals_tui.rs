@@ -1562,11 +1562,11 @@ tryCatch({
         }
 
         fn normalize_wire_string(text: &str, workspace: &Path, codex_home: &Path) -> String {
-            let mut normalized = normalize_temp_paths(&normalize_codex_home_path(text));
             let workspace_display = workspace.display().to_string();
             let workspace_private = format!("/private{workspace_display}");
             let codex_home_display = codex_home.display().to_string();
             let codex_home_private = format!("/private{codex_home_display}");
+            let mut normalized = text.to_string();
             for (needle, replacement) in [
                 (&workspace_private, "<WORKSPACE>"),
                 (&workspace_display, "<WORKSPACE>"),
@@ -1575,7 +1575,7 @@ tryCatch({
             ] {
                 normalized = normalized.replace(needle, replacement);
             }
-            normalized
+            normalize_temp_paths(&normalize_codex_home_path(&normalized))
         }
 
         fn normalize_inner(

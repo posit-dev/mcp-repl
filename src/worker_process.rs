@@ -6665,22 +6665,25 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Files,
         )
         .expect("worker manager");
-        manager
-            .update_sandbox_state(
-                SandboxStateUpdate {
-                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                        writable_roots: Vec::new(),
-                        network_access: false,
-                        exclude_tmpdir_env_var: false,
-                        exclude_slash_tmp: false,
-                    },
-                    sandbox_cwd: Some(std::env::temp_dir()),
-                    use_linux_sandbox_bwrap: Some(true),
-                    use_legacy_landlock: None,
-                },
-                Duration::from_millis(1),
-            )
-            .expect("initial sandbox state");
+        let mut inherited_state = manager.sandbox_defaults.clone();
+        inherited_state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: Some(std::env::temp_dir()),
+            use_linux_sandbox_bwrap: Some(true),
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_state.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_state),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial sandbox state");
         assert!(
             manager.sandbox_state.use_linux_sandbox_bwrap,
             "test setup should start with bwrap enabled"
@@ -6734,26 +6737,25 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Files,
         )
         .expect("worker manager");
-        manager
-            .update_sandbox_state(
-                SandboxStateUpdate {
-                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                        writable_roots: Vec::new(),
-                        network_access: false,
-                        exclude_tmpdir_env_var: false,
-                        exclude_slash_tmp: false,
-                    },
-                    sandbox_cwd: None,
-                    use_linux_sandbox_bwrap: None,
-                    use_legacy_landlock: None,
-                },
-                Duration::from_millis(1),
-            )
-            .expect("initial inherited sandbox state");
-        let inherited_before = manager
-            .inherited_sandbox_state
-            .clone()
-            .expect("inherited state should be present");
+        let mut inherited_before = manager.sandbox_defaults.clone();
+        inherited_before.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: None,
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_before.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_before),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial inherited sandbox state");
 
         let err = manager
             .update_sandbox_state(
