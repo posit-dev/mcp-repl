@@ -595,6 +595,12 @@ pub struct WorkerManager {
     guardrail: GuardrailShared,
 }
 
+struct PreparedSandboxStateUpdate {
+    update_for_log: serde_json::Value,
+    changed: bool,
+    missing_before: bool,
+}
+
 impl WorkerManager {
     pub fn new(
         backend: Backend,
@@ -2468,11 +2474,10 @@ impl WorkerManager {
     // recycled and a replacement worker is spawned. Session temp handling is
     // separate: the server-owned temp dir is reset before each spawn, and
     // today that reset reuses the same configured path in place.
-    pub fn update_sandbox_state(
+    fn prepare_sandbox_state_update(
         &mut self,
         update: SandboxStateUpdate,
-        timeout: Duration,
-    ) -> Result<bool, WorkerError> {
+    ) -> Result<PreparedSandboxStateUpdate, WorkerError> {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
@@ -2495,16 +2500,47 @@ impl WorkerManager {
             // picks up the updated sandbox state.
             self.windows_sandbox_launch = None;
         }
+        Ok(PreparedSandboxStateUpdate {
+            update_for_log,
+            changed,
+            missing_before,
+        })
+    }
+
+    fn log_sandbox_state_update(
+        prepared: &PreparedSandboxStateUpdate,
+        timeout: Option<Duration>,
+        respawned: bool,
+    ) {
         crate::event_log::log(
             "worker_sandbox_state_update",
             serde_json::json!({
-                "changed": changed,
-                "timeout_ms": timeout.as_millis(),
-                "update": update_for_log,
+                "changed": prepared.changed,
+                "timeout_ms": timeout.map(|timeout| timeout.as_millis()),
+                "respawned": respawned,
+                "update": prepared.update_for_log,
             }),
         );
-        if !changed {
-            if missing_before && self.process.is_none() {
+    }
+
+    pub fn stage_sandbox_state_update(
+        &mut self,
+        update: SandboxStateUpdate,
+    ) -> Result<(), WorkerError> {
+        let prepared = self.prepare_sandbox_state_update(update)?;
+        Self::log_sandbox_state_update(&prepared, None, false);
+        Ok(())
+    }
+
+    pub fn update_sandbox_state(
+        &mut self,
+        update: SandboxStateUpdate,
+        timeout: Duration,
+    ) -> Result<bool, WorkerError> {
+        let prepared = self.prepare_sandbox_state_update(update)?;
+        let mut respawned = false;
+        if !prepared.changed {
+            if prepared.missing_before && self.process.is_none() {
                 match self.oversized_output {
                     OversizedOutputMode::Files => self.reset_output_state_files(true),
                     OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
@@ -2513,9 +2549,10 @@ impl WorkerManager {
                     OversizedOutputMode::Files => self.spawn_process_files()?,
                     OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
                 });
-                return Ok(true);
+                respawned = true;
             }
-            return Ok(false);
+            Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
+            return Ok(respawned);
         }
 
         if let Some(process) = self.process.take() {
@@ -2529,7 +2566,9 @@ impl WorkerManager {
             OversizedOutputMode::Files => self.spawn_process_files()?,
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
-        Ok(true)
+        respawned = true;
+        Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
+        Ok(respawned)
     }
 
     fn reset_output_state_files(&mut self, clear_pending_output: bool) {

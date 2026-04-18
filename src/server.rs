@@ -143,6 +143,17 @@ impl SharedServer {
         Ok(())
     }
 
+    fn stage_tool_call_sandbox_state_for_reset(
+        state: &mut ServerState,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+
+        state.worker.stage_sandbox_state_update(update)
+    }
+
     /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
     /// The response layer needs `pending_request` after the worker call to decide transcript reuse.
     async fn run_write_input(
@@ -160,7 +171,16 @@ impl SharedServer {
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
             let sandbox_state_result = match &sandbox_state_update {
-                Ok(update) => SharedServer::apply_tool_call_sandbox_state(state, update.clone()),
+                Ok(update) => {
+                    // A timed-out request still owns empty-input polls and busy
+                    // follow-ups. Don't let newer sandbox metadata tear down
+                    // that worker before the in-flight request settles.
+                    if state.worker.pending_request() {
+                        Ok(())
+                    } else {
+                        SharedServer::apply_tool_call_sandbox_state(state, update.clone())
+                    }
+                }
                 Err(WorkerError::Sandbox(message)) => Err(WorkerError::Sandbox(message.clone())),
                 Err(err) => Err(WorkerError::Sandbox(err.to_string())),
             };
@@ -348,9 +368,10 @@ macro_rules! define_backend_tool_server {
                     .shared
                     .run_state(move |state| {
                         let sandbox_state_result = match &sandbox_state_update {
-                            Ok(update) => {
-                                SharedServer::apply_tool_call_sandbox_state(state, update.clone())
-                            }
+                            Ok(update) => SharedServer::stage_tool_call_sandbox_state_for_reset(
+                                state,
+                                update.clone(),
+                            ),
                             Err(WorkerError::Sandbox(message)) => {
                                 Err(WorkerError::Sandbox(message.clone()))
                             }

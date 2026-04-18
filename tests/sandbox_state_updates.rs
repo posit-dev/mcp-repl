@@ -5,6 +5,7 @@ mod common;
 use common::{McpTestSession, TestResult};
 use rmcp::model::{CallToolResult, RawContent};
 use serde_json::{Value, json};
+use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +145,63 @@ async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     .await
 }
 
+async fn spawn_inherit_server_with_env(
+    cwd: &Path,
+    env: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        env,
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_files_server(
+    cwd: &Path,
+    env: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ],
+        env,
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+fn timeout_then_tail_code() -> &'static str {
+    r#"
+Sys.sleep(0.2)
+cat("MID\n")
+flush.console()
+Sys.sleep(1.0)
+cat("TAIL\n")
+flush.console()
+"#
+}
+
+fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
+    let mut sessions = fs::read_dir(debug_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    let session_dir = sessions
+        .last()
+        .cloned()
+        .ok_or_else(|| "missing debug session directory".to_string())?;
+    let log_text = fs::read_to_string(session_dir.join("events.jsonl"))?;
+    Ok(log_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<()> {
     let _guard = test_guard();
@@ -238,6 +296,74 @@ async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() ->
     assert!(
         !text.contains("2"),
         "did not expect successful evaluation, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_follow_up_ignores_new_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta("1+1", Some(0.1), Some(full_access_meta(temp.path())))
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("[repl] input discarded while worker busy"),
+        "expected busy follow-up to preserve the pending request, got: {second_text}"
+    );
+    assert!(
+        !second_text.contains("[1] 2"),
+        "did not expect changed metadata to start a fresh request, got: {second_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let poll = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(full_access_meta(temp.path())))
+        .await?;
+    let poll_text = collect_text(&poll);
+    assert!(
+        poll_text.contains("TAIL"),
+        "expected empty poll to continue draining the original request, got: {poll_text}"
     );
     session.cancel().await?;
     Ok(())
@@ -458,5 +584,47 @@ async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
         "expected repl_reset with sandbox metadata to succeed, got: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_repl_reset_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_reset",
+            json!({}),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected repl_reset with sandbox metadata to succeed, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let saw_restart = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_restart_begin");
+    assert!(saw_restart, "expected repl_reset to emit a restart event");
+    let saw_spawn = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_spawn_begin");
+    assert!(
+        !saw_spawn,
+        "did not expect repl_reset to spawn a worker just to stage sandbox metadata"
+    );
     Ok(())
 }
