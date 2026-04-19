@@ -185,6 +185,7 @@ impl SharedServer {
                     &meta,
                 )
             };
+            let mut suppress_session_end_reset = false;
             let (sandbox_state_result, local_error_is_mcp_error) = if raw_input.is_empty() {
                 // Empty-input polls only skip metadata when they are truly
                 // draining existing output. In pager mode, empty input can
@@ -192,7 +193,16 @@ impl SharedServer {
                 // inherit metadata until a later worker interaction.
                 let needs_post_poll_reset = state.worker.empty_input_may_auto_reset_after_poll();
                 if state.worker.empty_input_uses_local_pager_state() {
-                    (Ok(None), false)
+                    (
+                        match parse_tool_call_sandbox_state() {
+                            Ok(update) => Ok(update),
+                            Err(_) => {
+                                suppress_session_end_reset = true;
+                                Ok(None)
+                            }
+                        },
+                        false,
+                    )
                 } else {
                     match state.worker.empty_input_requires_spawn() {
                         Ok(true) => (
@@ -205,7 +215,10 @@ impl SharedServer {
                         Ok(false) if needs_post_poll_reset => (
                             match parse_tool_call_sandbox_state() {
                                 Ok(update) => Ok(update),
-                                Err(_) => Ok(None),
+                                Err(_) => {
+                                    suppress_session_end_reset = true;
+                                    Ok(None)
+                                }
                             },
                             false,
                         ),
@@ -222,7 +235,16 @@ impl SharedServer {
                 if is_bare_interrupt_input(&raw_input)
                     || is_pure_local_pager_input(state, &raw_input)
                 {
-                    (Ok(None), false)
+                    (
+                        match parse_tool_call_sandbox_state() {
+                            Ok(update) => Ok(update),
+                            Err(_) => {
+                                suppress_session_end_reset = true;
+                                Ok(None)
+                            }
+                        },
+                        false,
+                    )
                 } else {
                     let local_pager_follow_up = input_uses_local_pager_state(state, &raw_input);
                     (
@@ -261,6 +283,7 @@ impl SharedServer {
                 WriteStdinOptions {
                     pending_state_prechecked: true,
                     deferred_sandbox_state_update,
+                    suppress_session_end_reset,
                     ..WriteStdinOptions::default()
                 },
             );

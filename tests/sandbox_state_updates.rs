@@ -1114,6 +1114,189 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_respawn_stale_worker()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-empty-poll-session-end-missing-meta")?;
+    let home_dir = tempdir()?;
+    let startup_target = home_dir.path().join("startup-spawn.txt");
+    let encoded_target = encode_path(&startup_target)?;
+    fs::write(
+        home_dir.path().join(".Rprofile"),
+        format!(
+            "invisible(suppressWarnings(tryCatch({{ writeLines(\"startup\", {encoded_target}) }}, error = function(e) NULL)))\n"
+        ),
+    )?;
+
+    let session =
+        spawn_inherit_files_server(scratch.path(), home_env_vars(home_dir.path())).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            "Sys.sleep(0.2)\nquit(\"no\")",
+            Some(0.05),
+            Some(full_access_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(&startup_target);
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let drained = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let drained_text = common::result_text(&drained);
+    assert!(
+        drained_text.contains("session ended")
+            || drained_text.contains("ipc disconnected while waiting for request completion"),
+        "expected timed-out quit request to end the session on the draining poll, got: {drained_text}"
+    );
+    assert!(
+        !startup_target.exists(),
+        "did not expect a draining poll without metadata to respawn a stale worker"
+    );
+
+    let prompt = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let prompt_text = common::result_text(&prompt);
+    session.cancel().await?;
+
+    assert!(
+        prompt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected the next empty poll to fail closed once a new worker spawn was required, got: {prompt_text}"
+    );
+    assert_eq!(
+        prompt.is_error,
+        Some(true),
+        "expected the spawn-needed follow-up poll without metadata to set isError, got: {:?}",
+        prompt.is_error
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_meta() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-bare-interrupt-session-end-meta")?;
+    let home_dir = tempdir()?;
+    let startup_target = home_dir.path().join("startup-spawn.txt");
+    let encoded_target = encode_path(&startup_target)?;
+    fs::write(
+        home_dir.path().join(".Rprofile"),
+        format!(
+            "invisible(suppressWarnings(tryCatch({{ writeLines(\"startup\", {encoded_target}) }}, error = function(e) NULL)))\n"
+        ),
+    )?;
+
+    let session =
+        spawn_inherit_files_server(scratch.path(), home_env_vars(home_dir.path())).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            "Sys.sleep(0.2)\nquit(\"no\")",
+            Some(0.05),
+            Some(full_access_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(&startup_target);
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let interrupt = session
+        .write_stdin_raw_with_meta("\u{3}", Some(2.0), Some(read_only_meta(scratch.path())))
+        .await?;
+    let interrupt_text = common::result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "did not expect bare interrupt with current metadata to fail closed, got: {interrupt_text}"
+    );
+
+    let prompt = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let prompt_text = common::result_text(&prompt);
+    session.cancel().await?;
+
+    assert!(
+        prompt_text.contains("<<repl status: idle>>"),
+        "expected bare interrupt to let the session respawn under the current metadata, got: {prompt_text}"
+    );
+    assert!(
+        !startup_target.exists(),
+        "expected bare interrupt respawn to honor the current read-only metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_does_not_respawn_stale_worker()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-bare-interrupt-session-end-missing-meta")?;
+    let home_dir = tempdir()?;
+    let startup_target = home_dir.path().join("startup-spawn.txt");
+    let encoded_target = encode_path(&startup_target)?;
+    fs::write(
+        home_dir.path().join(".Rprofile"),
+        format!(
+            "invisible(suppressWarnings(tryCatch({{ writeLines(\"startup\", {encoded_target}) }}, error = function(e) NULL)))\n"
+        ),
+    )?;
+
+    let session =
+        spawn_inherit_files_server(scratch.path(), home_env_vars(home_dir.path())).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            "Sys.sleep(0.2)\nquit(\"no\")",
+            Some(0.05),
+            Some(full_access_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(&startup_target);
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(2.0)).await?;
+    let interrupt_text = common::result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "did not expect bare interrupt without metadata to fail closed, got: {interrupt_text}"
+    );
+    assert!(
+        !startup_target.exists(),
+        "did not expect bare interrupt without metadata to respawn a stale worker"
+    );
+
+    let prompt = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let prompt_text = common::result_text(&prompt);
+    session.cancel().await?;
+
+    assert!(
+        prompt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected the next empty poll to fail closed once a new worker spawn was required, got: {prompt_text}"
+    );
+    assert_eq!(
+        prompt.is_error,
+        Some(true),
+        "expected the spawn-needed poll after bare interrupt without metadata to set isError, got: {:?}",
+        prompt.is_error
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles() -> TestResult<()>
 {
     let _guard = test_guard();

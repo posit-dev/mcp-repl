@@ -534,6 +534,7 @@ pub(crate) struct WriteStdinOptions {
     pub echo_input: bool,
     pub pending_state_prechecked: bool,
     pub deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+    pub suppress_session_end_reset: bool,
 }
 
 impl WriteStdinOptions {
@@ -543,6 +544,7 @@ impl WriteStdinOptions {
             echo_input: self.echo_input,
             pending_state_prechecked: false,
             deferred_sandbox_state_update,
+            suppress_session_end_reset: false,
         }
     }
 }
@@ -824,6 +826,18 @@ impl WorkerManager {
         Ok(())
     }
 
+    fn maybe_reset_after_session_end_with_options(
+        &mut self,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<(), WorkerError> {
+        self.stage_deferred_sandbox_state_before_session_end_reset(deferred_sandbox_state_update)?;
+        if !suppress_session_end_reset {
+            self.maybe_reset_after_session_end();
+        }
+        Ok(())
+    }
+
     fn apply_deferred_sandbox_state_update(
         &mut self,
         update: Option<SandboxStateUpdate>,
@@ -902,6 +916,7 @@ impl WorkerManager {
     ) -> Result<WorkerReply, WorkerError> {
         let pending_state_prechecked = options.pending_state_prechecked;
         let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
+        let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
@@ -913,7 +928,11 @@ impl WorkerManager {
                 }
             };
             let control_reply = match control {
-                WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
+                WriteStdinControlAction::Interrupt => self.interrupt(
+                    worker_timeout,
+                    remaining_sandbox_state_update.clone(),
+                    suppress_session_end_reset,
+                ),
                 WriteStdinControlAction::Restart => self.restart(worker_timeout),
             }?;
             if remaining.is_empty() {
@@ -945,7 +964,7 @@ impl WorkerManager {
             let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let _ = self.reset_preserving_detached_prefix_item_count();
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
 
@@ -960,23 +979,23 @@ impl WorkerManager {
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_files(worker_timeout)?;
-                self.stage_deferred_sandbox_state_before_session_end_reset(
-                    deferred_sandbox_state_update,
-                )?;
                 let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
+                self.maybe_reset_after_session_end_with_options(
+                    deferred_sandbox_state_update,
+                    suppress_session_end_reset,
+                )?;
                 return Ok(reply);
             }
             if let Err(err) = self.ensure_process() {
                 let input_context = self.prepare_input_context_files();
                 let reply = self.build_reply_from_worker_error_files(&err, input_context);
                 let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
+                self.maybe_reset_after_session_end_with_options(None, false)?;
                 return Ok(reply);
             }
             let reply = self.build_idle_poll_reply_files();
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
         if !pending_state_prechecked && self.pending_request {
@@ -990,7 +1009,7 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = detached_prefix_item_count;
             mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
         self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
@@ -998,7 +1017,7 @@ impl WorkerManager {
             let input_context = self.prepare_input_context_files();
             let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
 
@@ -1015,7 +1034,7 @@ impl WorkerManager {
         };
         let reply = self.build_reply_from_request_files(request, input_context)?;
         let reply = self.finalize_reply(reply);
-        self.maybe_reset_after_session_end();
+        self.maybe_reset_after_session_end_with_options(None, false)?;
         Ok(reply)
     }
 
@@ -1030,6 +1049,7 @@ impl WorkerManager {
         let echo_input = options.echo_input;
         let pending_state_prechecked = options.pending_state_prechecked;
         let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
+        let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
@@ -1041,7 +1061,11 @@ impl WorkerManager {
                 }
             };
             let control_reply = match control {
-                WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
+                WriteStdinControlAction::Interrupt => self.interrupt(
+                    worker_timeout,
+                    remaining_sandbox_state_update.clone(),
+                    suppress_session_end_reset,
+                ),
                 WriteStdinControlAction::Restart => self.restart(worker_timeout),
             }?;
             if remaining.is_empty() {
@@ -1074,7 +1098,7 @@ impl WorkerManager {
             let preserve_pager = self.pager.is_active();
             let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
 
@@ -1085,7 +1109,10 @@ impl WorkerManager {
             if trimmed.is_empty() || trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
                     let reply = self.finalize_reply(reply);
-                    self.maybe_reset_after_session_end();
+                    self.maybe_reset_after_session_end_with_options(
+                        deferred_sandbox_state_update,
+                        suppress_session_end_reset,
+                    )?;
                     return Ok(reply);
                 }
             } else {
@@ -1105,18 +1132,21 @@ impl WorkerManager {
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
-                self.stage_deferred_sandbox_state_before_session_end_reset(
-                    deferred_sandbox_state_update,
-                )?;
                 let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
+                self.maybe_reset_after_session_end_with_options(
+                    deferred_sandbox_state_update,
+                    suppress_session_end_reset,
+                )?;
                 return Ok(reply);
             }
             if self.pager.is_active()
                 && let Some(reply) = self.handle_pager_command(&text)
             {
                 let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
+                self.maybe_reset_after_session_end_with_options(
+                    deferred_sandbox_state_update,
+                    suppress_session_end_reset,
+                )?;
                 return Ok(reply);
             }
         }
@@ -1125,7 +1155,7 @@ impl WorkerManager {
             let input_context = self.prepare_input_context_pager(&text, echo_input);
             let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
         if !empty_input {
@@ -1138,7 +1168,7 @@ impl WorkerManager {
         if empty_input {
             let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
         if !pending_state_prechecked && self.pending_request {
@@ -1152,7 +1182,7 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = detached_prefix_item_count;
             mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(None, false)?;
             return Ok(reply);
         }
         self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
@@ -1172,7 +1202,7 @@ impl WorkerManager {
         };
         let reply = self.build_reply_from_request_pager(request, input_context, page_bytes)?;
         let reply = self.finalize_reply(reply);
-        self.maybe_reset_after_session_end();
+        self.maybe_reset_after_session_end_with_options(None, false)?;
         Ok(reply)
     }
 
@@ -2291,21 +2321,41 @@ impl WorkerManager {
         }
     }
 
-    pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    pub fn interrupt(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
-            OversizedOutputMode::Files => self.interrupt_files(timeout),
-            OversizedOutputMode::Pager => self.interrupt_pager(timeout),
+            OversizedOutputMode::Files => self.interrupt_files(
+                timeout,
+                deferred_sandbox_state_update,
+                suppress_session_end_reset,
+            ),
+            OversizedOutputMode::Pager => self.interrupt_pager(
+                timeout,
+                deferred_sandbox_state_update,
+                suppress_session_end_reset,
+            ),
         }
     }
 
-    fn interrupt_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    fn interrupt_files(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        self.ensure_process()?;
+        if self.pending_request {
+            self.ensure_process()?;
+        }
         if self.pending_request
             && let Err(err) = self.driver.interrupt(
                 self.process
@@ -2336,7 +2386,10 @@ impl WorkerManager {
                 append_prompt_if_missing(contents, Some(prompt));
             }
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(
+                deferred_sandbox_state_update,
+                suppress_session_end_reset,
+            )?;
             return Ok(reply);
         }
 
@@ -2403,10 +2456,15 @@ impl WorkerManager {
                 "session_end": session_end,
             }),
         );
-        Ok(self.finalize_reply(ReplyWithOffset {
+        let reply = self.finalize_reply(ReplyWithOffset {
             reply,
             end_offset: 0,
-        }))
+        });
+        self.maybe_reset_after_session_end_with_options(
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+        )?;
+        Ok(reply)
     }
 
     pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
@@ -2439,14 +2497,21 @@ impl WorkerManager {
         Ok(self.finalize_reply(reply))
     }
 
-    fn interrupt_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    fn interrupt_pager(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        self.ensure_process()?;
+        if self.pending_request {
+            self.ensure_process()?;
+        }
         if self.pending_request
             && let Err(err) = self.driver.interrupt(
                 self.process
@@ -2481,7 +2546,10 @@ impl WorkerManager {
                 }
             }
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            self.maybe_reset_after_session_end_with_options(
+                deferred_sandbox_state_update,
+                suppress_session_end_reset,
+            )?;
             return Ok(reply);
         }
 
@@ -2570,7 +2638,12 @@ impl WorkerManager {
                 "session_end": session_end,
             }),
         );
-        Ok(self.finalize_reply(ReplyWithOffset { reply, end_offset }))
+        let reply = self.finalize_reply(ReplyWithOffset { reply, end_offset });
+        self.maybe_reset_after_session_end_with_options(
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+        )?;
+        Ok(reply)
     }
 
     fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
