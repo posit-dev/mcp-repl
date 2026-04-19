@@ -283,6 +283,12 @@ impl ResponseState {
         }
     }
 
+    /// Returns a local pre-execution error without disturbing any active timeout-bundle state.
+    pub(crate) fn finalize_local_error(&mut self, err: WorkerError) -> CallToolResult {
+        eprintln!("worker write stdin error: {err}");
+        finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
+    }
+
     /// Materializes a worker reply inline without applying files-mode bundle compaction.
     pub(crate) fn materialize_worker_result_inline(
         &mut self,

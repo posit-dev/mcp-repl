@@ -14,6 +14,10 @@ use tempfile::{Builder, TempDir, tempdir};
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 const MISSING_INHERITED_STATE_MESSAGE: &str =
     "--sandbox inherit requested but no client sandbox state was provided";
+const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
+const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
+const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -98,6 +102,18 @@ fn full_access_meta(sandbox_cwd: &Path) -> Value {
 
 fn encode_path(path: &Path) -> TestResult<String> {
     Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
+}
+
+fn bundle_transcript_path(text: &str) -> Option<std::path::PathBuf> {
+    disclosed_path(text, "transcript.txt")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<std::path::PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(std::path::PathBuf::from(&text[start..end]))
 }
 
 fn outside_workspace_target(label: &str) -> TestResult<std::path::PathBuf> {
@@ -227,6 +243,33 @@ cat("DONE\n")
 flush.console()
 "#
     )
+}
+
+fn timeout_then_large_completion_code() -> &'static str {
+    Box::leak(
+        format!(
+            "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             cat('FIRST_START\\n'); \
+             cat(small); \
+             cat('\\nFIRST_END\\n'); \
+             flush.console(); \
+             Sys.sleep(0.5); \
+             cat('SECOND_START\\n'); \
+             cat(big); \
+             cat('\\nSECOND_END\\n'); \
+             flush.console()"
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn test_delay_ms(default_ms: u64, windows_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(if cfg!(windows) {
+        windows_ms
+    } else {
+        default_ms
+    })
 }
 
 fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
@@ -452,6 +495,73 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the first under-threshold timeout reply to disclose a bundle path, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(test_delay_ms(600, 900)).await;
+
+    let metadata_error = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let metadata_error_text = common::result_text(&metadata_error);
+    assert!(
+        metadata_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error, got: {metadata_error_text}"
+    );
+
+    let mut final_text = String::new();
+    for _ in 0..10 {
+        let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+        final_text = common::result_text(&final_poll);
+        if !final_text.contains("<<repl status: busy") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let transcript_path = bundle_transcript_path(&final_text).unwrap_or_else(|| {
+        panic!(
+            "expected preserved timeout state to disclose a transcript path on the later poll, got: {final_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+        "expected the preserved timeout bundle to backfill the first timed-out chunk, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+        "expected the preserved timeout bundle to include the later completion chunk, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
@@ -493,6 +603,66 @@ async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> Te
         "expected prompt after pager quit, got: {quit_text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let interrupt_error = session
+        .write_stdin_raw_with_meta(
+            "\u{3}cat('AFTER_INTERRUPT\\n')",
+            Some(0.1),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let interrupt_error_text = common::result_text(&interrupt_error);
+    assert!(
+        interrupt_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after local interrupt, got: {interrupt_error_text}"
+    );
+
+    let mut recovery_text = String::new();
+    for _ in 0..20 {
+        let recovery = session
+            .write_stdin_raw_with_meta("1+1", Some(0.5), Some(workspace_write_meta(temp.path())))
+            .await?;
+        recovery_text = common::result_text(&recovery);
+        if !recovery_text.contains("[repl] input discarded while worker busy")
+            && !recovery_text.contains("<<repl status: busy")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    session.cancel().await?;
+
+    assert!(
+        !recovery_text.contains("[repl] input discarded while worker busy")
+            && !recovery_text.contains("<<repl status: busy"),
+        "expected the pending request to be interrupted before the metadata error returned, got: {recovery_text}"
+    );
+    assert!(
+        recovery_text.contains("[1] 2"),
+        "expected the next valid call to run after the interrupt side effect, got: {recovery_text}"
+    );
     Ok(())
 }
 

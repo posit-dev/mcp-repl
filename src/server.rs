@@ -183,6 +183,7 @@ impl SharedServer {
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
             state.worker.refresh_timeout_marker();
+            let mut control_input_on_meta_error = None;
             let parse_tool_call_sandbox_state = || {
                 SharedServer::sandbox_state_update_for_tool_call_meta(
                     accepts_sandbox_state_meta,
@@ -223,33 +224,24 @@ impl SharedServer {
                             WriteStdinControlAction::Restart => true,
                         };
                         if needs_deferred_update {
-                            match parse_tool_call_sandbox_state() {
-                                Ok(update) => {
-                                    deferred_sandbox_state_update = update;
-                                }
-                                Err(err) => {
-                                    return {
-                                        let pending_request_after = state.worker.pending_request();
-                                        let detached_prefix_item_count =
-                                            state.worker.detached_prefix_item_count();
-                                        let mut result = finalize_visible_reply(
-                                            state,
-                                            Err(err),
-                                            pending_request_after,
-                                            TimeoutBundleReuse::None,
-                                            detached_prefix_item_count,
-                                            use_inline_pager_materialization
-                                                && !pending_request_after
-                                                && !state.response.has_timeout_bundle_state(),
-                                        );
-                                        strip_text_stream_meta(&mut result);
-                                        result
-                                    };
-                                }
+                            control_input_on_meta_error = Some(match control {
+                                WriteStdinControlAction::Interrupt => "\u{3}".to_string(),
+                                WriteStdinControlAction::Restart => "\u{4}".to_string(),
+                            });
+                            if let Err(err) = parse_tool_call_sandbox_state().map(|update| {
+                                control_input_on_meta_error = None;
+                                deferred_sandbox_state_update = update;
+                            }) {
+                                Err(err)
+                            } else {
+                                Ok(deferred_sandbox_state_update)
                             }
+                        } else {
+                            Ok(deferred_sandbox_state_update)
                         }
+                    } else {
+                        Ok(deferred_sandbox_state_update)
                     }
-                    Ok(deferred_sandbox_state_update)
                 } else if state
                     .worker
                     .nonexecuting_follow_up_uses_existing_state(&raw_input)
@@ -270,18 +262,18 @@ impl SharedServer {
             let deferred_sandbox_state_update = match sandbox_state_result {
                 Ok(update) => update,
                 Err(err) => {
-                    let pending_request_after = state.worker.pending_request();
-                    let detached_prefix_item_count = state.worker.detached_prefix_item_count();
-                    let mut result = finalize_visible_reply(
-                        state,
-                        Err(err),
-                        pending_request_after,
-                        TimeoutBundleReuse::None,
-                        detached_prefix_item_count,
-                        use_inline_pager_materialization
-                            && !pending_request_after
-                            && !state.response.has_timeout_bundle_state(),
-                    );
+                    if let Some(control_input) = control_input_on_meta_error.take() {
+                        let _ = state.worker.write_stdin(
+                            control_input,
+                            worker_timeout,
+                            server_timeout,
+                            WriteStdinOptions {
+                                pending_state_prechecked: true,
+                                ..WriteStdinOptions::default()
+                            },
+                        );
+                    }
+                    let mut result = state.response.finalize_local_error(err);
                     strip_text_stream_meta(&mut result);
                     return result;
                 }
@@ -467,15 +459,7 @@ macro_rules! define_backend_tool_server {
                             Err(err) => Err(WorkerError::Sandbox(err.to_string())),
                         };
                         if let Err(err) = sandbox_state_result {
-                            let pending_request_after = state.worker.pending_request();
-                            let mut result = finalize_visible_reply(
-                                state,
-                                Err(err),
-                                pending_request_after,
-                                TimeoutBundleReuse::None,
-                                0,
-                                true,
-                            );
+                            let mut result = state.response.finalize_local_error(err);
                             strip_text_stream_meta(&mut result);
                             return result;
                         }

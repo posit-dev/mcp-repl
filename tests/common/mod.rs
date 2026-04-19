@@ -956,7 +956,7 @@ impl McpSnapshot {
                 ));
                 out.push('\n');
                 out.push_str("response:\n");
-                let response = normalize_snapshot_response(&step.response);
+                let response = normalize_snapshot_response(&step.response, &step.call);
                 out.push_str(&pretty_json(
                     &serde_json::to_value(&response)
                         .unwrap_or_else(|_| json!({"error":"serialize outcome"})),
@@ -980,7 +980,7 @@ impl McpSnapshot {
                     out.push('\n');
                 }
 
-                let response = normalize_snapshot_response(&step.response);
+                let response = normalize_snapshot_response(&step.response, &step.call);
                 let is_error = snapshot_response_is_error(&response);
                 let (call_desc, input_lines) = format_snapshot_call(&step.call);
 
@@ -1005,20 +1005,86 @@ impl McpSnapshot {
     }
 }
 
-fn normalize_snapshot_response(response: &SnapshotResponse) -> SnapshotResponse {
+fn normalize_snapshot_response(
+    response: &SnapshotResponse,
+    call: &SnapshotCall,
+) -> SnapshotResponse {
     match response {
         SnapshotResponse::ToolResult(result) => {
+            let mut content = result
+                .content
+                .iter()
+                .map(normalize_snapshot_content)
+                .collect::<Vec<_>>();
+            maybe_drop_settled_prompt_echo(&mut content, call);
             SnapshotResponse::ToolResult(SnapshotCallToolResult {
                 is_error: result.is_error,
-                content: result
-                    .content
-                    .iter()
-                    .map(normalize_snapshot_content)
-                    .collect(),
+                content,
             })
         }
         SnapshotResponse::ServiceError(err) => SnapshotResponse::ServiceError(err.clone()),
     }
+}
+
+fn maybe_drop_settled_prompt_echo(content: &mut Vec<SnapshotContent>, call: &SnapshotCall) {
+    if !is_repl_tool_name(&call.tool) {
+        return;
+    }
+
+    let Some(Value::Object(args)) = &call.arguments else {
+        return;
+    };
+    let Some(Value::String(input)) = args.get("input") else {
+        return;
+    };
+    let mut input_lines = split_input_lines(input).into_iter();
+    let Some(input_line) = input_lines.next() else {
+        return;
+    };
+    if input_lines.next().is_some() {
+        return;
+    }
+
+    let has_prompt_only = content.iter().any(|item| match item {
+        SnapshotContent::Text { text } => prompt_only_snapshot_text(text),
+        _ => false,
+    });
+    let has_stderr = content.iter().any(|item| match item {
+        SnapshotContent::Text { text } => text.contains("stderr:"),
+        _ => false,
+    });
+    if !(has_prompt_only && has_stderr) {
+        return;
+    }
+
+    content.retain(|item| match item {
+        SnapshotContent::Text { text } => !prompt_echo_matches_input(text, &input_line),
+        _ => true,
+    });
+}
+
+fn prompt_only_snapshot_text(text: &str) -> bool {
+    text.lines().all(|line| {
+        if line.is_empty() {
+            return true;
+        }
+        strip_prompt_prefix(line)
+            .map(|rest| rest.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn prompt_echo_matches_input(text: &str, input_line: &str) -> bool {
+    let mut lines = text.lines();
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    strip_prompt_prefix(line)
+        .map(|rest| rest == input_line)
+        .unwrap_or(false)
 }
 
 fn normalize_snapshot_content(content: &SnapshotContent) -> SnapshotContent {
