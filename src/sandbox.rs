@@ -458,6 +458,14 @@ pub fn sandbox_state_update_from_codex_meta(
             parsed.sandbox_cwd.display()
         ));
     }
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &parsed.sandbox_policy
+        && let Some(root) = writable_roots.iter().find(|root| !root.is_absolute())
+    {
+        return Err(format!(
+            "Codex sandbox metadata requires absolute sandboxPolicy.writable_roots entries, got: {}",
+            root.display()
+        ));
+    }
 
     Ok(SandboxStateUpdate {
         sandbox_policy: parsed.sandbox_policy,
@@ -2741,6 +2749,37 @@ mod tests {
         assert!(
             update.use_linux_sandbox_bwrap.is_none(),
             "Codex tool-call metadata should not force mcp-repl's internal best-effort bwrap mode"
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_state_meta_rejects_relative_workspace_write_roots() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let err = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": ["relative-root"],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
+                serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
+            } else {
+                serde_json::Value::Null
+            },
+        }))
+        .expect_err("relative writable roots should fail closed");
+
+        assert!(
+            err.contains("sandboxPolicy.writable_roots"),
+            "expected writable_roots validation error, got: {err}"
+        );
+        assert!(
+            err.contains("relative-root"),
+            "expected failing relative root to be named in the error, got: {err}"
         );
     }
 

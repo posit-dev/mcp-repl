@@ -2772,7 +2772,9 @@ impl WorkerManager {
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.pending_request_input = None;
+        if !preserve_detached_output {
+            self.pending_request_input = None;
+        }
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -6439,6 +6441,45 @@ mod tests {
         assert!(
             manager.settled_pending_completion.is_none(),
             "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn files_reset_preserving_detached_output_keeps_pending_request_input_for_trim() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        manager.reset_output_state_files_preserving_detached_output();
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected detached files-mode output to survive the preserved reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the preserved reset to leak the original Python input echo, got: {text:?}"
+        );
+        assert!(
+            manager.pending_request_input.is_none(),
+            "expected preserved pending input to be consumed once the detached prefix is prepared"
         );
     }
 
