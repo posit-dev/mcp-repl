@@ -49,6 +49,7 @@ pub(crate) fn run(
     } else {
         None
     };
+    worker.bootstrap_local_inherited_sandbox_state()?;
     worker.warm_start()?;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
     render_visible_reply(

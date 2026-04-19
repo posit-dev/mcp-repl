@@ -702,6 +702,29 @@ impl WorkerManager {
         self.ensure_process()
     }
 
+    pub fn bootstrap_local_inherited_sandbox_state(&mut self) -> Result<bool, WorkerError> {
+        if !self.missing_inherited_sandbox_state() {
+            return Ok(false);
+        }
+
+        let update = SandboxStateUpdate {
+            sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
+            sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
+            use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
+            use_legacy_landlock: None,
+        };
+        crate::event_log::log(
+            "worker_local_inherit_bootstrap",
+            serde_json::json!({
+                "sandbox_policy": update.sandbox_policy.clone(),
+                "sandbox_cwd": update.sandbox_cwd.clone(),
+                "use_linux_sandbox_bwrap": update.use_linux_sandbox_bwrap,
+            }),
+        );
+        self.stage_sandbox_state_update(update)?;
+        Ok(true)
+    }
+
     fn missing_inherited_sandbox_state(&self) -> bool {
         sandbox_plan_requests_inherited_state(&self.sandbox_plan)
             && self.inherited_sandbox_state.is_none()

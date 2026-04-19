@@ -103,14 +103,14 @@ fn wait_for_prompt_or_idle(
     (saw_prompt, saw_idle)
 }
 
-#[test]
-fn debug_repl_prints_initial_prompt() -> TestResult<()> {
+fn assert_debug_repl_starts(extra_args: &[&str]) -> TestResult<()> {
     let _guard = debug_repl_test_mutex()
         .lock()
         .expect("debug repl prompt test mutex poisoned");
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl");
+    cmd.args(extra_args);
     #[cfg(target_os = "macos")]
     if !sandbox_exec_available() {
         cmd.arg("--sandbox").arg("danger-full-access");
@@ -183,6 +183,16 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
         "expected prompt or idle status in stdout, got: {output:?}, stderr: {err_output:?}"
     );
     Ok(())
+}
+
+#[test]
+fn debug_repl_prints_initial_prompt() -> TestResult<()> {
+    assert_debug_repl_starts(&[])
+}
+
+#[test]
+fn debug_repl_inherit_prints_initial_prompt() -> TestResult<()> {
+    assert_debug_repl_starts(&["--sandbox", "inherit"])
 }
 
 #[test]

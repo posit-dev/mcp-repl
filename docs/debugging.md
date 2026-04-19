@@ -59,6 +59,11 @@ MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --sandbox inherit
 
 `--debug-repl` runs `mcp-repl` as a local interactive driver for the worker instead of as an MCP server. This is the fastest way to reproduce REPL behavior without involving a client.
 
+If you start it with `--sandbox inherit`, the debug REPL bootstraps one local
+inherited sandbox snapshot from the current default sandbox state before the
+first worker spawn. That keeps the inherit code path debuggable even though
+there is no per-tool-call MCP metadata in local debug mode.
+
 Start it with:
 
 ```sh
