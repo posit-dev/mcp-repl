@@ -35,6 +35,7 @@ use crate::worker_process::{
     WorkerError, WorkerManager, WriteStdinControlAction, WriteStdinOptions,
     split_write_stdin_control_prefix,
 };
+use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
@@ -221,10 +222,14 @@ impl SharedServer {
                             WriteStdinControlAction::Restart => true,
                         };
                         if needs_deferred_update {
-                            control_input_on_meta_error = Some(match control {
-                                WriteStdinControlAction::Interrupt => "\u{3}".to_string(),
-                                WriteStdinControlAction::Restart => "\u{4}".to_string(),
-                            });
+                            control_input_on_meta_error = Some((
+                                match control {
+                                    WriteStdinControlAction::Interrupt => "\u{3}".to_string(),
+                                    WriteStdinControlAction::Restart => "\u{4}".to_string(),
+                                },
+                                timeout_bundle_reuse_for_input(&raw_input),
+                                matches!(control, WriteStdinControlAction::Interrupt),
+                            ));
                             if let Err(err) = parse_tool_call_sandbox_state().map(|update| {
                                 control_input_on_meta_error = None;
                                 deferred_sandbox_state_update = update;
@@ -266,8 +271,10 @@ impl SharedServer {
             let deferred_sandbox_state_update = match sandbox_state_result {
                 Ok(update) => update,
                 Err(err) => {
-                    if let Some(control_input) = control_input_on_meta_error.take() {
-                        let _ = state.worker.write_stdin(
+                    if let Some((control_input, timeout_bundle_reuse, detach_control_reply)) =
+                        control_input_on_meta_error.take()
+                    {
+                        let control_result = state.worker.write_stdin(
                             control_input,
                             worker_timeout,
                             server_timeout,
@@ -276,6 +283,29 @@ impl SharedServer {
                                 ..WriteStdinOptions::default()
                             },
                         );
+                        let pending_request_after = state.worker.pending_request();
+                        let detached_prefix_item_count = if detach_control_reply {
+                            control_result
+                                .as_ref()
+                                .map_or(0, prefixed_worker_reply_item_count)
+                        } else {
+                            0
+                        };
+                        let mut result = finalize_visible_reply(
+                            state,
+                            control_result,
+                            pending_request_after,
+                            timeout_bundle_reuse,
+                            detached_prefix_item_count,
+                            use_inline_pager_materialization
+                                && !pending_request_after
+                                && !state.response.has_timeout_bundle_state(),
+                        );
+                        result
+                            .content
+                            .push(rmcp::model::Content::text(format!("worker error: {err}")));
+                        strip_text_stream_meta(&mut result);
+                        return result;
                     }
                     let mut result = state.response.finalize_local_error(err);
                     strip_text_stream_meta(&mut result);
@@ -518,6 +548,32 @@ fn finalize_visible_reply(
             timeout_bundle_reuse,
             detached_prefix_item_count,
         ),
+    }
+}
+
+fn prefixed_worker_reply_item_count(reply: &WorkerReply) -> usize {
+    let WorkerReply::Output {
+        contents, prompt, ..
+    } = reply;
+    let Some(prompt_text) = prompt.as_deref() else {
+        return contents.len();
+    };
+    if prompt_text.is_empty() {
+        return contents.len();
+    }
+    let Some(idx) = contents
+        .iter()
+        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
+    else {
+        return contents.len();
+    };
+    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
+        return contents.len();
+    };
+    if matches!(text.strip_suffix(prompt_text), Some("")) {
+        contents.len().saturating_sub(1)
+    } else {
+        contents.len()
     }
 }
 

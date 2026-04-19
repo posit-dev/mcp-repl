@@ -611,12 +611,11 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts()
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); detached <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); tryCatch({{ Sys.sleep(30) }}, interrupt = function(e) {{ cat('DETACHED_START\\n'); cat(detached); cat('\\nDETACHED_END\\n'); flush.console() }})"
+    );
     let first = session
-        .write_stdin_raw_with_meta(
-            timeout_then_tail_code(),
-            Some(0.05),
-            Some(workspace_write_meta(temp.path())),
-        )
+        .write_stdin_raw_with_meta(input, Some(0.05), Some(workspace_write_meta(temp.path())))
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
@@ -624,12 +623,16 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts()
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect timeout bundle disclosure before the interrupt-side metadata error, got: {first_text:?}"
+    );
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
 
     let interrupt_error = session
         .write_stdin_raw_with_meta(
             "\u{3}cat('AFTER_INTERRUPT\\n')",
-            Some(0.1),
+            Some(10.0),
             Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
         )
         .await?;
@@ -637,6 +640,20 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts()
     assert!(
         interrupt_error_text.contains("failed to parse Codex sandbox state metadata"),
         "expected malformed metadata error after local interrupt, got: {interrupt_error_text}"
+    );
+    let transcript_path = bundle_transcript_path(&interrupt_error_text).unwrap_or_else(|| {
+        panic!(
+            "expected the interrupt-side metadata error reply to disclose the detached timeout transcript, got: {interrupt_error_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+    assert!(
+        transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+        "expected the earlier timed-out output to remain on the transcript path, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("DETACHED_START") && transcript.contains("DETACHED_END"),
+        "expected the interrupt-side detached output to remain on the transcript path, got: {transcript:?}"
     );
 
     let mut recovery_text = String::new();
@@ -662,6 +679,64 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts()
     assert!(
         recovery_text.contains("[1] 2"),
         "expected the next valid call to run after the interrupt side effect, got: {recovery_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_restart_with_bad_meta_clears_timeout_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let restart_error = session
+        .write_stdin_raw_with_meta(
+            "\u{4}cat('AFTER_RESTART\\n')",
+            Some(0.1),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let restart_error_text = common::result_text(&restart_error);
+    assert!(
+        restart_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after local restart, got: {restart_error_text}"
+    );
+    assert!(
+        restart_error_text.contains("new session started"),
+        "expected the restart-side metadata error reply to include the restart notice, got: {restart_error_text}"
+    );
+
+    let recovery = session
+        .write_stdin_raw_with_meta("1+1", Some(1.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let recovery_text = common::result_text(&recovery);
+    session.cancel().await?;
+
+    assert!(
+        recovery_text.contains("[1] 2"),
+        "expected the next valid call to run in the restarted session, got: {recovery_text}"
+    );
+    assert!(
+        !recovery_text.contains("MID") && !recovery_text.contains("TAIL"),
+        "did not expect pre-restart timeout output to leak into the restarted session, got: {recovery_text}"
+    );
+    assert!(
+        bundle_transcript_path(&recovery_text).is_none(),
+        "did not expect the restarted session to keep a stale timeout bundle attached, got: {recovery_text:?}"
     );
     Ok(())
 }
