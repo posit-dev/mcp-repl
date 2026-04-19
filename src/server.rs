@@ -223,7 +223,7 @@ impl SharedServer {
                             false,
                         ),
                         Ok(false) => (Ok(None), false),
-                        Err(err) => (Err(err), false),
+                        Err(err) => (Err(err), true),
                     }
                 }
             } else {
