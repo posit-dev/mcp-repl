@@ -487,6 +487,32 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_repl_without_state_meta_sets_is_error() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected empty inherit repl call without metadata to fail closed, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected empty inherit repl preflight failure to set isError, got: {:?}",
+        result.is_error
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
@@ -981,6 +1007,46 @@ async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResu
     assert!(
         poll_text.contains("TAIL"),
         "expected empty poll to continue draining the original request, got: {poll_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_empty_poll_ignores_missing_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let poll_text = collect_text(&poll);
+    assert!(
+        poll_text.contains("TAIL"),
+        "expected empty poll without metadata to continue draining the original request, got: {poll_text}"
+    );
+    assert!(
+        !poll_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "did not expect empty draining poll without metadata to fail closed, got: {poll_text}"
+    );
+    assert_ne!(
+        poll.is_error,
+        Some(true),
+        "did not expect empty draining poll without metadata to set isError, got: {:?}",
+        poll.is_error
     );
     session.cancel().await?;
     Ok(())

@@ -194,18 +194,24 @@ impl SharedServer {
                 if state.worker.empty_input_uses_local_pager_state() {
                     (Ok(None), false)
                 } else {
-                    (
-                        match state.worker.empty_input_requires_spawn() {
-                            Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
+                    match state.worker.empty_input_requires_spawn() {
+                        Ok(true) => (
+                            parse_tool_call_sandbox_state().and_then(|update| {
                                 let _ = SharedServer::apply_tool_call_sandbox_state(state, update)?;
                                 Ok(None)
                             }),
-                            Ok(false) if needs_post_poll_reset => parse_tool_call_sandbox_state(),
-                            Ok(false) => Ok(None),
-                            Err(err) => Err(err),
-                        },
-                        false,
-                    )
+                            true,
+                        ),
+                        Ok(false) if needs_post_poll_reset => (
+                            match parse_tool_call_sandbox_state() {
+                                Ok(update) => Ok(update),
+                                Err(_) => Ok(None),
+                            },
+                            false,
+                        ),
+                        Ok(false) => (Ok(None), false),
+                        Err(err) => (Err(err), false),
+                    }
                 }
             } else {
                 if state.worker.pending_request() {
