@@ -146,12 +146,9 @@ impl SharedServer {
             return Ok(());
         };
 
-        if state
+        state
             .worker
-            .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)?
-        {
-            state.response.clear_active_timeout_bundle()?;
-        }
+            .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)?;
         Ok(())
     }
 
@@ -242,19 +239,26 @@ impl SharedServer {
                     } else {
                         Ok(deferred_sandbox_state_update)
                     }
-                } else if state
-                    .worker
-                    .nonexecuting_follow_up_uses_existing_state(&raw_input)
-                {
-                    // Local follow-ups like bare Ctrl-C or active pager
-                    // commands do not execute fresh code or spawn a worker.
-                    // Ignore per-call inherit metadata for those paths.
-                    Ok(None)
                 } else {
-                    match parse_tool_call_sandbox_state().and_then(|update| {
-                        SharedServer::apply_tool_call_sandbox_state(state, update)
-                    }) {
-                        Ok(()) => Ok(None),
+                    match state
+                        .worker
+                        .nonexecuting_follow_up_uses_existing_state(&raw_input)
+                    {
+                        Ok(true) => {
+                            // Local follow-ups like bare Ctrl-C or active pager
+                            // commands can keep using existing state. Exact
+                            // Ctrl-C is only in this path when it will not
+                            // respawn a worker.
+                            Ok(None)
+                        }
+                        Ok(false) => {
+                            match parse_tool_call_sandbox_state().and_then(|update| {
+                                SharedServer::apply_tool_call_sandbox_state(state, update)
+                            }) {
+                                Ok(()) => Ok(None),
+                                Err(err) => Err(err),
+                            }
+                        }
                         Err(err) => Err(err),
                     }
                 }

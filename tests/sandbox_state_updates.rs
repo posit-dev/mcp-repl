@@ -777,6 +777,107 @@ async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-tail-across-state-change")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        !first_text.contains("TAIL"),
+        "expected the late completion chunk to remain detached from the timeout reply, got: {first_text}"
+    );
+    tokio::time::sleep(test_delay_ms(1400, 1800)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("TAIL"),
+        "expected settled timeout output to survive sandbox respawn, got: {second_text}"
+    );
+    assert!(
+        second_text.contains("[1] 2"),
+        "expected the fresh call to still execute after the preserved timeout tail, got: {second_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-bundle-across-state-change")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(test_delay_ms(900, 1200)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = common::result_text(&second);
+    let transcript_path = bundle_transcript_path(&second_text).unwrap_or_else(|| {
+        panic!(
+            "expected the metadata-changing follow-up to preserve and disclose the timeout transcript, got: {second_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+        "expected the preserved timeout transcript to include the first timed-out chunk, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+        "expected the preserved timeout transcript to include the settled completion chunk, got: {transcript:?}"
+    );
+    assert!(
+        second_text.contains("[1] 2") || transcript.contains("[1] 2"),
+        "expected the fresh follow-up result to execute after preserving the timeout transcript, got reply {second_text:?} and transcript {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> TestResult<()> {
     let _guard = test_guard();
     for delay_ms in [90_u64, 100, 110, 120, 130, 140, 150, 160] {

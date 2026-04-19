@@ -750,17 +750,31 @@ impl WorkerManager {
         Ok(needs_spawn)
     }
 
-    pub fn nonexecuting_follow_up_uses_existing_state(&self, text: &str) -> bool {
+    pub fn nonexecuting_follow_up_uses_existing_state(
+        &mut self,
+        text: &str,
+    ) -> Result<bool, WorkerError> {
         if let Some((control, remaining)) = split_write_stdin_control_prefix(text) {
             return match control {
                 WriteStdinControlAction::Interrupt => {
-                    remaining.is_empty() || self.pager_follow_up_uses_existing_state(remaining)
+                    if remaining.is_empty() {
+                        Ok(!self.control_only_interrupt_requires_spawn()?)
+                    } else {
+                        Ok(self.pager_follow_up_uses_existing_state(remaining))
+                    }
                 }
-                WriteStdinControlAction::Restart => false,
+                WriteStdinControlAction::Restart => Ok(false),
             };
         }
 
-        self.pager_follow_up_uses_existing_state(text)
+        Ok(self.pager_follow_up_uses_existing_state(text))
+    }
+
+    fn control_only_interrupt_requires_spawn(&mut self) -> Result<bool, WorkerError> {
+        match self.process.as_mut() {
+            Some(process) => Ok(!process.is_running()?),
+            None => Ok(true),
+        }
     }
 
     pub fn detached_prefix_item_count(&self) -> usize {
@@ -2711,7 +2725,13 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         match self.oversized_output {
+            OversizedOutputMode::Files if self.has_detached_output_to_preserve() => {
+                self.reset_output_state_files_preserving_detached_output()
+            }
             OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager if self.has_detached_output_to_preserve() => {
+                self.reset_output_state_pager_preserving_detached_output(self.pager.is_active())
+            }
             OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
         }
         self.process = Some(match self.oversized_output {
@@ -2723,7 +2743,30 @@ impl WorkerManager {
         Ok(respawned)
     }
 
+    fn has_detached_output_to_preserve(&self) -> bool {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_output_tape.has_pending() || self.settled_pending_completion.is_some()
+            }
+            OversizedOutputMode::Pager => {
+                self.output.has_pending_output() || self.settled_pending_completion.is_some()
+            }
+        }
+    }
+
     fn reset_output_state_files(&mut self, clear_pending_output: bool) {
+        self.reset_output_state_files_inner(clear_pending_output, false);
+    }
+
+    fn reset_output_state_files_preserving_detached_output(&mut self) {
+        self.reset_output_state_files_inner(false, true);
+    }
+
+    fn reset_output_state_files_inner(
+        &mut self,
+        clear_pending_output: bool,
+        preserve_detached_output: bool,
+    ) {
         if clear_pending_output {
             self.pending_output_tape.clear();
         }
@@ -2731,19 +2774,36 @@ impl WorkerManager {
         self.pending_request_started_at = None;
         self.pending_request_input = None;
         self.session_end_seen = false;
-        self.settled_pending_completion = None;
-        self.last_detached_prefix_item_count = 0;
+        if !preserve_detached_output {
+            self.settled_pending_completion = None;
+            self.last_detached_prefix_item_count = 0;
+        }
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
     fn reset_output_state_pager(&mut self, clear_pending_output: bool, preserve_pager: bool) {
+        self.reset_output_state_pager_inner(clear_pending_output, preserve_pager, false);
+    }
+
+    fn reset_output_state_pager_preserving_detached_output(&mut self, preserve_pager: bool) {
+        self.reset_output_state_pager_inner(false, preserve_pager, true);
+    }
+
+    fn reset_output_state_pager_inner(
+        &mut self,
+        clear_pending_output: bool,
+        preserve_pager: bool,
+        preserve_detached_output: bool,
+    ) {
         if clear_pending_output {
             self.pending_output_tape.clear();
         }
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-        self.output = OutputBuffer::default();
+        if !preserve_detached_output {
+            reset_output_ring();
+            reset_last_reply_marker_offset();
+            self.output = OutputBuffer::default();
+        }
         if !preserve_pager {
             self.pager = Pager::default();
         }
@@ -2751,8 +2811,10 @@ impl WorkerManager {
         self.pending_request_started_at = None;
         self.pending_request_input = None;
         self.session_end_seen = false;
-        self.settled_pending_completion = None;
-        self.last_detached_prefix_item_count = 0;
+        if !preserve_detached_output {
+            self.settled_pending_completion = None;
+            self.last_detached_prefix_item_count = 0;
+        }
         self.pager_prompt = None;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -6922,6 +6984,62 @@ mod tests {
     }
 
     #[test]
+    fn inherit_workspace_write_refinements_wait_for_client_state() {
+        let writable_root = std::env::temp_dir();
+        let plan = SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::AddWritableRoot(writable_root.clone()),
+                crate::sandbox_cli::SandboxCliOperation::Config(
+                    crate::sandbox_cli::SandboxConfigOperation::SetWorkspaceNetworkAccess(true),
+                ),
+            ],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                    writable_roots: Vec::new(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                },
+                sandbox_cwd: Some(writable_root.clone()),
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("workspace-write Codex metadata should satisfy deferred refinements");
+
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            ..
+        } = &manager.sandbox_state.sandbox_policy
+        else {
+            panic!(
+                "expected staged inherit refinements to resolve to workspace-write, got {:?}",
+                manager.sandbox_state.sandbox_policy
+            );
+        };
+        assert!(
+            *network_access,
+            "expected deferred workspace network setting to apply after client metadata"
+        );
+        assert!(
+            writable_roots.iter().any(|path| path == &writable_root),
+            "expected deferred writable root to apply after client metadata"
+        );
+    }
+
+    #[test]
     fn failed_sandbox_update_does_not_commit_inherited_state() {
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let plan = crate::sandbox_cli::SandboxCliPlan {
@@ -6979,6 +7097,28 @@ mod tests {
             manager.inherited_sandbox_state,
             Some(inherited_before),
             "failed updates must not mutate inherited sandbox baseline"
+        );
+    }
+
+    #[test]
+    fn exact_interrupt_requires_current_sandbox_when_worker_would_respawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        assert!(
+            !manager
+                .nonexecuting_follow_up_uses_existing_state("\u{3}")
+                .expect("interrupt follow-up classification"),
+            "a bare Ctrl-C should require current per-call sandbox metadata when it would respawn"
         );
     }
 

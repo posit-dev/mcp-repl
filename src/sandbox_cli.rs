@@ -73,6 +73,7 @@ enum SandboxValidationMode {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+    DeferredInherit,
     UnresolvedInherit,
 }
 
@@ -260,11 +261,17 @@ fn validate_sandbox_plan_operations(
     inherited: Option<&SandboxState>,
     defaults: &SandboxState,
 ) -> Result<(), String> {
+    let allow_deferred_workspace_write =
+        inherited.is_none() && sandbox_plan_requests_inherited_state(plan);
     let mut mode = SandboxValidationMode::from_policy(&defaults.sandbox_policy);
     for op in &plan.operations {
         match op {
             SandboxCliOperation::SetMode(next_mode) => {
-                mode = validation_mode_for_mode_arg(*next_mode, inherited);
+                mode = validation_mode_for_mode_arg(
+                    *next_mode,
+                    inherited,
+                    allow_deferred_workspace_write,
+                );
             }
             SandboxCliOperation::AddWritableRoot(_) => {
                 require_workspace_write_mode(
@@ -279,7 +286,11 @@ fn validate_sandbox_plan_operations(
             }
             SandboxCliOperation::Config(config_op) => match config_op {
                 SandboxConfigOperation::SetMode(next_mode) => {
-                    mode = validation_mode_for_mode_arg(*next_mode, inherited);
+                    mode = validation_mode_for_mode_arg(
+                        *next_mode,
+                        inherited,
+                        allow_deferred_workspace_write,
+                    );
                 }
                 SandboxConfigOperation::SetWorkspaceNetworkAccess(_) => {
                     require_workspace_write_mode(
@@ -318,11 +329,16 @@ fn validate_sandbox_plan_operations(
 fn validation_mode_for_mode_arg(
     mode: SandboxModeArg,
     inherited: Option<&SandboxState>,
+    allow_deferred_workspace_write: bool,
 ) -> SandboxValidationMode {
     match mode {
         SandboxModeArg::Inherit => inherited
             .map(|state| SandboxValidationMode::from_policy(&state.sandbox_policy))
-            .unwrap_or(SandboxValidationMode::UnresolvedInherit),
+            .unwrap_or(if allow_deferred_workspace_write {
+                SandboxValidationMode::DeferredInherit
+            } else {
+                SandboxValidationMode::UnresolvedInherit
+            }),
         SandboxModeArg::ReadOnly => SandboxValidationMode::ReadOnly,
         SandboxModeArg::WorkspaceWrite => SandboxValidationMode::WorkspaceWrite,
         SandboxModeArg::DangerFullAccess => SandboxValidationMode::DangerFullAccess,
@@ -330,7 +346,10 @@ fn validation_mode_for_mode_arg(
 }
 
 fn require_workspace_write_mode(mode: SandboxValidationMode, message: &str) -> Result<(), String> {
-    if matches!(mode, SandboxValidationMode::WorkspaceWrite) {
+    if matches!(
+        mode,
+        SandboxValidationMode::WorkspaceWrite | SandboxValidationMode::DeferredInherit
+    ) {
         Ok(())
     } else {
         Err(message.to_string())
