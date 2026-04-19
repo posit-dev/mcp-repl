@@ -34,6 +34,10 @@ More specifically:
 - If an empty-input poll needs to spawn or respawn a worker to finish answering
   the call, including after draining a session-ended request, `mcp-repl`
   applies the current tool call's metadata before that spawn.
+- While the pager is active, pure pager navigation is local UI state, not a
+  worker interaction. Pager-local commands such as `:q` or empty-string page
+  advance ignore sandbox metadata until a later tool call actually interacts
+  with the worker again.
 - Bare `Ctrl-C` is the one non-empty `repl` follow-up that stays local and does
   not force a sandbox-driven restart.
 - Every other non-empty `repl` call must have valid current
@@ -45,9 +49,8 @@ More specifically:
 - Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the
   restarted session when the sandbox changed; the control prefix itself is not
   replayed into the fresh worker.
-- Active pager commands also require current metadata. If the sandbox changed,
-  `mcp-repl` restarts the worker and clears the old pager state instead of
-  replaying pager-local input like `:q` into the fresh session.
+- Sandbox metadata is enforced again at the next tool call that actually
+  interacts with the worker after pager navigation ends.
 - Missing or malformed metadata still fails closed on calls that need it.
 
 The worker also gets a per-session temp directory, exported as:

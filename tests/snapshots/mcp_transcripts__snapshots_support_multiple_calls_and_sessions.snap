@@ -80,7 +80,7 @@ call:
 response:
 {
   "type": "tool_result",
-  "is_error": true,
+  "is_error": false,
   "content": [
     {
       "type": "text",

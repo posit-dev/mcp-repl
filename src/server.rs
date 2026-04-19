@@ -185,19 +185,27 @@ impl SharedServer {
                     &meta,
                 )
             };
-            let sandbox_state_result = if raw_input.is_empty() {
-                // Empty-input polls only use current metadata when this call
-                // needs to start or restage a worker. Existing output still
-                // drains under the prior request's ownership.
+            let (sandbox_state_result, local_error_is_mcp_error) = if raw_input.is_empty() {
+                // Empty-input polls only skip metadata when they are truly
+                // draining existing output. In pager mode, empty input can
+                // also be a pure local navigation command and should ignore
+                // inherit metadata until a later worker interaction.
                 let needs_post_poll_reset = state.worker.empty_input_may_auto_reset_after_poll();
-                match state.worker.empty_input_requires_spawn() {
-                    Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
-                        let _ = SharedServer::apply_tool_call_sandbox_state(state, update)?;
-                        Ok(None)
-                    }),
-                    Ok(false) if needs_post_poll_reset => parse_tool_call_sandbox_state(),
-                    Ok(false) => Ok(None),
-                    Err(err) => Err(err),
+                if state.worker.empty_input_uses_local_pager_state() {
+                    (Ok(None), false)
+                } else {
+                    (
+                        match state.worker.empty_input_requires_spawn() {
+                            Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
+                                let _ = SharedServer::apply_tool_call_sandbox_state(state, update)?;
+                                Ok(None)
+                            }),
+                            Ok(false) if needs_post_poll_reset => parse_tool_call_sandbox_state(),
+                            Ok(false) => Ok(None),
+                            Err(err) => Err(err),
+                        },
+                        false,
+                    )
                 }
             } else {
                 if state.worker.pending_request() {
@@ -205,30 +213,37 @@ impl SharedServer {
                         .worker
                         .refresh_timeout_marker_with_wait(BUSY_FOLLOW_UP_RECHECK_WAIT);
                 }
-                if is_bare_interrupt_input(&raw_input) {
-                    Ok(None)
+                if is_bare_interrupt_input(&raw_input)
+                    || is_pure_local_pager_input(state, &raw_input)
+                {
+                    (Ok(None), false)
                 } else {
                     let local_pager_follow_up = input_uses_local_pager_state(state, &raw_input);
-                    match parse_tool_call_sandbox_state().and_then(|update| {
-                        SharedServer::apply_tool_call_sandbox_state(state, update)
-                    }) {
-                        Ok(respawned) => {
-                            if respawned {
-                                raw_input = normalize_input_after_sandbox_respawn(
-                                    &raw_input,
-                                    local_pager_follow_up,
-                                );
+                    (
+                        match parse_tool_call_sandbox_state().and_then(|update| {
+                            SharedServer::apply_tool_call_sandbox_state(state, update)
+                        }) {
+                            Ok(respawned) => {
+                                if respawned {
+                                    raw_input = normalize_input_after_sandbox_respawn(
+                                        &raw_input,
+                                        local_pager_follow_up,
+                                    );
+                                }
+                                Ok(None)
                             }
-                            Ok(None)
-                        }
-                        Err(err) => Err(err),
-                    }
+                            Err(err) => Err(err),
+                        },
+                        true,
+                    )
                 }
             };
             let deferred_sandbox_state_update = match sandbox_state_result {
                 Ok(update) => update,
                 Err(err) => {
-                    let mut result = state.response.finalize_local_error(err);
+                    let mut result = state
+                        .response
+                        .finalize_local_error(err, local_error_is_mcp_error);
                     strip_text_stream_meta(&mut result);
                     return result;
                 }
@@ -279,6 +294,13 @@ fn input_uses_local_pager_state(state: &ServerState, input: &str) -> bool {
             .worker
             .local_pager_follow_up_uses_existing_state(input)
     }
+}
+
+fn is_pure_local_pager_input(state: &ServerState, input: &str) -> bool {
+    split_write_stdin_control_prefix(input).is_none()
+        && state
+            .worker
+            .local_pager_follow_up_uses_existing_state(input)
 }
 
 fn normalize_input_after_sandbox_respawn(input: &str, local_pager_follow_up: bool) -> String {
@@ -447,7 +469,7 @@ macro_rules! define_backend_tool_server {
                             Err(err) => Err(WorkerError::Sandbox(err.to_string())),
                         };
                         if let Err(err) = sandbox_state_result {
-                            let mut result = state.response.finalize_local_error(err);
+                            let mut result = state.response.finalize_local_error(err, true);
                             strip_text_stream_meta(&mut result);
                             return result;
                         }

@@ -28,7 +28,7 @@ expression: transcript
 >>> Sys.sleep(5)
 <<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
-6) ! r_repl timeout_ms=5000
+6) r_repl timeout_ms=5000
 >>> 
 <<< stderr: 
 

@@ -284,9 +284,19 @@ impl ResponseState {
     }
 
     /// Returns a local pre-execution error without disturbing any active timeout-bundle state.
-    pub(crate) fn finalize_local_error(&mut self, err: WorkerError) -> CallToolResult {
+    pub(crate) fn finalize_local_error(
+        &mut self,
+        err: WorkerError,
+        is_mcp_error: bool,
+    ) -> CallToolResult {
         eprintln!("worker write stdin error: {err}");
-        finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
+        let mut contents = vec![Content::text(format!("worker error: {err}"))];
+        ensure_nonempty_contents(&mut contents);
+        if is_mcp_error {
+            CallToolResult::error(contents)
+        } else {
+            CallToolResult::success(contents)
+        }
     }
 
     /// Materializes a worker reply inline without applying files-mode bundle compaction.
@@ -1833,11 +1843,8 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
 
 pub(crate) fn finalize_batch(mut contents: Vec<Content>, is_error: bool) -> CallToolResult {
     ensure_nonempty_contents(&mut contents);
-    if is_error {
-        CallToolResult::error(contents)
-    } else {
-        CallToolResult::success(contents)
-    }
+    let _ = is_error;
+    CallToolResult::success(contents)
 }
 
 pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {

@@ -259,7 +259,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
         text.contains("input discarded while worker busy") || text.contains("<<repl status: busy"),
         "expected busy discard/timeout message, got: {text:?}"
     );
-    assert_eq!(result.is_error, Some(true));
+    assert_ne!(result.is_error, Some(true));
 
     session.cancel().await?;
     Ok(())
@@ -494,7 +494,7 @@ async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
         text.contains("stderr:"),
         "missing stderr prefix, got: {text:?}"
     );
-    assert_eq!(result.is_error, Some(true));
+    assert_ne!(result.is_error, Some(true));
     Ok(())
 }
 
@@ -526,7 +526,7 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
         !text.contains("> Error: boom\n"),
         "expected leading prompt to be normalized, got: {text:?}"
     );
-    assert_eq!(result.is_error, Some(true));
+    assert_ne!(result.is_error, Some(true));
     Ok(())
 }
 

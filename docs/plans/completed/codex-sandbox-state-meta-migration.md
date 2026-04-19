@@ -74,7 +74,7 @@
 - Every other non-empty `repl` call requires valid current `_meta["codex/sandbox-state-meta"]`.
 - If current metadata changes the effective inherited sandbox, `mcp-repl` restarts the worker before handling that non-empty call and includes a reply notice naming the new sandbox policy.
 - Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the restarted session when the sandbox changed; the control prefix itself is not replayed into the fresh worker.
-- Active pager commands also require current metadata. If the sandbox changed, `mcp-repl` restarts the worker and clears the old pager state instead of replaying pager-local input into the fresh session.
+- While the pager is active, pure pager navigation remains local UI state and ignores sandbox metadata until a later tool call actually interacts with the worker again.
 - Empty-input `repl` polls ignore per-call sandbox metadata when they can be answered from existing state, but they still apply the current tool call's metadata before any spawn or respawn needed to answer the call, including after draining a session-ended request.
 - When a prior timed-out request has already settled, `mcp-repl` resolves the stale timeout marker before deciding whether a new non-empty `repl` call is still just a busy follow-up.
 - Missing or malformed metadata fails closed with the existing inherit error path.

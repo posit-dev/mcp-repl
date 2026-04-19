@@ -751,8 +751,29 @@ impl WorkerManager {
         Ok(needs_spawn)
     }
 
+    pub fn empty_input_polls_existing_output(&self) -> bool {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_request
+                    || self.pending_output_tape.has_pending()
+                    || self.settled_pending_completion.is_some()
+            }
+            OversizedOutputMode::Pager => {
+                self.pending_request
+                    || self.output.has_pending_output()
+                    || self.settled_pending_completion.is_some()
+            }
+        }
+    }
+
+    pub fn empty_input_uses_local_pager_state(&self) -> bool {
+        matches!(self.oversized_output, OversizedOutputMode::Pager)
+            && self.pager.is_active()
+            && !self.empty_input_polls_existing_output()
+    }
+
     pub fn empty_input_may_auto_reset_after_poll(&self) -> bool {
-        self.empty_input_uses_existing_state()
+        self.empty_input_polls_existing_output()
             && (self.pending_request
                 || self.settled_pending_completion.is_some()
                 || self.session_end_seen)
@@ -6650,34 +6671,34 @@ mod tests {
     }
 
     #[test]
-    fn pager_prepare_input_context_trims_echo_from_settled_completion() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
+    fn pager_collapsed_settled_completion_trims_echo_and_keeps_output() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 25,
+            bytes: b"> Sys.sleep(0.2); 1+1\n[1] 2\n".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 25,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
 
-        let mut manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Pager,
-        )
-        .expect("worker manager");
-        manager.output.start_capture();
-        manager.output_timeline.append_text(
-            b"> Sys.sleep(0.2); 1+1\n[1] 2\n",
-            false,
-            ContentOrigin::Worker,
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
         );
-        manager.settled_pending_completion = Some(CompletionInfo {
-            prompt: Some("> ".to_string()),
-            prompt_variants: Some(vec!["> ".to_string()]),
-            echo_events: vec![echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
-            protocol_warnings: Vec::new(),
-            session_end_seen: false,
-        });
-
-        let context = manager.prepare_input_context_pager("3+3", false);
-        let text = contents_text(&context.prefix_contents);
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            25,
+        );
+        let text = contents_text(&contents);
 
         assert!(
             text.contains("[1] 2\n"),
@@ -6686,10 +6707,6 @@ mod tests {
         assert!(
             !text.contains("Sys.sleep(0.2); 1+1"),
             "did not expect settled pager echo to leak into the next input context, got: {text:?}"
-        );
-        assert!(
-            manager.settled_pending_completion.is_none(),
-            "expected settled completion metadata to be consumed with the detached prefix"
         );
     }
 

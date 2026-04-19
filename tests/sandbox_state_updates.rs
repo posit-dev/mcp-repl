@@ -415,6 +415,12 @@ async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestRe
         !text.contains("2"),
         "did not expect successful evaluation, got: {text}"
     );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected missing metadata on the first worker interaction to set isError, got: {:?}",
+        result.is_error
+    );
     session.cancel().await?;
     Ok(())
 }
@@ -443,6 +449,12 @@ async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() ->
     assert!(
         !text.contains("2"),
         "did not expect successful evaluation, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected malformed metadata on the first worker interaction to set isError, got: {:?}",
+        result.is_error
     );
     session.cancel().await?;
     Ok(())
@@ -585,7 +597,7 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_active_pager_command_requires_state_meta() -> TestResult<()> {
+async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -610,15 +622,27 @@ async fn sandbox_inherit_active_pager_command_requires_state_meta() -> TestResul
     let quit = session.write_stdin_raw_with(":q", Some(30.0)).await?;
     let quit_text = common::result_text(&quit);
     assert!(
-        quit_text.contains(MISSING_INHERITED_STATE_MESSAGE),
-        "expected active pager :q to fail closed without inherited metadata, got: {quit_text}"
+        !quit_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected active pager :q to ignore missing inherited metadata, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected active pager :q to skip sandbox metadata parsing, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("unexpected ':'"),
+        "expected :q to be handled by pager after inherit warm-up, got: {quit_text}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after :q, got: {quit_text}"
     );
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_active_pager_command_restarts_on_state_change() -> TestResult<()> {
+async fn sandbox_inherit_active_pager_command_ignores_state_meta_changes() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -645,18 +669,66 @@ async fn sandbox_inherit_active_pager_command_restarts_on_state_change() -> Test
         .await?;
     let quit_text = common::result_text(&quit);
     assert!(
-        quit_text.contains("sandbox policy changed; new session started"),
-        "expected active pager command with changed metadata to restart the worker, got: {quit_text}"
+        !quit_text.contains("sandbox policy changed; new session started"),
+        "did not expect active pager command to restart the worker, got: {quit_text}"
     );
     assert!(
-        quit_text.contains("new sandbox policy"),
-        "expected restart notice to include the new sandbox policy, got: {quit_text}"
+        !quit_text.contains("new sandbox policy"),
+        "did not expect active pager command to apply the new sandbox policy immediately, got: {quit_text}"
     );
     assert!(
         !quit_text.contains("unexpected ':'"),
-        "did not expect pager quit input to be replayed into the fresh worker, got: {quit_text}"
+        "expected pager quit to stay pager-local, got: {quit_text}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after pager quit, got: {quit_text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_active_pager_empty_input_ignores_missing_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_pager_server(temp.path(), 120).await?;
+    let initial = session
+        .write_stdin_raw_with_meta(
+            "line <- paste(rep(\"foo\", 80), collapse = \" \"); for (i in 1:300) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let initial_text = common::result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate before empty pager command test, got: {initial_text:?}"
+    );
+
+    let page_advance = session.write_stdin_raw_with("", Some(30.0)).await?;
+    let page_advance_text = common::result_text(&page_advance);
+    session.cancel().await?;
+
+    assert!(
+        !page_advance_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected active pager empty input to ignore missing inherited metadata, got: {page_advance_text}"
+    );
+    assert!(
+        page_advance_text.contains("--More--") || page_advance_text.contains("(END"),
+        "expected active pager empty input to stay in pager mode, got: {page_advance_text}"
+    );
+    assert_ne!(
+        page_advance.is_error,
+        Some(true),
+        "did not expect active pager empty input to set isError, got: {:?}",
+        page_advance.is_error
+    );
     Ok(())
 }
 
@@ -1398,6 +1470,12 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
     assert!(
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
         "expected missing sandbox-state-meta error, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected repl_reset without required metadata to set isError, got: {:?}",
+        result.is_error
     );
     session.cancel().await?;
     Ok(())

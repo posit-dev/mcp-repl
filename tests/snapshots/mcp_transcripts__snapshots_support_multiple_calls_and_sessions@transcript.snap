@@ -15,6 +15,6 @@ expression: transcript
 <<< [repl] new session started
 
 == session: session_2 ==
-1) ! r_repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x
 <<< stderr: Error: object 'x' not found
