@@ -31,7 +31,10 @@ use crate::sandbox::{SANDBOX_STATE_META_CAPABILITY, SandboxStateUpdate};
 use crate::sandbox_cli::{
     MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan, sandbox_plan_requests_inherited_state,
 };
-use crate::worker_process::{WorkerError, WorkerManager};
+use crate::worker_process::{
+    WorkerError, WorkerManager, WriteStdinControlAction, WriteStdinOptions,
+    split_write_stdin_control_prefix,
+};
 
 const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
@@ -190,52 +193,100 @@ impl SharedServer {
                 // Empty-input polls may need the current tool call's metadata
                 // only when they must spawn a worker to answer the call.
                 match state.worker.empty_input_requires_spawn() {
-                    Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
-                        SharedServer::apply_tool_call_sandbox_state(state, update)
-                    }),
-                    Ok(false) => Ok(()),
+                    Ok(true) => {
+                        if let Err(err) = parse_tool_call_sandbox_state().and_then(|update| {
+                            SharedServer::apply_tool_call_sandbox_state(state, update)
+                        }) {
+                            Err(err)
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Ok(false) => Ok(None),
                     Err(err) => Err(err),
                 }
             } else {
                 // A timed-out request still owns busy follow-ups, but a fresh
                 // non-empty call after that request has already settled must
                 // run under the current tool call's sandbox metadata.
+                let mut deferred_sandbox_state_update = None;
                 if state.worker.pending_request() {
                     state
                         .worker
                         .refresh_timeout_marker_with_wait(BUSY_FOLLOW_UP_RECHECK_WAIT);
                 }
                 if state.worker.pending_request() {
-                    Ok(())
+                    if let Some((control, remaining)) = split_write_stdin_control_prefix(&raw_input)
+                    {
+                        let needs_deferred_update = match control {
+                            WriteStdinControlAction::Interrupt => !remaining.is_empty(),
+                            WriteStdinControlAction::Restart => true,
+                        };
+                        if needs_deferred_update {
+                            match parse_tool_call_sandbox_state() {
+                                Ok(update) => {
+                                    deferred_sandbox_state_update = update;
+                                }
+                                Err(err) => {
+                                    return {
+                                        let pending_request_after = state.worker.pending_request();
+                                        let detached_prefix_item_count =
+                                            state.worker.detached_prefix_item_count();
+                                        let mut result = finalize_visible_reply(
+                                            state,
+                                            Err(err),
+                                            pending_request_after,
+                                            TimeoutBundleReuse::None,
+                                            detached_prefix_item_count,
+                                            use_inline_pager_materialization
+                                                && !pending_request_after
+                                                && !state.response.has_timeout_bundle_state(),
+                                        );
+                                        strip_text_stream_meta(&mut result);
+                                        result
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    Ok(deferred_sandbox_state_update)
                 } else {
-                    parse_tool_call_sandbox_state().and_then(|update| {
+                    match parse_tool_call_sandbox_state().and_then(|update| {
                         SharedServer::apply_tool_call_sandbox_state(state, update)
-                    })
+                    }) {
+                        Ok(()) => Ok(None),
+                        Err(err) => Err(err),
+                    }
                 }
             };
-            if let Err(err) = sandbox_state_result {
-                let pending_request_after = state.worker.pending_request();
-                let detached_prefix_item_count = state.worker.detached_prefix_item_count();
-                let mut result = finalize_visible_reply(
-                    state,
-                    Err(err),
-                    pending_request_after,
-                    TimeoutBundleReuse::None,
-                    detached_prefix_item_count,
-                    use_inline_pager_materialization
-                        && !pending_request_after
-                        && !state.response.has_timeout_bundle_state(),
-                );
-                strip_text_stream_meta(&mut result);
-                return result;
-            }
+            let deferred_sandbox_state_update = match sandbox_state_result {
+                Ok(update) => update,
+                Err(err) => {
+                    let pending_request_after = state.worker.pending_request();
+                    let detached_prefix_item_count = state.worker.detached_prefix_item_count();
+                    let mut result = finalize_visible_reply(
+                        state,
+                        Err(err),
+                        pending_request_after,
+                        TimeoutBundleReuse::None,
+                        detached_prefix_item_count,
+                        use_inline_pager_materialization
+                            && !pending_request_after
+                            && !state.response.has_timeout_bundle_state(),
+                    );
+                    strip_text_stream_meta(&mut result);
+                    return result;
+                }
+            };
             let result = state.worker.write_stdin(
                 raw_input.clone(),
                 worker_timeout,
                 server_timeout,
-                None,
-                false,
-                true,
+                WriteStdinOptions {
+                    pending_state_prechecked: true,
+                    deferred_sandbox_state_update,
+                    ..WriteStdinOptions::default()
+                },
             );
             let pending_request_after = state.worker.pending_request();
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();

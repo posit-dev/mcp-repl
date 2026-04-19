@@ -15,6 +15,12 @@ In an interactive R session, the plot is already visible before the later
 `cat("done\n")`. In `mcp-repl`, the current hook-based capture path can delay
 the plot image until later than that.
 
+That timing gap is also visible at timeout boundaries. A short `write_stdin`
+timeout can return before the worker has replayed the recorded plot into a PNG,
+so under heavier load the same request may surface the image in the timeout
+reply or in the next empty-input poll. The combined behavior is still correct,
+but the exact per-reply split is not a stable contract today.
+
 This future work item covers a more direct graphics-capture design that can
 emit plots incrementally, without waiting for top-level task completion.
 

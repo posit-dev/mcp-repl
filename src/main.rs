@@ -486,7 +486,10 @@ If no --interpreter is specified, install uses the full interpreter grid for eac
 mod tests {
     use super::*;
     use crate::sandbox::{SandboxPolicy, SandboxState};
-    use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
+    use crate::sandbox_cli::{
+        SandboxConfigOperation, resolve_effective_sandbox_state,
+        sandbox_plan_requests_inherited_state,
+    };
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {
@@ -687,6 +690,34 @@ mod tests {
             SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn later_explicit_sandbox_mode_clears_inherit_requirement() {
+        let cli_override_plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+            ],
+        };
+        assert!(
+            !sandbox_plan_requests_inherited_state(&cli_override_plan),
+            "a later explicit --sandbox override should disable per-call inherit metadata"
+        );
+
+        let config_override_plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override("sandbox_mode=workspace-write")
+                        .expect("config override"),
+                ),
+            ],
+        };
+        assert!(
+            !sandbox_plan_requests_inherited_state(&config_override_plan),
+            "a later sandbox_mode override should disable per-call inherit metadata"
+        );
     }
 
     #[test]

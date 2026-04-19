@@ -12,7 +12,7 @@ use crate::sandbox_cli::SandboxCliPlan;
 use crate::server::response::{
     ResponseState, TimeoutBundleReuse, text_stream_from_content, timeout_bundle_reuse_for_input,
 };
-use crate::worker_process::{WorkerError, WorkerManager};
+use crate::worker_process::{WorkerError, WorkerManager, WriteStdinOptions};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -105,9 +105,7 @@ pub(crate) fn run(
                 String::new(),
                 DEFAULT_WRITE_STDIN_TIMEOUT,
                 server_timeout,
-                None,
-                false,
-                false,
+                WriteStdinOptions::default(),
             );
             render_visible_reply(
                 response.as_mut(),
@@ -144,9 +142,7 @@ pub(crate) fn run(
             input,
             DEFAULT_WRITE_STDIN_TIMEOUT,
             server_timeout,
-            None,
-            false,
-            false,
+            WriteStdinOptions::default(),
         );
         render_visible_reply(
             response.as_mut(),
@@ -178,9 +174,7 @@ fn wait_for_initial_prompt(
         String::new(),
         DEFAULT_WRITE_STDIN_TIMEOUT,
         server_timeout,
-        None,
-        false,
-        false,
+        WriteStdinOptions::default(),
     )?;
     while !reply_has_prompt(&last_reply) && Instant::now() < deadline {
         thread::sleep(INITIAL_PROMPT_POLL_INTERVAL);
@@ -188,9 +182,7 @@ fn wait_for_initial_prompt(
             String::new(),
             DEFAULT_WRITE_STDIN_TIMEOUT,
             server_timeout,
-            None,
-            false,
-            false,
+            WriteStdinOptions::default(),
         )?;
     }
     Ok(last_reply)

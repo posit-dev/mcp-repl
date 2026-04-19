@@ -157,6 +157,20 @@ async fn spawn_inherit_server_with_env(
     .await
 }
 
+async fn spawn_inherit_then_workspace_write_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+        ],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
 async fn spawn_inherit_files_server(
     cwd: &Path,
     env: Vec<(String, String)>,
@@ -261,6 +275,45 @@ async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()
     assert!(
         !advertised,
         "did not expect sandbox state meta capability without `--sandbox inherit`: {info:?}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_meta_capability_hidden_after_later_workspace_write_override()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-inherit-override-workspace-write")?;
+    let session = spawn_inherit_then_workspace_write_server(scratch.path()).await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let advertised = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key(SANDBOX_STATE_META_CAPABILITY));
+    assert!(
+        !advertised,
+        "did not expect sandbox state meta capability after later workspace-write override: {info:?}"
+    );
+
+    let target = scratch.path().join("override-write.txt");
+    let result = session
+        .write_stdin_raw_with(write_file_code(&target)?, Some(10.0))
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected later workspace-write override to avoid inherit metadata requirements, got: {text}"
     );
     session.cancel().await?;
     Ok(())
@@ -499,6 +552,52 @@ async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> 
         );
         session.cancel().await?;
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_restart_follow_up_applies_current_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-restart-follow-up-state-meta")?;
+    let target = scratch.path().join("restart-follow-up-write.txt");
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            format!("\u{4}{}", write_file_code(&target)?),
+            Some(10.0),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("new session started"),
+        "expected restart follow-up reply to include restart notice, got: {second_text}"
+    );
+    assert!(
+        !second_text.contains("WRITE_OK"),
+        "did not expect restart follow-up to run under stale workspace-write metadata, got: {second_text}"
+    );
+    assert!(
+        !target.exists(),
+        "did not expect restart follow-up to create {}",
+        target.display()
+    );
+    session.cancel().await?;
     Ok(())
 }
 

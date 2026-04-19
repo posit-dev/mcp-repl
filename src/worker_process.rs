@@ -519,13 +519,36 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
     }
 }
 
+const DEFERRED_SANDBOX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy)]
-enum WriteStdinControlAction {
+pub(crate) enum WriteStdinControlAction {
     Interrupt,
     Restart,
 }
 
-fn split_write_stdin_control_prefix(input: &str) -> Option<(WriteStdinControlAction, &str)> {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteStdinOptions {
+    pub page_bytes_override: Option<u64>,
+    pub echo_input: bool,
+    pub pending_state_prechecked: bool,
+    pub deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+}
+
+impl WriteStdinOptions {
+    fn control_tail(&self, deferred_sandbox_state_update: Option<SandboxStateUpdate>) -> Self {
+        Self {
+            page_bytes_override: self.page_bytes_override,
+            echo_input: self.echo_input,
+            pending_state_prechecked: false,
+            deferred_sandbox_state_update,
+        }
+    }
+}
+
+pub(crate) fn split_write_stdin_control_prefix(
+    input: &str,
+) -> Option<(WriteStdinControlAction, &str)> {
     let first = input.chars().next()?;
     let action = match first {
         '\u{3}' => WriteStdinControlAction::Interrupt,
@@ -708,6 +731,27 @@ impl WorkerManager {
         self.last_detached_prefix_item_count
     }
 
+    fn stage_deferred_sandbox_state_update(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        self.stage_sandbox_state_update(update)
+    }
+
+    fn apply_deferred_sandbox_state_update(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        self.update_sandbox_state(update, DEFERRED_SANDBOX_UPDATE_TIMEOUT)?;
+        Ok(())
+    }
+
     fn empty_input_uses_existing_state(&self) -> bool {
         match self.oversized_output {
             OversizedOutputMode::Files => {
@@ -746,25 +790,15 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        page_bytes_override: Option<u64>,
-        echo_input: bool,
-        pending_state_prechecked: bool,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
-            OversizedOutputMode::Files => self.write_stdin_files(
-                text,
-                worker_timeout,
-                server_timeout,
-                pending_state_prechecked,
-            ),
-            OversizedOutputMode::Pager => self.write_stdin_pager(
-                text,
-                worker_timeout,
-                server_timeout,
-                page_bytes_override,
-                echo_input,
-                pending_state_prechecked,
-            ),
+            OversizedOutputMode::Files => {
+                self.write_stdin_files(text, worker_timeout, server_timeout, options)
+            }
+            OversizedOutputMode::Pager => {
+                self.write_stdin_pager(text, worker_timeout, server_timeout, options)
+            }
         }
     }
 
@@ -774,11 +808,20 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        pending_state_prechecked: bool,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
+        let pending_state_prechecked = options.pending_state_prechecked;
+        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
+            let remaining_sandbox_state_update = match control {
+                WriteStdinControlAction::Interrupt => deferred_sandbox_state_update,
+                WriteStdinControlAction::Restart => {
+                    self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
+                    None
+                }
+            };
             let control_reply = match control {
                 WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
                 WriteStdinControlAction::Restart => self.restart(worker_timeout),
@@ -791,7 +834,7 @@ impl WorkerManager {
                 remaining.to_string(),
                 worker_timeout,
                 server_timeout,
-                false,
+                options.control_tail(remaining_sandbox_state_update),
             )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
@@ -857,6 +900,7 @@ impl WorkerManager {
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
+        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
         if let Err(err) = self.ensure_process() {
             let input_context = self.prepare_input_context_files();
             let reply = self.build_reply_from_worker_error_files(&err, input_context);
@@ -887,13 +931,22 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        page_bytes_override: Option<u64>,
-        echo_input: bool,
-        pending_state_prechecked: bool,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
+        let page_bytes_override = options.page_bytes_override;
+        let echo_input = options.echo_input;
+        let pending_state_prechecked = options.pending_state_prechecked;
+        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
+            let remaining_sandbox_state_update = match control {
+                WriteStdinControlAction::Interrupt => deferred_sandbox_state_update,
+                WriteStdinControlAction::Restart => {
+                    self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
+                    None
+                }
+            };
             let control_reply = match control {
                 WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
                 WriteStdinControlAction::Restart => self.restart(worker_timeout),
@@ -906,9 +959,7 @@ impl WorkerManager {
                 remaining.to_string(),
                 worker_timeout,
                 server_timeout,
-                page_bytes_override,
-                echo_input,
-                false,
+                options.control_tail(remaining_sandbox_state_update),
             )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
@@ -1008,6 +1059,7 @@ impl WorkerManager {
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
+        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
 
         let input_context = self.prepare_input_context_pager(&text, echo_input);
 
@@ -6024,9 +6076,7 @@ mod tests {
                 "1+1".to_string(),
                 Duration::from_millis(50),
                 Duration::ZERO,
-                None,
-                false,
-                false,
+                WriteStdinOptions::default(),
             )
             .expect("reply");
 
@@ -6480,9 +6530,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(16),
-                true,
-                false,
+                WriteStdinOptions {
+                    page_bytes_override: Some(16),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty poll reply");
 
@@ -6531,9 +6583,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(16),
-                true,
-                false,
+                WriteStdinOptions {
+                    page_bytes_override: Some(16),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty pager reply");
         let WorkerReply::Output { contents, .. } = reply;
@@ -6587,9 +6641,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(256),
-                true,
-                false,
+                WriteStdinOptions {
+                    page_bytes_override: Some(256),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty poll reply");
         let WorkerReply::Output { contents, .. } = reply;

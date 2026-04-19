@@ -54,16 +54,24 @@ pub struct SandboxCliPlan {
     pub operations: Vec<SandboxCliOperation>,
 }
 
+fn last_mode_operation(plan: &SandboxCliPlan) -> Option<(usize, SandboxModeArg)> {
+    plan.operations
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, op)| match op {
+            SandboxCliOperation::SetMode(mode)
+            | SandboxCliOperation::Config(SandboxConfigOperation::SetMode(mode)) => {
+                Some((index, *mode))
+            }
+            _ => None,
+        })
+}
+
 pub fn sandbox_plan_requests_inherited_state(plan: &SandboxCliPlan) -> bool {
-    plan.operations.iter().any(|op| {
-        matches!(
-            op,
-            SandboxCliOperation::SetMode(SandboxModeArg::Inherit)
-                | SandboxCliOperation::Config(SandboxConfigOperation::SetMode(
-                    SandboxModeArg::Inherit
-                ))
-        )
-    })
+    last_mode_operation(plan)
+        .map(|(_, mode)| mode)
+        .is_some_and(|mode| matches!(mode, SandboxModeArg::Inherit))
 }
 
 pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation, String> {
@@ -177,8 +185,12 @@ pub fn resolve_effective_sandbox_state_with_defaults(
         return Ok(inherited.cloned().unwrap_or_else(|| defaults.clone()));
     }
 
+    let start_index = match last_mode_operation(plan) {
+        Some((index, mode)) if !matches!(mode, SandboxModeArg::Inherit) => index,
+        _ => 0,
+    };
     let mut state = defaults.clone();
-    for op in &plan.operations {
+    for op in &plan.operations[start_index..] {
         match op {
             SandboxCliOperation::SetMode(mode) => {
                 apply_mode(&mut state, *mode, inherited, defaults)?

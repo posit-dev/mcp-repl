@@ -65,6 +65,7 @@
 ## Outcome
 
 - `mcp-repl` now advertises `codex/sandbox-state-meta` only when `--sandbox inherit` is configured.
+- Later explicit sandbox mode overrides such as `--sandbox inherit --sandbox workspace-write` or `sandbox_mode=workspace-write` cancel inherit-mode metadata requirements, matching the documented later-wins CLI semantics.
 - `repl_reset` derives inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]`.
 - Non-empty `repl` calls derive inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]` before executing fresh code.
 - Empty-input `repl` polls ignore per-call sandbox metadata when they can be answered from existing state, but they still apply the current tool call's metadata before spawning a worker to answer an idle call on a fresh session.

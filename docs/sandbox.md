@@ -40,7 +40,7 @@ The worker also gets a per-session temp directory, exported as:
 - Advanced overrides:
   `mcp-repl --config key=value` with Codex-shaped keys
 - MCP sandbox metadata capability:
-  `codex/sandbox-state-meta` (advertised only with `--sandbox inherit`)
+  `codex/sandbox-state-meta` (advertised only when the effective CLI sandbox mode still resolves to `inherit` after later overrides)
 
 Operations are applied strictly in CLI argument order. Later operations win.
 `--sandbox ...` resets the base policy at the point where it appears.
