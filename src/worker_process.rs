@@ -2966,9 +2966,28 @@ impl WorkerManager {
     }
 
     fn reset_output_state_files_preserving_detached_output(&mut self) {
+        self.seed_aborted_files_completion_for_respawn();
         let prefix = self.take_current_prefix_files();
         self.stage_prefix_before_respawn(prefix);
         self.reset_output_state_files_inner(true, false);
+    }
+
+    fn seed_aborted_files_completion_for_respawn(&mut self) {
+        if !self.pending_request
+            || self.settled_pending_completion.is_some()
+            || self.pending_request_input.is_none()
+        {
+            return;
+        }
+
+        let prompt = self.last_prompt.clone();
+        self.settled_pending_completion = Some(CompletionInfo {
+            prompt: prompt.clone(),
+            prompt_variants: prompt.clone().map(|prompt| vec![prompt]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
     }
 
     fn reset_output_state_files_inner(
@@ -5819,8 +5838,8 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, ensure_output_ring,
-        reset_last_reply_marker_offset, reset_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSpan,
+        ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
@@ -5861,6 +5880,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn pager_buffer_from_worker_text(text: &str) -> crate::pager::PagerBuffer {
+        crate::pager::PagerBuffer::from_bytes_and_events(
+            text.as_bytes().to_vec(),
+            Vec::new(),
+            vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: text.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+            text.len() as u64,
+        )
     }
 
     #[cfg(target_family = "unix")]
@@ -6733,6 +6766,40 @@ mod tests {
     }
 
     #[test]
+    fn files_respawned_pending_request_trims_echo_without_settled_completion() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_request = true;
+        manager.last_prompt = Some(">>> ".to_string());
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+
+        manager.reset_output_state_files_preserving_detached_output();
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected aborted pending output to survive the respawned reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the aborted request echo to leak across the respawn boundary, got: {text:?}"
+        );
+        assert!(
+            manager.pending_request_input.is_none(),
+            "expected the aborted request input fallback to be consumed once the detached prefix is prepared"
+        );
+    }
+
+    #[test]
     fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
         let mut manager = WorkerManager::new(
             Backend::Python,
@@ -6985,17 +7052,12 @@ mod tests {
         .expect("worker manager");
         manager.process = Some(test_worker_process(sleeping_test_child()));
 
-        manager.output.start_capture();
-        manager.output_timeline.append_text(
-            b"line0001\nline0002\nline0003\nline0004\n",
+        manager.pager.activate(
+            pager_buffer_from_worker_text("line0001\nline0002\nline0003\nline0004\n"),
             false,
-            ContentOrigin::Worker,
         );
-        let end_offset = manager.output.end_offset().expect("output end offset");
-        let SnapshotWithImages { buffer, .. } =
-            snapshot_page_with_images(&manager.output, end_offset, 16);
-        manager.pager.activate(buffer.expect("pager buffer"), false);
 
+        manager.output.start_capture();
         manager
             .output_timeline
             .append_text(b"detached\n", false, ContentOrigin::Worker);
@@ -7037,15 +7099,10 @@ mod tests {
         manager.process = Some(test_worker_process(sleeping_test_child()));
         manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
 
-        manager.output.start_capture();
         let output = (1..=24).map(|n| format!("L{n:04}\n")).collect::<String>();
         manager
-            .output_timeline
-            .append_text(output.as_bytes(), false, ContentOrigin::Worker);
-        let end_offset = manager.output.end_offset().expect("output end offset");
-        let SnapshotWithImages { buffer, .. } =
-            snapshot_page_with_images(&manager.output, end_offset, 16);
-        manager.pager.activate(buffer.expect("pager buffer"), false);
+            .pager
+            .activate(pager_buffer_from_worker_text(&output), false);
 
         {
             let process = manager.process.as_mut().expect("worker process");

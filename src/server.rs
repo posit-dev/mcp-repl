@@ -253,6 +253,7 @@ impl SharedServer {
                         }) {
                             Ok(respawned) => {
                                 if respawned {
+                                    state.response.retire_disclosed_timeout_bundle();
                                     raw_input = normalize_input_after_sandbox_respawn(
                                         &raw_input,
                                         local_pager_follow_up,

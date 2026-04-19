@@ -234,6 +234,16 @@ impl ResponseState {
         self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some()
     }
 
+    pub(crate) fn retire_disclosed_timeout_bundle(&mut self) {
+        if self
+            .active_timeout_bundle
+            .as_ref()
+            .is_some_and(ActiveOutputBundle::was_disclosed)
+        {
+            self.active_timeout_bundle = None;
+        }
+    }
+
     fn materialize_staged_timeout_output(
         &mut self,
         staged: &StagedTimeoutOutput,
