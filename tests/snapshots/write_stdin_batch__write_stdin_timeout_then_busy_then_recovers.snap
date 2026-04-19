@@ -39,7 +39,7 @@ call:
 response:
 {
   "type": "tool_result",
-  "is_error": false,
+  "is_error": true,
   "content": [
     {
       "type": "text",

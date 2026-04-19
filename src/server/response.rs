@@ -1833,8 +1833,11 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
 
 pub(crate) fn finalize_batch(mut contents: Vec<Content>, is_error: bool) -> CallToolResult {
     ensure_nonempty_contents(&mut contents);
-    let _ = is_error;
-    CallToolResult::success(contents)
+    if is_error {
+        CallToolResult::error(contents)
+    } else {
+        CallToolResult::success(contents)
+    }
 }
 
 pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {

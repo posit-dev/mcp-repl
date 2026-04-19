@@ -35,7 +35,6 @@ use crate::worker_process::{
     WorkerError, WorkerManager, WriteStdinControlAction, WriteStdinOptions,
     split_write_stdin_control_prefix,
 };
-use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
@@ -142,15 +141,14 @@ impl SharedServer {
     fn apply_tool_call_sandbox_state(
         state: &mut ServerState,
         update: Option<SandboxStateUpdate>,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
         let Some(update) = update else {
-            return Ok(());
+            return Ok(false);
         };
 
         state
             .worker
-            .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)?;
-        Ok(())
+            .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
     }
 
     fn stage_tool_call_sandbox_state_for_reset(
@@ -177,11 +175,10 @@ impl SharedServer {
         let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
         self.run_state(move |state| {
             let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
-            let raw_input = input;
+            let mut raw_input = input;
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
             state.worker.refresh_timeout_marker();
-            let mut control_input_on_meta_error = None;
             let parse_tool_call_sandbox_state = || {
                 SharedServer::sandbox_state_update_for_tool_call_meta(
                     accepts_sandbox_state_meta,
@@ -189,80 +186,40 @@ impl SharedServer {
                 )
             };
             let sandbox_state_result = if raw_input.is_empty() {
-                // Empty-input polls may need the current tool call's metadata
-                // only when they must spawn a worker to answer the call.
+                // Empty-input polls only use current metadata when this call
+                // needs to start or restage a worker. Existing output still
+                // drains under the prior request's ownership.
+                let needs_post_poll_reset = state.worker.empty_input_may_auto_reset_after_poll();
                 match state.worker.empty_input_requires_spawn() {
-                    Ok(true) => {
-                        if let Err(err) = parse_tool_call_sandbox_state().and_then(|update| {
-                            SharedServer::apply_tool_call_sandbox_state(state, update)
-                        }) {
-                            Err(err)
-                        } else {
-                            Ok(None)
-                        }
-                    }
+                    Ok(true) => parse_tool_call_sandbox_state().and_then(|update| {
+                        let _ = SharedServer::apply_tool_call_sandbox_state(state, update)?;
+                        Ok(None)
+                    }),
+                    Ok(false) if needs_post_poll_reset => parse_tool_call_sandbox_state(),
                     Ok(false) => Ok(None),
                     Err(err) => Err(err),
                 }
             } else {
-                // A timed-out request still owns busy follow-ups, but a fresh
-                // non-empty call after that request has already settled must
-                // run under the current tool call's sandbox metadata.
-                let mut deferred_sandbox_state_update = None;
                 if state.worker.pending_request() {
                     state
                         .worker
                         .refresh_timeout_marker_with_wait(BUSY_FOLLOW_UP_RECHECK_WAIT);
                 }
-                if state.worker.pending_request() {
-                    if let Some((control, remaining)) = split_write_stdin_control_prefix(&raw_input)
-                    {
-                        let needs_deferred_update = match control {
-                            WriteStdinControlAction::Interrupt => !remaining.is_empty(),
-                            WriteStdinControlAction::Restart => true,
-                        };
-                        if needs_deferred_update {
-                            control_input_on_meta_error = Some((
-                                match control {
-                                    WriteStdinControlAction::Interrupt => "\u{3}".to_string(),
-                                    WriteStdinControlAction::Restart => "\u{4}".to_string(),
-                                },
-                                timeout_bundle_reuse_for_input(&raw_input),
-                                matches!(control, WriteStdinControlAction::Interrupt),
-                            ));
-                            if let Err(err) = parse_tool_call_sandbox_state().map(|update| {
-                                control_input_on_meta_error = None;
-                                deferred_sandbox_state_update = update;
-                            }) {
-                                Err(err)
-                            } else {
-                                Ok(deferred_sandbox_state_update)
-                            }
-                        } else {
-                            Ok(deferred_sandbox_state_update)
-                        }
-                    } else {
-                        Ok(deferred_sandbox_state_update)
-                    }
+                if is_bare_interrupt_input(&raw_input) {
+                    Ok(None)
                 } else {
-                    match state
-                        .worker
-                        .nonexecuting_follow_up_uses_existing_state(&raw_input)
-                    {
-                        Ok(true) => {
-                            // Local follow-ups like bare Ctrl-C or active pager
-                            // commands can keep using existing state. Exact
-                            // Ctrl-C is only in this path when it will not
-                            // respawn a worker.
-                            Ok(None)
-                        }
-                        Ok(false) => {
-                            match parse_tool_call_sandbox_state().and_then(|update| {
-                                SharedServer::apply_tool_call_sandbox_state(state, update)
-                            }) {
-                                Ok(()) => Ok(None),
-                                Err(err) => Err(err),
+                    let local_pager_follow_up = input_uses_local_pager_state(state, &raw_input);
+                    match parse_tool_call_sandbox_state().and_then(|update| {
+                        SharedServer::apply_tool_call_sandbox_state(state, update)
+                    }) {
+                        Ok(respawned) => {
+                            if respawned {
+                                raw_input = normalize_input_after_sandbox_respawn(
+                                    &raw_input,
+                                    local_pager_follow_up,
+                                );
                             }
+                            Ok(None)
                         }
                         Err(err) => Err(err),
                     }
@@ -271,42 +228,6 @@ impl SharedServer {
             let deferred_sandbox_state_update = match sandbox_state_result {
                 Ok(update) => update,
                 Err(err) => {
-                    if let Some((control_input, timeout_bundle_reuse, detach_control_reply)) =
-                        control_input_on_meta_error.take()
-                    {
-                        let control_result = state.worker.write_stdin(
-                            control_input,
-                            worker_timeout,
-                            server_timeout,
-                            WriteStdinOptions {
-                                pending_state_prechecked: true,
-                                ..WriteStdinOptions::default()
-                            },
-                        );
-                        let pending_request_after = state.worker.pending_request();
-                        let detached_prefix_item_count = if detach_control_reply {
-                            control_result
-                                .as_ref()
-                                .map_or(0, prefixed_worker_reply_item_count)
-                        } else {
-                            0
-                        };
-                        let mut result = finalize_visible_reply(
-                            state,
-                            control_result,
-                            pending_request_after,
-                            timeout_bundle_reuse,
-                            detached_prefix_item_count,
-                            use_inline_pager_materialization
-                                && !pending_request_after
-                                && !state.response.has_timeout_bundle_state(),
-                        );
-                        result
-                            .content
-                            .push(rmcp::model::Content::text(format!("worker error: {err}")));
-                        strip_text_stream_meta(&mut result);
-                        return result;
-                    }
                     let mut result = state.response.finalize_local_error(err);
                     strip_text_stream_meta(&mut result);
                     return result;
@@ -338,6 +259,39 @@ impl SharedServer {
             result
         })
         .await
+    }
+}
+
+fn is_bare_interrupt_input(input: &str) -> bool {
+    matches!(
+        split_write_stdin_control_prefix(input),
+        Some((WriteStdinControlAction::Interrupt, remaining)) if remaining.is_empty()
+    )
+}
+
+fn input_uses_local_pager_state(state: &ServerState, input: &str) -> bool {
+    if let Some((_control, remaining)) = split_write_stdin_control_prefix(input) {
+        state
+            .worker
+            .local_pager_follow_up_uses_existing_state(remaining)
+    } else {
+        state
+            .worker
+            .local_pager_follow_up_uses_existing_state(input)
+    }
+}
+
+fn normalize_input_after_sandbox_respawn(input: &str, local_pager_follow_up: bool) -> String {
+    if let Some((_control, remaining)) = split_write_stdin_control_prefix(input) {
+        if local_pager_follow_up {
+            String::new()
+        } else {
+            remaining.to_string()
+        }
+    } else if local_pager_follow_up {
+        String::new()
+    } else {
+        input.to_string()
     }
 }
 
@@ -548,32 +502,6 @@ fn finalize_visible_reply(
             timeout_bundle_reuse,
             detached_prefix_item_count,
         ),
-    }
-}
-
-fn prefixed_worker_reply_item_count(reply: &WorkerReply) -> usize {
-    let WorkerReply::Output {
-        contents, prompt, ..
-    } = reply;
-    let Some(prompt_text) = prompt.as_deref() else {
-        return contents.len();
-    };
-    if prompt_text.is_empty() {
-        return contents.len();
-    }
-    let Some(idx) = contents
-        .iter()
-        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
-    else {
-        return contents.len();
-    };
-    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
-        return contents.len();
-    };
-    if matches!(text.strip_suffix(prompt_text), Some("")) {
-        contents.len().saturating_sub(1)
-    } else {
-        contents.len()
     }
 }
 

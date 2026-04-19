@@ -93,6 +93,7 @@ fn raw_unix_kill(target: i32, signal: i32) -> i32 {
 struct GuardrailEvent {
     message: String,
     was_busy: bool,
+    is_error: bool,
 }
 
 #[derive(Clone)]
@@ -750,6 +751,14 @@ impl WorkerManager {
         Ok(needs_spawn)
     }
 
+    pub fn empty_input_may_auto_reset_after_poll(&self) -> bool {
+        self.empty_input_uses_existing_state()
+            && (self.pending_request
+                || self.settled_pending_completion.is_some()
+                || self.session_end_seen)
+    }
+
+    #[cfg(test)]
     pub fn nonexecuting_follow_up_uses_existing_state(
         &mut self,
         text: &str,
@@ -758,23 +767,16 @@ impl WorkerManager {
             return match control {
                 WriteStdinControlAction::Interrupt => {
                     if remaining.is_empty() {
-                        Ok(!self.control_only_interrupt_requires_spawn()?)
+                        Ok(true)
                     } else {
-                        Ok(self.pager_follow_up_uses_existing_state(remaining))
+                        Ok(self.local_pager_follow_up_uses_existing_state(remaining))
                     }
                 }
                 WriteStdinControlAction::Restart => Ok(false),
             };
         }
 
-        Ok(self.pager_follow_up_uses_existing_state(text))
-    }
-
-    fn control_only_interrupt_requires_spawn(&mut self) -> Result<bool, WorkerError> {
-        match self.process.as_mut() {
-            Some(process) => Ok(!process.is_running()?),
-            None => Ok(true),
-        }
+        Ok(self.local_pager_follow_up_uses_existing_state(text))
     }
 
     pub fn detached_prefix_item_count(&self) -> usize {
@@ -789,6 +791,16 @@ impl WorkerManager {
             return Ok(());
         };
         self.stage_sandbox_state_update(update)
+    }
+
+    fn stage_deferred_sandbox_state_before_session_end_reset(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        if self.session_end_seen {
+            self.stage_deferred_sandbox_state_update(update)?;
+        }
+        Ok(())
     }
 
     fn apply_deferred_sandbox_state_update(
@@ -818,7 +830,7 @@ impl WorkerManager {
         }
     }
 
-    fn pager_follow_up_uses_existing_state(&self, text: &str) -> bool {
+    pub(crate) fn local_pager_follow_up_uses_existing_state(&self, text: &str) -> bool {
         matches!(self.oversized_output, OversizedOutputMode::Pager) && self.pager.is_active() && {
             let trimmed = text.trim();
             trimmed.is_empty() || trimmed.starts_with(':')
@@ -927,6 +939,9 @@ impl WorkerManager {
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_files(worker_timeout)?;
+                self.stage_deferred_sandbox_state_before_session_end_reset(
+                    deferred_sandbox_state_update,
+                )?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
@@ -1069,6 +1084,9 @@ impl WorkerManager {
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
+                self.stage_deferred_sandbox_state_before_session_end_reset(
+                    deferred_sandbox_state_update,
+                )?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
@@ -2174,14 +2192,22 @@ impl WorkerManager {
             return;
         };
         match self.oversized_output {
-            OversizedOutputMode::Files => self
-                .pending_output_tape
-                .append_server_stderr_bytes(event.message.as_bytes()),
-            OversizedOutputMode::Pager => self.output_timeline.append_text(
-                event.message.as_bytes(),
-                true,
-                ContentOrigin::Server,
-            ),
+            OversizedOutputMode::Files => {
+                if event.is_error {
+                    self.pending_output_tape
+                        .append_server_stderr_bytes(event.message.as_bytes());
+                } else {
+                    self.pending_output_tape
+                        .append_stdout_status_line(event.message.as_bytes());
+                }
+            }
+            OversizedOutputMode::Pager => {
+                self.output_timeline.append_text(
+                    event.message.as_bytes(),
+                    event.is_error,
+                    ContentOrigin::Server,
+                );
+            }
         }
     }
 
@@ -2721,6 +2747,8 @@ impl WorkerManager {
             return Ok(respawned);
         }
 
+        let aborted_request = self.pending_request;
+        let had_prior_session = self.last_spawn.is_some();
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
@@ -2739,8 +2767,31 @@ impl WorkerManager {
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
         respawned = true;
+        if had_prior_session {
+            self.stage_sandbox_change_restart_notice(aborted_request);
+        }
         Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
         Ok(respawned)
+    }
+
+    fn stage_sandbox_change_restart_notice(&mut self, aborted_request: bool) {
+        let policy = serde_json::to_string(&self.sandbox_state.sandbox_policy)
+            .unwrap_or_else(|err| format!("{{\"serialize_error\":\"{}\"}}", err));
+        let mut message = String::from("[repl] sandbox policy changed; new session started\n");
+        if aborted_request {
+            message.push_str("[repl] previous request aborted because sandbox policy changed\n");
+        }
+        message.push_str(&format!("[repl] new sandbox policy: {policy}\n"));
+        let mut slot = self
+            .guardrail
+            .event
+            .lock()
+            .expect("guardrail event mutex poisoned");
+        *slot = Some(GuardrailEvent {
+            message,
+            was_busy: false,
+            is_error: false,
+        });
     }
 
     fn has_detached_output_to_preserve(&self) -> bool {
@@ -5142,6 +5193,7 @@ fn start_memory_guardrail(
                     *slot = Some(GuardrailEvent {
                         message: message.clone(),
                         was_busy: busy,
+                        is_error: true,
                     });
                 }
             }
@@ -6779,6 +6831,7 @@ mod tests {
             *slot = Some(GuardrailEvent {
                 message: "[repl] worker was idle; new session started\n".to_string(),
                 was_busy: false,
+                is_error: false,
             });
         }
 
@@ -7142,7 +7195,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_interrupt_requires_current_sandbox_when_worker_would_respawn() {
+    fn exact_interrupt_remains_local_when_worker_would_respawn() {
         let plan = SandboxCliPlan {
             operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
                 crate::sandbox_cli::SandboxModeArg::Inherit,
@@ -7156,10 +7209,10 @@ mod tests {
         .expect("worker manager");
 
         assert!(
-            !manager
+            manager
                 .nonexecuting_follow_up_uses_existing_state("\u{3}")
                 .expect("interrupt follow-up classification"),
-            "a bare Ctrl-C should require current per-call sandbox metadata when it would respawn"
+            "a bare Ctrl-C should stay a local follow-up even when it would otherwise respawn"
         );
     }
 

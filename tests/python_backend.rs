@@ -722,7 +722,7 @@ async fn python_busy_discards_input() -> TestResult<()> {
         text.contains("input discarded while worker busy"),
         "expected busy discard message, got: {text:?}"
     );
-    assert_ne!(result.is_error, Some(true));
+    assert_eq!(result.is_error, Some(true));
 
     session.cancel().await?;
     Ok(())

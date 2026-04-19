@@ -10,7 +10,7 @@
 ## Status
 
 - State: completed
-- Last updated: 2026-04-18
+- Last updated: 2026-04-19
 - Current phase: completed
 
 ## Design Intent
@@ -69,8 +69,13 @@
 - Ordered sandbox plans still validate earlier operations before later mode resets; later-wins resolution does not silently discard earlier invalid CLI/config ops.
 - `--debug-repl --sandbox inherit` remains locally usable by bootstrapping one inherited snapshot from the current default sandbox state before the first worker spawn.
 - `repl_reset` derives inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]`.
-- Non-empty `repl` calls derive inherited sandbox state from the current tool call's `_meta["codex/sandbox-state-meta"]` before executing fresh code.
-- Empty-input `repl` polls ignore per-call sandbox metadata when they can be answered from existing state, but they still apply the current tool call's metadata before spawning a worker to answer an idle call on a fresh session.
+- Non-empty `repl` calls resolve stale timeout markers before deciding whether they still belong to a prior timed-out request.
+- Bare `Ctrl-C` is the one non-empty follow-up that remains a local recovery control and does not force a sandbox-driven restart.
+- Every other non-empty `repl` call requires valid current `_meta["codex/sandbox-state-meta"]`.
+- If current metadata changes the effective inherited sandbox, `mcp-repl` restarts the worker before handling that non-empty call and includes a reply notice naming the new sandbox policy.
+- Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the restarted session when the sandbox changed; the control prefix itself is not replayed into the fresh worker.
+- Active pager commands also require current metadata. If the sandbox changed, `mcp-repl` restarts the worker and clears the old pager state instead of replaying pager-local input into the fresh session.
+- Empty-input `repl` polls ignore per-call sandbox metadata when they can be answered from existing state, but they still apply the current tool call's metadata before any spawn or respawn needed to answer the call, including after draining a session-ended request.
 - When a prior timed-out request has already settled, `mcp-repl` resolves the stale timeout marker before deciding whether a new non-empty `repl` call is still just a busy follow-up.
 - Missing or malformed metadata fails closed with the existing inherit error path.
 - Explicit non-`inherit` sandbox modes ignore Codex metadata.
@@ -88,7 +93,7 @@
 
 - Current Codex source and live traces both showed the old async update protocol was obsolete for the current release line.
 - The migration stayed intentionally single-path: no compatibility layer for older Codex builds.
-- Follow-up review fixes tightened the runtime sequencing so sandbox metadata is applied only for fresh execution or worker spawn, not for empty-input polls that are only draining prior output or using an already-running idle session.
+- Follow-up review fixes and final contract clarification tightened the runtime sequencing so sandbox changes now define worker-session boundaries for non-empty calls: empty polls keep draining, bare interrupts stay local, and other non-empty interactions restart into the current inherited sandbox when it changed.
 
 ## Decision Log
 
@@ -97,3 +102,4 @@
 - 2026-04-17: Chose per-tool-call `_meta["codex/sandbox-state-meta"]` as the source of truth after inspecting current Codex source and live traces.
 - 2026-04-17: Completed the repo migration and verification against the real current Codex integration tests.
 - 2026-04-18: Clarified the shipped contract for `repl`: empty-input polls ignore per-call sandbox metadata only when they can be answered from existing state, while fresh non-empty calls resolve stale timeout markers and then apply the current call's sandbox metadata before executing new code.
+- 2026-04-19: Replaced the earlier local-follow-up exception set with a simpler restart-on-change contract: empty polls keep draining, bare interrupts remain local, and other non-empty interactions use current metadata and restart the worker when the inherited sandbox changed.
