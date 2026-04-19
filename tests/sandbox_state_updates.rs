@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, TempDir, tempdir};
 
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+const MISSING_INHERITED_STATE_MESSAGE: &str =
+    "--sandbox inherit requested but no client sandbox state was provided";
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -184,6 +186,16 @@ async fn spawn_inherit_files_server(
         ],
         env,
         Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_pager_server(cwd: &Path, page_chars: u64) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+        page_chars,
     )
     .await
 }
@@ -393,6 +405,92 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
     assert!(
         !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
         "did not expect empty inherit repl call with metadata to fail closed, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let initial = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let initial_text = common::result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let interrupt = session
+        .write_stdin_raw_with_meta(
+            "\u{3}",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let interrupt_text = common::result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected local interrupt follow-up to ignore malformed metadata, got: {interrupt_text}"
+    );
+    assert!(
+        !interrupt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected local interrupt follow-up to ignore missing inherited metadata checks, got: {interrupt_text}"
+    );
+    assert!(
+        interrupt_text.contains(">")
+            || interrupt_text.contains("<<repl status: busy")
+            || interrupt_text.contains("<<repl status: idle>>"),
+        "expected interrupt follow-up to return local recovery output, got: {interrupt_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_pager_server(temp.path(), 120).await?;
+    let initial = session
+        .write_stdin_raw_with_meta(
+            "line <- paste(rep(\"foo\", 80), collapse = \" \"); for (i in 1:300) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let initial_text = common::result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate before local pager command test, got: {initial_text:?}"
+    );
+
+    let quit = session.write_stdin_raw_with(":q", Some(30.0)).await?;
+    let quit_text = common::result_text(&quit);
+    assert!(
+        !quit_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected active pager :q to ignore missing inherited metadata, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected active pager :q to skip sandbox metadata parsing, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("unexpected ':'"),
+        "expected :q to be handled by pager after inherit warm-up, got: {quit_text}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after pager quit, got: {quit_text}"
     );
     session.cancel().await?;
     Ok(())

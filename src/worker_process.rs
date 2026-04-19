@@ -750,6 +750,19 @@ impl WorkerManager {
         Ok(needs_spawn)
     }
 
+    pub fn nonexecuting_follow_up_uses_existing_state(&self, text: &str) -> bool {
+        if let Some((control, remaining)) = split_write_stdin_control_prefix(text) {
+            return match control {
+                WriteStdinControlAction::Interrupt => {
+                    remaining.is_empty() || self.pager_follow_up_uses_existing_state(remaining)
+                }
+                WriteStdinControlAction::Restart => false,
+            };
+        }
+
+        self.pager_follow_up_uses_existing_state(text)
+    }
+
     pub fn detached_prefix_item_count(&self) -> usize {
         self.last_detached_prefix_item_count
     }
@@ -788,6 +801,13 @@ impl WorkerManager {
                     || self.settled_pending_completion.is_some()
                     || self.pager.is_active()
             }
+        }
+    }
+
+    fn pager_follow_up_uses_existing_state(&self, text: &str) -> bool {
+        matches!(self.oversized_output, OversizedOutputMode::Pager) && self.pager.is_active() && {
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed.starts_with(':')
         }
     }
 

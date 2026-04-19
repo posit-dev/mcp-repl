@@ -93,7 +93,9 @@ jobs:
         run: |
           set -euo pipefail
           npm install -g @openai/codex
-          echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
+          npm_bin="$(npm config get prefix)/bin"
+          echo "$npm_bin" >> "$GITHUB_PATH"
+          export PATH="$npm_bin:$PATH"
           codex --version
 
       - name: Install Codex CLI (windows)
@@ -103,7 +105,8 @@ jobs:
           npm install -g @openai/codex
           $npmPrefix = npm config get prefix
           Add-Content -Path $env:GITHUB_PATH -Value $npmPrefix
-          codex --version
+          $env:PATH = "$npmPrefix;$env:PATH"
+          & (Join-Path $npmPrefix "codex.cmd") --version
 
       - name: cargo test (real codex integrations)
         if: matrix.os != 'windows-2022'
