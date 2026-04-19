@@ -207,7 +207,11 @@ impl SharedServer {
                     match state.worker.empty_input_requires_spawn() {
                         Ok(true) => (
                             parse_tool_call_sandbox_state().and_then(|update| {
-                                let _ = SharedServer::apply_tool_call_sandbox_state(state, update)?;
+                                let respawned =
+                                    SharedServer::apply_tool_call_sandbox_state(state, update)?;
+                                if respawned {
+                                    state.response.retire_disclosed_timeout_bundle();
+                                }
                                 Ok(None)
                             }),
                             true,

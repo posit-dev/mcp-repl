@@ -1701,11 +1701,9 @@ impl WorkerManager {
     ) -> Result<RequestState, WorkerError> {
         let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
-        if matches!(self.oversized_output, OversizedOutputMode::Files) {
-            let prompt = self.current_prompt_hint();
-            self.remember_prompt(prompt.clone());
-            self.pending_request_input = Some(text.clone());
-        }
+        let prompt = self.current_prompt_hint();
+        self.remember_prompt(prompt);
+        self.pending_request_input = Some(text.clone());
         let ipc = self
             .process
             .as_ref()
@@ -2209,7 +2207,9 @@ impl WorkerManager {
     }
 
     fn should_settle_multiline_r_timeout(&self) -> bool {
-        if self.backend != Backend::R {
+        if self.backend != Backend::R
+            || !matches!(self.oversized_output, OversizedOutputMode::Files)
+        {
             return false;
         }
         self.pending_request_input
@@ -3017,10 +3017,34 @@ impl WorkerManager {
     }
 
     fn reset_output_state_pager_preserving_detached_output(&mut self, preserve_pager: bool) {
+        self.seed_aborted_pager_completion_for_respawn();
         let had_pending_output = self.output.has_pending_output();
         let prefix = self.take_current_prefix_pager(had_pending_output);
         self.stage_prefix_before_respawn(prefix);
         self.reset_output_state_pager_inner(true, preserve_pager, false);
+    }
+
+    fn seed_aborted_pager_completion_for_respawn(&mut self) {
+        if !self.pending_request
+            || self.settled_pending_completion.is_some()
+            || self.pending_request_input.is_none()
+        {
+            return;
+        }
+
+        let prompt = self.last_prompt.clone();
+        let prompt_variants = prompt.clone().map(|prompt| vec![prompt]);
+        let echo_events = match (prompt, self.pending_request_input.clone()) {
+            (Some(prompt), Some(line)) => vec![IpcEchoEvent { prompt, line }],
+            _ => Vec::new(),
+        };
+        self.settled_pending_completion = Some(CompletionInfo {
+            prompt: self.last_prompt.clone(),
+            prompt_variants,
+            echo_events,
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
     }
 
     fn reset_output_state_pager_inner(
@@ -5861,7 +5885,7 @@ mod tests {
     fn output_ring_test_guard() -> MutexGuard<'static, ()> {
         crate::output_capture::output_ring_test_mutex()
             .lock()
-            .expect("output ring test lock")
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
@@ -5883,6 +5907,17 @@ mod tests {
     }
 
     fn pager_buffer_from_worker_text(text: &str) -> crate::pager::PagerBuffer {
+        pager_buffer_from_worker_text_with_source_end(text, text.len() as u64)
+    }
+
+    fn static_pager_buffer_from_worker_text(text: &str) -> crate::pager::PagerBuffer {
+        pager_buffer_from_worker_text_with_source_end(text, u64::MAX)
+    }
+
+    fn pager_buffer_from_worker_text_with_source_end(
+        text: &str,
+        source_end: u64,
+    ) -> crate::pager::PagerBuffer {
         crate::pager::PagerBuffer::from_bytes_and_events(
             text.as_bytes().to_vec(),
             Vec::new(),
@@ -5892,7 +5927,7 @@ mod tests {
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
             }],
-            text.len() as u64,
+            source_end,
         )
     }
 
@@ -6800,6 +6835,44 @@ mod tests {
     }
 
     #[test]
+    fn pager_respawned_pending_request_trims_echo_without_echo_events() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.pending_request = true;
+        manager.last_prompt = Some(">>> ".to_string());
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b">>> import time; time.sleep(0.2)\nDETACHED_OK\n",
+            false,
+            ContentOrigin::Worker,
+        );
+
+        manager.reset_output_state_pager_preserving_detached_output(false);
+
+        let context = manager.prepare_input_context_pager("1+1", false);
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected aborted pager output to survive the respawned reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the aborted pager echo to leak across the respawn boundary, got: {text:?}"
+        );
+    }
+
+    #[test]
     fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
         let mut manager = WorkerManager::new(
             Backend::Python,
@@ -7102,7 +7175,7 @@ mod tests {
         let output = (1..=24).map(|n| format!("L{n:04}\n")).collect::<String>();
         manager
             .pager
-            .activate(pager_buffer_from_worker_text(&output), false);
+            .activate(static_pager_buffer_from_worker_text(&output), false);
 
         {
             let process = manager.process.as_mut().expect("worker process");

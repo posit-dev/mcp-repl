@@ -285,6 +285,26 @@ fn timeout_then_large_completion_code() -> &'static str {
     )
 }
 
+fn timeout_then_large_completion_and_quit_code() -> &'static str {
+    Box::leak(
+        format!(
+            "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             cat('FIRST_START\\n'); \
+             cat(small); \
+             cat('\\nFIRST_END\\n'); \
+             flush.console(); \
+             Sys.sleep(0.5); \
+             cat('SECOND_START\\n'); \
+             cat(big); \
+             cat('\\nSECOND_END\\n'); \
+             flush.console(); \
+             quit('no')"
+        )
+        .into_boxed_str(),
+    )
+}
+
 fn oversized_follow_up_code(marker: &str) -> String {
     format!(
         "big <- paste(rep('u', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
@@ -1119,6 +1139,101 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
     assert!(
         !startup_target.exists(),
         "expected drained-session respawn to honor the current empty-poll read-only metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_poll_respawn_retires_disclosed_timeout_bundle() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-empty-poll-retires-timeout-bundle")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_and_quit_code(),
+            Some(0.05),
+            Some(full_access_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let mut drained = None;
+    for _ in 0..20 {
+        let poll = session
+            .write_stdin_raw_with_meta("", Some(2.0), Some(full_access_meta(scratch.path())))
+            .await?;
+        let poll_text = common::result_text(&poll);
+        if bundle_transcript_path(&poll_text).is_some()
+            && (poll_text.contains("session ended")
+                || poll_text.contains("ipc disconnected while waiting for request completion"))
+        {
+            drained = Some(poll);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let drained = drained.unwrap_or_else(|| {
+        panic!("expected draining poll to disclose the settled timeout transcript before respawn")
+    });
+    let drained_text = common::result_text(&drained);
+    let first_transcript_path = bundle_transcript_path(&drained_text).unwrap_or_else(|| {
+        panic!(
+            "expected draining poll to disclose the settled timeout transcript, got: {drained_text:?}"
+        )
+    });
+    let first_transcript_before = fs::read_to_string(&first_transcript_path)?;
+    assert!(
+        first_transcript_before.contains("SECOND_START")
+            && first_transcript_before.contains("SECOND_END"),
+        "expected the disclosed timeout transcript to contain the settled completion chunk, got: {first_transcript_before:?}"
+    );
+
+    let respawned = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(read_only_meta(scratch.path())))
+        .await?;
+    let respawned_text = common::result_text(&respawned);
+    assert!(
+        respawned_text.contains("<<repl status: idle>>"),
+        "expected the empty poll to respawn the ended session before the fresh follow-up, got: {respawned_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with_meta(
+            oversized_follow_up_code("FOLLOW_UP"),
+            Some(10.0),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let follow_up_text = common::result_text(&follow_up);
+    let follow_up_transcript_path = bundle_transcript_path(&follow_up_text);
+    let first_transcript_after = fs::read_to_string(&first_transcript_path)?;
+    let follow_up_transcript = follow_up_transcript_path
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()?
+        .unwrap_or_default();
+
+    session.cancel().await?;
+
+    if let Some(follow_up_transcript_path) = follow_up_transcript_path {
+        assert_ne!(
+            first_transcript_path, follow_up_transcript_path,
+            "expected the empty-poll respawn to stop reusing the old disclosed timeout bundle"
+        );
+    }
+    assert!(
+        !first_transcript_after.contains("FOLLOW_UP_START"),
+        "did not expect the fresh post-respawn output in the prior disclosed timeout transcript: {first_transcript_after:?}"
+    );
+    assert!(
+        follow_up_text.contains("FOLLOW_UP_START")
+            || follow_up_transcript.contains("FOLLOW_UP_START"),
+        "expected the fresh post-respawn output to stay with the new turn, got reply {follow_up_text:?} and transcript {follow_up_transcript:?}"
     );
     Ok(())
 }
