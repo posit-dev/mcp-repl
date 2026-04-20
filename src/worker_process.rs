@@ -44,6 +44,7 @@ use crate::sandbox::{
 use crate::sandbox_cli::{
     MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
     resolve_effective_sandbox_state_with_defaults, sandbox_plan_requests_inherited_state,
+    validate_sandbox_plan_with_defaults,
 };
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
@@ -631,6 +632,8 @@ pub struct WorkerManager {
     spawn_count: u64,
     guardrail: GuardrailShared,
     pending_server_notice: Option<GuardrailEvent>,
+    #[cfg(target_os = "linux")]
+    linux_bwrap_fallback_disabled: bool,
 }
 
 struct PreparedSandboxStateUpdate {
@@ -649,6 +652,8 @@ impl WorkerManager {
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
         let sandbox_state = if plan_requests_inherited_state {
+            validate_sandbox_plan_with_defaults(&sandbox_plan, &sandbox_defaults)
+                .map_err(WorkerError::Sandbox)?;
             sandbox_defaults.clone()
         } else {
             resolve_effective_sandbox_state_with_defaults(&sandbox_plan, None, &sandbox_defaults)
@@ -711,6 +716,8 @@ impl WorkerManager {
                 busy: Arc::new(AtomicBool::new(false)),
             },
             pending_server_notice: None,
+            #[cfg(target_os = "linux")]
+            linux_bwrap_fallback_disabled: false,
         })
     }
 
@@ -2835,12 +2842,16 @@ impl WorkerManager {
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
         let mut inherited_state = self.sandbox_defaults.clone();
         inherited_state.apply_update(update);
-        let resolved_state = resolve_effective_sandbox_state_with_defaults(
+        #[cfg(target_os = "linux")]
+        self.apply_linux_bwrap_fallback_override(&mut inherited_state);
+        let mut resolved_state = resolve_effective_sandbox_state_with_defaults(
             &self.sandbox_plan,
             Some(&inherited_state),
             &self.sandbox_defaults,
         )
         .map_err(WorkerError::Sandbox)?;
+        #[cfg(target_os = "linux")]
+        self.apply_linux_bwrap_fallback_override(&mut resolved_state);
         let missing_before = self.missing_inherited_sandbox_state();
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
@@ -2857,6 +2868,13 @@ impl WorkerManager {
             changed,
             missing_before,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_linux_bwrap_fallback_override(&self, state: &mut SandboxState) {
+        if self.linux_bwrap_fallback_disabled {
+            state.use_linux_sandbox_bwrap = false;
+        }
     }
 
     fn log_sandbox_state_update(
@@ -3348,6 +3366,7 @@ impl WorkerManager {
             }),
         );
 
+        self.linux_bwrap_fallback_disabled = true;
         self.sandbox_state.use_linux_sandbox_bwrap = false;
         self.sandbox_defaults.use_linux_sandbox_bwrap = false;
         if let Some(inherited_state) = self.inherited_sandbox_state.as_mut() {
@@ -7528,6 +7547,107 @@ mod tests {
         assert!(
             !manager.sandbox_state.use_linux_sandbox_bwrap,
             "follow-up Codex metadata should preserve the local no-bwrap fallback"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_stays_disabled_after_followup_plan_bwrap_override() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::Config(
+                    crate::sandbox_cli::SandboxConfigOperation::SetUseLinuxSandboxBwrap(true),
+                ),
+            ],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let mut inherited_state = manager.sandbox_defaults.clone();
+        inherited_state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: Some(std::env::temp_dir()),
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_state.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_state),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial sandbox state");
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "test setup should start with the plan-level bwrap override enabled"
+        );
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+        assert!(retry, "expected startup failure to disable bwrap");
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            },
+            "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
+        }))
+        .expect("Codex sandbox metadata");
+        manager
+            .update_sandbox_state(update, Duration::from_millis(1))
+            .expect("follow-up sandbox state");
+
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "plan-level bwrap overrides should not re-enable bwrap after the local fallback"
+        );
+    }
+
+    #[test]
+    fn inherit_ending_invalid_plan_fails_during_startup_validation() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::ReadOnly,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::AddWritableRoot(std::env::temp_dir()),
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+            ],
+        };
+
+        let err = match WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        ) {
+            Ok(_) => panic!("invalid inherit-ending plan should fail during startup"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, WorkerError::Sandbox(ref message) if message.contains("--add-writable-root can only be used while sandbox mode is workspace-write")),
+            "unexpected error: {err}"
         );
     }
 
