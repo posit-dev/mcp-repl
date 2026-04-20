@@ -111,6 +111,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
         "mcp-repl-x86_64-pc-windows-msvc.zip",
+        "npm install -g @openai/codex",
+        "npm config get prefix",
         "SHA256SUMS.txt",
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
@@ -141,6 +143,14 @@ fn ci_workflow_defines_dev_release_contract() {
         "publish-stable:",
         "-F make_latest=false",
         "-F make_latest=\"${latest_flag}\"",
+        "CODEX_VERSION:",
+        "openai/codex-action",
+        "secrets.OPENAI_API_KEY",
+        "codex-x86_64-unknown-linux-musl.tar.gz",
+        "codex-aarch64-apple-darwin.tar.gz",
+        "codex-x86_64-pc-windows-msvc.exe.zip",
+        "https://github.com/openai/codex/releases/latest/download/",
+        "Expand-Archive",
     ] {
         assert!(
             !workflow.contains(forbidden),
