@@ -9,8 +9,12 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_NAME: &str = "claude_live_integration";
@@ -483,12 +487,83 @@ fn claude_subscription_available() -> TestResult<bool> {
     cmd.stderr(Stdio::piped());
 
     let output = cmd.output()?;
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|err| format!("claude auth status stdout was not valid UTF-8: {err}"))?;
-    let status: ClaudeAuthStatus = serde_json::from_str(stdout.trim()).map_err(|err| {
-        format!("failed to parse claude auth status JSON: {err}\nstdout:\n{stdout}")
-    })?;
-    Ok(output.status.success() && status.logged_in && status.api_provider == "firstParty")
+    Ok(claude_auth_status_supports_first_party_subscription(
+        &output,
+    ))
+}
+
+fn claude_auth_status_supports_first_party_subscription(output: &Output) -> bool {
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = match String::from_utf8(output.stdout.clone()) {
+        Ok(stdout) => stdout,
+        Err(err) => {
+            eprintln!("claude auth status stdout was not valid UTF-8; skipping: {err}");
+            return false;
+        }
+    };
+    let status: ClaudeAuthStatus = match serde_json::from_str(stdout.trim()) {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!("failed to parse claude auth status JSON; skipping: {err}");
+            return false;
+        }
+    };
+    status.logged_in && status.api_provider == "firstParty"
+}
+
+#[cfg(unix)]
+fn exit_status(code: i32) -> ExitStatus {
+    ExitStatus::from_raw(code << 8)
+}
+
+#[cfg(windows)]
+fn exit_status(code: u32) -> ExitStatus {
+    ExitStatus::from_raw(code)
+}
+
+#[test]
+fn claude_auth_status_failure_output_skips_without_parsing_json() {
+    let output = Output {
+        status: exit_status(1),
+        stdout: b"not json\n".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(
+        !claude_auth_status_supports_first_party_subscription(&output),
+        "expected failed auth probes to skip without requiring JSON output"
+    );
+}
+
+#[test]
+fn claude_auth_status_success_requires_first_party_json() {
+    let output = Output {
+        status: exit_status(0),
+        stdout: br#"{"loggedIn":true,"apiProvider":"firstParty"}"#.to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(
+        claude_auth_status_supports_first_party_subscription(&output),
+        "expected successful first-party auth JSON to enable Claude live tests"
+    );
+}
+
+#[test]
+fn claude_auth_status_success_with_non_json_output_skips() {
+    let output = Output {
+        status: exit_status(0),
+        stdout: b"logged out\n".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(
+        !claude_auth_status_supports_first_party_subscription(&output),
+        "expected non-JSON auth output to skip Claude live tests"
+    );
 }
 
 fn assert_installed_claude_config(staged: &StagedClaudeEnv) -> TestResult<()> {

@@ -1817,11 +1817,13 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         .write_stdin_raw_with_meta("\u{4}", Some(1.0), Some(read_only_meta(scratch.path())))
         .await?;
     let restart_text = common::result_text(&restart);
-    session.cancel().await?;
-
     assert!(
         restart_text.contains("new session started"),
         "expected bare Ctrl-D after sandbox respawn to remain an explicit restart, got: {restart_text}"
+    );
+    assert!(
+        restart_text.contains("sandbox policy changed; new session started"),
+        "expected bare Ctrl-D after sandbox respawn to flush the sandbox-change notice, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("MID") && !restart_text.contains("TAIL"),
@@ -1830,6 +1832,21 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
     assert!(
         !restart_text.contains("<<repl status: idle>>"),
         "did not expect bare Ctrl-D after sandbox respawn to degrade into an empty poll, got: {restart_text}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with_meta("1+1", Some(1.0), Some(read_only_meta(scratch.path())))
+        .await?;
+    let follow_up_text = common::result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("sandbox policy changed; new session started"),
+        "did not expect the sandbox-change notice to leak into the next unrelated reply, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected the post-restart follow-up to run normally, got: {follow_up_text}"
     );
     Ok(())
 }

@@ -2582,6 +2582,7 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        self.maybe_emit_pending_server_notice();
 
         let reply = self.build_session_reset_reply_files("new session started");
         self.reset_output_state_files(true);
@@ -2757,6 +2758,7 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        self.maybe_emit_pending_server_notice();
 
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
@@ -7158,6 +7160,41 @@ mod tests {
         assert!(
             manager.pending_server_notice.is_none(),
             "expected the restart notice to be emitted instead of lingering"
+        );
+    }
+
+    #[test]
+    fn bare_restart_flushes_queued_sandbox_change_notice() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.stage_sandbox_change_restart_notice(true);
+
+        let reply = manager
+            .write_stdin_files(
+                "\u{4}".to_string(),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                WriteStdinOptions::default(),
+            )
+            .expect("restart reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        assert!(
+            text.contains("sandbox policy changed; new session started"),
+            "expected bare restart to flush the queued sandbox notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("[repl] new session started"),
+            "expected the explicit restart notice to remain visible, got: {text:?}"
+        );
+        assert!(
+            manager.pending_server_notice.is_none(),
+            "expected the queued sandbox notice to be consumed by the restart reply"
         );
     }
 
