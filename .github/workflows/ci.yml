@@ -79,13 +79,42 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: cargo test (skip client integrations)
+      - name: cargo test
         if: matrix.os != 'windows-2022'
-        run: cargo test -- --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
+        run: cargo test
 
-      - name: cargo test (windows serial, skip client integrations)
+      - name: cargo test (windows serial)
         if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 -- --test-threads=1 --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
+        run: cargo test -j 1 -- --test-threads=1
+
+      - name: Install Codex CLI
+        if: matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @openai/codex
+          npm_bin="$(npm config get prefix)/bin"
+          echo "$npm_bin" >> "$GITHUB_PATH"
+          export PATH="$npm_bin:$PATH"
+          codex --version
+
+      - name: Install Codex CLI (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          npm install -g @openai/codex
+          $npmPrefix = npm config get prefix
+          Add-Content -Path $env:GITHUB_PATH -Value $npmPrefix
+          $env:PATH = "$npmPrefix;$env:PATH"
+          & (Join-Path $npmPrefix "codex.cmd") --version
+
+      - name: cargo test (real codex integrations)
+        if: matrix.os != 'windows-2022'
+        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+
+      - name: cargo test (real codex integrations, windows serial)
+        if: matrix.os == 'windows-2022'
+        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check
