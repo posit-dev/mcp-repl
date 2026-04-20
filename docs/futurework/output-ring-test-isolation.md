@@ -15,3 +15,7 @@ Future work:
   coverage can exercise `WorkerManager` directly without cross-test interference.
 - audit remaining output-ring tests and remove any dependence on implicit global
   resets from unrelated manager construction.
+- `worker_process::tests::pager_empty_input_advances_page_after_worker_exit`
+  still flakes under the full unit suite: an empty pager follow-up can see
+  unrelated global output, skip the pager-local path, and surface another
+  test's worker stderr instead of advancing the page.
