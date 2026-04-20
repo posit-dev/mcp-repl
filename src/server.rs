@@ -338,9 +338,11 @@ fn is_pure_local_pager_input(state: &ServerState, input: &str) -> bool {
 }
 
 fn normalize_input_after_sandbox_respawn(input: &str, local_pager_follow_up: bool) -> String {
-    if let Some((_control, remaining)) = split_write_stdin_control_prefix(input) {
+    if let Some((control, remaining)) = split_write_stdin_control_prefix(input) {
         if local_pager_follow_up {
             String::new()
+        } else if matches!(control, WriteStdinControlAction::Restart) && remaining.is_empty() {
+            input.to_string()
         } else {
             remaining.to_string()
         }

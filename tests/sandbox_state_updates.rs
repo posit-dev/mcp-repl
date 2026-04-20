@@ -1736,6 +1736,47 @@ async fn sandbox_inherit_restart_follow_up_applies_current_state_meta() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-bare-restart-after-respawn")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
+
+    let restart = session
+        .write_stdin_raw_with_meta("\u{4}", Some(1.0), Some(read_only_meta(scratch.path())))
+        .await?;
+    let restart_text = common::result_text(&restart);
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("new session started"),
+        "expected bare Ctrl-D after sandbox respawn to remain an explicit restart, got: {restart_text}"
+    );
+    assert!(
+        !restart_text.contains("MID") && !restart_text.contains("TAIL"),
+        "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
+    );
+    assert!(
+        !restart_text.contains("<<repl status: idle>>"),
+        "did not expect bare Ctrl-D after sandbox respawn to degrade into an empty poll, got: {restart_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResult<()> {
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-workspace-write")?;
