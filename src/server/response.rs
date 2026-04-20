@@ -234,11 +234,31 @@ impl ResponseState {
         self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some()
     }
 
+    pub(crate) fn disclosed_timeout_bundle_id(&self) -> Option<u64> {
+        self.active_timeout_bundle
+            .as_ref()
+            .filter(|active| active.was_disclosed())
+            .map(|active| active.id)
+    }
+
     pub(crate) fn retire_disclosed_timeout_bundle(&mut self) {
         if self
             .active_timeout_bundle
             .as_ref()
             .is_some_and(ActiveOutputBundle::was_disclosed)
+        {
+            self.active_timeout_bundle = None;
+        }
+    }
+
+    pub(crate) fn retire_timeout_bundle_if_matches(&mut self, bundle_id: Option<u64>) {
+        let Some(bundle_id) = bundle_id else {
+            return;
+        };
+        if self
+            .active_timeout_bundle
+            .as_ref()
+            .is_some_and(|active| active.id == bundle_id)
         {
             self.active_timeout_bundle = None;
         }

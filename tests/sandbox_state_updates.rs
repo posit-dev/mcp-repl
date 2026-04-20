@@ -1565,6 +1565,64 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle_output()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-bundle-across-restart-tail-respawn")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(test_delay_ms(900, 1200)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            "\u{4}1+1",
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = common::result_text(&second);
+    let transcript_path = bundle_transcript_path(&second_text).unwrap_or_else(|| {
+        panic!(
+            "expected the sandbox-respawned restart tail to preserve and disclose the timeout transcript, got: {second_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+        "expected the preserved timeout transcript to include the first timed-out chunk, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+        "expected the preserved timeout transcript to include the settled completion chunk, got: {transcript:?}"
+    );
+    assert!(
+        second_text.contains("[1] 2") || transcript.contains("[1] 2"),
+        "expected the restart tail to execute after preserving the timeout transcript, got reply {second_text:?} and transcript {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -> TestResult<()> {
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-disclosed-timeout-bundle-respawn")?;

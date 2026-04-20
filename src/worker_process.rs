@@ -632,6 +632,8 @@ pub struct WorkerManager {
     spawn_count: u64,
     guardrail: GuardrailShared,
     pending_server_notice: Option<GuardrailEvent>,
+    write_in_progress: bool,
+    last_write_respawned: bool,
     #[cfg(target_os = "linux")]
     linux_bwrap_fallback_disabled: bool,
 }
@@ -716,6 +718,8 @@ impl WorkerManager {
                 busy: Arc::new(AtomicBool::new(false)),
             },
             pending_server_notice: None,
+            write_in_progress: false,
+            last_write_respawned: false,
             #[cfg(target_os = "linux")]
             linux_bwrap_fallback_disabled: false,
         })
@@ -829,6 +833,16 @@ impl WorkerManager {
         self.last_detached_prefix_item_count
     }
 
+    pub fn respawned_during_last_write(&self) -> bool {
+        self.last_write_respawned
+    }
+
+    fn note_respawn_during_write(&mut self) {
+        if self.write_in_progress {
+            self.last_write_respawned = true;
+        }
+    }
+
     fn stage_deferred_sandbox_state_update(
         &mut self,
         update: Option<SandboxStateUpdate>,
@@ -919,14 +933,18 @@ impl WorkerManager {
         server_timeout: Duration,
         options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
-        match self.oversized_output {
+        self.write_in_progress = true;
+        self.last_write_respawned = false;
+        let result = match self.oversized_output {
             OversizedOutputMode::Files => {
                 self.write_stdin_files(text, worker_timeout, server_timeout, options)
             }
             OversizedOutputMode::Pager => {
                 self.write_stdin_pager(text, worker_timeout, server_timeout, options)
             }
-        }
+        };
+        self.write_in_progress = false;
+        result
     }
 
     /// Entry point for the public `repl` tool in default files mode.
@@ -2381,11 +2399,14 @@ impl WorkerManager {
 
     fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
-            let _ = match self.oversized_output {
+            let result = match self.oversized_output {
                 OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
                 OversizedOutputMode::Pager => self
                     .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
             };
+            if result.is_ok() {
+                self.note_respawn_during_write();
+            }
             self.session_end_seen = false;
         }
     }
@@ -2564,6 +2585,7 @@ impl WorkerManager {
 
         let reply = self.build_session_reset_reply_files("new session started");
         self.reset_output_state_files(true);
+        self.note_respawn_during_write();
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -2739,6 +2761,7 @@ impl WorkerManager {
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
         self.reset_output_state_pager(true, false);
+        self.note_respawn_during_write();
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -2920,6 +2943,7 @@ impl WorkerManager {
                     OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
                 });
                 respawned = true;
+                self.note_respawn_during_write();
             }
             Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
             return Ok(respawned);
@@ -2945,6 +2969,7 @@ impl WorkerManager {
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
         respawned = true;
+        self.note_respawn_during_write();
         if had_prior_session {
             self.stage_sandbox_change_restart_notice(aborted_request);
             self.next_live_prefix_belongs_to_reply = true;

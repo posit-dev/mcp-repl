@@ -174,7 +174,6 @@ impl SharedServer {
         let server_timeout = apply_safety_margin(timeout);
         let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
         self.run_state(move |state| {
-            let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
             let mut raw_input = input;
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
@@ -281,6 +280,8 @@ impl SharedServer {
                     return result;
                 }
             };
+            let prior_disclosed_timeout_bundle_id = state.response.disclosed_timeout_bundle_id();
+            let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&raw_input);
             let result = state.worker.write_stdin(
                 raw_input.clone(),
                 worker_timeout,
@@ -294,6 +295,7 @@ impl SharedServer {
             );
             let pending_request_after = state.worker.pending_request();
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();
+            let respawned_during_write = state.worker.respawned_during_last_write();
             let mut result = finalize_visible_reply(
                 state,
                 result,
@@ -304,6 +306,11 @@ impl SharedServer {
                     && !pending_request_after
                     && !state.response.has_timeout_bundle_state(),
             );
+            if respawned_during_write {
+                state
+                    .response
+                    .retire_timeout_bundle_if_matches(prior_disclosed_timeout_bundle_id);
+            }
             strip_text_stream_meta(&mut result);
             result
         })
