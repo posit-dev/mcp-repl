@@ -45,6 +45,15 @@ fn collect_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+#[cfg(not(windows))]
+fn count_images(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, rmcp::model::RawContent::Image(_)))
+        .count()
+}
+
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -141,45 +150,62 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut snapshot = McpSnapshot::new();
+    let session = common::spawn_server_with_files().await?;
 
-    snapshot
-        .files_session(
-            "files_multidrain_plot_then_later_stdout",
-            mcp_session!(|session| {
-                session
-                    .call_tool(
-                        session.repl_tool_name(),
-                        json!({
-                            "input": "plot(1:10)\nSys.sleep(2)\ncat('done\\n')\n",
-                            "timeout_ms": 200
-                        }),
-                    )
-                    .await;
-                session
-                    .call_tool(
-                        session.repl_tool_name(),
-                        json!({
-                            "input": "",
-                            "timeout_ms": 10000
-                        }),
-                    )
-                    .await;
-                Ok(())
+    let first = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "plot(1:10)\nSys.sleep(2)\ncat('done\\n')\n",
+                "timeout_ms": 200
             }),
         )
         .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
-    assert_snapshot_or_skip(
-        "write_stdin_files_multidrain_plot_then_later_stdout_snapshot",
-        &snapshot,
-    )
+    let second = session
+        .call_tool_raw(
+            session.repl_tool_name(),
+            json!({
+                "input": "",
+                "timeout_ms": 10000
+            }),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    session.cancel().await?;
+
+    let combined_text = format!("{first_text}\n{second_text}");
+    let total_images = count_images(&first) + count_images(&second);
+
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial call to time out while the request was still running, got: {first_text:?}"
+    );
+    assert!(
+        !second_text.contains("<<repl status: busy"),
+        "expected follow-up poll to finish the timed-out request, got: {second_text:?}"
+    );
+    assert!(
+        combined_text.contains("done"),
+        "expected combined responses to include trailing stdout, got: {combined_text:?}"
+    );
+    assert_eq!(
+        total_images, 1,
+        "expected exactly one plot image across timeout and poll responses"
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let first = session
         .write_stdin_raw_with(
@@ -274,7 +300,7 @@ async fn write_stdin_pager_hits() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_recovers_after_error() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
     let _ = session
         .write_stdin_raw_with("stop('boom')", Some(10.0))
         .await?;
@@ -302,7 +328,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let input = (1..=2_000)
         .map(|idx| format!("x{idx} <- {idx}\n"))
@@ -334,7 +360,7 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let mut input = String::new();
     for idx in 1..=1_000 {

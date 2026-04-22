@@ -49,7 +49,7 @@ fn busy_response(text: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_small_page_size() -> TestResult<()> {
     let page_bytes = 80;
-    let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
     let mut result = session
         .write_stdin_raw_with("for (i in 1:50) cat('abcd\\n')", Some(30.0))
@@ -116,7 +116,7 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_large_page_size() -> TestResult<()> {
     let page_bytes = 10_000;
-    let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
     let mut result = session
         .write_stdin_raw_with("for (i in 1:10) cat('abcd\\n\')", Some(30.0))
@@ -166,7 +166,7 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn large_page_size_keeps_pager_mode_instead_of_spilling_to_output_bundle() -> TestResult<()> {
     let page_bytes = 10_000;
-    let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
     let initial = session
         .write_stdin_raw_with(

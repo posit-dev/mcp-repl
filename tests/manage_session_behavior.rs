@@ -49,7 +49,7 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "manage_session_behavior test mutex poisoned")?;
-    let mut session = spawn_manage_session().await?;
+    let session = spawn_manage_session().await?;
 
     let _ = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
     let result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
@@ -106,7 +106,7 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "manage_session_behavior test mutex poisoned")?;
-    let mut session = spawn_manage_session().await?;
+    let session = spawn_manage_session().await?;
 
     let _ = session
         .write_stdin_raw_with("x <- 1; Sys.sleep(5)", Some(0.1))

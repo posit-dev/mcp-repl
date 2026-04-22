@@ -4,19 +4,28 @@ mod common;
 
 use common::{McpTestSession, TestResult};
 use rmcp::model::{CallToolResult, RawContent};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
-use tempfile::tempdir;
-use tokio::time::sleep;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::{Builder, TempDir, tempdir};
 
-const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
+const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+const MISSING_INHERITED_STATE_MESSAGE: &str =
+    "--sandbox inherit requested but no client sandbox state was provided";
+const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
+const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
+const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    test_mutex().lock().unwrap_or_else(|err| err.into_inner())
 }
 
 fn collect_text(result: &CallToolResult) -> String {
@@ -38,397 +47,1321 @@ fn collect_text(result: &CallToolResult) -> String {
         .join("\n")
 }
 
-fn result_text(result: &CallToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+fn linux_sandbox_exe_value(use_legacy_landlock: bool) -> Value {
+    #[cfg(target_os = "linux")]
+    {
+        if use_legacy_landlock {
+            Value::Null
+        } else {
+            Value::String("/tmp/codex-linux-sandbox".to_string())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = use_legacy_landlock;
+        Value::Null
+    }
 }
 
-fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+fn codex_sandbox_state_meta(
+    sandbox_policy: Value,
+    sandbox_cwd: &Path,
+    use_legacy_landlock: bool,
+) -> Value {
+    json!({
+        SANDBOX_STATE_META_CAPABILITY: {
+            "sandboxPolicy": sandbox_policy,
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": use_legacy_landlock,
+            "codexLinuxSandboxExe": linux_sandbox_exe_value(use_legacy_landlock),
+        }
+    })
+}
+
+fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        json!({
+            "type": "workspace-write",
+            "writable_roots": [],
+            "network_access": false,
+            "exclude_tmpdir_env_var": false,
+            "exclude_slash_tmp": false,
+        }),
+        sandbox_cwd,
+        /*use_legacy_landlock*/ false,
+    )
+}
+
+fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        json!({
+            "type": "workspace-write",
+            "writable_roots": [],
+            "network_access": false,
+            "exclude_tmpdir_env_var": false,
+            "exclude_slash_tmp": false,
+            "read_only_access": {
+                "mode": "read-only",
+            },
+        }),
+        sandbox_cwd,
+        /*use_legacy_landlock*/ false,
+    )
+}
+
+fn read_only_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
+}
+
+fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        json!({
+            "type": "read-only",
+            "access": {
+                "mode": "read-only",
+            },
+        }),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        json!({
+            "type": "read-only",
+            "network_access": true,
+        }),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn full_access_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd, false)
+}
+
+fn encode_path(path: &Path) -> TestResult<String> {
+    Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
+}
+
+fn bundle_transcript_path(text: &str) -> Option<std::path::PathBuf> {
+    disclosed_path(text, "transcript.txt")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<std::path::PathBuf> {
     let end = text.find(suffix)?.saturating_add(suffix.len());
     let start = text[..end]
         .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
         .map_or(0, |idx| idx.saturating_add(1));
-    Some(PathBuf::from(&text[start..end]))
+    Some(std::path::PathBuf::from(&text[start..end]))
 }
 
-fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
-    disclosed_path(text, "transcript.txt")
+fn outside_workspace_target(label: &str) -> TestResult<std::path::PathBuf> {
+    let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "missing HOME/USERPROFILE for sandbox test target".to_string())?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(base.join(format!(".mcp-repl-{label}-{nanos}.txt")))
 }
 
-fn sandbox_update_params(network_access: bool) -> serde_json::Value {
-    json!({
-        "sandboxPolicy": {
-            "type": "workspace-write",
-            "writable_roots": [],
-            "network_access": network_access,
-            "exclude_tmpdir_env_var": false,
-            "exclude_slash_tmp": false
-        }
-    })
+fn repo_scratch_dir(label: &str) -> TestResult<TempDir> {
+    Ok(Builder::new()
+        .prefix(&format!(".tmp-{label}-"))
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))?)
+}
+
+fn write_file_code(path: &Path) -> TestResult<String> {
+    let target = encode_path(path)?;
+    Ok(format!(
+        r#"
+target <- {target}
+tryCatch({{
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+    ))
+}
+
+fn variable_probe_code() -> &'static str {
+    r#"cat(sprintf("X_EXISTS:%s\n", exists("x")))"#
 }
 
 fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with signal")
-        || text.contains("worker exited with status")
-        || text.contains("worker io error: Broken pipe")
-        || text.contains("unable to initialize the JIT")
-        || text.contains("libR.so: cannot open shared object file")
-        || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
+    common::backend_unavailable(text)
+}
+
+async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_server_with_env(
+    cwd: &Path,
+    env: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        env,
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_then_workspace_write_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+        ],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_files_server(
+    cwd: &Path,
+    env: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ],
+        env,
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_pager_server(cwd: &Path, page_chars: u64) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+        page_chars,
+    )
+    .await
+}
+
+fn timeout_then_tail_code() -> &'static str {
+    r#"
+Sys.sleep(0.2)
+cat("MID\n")
+flush.console()
+Sys.sleep(1.0)
+cat("TAIL\n")
+flush.console()
+"#
+}
+
+fn timeout_then_done_code() -> &'static str {
+    r#"
+Sys.sleep(0.2)
+cat("DONE\n")
+flush.console()
+"#
+}
+
+#[cfg(unix)]
+fn timeout_then_exit_code() -> &'static str {
+    r#"
+cat("BEFORE_EXIT\n")
+flush.console()
+Sys.sleep(0.2)
+q("no", status = 0, runLast = FALSE)
+"#
+}
+
+#[cfg(unix)]
+fn timeout_then_tail_exit_code() -> &'static str {
+    r#"
+Sys.sleep(0.2)
+cat("MID\n")
+flush.console()
+Sys.sleep(1.0)
+q("no", status = 0, runLast = FALSE)
+"#
+}
+
+#[cfg(unix)]
+fn interrupt_then_exit_code() -> &'static str {
+    r#"
+tryCatch({
+  Sys.sleep(30)
+}, interrupt = function(e) {
+  cat("INTERRUPT_EXIT\n")
+  flush.console()
+  q("no", status = 0, runLast = FALSE)
+})
+"#
+}
+
+#[cfg(unix)]
+fn interrupt_then_prompt_code() -> &'static str {
+    r#"
+tryCatch({
+  Sys.sleep(30)
+}, interrupt = function(e) {
+  cat("INTERRUPT_PROMPT\n")
+  flush.console()
+})
+"#
+}
+
+fn timeout_then_large_completion_code() -> &'static str {
+    Box::leak(
+        format!(
+            "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); \
+             cat('FIRST_START\\n'); \
+             cat(small); \
+             cat('\\nFIRST_END\\n'); \
+             flush.console(); \
+             Sys.sleep(0.5); \
+             cat('SECOND_START\\n'); \
+             cat(big); \
+             cat('\\nSECOND_END\\n'); \
+             flush.console()"
         )
+        .into_boxed_str(),
+    )
 }
 
-fn busy_response(text: &str) -> bool {
-    text.contains("<<repl status: busy")
-        || text.contains("worker is busy")
-        || text.contains("request already running")
-        || text.contains("input discarded while worker busy")
-}
-
-async fn spawn_server_retry() -> TestResult<common::McpTestSession> {
-    spawn_server_retry_with_env_vars(Vec::new()).await
-}
-
-async fn spawn_server_retry_with_env_vars(
-    env_vars: Vec<(String, String)>,
-) -> TestResult<common::McpTestSession> {
-    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for _ in 0..3 {
-        match common::spawn_server_with_env_vars(env_vars.clone()).await {
-            Ok(session) => return Ok(session),
-            Err(err) => {
-                let message = err.to_string();
-                if message.contains(
-                    "failed to create session temp dir: The directory is not empty. (os error 145)",
-                ) {
-                    last_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from(
-            "failed to spawn server after temp-dir retries".to_string(),
-        )
-    }))
-}
-
-async fn spawn_server_with_files_retry_with_env_vars(
-    env_vars: Vec<(String, String)>,
-) -> TestResult<common::McpTestSession> {
-    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for _ in 0..3 {
-        match common::spawn_server_with_files_env_vars(env_vars.clone()).await {
-            Ok(session) => return Ok(session),
-            Err(err) => {
-                let message = err.to_string();
-                if message.contains(
-                    "failed to create session temp dir: The directory is not empty. (os error 145)",
-                ) {
-                    last_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from(
-            "failed to spawn files-mode server after temp-dir retries".to_string(),
-        )
-    }))
-}
-
-enum SandboxUpdateKind {
-    Request,
-    Notification,
-}
-
-async fn wait_for_timeout_bundle_transcript(
-    session: &mut McpTestSession,
-    input: &str,
-) -> TestResult<Option<PathBuf>> {
-    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
-    let first_text = result_text(&first);
-    if backend_unavailable(&first_text) {
-        return Ok(None);
-    }
-
-    sleep(Duration::from_millis(260)).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let spilled = session
-            .write_stdin_raw_unterminated_with("", Some(0.1))
-            .await?;
-        let spilled_text = result_text(&spilled);
-        if let Some(path) = bundle_transcript_path(&spilled_text) {
-            return Ok(Some(path));
-        }
-        if !busy_response(&spilled_text) {
-            return Err(format!(
-                "expected timeout bundle disclosure in spill poll, got: {spilled_text:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    Err("timed out waiting for timeout bundle transcript".into())
-}
-
-async fn poll_until_not_busy(session: &mut McpTestSession) -> TestResult<CallToolResult> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let result = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        let text = result_text(&result);
-        if !busy_response(&text) {
-            return Ok(result);
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    Err("timed out waiting for non-busy empty poll".into())
-}
-
-async fn assert_sandbox_update_clears_stale_timeout_bundle(
-    kind: SandboxUpdateKind,
-) -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
-
-    let temp = tempdir()?;
-    // Transcript-path assertions are part of the files-mode surface. The
-    // default pager mode can satisfy the same timeout semantics without
-    // deterministically disclosing a transcript path before the restart.
-    let mut session = spawn_server_with_files_retry_with_env_vars(vec![(
-        "TMPDIR".to_string(),
-        temp.path().display().to_string(),
-    )])
-    .await?;
-    let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
-    let Some(transcript_path) = wait_for_timeout_bundle_transcript(&mut session, input).await?
-    else {
-        eprintln!("sandbox_state_updates backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    };
-    let transcript_before = fs::read_to_string(&transcript_path)?;
-
-    match kind {
-        SandboxUpdateKind::Request => {
-            session
-                .send_custom_request(SANDBOX_STATE_METHOD, sandbox_update_params(true))
-                .await?;
-        }
-        SandboxUpdateKind::Notification => {
-            session
-                .send_custom_notification(SANDBOX_STATE_METHOD, sandbox_update_params(true))
-                .await?;
-            sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    let poll = poll_until_not_busy(&mut session).await?;
-    let poll_text = result_text(&poll);
-    let transcript_after = fs::read_to_string(&transcript_path)?;
-
-    session.cancel().await?;
-
-    assert!(
-        bundle_transcript_path(&poll_text).is_none(),
-        "did not expect empty poll after sandbox restart to reuse prior timeout bundle: {poll_text:?}"
-    );
-    assert_eq!(
-        transcript_after, transcript_before,
-        "did not expect sandbox-triggered restart output to append to prior timeout bundle"
-    );
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sandbox_full_access_params() -> serde_json::Value {
-    json!({
-        "sandboxPolicy": {
-            "type": "danger-full-access"
-        }
+fn test_delay_ms(default_ms: u64, windows_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(if cfg!(windows) {
+        windows_ms
+    } else {
+        default_ms
     })
 }
 
-async fn assert_session_reset(session: &mut McpTestSession) -> TestResult<bool> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last_text = String::new();
-    while Instant::now() < deadline {
-        let result = session
-            .write_stdin_raw_with("x <- 42; print(exists(\"x\"))", Some(10.0))
-            .await?;
-        last_text = collect_text(&result);
-        if backend_unavailable(&last_text) {
-            return Ok(false);
-        }
-        if last_text.contains("TRUE") {
-            return Ok(true);
-        }
-        if busy_response(&last_text) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    eprintln!("sandbox_state_updates pre-update check did not stabilize: {last_text}");
-    Ok(false)
+fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
+    let mut sessions = fs::read_dir(debug_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    let session_dir = sessions
+        .last()
+        .cloned()
+        .ok_or_else(|| "missing debug session directory".to_string())?;
+    let log_text = fs::read_to_string(session_dir.join("events.jsonl"))?;
+    Ok(log_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
-async fn assert_variable_cleared(session: &mut McpTestSession) -> TestResult<bool> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last_text = String::new();
-    while Instant::now() < deadline {
-        let result = session
-            .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
-            .await?;
-        last_text = collect_text(&result);
-        if backend_unavailable(&last_text) {
-            return Ok(false);
-        }
-        if last_text.contains("FALSE") {
-            return Ok(true);
-        }
-        if busy_response(&last_text) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    eprintln!("sandbox_state_updates post-update check did not stabilize: {last_text}");
-    Ok(false)
+#[cfg(unix)]
+fn worker_spawn_policy_types(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .filter_map(|entry| entry["payload"]["sandbox_policy"]["type"].as_str())
+        .map(str::to_string)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_update_request_restarts_worker() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
-    let mut session = spawn_server_retry().await?;
-    if !assert_session_reset(&mut session).await? {
-        eprintln!("sandbox_state_updates request backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    session
-        .send_custom_request(SANDBOX_STATE_METHOD, sandbox_update_params(true))
-        .await?;
-    if !assert_variable_cleared(&mut session).await? {
-        eprintln!("sandbox_state_updates request backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<()> {
+    let _guard = test_guard();
+    let session =
+        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
+            .await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let experimental = info.capabilities.experimental.as_ref().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing experimental capabilities".to_string(),
+        )
+    })?;
+    assert!(
+        experimental.contains_key(SANDBOX_STATE_META_CAPABILITY),
+        "expected sandbox state meta capability in experimental: {experimental:?}"
+    );
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_update_request_clears_hidden_timeout_bundle() -> TestResult<()> {
-    assert_sandbox_update_clears_stale_timeout_bundle(SandboxUpdateKind::Request).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_update_notification_restarts_worker() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
-    let mut session = spawn_server_retry().await?;
-    if !assert_session_reset(&mut session).await? {
-        eprintln!("sandbox_state_updates notification backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    session
-        .send_custom_notification(SANDBOX_STATE_METHOD, sandbox_update_params(true))
-        .await?;
-    if !assert_variable_cleared(&mut session).await? {
-        eprintln!("sandbox_state_updates notification backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()> {
+    let _guard = test_guard();
+    let session = common::spawn_server().await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let advertised = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key(SANDBOX_STATE_META_CAPABILITY));
+    assert!(
+        !advertised,
+        "did not expect sandbox state meta capability without `--sandbox inherit`: {info:?}"
+    );
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_update_notification_clears_hidden_timeout_bundle() -> TestResult<()> {
-    assert_sandbox_update_clears_stale_timeout_bundle(SandboxUpdateKind::Notification).await
-}
+async fn sandbox_state_meta_capability_hidden_after_later_workspace_write_override()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-inherit-override-workspace-write")?;
+    let session = spawn_inherit_then_workspace_write_server(scratch.path()).await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let advertised = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key(SANDBOX_STATE_META_CAPABILITY));
+    assert!(
+        !advertised,
+        "did not expect sandbox state meta capability after later workspace-write override: {info:?}"
+    );
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_update_applies_full_access_policy() -> TestResult<()> {
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
-    if std::env::var_os("CODEX_SANDBOX").is_some() {
-        return Ok(());
-    }
-    let target = std::env::temp_dir().join("mcp-repl-sandbox-state-update.txt");
-    let _ = std::fs::remove_file(&target);
-    let mut session = common::spawn_server().await?;
-    session
-        .send_custom_request(SANDBOX_STATE_METHOD, sandbox_full_access_params())
+    let target = scratch.path().join("override-write.txt");
+    let result = session
+        .write_stdin_raw_with(write_file_code(&target)?, Some(10.0))
         .await?;
-    let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
-        .map_err(|err| format!("failed to encode target path: {err}"))?;
-    let code = r#"
-target <- __TARGET__
-tryCatch({
-  writeLines("allowed", target)
-  cat("WRITE_OK\n")
-}, error = function(e) {
-  message("WRITE_ERROR:", conditionMessage(e))
-})
-"#
-    .replace("__TARGET__", &target_literal);
-    let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates full_access backend unavailable; skipping");
-        let _ = std::fs::remove_file(&target);
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert!(
         text.contains("WRITE_OK"),
-        "expected full access to allow write, got: {text}"
+        "expected later workspace-write override to avoid inherit metadata requirements, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "expected missing sandbox-state-meta error, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected missing sandbox-state-meta to be reported as an MCP tool error"
+    );
+    assert!(
+        !text.contains("2"),
+        "did not expect successful evaluation, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let meta = Some(json!({
+        SANDBOX_STATE_META_CAPABILITY: "invalid",
+    }));
+    let result = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), meta)
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed sandbox-state-meta error, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected malformed sandbox-state-meta to be reported as an MCP tool error"
+    );
+    assert!(
+        !text.contains("2"),
+        "did not expect successful evaluation, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("<<repl status: idle>>"),
+        "expected empty inherit repl call with metadata to return idle status, got: {text}"
+    );
+    assert!(
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "did not expect empty inherit repl call with metadata to fail closed, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_repl_after_reset_uses_staged_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let reset = session
+        .call_tool_raw_with_meta(
+            "repl_reset",
+            json!({}),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let reset_text = collect_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset with sandbox metadata to succeed, got: {reset_text}"
+    );
+
+    let result = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("<<repl status: idle>>"),
+        "expected empty inherit repl call after reset to return idle status, got: {text}"
+    );
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "did not expect empty inherit repl call after reset to fail closed"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_poll_with_existing_worker_ignores_bad_state_meta() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let initial = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let initial_text = collect_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let poll = session
+        .write_stdin_raw_with_meta(
+            "",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let poll_text = collect_text(&poll);
+    session.cancel().await?;
+
+    assert_ne!(
+        poll.is_error,
+        Some(true),
+        "did not expect empty poll with existing worker to fail on malformed metadata"
+    );
+    assert!(
+        !poll_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected empty poll with existing worker to ignore malformed metadata, got: {poll_text}"
+    );
+    assert!(
+        poll_text.contains("<<repl status: idle>>") || poll_text.contains(">"),
+        "expected empty poll with existing worker to return local status, got: {poll_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let initial = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let initial_text = common::result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let interrupt = session
+        .write_stdin_raw_with_meta(
+            "\u{3}",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let interrupt_text = common::result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected local interrupt follow-up to ignore malformed metadata, got: {interrupt_text}"
+    );
+    assert!(
+        !interrupt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected local interrupt follow-up to ignore missing inherited metadata checks, got: {interrupt_text}"
+    );
+    assert!(
+        interrupt_text.contains(">")
+            || interrupt_text.contains("<<repl status: busy")
+            || interrupt_text.contains("<<repl status: idle>>"),
+        "expected interrupt follow-up to return local recovery output, got: {interrupt_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the first under-threshold timeout reply to disclose a bundle path, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(test_delay_ms(600, 900)).await;
+
+    let metadata_error = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    let metadata_error_text = common::result_text(&metadata_error);
+    assert!(
+        metadata_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error, got: {metadata_error_text}"
+    );
+
+    let mut final_text = String::new();
+    for _ in 0..10 {
+        let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+        final_text = common::result_text(&final_poll);
+        if !final_text.contains("<<repl status: busy") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let transcript_path = bundle_transcript_path(&final_text).unwrap_or_else(|| {
+        panic!(
+            "expected preserved timeout state to disclose a transcript path on the later poll, got: {final_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+        "expected the preserved timeout bundle to backfill the first timed-out chunk, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+        "expected the preserved timeout bundle to include the later completion chunk, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_pager_server(temp.path(), 120).await?;
+    let initial = session
+        .write_stdin_raw_with_meta(
+            "line <- paste(rep(\"foo\", 80), collapse = \" \"); for (i in 1:300) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let initial_text = common::result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate before local pager command test, got: {initial_text:?}"
+    );
+
+    let quit = session.write_stdin_raw_with(":q", Some(30.0)).await?;
+    let quit_text = common::result_text(&quit);
+    assert!(
+        !quit_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected active pager :q to ignore missing inherited metadata, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected active pager :q to skip sandbox metadata parsing, got: {quit_text}"
+    );
+    assert!(
+        !quit_text.contains("unexpected ':'"),
+        "expected :q to be handled by pager after inherit warm-up, got: {quit_text}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after pager quit, got: {quit_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_still_interrupts() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); detached <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); tryCatch({{ Sys.sleep(30) }}, interrupt = function(e) {{ cat('DETACHED_START\\n'); cat(detached); cat('\\nDETACHED_END\\n'); flush.console() }})"
+    );
+    let first = session
+        .write_stdin_raw_with_meta(input, Some(0.05), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect timeout bundle disclosure before the interrupt-side metadata error, got: {first_text:?}"
+    );
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
+
+    let interrupt_error = session
+        .write_stdin_raw_with_meta(
+            "\u{3}cat('AFTER_INTERRUPT\\n')",
+            Some(10.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    assert_eq!(
+        interrupt_error.is_error,
+        Some(true),
+        "expected malformed metadata follow-up to be reported as an MCP tool error"
+    );
+    let interrupt_error_text = common::result_text(&interrupt_error);
+    assert!(
+        interrupt_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after local interrupt, got: {interrupt_error_text}"
+    );
+    let transcript_path = bundle_transcript_path(&interrupt_error_text).unwrap_or_else(|| {
+        panic!(
+            "expected the interrupt-side metadata error reply to disclose the detached timeout transcript, got: {interrupt_error_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+    assert!(
+        transcript.contains("SMALL_START") && transcript.contains("SMALL_END"),
+        "expected the earlier timed-out output to remain on the transcript path, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("DETACHED_START") && transcript.contains("DETACHED_END"),
+        "expected the interrupt-side detached output to remain on the transcript path, got: {transcript:?}"
+    );
+
+    let mut recovery_text = String::new();
+    for _ in 0..20 {
+        let recovery = session
+            .write_stdin_raw_with_meta("1+1", Some(0.5), Some(workspace_write_meta(temp.path())))
+            .await?;
+        recovery_text = common::result_text(&recovery);
+        if !recovery_text.contains("[repl] input discarded while worker busy")
+            && !recovery_text.contains("<<repl status: busy")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    session.cancel().await?;
+
+    assert!(
+        !recovery_text.contains("[repl] input discarded while worker busy")
+            && !recovery_text.contains("<<repl status: busy"),
+        "expected the pending request to be interrupted before the metadata error returned, got: {recovery_text}"
+    );
+    assert!(
+        recovery_text.contains("[1] 2"),
+        "expected the next valid call to run after the interrupt side effect, got: {recovery_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_restart_with_bad_meta_clears_timeout_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let restart_error = session
+        .write_stdin_raw_with_meta(
+            "\u{4}cat('AFTER_RESTART\\n')",
+            Some(0.1),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    assert_eq!(
+        restart_error.is_error,
+        Some(true),
+        "expected malformed metadata restart follow-up to be reported as an MCP tool error"
+    );
+    let restart_error_text = common::result_text(&restart_error);
+    assert!(
+        restart_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after local restart, got: {restart_error_text}"
+    );
+    assert!(
+        restart_error_text.contains("new session started"),
+        "expected the restart-side metadata error reply to include the restart notice, got: {restart_error_text}"
+    );
+
+    let recovery = session
+        .write_stdin_raw_with_meta("1+1", Some(1.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let recovery_text = common::result_text(&recovery);
+    session.cancel().await?;
+
+    assert!(
+        recovery_text.contains("[1] 2"),
+        "expected the next valid call to run in the restarted session, got: {recovery_text}"
+    );
+    assert!(
+        !recovery_text.contains("MID") && !recovery_text.contains("TAIL"),
+        "did not expect pre-restart timeout output to leak into the restarted session, got: {recovery_text}"
+    );
+    assert!(
+        bundle_transcript_path(&recovery_text).is_none(),
+        "did not expect the restarted session to keep a stale timeout bundle attached, got: {recovery_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_follow_up_ignores_new_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta("1+1", Some(0.1), Some(full_access_meta(temp.path())))
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("[repl] input discarded while worker busy"),
+        "expected busy follow-up to preserve the pending request, got: {second_text}"
+    );
+    assert!(
+        !second_text.contains("[1] 2"),
+        "did not expect changed metadata to start a fresh request, got: {second_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_reset()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_files_server(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_exit_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected exit setup request to time out, got: {timeout_text}"
+    );
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
+
+    let follow_up = session
+        .write_stdin_raw_with_meta(
+            "cat(\"BUSY_FOLLOWUP\\n\")",
+            Some(5.0),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let follow_up_text = collect_text(&follow_up);
+    session.cancel().await?;
+
+    if follow_up_text.contains("<<repl status: busy") {
+        eprintln!("busy follow-up did not observe session end before timeout; skipping");
+        return Ok(());
+    }
+    let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
+    assert_eq!(
+        policy_types,
+        vec!["workspace-write".to_string(), "read-only".to_string()],
+        "expected busy-follow-up reset to use current read-only metadata, got policy sequence: {policy_types:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let poll = session
+        .write_stdin_raw_with_meta("", Some(2.0), Some(full_access_meta(temp.path())))
+        .await?;
+    let poll_text = collect_text(&poll);
+    assert!(
+        poll_text.contains("TAIL"),
+        "expected empty poll to continue draining the original request, got: {poll_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-settle-fresh-call")?;
+    let target = scratch.path().join("fresh-call-write.txt");
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_done_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("WRITE_OK"),
+        "expected fresh follow-up call to apply current sandbox metadata, got: {second_text}"
+    );
+    assert!(
+        !second_text.contains("WRITE_ERROR:"),
+        "did not expect stale settled timeout state to keep the old sandbox, got: {second_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-tail-across-state-change")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        !first_text.contains("TAIL"),
+        "expected the late completion chunk to remain detached from the timeout reply, got: {first_text}"
+    );
+    tokio::time::sleep(test_delay_ms(1400, 1800)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("TAIL"),
+        "expected settled timeout output to survive sandbox respawn, got: {second_text}"
+    );
+    assert!(
+        second_text.contains("[1] 2"),
+        "expected the fresh call to still execute after the preserved timeout tail, got: {second_text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-timeout-bundle-across-state-change")?;
+    let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            timeout_then_large_completion_code(),
+            Some(0.05),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let first_text = common::result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(test_delay_ms(900, 1200)).await;
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let second_text = common::result_text(&second);
+    let transcript_path = bundle_transcript_path(&second_text).unwrap_or_else(|| {
+        panic!(
+            "expected the metadata-changing follow-up to preserve and disclose the timeout transcript, got: {second_text:?}"
+        )
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("FIRST_START") && transcript.contains("FIRST_END"),
+        "expected the preserved timeout transcript to include the first timed-out chunk, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
+        "expected the preserved timeout transcript to include the settled completion chunk, got: {transcript:?}"
+    );
+    assert!(
+        second_text.contains("[1] 2") || transcript.contains("[1] 2"),
+        "expected the fresh follow-up result to execute after preserving the timeout transcript, got reply {second_text:?} and transcript {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-workspace-write")?;
+    let target = scratch.path().join("allowed.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected write in cwd to succeed, got: {text}"
     );
     assert!(
         !text.contains("WRITE_ERROR:"),
-        "full access unexpectedly blocked write: {text}"
+        "workspace-write unexpectedly blocked write in cwd: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(workspace_write_restricted_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected restricted read metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("read_only_access"),
+        "expected restricted read metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported restricted read metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(read_only_restricted_access_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected restricted read-only metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("access"),
+        "expected restricted read-only metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported restricted read-only metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(read_only_network_access_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected read-only network metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("network_access"),
+        "expected read-only network metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported read-only network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_full_access_meta_allows_write_outside_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let target = outside_workspace_target("full-access")?;
+    let _ = std::fs::remove_file(&target);
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(full_access_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected full access to allow write outside cwd, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "full access unexpectedly blocked outside write: {text}"
     );
     let _ = std::fs::remove_file(&target);
     session.cancel().await?;
@@ -436,71 +1369,839 @@ tryCatch({
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_state_capability_advertised() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let session = spawn_server_retry().await?;
-    let info = session.server_info().ok_or_else(|| {
-        let message = "missing server info from initialize".to_string();
-        Box::<dyn std::error::Error + Send + Sync>::from(message)
-    })?;
-    let experimental = info.capabilities.experimental.as_ref().ok_or_else(|| {
-        let message = "missing experimental capabilities".to_string();
-        Box::<dyn std::error::Error + Send + Sync>::from(message)
-    })?;
-    assert!(
-        experimental.contains_key("codex/sandbox-state"),
-        "expected sandbox state capability in experimental: {experimental:?}"
+async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tail_files()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let target = outside_workspace_target("ctrl-c-tail-files")?;
+    let _ = std::fs::remove_file(&target);
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let timed_out = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timed_out_text = collect_text(&timed_out);
+    if backend_unavailable(&timed_out_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
+
+    let mut text = collect_text(
+        &session
+            .write_stdin_raw_with_meta(
+                format!("\u{3}{}", write_file_code(&target)?),
+                Some(10.0),
+                Some(full_access_meta(temp.path())),
+            )
+            .await?,
     );
+    for _ in 0..20 {
+        if !text.contains("[repl] input discarded while worker busy")
+            && !text.contains("<<repl status: busy")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+    }
+    let file_text = std::fs::read_to_string(&target).ok();
+    let _ = std::fs::remove_file(&target);
     session.cancel().await?;
+
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected ctrl-c tail to execute under the updated full-access sandbox, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "did not expect ctrl-c tail to keep the previous sandbox permissions, got: {text}"
+    );
+    assert_eq!(
+        file_text.as_deref().map(str::trim_end),
+        Some("allowed"),
+        "expected ctrl-c tail to write outside the workspace under the new sandbox"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_allows_initialize_before_state_update() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let session =
-        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
-            .await?;
+async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tail_pager()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let target = outside_workspace_target("ctrl-c-tail-pager")?;
+    let _ = std::fs::remove_file(&target);
+    let session = spawn_inherit_pager_server(temp.path(), 120).await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let timed_out = session
+        .write_stdin_raw_with_meta(
+            timeout_then_tail_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timed_out_text = collect_text(&timed_out);
+    if backend_unavailable(&timed_out_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    tokio::time::sleep(test_delay_ms(260, 700)).await;
+
+    let mut text = collect_text(
+        &session
+            .write_stdin_raw_with_meta(
+                format!("\u{3}{}", write_file_code(&target)?),
+                Some(10.0),
+                Some(full_access_meta(temp.path())),
+            )
+            .await?,
+    );
+    for _ in 0..20 {
+        if !text.contains("[repl] input discarded while worker busy")
+            && !text.contains("<<repl status: busy")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+    }
+    let file_text = std::fs::read_to_string(&target).ok();
+    let _ = std::fs::remove_file(&target);
     session.cancel().await?;
+
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected pager ctrl-c tail to execute under the updated full-access sandbox, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "did not expect pager ctrl-c tail to keep the previous sandbox permissions, got: {text}"
+    );
+    assert_eq!(
+        file_text.as_deref().map(str::trim_end),
+        Some("allowed"),
+        "expected pager ctrl-c tail to write outside the workspace under the new sandbox"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_update_errors_on_first_tool_call() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let mut session =
-        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
-            .await?;
-    let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+async fn explicit_workspace_write_mode_ignores_codex_sandbox_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let target = outside_workspace_target("ignored-meta")?;
+    let _ = std::fs::remove_file(&target);
+    let session = common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "workspace-write".to_string()],
+        Vec::new(),
+        Some(temp.path().to_path_buf()),
+    )
+    .await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(full_access_meta(temp.path())),
+        )
+        .await?;
     let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected missing sandbox-state error, got: {text}"
+        text.contains("WRITE_ERROR:"),
+        "expected explicit workspace-write mode to ignore full-access metadata, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "did not expect explicit workspace-write mode to allow outside write, got: {text}"
+    );
+    let _ = std::fs::remove_file(&target);
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let first = session
+        .write_stdin_raw_with_meta(
+            r#"x <- 42; cat("SET_OK\n")"#,
+            Some(10.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("SET_OK"),
+        "expected setup write, got: {first_text}"
+    );
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            variable_probe_code(),
+            Some(10.0),
+            Some(full_access_meta(temp.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    assert!(
+        second_text.contains("X_EXISTS:FALSE"),
+        "expected sandbox state change to restart the worker session, got: {second_text}"
     );
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_update_errors_on_repl_reset() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
-    let mut session =
-        common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
-            .await?;
+async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
     let result = session.call_tool_raw("repl_reset", json!({})).await?;
     let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected missing sandbox-state error, got: {text}"
+        "expected missing sandbox-state-meta error, got: {text}"
+    );
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected missing sandbox-state-meta reset to be reported as an MCP tool error"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_reset",
+            json!({}),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("new session started"),
+        "expected repl_reset with sandbox metadata to succeed, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_repl_reset_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_reset",
+            json!({}),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected repl_reset with sandbox metadata to succeed, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let saw_restart = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_restart_begin");
+    assert!(saw_restart, "expected repl_reset to emit a restart event");
+    let saw_spawn = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_spawn_begin");
+    assert!(
+        !saw_spawn,
+        "did not expect repl_reset to spawn a worker just to stage sandbox metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let result = session
+        .write_stdin_raw_with_meta("\u{4}", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected bare Ctrl-D with sandbox metadata to restart the session, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let saw_restart = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_restart_begin");
+    assert!(saw_restart, "expected bare Ctrl-D to emit a restart event");
+    let saw_spawn = events
+        .iter()
+        .any(|entry| entry["event"] == "worker_spawn_begin");
+    assert!(
+        !saw_spawn,
+        "did not expect bare Ctrl-D to spawn a worker just to stage sandbox metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_first_ctrl_d_tail_stages_current_meta_before_restart() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "\u{4}1+1",
+            Some(2.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("new session started"),
+        "expected Ctrl-D tail to restart before running tail input, got: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected Ctrl-D tail to run with current sandbox metadata, got: {text}"
+    );
+    assert!(
+        !text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "did not expect valid current metadata to fail closed, got: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_end_reset()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_files_server(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            interrupt_then_exit_code(),
+            Some(0.2),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected interrupt setup request to time out, got: {timeout_text}"
+    );
+
+    let tail = session
+        .write_stdin_raw_with_meta(
+            "\u{3}1+1",
+            Some(10.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let tail_text = collect_text(&tail);
+    session.cancel().await?;
+
+    if backend_unavailable(&tail_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    if tail_text.contains("<<repl status: busy") {
+        eprintln!("interrupt tail did not complete before timeout; skipping");
+        return Ok(());
+    }
+    assert!(
+        tail_text.contains("[1] 2"),
+        "expected Ctrl-C tail to run after the exiting interrupt handler, got: {tail_text}"
+    );
+
+    let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
+    let read_only_spawns = policy_types
+        .iter()
+        .filter(|policy_type| policy_type.as_str() == "read-only")
+        .count();
+    assert_eq!(
+        read_only_spawns, 1,
+        "expected only the initial worker to spawn with read-only metadata, got policy sequence: {policy_types:?}"
+    );
+    assert!(
+        policy_types
+            .iter()
+            .any(|policy_type| policy_type == "workspace-write"),
+        "expected the interrupt tail replacement worker to use workspace-write metadata, got policy sequence: {policy_types:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_end_reset()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_files_server(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            interrupt_then_exit_code(),
+            Some(0.2),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected interrupt setup request to time out, got: {timeout_text}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_with_meta("\u{3}", Some(10.0), Some(read_only_meta(temp.path())))
+        .await?;
+    let interrupt_text = collect_text(&interrupt);
+    session.cancel().await?;
+
+    if interrupt_text.contains("<<repl status: busy") {
+        eprintln!("bare interrupt did not complete before timeout; skipping");
+        return Ok(());
+    }
+
+    let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
+    assert_eq!(
+        policy_types,
+        vec!["workspace-write".to_string(), "read-only".to_string()],
+        "expected bare Ctrl-C reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_files_server(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            interrupt_then_prompt_code(),
+            Some(0.2),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected interrupt setup request to time out, got: {timeout_text}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_with_meta("\u{3}", Some(10.0), Some(read_only_meta(temp.path())))
+        .await?;
+    let interrupt_text = collect_text(&interrupt);
+    if interrupt_text.contains("<<repl status: busy") {
+        eprintln!("bare interrupt did not complete before timeout; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        interrupt_text.contains("INTERRUPT_PROMPT"),
+        "expected interrupt handler to return to the existing worker prompt, got: {interrupt_text}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with_meta(
+            "cat(\"AFTER_INTERRUPT\\n\")",
+            Some(5.0),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let follow_up_text = collect_text(&follow_up);
+    session.cancel().await?;
+    assert!(
+        follow_up_text.contains("AFTER_INTERRUPT"),
+        "expected follow-up to run after the bare interrupt, got: {follow_up_text}"
+    );
+
+    let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
+    assert_eq!(
+        policy_types,
+        vec!["workspace-write".to_string(), "read-only".to_string()],
+        "expected same-metadata follow-up to respawn under read-only after a surviving Ctrl-C, got policy sequence: {policy_types:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_files_server(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            timeout_then_exit_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected exit setup request to time out, got: {timeout_text}"
+    );
+    tokio::time::sleep(test_delay_ms(350, 700)).await;
+
+    let poll = session
+        .write_stdin_raw_with_meta("", Some(5.0), Some(read_only_meta(temp.path())))
+        .await?;
+    let poll_text = collect_text(&poll);
+    session.cancel().await?;
+
+    if poll_text.contains("<<repl status: busy") {
+        eprintln!("empty poll did not observe session end before timeout; skipping");
+        return Ok(());
+    }
+
+    let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
+    assert_eq!(
+        policy_types,
+        vec!["workspace-write".to_string(), "read-only".to_string()],
+        "expected empty-poll reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_empty_poll_without_meta_fails_before_session_end_reset() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
+
+    let timeout = session
+        .write_stdin_raw_with_meta(
+            timeout_then_exit_code(),
+            Some(0.05),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let timeout_text = collect_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected exit setup request to time out, got: {timeout_text}"
+    );
+    tokio::time::sleep(test_delay_ms(350, 700)).await;
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll_text = collect_text(&poll);
+    session.cancel().await?;
+
+    assert_eq!(
+        poll.is_error,
+        Some(true),
+        "expected omitted metadata empty poll to fail before respawn, got: {poll_text}"
+    );
+    assert!(
+        poll_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected missing sandbox metadata error before empty-poll respawn, got: {poll_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_idle_ctrl_d_without_state_meta_does_not_restart() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let first = session
+        .write_stdin_raw_with_meta("x <- 1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart_error = session.write_stdin_raw_with("\u{4}", Some(2.0)).await?;
+    assert_eq!(
+        restart_error.is_error,
+        Some(true),
+        "expected missing metadata Ctrl-D to be reported as an MCP tool error"
+    );
+    let restart_error_text = collect_text(&restart_error);
+    assert!(
+        restart_error_text.contains(MISSING_INHERITED_STATE_MESSAGE),
+        "expected missing metadata error after bare Ctrl-D, got: {restart_error_text}"
+    );
+    assert!(
+        !restart_error_text.contains("new session started"),
+        "did not expect missing metadata Ctrl-D to reset under stale state, got: {restart_error_text}"
+    );
+
+    let probe = session
+        .write_stdin_raw_with_meta(
+            variable_probe_code(),
+            Some(2.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let probe_text = collect_text(&probe);
+    session.cancel().await?;
+
+    assert!(
+        probe_text.contains("X_EXISTS:TRUE"),
+        "expected missing metadata Ctrl-D to preserve the existing session, got: {probe_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_idle_ctrl_d_with_bad_meta_does_not_restart() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let first = session
+        .write_stdin_raw_with_meta("x <- 1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart_error = session
+        .write_stdin_raw_with_meta(
+            "\u{4}",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    assert_eq!(
+        restart_error.is_error,
+        Some(true),
+        "expected malformed metadata Ctrl-D to be reported as an MCP tool error"
+    );
+    let restart_error_text = collect_text(&restart_error);
+    assert!(
+        restart_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after bare Ctrl-D, got: {restart_error_text}"
+    );
+    assert!(
+        !restart_error_text.contains("new session started"),
+        "did not expect malformed metadata Ctrl-D to reset under stale state, got: {restart_error_text}"
+    );
+
+    let probe = session
+        .write_stdin_raw_with_meta(
+            variable_probe_code(),
+            Some(2.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let probe_text = collect_text(&probe);
+    session.cancel().await?;
+
+    assert!(
+        probe_text.contains("X_EXISTS:TRUE"),
+        "expected malformed metadata Ctrl-D to preserve the existing session, got: {probe_text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_idle_ctrl_d_tail_with_bad_meta_does_not_run_tail() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart_error = session
+        .write_stdin_raw_with_meta(
+            "\u{4}x <- 2",
+            Some(2.0),
+            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
+        )
+        .await?;
+    assert_eq!(
+        restart_error.is_error,
+        Some(true),
+        "expected malformed metadata Ctrl-D tail to be reported as an MCP tool error"
+    );
+    let restart_error_text = collect_text(&restart_error);
+    assert!(
+        restart_error_text.contains("failed to parse Codex sandbox state metadata"),
+        "expected malformed metadata error after bare Ctrl-D tail, got: {restart_error_text}"
+    );
+    assert!(
+        !restart_error_text.contains("new session started"),
+        "did not expect malformed metadata Ctrl-D tail to reset under stale state, got: {restart_error_text}"
+    );
+
+    let probe = session
+        .write_stdin_raw_with_meta(
+            variable_probe_code(),
+            Some(2.0),
+            Some(workspace_write_meta(temp.path())),
+        )
+        .await?;
+    let probe_text = collect_text(&probe);
+    session.cancel().await?;
+
+    assert!(
+        probe_text.contains("X_EXISTS:FALSE"),
+        "expected malformed metadata Ctrl-D tail to avoid running fresh tail input, got: {probe_text}"
+    );
     Ok(())
 }

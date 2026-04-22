@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hits_after_seek_does_not_repeat() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let setup = session
         .write_stdin_raw_with(

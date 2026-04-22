@@ -78,7 +78,7 @@ fn events_log_path(text: &str) -> Option<PathBuf> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session
         .call_tool_raw(
@@ -108,7 +108,7 @@ async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_with("plot(1:10)\ncat('done\\n')", Some(30.0))
@@ -140,7 +140,7 @@ async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with("plot(1:10)\ncat('done\\n')", Some(30.0))
@@ -172,7 +172,7 @@ async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_reset_clears_state() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let set_var = session
         .call_tool_raw(
@@ -228,7 +228,7 @@ async fn repl_reset_clears_state() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session
         .call_tool_raw(
@@ -262,7 +262,7 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .call_tool_raw(
@@ -304,7 +304,7 @@ async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multiple_base_plots_in_one_reply_emit_each_image() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .call_tool_raw(
@@ -349,7 +349,7 @@ async fn multiple_base_plots_in_one_reply_emit_each_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn base_plots_above_inline_limit_use_bundle_and_keep_two_anchors() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
     let result = session
         .call_tool_raw(

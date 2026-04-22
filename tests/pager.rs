@@ -90,7 +90,7 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_commands_are_handled_server_side() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
         .write_stdin_raw_with(
@@ -151,7 +151,7 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
         .write_stdin_raw_with(
@@ -403,8 +403,8 @@ async fn pager_smoke() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestResult<()> {
-    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> TestResult<()> {
+    let session = common::spawn_server_with_args_env_and_pager_page_chars(
         vec!["--sandbox".to_string(), "inherit".to_string()],
         Vec::new(),
         80,
@@ -416,12 +416,25 @@ async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestR
         .await?;
     let text = result_text(&result);
 
-    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
     assert!(
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
-        "expected initial empty pager input to surface worker startup failure, got: {text:?}"
+        "expected initial empty pager input to surface sandbox-state failure, got: {text:?}"
     );
+    assert!(
+        !text.contains("<<repl status: idle>>"),
+        "did not expect empty pager input to spawn the worker before a sandbox update, got: {text:?}"
+    );
+    assert!(
+        !text.contains(">"),
+        "did not expect empty pager input to surface a worker prompt before a sandbox update, got: {text:?}"
+    );
+    session.cancel().await?;
     Ok(())
 }
 
@@ -487,7 +500,7 @@ async fn pager_empty_input_advances_page() -> TestResult<()> {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+    let session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let initial = session
         .write_stdin_raw_with(

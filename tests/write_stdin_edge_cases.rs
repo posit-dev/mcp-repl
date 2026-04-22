@@ -65,7 +65,7 @@ fn assert_invalid_timeout(err: ServiceError) {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let timeout_result = session
         .write_stdin_raw_unterminated_with("1+1", Some(0.0))
@@ -110,7 +110,7 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let input = "cat('A\\n')\r\ncat('B\\n')";
     let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
@@ -151,7 +151,7 @@ async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_without_trailing_newline_runs() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_unterminated_with("1+1", Some(10.0))
@@ -173,7 +173,7 @@ async fn write_stdin_without_trailing_newline_runs() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_empty_returns_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_unterminated_with("", Some(1.0))
@@ -201,7 +201,7 @@ async fn write_stdin_empty_returns_prompt() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_poll_after_completed_request_returns_idle_status_and_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = common::spawn_server().await?;
+    let session = common::spawn_server().await?;
 
     let result = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
     let text = result_text(&result);

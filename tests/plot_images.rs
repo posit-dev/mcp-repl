@@ -526,7 +526,7 @@ fn is_prompt_line(line: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_images_and_updates() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "plot(1:10)";
@@ -607,7 +607,7 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_stable_images_for_repeats() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "plot(1:10)";
@@ -681,7 +681,7 @@ async fn plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)";
@@ -733,7 +733,7 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_emit_images_when_paged_output() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:50) cat(line, \"\\n\"); plot(1:10)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -770,7 +770,7 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plots_respect_numeric_size_options() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = "options(console.plot.width = 4, console.plot.height = 3, console.plot.dpi = 100); plot(1:10)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -804,7 +804,7 @@ async fn plots_respect_numeric_size_options() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
@@ -885,7 +885,7 @@ async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();
 
     let plot_input = "grid::grid.newpage(); grid::grid.lines(x = c(0.1, 0.9), y = c(0.1, 0.9))";
@@ -959,7 +959,7 @@ async fn grid_plots_emit_stable_images_for_repeats() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = "plot(1:10); lines(2:9, 2:9); lines(2:9, 2:9)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -988,7 +988,7 @@ async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plot_emitted_after_large_output() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = r#"
 cat(paste(rep("x", 3000000), collapse = ""))
@@ -1030,7 +1030,7 @@ plot(1:10)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_plot_reply_with_four_images_and_under_grace_text_stays_inline() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = format!(
         r#"
@@ -1082,7 +1082,7 @@ for (i in 1:4) {{
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_plot_reply_with_two_images_and_over_grace_text_uses_output_bundle() -> TestResult<()>
 {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = format!(
         r#"
@@ -1136,7 +1136,7 @@ for (i in 1:2) {{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn single_image_over_grace_text_does_not_duplicate_pre_image_preview() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = format!(
         r#"
@@ -1201,7 +1201,7 @@ cat("\nPOST_END\n")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_plot_replies_output_bundle_and_keep_first_and_last_images() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = r#"
 for (i in 1:6) {
@@ -1308,7 +1308,7 @@ for (i in 1:6) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_output_bundle_events_log_keeps_partial_line_ranges_stable() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = r#"
 cat("a")
@@ -1376,7 +1376,7 @@ for (i in 1:5) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_image_output_bundle_backfills_earlier_worker_text() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = r#"
 cat("warn000\n")
@@ -1450,7 +1450,7 @@ for (i in 1:6) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_output_bundle_text_only_poll_does_not_duplicate_prefix_text() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = r#"
 cat("HEAD_ONLY\n")
@@ -1541,7 +1541,7 @@ cat("TAIL_ONLY\n")
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path() -> TestResult<()> {
     let temp = tempdir()?;
-    let mut session = spawn_server_with_files_env_vars(vec![
+    let session = spawn_server_with_files_env_vars(vec![
         ("TMPDIR".to_string(), temp.path().display().to_string()),
         (
             "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
@@ -1597,7 +1597,7 @@ Sys.sleep(1)
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()> {
     let temp = tempdir()?;
-    let mut session = spawn_server_with_files_env_vars(vec![(
+    let session = spawn_server_with_files_env_vars(vec![(
         "TMPDIR".to_string(),
         temp.path().display().to_string(),
     )])
@@ -1670,7 +1670,7 @@ Sys.sleep(1)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn same_reply_plot_updates_bundle_preserves_image_history() -> TestResult<()> {
-    let mut session = spawn_server_with_files().await?;
+    let session = spawn_server_with_files().await?;
 
     let input = format!(
         r#"
@@ -1756,8 +1756,8 @@ lines(3:8, 3:8)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn same_reply_plot_updates_stay_inline_and_show_final_state() -> TestResult<()> {
-    let mut batch_session = spawn_server_with_files().await?;
-    let mut control_session = spawn_server_with_files().await?;
+    let batch_session = spawn_server_with_files().await?;
+    let control_session = spawn_server_with_files().await?;
 
     let steps = [
         "plot(1:10)",

@@ -30,7 +30,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_show_returns_full_output_without_pager() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
     let timeout_secs = if cfg!(windows) { 60.0 } else { 30.0 };
 
     let result = session
