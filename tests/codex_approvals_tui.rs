@@ -2,28 +2,49 @@ mod common;
 
 use common::TestResult;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod unix_impl {
-    use super::{TestResult, common};
+    use super::TestResult;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::common;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::Value;
     use std::collections::BTreeMap;
-    use std::io::{ErrorKind, Read, Write};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::io::ErrorKind;
+    use std::io::Read;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::io::Write;
     use std::net::SocketAddr;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+    use std::sync::Arc;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
+    use toml_edit::DocumentMut;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use vt100::Parser;
 
     const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
+    const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
+
+    fn codex_exec_test_mutex() -> &'static tokio::sync::Mutex<()> {
+        static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     struct IsolatedCodexEnv {
         _temp_dir: tempfile::TempDir,
@@ -42,13 +63,13 @@ mod unix_impl {
         run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Json).await
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_exec_initial_sandbox_state_plain() -> TestResult<String> {
         run_codex_exec_initial_sandbox_state_for_mode(ExecSnapshotMode::Plain).await
     }
 
-    async fn run_codex_exec_initial_sandbox_state_for_mode(
-        mode: ExecSnapshotMode,
-    ) -> TestResult<String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) async fn run_codex_exec_wire_sandbox_state_meta() -> TestResult<String> {
         if !codex_available() {
             eprintln!("codex not found on PATH; skipping");
             return Ok(String::new());
@@ -57,33 +78,32 @@ mod unix_impl {
             eprintln!("loopback TCP bind unavailable; skipping");
             return Ok(String::new());
         }
+        let Some(python_program) = common::python_program() else {
+            eprintln!("python not found on PATH; skipping");
+            return Ok(String::new());
+        };
+        let _guard = codex_exec_test_mutex().lock().await;
 
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
         let mcp_repl = resolve_mcp_repl_path()?;
-        let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
+        let trace_script = resolve_trace_script_path()?;
+        let env = create_isolated_codex_env_with_trace(
+            &mcp_repl,
+            &trace_script,
+            python_program,
+            &mock_server.base_url(),
+        )?;
+        let sandbox_mode = codex_exec_sandbox_mode();
 
-        let prompt = format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test");
-        let mode_flag = match mode {
-            ExecSnapshotMode::Json => "--json ",
-            ExecSnapshotMode::Plain => "",
-        };
-        let shell_script = format!(
-            "codex exec {mode_flag}--sandbox workspace-write --skip-git-repo-check --cd {} {}",
-            sh_single_quote(&env.workspace.display().to_string()),
-            sh_single_quote(&prompt),
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
+            sandbox_mode,
+            None,
         );
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
-        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
-        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("LANG", "C");
-        cmd.arg("-c");
-        cmd.arg(shell_script);
-        cmd.current_dir(&env.workspace);
 
         let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
         let stdout = String::from_utf8(output.stdout)
@@ -105,7 +125,145 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
+        let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
+        if !saw_write_ok {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected workspace-write call to succeed\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
+
+        render_wire_snapshot(&env.debug_dir, &env.workspace, &env.codex_home)
+    }
+
+    pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
+            return Ok(());
+        }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(());
+        }
+        let _guard = codex_exec_test_mutex().lock().await;
+
+        let tool_args = tool_args_for_code("1+1");
+        let mock_server =
+            MockResponsesServer::start_with_first_user_turn_tool_call(tool_name(), tool_args)
+                .await?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env_for_install(&mock_server.base_url())?;
+        let sandbox_mode = codex_exec_sandbox_mode();
+
+        run_mcp_repl_install_for_codex_r(&mcp_repl, &env.codex_home)?;
+        assert_codex_install_wrote_r_inherit_config(&env.codex_home, &mcp_repl)?;
+
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            INSTALL_SCRIPTED_TOOL_CALL_MARKER,
+            sandbox_mode,
+            Some("--json"),
+        );
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        let outputs = mock_server.function_call_outputs().await;
+        if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
+            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            return Ok(());
+        }
+        if !output.status.success() {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "codex exec with installed config failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+
+        assert_exec_output_contains_tool_call(&stdout, "r", "repl", "1+1\n")?;
+
+        let saw_result = outputs.iter().any(|out| out.contains("[1] 2"));
+        if !saw_result {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected installed codex config to run r repl and return 2\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    async fn run_codex_exec_initial_sandbox_state_for_mode(
+        mode: ExecSnapshotMode,
+    ) -> TestResult<String> {
+        if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
+            return Ok(String::new());
+        }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(String::new());
+        }
+        let _guard = codex_exec_test_mutex().lock().await;
+
+        let tool_args = tool_args_for_code(&sandbox_run_code());
+        let mock_server =
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
+        let sandbox_mode = codex_exec_sandbox_mode();
+
+        let cmd = codex_exec_command(
+            &env,
+            &mock_server.base_url(),
+            &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
+            sandbox_mode,
+            match mode {
+                ExecSnapshotMode::Json => Some("--json"),
+                ExecSnapshotMode::Plain => None,
+            },
+        );
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        let outputs = mock_server.function_call_outputs().await;
+        if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
+            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            return Ok(String::new());
+        }
+        if !output.status.success() {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "codex exec failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -119,6 +277,7 @@ mod unix_impl {
         render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
         if !full_access_test_enabled() {
             eprintln!(
@@ -177,11 +336,7 @@ mod unix_impl {
             "danger-full-access",
             Duration::from_secs(20),
         )?;
-        wait_for_log_contains(
-            &env.debug_dir,
-            "codex/sandbox-state/update",
-            Duration::from_secs(20),
-        )?;
+        wait_for_log_contains(&env.debug_dir, "tool-call-meta", Duration::from_secs(20))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
@@ -202,6 +357,7 @@ mod unix_impl {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_mock_rejects_malformed_responses_payload() -> TestResult<()> {
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
@@ -238,6 +394,7 @@ mod unix_impl {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn full_access_test_enabled() -> bool {
         std::env::var_os(FULL_ACCESS_TEST_ENV).is_some()
     }
@@ -296,9 +453,8 @@ mod unix_impl {
             .is_ok()
     }
 
-    fn create_isolated_codex_env(
-        mcp_repl: &Path,
-        openai_base_url: &str,
+    fn create_isolated_codex_env_with_config(
+        build_config: impl FnOnce(&Path) -> String,
     ) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
         let workspace = temp_dir.path().join("workspace");
@@ -320,7 +476,7 @@ mod unix_impl {
         let debug_dir = temp_dir.path().join("debug");
         std::fs::create_dir_all(&debug_dir)?;
 
-        let config = codex_config(mcp_repl, &workspace, openai_base_url);
+        let config = build_config(&workspace);
         std::fs::write(codex_home.join("config.toml"), config)?;
 
         Ok(IsolatedCodexEnv {
@@ -331,12 +487,90 @@ mod unix_impl {
         })
     }
 
+    fn create_isolated_codex_env(
+        mcp_repl: &Path,
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_config(mcp_repl, workspace, openai_base_url)
+        })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn create_isolated_codex_env_with_trace(
+        mcp_repl: &Path,
+        trace_script: &Path,
+        python_program: &str,
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_traced_config(
+                mcp_repl,
+                trace_script,
+                python_program,
+                workspace,
+                openai_base_url,
+            )
+        })
+    }
+
+    fn create_isolated_codex_env_for_install(
+        openai_base_url: &str,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config(|workspace| {
+            codex_install_base_config(workspace, openai_base_url)
+        })
+    }
+
+    fn codex_exec_sandbox_mode() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "danger-full-access"
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            "workspace-write"
+        }
+    }
+
+    fn codex_exec_expected_sandbox_log() -> &'static str {
+        codex_exec_sandbox_mode()
+    }
+
+    fn codex_exec_command(
+        env: &IsolatedCodexEnv,
+        base_url: &str,
+        prompt: &str,
+        sandbox_mode: &str,
+        mode_flag: Option<&str>,
+    ) -> std::process::Command {
+        let mut cmd = std::process::Command::new("codex");
+        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
+        cmd.env("CODEX_OSS_BASE_URL", base_url);
+        cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "C");
+        cmd.arg("exec");
+        if let Some(flag) = mode_flag {
+            cmd.arg(flag);
+        }
+        cmd.arg("--sandbox");
+        cmd.arg(sandbox_mode);
+        cmd.arg("--skip-git-repo-check");
+        cmd.arg("--cd");
+        cmd.arg(&env.workspace);
+        cmd.arg(prompt);
+        cmd.current_dir(&env.workspace);
+        cmd
+    }
+
     fn run_command_with_timeout(
         mut cmd: std::process::Command,
         timeout: Duration,
     ) -> TestResult<std::process::Output> {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         cmd.process_group(0);
         let mut child = cmd.spawn()?;
         let mut stdout_reader = child
@@ -367,10 +601,13 @@ mod unix_impl {
                 break status;
             }
             if Instant::now() >= deadline {
-                let pid = child.id() as i32;
-                // Ensure the timeout path tears down the whole subtree (shell + codex + children).
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    let pid = child.id() as i32;
+                    // Ensure the timeout path tears down the whole subtree (codex + children).
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -573,6 +810,7 @@ mod unix_impl {
         out
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn sh_single_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -651,6 +889,55 @@ mod unix_impl {
         Err("unable to locate mcp-repl test binary".into())
     }
 
+    fn run_mcp_repl_install_for_codex_r(mcp_repl: &Path, codex_home: &Path) -> TestResult<()> {
+        let output = std::process::Command::new(mcp_repl)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .arg("--interpreter")
+            .arg("r")
+            .env("CODEX_HOME", codex_home)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "mcp-repl install --client codex --interpreter r failed with status {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            status = output.status
+        )
+        .into())
+    }
+
+    fn assert_codex_install_wrote_r_inherit_config(
+        codex_home: &Path,
+        mcp_repl: &Path,
+    ) -> TestResult<()> {
+        let config_path = codex_home.join("config.toml");
+        let text = std::fs::read_to_string(&config_path)?;
+        let doc = text.parse::<DocumentMut>()?;
+        let expected_command = mcp_repl.to_string_lossy().to_string();
+        assert_eq!(
+            doc["mcp_servers"]["r"]["command"].as_str(),
+            Some(expected_command.as_str()),
+            "expected install to register the current mcp-repl executable"
+        );
+        let r_args = doc["mcp_servers"]["r"]["args"]
+            .as_array()
+            .ok_or_else(|| "expected mcp_servers.r.args array".to_string())?;
+        let has_sandbox_inherit = r_args
+            .iter()
+            .zip(r_args.iter().skip(1))
+            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+        assert!(
+            has_sandbox_inherit,
+            "expected installed Codex config to include `--sandbox inherit`"
+        );
+        Ok(())
+    }
+
     fn tool_name() -> String {
         "mcp__r__repl".to_string()
     }
@@ -713,7 +1000,88 @@ responses_websockets = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
+args = ["--sandbox", "inherit"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
+[projects."{repo_root}"]
+trust_level = "trusted"
+"#,
+        )
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn codex_traced_config(
+        mcp_repl: &Path,
+        trace_script: &Path,
+        python_program: &str,
+        repo_root: &Path,
+        openai_base_url: &str,
+    ) -> String {
+        let python_program = toml_escape(python_program);
+        let trace_script = toml_escape(&trace_script.display().to_string());
+        let mcp_repl = toml_escape(&mcp_repl.display().to_string());
+        let repo_root = toml_escape(&repo_root.display().to_string());
+        let openai_base_url = toml_escape(openai_base_url);
+        format!(
+            r#"model_provider = "mock-openai"
+disable_paste_burst = true
+project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[notice]
+hide_full_access_warning = true
+
+[tui]
+alternate_screen = "never"
+animations = false
+
+[features]
+steer = true
+remote_models = true
+responses_websockets = false
+
+[mcp_servers.r]
+command = "{python_program}"
+args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit"]
+env_vars = ["MCP_REPL_DEBUG_DIR"]
+[projects."{repo_root}"]
+trust_level = "trusted"
+"#,
+        )
+    }
+
+    fn codex_install_base_config(repo_root: &Path, openai_base_url: &str) -> String {
+        let repo_root = toml_escape(&repo_root.display().to_string());
+        let openai_base_url = toml_escape(openai_base_url);
+        format!(
+            r#"model_provider = "mock-openai"
+disable_paste_burst = true
+project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[notice]
+hide_full_access_warning = true
+
+[tui]
+alternate_screen = "never"
+animations = false
+
+[features]
+steer = true
+remote_models = true
+responses_websockets = false
+
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
@@ -729,6 +1097,7 @@ trust_level = "trusted"
             .to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn outside_workspace_probe_code() -> TestResult<String> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -754,6 +1123,19 @@ tryCatch({
         .to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn resolve_trace_script_path() -> TestResult<PathBuf> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("mcp-stdio-trace.py");
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!("missing trace proxy script at {}", path.display()).into())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn normalize_screen(screen: &str) -> String {
         fn is_prompt_line(line: &str) -> bool {
             line.as_bytes().starts_with(&[0xE2, 0x80, 0xBA])
@@ -943,6 +1325,7 @@ tryCatch({
         normalized.join("\n").trim_end().to_string()
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn scrub_seconds(line: &str) -> String {
         let mut out = String::with_capacity(line.len());
         let mut chars = line.chars().peekable();
@@ -1056,6 +1439,249 @@ tryCatch({
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn latest_wire_log_path(debug_dir: &Path) -> Option<PathBuf> {
+        let mut sessions = std::fs::read_dir(debug_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions.last().map(|session| session.join("wire.jsonl"))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn render_wire_snapshot(
+        debug_dir: &Path,
+        workspace: &Path,
+        codex_home: &Path,
+    ) -> TestResult<String> {
+        let wire_path = latest_wire_log_path(debug_dir)
+            .ok_or_else(|| "missing wire.jsonl trace output".to_string())?;
+        let contents = std::fs::read_to_string(&wire_path)?;
+        let frames = extract_wire_messages(&contents)?;
+
+        let initialize_request = frames
+            .iter()
+            .find(|(stream, message)| *stream == "stdin" && message["method"] == "initialize")
+            .map(|(_, message)| message.clone())
+            .ok_or_else(|| format!("missing initialize request in {}", wire_path.display()))?;
+        let initialize_id = initialize_request.get("id").cloned();
+        let initialize_response = matching_response(&frames, initialize_id.as_ref(), |message| {
+            message
+                .get("result")
+                .and_then(|result| result.get("capabilities"))
+                .is_some()
+        })
+        .ok_or_else(|| format!("missing initialize response in {}", wire_path.display()))?;
+
+        let tools_call_request = frames
+            .iter()
+            .find(|(stream, message)| *stream == "stdin" && message["method"] == "tools/call")
+            .map(|(_, message)| message.clone())
+            .ok_or_else(|| format!("missing tools/call request in {}", wire_path.display()))?;
+        let tools_call_id = tools_call_request.get("id").cloned();
+        let tools_call_response = matching_response(&frames, tools_call_id.as_ref(), |message| {
+            message
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .is_some()
+        })
+        .ok_or_else(|| format!("missing tools/call response in {}", wire_path.display()))?;
+
+        let mut snapshot = serde_json::json!({
+            "client_to_server": {
+                "initialize": simplify_wire_request(&initialize_request),
+                "tools_call": simplify_wire_request(&tools_call_request),
+            },
+            "server_to_client": {
+                "initialize": simplify_wire_response(&initialize_response),
+                "tools_call": simplify_wire_response(&tools_call_response),
+            }
+        });
+        normalize_wire_snapshot_value(&mut snapshot, workspace, codex_home);
+        Ok(serde_json::to_string_pretty(&snapshot)?)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn extract_wire_messages(contents: &str) -> TestResult<Vec<(String, Value)>> {
+        let mut frames = Vec::new();
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let record: Value = serde_json::from_str(line)?;
+            if record["event"] != "stream_chunk" {
+                continue;
+            }
+            let Some(stream) = record
+                .get("payload")
+                .and_then(|payload| payload.get("stream"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if stream != "stdin" && stream != "stdout" {
+                continue;
+            }
+            let Some(text_as_json) = record
+                .get("payload")
+                .and_then(|payload| payload.get("text_as_json"))
+            else {
+                continue;
+            };
+            match text_as_json {
+                Value::Array(items) => {
+                    for item in items {
+                        if item.is_object() {
+                            frames.push((stream.to_string(), item.clone()));
+                        }
+                    }
+                }
+                Value::Object(_) => frames.push((stream.to_string(), text_as_json.clone())),
+                _ => {}
+            }
+        }
+        Ok(frames)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn matching_response(
+        frames: &[(String, Value)],
+        expected_id: Option<&Value>,
+        fallback: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        if let Some(expected_id) = expected_id
+            && let Some(message) = frames.iter().find_map(|(stream, message)| {
+                (*stream == "stdout" && message.get("id") == Some(expected_id))
+                    .then_some(message.clone())
+            })
+        {
+            return Some(message);
+        }
+        frames.iter().find_map(|(stream, message)| {
+            (*stream == "stdout" && fallback(message)).then_some(message.clone())
+        })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn simplify_wire_request(message: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": message.get("jsonrpc").cloned().unwrap_or(Value::Null),
+            "method": message.get("method").cloned().unwrap_or(Value::Null),
+            "params": message.get("params").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn simplify_wire_response(message: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": message.get("jsonrpc").cloned().unwrap_or(Value::Null),
+            "result": message.get("result").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    fn normalize_wire_snapshot_value(value: &mut Value, workspace: &Path, codex_home: &Path) {
+        fn path_matches(path: &[String], suffix: &[&str]) -> bool {
+            path.len() >= suffix.len()
+                && path[path.len() - suffix.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(suffix.iter().copied())
+        }
+
+        fn normalize_wire_string(text: &str, workspace: &Path, codex_home: &Path) -> String {
+            let workspace_display = workspace.display().to_string();
+            let workspace_private = format!("/private{workspace_display}");
+            let codex_home_display = codex_home.display().to_string();
+            let codex_home_private = format!("/private{codex_home_display}");
+            let mut normalized = text.to_string();
+            for (needle, replacement) in [
+                (&workspace_private, "<WORKSPACE>"),
+                (&workspace_display, "<WORKSPACE>"),
+                (&codex_home_private, "<CODEX_HOME>"),
+                (&codex_home_display, "<CODEX_HOME>"),
+            ] {
+                normalized = normalized.replace(needle, replacement);
+            }
+            normalize_temp_paths(&normalize_codex_home_path(&normalized))
+        }
+
+        fn normalize_inner(
+            value: &mut Value,
+            path: &mut Vec<String>,
+            workspace: &Path,
+            codex_home: &Path,
+        ) {
+            match value {
+                Value::Object(map) => {
+                    let original = std::mem::take(map);
+                    for (key, mut child) in original {
+                        let normalized_key = normalize_wire_string(&key, workspace, codex_home);
+                        path.push(normalized_key.clone());
+                        normalize_inner(&mut child, path, workspace, codex_home);
+                        path.pop();
+                        map.insert(normalized_key, child);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        path.push("[]".to_string());
+                        normalize_inner(item, path, workspace, codex_home);
+                        path.pop();
+                    }
+                }
+                Value::String(text) => {
+                    if path_matches(path, &["clientInfo", "version"])
+                        || path_matches(path, &["serverInfo", "version"])
+                    {
+                        *text = "<VERSION>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "session_id") {
+                        *text = "<SESSION_ID>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "turn_id") {
+                        *text = "<TURN_ID>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "sandbox") {
+                        *text = "<SANDBOX_BACKEND>".to_string();
+                        return;
+                    }
+                    if path.last().is_some_and(|key| key == "codexLinuxSandboxExe") {
+                        *text = "<CODEX_LINUX_SANDBOX_EXE>".to_string();
+                        return;
+                    }
+                    *text = normalize_wire_string(text, workspace, codex_home);
+                }
+                Value::Null => {}
+                _ => {}
+            }
+        }
+
+        let mut path = Vec::new();
+        normalize_inner(value, &mut path, workspace, codex_home);
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_preserves_null_codex_linux_sandbox_exe() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "codexLinuxSandboxExe": null
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "codexLinuxSandboxExe": null
+            }),
+            "wire snapshots should preserve a null Codex Linux helper path"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn detect_cursor_request(
         chunk: &[u8],
         carry: &mut Vec<u8>,
@@ -1079,6 +1705,7 @@ tryCatch({
         carry.extend_from_slice(&data[keep..]);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct CodexPtyDriver {
         child: Box<dyn portable_pty::Child + Send>,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -1088,6 +1715,7 @@ tryCatch({
         _slave: Box<dyn portable_pty::SlavePty + Send>,
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl CodexPtyDriver {
         fn spawn(
             codex_home: &Path,
@@ -1299,6 +1927,7 @@ tryCatch({
         tool_name: String,
         workspace_write_tool_args: String,
         full_access_tool_args: Option<String>,
+        first_user_turn_tool_args: Option<String>,
         requests: Vec<Value>,
         request_paths: Vec<String>,
         next_call_ordinal: usize,
@@ -1312,12 +1941,41 @@ tryCatch({
             workspace_write_tool_args: String,
             full_access_tool_args: Option<String>,
         ) -> TestResult<Self> {
+            Self::start_with_options(
+                tool_name,
+                workspace_write_tool_args,
+                full_access_tool_args,
+                None,
+            )
+            .await
+        }
+
+        async fn start_with_first_user_turn_tool_call(
+            tool_name: String,
+            first_user_turn_tool_args: String,
+        ) -> TestResult<Self> {
+            Self::start_with_options(
+                tool_name,
+                String::new(),
+                None,
+                Some(first_user_turn_tool_args),
+            )
+            .await
+        }
+
+        async fn start_with_options(
+            tool_name: String,
+            workspace_write_tool_args: String,
+            full_access_tool_args: Option<String>,
+            first_user_turn_tool_args: Option<String>,
+        ) -> TestResult<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
             let state = Arc::new(tokio::sync::Mutex::new(MockState {
                 tool_name,
                 workspace_write_tool_args,
                 full_access_tool_args,
+                first_user_turn_tool_args,
                 requests: Vec::new(),
                 request_paths: Vec::new(),
                 next_call_ordinal: 1,
@@ -1534,6 +2192,12 @@ tryCatch({
             );
         }
 
+        if has_user_message(body)
+            && let Some(tool_args) = state.first_user_turn_tool_args.take()
+        {
+            return queue_tool_call(body, state, tool_args);
+        }
+
         if has_user_marker(body, WORKSPACE_WRITE_MARKER) {
             return queue_tool_call(body, state, state.workspace_write_tool_args.clone());
         }
@@ -1667,6 +2331,16 @@ tryCatch({
             .unwrap_or(false)
     }
 
+    fn has_user_message(body: &Value) -> bool {
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            return false;
+        };
+        items.iter().rev().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+    }
+
     fn has_function_call_output(body: &Value, call_id: &str) -> bool {
         let Some(items) = body.get("input").and_then(Value::as_array) else {
             return false;
@@ -1697,6 +2371,50 @@ tryCatch({
             }
         }
         outputs
+    }
+
+    fn assert_exec_output_contains_tool_call(
+        stdout: &str,
+        server: &str,
+        tool: &str,
+        input: &str,
+    ) -> TestResult<()> {
+        let mut saw_json = false;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            saw_json = true;
+            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let Some(item) = event.get("item") else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("mcp_tool_call") {
+                continue;
+            }
+            let Some(arguments) = item.get("arguments") else {
+                continue;
+            };
+            if item.get("server").and_then(Value::as_str) == Some(server)
+                && item.get("tool").and_then(Value::as_str) == Some(tool)
+                && arguments.get("input").and_then(Value::as_str) == Some(input)
+            {
+                return Ok(());
+            }
+        }
+
+        let json_note = if saw_json {
+            "saw json events, but not the expected mcp tool call"
+        } else {
+            "stdout did not contain json events"
+        };
+        Err(format!(
+            "expected codex exec output to include {server}.{tool} with input {input:?}; {json_note}\nstdout:\n{stdout}"
+        )
+        .into())
     }
 
     #[test]
@@ -1757,6 +2475,21 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_wire_sandbox_state_meta", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -1792,6 +2525,21 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        insta::assert_snapshot!("codex_exec_wire_sandbox_state_meta", snapshot);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -1803,8 +2551,20 @@ mod macos {
 }
 
 #[cfg(target_os = "windows")]
-#[test]
-fn codex_exec_initial_sandbox_state_windows_stub() -> TestResult<()> {
-    eprintln!("codex exec sandbox state test is not implemented on Windows; skipping");
-    Ok(())
+mod windows {
+    use super::TestResult;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
+        let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
+        super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
 }

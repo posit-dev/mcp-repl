@@ -1,0 +1,100 @@
+---
+source: tests/codex_approvals_tui.rs
+assertion_line: 2490
+expression: snapshot
+---
+{
+  "client_to_server": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "method": "initialize",
+      "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {
+          "elicitation": {
+            "form": {}
+          }
+        },
+        "clientInfo": {
+          "name": "codex-mcp-client",
+          "title": "Codex",
+          "version": "<VERSION>"
+        }
+      }
+    },
+    "tools_call": {
+      "jsonrpc": "2.0",
+      "method": "tools/call",
+      "params": {
+        "_meta": {
+          "progressToken": 1,
+          "x-codex-turn-metadata": {
+            "session_id": "<SESSION_ID>",
+            "thread_source": "user",
+            "turn_id": "<TURN_ID>",
+            "workspaces": {
+              "<WORKSPACE>": {
+                "has_changes": false
+              }
+            },
+            "sandbox": "<SANDBOX_BACKEND>"
+          },
+          "codex/sandbox-state-meta": {
+            "sandboxPolicy": {
+              "type": "workspace-write",
+              "writable_roots": [
+                "<CODEX_HOME>/memories"
+              ],
+              "network_access": false,
+              "exclude_tmpdir_env_var": false,
+              "exclude_slash_tmp": false
+            },
+            "codexLinuxSandboxExe": "<CODEX_LINUX_SANDBOX_EXE>",
+            "sandboxCwd": "<WORKSPACE>",
+            "useLegacyLandlock": false
+          }
+        },
+        "name": "repl",
+        "arguments": {
+          "input": "target <- tempfile(\"mcp-repl-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})\n"
+        }
+      }
+    }
+  },
+  "server_to_client": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {
+          "experimental": {
+            "codex/sandbox-state-meta": {
+              "version": "1.0.0"
+            }
+          },
+          "tools": {}
+        },
+        "serverInfo": {
+          "name": "rmcp",
+          "version": "<VERSION>"
+        }
+      }
+    },
+    "tools_call": {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "WRITE_OK\n"
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    }
+  }
+}
