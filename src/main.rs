@@ -461,7 +461,7 @@ mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|pytho
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
 --oversized-output: choose oversized-output handling (pager: default legacy modal pager; files: spill oversized replies to files)\n\
---sandbox: base sandbox mode (inherit requires client sandbox update)\n\
+--sandbox: base sandbox mode (inherit uses client tool-call metadata; --debug-repl bootstraps local defaults)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
@@ -486,7 +486,10 @@ If no --interpreter is specified, install uses the full interpreter grid for eac
 mod tests {
     use super::*;
     use crate::sandbox::{SandboxPolicy, SandboxState};
-    use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
+    use crate::sandbox_cli::{
+        SandboxConfigOperation, resolve_effective_sandbox_state,
+        sandbox_plan_requests_inherited_state,
+    };
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {
@@ -687,6 +690,54 @@ mod tests {
             SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn later_explicit_sandbox_mode_clears_inherit_requirement() {
+        let cli_override_plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+            ],
+        };
+        assert!(
+            !sandbox_plan_requests_inherited_state(&cli_override_plan),
+            "a later explicit --sandbox override should disable per-call inherit metadata"
+        );
+
+        let config_override_plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override("sandbox_mode=workspace-write")
+                        .expect("config override"),
+                ),
+            ],
+        };
+        assert!(
+            !sandbox_plan_requests_inherited_state(&config_override_plan),
+            "a later sandbox_mode override should disable per-call inherit metadata"
+        );
+    }
+
+    #[test]
+    fn later_explicit_sandbox_mode_still_validates_earlier_ordered_ops() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::ReadOnly),
+                SandboxCliOperation::AddWritableRoot(std::env::temp_dir()),
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+            ],
+        };
+
+        let err = resolve_effective_sandbox_state(&plan, None)
+            .expect_err("earlier invalid ordered op should still fail");
+        assert!(
+            err.contains(
+                "--add-writable-root can only be used while sandbox mode is workspace-write"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
