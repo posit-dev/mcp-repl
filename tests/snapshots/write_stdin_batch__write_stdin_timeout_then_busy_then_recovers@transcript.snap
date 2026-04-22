@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: timeout_list ==
 1) r_repl timeout_ms=2000

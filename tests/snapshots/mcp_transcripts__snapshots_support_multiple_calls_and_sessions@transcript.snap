@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_transcripts.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: session_1 ==
 1) r_repl timeout_ms=10000
