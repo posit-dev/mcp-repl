@@ -43,8 +43,7 @@ use crate::sandbox::{
 };
 use crate::sandbox_cli::{
     MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
-    is_missing_inherited_sandbox_state_error, resolve_effective_sandbox_state_with_defaults,
-    sandbox_plan_requests_inherited_state,
+    resolve_effective_sandbox_state_with_defaults, sandbox_plan_requests_inherited_state,
 };
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
@@ -175,6 +174,8 @@ const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 const LINUX_BWRAP_FALLBACK_NOTICE: &str =
     "[repl] Linux bubblewrap sandbox unavailable; continuing without bwrap\n";
+const PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE: &str =
+    "worker follow-up needs current sandbox metadata after precheck";
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -183,6 +184,14 @@ pub enum WorkerError {
     Timeout(Duration),
     Sandbox(String),
     Guardrail(String),
+}
+
+pub(crate) fn is_prechecked_follow_up_requires_meta(err: &WorkerError) -> bool {
+    matches!(err, WorkerError::Protocol(message) if message == PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE)
+}
+
+fn prechecked_follow_up_requires_meta_error() -> WorkerError {
+    WorkerError::Protocol(PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE.to_string())
 }
 
 trait BackendDriver: Send {
@@ -520,13 +529,36 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
     }
 }
 
+const DEFERRED_SANDBOX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy)]
-enum WriteStdinControlAction {
+pub(crate) enum WriteStdinControlAction {
     Interrupt,
     Restart,
 }
 
-fn split_write_stdin_control_prefix(input: &str) -> Option<(WriteStdinControlAction, &str)> {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WriteStdinOptions {
+    pub page_bytes_override: Option<u64>,
+    pub echo_input: bool,
+    pub pending_state_prechecked: bool,
+    pub deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+}
+
+impl WriteStdinOptions {
+    fn control_tail(&self, deferred_sandbox_state_update: Option<SandboxStateUpdate>) -> Self {
+        Self {
+            page_bytes_override: self.page_bytes_override,
+            echo_input: self.echo_input,
+            pending_state_prechecked: false,
+            deferred_sandbox_state_update,
+        }
+    }
+}
+
+pub(crate) fn split_write_stdin_control_prefix(
+    input: &str,
+) -> Option<(WriteStdinControlAction, &str)> {
     let first = input.chars().next()?;
     let action = match first {
         '\u{3}' => WriteStdinControlAction::Interrupt,
@@ -572,7 +604,6 @@ pub struct WorkerManager {
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
-    awaiting_initial_sandbox_state_update: bool,
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
@@ -597,6 +628,12 @@ pub struct WorkerManager {
     guardrail: GuardrailShared,
 }
 
+struct PreparedSandboxStateUpdate {
+    update_for_log: serde_json::Value,
+    changed: bool,
+    missing_before: bool,
+}
+
 impl WorkerManager {
     pub fn new(
         backend: Backend,
@@ -605,38 +642,25 @@ impl WorkerManager {
     ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
-        let mut inherited_state = sandbox_defaults.clone();
-        let mut inherited_update_received = false;
-        if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
-            inherited_state.apply_update(update);
-            inherited_update_received = true;
-        }
-        let inherited = if inherited_update_received {
-            Some(&inherited_state)
+        let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
+        let sandbox_state = if plan_requests_inherited_state {
+            sandbox_defaults.clone()
         } else {
-            None
+            resolve_effective_sandbox_state_with_defaults(&sandbox_plan, None, &sandbox_defaults)
+                .map_err(WorkerError::Sandbox)?
         };
-        let (sandbox_state, awaiting_initial_sandbox_state_update) =
-            match resolve_effective_sandbox_state_with_defaults(
-                &sandbox_plan,
-                inherited,
-                &sandbox_defaults,
-            ) {
-                Ok(state) => (state, false),
-                Err(err)
-                    if sandbox_plan_requests_inherited_state(&sandbox_plan)
-                        && is_missing_inherited_sandbox_state_error(&err) =>
-                {
-                    // Allow MCP initialize to complete; first tool call will fail fast
-                    // unless the client sends codex/sandbox-state/update.
-                    (sandbox_defaults.clone(), true)
-                }
-                Err(err) => return Err(WorkerError::Sandbox(err)),
-            };
-        crate::event_log::log_lazy("worker_manager_created", || {
-            worker_context_event_payload(backend, &sandbox_state)
-        });
-        if !awaiting_initial_sandbox_state_update {
+        if plan_requests_inherited_state {
+            crate::event_log::log(
+                "worker_manager_created",
+                serde_json::json!({
+                    "backend": format!("{backend:?}"),
+                    "awaiting_initial_tool_call_sandbox_state_meta": true,
+                }),
+            );
+        } else {
+            crate::event_log::log_lazy("worker_manager_created", || {
+                worker_context_event_payload(backend, &sandbox_state)
+            });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
         let output_timeline = {
@@ -650,8 +674,7 @@ impl WorkerManager {
             backend,
             process: None,
             sandbox_plan,
-            awaiting_initial_sandbox_state_update,
-            inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
+            inherited_sandbox_state: None,
             sandbox_defaults,
             sandbox_state,
             #[cfg(target_os = "windows")]
@@ -683,10 +706,38 @@ impl WorkerManager {
     }
 
     pub fn warm_start(&mut self) -> Result<(), WorkerError> {
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Ok(());
         }
         self.ensure_process()
+    }
+
+    pub fn bootstrap_local_inherited_sandbox_state(&mut self) -> Result<bool, WorkerError> {
+        if !self.missing_inherited_sandbox_state() {
+            return Ok(false);
+        }
+
+        let update = SandboxStateUpdate {
+            sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
+            sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
+            use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
+            use_legacy_landlock: None,
+        };
+        crate::event_log::log(
+            "worker_local_inherit_bootstrap",
+            serde_json::json!({
+                "sandbox_policy": update.sandbox_policy.clone(),
+                "sandbox_cwd": update.sandbox_cwd.clone(),
+                "use_linux_sandbox_bwrap": update.use_linux_sandbox_bwrap,
+            }),
+        );
+        self.stage_sandbox_state_update(update)?;
+        Ok(true)
+    }
+
+    fn missing_inherited_sandbox_state(&self) -> bool {
+        sandbox_plan_requests_inherited_state(&self.sandbox_plan)
+            && self.inherited_sandbox_state.is_none()
     }
 
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
@@ -694,8 +745,112 @@ impl WorkerManager {
         self.pending_request
     }
 
+    pub fn refresh_timeout_marker_with_wait(&mut self, wait: Duration) {
+        self.resolve_timeout_marker_with_wait(wait);
+    }
+
+    pub fn empty_input_requires_spawn(&mut self) -> Result<bool, WorkerError> {
+        if self.empty_input_uses_existing_state() {
+            return Ok(false);
+        }
+        let needs_spawn = match self.process.as_mut() {
+            Some(process) => !process.is_running()?,
+            None => true,
+        };
+        Ok(needs_spawn)
+    }
+
+    pub fn nonexecuting_follow_up_uses_existing_state(
+        &mut self,
+        text: &str,
+    ) -> Result<bool, WorkerError> {
+        if let Some((control, remaining)) = split_write_stdin_control_prefix(text) {
+            return match control {
+                WriteStdinControlAction::Interrupt => {
+                    if remaining.is_empty() {
+                        Ok(!self.control_only_interrupt_requires_spawn()?)
+                    } else {
+                        Ok(self.pager_follow_up_uses_existing_state(remaining)
+                            && !self.control_only_interrupt_requires_spawn()?)
+                    }
+                }
+                WriteStdinControlAction::Restart => Ok(false),
+            };
+        }
+
+        Ok(self.pager_follow_up_uses_existing_state(text) || self.guardrail_busy_event_pending())
+    }
+
+    fn control_only_interrupt_requires_spawn(&mut self) -> Result<bool, WorkerError> {
+        match self.process.as_mut() {
+            Some(process) => Ok(!process.is_running()?),
+            None => Ok(true),
+        }
+    }
+
     pub fn detached_prefix_item_count(&self) -> usize {
         self.last_detached_prefix_item_count
+    }
+
+    fn stage_deferred_sandbox_state_update(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        self.stage_sandbox_state_update(update)
+    }
+
+    fn stage_session_end_sandbox_state_update(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+        pending_state_prechecked: bool,
+    ) -> Result<(), WorkerError> {
+        if pending_state_prechecked
+            && update.is_none()
+            && sandbox_plan_requests_inherited_state(&self.sandbox_plan)
+        {
+            return Err(prechecked_follow_up_requires_meta_error());
+        }
+
+        self.stage_deferred_sandbox_state_update(update)
+    }
+
+    fn apply_deferred_sandbox_state_update(
+        &mut self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        self.update_sandbox_state(update, DEFERRED_SANDBOX_UPDATE_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn empty_input_uses_existing_state(&self) -> bool {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_request
+                    || self.pending_output_tape.has_pending()
+                    || self.settled_pending_completion.is_some()
+                    || self.guardrail_busy_event_pending()
+            }
+            OversizedOutputMode::Pager => {
+                self.pending_request
+                    || self.output.has_pending_output()
+                    || self.settled_pending_completion.is_some()
+                    || self.pager.is_active()
+                    || self.guardrail_busy_event_pending()
+            }
+        }
+    }
+
+    fn pager_follow_up_uses_existing_state(&self, text: &str) -> bool {
+        matches!(self.oversized_output, OversizedOutputMode::Pager) && self.pager.is_active() && {
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed.starts_with(':')
+        }
     }
 
     fn reset_preserving_detached_prefix_item_count(&mut self) -> Result<(), WorkerError> {
@@ -720,20 +875,15 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        page_bytes_override: Option<u64>,
-        echo_input: bool,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
             OversizedOutputMode::Files => {
-                self.write_stdin_files(text, worker_timeout, server_timeout)
+                self.write_stdin_files(text, worker_timeout, server_timeout, options)
             }
-            OversizedOutputMode::Pager => self.write_stdin_pager(
-                text,
-                worker_timeout,
-                server_timeout,
-                page_bytes_override,
-                echo_input,
-            ),
+            OversizedOutputMode::Pager => {
+                self.write_stdin_pager(text, worker_timeout, server_timeout, options)
+            }
         }
     }
 
@@ -743,20 +893,55 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
+        let pending_state_prechecked = options.pending_state_prechecked;
+        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
+            let control_requires_spawn = matches!(control, WriteStdinControlAction::Interrupt)
+                && self.control_only_interrupt_requires_spawn()?;
+            if pending_state_prechecked
+                && control_requires_spawn
+                && deferred_sandbox_state_update.is_none()
+            {
+                return Err(prechecked_follow_up_requires_meta_error());
+            }
+            let stage_before_control =
+                control_requires_spawn || matches!(control, WriteStdinControlAction::Restart);
+            let stage_interrupt_after_session_end =
+                matches!(control, WriteStdinControlAction::Interrupt) && !stage_before_control;
+            let mut tail_sandbox_state_update = if stage_before_control {
+                self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update.clone())?;
+                None
+            } else {
+                deferred_sandbox_state_update
+            };
             let control_reply = match control {
-                WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
-                WriteStdinControlAction::Restart => self.restart(worker_timeout),
+                WriteStdinControlAction::Interrupt if stage_interrupt_after_session_end => {
+                    self.interrupt_files_control_tail(worker_timeout)
+                }
+                WriteStdinControlAction::Interrupt => self.interrupt_files(worker_timeout),
+                WriteStdinControlAction::Restart => self.restart_files(worker_timeout),
             }?;
+            if stage_interrupt_after_session_end && self.session_end_seen {
+                self.stage_session_end_sandbox_state_update(
+                    tail_sandbox_state_update.take(),
+                    pending_state_prechecked,
+                )?;
+                self.maybe_reset_after_session_end();
+            }
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
             let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
-            let remaining_reply =
-                self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout)?;
+            let remaining_reply = self.write_stdin_files(
+                remaining.to_string(),
+                worker_timeout,
+                server_timeout,
+                options.control_tail(tail_sandbox_state_update),
+            )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
@@ -780,21 +965,33 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_files();
-            let reply = self.build_reply_from_worker_error_files(&err, input_context);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
+        let empty_input = text.is_empty();
         self.maybe_emit_guardrail_notice();
-        self.resolve_timeout_marker();
-        if text.is_empty() {
+        if !pending_state_prechecked {
+            self.resolve_timeout_marker();
+        }
+        if empty_input {
             if self.pending_request
                 || self.pending_output_tape.has_pending()
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_files(worker_timeout)?;
+                let reply = self.finalize_reply(reply);
+                if self.session_end_seen {
+                    self.stage_session_end_sandbox_state_update(
+                        deferred_sandbox_state_update,
+                        pending_state_prechecked,
+                    )?;
+                }
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            if pending_state_prechecked && self.control_only_interrupt_requires_spawn()? {
+                return Err(prechecked_follow_up_requires_meta_error());
+            }
+            if let Err(err) = self.ensure_process() {
+                let input_context = self.prepare_input_context_files();
+                let reply = self.build_reply_from_worker_error_files(&err, input_context);
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
@@ -804,16 +1001,30 @@ impl WorkerManager {
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
-        if !text.is_empty() && self.pending_request {
+        if !pending_state_prechecked && self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
-        if !text.is_empty() && self.pending_request {
+        if self.pending_request {
             let mut reply = self.poll_pending_output_files(worker_timeout)?;
             let detached_prefix_item_count = match &reply.reply {
                 WorkerReply::Output { contents, .. } => contents.len(),
             };
             self.last_detached_prefix_item_count = detached_prefix_item_count;
             mark_busy_follow_up_reply(&mut reply.reply);
+            let reply = self.finalize_reply(reply);
+            if self.session_end_seen {
+                self.stage_session_end_sandbox_state_update(
+                    deferred_sandbox_state_update,
+                    pending_state_prechecked,
+                )?;
+            }
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
+        if let Err(err) = self.ensure_process() {
+            let input_context = self.prepare_input_context_files();
+            let reply = self.build_reply_from_worker_error_files(&err, input_context);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -841,16 +1052,47 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-        page_bytes_override: Option<u64>,
-        echo_input: bool,
+        options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
+        let page_bytes_override = options.page_bytes_override;
+        let echo_input = options.echo_input;
+        let pending_state_prechecked = options.pending_state_prechecked;
+        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
+            let control_requires_spawn = matches!(control, WriteStdinControlAction::Interrupt)
+                && self.control_only_interrupt_requires_spawn()?;
+            if pending_state_prechecked
+                && control_requires_spawn
+                && deferred_sandbox_state_update.is_none()
+            {
+                return Err(prechecked_follow_up_requires_meta_error());
+            }
+            let stage_before_control =
+                control_requires_spawn || matches!(control, WriteStdinControlAction::Restart);
+            let stage_interrupt_after_session_end =
+                matches!(control, WriteStdinControlAction::Interrupt) && !stage_before_control;
+            let mut tail_sandbox_state_update = if stage_before_control {
+                self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update.clone())?;
+                None
+            } else {
+                deferred_sandbox_state_update
+            };
             let control_reply = match control {
-                WriteStdinControlAction::Interrupt => self.interrupt(worker_timeout),
-                WriteStdinControlAction::Restart => self.restart(worker_timeout),
+                WriteStdinControlAction::Interrupt if stage_interrupt_after_session_end => {
+                    self.interrupt_pager_control_tail(worker_timeout)
+                }
+                WriteStdinControlAction::Interrupt => self.interrupt_pager(worker_timeout),
+                WriteStdinControlAction::Restart => self.restart_pager(worker_timeout),
             }?;
+            if stage_interrupt_after_session_end && self.session_end_seen {
+                self.stage_session_end_sandbox_state_update(
+                    tail_sandbox_state_update.take(),
+                    pending_state_prechecked,
+                )?;
+                self.maybe_reset_after_session_end();
+            }
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
@@ -859,8 +1101,7 @@ impl WorkerManager {
                 remaining.to_string(),
                 worker_timeout,
                 server_timeout,
-                page_bytes_override,
-                echo_input,
+                options.control_tail(tail_sandbox_state_update),
             )?;
             self.last_detached_prefix_item_count += control_prefix_item_count;
             return Ok(prefix_worker_reply(control_reply, remaining_reply));
@@ -905,13 +1146,21 @@ impl WorkerManager {
         if empty_input {
             self.output.start_capture();
             self.maybe_emit_guardrail_notice();
-            self.resolve_timeout_marker();
+            if !pending_state_prechecked {
+                self.resolve_timeout_marker();
+            }
             if self.pending_request
                 || self.output.has_pending_output()
                 || self.settled_pending_completion.is_some()
             {
                 let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
                 let reply = self.finalize_reply(reply);
+                if self.session_end_seen {
+                    self.stage_session_end_sandbox_state_update(
+                        deferred_sandbox_state_update,
+                        pending_state_prechecked,
+                    )?;
+                }
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
@@ -921,6 +1170,9 @@ impl WorkerManager {
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
+            }
+            if pending_state_prechecked && self.control_only_interrupt_requires_spawn()? {
+                return Err(prechecked_follow_up_requires_meta_error());
             }
         }
 
@@ -934,7 +1186,9 @@ impl WorkerManager {
         if !empty_input {
             self.output.start_capture();
             self.maybe_emit_guardrail_notice();
-            self.resolve_timeout_marker();
+            if !pending_state_prechecked {
+                self.resolve_timeout_marker();
+            }
         }
         if empty_input {
             let reply = self.build_idle_poll_reply_pager();
@@ -942,7 +1196,7 @@ impl WorkerManager {
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
-        if self.pending_request {
+        if !pending_state_prechecked && self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
         if self.pending_request {
@@ -953,9 +1207,16 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = detached_prefix_item_count;
             mark_busy_follow_up_reply(&mut reply.reply);
             let reply = self.finalize_reply(reply);
+            if self.session_end_seen {
+                self.stage_session_end_sandbox_state_update(
+                    deferred_sandbox_state_update,
+                    pending_state_prechecked,
+                )?;
+            }
             self.maybe_reset_after_session_end();
             return Ok(reply);
         }
+        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
 
         let input_context = self.prepare_input_context_pager(&text, echo_input);
 
@@ -2091,6 +2352,21 @@ impl WorkerManager {
     }
 
     fn interrupt_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_inner(timeout, true)
+    }
+
+    fn interrupt_files_control_tail(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_inner(timeout, false)
+    }
+
+    fn interrupt_files_inner(
+        &mut self,
+        timeout: Duration,
+        reset_after_session_end: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
@@ -2128,7 +2404,9 @@ impl WorkerManager {
                 append_prompt_if_missing(contents, Some(prompt));
             }
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            if reset_after_session_end {
+                self.maybe_reset_after_session_end();
+            }
             return Ok(reply);
         }
 
@@ -2215,7 +2493,7 @@ impl WorkerManager {
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2232,6 +2510,21 @@ impl WorkerManager {
     }
 
     fn interrupt_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_inner(timeout, true)
+    }
+
+    fn interrupt_pager_control_tail(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_inner(timeout, false)
+    }
+
+    fn interrupt_pager_inner(
+        &mut self,
+        timeout: Duration,
+        reset_after_session_end: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
             serde_json::json!({
@@ -2273,7 +2566,9 @@ impl WorkerManager {
                 }
             }
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
+            if reset_after_session_end {
+                self.maybe_reset_after_session_end();
+            }
             return Ok(reply);
         }
 
@@ -2372,7 +2667,7 @@ impl WorkerManager {
                 "timeout_ms": timeout.as_millis(),
             }),
         );
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2398,7 +2693,7 @@ impl WorkerManager {
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2430,7 +2725,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2457,7 +2752,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.awaiting_initial_sandbox_state_update {
+        if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
@@ -2474,23 +2769,19 @@ impl WorkerManager {
         Ok(())
     }
 
-    // Updates the server-side sandbox configuration. The new policy becomes
-    // effective in the worker only after the current process is recycled and a
-    // replacement worker is spawned. Session temp handling is separate: the
-    // server-owned temp dir is reset before each spawn, and today that reset
-    // reuses the same configured path in place.
-    pub fn update_sandbox_state(
+    // Replaces the inherited sandbox snapshot for this tool call. The new
+    // policy becomes effective in the worker only after the current process is
+    // recycled and a replacement worker is spawned. Session temp handling is
+    // separate: the server-owned temp dir is reset before each spawn, and
+    // today that reset reuses the same configured path in place.
+    fn prepare_sandbox_state_update(
         &mut self,
         update: SandboxStateUpdate,
-        timeout: Duration,
-    ) -> Result<bool, WorkerError> {
+    ) -> Result<PreparedSandboxStateUpdate, WorkerError> {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
-        let mut inherited_state = self
-            .inherited_sandbox_state
-            .clone()
-            .unwrap_or_else(|| self.sandbox_defaults.clone());
+        let mut inherited_state = self.sandbox_defaults.clone();
         inherited_state.apply_update(update);
         let resolved_state = resolve_effective_sandbox_state_with_defaults(
             &self.sandbox_plan,
@@ -2498,8 +2789,7 @@ impl WorkerManager {
             &self.sandbox_defaults,
         )
         .map_err(WorkerError::Sandbox)?;
-        let awaiting_before = self.awaiting_initial_sandbox_state_update;
-        self.awaiting_initial_sandbox_state_update = false;
+        let missing_before = self.missing_inherited_sandbox_state();
         self.inherited_sandbox_state = Some(inherited_state);
         let changed = self.sandbox_state != resolved_state;
         self.sandbox_state = resolved_state;
@@ -2510,16 +2800,47 @@ impl WorkerManager {
             // picks up the updated sandbox state.
             self.windows_sandbox_launch = None;
         }
+        Ok(PreparedSandboxStateUpdate {
+            update_for_log,
+            changed,
+            missing_before,
+        })
+    }
+
+    fn log_sandbox_state_update(
+        prepared: &PreparedSandboxStateUpdate,
+        timeout: Option<Duration>,
+        respawned: bool,
+    ) {
         crate::event_log::log(
             "worker_sandbox_state_update",
             serde_json::json!({
-                "changed": changed,
-                "timeout_ms": timeout.as_millis(),
-                "update": update_for_log,
+                "changed": prepared.changed,
+                "timeout_ms": timeout.map(|timeout| timeout.as_millis()),
+                "respawned": respawned,
+                "update": prepared.update_for_log,
             }),
         );
-        if !changed {
-            if awaiting_before && self.process.is_none() {
+    }
+
+    pub fn stage_sandbox_state_update(
+        &mut self,
+        update: SandboxStateUpdate,
+    ) -> Result<(), WorkerError> {
+        let prepared = self.prepare_sandbox_state_update(update)?;
+        Self::log_sandbox_state_update(&prepared, None, false);
+        Ok(())
+    }
+
+    pub fn update_sandbox_state(
+        &mut self,
+        update: SandboxStateUpdate,
+        timeout: Duration,
+    ) -> Result<bool, WorkerError> {
+        let prepared = self.prepare_sandbox_state_update(update)?;
+        let mut respawned = false;
+        if !prepared.changed {
+            if prepared.missing_before && self.process.is_none() {
                 match self.oversized_output {
                     OversizedOutputMode::Files => self.reset_output_state_files(true),
                     OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
@@ -2528,46 +2849,97 @@ impl WorkerManager {
                     OversizedOutputMode::Files => self.spawn_process_files()?,
                     OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
                 });
-                return Ok(true);
+                respawned = true;
             }
-            return Ok(false);
+            Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
+            return Ok(respawned);
         }
 
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
         match self.oversized_output {
+            OversizedOutputMode::Files if self.has_detached_output_to_preserve() => {
+                self.reset_output_state_files_preserving_detached_output()
+            }
             OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager if self.has_detached_output_to_preserve() => {
+                self.reset_output_state_pager_preserving_detached_output(self.pager.is_active())
+            }
             OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
         }
         self.process = Some(match self.oversized_output {
             OversizedOutputMode::Files => self.spawn_process_files()?,
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
-        Ok(true)
+        respawned = true;
+        Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
+        Ok(respawned)
+    }
+
+    fn has_detached_output_to_preserve(&self) -> bool {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_output_tape.has_pending() || self.settled_pending_completion.is_some()
+            }
+            OversizedOutputMode::Pager => {
+                self.output.has_pending_output() || self.settled_pending_completion.is_some()
+            }
+        }
     }
 
     fn reset_output_state_files(&mut self, clear_pending_output: bool) {
+        self.reset_output_state_files_inner(clear_pending_output, false);
+    }
+
+    fn reset_output_state_files_preserving_detached_output(&mut self) {
+        self.reset_output_state_files_inner(false, true);
+    }
+
+    fn reset_output_state_files_inner(
+        &mut self,
+        clear_pending_output: bool,
+        preserve_detached_output: bool,
+    ) {
         if clear_pending_output {
             self.pending_output_tape.clear();
         }
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.pending_request_input = None;
+        if !preserve_detached_output {
+            self.pending_request_input = None;
+        }
         self.session_end_seen = false;
-        self.settled_pending_completion = None;
-        self.last_detached_prefix_item_count = 0;
+        if !preserve_detached_output {
+            self.settled_pending_completion = None;
+            self.last_detached_prefix_item_count = 0;
+        }
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
     fn reset_output_state_pager(&mut self, clear_pending_output: bool, preserve_pager: bool) {
+        self.reset_output_state_pager_inner(clear_pending_output, preserve_pager, false);
+    }
+
+    fn reset_output_state_pager_preserving_detached_output(&mut self, preserve_pager: bool) {
+        self.reset_output_state_pager_inner(false, preserve_pager, true);
+    }
+
+    fn reset_output_state_pager_inner(
+        &mut self,
+        clear_pending_output: bool,
+        preserve_pager: bool,
+        preserve_detached_output: bool,
+    ) {
         if clear_pending_output {
             self.pending_output_tape.clear();
         }
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-        self.output = OutputBuffer::default();
+        if !preserve_detached_output {
+            reset_output_ring();
+            reset_last_reply_marker_offset();
+            self.output = OutputBuffer::default();
+        }
         if !preserve_pager {
             self.pager = Pager::default();
         }
@@ -2575,8 +2947,10 @@ impl WorkerManager {
         self.pending_request_started_at = None;
         self.pending_request_input = None;
         self.session_end_seen = false;
-        self.settled_pending_completion = None;
-        self.last_detached_prefix_item_count = 0;
+        if !preserve_detached_output {
+            self.settled_pending_completion = None;
+            self.last_detached_prefix_item_count = 0;
+        }
         self.pager_prompt = None;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -2920,6 +3294,10 @@ impl WorkerManager {
 
     fn resolve_timeout_marker(&mut self) {
         self.resolve_timeout_marker_with_wait(Duration::from_millis(0));
+    }
+
+    pub fn refresh_timeout_marker(&mut self) {
+        self.resolve_timeout_marker();
     }
 
     fn resolve_timeout_marker_with_wait(&mut self, wait: Duration) {
@@ -5330,6 +5708,10 @@ mod tests {
         reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
+    #[cfg(target_os = "linux")]
+    use crate::sandbox::sandbox_state_update_from_codex_meta;
+    #[cfg(target_os = "linux")]
+    use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
@@ -5386,6 +5768,14 @@ mod tests {
     fn successful_test_child() -> Child {
         Command::new("sh")
             .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn exiting test child")
+    }
+
+    #[cfg(target_family = "windows")]
+    fn successful_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "exit 0"])
             .spawn()
             .expect("spawn exiting test child")
     }
@@ -5935,8 +6325,7 @@ mod tests {
                 "1+1".to_string(),
                 Duration::from_millis(50),
                 Duration::ZERO,
-                None,
-                false,
+                WriteStdinOptions::default(),
             )
             .expect("reply");
 
@@ -6198,6 +6587,45 @@ mod tests {
     }
 
     #[test]
+    fn files_reset_preserving_detached_output_keeps_pending_request_input_for_trim() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        manager.reset_output_state_files_preserving_detached_output();
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected detached files-mode output to survive the preserved reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the preserved reset to leak the original Python input echo, got: {text:?}"
+        );
+        assert!(
+            manager.pending_request_input.is_none(),
+            "expected preserved pending input to be consumed once the detached prefix is prepared"
+        );
+    }
+
+    #[test]
     fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
         let mut manager = WorkerManager::new(
             Backend::Python,
@@ -6390,8 +6818,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(16),
-                true,
+                WriteStdinOptions {
+                    page_bytes_override: Some(16),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty poll reply");
 
@@ -6440,8 +6871,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(16),
-                true,
+                WriteStdinOptions {
+                    page_bytes_override: Some(16),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty pager reply");
         let WorkerReply::Output { contents, .. } = reply;
@@ -6495,8 +6929,11 @@ mod tests {
                 String::new(),
                 Duration::from_millis(0),
                 Duration::from_millis(0),
-                Some(256),
-                true,
+                WriteStdinOptions {
+                    page_bytes_override: Some(256),
+                    echo_input: true,
+                    ..WriteStdinOptions::default()
+                },
             )
             .expect("empty poll reply");
         let WorkerReply::Output { contents, .. } = reply;
@@ -6662,25 +7099,132 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn failed_sandbox_update_does_not_commit_inherited_state() {
-        let _guard = env_test_mutex().lock().expect("env mutex");
-        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
-        let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
-        let initial = serde_json::json!({
+    fn linux_bwrap_startup_retry_stays_disabled_after_followup_codex_meta_update() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let mut inherited_state = manager.sandbox_defaults.clone();
+        inherited_state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: Some(std::env::temp_dir()),
+            use_linux_sandbox_bwrap: Some(true),
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_state.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_state),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial sandbox state");
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "test setup should start with bwrap enabled"
+        );
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+        assert!(retry, "expected startup failure to disable bwrap");
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
             "sandboxPolicy": {
                 "type": "workspace-write",
                 "writable_roots": [],
                 "network_access": false,
                 "exclude_tmpdir_env_var": false,
                 "exclude_slash_tmp": false
-            }
-        })
-        .to_string();
-        unsafe {
-            std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, initial);
-        }
+            },
+            "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
+        }))
+        .expect("Codex sandbox metadata");
+        manager
+            .update_sandbox_state(update, Duration::from_millis(1))
+            .expect("follow-up sandbox state");
 
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "follow-up Codex metadata should preserve the local no-bwrap fallback"
+        );
+    }
+
+    #[test]
+    fn inherit_workspace_write_refinements_wait_for_client_state() {
+        let writable_root = std::env::temp_dir();
+        let plan = SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::AddWritableRoot(writable_root.clone()),
+                crate::sandbox_cli::SandboxCliOperation::Config(
+                    crate::sandbox_cli::SandboxConfigOperation::SetWorkspaceNetworkAccess(true),
+                ),
+            ],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                    writable_roots: Vec::new(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                },
+                sandbox_cwd: Some(writable_root.clone()),
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("workspace-write Codex metadata should satisfy deferred refinements");
+
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            ..
+        } = &manager.sandbox_state.sandbox_policy
+        else {
+            panic!(
+                "expected staged inherit refinements to resolve to workspace-write, got {:?}",
+                manager.sandbox_state.sandbox_policy
+            );
+        };
+        assert!(
+            *network_access,
+            "expected deferred workspace network setting to apply after client metadata"
+        );
+        assert!(
+            writable_roots.iter().any(|path| path == &writable_root),
+            "expected deferred writable root to apply after client metadata"
+        );
+    }
+
+    #[test]
+    fn failed_sandbox_update_does_not_commit_inherited_state() {
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let plan = crate::sandbox_cli::SandboxCliPlan {
             operations: vec![
                 crate::sandbox_cli::SandboxCliOperation::SetMode(
@@ -6697,10 +7241,25 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Files,
         )
         .expect("worker manager");
-        let inherited_before = manager
-            .inherited_sandbox_state
-            .clone()
-            .expect("inherited state should be present");
+        let mut inherited_before = manager.sandbox_defaults.clone();
+        inherited_before.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: None,
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_before.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_before),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial inherited sandbox state");
 
         let err = manager
             .update_sandbox_state(
@@ -6722,15 +7281,344 @@ mod tests {
             Some(inherited_before),
             "failed updates must not mutate inherited sandbox baseline"
         );
+    }
 
-        match original_initial {
-            Some(value) => unsafe {
-                std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
-            },
+    #[test]
+    fn exact_interrupt_requires_current_sandbox_when_worker_would_respawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        assert!(
+            !manager
+                .nonexecuting_follow_up_uses_existing_state("\u{3}")
+                .expect("interrupt follow-up classification"),
+            "a bare Ctrl-C should require current per-call sandbox metadata when it would respawn"
+        );
+    }
+
+    #[test]
+    fn interrupt_pager_tail_requires_current_sandbox_when_worker_would_respawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .child
+            .wait()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b"line0001\nline0002\nline0003\nline0004\n",
+            false,
+            ContentOrigin::Worker,
+        );
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        assert!(
+            !manager
+                .nonexecuting_follow_up_uses_existing_state("\u{3}:q")
+                .expect("interrupt follow-up classification"),
+            "a pager ctrl-c tail should require current per-call sandbox metadata when it would respawn"
+        );
+    }
+
+    #[test]
+    fn empty_input_with_busy_guardrail_uses_existing_state() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(GuardrailEvent {
+                message: "[repl] previous request aborted; retry your last input\n".to_string(),
+                was_busy: true,
+            });
         }
+
+        assert!(
+            !manager
+                .empty_input_requires_spawn()
+                .expect("empty-input classification"),
+            "empty polls should keep pending busy-guardrail recovery local"
+        );
+    }
+
+    #[test]
+    fn nonempty_input_with_busy_guardrail_uses_existing_state() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(GuardrailEvent {
+                message: "[repl] previous request aborted; retry your last input\n".to_string(),
+                was_busy: true,
+            });
+        }
+
+        assert!(
+            manager
+                .nonexecuting_follow_up_uses_existing_state("1+1")
+                .expect("follow-up classification"),
+            "busy-guardrail retries should keep pending recovery local"
+        );
+    }
+
+    #[test]
+    fn empty_input_with_idle_guardrail_requires_spawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(GuardrailEvent {
+                message: "[repl] worker was idle; new session started\n".to_string(),
+                was_busy: false,
+            });
+        }
+
+        assert!(
+            manager
+                .empty_input_requires_spawn()
+                .expect("empty-input classification"),
+            "idle guardrail notices should still require current per-call sandbox metadata when a poll would respawn"
+        );
+    }
+
+    #[test]
+    fn prechecked_empty_input_requires_current_sandbox_when_worker_exited() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: None,
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .child
+            .wait()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        let result = manager.write_stdin(
+            String::new(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            WriteStdinOptions {
+                pending_state_prechecked: true,
+                ..WriteStdinOptions::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ref err) if is_prechecked_follow_up_requires_meta(err)),
+            "expected prechecked empty input to require current sandbox metadata once the worker has exited, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn prechecked_bare_interrupt_requires_current_sandbox_when_worker_exited() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: None,
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .child
+            .wait()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        let result = manager.write_stdin(
+            "\u{3}".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            WriteStdinOptions {
+                pending_state_prechecked: true,
+                ..WriteStdinOptions::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ref err) if is_prechecked_follow_up_requires_meta(err)),
+            "expected prechecked bare ctrl-c to require current sandbox metadata once the worker has exited, got: {result:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn interrupt_tail_uses_current_sandbox_for_the_respawn() {
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let temp = tempfile::Builder::new()
+            .prefix(".tmp-interrupt-tail-current-sandbox-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let sandbox_cwd = temp.path().to_path_buf();
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            plan,
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: Some(sandbox_cwd.clone()),
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited read-only state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .child
+            .wait()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+        manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
+
+        let result = manager.write_stdin(
+            "\u{3}1+1".to_string(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            WriteStdinOptions {
+                deferred_sandbox_state_update: Some(SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                        writable_roots: Vec::new(),
+                        network_access: false,
+                        exclude_tmpdir_env_var: false,
+                        exclude_slash_tmp: false,
+                    },
+                    sandbox_cwd: Some(sandbox_cwd.clone()),
+                    use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
+                }),
+                ..WriteStdinOptions::default()
+            },
+        );
+        match result {
+            Ok(WorkerReply::Output {
+                contents, is_error, ..
+            }) => {
+                let text = contents_text(&contents);
+                assert!(
+                    is_error,
+                    "expected the failed interrupt-tail respawn attempt to surface as an error reply"
+                );
+                assert!(
+                    text.contains("worker error:"),
+                    "expected the failed interrupt-tail respawn attempt to report a worker error, got: {text:?}"
+                );
+            }
+            Err(WorkerError::Protocol(message)) => {
+                assert!(
+                    message.contains("backend info") || message.contains("ipc disconnected"),
+                    "expected the failed interrupt-tail respawn attempt to fail during worker startup, got: {message:?}"
+                );
+            }
+            Err(err) => panic!("unexpected interrupt-tail respawn error: {err}"),
+        }
+        assert!(
+            matches!(
+                manager.sandbox_state.sandbox_policy,
+                SandboxPolicy::WorkspaceWrite { .. }
+            ),
+            "expected deferred metadata to stage before interrupt attempts the respawn"
+        );
+        assert_eq!(
+            manager.sandbox_state.sandbox_cwd, sandbox_cwd,
+            "expected deferred metadata to update the effective sandbox cwd before the respawn path"
+        );
     }
 
     #[test]

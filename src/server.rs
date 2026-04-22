@@ -1,10 +1,10 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, CustomNotification, CustomRequest, CustomResult, ErrorCode,
-    ErrorData as McpError, JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ErrorData as McpError, JsonObject, Meta, ProtocolVersion, ServerCapabilities,
+    ServerInfo,
 };
-use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,9 +27,17 @@ use self::timeouts::{
 
 use crate::backend::Backend;
 use crate::oversized_output::OversizedOutputMode;
-use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
-use crate::sandbox_cli::SandboxCliPlan;
-use crate::worker_process::{WorkerError, WorkerManager};
+use crate::sandbox::{SANDBOX_STATE_META_CAPABILITY, SandboxStateUpdate};
+use crate::sandbox_cli::{
+    MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan, sandbox_plan_requests_inherited_state,
+};
+use crate::worker_process::{
+    WorkerError, WorkerManager, WriteStdinControlAction, WriteStdinOptions,
+    is_prechecked_follow_up_requires_meta, split_write_stdin_control_prefix,
+};
+use crate::worker_protocol::{WorkerContent, WorkerReply};
+
+const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
 #[cfg(test)]
 fn repl_tool_description_for_backend(
@@ -54,6 +62,7 @@ fn repl_tool_description_for_backend(
 
 #[derive(Clone)]
 struct SharedServer {
+    accepts_sandbox_state_meta: bool,
     state: Arc<Mutex<ServerState>>,
 }
 
@@ -69,7 +78,9 @@ impl SharedServer {
         sandbox_plan: SandboxCliPlan,
         oversized_output: OversizedOutputMode,
     ) -> Result<Self, WorkerError> {
+        let accepts_sandbox_state_meta = sandbox_plan_requests_inherited_state(&sandbox_plan);
         Ok(Self {
+            accepts_sandbox_state_meta,
             state: Arc::new(Mutex::new(ServerState {
                 worker: WorkerManager::new(backend, sandbox_plan, oversized_output)?,
                 response: ResponseState::new()?,
@@ -80,6 +91,10 @@ impl SharedServer {
 
     fn state(&self) -> Arc<Mutex<ServerState>> {
         Arc::clone(&self.state)
+    }
+
+    fn accepts_sandbox_state_meta(&self) -> bool {
+        self.accepts_sandbox_state_meta
     }
 
     /// Runs a closure with exclusive access to the combined worker/response state.
@@ -98,27 +113,271 @@ impl SharedServer {
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
+    fn sandbox_state_update_for_tool_call(
+        &self,
+        meta: &Meta,
+    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
+        Self::sandbox_state_update_for_tool_call_meta(self.accepts_sandbox_state_meta(), meta)
+    }
+
+    fn sandbox_state_update_for_tool_call_meta(
+        accepts_sandbox_state_meta: bool,
+        meta: &Meta,
+    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
+        if !accepts_sandbox_state_meta {
+            return Ok(None);
+        }
+
+        let Some(raw_meta) = meta.get(SANDBOX_STATE_META_CAPABILITY) else {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        };
+        crate::sandbox::log_sandbox_state_meta(raw_meta);
+        let update = crate::sandbox::sandbox_state_update_from_codex_meta(raw_meta)
+            .map_err(WorkerError::Sandbox)?;
+        Ok(Some(update))
+    }
+
+    fn optional_sandbox_state_update_for_tool_call_meta(
+        accepts_sandbox_state_meta: bool,
+        meta: &Meta,
+    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
+        if !accepts_sandbox_state_meta {
+            return Ok(None);
+        }
+
+        let Some(raw_meta) = meta.get(SANDBOX_STATE_META_CAPABILITY) else {
+            return Ok(None);
+        };
+
+        match crate::sandbox::sandbox_state_update_from_codex_meta(raw_meta) {
+            Ok(update) => Ok(Some(update)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn apply_tool_call_sandbox_state(
+        state: &mut ServerState,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+
+        state
+            .worker
+            .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn stage_tool_call_sandbox_state_for_reset(
+        state: &mut ServerState,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+
+        state.worker.stage_sandbox_state_update(update)
+    }
+
     /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
     /// The response layer needs `pending_request` after the worker call to decide transcript reuse.
     async fn run_write_input(
         &self,
         input: String,
         timeout: Duration,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
+        let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
         self.run_state(move |state| {
             let timeout_bundle_reuse = timeout_bundle_reuse_for_input(&input);
             let raw_input = input;
             let use_inline_pager_materialization =
                 matches!(state.oversized_output, OversizedOutputMode::Pager);
-            let result = state.worker.write_stdin(
-                raw_input.clone(),
-                worker_timeout,
-                server_timeout,
-                None,
-                false,
-            );
+            state.worker.refresh_timeout_marker();
+            let mut control_input_on_meta_error = None;
+            let parse_tool_call_sandbox_state = || {
+                SharedServer::sandbox_state_update_for_tool_call_meta(
+                    accepts_sandbox_state_meta,
+                    &meta,
+                )
+            };
+            let parse_optional_tool_call_sandbox_state = || {
+                SharedServer::optional_sandbox_state_update_for_tool_call_meta(
+                    accepts_sandbox_state_meta,
+                    &meta,
+                )
+            };
+            let sandbox_state_result = if raw_input.is_empty() {
+                // Empty-input polls may drain an existing request. Pass current
+                // metadata through so a session-end reset can stage it before
+                // respawning, but only apply it immediately when answering the
+                // call itself requires a spawn.
+                match state.worker.empty_input_requires_spawn() {
+                    Ok(true) => {
+                        if let Err(err) = parse_tool_call_sandbox_state().and_then(|update| {
+                            SharedServer::apply_tool_call_sandbox_state(state, update)
+                        }) {
+                            Err(err)
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Ok(false) => parse_optional_tool_call_sandbox_state(),
+                    Err(err) => Err(err),
+                }
+            } else {
+                // A timed-out request still owns busy follow-ups, but a fresh
+                // non-empty call after that request has already settled must
+                // run under the current tool call's sandbox metadata.
+                let mut deferred_sandbox_state_update = None;
+                if state.worker.pending_request() {
+                    state
+                        .worker
+                        .refresh_timeout_marker_with_wait(BUSY_FOLLOW_UP_RECHECK_WAIT);
+                }
+                if state.worker.pending_request() {
+                    if let Some((control, _remaining)) =
+                        split_write_stdin_control_prefix(&raw_input)
+                    {
+                        control_input_on_meta_error = Some((
+                            match control {
+                                WriteStdinControlAction::Interrupt => "\u{3}".to_string(),
+                                WriteStdinControlAction::Restart => "\u{4}".to_string(),
+                            },
+                            timeout_bundle_reuse_for_input(&raw_input),
+                            matches!(control, WriteStdinControlAction::Interrupt),
+                        ));
+                        if let Err(err) = parse_tool_call_sandbox_state().map(|update| {
+                            control_input_on_meta_error = None;
+                            deferred_sandbox_state_update = update;
+                        }) {
+                            Err(err)
+                        } else {
+                            Ok(deferred_sandbox_state_update)
+                        }
+                    } else {
+                        parse_optional_tool_call_sandbox_state()
+                    }
+                } else {
+                    match state
+                        .worker
+                        .nonexecuting_follow_up_uses_existing_state(&raw_input)
+                    {
+                        Ok(true) => {
+                            // Local follow-ups like bare Ctrl-C or active pager
+                            // commands can keep using existing state. Exact
+                            // Ctrl-C is only in this path when it will not
+                            // respawn a worker.
+                            Ok(None)
+                        }
+                        Ok(false) => {
+                            if matches!(
+                                split_write_stdin_control_prefix(&raw_input),
+                                Some((WriteStdinControlAction::Restart, _))
+                            ) {
+                                if let Err(err) = parse_tool_call_sandbox_state().map(|update| {
+                                    deferred_sandbox_state_update = update;
+                                }) {
+                                    Err(err)
+                                } else {
+                                    Ok(deferred_sandbox_state_update)
+                                }
+                            } else {
+                                match parse_tool_call_sandbox_state().and_then(|update| {
+                                    SharedServer::apply_tool_call_sandbox_state(state, update)
+                                }) {
+                                    Ok(()) => Ok(None),
+                                    Err(err) => Err(err),
+                                }
+                            }
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            };
+            let deferred_sandbox_state_update = match sandbox_state_result {
+                Ok(update) => update,
+                Err(err) => {
+                    if let Some((control_input, timeout_bundle_reuse, detach_control_reply)) =
+                        control_input_on_meta_error.take()
+                    {
+                        let control_result = state.worker.write_stdin(
+                            control_input,
+                            worker_timeout,
+                            server_timeout,
+                            WriteStdinOptions {
+                                pending_state_prechecked: true,
+                                ..WriteStdinOptions::default()
+                            },
+                        );
+                        let pending_request_after = state.worker.pending_request();
+                        let detached_prefix_item_count = if detach_control_reply {
+                            control_result
+                                .as_ref()
+                                .map_or(0, prefixed_worker_reply_item_count)
+                        } else {
+                            0
+                        };
+                        let mut result = finalize_visible_reply(
+                            state,
+                            control_result,
+                            pending_request_after,
+                            timeout_bundle_reuse,
+                            detached_prefix_item_count,
+                            use_inline_pager_materialization
+                                && !pending_request_after
+                                && !state.response.has_timeout_bundle_state(),
+                        );
+                        result.is_error = Some(true);
+                        result
+                            .content
+                            .push(rmcp::model::Content::text(format!("worker error: {err}")));
+                        strip_text_stream_meta(&mut result);
+                        return result;
+                    }
+                    let mut result = state.response.finalize_local_error(err);
+                    strip_text_stream_meta(&mut result);
+                    return result;
+                }
+            };
+            let mut write_options = WriteStdinOptions {
+                pending_state_prechecked: true,
+                deferred_sandbox_state_update,
+                ..WriteStdinOptions::default()
+            };
+            let mut retried_after_meta_refresh = false;
+            let result = loop {
+                let result = state.worker.write_stdin(
+                    raw_input.clone(),
+                    worker_timeout,
+                    server_timeout,
+                    write_options.clone(),
+                );
+                match result {
+                    Err(err)
+                        if !retried_after_meta_refresh
+                            && is_prechecked_follow_up_requires_meta(&err) =>
+                    {
+                        match parse_tool_call_sandbox_state().and_then(|update| {
+                            SharedServer::apply_tool_call_sandbox_state(state, update)
+                        }) {
+                            Ok(()) => {
+                                retried_after_meta_refresh = true;
+                                write_options.pending_state_prechecked = false;
+                                write_options.deferred_sandbox_state_update = None;
+                                continue;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    other => break other,
+                }
+            };
             let pending_request_after = state.worker.pending_request();
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();
             let mut result = finalize_visible_reply(
@@ -136,170 +395,18 @@ impl SharedServer {
         })
         .await
     }
-
-    async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
-        crate::event_log::log(
-            "custom_request_received",
-            json!({
-                "method": request.method.clone(),
-                "params": request.params.clone(),
-            }),
-        );
-        crate::sandbox::log_sandbox_state_event(&request.method, request.params.as_ref());
-        if request.method != SANDBOX_STATE_METHOD {
-            crate::event_log::log(
-                "custom_request_rejected",
-                json!({
-                    "method": request.method.clone(),
-                    "reason": "method_not_found",
-                }),
-            );
-            return Err(McpError::new(
-                ErrorCode::METHOD_NOT_FOUND,
-                request.method,
-                None,
-            ));
-        }
-
-        let update = request
-            .params_as::<SandboxStateUpdate>()
-            .map_err(|err| McpError::invalid_params(err.to_string(), None))?
-            .ok_or_else(|| McpError::invalid_params("missing sandbox state params", None))?;
-        let update_for_log = serde_json::to_value(&update)
-            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-
-        let outcome = self
-            .run_state(move |state| {
-                let outcome = state
-                    .worker
-                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT);
-                if matches!(outcome, Ok(true))
-                    && let Err(err) = state.response.clear_active_timeout_bundle()
-                {
-                    return Err(err);
-                }
-                outcome
-            })
-            .await?;
-        match outcome {
-            Ok(changed) => {
-                crate::event_log::log(
-                    "sandbox_state_request_applied",
-                    json!({
-                        "changed": changed,
-                        "update": update_for_log,
-                    }),
-                );
-            }
-            Err(err) => {
-                crate::event_log::log(
-                    "sandbox_state_request_failed",
-                    json!({
-                        "error": err.to_string(),
-                        "update": update_for_log,
-                    }),
-                );
-                return Err(McpError::internal_error(err.to_string(), None));
-            }
-        }
-
-        Ok(CustomResult::new(json!({})))
-    }
-
-    async fn on_custom_notification(&self, notification: CustomNotification) {
-        crate::event_log::log(
-            "custom_notification_received",
-            json!({
-                "method": notification.method.clone(),
-                "params": notification.params.clone(),
-            }),
-        );
-        crate::sandbox::log_sandbox_state_event(&notification.method, notification.params.as_ref());
-        if notification.method != SANDBOX_STATE_METHOD {
-            return;
-        }
-
-        let update = match notification.params_as::<SandboxStateUpdate>() {
-            Ok(Some(update)) => update,
-            Ok(None) => {
-                eprintln!("sandbox update missing params");
-                crate::event_log::log(
-                    "sandbox_state_notification_failed",
-                    json!({
-                        "error": "missing sandbox state params",
-                    }),
-                );
-                return;
-            }
-            Err(err) => {
-                eprintln!("sandbox update parse error: {err}");
-                crate::event_log::log(
-                    "sandbox_state_notification_failed",
-                    json!({
-                        "error": err.to_string(),
-                    }),
-                );
-                return;
-            }
-        };
-        let update_for_log = serde_json::to_value(&update)
-            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-
-        match self
-            .run_state(move |state| {
-                let outcome = state
-                    .worker
-                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT);
-                if matches!(outcome, Ok(true))
-                    && let Err(err) = state.response.clear_active_timeout_bundle()
-                {
-                    return Err(err);
-                }
-                outcome
-            })
-            .await
-        {
-            Ok(Ok(changed)) => {
-                crate::event_log::log(
-                    "sandbox_state_notification_applied",
-                    json!({
-                        "changed": changed,
-                        "update": update_for_log.clone(),
-                    }),
-                );
-            }
-            Ok(Err(err)) => {
-                eprintln!("sandbox update failed: {err}");
-                crate::event_log::log(
-                    "sandbox_state_notification_failed",
-                    json!({
-                        "error": err.to_string(),
-                        "update": update_for_log.clone(),
-                    }),
-                );
-            }
-            Err(err) => {
-                eprintln!("sandbox update failed: {err}");
-                crate::event_log::log(
-                    "sandbox_state_notification_failed",
-                    json!({
-                        "error": err.to_string(),
-                        "update": update_for_log.clone(),
-                    }),
-                );
-            }
-        }
-    }
 }
 
-fn server_info() -> ServerInfo {
-    ServerInfo::new(
+fn server_info(advertise_sandbox_capabilities: bool) -> ServerInfo {
+    let capabilities = if advertise_sandbox_capabilities {
         ServerCapabilities::builder()
             .enable_tools()
             .enable_experimental_with(sandbox_capabilities())
-            .build(),
-    )
-    .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .build()
+    } else {
+        ServerCapabilities::builder().enable_tools().build()
+    };
+    ServerInfo::new(capabilities).with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
 
 #[derive(Clone, Copy)]
@@ -327,6 +434,7 @@ where
                 "tool": tool.as_ref(),
                 "arguments": arguments,
                 "task": task,
+                "meta": context.request_context.meta.clone(),
             })
         });
         let result = self.inner.call(context).await;
@@ -384,7 +492,7 @@ macro_rules! define_backend_tool_server {
             }
 
             fn get_info(&self) -> ServerInfo {
-                server_info()
+                server_info(self.shared.accepts_sandbox_state_meta())
             }
 
             fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
@@ -400,10 +508,14 @@ macro_rules! define_backend_tool_server {
                     open_world_hint = false
                 )
             )]
-            async fn repl(&self, params: Parameters<ReplArgs>) -> Result<CallToolResult, McpError> {
+            async fn repl(
+                &self,
+                meta: Meta,
+                params: Parameters<ReplArgs>,
+            ) -> Result<CallToolResult, McpError> {
                 let ReplArgs { input, timeout_ms } = params.0;
                 let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
-                self.shared.run_write_input(input, timeout).await
+                self.shared.run_write_input(input, timeout, meta).await
             }
 
             #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
@@ -417,13 +529,30 @@ macro_rules! define_backend_tool_server {
             )]
             async fn repl_reset(
                 &self,
+                meta: Meta,
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
+                let sandbox_state_update = self.shared.sandbox_state_update_for_tool_call(&meta);
                 let result = self
                     .shared
                     .run_state(move |state| {
+                        let sandbox_state_result = match &sandbox_state_update {
+                            Ok(update) => SharedServer::stage_tool_call_sandbox_state_for_reset(
+                                state,
+                                update.clone(),
+                            ),
+                            Err(WorkerError::Sandbox(message)) => {
+                                Err(WorkerError::Sandbox(message.clone()))
+                            }
+                            Err(err) => Err(WorkerError::Sandbox(err.to_string())),
+                        };
+                        if let Err(err) = sandbox_state_result {
+                            let mut result = state.response.finalize_local_error(err);
+                            strip_text_stream_meta(&mut result);
+                            return result;
+                        }
                         let result = state.worker.restart(worker_timeout);
                         let pending_request_after = state.worker.pending_request();
                         let mut result = finalize_visible_reply(
@@ -446,22 +575,6 @@ macro_rules! define_backend_tool_server {
         impl ServerHandler for $server_ty {
             fn get_info(&self) -> ServerInfo {
                 $server_ty::get_info(self)
-            }
-
-            async fn on_custom_request(
-                &self,
-                request: CustomRequest,
-                _context: rmcp::service::RequestContext<RoleServer>,
-            ) -> Result<CustomResult, McpError> {
-                self.shared.on_custom_request(request).await
-            }
-
-            async fn on_custom_notification(
-                &self,
-                notification: CustomNotification,
-                _context: rmcp::service::NotificationContext<RoleServer>,
-            ) {
-                self.shared.on_custom_notification(notification).await
             }
         }
     };
@@ -491,6 +604,32 @@ fn finalize_visible_reply(
             timeout_bundle_reuse,
             detached_prefix_item_count,
         ),
+    }
+}
+
+fn prefixed_worker_reply_item_count(reply: &WorkerReply) -> usize {
+    let WorkerReply::Output {
+        contents, prompt, ..
+    } = reply;
+    let Some(prompt_text) = prompt.as_deref() else {
+        return contents.len();
+    };
+    if prompt_text.is_empty() {
+        return contents.len();
+    }
+    let Some(idx) = contents
+        .iter()
+        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
+    else {
+        return contents.len();
+    };
+    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
+        return contents.len();
+    };
+    if matches!(text.strip_suffix(prompt_text), Some("")) {
+        contents.len().saturating_sub(1)
+    } else {
+        contents.len()
     }
 }
 
@@ -533,7 +672,7 @@ fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
     let mut capability = JsonObject::new();
     capability.insert("version".to_string(), json!("1.0.0"));
     let mut experimental = BTreeMap::new();
-    experimental.insert(SANDBOX_STATE_CAPABILITY.to_string(), capability);
+    experimental.insert(SANDBOX_STATE_META_CAPABILITY.to_string(), capability);
     experimental
 }
 
