@@ -197,6 +197,13 @@ pub fn resolve_effective_sandbox_state(
     resolve_effective_sandbox_state_with_defaults(plan, inherited, &defaults)
 }
 
+pub fn validate_sandbox_plan_with_defaults(
+    plan: &SandboxCliPlan,
+    defaults: &SandboxState,
+) -> Result<(), String> {
+    validate_sandbox_plan_operations(plan, None, defaults)
+}
+
 pub fn resolve_effective_sandbox_state_with_defaults(
     plan: &SandboxCliPlan,
     inherited: Option<&SandboxState>,

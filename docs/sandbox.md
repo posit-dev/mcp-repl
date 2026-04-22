@@ -21,14 +21,45 @@ metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
 bootstraps one local inherited snapshot from the current default sandbox state
 before the first worker spawn.
 
-For `repl`, empty-input polls ignore per-call sandbox metadata when they can be
-answered from existing state, such as draining a timed-out request or returning an
-idle prompt from an already-running worker. If an empty-input call must spawn a
-worker to answer the call, `mcp-repl` applies the current tool call's sandbox
-metadata before that spawn. Non-empty `repl` calls resolve any stale timeout
-marker first, then apply the current call's sandbox metadata before executing
-fresh code. If a timed-out request is still genuinely in flight, follow-up calls
-continue servicing that request instead of switching sandboxes mid-flight.
+For `repl`, inherited sandbox metadata controls the worker session that handles
+the call. When a non-empty tool call would use the worker and the effective
+inherited sandbox changed, `mcp-repl` restarts the worker before serving that
+call and includes a restart notice that names the new sandbox policy.
+
+More specifically:
+
+- Empty-input polls ignore per-call sandbox metadata while they are only
+  draining existing pending or settled output, or returning an idle prompt from
+  an already-running worker.
+- If an empty-input poll needs to spawn or respawn a worker to finish answering
+  the call, `mcp-repl` applies the current tool call's metadata before that
+  spawn. If a poll can first answer by draining a session-ended request, it
+  returns that local drain without respawning; the next spawn-needed call must
+  provide valid current metadata.
+- While the pager is active, pure pager navigation is local UI state, not a
+  worker interaction. Pager-local commands such as `:q` or empty-string page
+  advance ignore sandbox metadata until a later tool call actually interacts
+  with the worker again. Bare `Ctrl-D` is not pager navigation; it remains an
+  explicit restart even when the pager is active.
+- Bare `Ctrl-C` is the one non-empty `repl` follow-up that stays local and does
+  not force a sandbox-driven restart.
+- Every other non-empty `repl` call must have valid current
+  `_meta["codex/sandbox-state-meta"]`.
+- A non-empty retry after the memory guardrail aborts a worker is an ordinary
+  non-empty call. It must have valid current metadata before `mcp-repl` resets
+  or retries under `--sandbox inherit`.
+- Non-empty `repl` calls resolve stale timeout markers before deciding whether
+  they are still looking at a live worker request.
+- If current metadata changes the effective inherited sandbox, `mcp-repl`
+  restarts the worker at that call before handling the input.
+- Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the
+  restarted session when the sandbox changed; the control prefix itself is not
+  replayed into the fresh worker.
+- Explicit restarts discard preserved detached output from aborted prior
+  requests instead of carrying it into later unrelated replies.
+- Sandbox metadata is enforced again at the next tool call that actually
+  interacts with the worker after pager navigation ends.
+- Missing or malformed metadata still fails closed on calls that need it.
 
 The worker also gets a per-session temp directory, exported as:
 

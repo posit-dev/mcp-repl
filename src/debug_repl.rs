@@ -70,7 +70,7 @@ pub(crate) fn run(
 
     while let Some(line) = read_line(&mut stdin)? {
         if is_exact_command(&line, "INTERRUPT") {
-            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT);
+            let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT, None, false);
             render_visible_reply(
                 response.as_mut(),
                 reply,
