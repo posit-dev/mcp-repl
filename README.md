@@ -177,7 +177,7 @@ mcp-repl install --client codex --interpreter r
 Bare `mcp-repl` defaults to `--oversized-output pager`.
 
 `install --client codex` writes `--sandbox inherit --oversized-output files` by default. That
-sentinel means `mcp-repl` should inherit sandbox policy updates from Codex for the session while
+sentinel means `mcp-repl` should inherit sandbox policy metadata from Codex on each tool call while
 keeping installed Codex configs on the file-backed oversized-output path.
 
 Example `R` REPL Codex config (paths vary by OS/user):
@@ -187,8 +187,8 @@ Example `R` REPL Codex config (paths vary by OS/user):
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl exits with an error.
+# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.
+# mcp-repl fails closed if the tool call omits or malforms that metadata.
 args = [
   "--sandbox", "inherit",
   "--oversized-output", "files",
@@ -203,8 +203,8 @@ Example `Python` REPL Codex config:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl exits with an error.
+# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.
+# mcp-repl fails closed if the tool call omits or malforms that metadata.
 args = [
   "--sandbox", "inherit",
   "--oversized-output", "files",
@@ -213,7 +213,7 @@ args = [
 ```
 
 For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode and
-`--oversized-output files` because Claude does not propagate sandbox state updates to MCP servers:
+`--oversized-output files` because Claude does not propagate Codex-style sandbox metadata to MCP servers:
 
 ```json
 // ~/.claude.json

@@ -17,10 +17,10 @@ Enable per-startup JSONL logs with either:
 
 Each startup creates a fresh session directory under that root. `mcp-repl` writes:
 
-- `events.jsonl` with startup metadata, tool calls, and sandbox custom request events
+- `events.jsonl` with startup metadata, tool calls, and parsed sandbox metadata events
 - `startup.log` for server-side startup trace lines
 - `worker-startup.log` for worker-side startup trace lines
-- `sandbox-state.jsonl` for the initial effective sandbox policy plus later sandbox policy/update payloads
+- `sandbox-state.jsonl` for the initial effective sandbox policy plus later tool-call sandbox metadata and effective policy updates
 
 Example:
 
@@ -43,7 +43,7 @@ MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --interpreter python
 
 ## MCP and sandbox tracing
 
-These switches are useful when the client is sending custom sandbox updates or when the sandbox policy is the thing you are debugging.
+These switches are useful when the client is sending Codex sandbox metadata or when the sandbox policy is the thing you are debugging.
 
 - `MCP_REPL_DEBUG_DIR=/path/to/debug-root` writes `sandbox-state.jsonl` inside the session directory
 - `MCP_REPL_KEEP_SESSION_TMPDIR=1` keeps the worker session temp directory after exit so you can inspect it
@@ -58,6 +58,11 @@ MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --sandbox inherit
 ## Interactive debug REPL
 
 `--debug-repl` runs `mcp-repl` as a local interactive driver for the worker instead of as an MCP server. This is the fastest way to reproduce REPL behavior without involving a client.
+
+If you start it with `--sandbox inherit`, the debug REPL bootstraps one local
+inherited sandbox snapshot from the current default sandbox state before the
+first worker spawn. That keeps the inherit code path debuggable even though
+there is no per-tool-call MCP metadata in local debug mode.
 
 Start it with:
 
