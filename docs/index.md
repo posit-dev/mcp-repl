@@ -10,9 +10,10 @@ checked-in execution plans without relying on stale notes.
 - `docs/output_timeline.md`: server-side model for merging text pipes and sideband events into visible reply order.
 - `docs/testing.md`: public validation surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
-- `docs/sandbox.md`: sandbox modes, writable roots, and client-driven sandbox updates.
+- `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
 - `docs/worker_sideband_protocol.md`: server/worker IPC contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
+- `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
 
 ## Normative Docs
 

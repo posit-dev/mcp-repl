@@ -10,9 +10,25 @@ When no CLI sandbox mode is provided, the default is:
 - `workspace-write`
 - `network_access: false`
 
-When `--sandbox inherit` is used, the client must send a sandbox update
-(`codex/sandbox-state/update`) before the first worker start/tool call.
-If no update is provided, the first tool call fails fast.
+When `--sandbox inherit` is used for MCP server operation, the client must
+attach per-tool-call sandbox metadata in `_meta["codex/sandbox-state-meta"]`.
+That metadata is the source of truth for the tool call that is about to run. If
+it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
+requested but no client sandbox state was provided`.
+
+`--debug-repl` is the one local-only exception. Because there is no client
+metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
+bootstraps one local inherited snapshot from the current default sandbox state
+before the first worker spawn.
+
+For `repl`, empty-input polls ignore per-call sandbox metadata when they can be
+answered from existing state, such as draining a timed-out request or returning an
+idle prompt from an already-running worker. If an empty-input call must spawn a
+worker to answer the call, `mcp-repl` applies the current tool call's sandbox
+metadata before that spawn. Non-empty `repl` calls resolve any stale timeout
+marker first, then apply the current call's sandbox metadata before executing
+fresh code. If a timed-out request is still genuinely in flight, follow-up calls
+continue servicing that request instead of switching sandboxes mid-flight.
 
 The worker also gets a per-session temp directory, exported as:
 
@@ -28,8 +44,8 @@ The worker also gets a per-session temp directory, exported as:
   `mcp-repl --add-allowed-domain <pattern>`
 - Advanced overrides:
   `mcp-repl --config key=value` with Codex-shaped keys
-- MCP sandbox update method:
-  `codex/sandbox-state/update` (capability `codex/sandbox-state`)
+- MCP sandbox metadata capability:
+  `codex/sandbox-state-meta` (advertised only when the effective CLI sandbox mode still resolves to `inherit` after later overrides)
 
 Operations are applied strictly in CLI argument order. Later operations win.
 `--sandbox ...` resets the base policy at the point where it appears.
@@ -72,8 +88,8 @@ Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock
 - default Linux worker setup disables network unless explicitly enabled.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; client-provided
   helper executable paths are ignored.
-- inherited `useLegacyLandlock` updates are translated onto `mcp-repl`'s
-  internal `bwrap` on/off choice.
+- Codex sandbox metadata does not control `mcp-repl`'s optional internal
+  `bwrap` stage. That remains a local best-effort setting.
 
 Optional `bwrap` stage:
 

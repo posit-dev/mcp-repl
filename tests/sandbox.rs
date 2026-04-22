@@ -603,7 +603,7 @@ async fn sandbox_read_only_blocks_workspace_writes() -> TestResult<()> {
     }
     let repo_root = std::env::current_dir()?;
     let target = unique_path(&repo_root, "read-only");
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
     let result = session
         .write_stdin_raw_with(write_test_code(&target), Some(10.0))
         .await?;
@@ -635,7 +635,7 @@ async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
     }
     let repo_root = std::env::current_dir()?;
     let target = unique_path(&repo_root, "workspace-write");
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let result = session
         .write_stdin_raw_with(write_test_code(&target), Some(10.0))
         .await?;
@@ -679,7 +679,7 @@ async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> Te
         std::fs::create_dir_all(path)?;
     }
 
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
         false,
         vec![r_package_cache_root.clone()],
     ))
@@ -742,8 +742,7 @@ async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()
         "R_USER_CACHE_DIR".to_string(),
         xdg_cache_home.to_string_lossy().to_string(),
     )];
-    let mut session =
-        spawn_server_with_sandbox_state_and_env(sandbox_state_read_only(), env).await?;
+    let session = spawn_server_with_sandbox_state_and_env(sandbox_state_read_only(), env).await?;
 
     let target = unique_path(
         &reticulate_uv_cache_root,
@@ -788,7 +787,7 @@ async fn sandbox_full_access_allows_writes_outside_workspace() -> TestResult<()>
         return Ok(());
     }
     let target = unique_path(&std::env::temp_dir(), "full-access");
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
     let result = session
         .write_stdin_raw_with(write_test_code(&target), Some(10.0))
         .await?;
@@ -817,7 +816,7 @@ async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
         .await?;
@@ -849,7 +848,7 @@ async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
     if let Some(root) = reticulate_cache_dir() {
         writable_roots.push(root);
     }
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
         false,
         writable_roots,
     ))
@@ -924,7 +923,7 @@ async fn sandbox_workspace_write_blocks_network_access() -> TestResult<()> {
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
         .await?;
@@ -999,7 +998,7 @@ async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
         .unwrap_or_default()
         .as_nanos();
     let sentinel = format!("/tmp/mcp-repl-preexisting-{nanos}");
-    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+    let session = common::spawn_server_with_args_env_and_pager_page_chars(
         Vec::new(),
         vec![("R_SESSION_TMPDIR".to_string(), sentinel.clone())],
         SANDBOX_PAGER_PAGE_CHARS,
@@ -1051,7 +1050,7 @@ async fn sandbox_workspace_write_allows_network_access() -> TestResult<()> {
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(true)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(true)).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
         .await?;
@@ -1078,7 +1077,7 @@ async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
         .await?;
@@ -1103,7 +1102,7 @@ async fn sandbox_allows_sysctl_used_by_quarto() -> TestResult<()> {
         return Ok(());
     }
 
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"
 brand <- suppressWarnings(system("/usr/sbin/sysctl machdep.cpu.brand_string", intern = TRUE))
 status_ngroups <- system("sysctl -n kern.ngroups >/dev/null")
@@ -1143,7 +1142,7 @@ async fn sandbox_allows_parallel_detect_cores() -> TestResult<()> {
         return Ok(());
     }
 
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"
 suppressWarnings({
   logical <- parallel::detectCores(logical = TRUE)
@@ -1181,7 +1180,7 @@ async fn sandbox_denials_linux() -> TestResult<()> {
     let forbidden = Path::new(&home).join(format!("mcp-repl-denied-{nanos}.txt"));
     let forbidden = forbidden.to_string_lossy().to_string();
 
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = format!(
         r#"
 target <- {forbidden:?}
@@ -1228,7 +1227,7 @@ async fn sandbox_denials_linux_bwrap() -> TestResult<()> {
     let forbidden = Path::new(&home).join(format!("mcp-repl-bwrap-denied-{nanos}.txt"));
     let forbidden = forbidden.to_string_lossy().to_string();
 
-    let mut session = spawn_server_with_sandbox_state_and_env(
+    let session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
         vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
@@ -1280,7 +1279,7 @@ async fn sandbox_bwrap_protects_dot_git_codex_agents() -> TestResult<()> {
     std::fs::create_dir_all(writable_root.join(".codex"))?;
     std::fs::create_dir_all(writable_root.join(".agents"))?;
 
-    let mut session = spawn_server_with_sandbox_state_and_env(
+    let session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
         vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
@@ -1341,7 +1340,7 @@ async fn sandbox_workspace_write_blocks_network_access_bwrap() -> TestResult<()>
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
-    let mut session = spawn_server_with_sandbox_state_and_env(
+    let session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
         vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
     )
@@ -1374,7 +1373,7 @@ async fn sandbox_bwrap_no_proc_mode_starts_worker() -> TestResult<()> {
         eprintln!("bwrap unavailable; skipping");
         return Ok(());
     }
-    let mut session = spawn_server_with_sandbox_state_and_env(
+    let session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
         vec![
             ("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string()),
@@ -1706,7 +1705,7 @@ async fn sandbox_denials_windows() -> TestResult<()> {
 
     // This test only needs an arbitrary writable workspace root; using a temp
     // workspace avoids recursive ACL refreshes over the repo's build output.
-    let (mut session, _workspace, _cwd) =
+    let (session, _workspace, _cwd) =
         spawn_server_with_sandbox_state_in_temp_cwd(sandbox_state_workspace_write(false)).await?;
     let code = format!(
         r#"
@@ -1765,7 +1764,7 @@ async fn sandbox_workspace_write_restart_blocks_file_moved_outside_writable_root
     ));
     let source_r = r_string(&source.to_string_lossy());
     let target_r = r_string(&target.to_string_lossy());
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -1866,7 +1865,7 @@ async fn sandbox_workspace_write_restart_blocks_moved_file_inside_git_dir() -> T
     ));
     let source_r = r_string(&source.to_string_lossy());
     let target_r = r_string(&target.to_string_lossy());
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -1982,7 +1981,7 @@ async fn sandbox_workspace_write_concurrent_sessions_block_file_moved_into_git_d
     std::fs::create_dir_all(&nested_dir)?;
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2024,7 +2023,7 @@ cat("SOURCE_READ=", paste(readLines(source, warn = FALSE), collapse = "|"), "\n"
     std::fs::rename(&source, &target)?;
     let target_acl_before = unresolved_windows_sid_acl_entries(&target)?;
 
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let ready_b = session_b
@@ -2094,10 +2093,10 @@ async fn sandbox_workspace_write_concurrent_sessions_do_not_share_session_temp_c
     let workspace = temp_workspace_root()?;
     let repo_root = workspace.path().to_path_buf();
     scrub_unresolved_windows_sid_aces(&repo_root)?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2194,11 +2193,10 @@ async fn sandbox_workspace_write_concurrent_sessions_do_not_share_in_workspace_s
         ("TMPDIR".to_string(), temp_root_value),
     ];
     let state = sandbox_state_workspace_write(false);
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_and_env_in_cwd(state.clone(), env.clone(), &repo_root)
             .await?;
-    let mut session_b =
-        spawn_server_with_sandbox_state_and_env_in_cwd(state, env, &repo_root).await?;
+    let session_b = spawn_server_with_sandbox_state_and_env_in_cwd(state, env, &repo_root).await?;
 
     let create = session_a
         .write_stdin_raw_with(
@@ -2332,7 +2330,7 @@ async fn sandbox_workspace_write_restart_unblocks_file_moved_out_of_git_dir() ->
     ));
     let protected_r = r_string(&protected.to_string_lossy());
     let restored_r = r_string(&restored.to_string_lossy());
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2451,7 +2449,7 @@ async fn sandbox_workspace_write_restart_allows_host_created_file_under_workspac
     let host_created_r = r_string(&host_created.to_string_lossy());
     std::fs::create_dir_all(&nested_dir)?;
 
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2469,7 +2467,7 @@ async fn sandbox_workspace_write_restart_allows_host_created_file_under_workspac
 
     std::fs::write(&host_created, b"host before restart")?;
 
-    let mut restarted =
+    let restarted =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let follow_up_code = format!(
@@ -2530,7 +2528,7 @@ async fn sandbox_workspace_write_restart_allows_host_created_file_under_nested_w
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
 
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2550,7 +2548,7 @@ async fn sandbox_workspace_write_restart_allows_host_created_file_under_nested_w
     std::fs::create_dir_all(&nested_dir)?;
     std::fs::write(&host_created, b"host before restart nested")?;
 
-    let mut restarted =
+    let restarted =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let current_acl = unresolved_windows_sid_acl_entries(&host_created)?;
@@ -2616,7 +2614,7 @@ async fn sandbox_workspace_write_nested_midrun_file_keeps_prepared_sid() -> Test
     std::fs::create_dir_all(&nested_dir)?;
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -2673,8 +2671,8 @@ async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() 
     std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
-    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
+    let session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -2778,8 +2776,8 @@ async fn sandbox_workspace_write_concurrent_sessions_respawn_repairs_temp_rename
     std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
-    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
+    let session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -2921,8 +2919,8 @@ async fn sandbox_workspace_write_concurrent_sessions_share_direct_workspace_file
     std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
-    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
+    let session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -3019,7 +3017,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_created_nested_w
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3038,7 +3036,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_created_nested_w
     std::fs::create_dir_all(&nested_dir)?;
     std::fs::write(&shared, b"from host nested")?;
 
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let ready_b = session_b
@@ -3128,7 +3126,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
         &repo_root,
         &[writable_root.path().to_path_buf()],
     )?;
-    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &repo_root).await?;
+    let session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &repo_root).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -3148,7 +3146,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
     std::fs::write(&host_file, b"from moved host tree with extra root")?;
     std::fs::rename(&host_pkg, &nested_dir)?;
 
-    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &repo_root).await?;
+    let session_b = spawn_server_with_sandbox_state_in_cwd(state, &repo_root).await?;
     let ready_b = session_b
         .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
         .await?;
@@ -3235,7 +3233,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3256,7 +3254,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
     std::fs::write(&host_temp, b"from host temp")?;
     std::fs::rename(&host_temp, &shared)?;
 
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let ready_b = session_b
@@ -3341,7 +3339,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
     std::fs::create_dir_all(&src_dir)?;
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3361,7 +3359,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_host_renamed_nested_w
     std::fs::write(&host_file, b"from moved host tree")?;
     std::fs::rename(&host_pkg, &nested_dir)?;
 
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let ready_b = session_b
@@ -3448,7 +3446,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_file_created_inside_h
     std::fs::create_dir_all(&src_dir)?;
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session_a =
+    let session_a =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3468,7 +3466,7 @@ async fn sandbox_workspace_write_concurrent_sessions_share_file_created_inside_h
     std::fs::rename(&host_pkg, &nested_dir)?;
     std::fs::write(&shared, b"from host file in renamed tree")?;
 
-    let mut session_b =
+    let session_b =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
     let ready_b = session_b
@@ -3549,7 +3547,7 @@ async fn sandbox_workspace_write_direct_midrun_file_keeps_prepared_sid() -> Test
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let (mut session, _workspace, cwd) = spawn_server_with_sandbox_state_in_temp_cwd(state).await?;
+    let (session, _workspace, cwd) = spawn_server_with_sandbox_state_in_temp_cwd(state).await?;
     let expected_stable_sid =
         windows_workspace_write_prepared_sid_for_cwd(&cwd, &[writable_root.path().to_path_buf()])?;
 
@@ -3604,7 +3602,7 @@ async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_nested_wor
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3762,7 +3760,7 @@ async fn sandbox_workspace_write_restart_repairs_stable_acl_for_late_created_nes
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(&repo_root)?;
     let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
-    let mut session =
+    let session =
         spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
             .await?;
 
@@ -3869,7 +3867,7 @@ async fn sandbox_workspace_write_first_launch_accepts_missing_writable_root_pare
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root_parent.path())?;
     std::fs::create_dir_all(&cwd)?;
-    let mut session = spawn_server_with_sandbox_state_in_cwd(
+    let session = spawn_server_with_sandbox_state_in_cwd(
         sandbox_state_workspace_write_with_roots(false, vec![declared_root]),
         &cwd,
     )
@@ -3934,7 +3932,7 @@ async fn sandbox_workspace_write_first_launch_accepts_temp_prefixed_writable_roo
     scrub_unresolved_windows_sid_aces(&writable_root)?;
     let expected_stable_sid =
         windows_workspace_write_prepared_sid_for_cwd(&cwd, std::slice::from_ref(&writable_root))?;
-    let mut session = spawn_server_with_sandbox_state_and_env_in_cwd(
+    let session = spawn_server_with_sandbox_state_and_env_in_cwd(
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
         env,
         &cwd,
@@ -4018,7 +4016,7 @@ async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_fil
     std::fs::create_dir_all(&cwd)?;
     let expected_stable_sid =
         windows_workspace_write_prepared_sid_for_cwd(&cwd, &[writable_root.path().to_path_buf()])?;
-    let mut session = spawn_server_with_sandbox_state_in_cwd(
+    let session = spawn_server_with_sandbox_state_in_cwd(
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]),
         &cwd,
     )

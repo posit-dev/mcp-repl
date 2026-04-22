@@ -66,7 +66,7 @@ async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
         }
     }
 
-    let mut session = common::spawn_server_with_env_vars(env_vars).await?;
+    let session = common::spawn_server_with_env_vars(env_vars).await?;
 
     let input = r#"
 cat("RPROFILE=", getOption("mcp_repl_rprofile_test"), "\n", sep = "")

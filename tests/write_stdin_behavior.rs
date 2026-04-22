@@ -241,7 +241,7 @@ async fn spawn_pager_behavior_session(page_chars: u64) -> TestResult<common::Mcp
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_discards_when_busy() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let _ = session
         .write_stdin_raw_with("Sys.sleep(2)", Some(0.1))
@@ -268,7 +268,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_continuation_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session.write_stdin_raw_with("1+\n1", Some(30.0)).await?;
     let text = result_text(&result);
@@ -298,7 +298,7 @@ async fn write_stdin_trims_continuation_echo_prefix() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_full_noninterleaved_multiexpression_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with("x <- 1\nx + 1", Some(30.0))
@@ -331,7 +331,7 @@ async fn write_stdin_trims_full_noninterleaved_multiexpression_echo_prefix() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_drops_echo_only_multiexpression_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with("x <- 1\ny <- 2", Some(30.0))
@@ -356,7 +356,7 @@ async fn write_stdin_drops_echo_only_multiexpression_reply() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with("cat('A\\n')\n1+1", Some(30.0))
@@ -450,7 +450,7 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_does_not_treat_colon_input_as_pager_command_by_default() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session.write_stdin_raw_with(":q", Some(10.0)).await?;
     let text = result_text(&result);
@@ -473,7 +473,7 @@ async fn write_stdin_does_not_treat_colon_input_as_pager_command_by_default() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -501,7 +501,7 @@ async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with("cat('> Error: boom\\n'); message('boom')", Some(30.0))
@@ -673,7 +673,7 @@ async fn text_only_oversized_reply_uses_output_bundle_dir() -> TestResult<()> {
 async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeout_marker()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('x', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
@@ -728,7 +728,7 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
 async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_threshold()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     // Keep the oversized output comfortably behind the initial 50 ms timeout.
     // The worker timeout path polls in 50 ms slices, so a narrower gap can make
@@ -994,7 +994,7 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.35); cat('tail\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
@@ -1052,7 +1052,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
-    let mut session =
+    let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let input = "big <- paste(rep('z', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
@@ -1099,7 +1099,7 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
-    let mut session =
+    let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let first = session
@@ -1154,7 +1154,7 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
@@ -1277,7 +1277,7 @@ async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = format!(
         "big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
@@ -1342,7 +1342,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
 #[tokio::test(flavor = "multi_thread")]
 async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = format!(
         "big <- paste(rep('i', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.5); cat('TAIL\\n')"
@@ -1414,7 +1414,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let first = session
         .write_stdin_raw_with("Sys.sleep(0.2); 1+1", Some(0.05))
@@ -1491,7 +1491,7 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('n', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.2); cat('tail\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;

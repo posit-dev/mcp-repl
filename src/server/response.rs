@@ -278,9 +278,15 @@ impl ResponseState {
                         "dropping closed timeout bundle after output-bundle error: {cleanup_err}"
                     );
                 }
-                finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
+                finalize_error_batch(vec![Content::text(format!("worker error: {err}"))])
             }
         }
+    }
+
+    /// Returns a local pre-execution error without disturbing any active timeout-bundle state.
+    pub(crate) fn finalize_local_error(&mut self, err: WorkerError) -> CallToolResult {
+        eprintln!("worker write stdin error: {err}");
+        finalize_error_batch(vec![Content::text(format!("worker error: {err}"))])
     }
 
     /// Materializes a worker reply inline without applying files-mode bundle compaction.
@@ -301,7 +307,7 @@ impl ResponseState {
             }
             Err(err) => {
                 eprintln!("worker write stdin error: {err}");
-                finalize_batch(vec![Content::text(format!("worker error: {err}"))], true)
+                finalize_error_batch(vec![Content::text(format!("worker error: {err}"))])
             }
         }
     }
@@ -1829,6 +1835,11 @@ pub(crate) fn finalize_batch(mut contents: Vec<Content>, is_error: bool) -> Call
     ensure_nonempty_contents(&mut contents);
     let _ = is_error;
     CallToolResult::success(contents)
+}
+
+fn finalize_error_batch(mut contents: Vec<Content>) -> CallToolResult {
+    ensure_nonempty_contents(&mut contents);
+    CallToolResult::error(contents)
 }
 
 pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {

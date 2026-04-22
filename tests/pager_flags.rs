@@ -38,7 +38,7 @@ async fn matches_limit_parses_long_flag() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "pager_flags test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(60).await?;
+    let session = common::spawn_server_with_pager_page_chars(60).await?;
 
     let setup = session
         .write_stdin_raw_with(
@@ -75,7 +75,7 @@ async fn hits_count_parses_long_flag() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "pager_flags test mutex poisoned")?;
-    let mut session = common::spawn_server_with_pager_page_chars(60).await?;
+    let session = common::spawn_server_with_pager_page_chars(60).await?;
 
     let setup = session
         .write_stdin_raw_with(

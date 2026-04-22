@@ -15,7 +15,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientNotification, ClientRequest, CustomNotification, CustomRequest,
-    RawContent,
+    Meta, RawContent,
 };
 use rmcp::service::ServiceError;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -740,9 +740,18 @@ impl McpTestSession {
     }
 
     pub async fn call_tool_raw(
-        &mut self,
+        &self,
         tool: impl Into<String>,
         arguments: Value,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.call_tool_raw_with_meta(tool, arguments, None).await
+    }
+
+    pub async fn call_tool_raw_with_meta(
+        &self,
+        tool: impl Into<String>,
+        arguments: Value,
+        meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let tool = tool.into();
         let request_tool = normalize_tool_name_for_request(&tool).to_string();
@@ -756,18 +765,36 @@ impl McpTestSession {
                 )));
             }
         };
-        let request = match arguments {
+        let mut request = match arguments {
             Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
             None => CallToolRequestParams::new(request_tool),
         };
+        if let Some(meta) = meta {
+            let Value::Object(meta_map) = meta else {
+                return Err(ServiceError::McpError(rmcp::ErrorData::invalid_params(
+                    "tool metadata must be a JSON object",
+                    None,
+                )));
+            };
+            request.meta = Some(Meta(meta_map.into_iter().collect()));
+        }
 
         self.service.call_tool(request).await
     }
 
     pub async fn write_stdin_raw_with(
-        &mut self,
+        &self,
         input: impl Into<String>,
         timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_with_meta(input, timeout, None).await
+    }
+
+    pub async fn write_stdin_raw_with_meta(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+        meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
         if !input.is_empty() && !input.ends_with('\n') {
@@ -783,14 +810,24 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_with_meta(self.repl_tool_name(), Value::Object(args), meta)
             .await
     }
 
     pub async fn write_stdin_raw_unterminated_with(
-        &mut self,
+        &self,
         input: impl Into<String>,
         timeout: Option<f64>,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        self.write_stdin_raw_unterminated_with_meta(input, timeout, None)
+            .await
+    }
+
+    pub async fn write_stdin_raw_unterminated_with_meta(
+        &self,
+        input: impl Into<String>,
+        timeout: Option<f64>,
+        meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let input = input.into();
         let timeout = normalized_test_timeout(timeout);
@@ -802,12 +839,12 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
+        self.call_tool_raw_with_meta(self.repl_tool_name(), Value::Object(args), meta)
             .await
     }
 
     pub async fn send_custom_request(
-        &mut self,
+        &self,
         method: impl Into<String>,
         params: Value,
     ) -> Result<(), ServiceError> {
@@ -817,7 +854,7 @@ impl McpTestSession {
     }
 
     pub async fn send_custom_notification(
-        &mut self,
+        &self,
         method: impl Into<String>,
         params: Value,
     ) -> Result<(), ServiceError> {
@@ -919,7 +956,7 @@ impl McpSnapshot {
                 ));
                 out.push('\n');
                 out.push_str("response:\n");
-                let response = normalize_snapshot_response(&step.response);
+                let response = normalize_snapshot_response(&step.response, &step.call);
                 out.push_str(&pretty_json(
                     &serde_json::to_value(&response)
                         .unwrap_or_else(|_| json!({"error":"serialize outcome"})),
@@ -943,7 +980,7 @@ impl McpSnapshot {
                     out.push('\n');
                 }
 
-                let response = normalize_snapshot_response(&step.response);
+                let response = normalize_snapshot_response(&step.response, &step.call);
                 let is_error = snapshot_response_is_error(&response);
                 let (call_desc, input_lines) = format_snapshot_call(&step.call);
 
@@ -968,20 +1005,86 @@ impl McpSnapshot {
     }
 }
 
-fn normalize_snapshot_response(response: &SnapshotResponse) -> SnapshotResponse {
+fn normalize_snapshot_response(
+    response: &SnapshotResponse,
+    call: &SnapshotCall,
+) -> SnapshotResponse {
     match response {
         SnapshotResponse::ToolResult(result) => {
+            let mut content = result
+                .content
+                .iter()
+                .map(normalize_snapshot_content)
+                .collect::<Vec<_>>();
+            maybe_drop_settled_prompt_echo(&mut content, call);
             SnapshotResponse::ToolResult(SnapshotCallToolResult {
                 is_error: result.is_error,
-                content: result
-                    .content
-                    .iter()
-                    .map(normalize_snapshot_content)
-                    .collect(),
+                content,
             })
         }
         SnapshotResponse::ServiceError(err) => SnapshotResponse::ServiceError(err.clone()),
     }
+}
+
+fn maybe_drop_settled_prompt_echo(content: &mut Vec<SnapshotContent>, call: &SnapshotCall) {
+    if !is_repl_tool_name(&call.tool) {
+        return;
+    }
+
+    let Some(Value::Object(args)) = &call.arguments else {
+        return;
+    };
+    let Some(Value::String(input)) = args.get("input") else {
+        return;
+    };
+    let mut input_lines = split_input_lines(input).into_iter();
+    let Some(input_line) = input_lines.next() else {
+        return;
+    };
+    if input_lines.next().is_some() {
+        return;
+    }
+
+    let has_prompt_only = content.iter().any(|item| match item {
+        SnapshotContent::Text { text } => prompt_only_snapshot_text(text),
+        _ => false,
+    });
+    let has_stderr = content.iter().any(|item| match item {
+        SnapshotContent::Text { text } => text.contains("stderr:"),
+        _ => false,
+    });
+    if !(has_prompt_only && has_stderr) {
+        return;
+    }
+
+    content.retain(|item| match item {
+        SnapshotContent::Text { text } => !prompt_echo_matches_input(text, &input_line),
+        _ => true,
+    });
+}
+
+fn prompt_only_snapshot_text(text: &str) -> bool {
+    text.lines().all(|line| {
+        if line.is_empty() {
+            return true;
+        }
+        strip_prompt_prefix(line)
+            .map(|rest| rest.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn prompt_echo_matches_input(text: &str, input_line: &str) -> bool {
+    let mut lines = text.lines();
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    strip_prompt_prefix(line)
+        .map(|rest| rest == input_line)
+        .unwrap_or(false)
 }
 
 fn normalize_snapshot_content(content: &SnapshotContent) -> SnapshotContent {

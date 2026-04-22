@@ -9,7 +9,7 @@ use serde_json::Value;
 async fn debug_events_include_tool_call_arguments_and_results() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let debug_dir = temp.path().join("debug");
-    let mut session = spawn_server_with_env_vars(vec![(
+    let session = spawn_server_with_env_vars(vec![(
         "MCP_REPL_DEBUG_DIR".to_string(),
         debug_dir.to_string_lossy().to_string(),
     )])

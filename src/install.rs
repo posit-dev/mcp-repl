@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
-const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl exits with an error.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.\n# mcp-repl fails closed if the tool call omits or malforms that metadata.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 
@@ -852,7 +852,9 @@ name="demo"
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
-            text.contains("--sandbox inherit: use sandbox policy updates sent by Codex"),
+            text.contains(
+                "--sandbox inherit: use sandbox policy metadata sent by Codex on each tool call"
+            ),
             "expected inherit comment in codex config"
         );
     }
@@ -878,7 +880,9 @@ name="demo"
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
-            !text.contains("--sandbox inherit: use sandbox policy updates sent by Codex"),
+            !text.contains(
+                "--sandbox inherit: use sandbox policy metadata sent by Codex on each tool call"
+            ),
             "inherit-only comment should be removed when inherit is no longer configured"
         );
     }
