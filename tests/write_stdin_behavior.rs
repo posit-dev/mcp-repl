@@ -1051,7 +1051,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
+    let session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.35); cat('tail\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
