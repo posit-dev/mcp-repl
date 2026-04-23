@@ -29,6 +29,7 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/debugging.md",
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
+        "scripts/diff_composition.py",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
     }
@@ -63,6 +64,7 @@ fn plans_layout_exists() {
         "docs/plans/active",
         "docs/plans/completed",
         "docs/plans/tech-debt.md",
+        "scripts/diff_composition.py",
         "scripts/install.sh",
         "scripts/install.ps1",
     ] {
