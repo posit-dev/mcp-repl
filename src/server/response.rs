@@ -61,6 +61,8 @@ struct ActiveOutputBundle {
     current_image_id: Option<String>,
     current_image_history_number: usize,
     history_image_count: usize,
+    first_history_image: Option<ReplyImage>,
+    last_image: Option<ReplyImage>,
     transcript_bytes: usize,
     transcript_lines: usize,
     transcript_has_partial_line: bool,
@@ -1013,6 +1015,8 @@ impl OutputStore {
             current_image_id: None,
             current_image_history_number: 0,
             history_image_count: 0,
+            first_history_image: None,
+            last_image: None,
             transcript_bytes: 0,
             transcript_lines: 0,
             transcript_has_partial_line: false,
@@ -1572,6 +1576,10 @@ impl ActiveOutputBundle {
         self.current_image_id = Some(image.id.clone());
         self.current_image_history_number = history_number;
         self.history_image_count = self.history_image_count.saturating_add(1);
+        if image_number == 1 && history_number == 1 {
+            self.first_history_image = Some(image.clone());
+        }
+        self.last_image = Some(image.clone());
         Ok(Some(ReplyItem::Image(image.clone())))
     }
 
@@ -1671,15 +1679,12 @@ impl ActiveOutputBundle {
         }
     }
 
-    fn image_path(&self, index: usize) -> PathBuf {
-        let stem = format!("{index:03}");
-        for extension in ["png", "jpg", "jpeg", "gif", "webp", "svg"] {
-            let path = self.paths.images_dir.join(format!("{stem}.{extension}"));
-            if path.exists() {
-                return path;
-            }
+    fn inline_preview_images(&self) -> (Option<&ReplyImage>, Option<&ReplyImage>) {
+        match self.next_image_number {
+            0 => (None, None),
+            1 => (self.last_image.as_ref(), None),
+            _ => (self.first_history_image.as_ref(), self.last_image.as_ref()),
         }
-        self.paths.images_dir.join(format!("{stem}.png"))
     }
 
     fn existing_image_alias_path(&self, index: usize) -> Option<PathBuf> {
@@ -2023,14 +2028,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
     let single_image = first_image_idx.is_some() && last_image_idx == first_image_idx;
     let mut out = Vec::new();
-    let (first_anchor, last_anchor) = match bundle.next_image_number {
-        0 => (None, None),
-        1 => (load_output_bundle_image_content(bundle, 1), None),
-        _ => (
-            load_output_bundle_history_image_content(bundle, 1, 1),
-            load_output_bundle_image_content(bundle, bundle.next_image_number),
-        ),
-    };
+    let (first_anchor, last_anchor) = bundle.inline_preview_images();
     let displayed_anchor_count =
         usize::from(first_anchor.is_some()) + usize::from(last_anchor.is_some());
 
@@ -2043,7 +2041,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         out.push(Content::text(head_text.clone()));
     }
     if let Some(image) = first_anchor {
-        out.push(image);
+        out.push(image_to_content(image));
     }
     out.push(Content::text(build_output_bundle_notice(
         bundle,
@@ -2075,7 +2073,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         out.push(Content::text(pre_last_text));
     }
     if let Some(image) = last_anchor {
-        out.push(image);
+        out.push(image_to_content(image));
     }
     let post_last_text = collect_prefix_text_after(items, last_image_idx, POST_LAST_TEXT_BUDGET);
     if !post_last_text.is_empty() {
@@ -2548,59 +2546,6 @@ fn image_extension(mime_type: &str) -> &str {
         "image/svg+xml" => "svg",
         _ => "png",
     }
-}
-
-fn mime_type_from_path(path: &Path) -> String {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" => "image/png".to_string(),
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "gif" => "image/gif".to_string(),
-        "webp" => "image/webp".to_string(),
-        "svg" => "image/svg+xml".to_string(),
-        _ => "image/png".to_string(),
-    }
-}
-
-fn load_output_bundle_image_content(bundle: &ActiveOutputBundle, index: usize) -> Option<Content> {
-    let path = bundle.image_path(index);
-    load_output_bundle_image_content_at_path(&path)
-}
-
-fn load_output_bundle_history_image_content(
-    bundle: &ActiveOutputBundle,
-    image_index: usize,
-    history_index: usize,
-) -> Option<Content> {
-    let stem = format!("images/history/{image_index:03}/{history_index:03}");
-    for extension in ["png", "jpg", "jpeg", "gif", "webp", "svg"] {
-        let path = bundle.paths.dir.join(format!("{stem}.{extension}"));
-        if path.exists() {
-            return load_output_bundle_image_content_at_path(&path);
-        }
-    }
-    load_output_bundle_image_content(bundle, image_index)
-}
-
-fn load_output_bundle_image_content_at_path(path: &Path) -> Option<Content> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!(
-                "skipping unreadable output bundle image {}: {err}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let mime_type = mime_type_from_path(path);
-    let data = STANDARD.encode(bytes);
-    Some(content_image(data, mime_type))
 }
 
 fn build_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {

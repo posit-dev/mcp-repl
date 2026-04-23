@@ -1049,6 +1049,78 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.35); cat('tail\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let spilled_text = result_text(&spilled);
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<repl status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => {
+            panic!("expected transcript path in first oversized poll reply, got: {spilled_text:?}")
+        }
+    };
+
+    fs::remove_file(&transcript_path)?;
+
+    sleep(Duration::from_millis(450)).await;
+    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior final poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let recreated_transcript = fs::read_to_string(&transcript_path)?;
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    if let Some(path) = bundle_transcript_path(&final_text) {
+        assert_eq!(
+            path, transcript_path,
+            "did not expect later polls to switch transcript paths after transcript deletion, got: {final_text:?}"
+        );
+    }
+    assert!(
+        recreated_transcript.contains("tail"),
+        "expected later small poll output to recreate the deleted spill file, got: {recreated_transcript:?}"
+    );
+    assert!(
+        !recreated_transcript.contains("mid080"),
+        "did not expect earlier spilled text to be replayed after transcript deletion, got: {recreated_transcript:?}"
+    );
+    assert!(
+        final_text.contains("tail") || final_text.contains("<<repl status: idle>>"),
+        "expected later small poll to either return inline tail text or settle idle after recreating the spill file, got: {final_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected session to stay alive after transcript deletion, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;

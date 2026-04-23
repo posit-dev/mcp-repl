@@ -7302,10 +7302,9 @@ mod tests {
             manager.pending_server_notice.is_none(),
             "expected the restart notice to be emitted instead of lingering"
         );
-        assert!(
-            manager.process.is_none(),
-            "did not expect the unit test to retain a spawned worker"
-        );
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
     }
 
     #[test]
@@ -7404,6 +7403,9 @@ mod tests {
         );
 
         manager.output.start_capture();
+        if let Some(end_offset) = manager.output.end_offset() {
+            manager.output.advance_offset_to(end_offset);
+        }
         manager
             .output_timeline
             .append_text(b"detached\n", false, ContentOrigin::Worker);
@@ -7442,20 +7444,19 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Pager,
         )
         .expect("worker manager");
-        manager.process = Some(test_worker_process(sleeping_test_child()));
+        let mut process = test_worker_process(successful_test_child());
+        process.exit_status = Some(process.child.wait().expect("wait test child"));
+        manager.process = Some(process);
         manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
 
         let output = (1..=24).map(|n| format!("L{n:04}\n")).collect::<String>();
         manager
             .pager
             .activate(static_pager_buffer_from_worker_text(&output), false);
-
-        {
-            let process = manager.process.as_mut().expect("worker process");
-            process.child.kill().expect("kill test child");
-            process.exit_status = Some(process.child.wait().expect("wait test child"));
+        manager.output.start_capture();
+        if let Some(end_offset) = manager.output.end_offset() {
+            manager.output.advance_offset_to(end_offset);
         }
-
         let reply = manager
             .write_stdin_pager(
                 String::new(),

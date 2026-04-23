@@ -3,7 +3,10 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TestResult, spawn_server_with_files, spawn_server_with_files_env_vars};
+use common::{
+    TestResult, spawn_server_with_files, spawn_server_with_files_env_vars,
+    wait_until_ready_with_input_retry,
+};
 use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
@@ -13,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tempfile::tempdir;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 #[derive(Debug)]
 struct ImageData {
@@ -236,6 +239,26 @@ fn parse_text_event_rows(events: &str) -> Vec<TextEventRow> {
             })
         })
         .collect()
+}
+
+fn parse_image_event_paths(events: &str) -> Vec<PathBuf> {
+    events
+        .lines()
+        .filter_map(|line| line.strip_prefix("I ").map(PathBuf::from))
+        .collect()
+}
+
+fn alias_path_for_history_image(bundle_dir: &Path, history_path: &Path) -> PathBuf {
+    let image_number = history_path
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("expected image number in history path, got: {history_path:?}"));
+    let extension = history_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_else(|| panic!("expected extension in history path, got: {history_path:?}"));
+    bundle_dir.join(format!("images/{image_number}.{extension}"))
 }
 
 fn advance_visible_lines(
@@ -1595,12 +1618,16 @@ Sys.sleep(1)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn timeout_output_bundle_survives_missing_anchor_image() -> TestResult<()> {
+async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappear() -> TestResult<()>
+{
     let temp = tempdir()?;
-    let session = spawn_server_with_files_env_vars(vec![(
-        "TMPDIR".to_string(),
-        temp.path().display().to_string(),
-    )])
+    let mut session = spawn_server_with_files_env_vars(vec![
+        ("TMPDIR".to_string(), temp.path().display().to_string()),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "200000".to_string(),
+        ),
+    ])
     .await?;
 
     let input = r#"
@@ -1610,6 +1637,12 @@ for (i in 1:6) {
 }
 flush.console()
 Sys.sleep(1)
+big <- paste(rep("x", 200), collapse = "")
+for (i in 1:2000) {
+  cat(sprintf("line%04d %s\n", i, big))
+}
+flush.console()
+Sys.sleep(2)
 "#;
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     if any_backend_unavailable(&[&first]) {
@@ -1618,7 +1651,7 @@ Sys.sleep(1)
         return Ok(());
     }
 
-    sleep(Duration::from_millis(600)).await;
+    sleep(Duration::from_millis(400)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
     if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
@@ -1633,19 +1666,52 @@ Sys.sleep(1)
     let bundle_dir = events_log
         .parent()
         .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
-    fs::remove_file(bundle_dir.join("images/001.png"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let image_paths = parse_image_event_paths(&events);
+    let first_image_history = image_paths
+        .first()
+        .map(|path| bundle_dir.join(path))
+        .unwrap_or_else(|| panic!("expected first image entry in events.log, got: {events:?}"));
+    let last_image_history = image_paths
+        .last()
+        .map(|path| bundle_dir.join(path))
+        .unwrap_or_else(|| panic!("expected last image entry in events.log, got: {events:?}"));
+    let first_image_alias = alias_path_for_history_image(bundle_dir, &first_image_history);
+    let last_image_alias = alias_path_for_history_image(bundle_dir, &last_image_history);
+    fs::remove_file(&first_image_history)?;
+    fs::remove_file(&first_image_alias)?;
+    fs::remove_file(&last_image_history)?;
+    fs::remove_file(&last_image_alias)?;
 
-    let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
-    let damaged_text = result_text(&damaged);
-    assert_ne!(
-        damaged.is_error,
-        Some(true),
-        "missing anchor image poll reported an error: {}",
-        damaged_text
-    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (damaged_text, damaged_images) = loop {
+        sleep(Duration::from_millis(100)).await;
+        let damaged = session.write_stdin_raw_with("", Some(0.2)).await?;
+        let damaged_text = result_text(&damaged);
+        let damaged_images = extract_images(&damaged);
+        assert_ne!(
+            damaged.is_error,
+            Some(true),
+            "bundle-file deletion poll reported an error: {}",
+            damaged_text
+        );
+        if damaged_images.len() == 2 {
+            break (damaged_text, damaged_images);
+        }
+        if !damaged_text.contains("<<repl status: busy") || Instant::now() >= deadline {
+            panic!(
+                "expected bundle-file deletion poll to keep inline preview images from memory, got text: {damaged_text:?}, images: {damaged_images:?}"
+            );
+        }
+    };
     assert!(
         damaged_text.contains("events.log"),
-        "expected damaged anchor poll to keep disclosing the output bundle, got: {damaged_text:?}"
+        "expected bundle-file deletion poll to keep disclosing the output bundle, got: {damaged_text:?}"
+    );
+    assert_eq!(
+        damaged_images.len(),
+        2,
+        "expected bundle-file deletion poll to keep inline preview images from memory, got {damaged_images:?}"
     );
 
     let mut settled_text = damaged_text;
@@ -1655,14 +1721,23 @@ Sys.sleep(1)
         settled_text = result_text(&next);
     }
 
-    let follow_up = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let follow_up = session.write_stdin_raw_with("1+1", Some(0.5)).await?;
+    let follow_up = wait_until_ready_with_input_retry(
+        &mut session,
+        "1+1",
+        follow_up,
+        0.5,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+    )
+    .await?;
     let follow_up_text = result_text(&follow_up);
 
     session.cancel().await?;
 
     assert!(
         follow_up_text.contains("[1] 2"),
-        "expected session to stay alive after anchor image deletion, got: {follow_up_text:?}"
+        "expected session to stay alive after bundle-file deletion, got: {follow_up_text:?}"
     );
 
     Ok(())
