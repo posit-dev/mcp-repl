@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tempfile::tempdir;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 #[derive(Debug)]
 struct ImageData {
@@ -1664,16 +1664,27 @@ Sys.sleep(2)
     fs::remove_file(&first_image_alias)?;
     fs::remove_file(&last_image_alias)?;
 
-    sleep(Duration::from_millis(900)).await;
-    let damaged = session.write_stdin_raw_with("", Some(0.05)).await?;
-    let damaged_text = result_text(&damaged);
-    let damaged_images = extract_images(&damaged);
-    assert_ne!(
-        damaged.is_error,
-        Some(true),
-        "bundle-file deletion poll reported an error: {}",
-        damaged_text
-    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (damaged_text, damaged_images) = loop {
+        sleep(Duration::from_millis(100)).await;
+        let damaged = session.write_stdin_raw_with("", Some(0.2)).await?;
+        let damaged_text = result_text(&damaged);
+        let damaged_images = extract_images(&damaged);
+        assert_ne!(
+            damaged.is_error,
+            Some(true),
+            "bundle-file deletion poll reported an error: {}",
+            damaged_text
+        );
+        if damaged_images.len() == 2 {
+            break (damaged_text, damaged_images);
+        }
+        if !damaged_text.contains("<<repl status: busy") || Instant::now() >= deadline {
+            panic!(
+                "expected bundle-file deletion poll to keep inline preview images from memory, got text: {damaged_text:?}, images: {damaged_images:?}"
+            );
+        }
+    };
     assert!(
         damaged_text.contains("events.log"),
         "expected bundle-file deletion poll to keep disclosing the output bundle, got: {damaged_text:?}"

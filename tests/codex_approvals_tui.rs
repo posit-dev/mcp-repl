@@ -1615,6 +1615,9 @@ tryCatch({
                     let original = std::mem::take(map);
                     for (key, mut child) in original {
                         let normalized_key = normalize_wire_string(&key, workspace, codex_home);
+                        if normalized_key == "threadId" {
+                            continue;
+                        }
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
