@@ -3,7 +3,10 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TestResult, spawn_server_with_files, spawn_server_with_files_env_vars};
+use common::{
+    TestResult, spawn_server_with_files, spawn_server_with_files_env_vars,
+    wait_until_ready_with_input_retry,
+};
 use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
@@ -1618,7 +1621,7 @@ Sys.sleep(1)
 async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappear() -> TestResult<()>
 {
     let temp = tempdir()?;
-    let session = spawn_server_with_files_env_vars(vec![
+    let mut session = spawn_server_with_files_env_vars(vec![
         ("TMPDIR".to_string(), temp.path().display().to_string()),
         (
             "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
@@ -1718,7 +1721,16 @@ Sys.sleep(2)
         settled_text = result_text(&next);
     }
 
-    let follow_up = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let follow_up = session.write_stdin_raw_with("1+1", Some(0.5)).await?;
+    let follow_up = wait_until_ready_with_input_retry(
+        &mut session,
+        "1+1",
+        follow_up,
+        0.5,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+    )
+    .await?;
     let follow_up_text = result_text(&follow_up);
 
     session.cancel().await?;
