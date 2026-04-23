@@ -6045,13 +6045,14 @@ mod tests {
     use super::*;
     use crate::output_capture::{
         OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSpan,
+        ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
     #[cfg(target_os = "linux")]
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -6061,6 +6062,12 @@ mod tests {
     fn env_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
+        crate::output_capture::output_ring_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
@@ -7062,6 +7069,11 @@ mod tests {
 
     #[test]
     fn pager_respawned_pending_request_trims_echo_without_echo_events() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -7372,6 +7384,11 @@ mod tests {
 
     #[test]
     fn pager_empty_input_polls_pending_output_before_pager_commands() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
@@ -7386,6 +7403,9 @@ mod tests {
         );
 
         manager.output.start_capture();
+        if let Some(end_offset) = manager.output.end_offset() {
+            manager.output.advance_offset_to(end_offset);
+        }
         manager
             .output_timeline
             .append_text(b"detached\n", false, ContentOrigin::Worker);
@@ -7413,6 +7433,11 @@ mod tests {
 
     #[test]
     fn pager_empty_input_advances_page_after_worker_exit() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
@@ -7508,6 +7533,11 @@ mod tests {
 
     #[test]
     fn pager_empty_input_preserves_idle_guardrail_notice() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),

@@ -245,6 +245,19 @@ fn parse_image_event_paths(events: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn alias_path_for_history_image(bundle_dir: &Path, history_path: &Path) -> PathBuf {
+    let image_number = history_path
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("expected image number in history path, got: {history_path:?}"));
+    let extension = history_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_else(|| panic!("expected extension in history path, got: {history_path:?}"));
+    bundle_dir.join(format!("images/{image_number}.{extension}"))
+}
+
 fn advance_visible_lines(
     text: &str,
     visible_lines: usize,
@@ -1605,10 +1618,13 @@ Sys.sleep(1)
 async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappear() -> TestResult<()>
 {
     let temp = tempdir()?;
-    let session = spawn_server_with_files_env_vars(vec![(
-        "TMPDIR".to_string(),
-        temp.path().display().to_string(),
-    )])
+    let session = spawn_server_with_files_env_vars(vec![
+        ("TMPDIR".to_string(), temp.path().display().to_string()),
+        (
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "200000".to_string(),
+        ),
+    ])
     .await?;
 
     let input = r#"
@@ -1618,8 +1634,9 @@ for (i in 1:6) {
 }
 flush.console()
 Sys.sleep(1)
-for (i in 7:8) {
-  plot(1:10, main = sprintf("plot%03d", i))
+big <- paste(rep("x", 200), collapse = "")
+for (i in 1:2000) {
+  cat(sprintf("line%04d %s\n", i, big))
 }
 flush.console()
 Sys.sleep(2)
@@ -1652,16 +1669,15 @@ Sys.sleep(2)
         .first()
         .map(|path| bundle_dir.join(path))
         .unwrap_or_else(|| panic!("expected first image entry in events.log, got: {events:?}"));
-    let first_image_extension = first_image_history
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_else(|| {
-            panic!("expected extension for first image path, got: {first_image_history:?}")
-        });
-    let first_image_alias = bundle_dir.join(format!("images/001.{first_image_extension}"));
-    let last_image_alias = bundle_dir.join(format!("images/006.{first_image_extension}"));
+    let last_image_history = image_paths
+        .last()
+        .map(|path| bundle_dir.join(path))
+        .unwrap_or_else(|| panic!("expected last image entry in events.log, got: {events:?}"));
+    let first_image_alias = alias_path_for_history_image(bundle_dir, &first_image_history);
+    let last_image_alias = alias_path_for_history_image(bundle_dir, &last_image_history);
     fs::remove_file(&first_image_history)?;
     fs::remove_file(&first_image_alias)?;
+    fs::remove_file(&last_image_history)?;
     fs::remove_file(&last_image_alias)?;
 
     let deadline = Instant::now() + Duration::from_secs(8);
