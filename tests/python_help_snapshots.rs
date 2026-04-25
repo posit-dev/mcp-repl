@@ -50,6 +50,10 @@ fn normalize_python_help_intro(text: String) -> String {
     let mut skipping_transcript_intro = false;
 
     for line in text.lines() {
+        if line == "<<<" && out.last().is_some_and(|previous| previous == "<<< help()") {
+            continue;
+        }
+
         if line.contains(r#""text": "help()\n"#)
             && line.contains("Welcome to Python <VERSION>'s help utility!")
         {
