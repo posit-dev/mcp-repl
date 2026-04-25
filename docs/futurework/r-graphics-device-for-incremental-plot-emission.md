@@ -2,8 +2,17 @@
 
 ## Summary
 
-The current R plot-capture path is good enough for many cases, but it cannot
-reliably surface a plot as soon as it becomes visible on an interactive device.
+A custom R graphics device was investigated as a way to emit plot updates closer
+to draw time. It is not currently recommended.
+
+The known plot-before-later-stdout ordering bug was a server-side timeline
+problem, not a graphics-device problem. That bug is now handled by timeline
+reconstruction, and a custom device would not remove the need for that ordering
+logic.
+
+The current R plot-capture path still has one real limitation: it cannot reliably
+surface a plot as soon as it becomes visible on an interactive device inside a
+single grouped top-level expression.
 
 The most obvious failure shape is a grouped top-level expression such as:
 
@@ -15,8 +24,8 @@ In an interactive R session, the plot is already visible before the later
 `cat("done\n")`. In `mcp-repl`, the current hook-based capture path can delay
 the plot image until later than that.
 
-This future work item covers a more direct graphics-capture design that can
-emit plots incrementally, without waiting for top-level task completion.
+This note is retained as a decision record for why that limitation is not enough
+to justify a custom graphics device today.
 
 ## Current Design
 
@@ -32,7 +41,7 @@ Today, `mcp-repl` captures R plots by:
 That path is intentionally lightweight and avoids implementing a full graphics
 device in Rust or C.
 
-## Why This Is Insufficient
+## Remaining Limitation
 
 The current hook set is too coarse for some timing-sensitive cases.
 
@@ -47,13 +56,38 @@ So for a grouped expression, the current design has no precise “plot is now on
 screen” signal. That means server-side timeline fixes can only help after the
 image exists; they cannot make an image arrive earlier than the worker emits it.
 
-## Candidate Approaches
+That limitation is separate from ordinary plot/stdout ordering across separate
+input lines. The server timeline can already place an emitted `plot_image`
+before later stdout when the sideband facts contain that ordering.
+
+## Investigation Outcome
+
+Do not implement a custom graphics device now.
+
+The reasons are:
+
+- The main observed ordering failure was fixed in server-side timeline
+  reconstruction.
+- A custom device would not by itself solve cross-stream ordering; the server
+  would still need to merge stdout/stderr pipes with sideband image events.
+- The remaining grouped-expression limitation is narrower than the original
+  ordering problem.
+- A device implementation would add a large native graphics surface: page
+  lifecycle, clipping, text, rasters, sizing, platform behavior, and replay
+  compatibility.
+- Lower-level graphics-engine hooks without a device do not appear to expose a
+  clean "current page changed" signal for the existing architecture.
+
+Keep the hook/replay path unless there is a concrete product requirement for
+mid-expression plot visibility.
+
+## Investigated Approaches
 
 ### 1. Real MCP graphics device
 
 Implement a real R graphics device for `mcp-repl`.
 
-Why this is attractive:
+Why this looked attractive:
 
 - drawing callbacks run as graphics operations happen,
 - the device can know immediately when a page becomes dirty,
@@ -68,6 +102,8 @@ Tradeoffs:
 - device correctness work for page lifecycle, clipping, text, rasters, and
   sizing,
 - likely more cross-platform complexity.
+
+Current decision: not recommended.
 
 ### 2. Custom offscreen capture device
 
@@ -86,6 +122,9 @@ Tradeoffs:
 - still needs careful handling of page boundaries and device state,
 - may end up close in complexity to a full custom device anyway.
 
+Current decision: not recommended. The narrower version still carries most of
+the hard device-lifecycle work.
+
 ### 3. Deeper graphics-engine integration without a device
 
 Investigate whether a lower-level hook into the R graphics engine could observe
@@ -101,24 +140,17 @@ Current read on this option:
 
 This option should be treated as a long shot, not the default plan.
 
-## Recommendation
+## Revisit Criteria
 
-If `mcp-repl` needs grouped expressions to surface plots before later stdout
-text, the serious path is a custom graphics device.
+Revisit this only if there is a concrete public requirement for plots to appear
+while a single grouped R expression is still running.
 
-If the goal is the smallest architectural leap from today’s code:
+Before changing the graphics device, require:
 
-- prefer a custom offscreen capture device first,
-- keep the emitted artifact as PNG,
-- dedupe on content hash as today,
-- leave server-side ordering logic unchanged except for consuming earlier image
-  arrivals.
-
-If the goal is the cleanest long-term architecture:
-
-- implement a real `mcp-repl` graphics device explicitly,
-- stop depending on `recordPlot()` / `replayPlot()` for timing-sensitive plot
-  emission.
+- a public API regression test that demonstrates the user-visible gap,
+- a prototype showing materially earlier image emission for that case,
+- evidence that the improvement is worth the native-device complexity,
+- no regression to current base and grid plot capture.
 
 ## Relationship To Other Work
 
@@ -132,7 +164,7 @@ specifically about the plot-capture mechanism.
 
 ## Non-Goals
 
-- Fixing plot/stdout ordering only in the server timeline.
+- Reopening the fixed plot/stdout ordering bug.
 - Expanding the existing `recordPlot()` hook set indefinitely.
 - Redesigning Python plotting.
 - Redefining request completion as part of the same work item.
