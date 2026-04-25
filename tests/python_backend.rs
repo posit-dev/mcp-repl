@@ -729,7 +729,9 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
         return Ok(());
     }
 
-    let session = common::spawn_python_server_with_files().await?;
+    let session =
+        common::spawn_python_server_with_files_env_vars(common::python_plain_help_env_vars())
+            .await?;
 
     let help_result = session
         .write_stdin_raw_with("help(len)", Some(10.0))

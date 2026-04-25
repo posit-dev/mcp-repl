@@ -915,7 +915,11 @@ impl McpSnapshot {
         Ok(())
     }
 
-    pub async fn python_files_session<F>(&mut self, name: impl Into<String>, f: F) -> TestResult<()>
+    pub async fn python_help_files_session<F>(
+        &mut self,
+        name: impl Into<String>,
+        f: F,
+    ) -> TestResult<()>
     where
         F: for<'a> FnOnce(
             &'a mut McpTestSession,
@@ -923,7 +927,8 @@ impl McpSnapshot {
             -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
     {
         let name = name.into();
-        let mut session = spawn_python_server_with_files().await?;
+        let mut session =
+            spawn_python_server_with_files_env_vars(python_plain_help_env_vars()).await?;
         f(&mut session).await?;
         let steps = session.steps.clone();
         session.cancel().await?;
@@ -1409,15 +1414,32 @@ pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSess
 }
 
 pub async fn spawn_python_server_with_files() -> TestResult<McpTestSession> {
-    spawn_server_with_args(vec![
-        "--interpreter".to_string(),
-        "python".to_string(),
-        "--oversized-output".to_string(),
-        "files".to_string(),
-        "--sandbox".to_string(),
-        "danger-full-access".to_string(),
-    ])
+    spawn_python_server_with_files_env_vars(Vec::new()).await
+}
+
+pub async fn spawn_python_server_with_files_env_vars(
+    env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        env_vars,
+    )
     .await
+}
+
+pub fn python_plain_help_env_vars() -> Vec<(String, String)> {
+    vec![
+        ("PAGER".to_string(), String::new()),
+        ("MANPAGER".to_string(), String::new()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ]
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {

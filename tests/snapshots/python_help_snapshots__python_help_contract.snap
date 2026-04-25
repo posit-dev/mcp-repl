@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "help(len)\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+      "text": "help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     },
     {
       "type": "text",
@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+      "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     },
     {
       "type": "text",
@@ -91,7 +91,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "len\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+      "text": "len\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     },
     {
       "type": "text",

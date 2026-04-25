@@ -19,9 +19,11 @@ fn normalize_python_help_banner(text: String) -> String {
     let docs_url_re =
         Regex::new(r"https://docs\.python\.org/\d+\.\d+/tutorial/").expect("python docs url regex");
     let text = version_re.replace_all(&text, "Welcome to Python <VERSION>'s help utility!");
-    docs_url_re
+    let text = docs_url_re
         .replace_all(&text, "https://docs.python.org/<VERSION>/tutorial/")
-        .to_string()
+        .to_string();
+    text.replace(r"l\ble\ben\bn", "len")
+        .replace("l\u{0008}le\u{0008}en\u{0008}n", "len")
 }
 
 #[cfg(not(windows))]
@@ -50,7 +52,7 @@ async fn python_help_contract_snapshot() -> TestResult<()> {
 
     let mut snapshot = McpSnapshot::new();
     snapshot
-        .python_files_session(
+        .python_help_files_session(
             "files",
             mcp_script! {
                 write_stdin("help(len)", timeout = 5.0);

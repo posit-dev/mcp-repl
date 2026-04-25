@@ -8,7 +8,7 @@ expression: transcript
 <<< help(len)
 <<< Help on built-in function len in module builtins:
 <<< 
-<<< lleenn(obj, /)
+<<< len(obj, /)
 <<<     Return the number of items in a container.
 
 2) py_repl timeout_ms=5000
@@ -16,7 +16,7 @@ expression: transcript
 <<< import pydoc; pydoc.help(len)
 <<< Help on built-in function len in module builtins:
 <<< 
-<<< lleenn(obj, /)
+<<< len(obj, /)
 <<<     Return the number of items in a container.
 
 3) py_repl timeout_ms=1000
@@ -44,7 +44,7 @@ expression: transcript
 <<< len
 <<< Help on built-in function len in module builtins:
 <<< 
-<<< lleenn(obj, /)
+<<< len(obj, /)
 <<<     Return the number of items in a container.
 <<< help> 
 
