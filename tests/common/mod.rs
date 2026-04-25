@@ -927,8 +927,7 @@ impl McpSnapshot {
             -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
     {
         let name = name.into();
-        let mut session =
-            spawn_python_server_with_files_env_vars(python_plain_help_env_vars()).await?;
+        let mut session = spawn_python_server_with_interactive_pager_files().await?;
         f(&mut session).await?;
         let steps = session.steps.clone();
         session.cancel().await?;
@@ -1417,6 +1416,10 @@ pub async fn spawn_python_server_with_files() -> TestResult<McpTestSession> {
     spawn_python_server_with_files_env_vars(Vec::new()).await
 }
 
+pub async fn spawn_python_server_with_interactive_pager_files() -> TestResult<McpTestSession> {
+    spawn_python_server_with_files_env_vars(python_interactive_pager_env_vars()).await
+}
+
 pub async fn spawn_python_server_with_files_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
@@ -1434,11 +1437,11 @@ pub async fn spawn_python_server_with_files_env_vars(
     .await
 }
 
-pub fn python_plain_help_env_vars() -> Vec<(String, String)> {
+pub fn python_interactive_pager_env_vars() -> Vec<(String, String)> {
     vec![
-        ("PAGER".to_string(), String::new()),
-        ("MANPAGER".to_string(), String::new()),
-        ("TERM".to_string(), "dumb".to_string()),
+        ("PAGER".to_string(), "less".to_string()),
+        ("MANPAGER".to_string(), "less".to_string()),
+        ("TERM".to_string(), "xterm".to_string()),
     ]
 }
 

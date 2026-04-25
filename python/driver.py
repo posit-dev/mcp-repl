@@ -5,11 +5,13 @@ import importlib.util
 import io
 import json
 import os
+import pydoc
 import readline
 import signal
 import select
 import sys
 import threading
+import time
 
 os.environ.setdefault("MPLBACKEND", "agg")
 
@@ -271,6 +273,17 @@ def _stdin_has_data():
         return False
 
 
+def _wait_for_request_active(timeout_seconds=0.05):
+    if _has_request_active():
+        return True
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _has_request_active():
+            return True
+        time.sleep(0.001)
+    return _has_request_active()
+
+
 def _run_with_sigint_blocked(fn):
     pthread_sigmask = getattr(signal, "pthread_sigmask", None)
     if pthread_sigmask is None:
@@ -350,13 +363,7 @@ def _discard_pending_request_input():
             _interrupt_pending = False
 
 
-def _emit_prompt(prompt=None, emit_request_end=True):
-    _discard_pending_request_input()
-    if prompt is None:
-        prompt = _last_prompt or _primary_prompt or getattr(sys, "ps1", ">>> ")
-    _send({"type": "readline_start", "prompt": str(prompt)})
-    if not emit_request_end:
-        return
+def _emit_request_end_if_idle():
     if not _has_request_active():
         return
     if _stdin_has_data():
@@ -372,6 +379,20 @@ def _emit_prompt(prompt=None, emit_request_end=True):
     except Exception:
         pass
     _send({"type": "request_end"})
+
+
+def _emit_prompt(prompt=None, emit_request_end=True):
+    _discard_pending_request_input()
+    if prompt is None:
+        prompt = _last_prompt or _primary_prompt or getattr(sys, "ps1", ">>> ")
+    _send({"type": "readline_start", "prompt": str(prompt)})
+    if emit_request_end:
+        _emit_request_end_if_idle()
+
+
+def _pydoc_plainpager(text, title=""):
+    pydoc.plainpager(text, title)
+    _wait_for_request_active()
 
 
 def _pre_input_hook():
@@ -435,4 +456,5 @@ _emit_backend_info()
 threading.Thread(target=_ipc_reader, daemon=True).start()
 _ensure_prompts()
 _wrap_input()
+pydoc.pager = _pydoc_plainpager
 readline.set_pre_input_hook(_pre_input_hook)
