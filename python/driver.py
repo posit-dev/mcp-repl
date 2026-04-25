@@ -391,7 +391,7 @@ def _emit_prompt(prompt=None, emit_request_end=True):
 
 
 def _pydoc_plainpager(text, title=""):
-    pydoc.plainpager(text, title)
+    pydoc.plainpager(text)
     _wait_for_request_active()
 
 
