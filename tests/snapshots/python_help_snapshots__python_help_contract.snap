@@ -20,10 +20,6 @@ response:
     {
       "type": "text",
       "text": "help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }
@@ -44,10 +40,6 @@ response:
     {
       "type": "text",
       "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }
@@ -67,7 +59,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "help()\nWelcome to Python <VERSION>'s help utility! If this is your first time using\nPython, you should definitely check out the tutorial at\nhttps://docs.python.org/<VERSION>/tutorial/.\n\nEnter the name of any module, keyword, or topic to get help on writing\nPython programs and using Python modules.  To get a list of available\nmodules, keywords, symbols, or topics, enter \"modules\", \"keywords\",\n\"symbols\", or \"topics\".\n\nEach module also comes with a one-line summary of what it does; to list\nthe modules whose name or summary contain a given string such as \"spam\",\nenter \"modules spam\".\n\nTo quit this help utility and return to the interpreter,\nenter \"q\", \"quit\" or \"exit\"."
+      "text": "help()\n<PYTHON HELP BANNER>"
     },
     {
       "type": "text",
@@ -116,10 +108,6 @@ response:
     {
       "type": "text",
       "text": "q\n\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }
@@ -140,10 +128,6 @@ response:
     {
       "type": "text",
       "text": "1+1\n2"
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }

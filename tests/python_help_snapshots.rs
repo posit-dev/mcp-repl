@@ -18,16 +18,63 @@ fn normalize_python_help_banner(text: String) -> String {
         Regex::new(r"Welcome to Python \d+\.\d+'s help utility!").expect("python version regex");
     let docs_url_re =
         Regex::new(r"https://docs\.python\.org/\d+\.\d+/tutorial/").expect("python docs url regex");
+    let rendered_prompt_entry_re = Regex::new(
+        r#"(?m)^    \{\n      "type": "text",\n      "text": "(>>> |\.\.\. )"\n    \},\n"#,
+    )
+    .expect("rendered leading prompt entry regex");
+    let rendered_trailing_prompt_entry_re = Regex::new(
+        r#"(?m),\n    \{\n      "type": "text",\n      "text": "(>>> |\.\.\. )"\n    \}"#,
+    )
+    .expect("rendered trailing prompt entry regex");
     let text = version_re.replace_all(&text, "Welcome to Python <VERSION>'s help utility!");
     let text = docs_url_re
         .replace_all(&text, "https://docs.python.org/<VERSION>/tutorial/")
         .to_string();
+    let text = rendered_prompt_entry_re.replace_all(&text, "").to_string();
+    let text = rendered_trailing_prompt_entry_re
+        .replace_all(&text, "")
+        .to_string();
+    let text = normalize_python_help_intro(text);
     text.replace(r"l\ble\ben\bn", "len")
         .replace("l\u{0008}le\u{0008}en\u{0008}n", "len")
         .lines()
         .map(str::trim_end)
+        .filter(|line| !matches!(*line, "<<< >>>" | "<<< ..."))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(not(windows))]
+fn normalize_python_help_intro(text: String) -> String {
+    let mut out = Vec::new();
+    let mut skipping_transcript_intro = false;
+
+    for line in text.lines() {
+        if line.contains(r#""text": "help()\n"#)
+            && line.contains("Welcome to Python <VERSION>'s help utility!")
+        {
+            out.push(r#"      "text": "help()\n<PYTHON HELP BANNER>""#.to_string());
+            continue;
+        }
+
+        if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
+            out.push("<<< <PYTHON HELP BANNER>".to_string());
+            skipping_transcript_intro = true;
+            continue;
+        }
+
+        if skipping_transcript_intro {
+            if line.trim_end() == "<<< help>" {
+                skipping_transcript_intro = false;
+                out.push("<<< help>".to_string());
+            }
+            continue;
+        }
+
+        out.push(line.to_string());
+    }
+
+    out.join("\n")
 }
 
 #[cfg(not(windows))]
