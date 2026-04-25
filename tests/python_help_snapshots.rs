@@ -24,6 +24,10 @@ fn normalize_python_help_banner(text: String) -> String {
         .to_string();
     text.replace(r"l\ble\ben\bn", "len")
         .replace("l\u{0008}le\u{0008}en\u{0008}n", "len")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(not(windows))]
