@@ -7564,7 +7564,7 @@ mod tests {
                 Duration::from_millis(0),
                 Duration::from_millis(0),
                 WriteStdinOptions {
-                    page_bytes_override: Some(256),
+                    page_bytes_override: Some(OUTPUT_RING_CAPACITY_BYTES as u64),
                     echo_input: true,
                     ..WriteStdinOptions::default()
                 },

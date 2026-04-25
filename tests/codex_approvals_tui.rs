@@ -704,6 +704,7 @@ mod unix_impl {
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "output_tokens", "\"<N>\"");
+        text = remove_json_number_field(&text, "reasoning_output_tokens");
         text = normalize_ms_duration(&text);
         if text.starts_with("OpenAI Codex v") {
             text = "OpenAI Codex vN.NN.N (research preview)".to_string();
@@ -861,6 +862,39 @@ mod unix_impl {
             } else {
                 idx = start + marker.len();
             }
+        }
+
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    fn remove_json_number_field(text: &str, key: &str) -> String {
+        let marker = format!("\"{key}\":");
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+
+        while let Some(pos) = text[idx..].find(&marker) {
+            let start = idx + pos;
+            let value_start = start + marker.len();
+            let mut value_end = value_start;
+            while value_end < text.len() && text.as_bytes()[value_end].is_ascii_digit() {
+                value_end += 1;
+            }
+            if value_end == value_start {
+                out.push_str(&text[idx..value_start]);
+                idx = value_start;
+                continue;
+            }
+
+            let mut remove_start = start;
+            let mut remove_end = value_end;
+            if remove_start > 0 && text.as_bytes()[remove_start - 1] == b',' {
+                remove_start -= 1;
+            } else if remove_end < text.len() && text.as_bytes()[remove_end] == b',' {
+                remove_end += 1;
+            }
+            out.push_str(&text[idx..remove_start]);
+            idx = remove_end;
         }
 
         out.push_str(&text[idx..]);
@@ -1616,6 +1650,9 @@ tryCatch({
                     for (key, mut child) in original {
                         let normalized_key = normalize_wire_string(&key, workspace, codex_home);
                         if normalized_key == "threadId" {
+                            continue;
+                        }
+                        if normalized_key == "permissionProfile" {
                             continue;
                         }
                         path.push(normalized_key.clone());
