@@ -34,14 +34,37 @@ fn normalize_python_help_banner(text: String) -> String {
     let text = rendered_trailing_prompt_entry_re
         .replace_all(&text, "")
         .to_string();
+    let text = text
+        .replace(r#""text": ">>> "#, r#""text": ""#)
+        .replace(r#""text": "... "#, r#""text": ""#);
     let text = normalize_python_help_intro(text);
     text.replace(r"l\ble\ben\bn", "len")
         .replace("l\u{0008}le\u{0008}en\u{0008}n", "len")
         .lines()
         .map(str::trim_end)
         .filter(|line| !matches!(*line, "<<< >>>" | "<<< ..."))
+        .filter(|line| !is_transcript_echo_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(not(windows))]
+fn is_transcript_echo_line(line: &str) -> bool {
+    matches!(
+        line,
+        "<<< help(len)"
+            | "<<< >>> help(len)"
+            | "<<< import pydoc; pydoc.help(len)"
+            | "<<< >>> import pydoc; pydoc.help(len)"
+            | "<<< help()"
+            | "<<< >>> help()"
+            | "<<< len"
+            | "<<< >>> len"
+            | "<<< q"
+            | "<<< >>> q"
+            | "<<< 1+1"
+            | "<<< >>> 1+1"
+    )
 }
 
 #[cfg(not(windows))]

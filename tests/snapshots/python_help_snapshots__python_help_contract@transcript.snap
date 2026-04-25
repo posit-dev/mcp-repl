@@ -5,7 +5,6 @@ expression: transcript
 == session: files ==
 1) py_repl timeout_ms=5000
 >>> help(len)
-<<< help(len)
 <<< Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
@@ -13,7 +12,6 @@ expression: transcript
 
 2) py_repl timeout_ms=5000
 >>> import pydoc; pydoc.help(len)
-<<< import pydoc; pydoc.help(len)
 <<< Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
@@ -21,13 +19,11 @@ expression: transcript
 
 3) py_repl timeout_ms=1000
 >>> help()
-<<< help()
 <<< <PYTHON HELP BANNER>
 <<< help>
 
 4) py_repl timeout_ms=1000
 >>> len
-<<< len
 <<< Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
@@ -36,7 +32,6 @@ expression: transcript
 
 5) py_repl timeout_ms=1000
 >>> q
-<<< q
 <<<
 <<< You are now leaving help and returning to the Python interpreter.
 <<< If you want to ask for help on a particular object directly from the
@@ -45,5 +40,4 @@ expression: transcript
 
 6) py_repl timeout_ms=5000
 >>> 1+1
-<<< 1+1
 <<< 2
