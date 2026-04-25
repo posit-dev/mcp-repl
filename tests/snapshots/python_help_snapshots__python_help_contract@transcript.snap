@@ -22,9 +22,9 @@ expression: transcript
 3) py_repl timeout_ms=1000
 >>> help()
 <<< help()
-<<< Welcome to Python 3.13's help utility! If this is your first time using
+<<< Welcome to Python <VERSION>'s help utility! If this is your first time using
 <<< Python, you should definitely check out the tutorial at
-<<< https://docs.python.org/3.13/tutorial/.
+<<< https://docs.python.org/<VERSION>/tutorial/.
 <<< 
 <<< Enter the name of any module, keyword, or topic to get help on writing
 <<< Python programs and using Python modules.  To get a list of available

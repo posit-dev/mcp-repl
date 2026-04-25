@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "help()\nWelcome to Python 3.13's help utility! If this is your first time using\nPython, you should definitely check out the tutorial at\nhttps://docs.python.org/3.13/tutorial/.\n\nEnter the name of any module, keyword, or topic to get help on writing\nPython programs and using Python modules.  To get a list of available\nmodules, keywords, symbols, or topics, enter \"modules\", \"keywords\",\n\"symbols\", or \"topics\".\n\nEach module also comes with a one-line summary of what it does; to list\nthe modules whose name or summary contain a given string such as \"spam\",\nenter \"modules spam\".\n\nTo quit this help utility and return to the interpreter,\nenter \"q\", \"quit\" or \"exit\"."
+      "text": "help()\nWelcome to Python <VERSION>'s help utility! If this is your first time using\nPython, you should definitely check out the tutorial at\nhttps://docs.python.org/<VERSION>/tutorial/.\n\nEnter the name of any module, keyword, or topic to get help on writing\nPython programs and using Python modules.  To get a list of available\nmodules, keywords, symbols, or topics, enter \"modules\", \"keywords\",\n\"symbols\", or \"topics\".\n\nEach module also comes with a one-line summary of what it does; to list\nthe modules whose name or summary contain a given string such as \"spam\",\nenter \"modules spam\".\n\nTo quit this help utility and return to the interpreter,\nenter \"q\", \"quit\" or \"exit\"."
     },
     {
       "type": "text",
