@@ -915,6 +915,22 @@ impl McpSnapshot {
         Ok(())
     }
 
+    pub async fn python_files_session<F>(&mut self, name: impl Into<String>, f: F) -> TestResult<()>
+    where
+        F: for<'a> FnOnce(
+            &'a mut McpTestSession,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = TestResult<()>> + Send + 'a>>,
+    {
+        let name = name.into();
+        let mut session = spawn_python_server_with_files().await?;
+        f(&mut session).await?;
+        let steps = session.steps.clone();
+        session.cancel().await?;
+        self.sessions.push((name, steps));
+        Ok(())
+    }
+
     pub async fn pager_session<F>(
         &mut self,
         name: impl Into<String>,

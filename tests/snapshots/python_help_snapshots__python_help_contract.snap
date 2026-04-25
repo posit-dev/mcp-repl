@@ -1,0 +1,149 @@
+---
+source: tests/python_help_snapshots.rs
+expression: rendered
+---
+== session: files ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "help(len)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "help(len)\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+    },
+    {
+      "type": "text",
+      "text": ">>> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "import pydoc; pydoc.help(len)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+    },
+    {
+      "type": "text",
+      "text": ">>> "
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "help()\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "help()\nWelcome to Python 3.13's help utility! If this is your first time using\nPython, you should definitely check out the tutorial at\nhttps://docs.python.org/3.13/tutorial/.\n\nEnter the name of any module, keyword, or topic to get help on writing\nPython programs and using Python modules.  To get a list of available\nmodules, keywords, symbols, or topics, enter \"modules\", \"keywords\",\n\"symbols\", or \"topics\".\n\nEach module also comes with a one-line summary of what it does; to list\nthe modules whose name or summary contain a given string such as \"spam\",\nenter \"modules spam\".\n\nTo quit this help utility and return to the interpreter,\nenter \"q\", \"quit\" or \"exit\"."
+    },
+    {
+      "type": "text",
+      "text": "help> "
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "len\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "len\nHelp on built-in function len in module builtins:\n\nl\ble\ben\bn(obj, /)\n    Return the number of items in a container."
+    },
+    {
+      "type": "text",
+      "text": "help> "
+    }
+  ]
+}
+-- step 5 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "q\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "q\n\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
+    },
+    {
+      "type": "text",
+      "text": ">>> "
+    }
+  ]
+}
+-- step 6 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "1+1\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "1+1\n2"
+    },
+    {
+      "type": "text",
+      "text": ">>> "
+    }
+  ]
+}

@@ -4,19 +4,19 @@
 
 - Keep the documented Python `repl` help contract in-band for `help(obj)`, `help("topic")`, `help()`, and `pydoc.help(...)`.
 - The tool descriptions already document that contract.
-- The remaining work is direct public regression coverage for native Python help flows; only patch startup if those tests fail.
+- Direct public regression coverage now exists for native Python help flows, and the current runtime behavior passes without a startup patch.
 
 ## Status
 
-- State: active
-- Last updated: 2026-04-16
-- Current phase: verification
+- State: completed
+- Last updated: 2026-04-17
+- Current phase: closed
 
 ## Current Direction
 
 - Treat the current docs as the product contract: Python help should stay in-band and should not hand control to an external pager.
-- Add direct public coverage for `help(len)`, `pydoc.help(len)`, and interactive `help()` roundtrips against the native Python backend.
-- Keep runtime startup unchanged unless those tests reproduce a pager prompt or wedged session.
+- Keep direct public coverage for `help(len)`, `pydoc.help(len)`, and interactive `help()` roundtrips against the native Python backend.
+- Keep runtime startup unchanged unless a future regression reproduces a pager prompt or wedged session.
 
 ## Long-Term Direction
 
@@ -34,17 +34,16 @@
 - Do not treat missing `matplotlib` as fatal to tests, but do updated tests to bootstrap a python environment with the dependencies we need using uv.
 - Do not treat reticulate coverage, optional package availability, or ordinary multiline Python semantics as part of this bug.
 
-## Open Questions
+## Outcome
 
-- Does the native Python backend still reproduce any external-pager or stuck-session behavior for direct `help()` / `pydoc.help()` flows?
-- If those direct tests pass without changes, should this plan close immediately with no runtime patch?
+- The native Python backend does not reproduce an external-pager or stuck-session failure for direct `help()` / `pydoc.help()` flows under the public test harness.
+- The plan closes without a runtime patch because the new regression tests pass against the current startup behavior.
 
-## Next Safe Slice
+## Completed Slice
 
-- Add a direct regression test for `help(len)` that asserts output stays inline, does not show `Press RETURN` or `--More--`, and does not leave the session busy.
-- Add a second regression test for `pydoc.help(len)` with the same expectations.
-- Add an interactive `help()` roundtrip test that requests `len`, exits help, and proves the session returns to `>>>`.
-- Only if those tests fail, patch `python/driver.py` with the minimal stdlib override and keep the docs unchanged.
+- Added direct regression coverage for `help(len)`, `pydoc.help(len)`, and an interactive `help()` roundtrip that asserts output stays inline, does not show `Press RETURN` or `--More--`, and does not leave the session busy.
+- Added files-mode snapshots for the same public Python help flow.
+- Left `python/driver.py` unchanged because the contract holds without a runtime patch.
 
 ## Stop Conditions
 
@@ -59,3 +58,4 @@
 - 2026-03-23: Deferred worker terminal-type warnings to separate tech debt so they do not block the help contract.
 - 2026-04-06: Reframed the slice as verification-first follow-up work because this branch keeps the in-band help contract in docs but does not land a dedicated Python-help runtime patch.
 - 2026-04-16: Curated the plan after adjacent Windows and reticulate fixes landed elsewhere; the remaining gap is direct native Python help coverage.
+- 2026-04-17: Landed direct public regression coverage for `help(len)`, `pydoc.help(len)`, and interactive `help()` roundtrips. The tests passed without a runtime change, so the plan moved to completed.
