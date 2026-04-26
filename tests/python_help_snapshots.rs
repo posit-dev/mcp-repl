@@ -71,9 +71,22 @@ fn is_transcript_echo_line(line: &str) -> bool {
 fn normalize_python_help_intro(text: String) -> String {
     let mut out = Vec::new();
     let mut skipping_transcript_intro = false;
+    let mut pending_blank_transcript_line = false;
 
     for line in text.lines() {
-        if line == "<<<" && out.last().is_some_and(|previous| previous == "<<< help()") {
+        if pending_blank_transcript_line {
+            if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
+                out.push("<<< <PYTHON HELP BANNER>".to_string());
+                pending_blank_transcript_line = false;
+                skipping_transcript_intro = true;
+                continue;
+            }
+            out.push("<<<".to_string());
+            pending_blank_transcript_line = false;
+        }
+
+        if line == "<<<" {
+            pending_blank_transcript_line = true;
             continue;
         }
 
@@ -99,6 +112,10 @@ fn normalize_python_help_intro(text: String) -> String {
         }
 
         out.push(line.to_string());
+    }
+
+    if pending_blank_transcript_line {
+        out.push("<<<".to_string());
     }
 
     out.join("\n")
