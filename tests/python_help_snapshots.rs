@@ -74,6 +74,7 @@ fn normalize_python_help_intro(text: String) -> String {
     let mut pending_blank_transcript_line = false;
 
     for line in text.lines() {
+        let trimmed_line = line.trim_end();
         if pending_blank_transcript_line {
             if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
                 out.push("<<< <PYTHON HELP BANNER>".to_string());
@@ -85,7 +86,15 @@ fn normalize_python_help_intro(text: String) -> String {
             pending_blank_transcript_line = false;
         }
 
-        if line == "<<<" {
+        if skipping_transcript_intro {
+            if trimmed_line == "<<< help>" {
+                skipping_transcript_intro = false;
+                out.push("<<< help>".to_string());
+            }
+            continue;
+        }
+
+        if trimmed_line == "<<<" {
             pending_blank_transcript_line = true;
             continue;
         }
@@ -103,14 +112,6 @@ fn normalize_python_help_intro(text: String) -> String {
             continue;
         }
 
-        if skipping_transcript_intro {
-            if line.trim_end() == "<<< help>" {
-                skipping_transcript_intro = false;
-                out.push("<<< help>".to_string());
-            }
-            continue;
-        }
-
         out.push(line.to_string());
     }
 
@@ -119,6 +120,19 @@ fn normalize_python_help_intro(text: String) -> String {
     }
 
     out.join("\n")
+}
+
+#[cfg(not(windows))]
+#[test]
+fn normalizes_help_banner_after_whitespace_only_transcript_line() {
+    let transcript = normalize_python_help_banner(
+        ">>> help()\n<<< \n<<< Welcome to Python 3.12's help utility!\n<<< help>".to_string(),
+    );
+
+    assert_eq!(
+        transcript,
+        ">>> help()\n<<< <PYTHON HELP BANNER>\n<<< help>"
+    );
 }
 
 #[cfg(not(windows))]
