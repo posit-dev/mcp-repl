@@ -179,7 +179,7 @@ impl HostPolicy {
     }
 
     fn allows_socket_addr(&self, addr: SocketAddr) -> bool {
-        self.allow_local_binding || !is_non_public_ip(addr.ip())
+        !is_non_public_ip(addr.ip()) || (self.allow_local_binding && is_loopback_ip(addr.ip()))
     }
 }
 
@@ -345,6 +345,15 @@ fn is_non_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_non_public_ipv4(ip),
         IpAddr::V6(ip) => is_non_public_ipv6(ip),
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ipv4_mapped_from_ipv6(ip).is_some_and(|mapped| mapped.is_loopback()) || ip.is_loopback()
+        }
     }
 }
 
@@ -729,8 +738,11 @@ mod tests {
         .expect("policy");
 
         let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
+        let private = SocketAddr::from(([10, 0, 0, 1], 443));
         assert!(!blocked.allows_socket_addr(loopback));
         assert!(allowed.allows_socket_addr(loopback));
+        assert!(!blocked.allows_socket_addr(private));
+        assert!(!allowed.allows_socket_addr(private));
     }
 
     #[test]
@@ -771,6 +783,18 @@ mod tests {
         assert!(!is_non_public_ipv6(
             "::ffff:8.8.8.8".parse::<Ipv6Addr>().expect("IPv6 address")
         ));
+    }
+
+    #[test]
+    fn loopback_classifier_unwraps_ipv4_mapped_addresses() {
+        assert!(is_loopback_ip(IpAddr::V6(
+            "::ffff:127.0.0.1"
+                .parse::<Ipv6Addr>()
+                .expect("IPv6 address")
+        )));
+        assert!(!is_loopback_ip(IpAddr::V6(
+            "::ffff:10.0.0.1".parse::<Ipv6Addr>().expect("IPv6 address")
+        )));
     }
 
     #[test]
