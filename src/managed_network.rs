@@ -423,6 +423,7 @@ fn listener_loop(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
                 let policy = Arc::clone(&policy);
                 thread::spawn(move || handler(stream, policy));
             }
