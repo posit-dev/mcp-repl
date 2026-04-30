@@ -1,0 +1,133 @@
+---
+source: tests/python_help_snapshots.rs
+expression: rendered
+---
+== session: files ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "help(len)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "import pydoc; pydoc.help(len)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "help()\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "help()\n<PYTHON HELP BANNER>"
+    },
+    {
+      "type": "text",
+      "text": "help> "
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "len\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "len\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+    },
+    {
+      "type": "text",
+      "text": "help> "
+    }
+  ]
+}
+-- step 5 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "q\n",
+    "timeout_ms": 1000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "q\n\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
+    }
+  ]
+}
+-- step 6 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "1+1\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "1+1\n2"
+    }
+  ]
+}

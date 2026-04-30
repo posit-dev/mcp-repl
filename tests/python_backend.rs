@@ -64,11 +64,28 @@ fn require_python() -> bool {
     }
 }
 
+fn python_backend_unavailable(text: &str) -> bool {
+    common::backend_unavailable(text)
+        || text.contains("python backend requires a unix-style pty")
+        || text.contains("worker io error: Permission denied")
+}
+
 fn is_busy_response(text: &str) -> bool {
     text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
+}
+
+fn assert_no_pager_markers(text: &str, context: &str) {
+    assert!(
+        !text.contains("Press RETURN"),
+        "{context} should stay inline without pager prompts, got: {text:?}"
+    );
+    assert!(
+        !text.contains("--More--"),
+        "{context} should stay inline without pager prompts, got: {text:?}"
+    );
 }
 
 fn interrupt_recovery_deadline() -> Instant {
@@ -703,6 +720,130 @@ async fn python_input_roundtrip() -> TestResult<()> {
     assert!(text.contains("hello"), "expected echo, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_help_flows_stay_inline() -> TestResult<()> {
+    if !require_python() {
+        return Ok(());
+    }
+
+    let session = common::spawn_python_server_with_interactive_pager_files().await?;
+
+    let help_result = session
+        .write_stdin_raw_with("help(len)", Some(10.0))
+        .await?;
+    let help_text = result_text(&help_result);
+    if python_backend_unavailable(&help_text) {
+        eprintln!("python help backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&help_text) {
+        session.cancel().await?;
+        return Err(format!("help(len) should complete inline, got: {help_text:?}").into());
+    }
+    let help_visible = visible_reply_text(&help_text)?;
+
+    assert!(
+        help_visible.contains("Help on built-in function len"),
+        "expected inline help(len) output, got: {help_visible:?}"
+    );
+    assert!(
+        help_visible.contains("Return the number of items in a container."),
+        "expected len() help text, got: {help_visible:?}"
+    );
+    assert_no_pager_markers(&help_visible, "help(len)");
+
+    let pydoc_result = session
+        .write_stdin_raw_with("import pydoc; pydoc.help(len)", Some(10.0))
+        .await?;
+    let pydoc_text = result_text(&pydoc_result);
+    if is_busy_response(&pydoc_text) {
+        session.cancel().await?;
+        return Err(format!("pydoc.help(len) should complete inline, got: {pydoc_text:?}").into());
+    }
+    let pydoc_visible = visible_reply_text(&pydoc_text)?;
+
+    assert!(
+        pydoc_visible.contains("Help on built-in function len"),
+        "expected inline pydoc.help(len) output, got: {pydoc_visible:?}"
+    );
+    assert!(
+        pydoc_visible.contains("Return the number of items in a container."),
+        "expected len() help text, got: {pydoc_visible:?}"
+    );
+    assert_no_pager_markers(&pydoc_visible, "pydoc.help(len)");
+
+    let mut enter_text = result_text(&session.write_stdin_raw_with("help()", Some(5.0)).await?);
+    if is_busy_response(&enter_text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&enter_text)
+            && !enter_text.contains("help>")
+        {
+            sleep(Duration::from_millis(50)).await;
+            enter_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&enter_text) {
+        session.cancel().await?;
+        return Err(format!("help() did not surface an interactive prompt: {enter_text:?}").into());
+    }
+    let enter_visible = visible_reply_text(&enter_text)?;
+
+    let mut exit_text = result_text(&session.write_stdin_raw_with("len\nq", Some(5.0)).await?);
+    if is_busy_response(&exit_text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&exit_text)
+            && !exit_text.contains(">>>")
+        {
+            sleep(Duration::from_millis(50)).await;
+            exit_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&exit_text) {
+        session.cancel().await?;
+        return Err(format!(
+            "interactive help() did not return to the Python prompt: {exit_text:?}"
+        )
+        .into());
+    }
+    let exit_visible = visible_reply_text(&exit_text)?;
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        session.cancel().await?;
+        return Err(format!("interactive help() left the session busy: {follow_up_text:?}").into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        enter_visible.contains("help>"),
+        "expected help() prompt to stay inline, got: {enter_visible:?}"
+    );
+    assert_no_pager_markers(&enter_visible, "help()");
+    assert!(
+        exit_visible.contains("Help on built-in function len"),
+        "expected interactive help() to show len help text, got: {exit_visible:?}"
+    );
+    assert!(
+        exit_visible.contains("Return the number of items in a container."),
+        "expected len() help text in interactive help(), got: {exit_visible:?}"
+    );
+    assert_no_pager_markers(&exit_visible, "help() roundtrip");
+    assert!(
+        exit_visible.contains(">>>"),
+        "expected interactive help() to return to the Python prompt, got: {exit_visible:?}"
+    );
+    assert!(
+        follow_up_text.contains("2"),
+        "expected a ready prompt after interactive help(), got: {follow_up_text:?}"
+    );
     Ok(())
 }
 

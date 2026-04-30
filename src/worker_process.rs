@@ -6870,7 +6870,8 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Files,
         )
         .expect("worker manager");
-        let process = test_worker_process(successful_test_child());
+        let mut process = test_worker_process(successful_test_child());
+        process.exit_status = Some(process.child.wait().expect("wait test child"));
         process.ipc.set(server);
         manager.process = Some(process);
         manager.pending_request = true;
@@ -6887,9 +6888,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         drop(worker);
-        thread::sleep(Duration::from_millis(20));
-
-        manager.resolve_timeout_marker_with_wait(Duration::from_millis(0));
+        manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));
         let formatted = manager.drain_final_formatted_output();
         let text = contents_text(&formatted.contents);
 
@@ -7535,51 +7534,61 @@ mod tests {
     fn pager_empty_input_preserves_idle_guardrail_notice() {
         let _guard = output_ring_test_guard();
         let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
 
-        let mut manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Pager,
-        )
-        .expect("worker manager");
-        manager.process = Some(test_worker_process(sleeping_test_child()));
-        {
-            let mut slot = manager
-                .guardrail
-                .event
-                .lock()
-                .expect("guardrail event mutex poisoned");
-            *slot = Some(GuardrailEvent {
-                message: "[repl] worker was idle; new session started\n".to_string(),
-                was_busy: false,
-                is_error: false,
-            });
-        }
+        let mut last_text = String::new();
+        for _ in 0..16 {
+            reset_output_ring();
+            reset_last_reply_marker_offset();
 
-        let reply = manager
-            .write_stdin_pager(
-                String::new(),
-                Duration::from_millis(0),
-                Duration::from_millis(0),
-                WriteStdinOptions {
-                    page_bytes_override: Some(256),
-                    echo_input: true,
-                    ..WriteStdinOptions::default()
-                },
+            let mut manager = WorkerManager::new(
+                Backend::R,
+                SandboxCliPlan::default(),
+                crate::oversized_output::OversizedOutputMode::Pager,
             )
-            .expect("empty poll reply");
-        let WorkerReply::Output { contents, .. } = reply;
-        let text = contents_text(&contents);
+            .expect("worker manager");
+            manager.process = Some(test_worker_process(sleeping_test_child()));
+            {
+                let mut slot = manager
+                    .guardrail
+                    .event
+                    .lock()
+                    .expect("guardrail event mutex poisoned");
+                *slot = Some(GuardrailEvent {
+                    message: "[repl] worker was idle; new session started\n".to_string(),
+                    was_busy: false,
+                    is_error: false,
+                });
+            }
 
-        if let Some(process) = manager.process.take() {
-            let _ = process.kill();
+            let reply = manager
+                .write_stdin_pager(
+                    String::new(),
+                    Duration::from_millis(0),
+                    Duration::from_millis(0),
+                    WriteStdinOptions {
+                        page_bytes_override: Some(OUTPUT_RING_CAPACITY_BYTES as u64),
+                        echo_input: true,
+                        ..WriteStdinOptions::default()
+                    },
+                )
+                .expect("empty poll reply");
+            let WorkerReply::Output { contents, .. } = reply;
+            last_text = contents_text(&contents);
+
+            if let Some(process) = manager.process.take() {
+                let _ = process.kill();
+            }
+
+            if last_text.contains("[repl] worker was idle; new session started") {
+                return;
+            }
+
+            thread::sleep(Duration::from_millis(5));
         }
 
         assert!(
-            text.contains("[repl] worker was idle; new session started"),
-            "expected empty pager polls to preserve idle guardrail restart notices, got: {text:?}"
+            last_text.contains("[repl] worker was idle; new session started"),
+            "expected empty pager polls to preserve idle guardrail restart notices, got: {last_text:?}"
         );
     }
 

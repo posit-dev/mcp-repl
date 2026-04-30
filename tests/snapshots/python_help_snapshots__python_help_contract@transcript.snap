@@ -1,0 +1,43 @@
+---
+source: tests/python_help_snapshots.rs
+expression: transcript
+---
+== session: files ==
+1) py_repl timeout_ms=5000
+>>> help(len)
+<<< Help on built-in function len in module builtins:
+<<<
+<<< len(obj, /)
+<<<     Return the number of items in a container.
+
+2) py_repl timeout_ms=5000
+>>> import pydoc; pydoc.help(len)
+<<< Help on built-in function len in module builtins:
+<<<
+<<< len(obj, /)
+<<<     Return the number of items in a container.
+
+3) py_repl timeout_ms=1000
+>>> help()
+<<< <PYTHON HELP BANNER>
+<<< help>
+
+4) py_repl timeout_ms=1000
+>>> len
+<<< Help on built-in function len in module builtins:
+<<<
+<<< len(obj, /)
+<<<     Return the number of items in a container.
+<<< help>
+
+5) py_repl timeout_ms=1000
+>>> q
+<<<
+<<< You are now leaving help and returning to the Python interpreter.
+<<< If you want to ask for help on a particular object directly from the
+<<< interpreter, you can type "help(object)".  Executing "help('string')"
+<<< has the same effect as typing a particular string at the help> prompt.
+
+6) py_repl timeout_ms=5000
+>>> 1+1
+<<< 2
