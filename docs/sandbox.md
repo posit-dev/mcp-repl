@@ -10,13 +10,13 @@ When no CLI sandbox mode is provided, the default is:
 - `workspace-write`
 - `network_access: false`
 
-When `--sandbox inherit` is used for MCP server operation, the client must
+When `--sandbox inherit` is used for MCP server operation, the MCP client must
 attach per-tool-call sandbox metadata in `_meta["codex/sandbox-state-meta"]`.
 That metadata is the source of truth for the tool call that is about to run. If
 it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
 requested but no client sandbox state was provided`.
 
-`--debug-repl` is the one local-only exception. Because there is no client
+`--debug-repl` is the one local-only exception. Because there is no MCP client
 metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
 bootstraps one local inherited snapshot from the current default sandbox state
 before the first worker spawn.
@@ -74,7 +74,7 @@ The worker also gets a per-session temp directory, exported as:
 - Add allowed domains (repeatable):
   `mcp-repl --add-allowed-domain <pattern>`
 - Advanced overrides:
-  `mcp-repl --config key=value` with Codex-shaped keys
+  `mcp-repl --config key=value` with documented sandbox/config keys
 - MCP sandbox metadata capability:
   `codex/sandbox-state-meta` (advertised only when the effective CLI sandbox mode still resolves to `inherit` after later overrides)
 
@@ -89,7 +89,7 @@ For `workspace-write`, writable roots include:
 
 - configured `writable_roots` (absolute paths only),
 - current working directory,
-- R cache roots configured in client policy,
+- R cache roots configured in MCP client policy,
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
 
@@ -107,8 +107,35 @@ Proxy-aware network behavior when `network_access: true`:
 - proxy env vars are inspected (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase variants),
 - loopback proxy endpoints are allowlisted for outbound traffic,
 - proxy configured but no usable loopback endpoint => fail closed (no network),
-- `MCP_REPL_MANAGED_NETWORK=1` enforces proxy-only mode,
+- when allowed or denied domains are configured, the server starts a managed
+  HTTP/SOCKS proxy on loopback, injects proxy env vars into the worker, and
+  permits Seatbelt egress only to that proxy,
+- `MCP_REPL_MANAGED_NETWORK=1` enforces proxy-only mode for an externally
+  configured loopback proxy,
+- domain rules support exact hosts, `*.example.com` subdomains, and
+  `**.example.com` for the apex plus subdomains,
+- exact URLs such as `https://pypi.org/simple/` are rejected; HTTPS proxying
+  can enforce the `CONNECT` host but not URL paths,
 - `ALLOW_LOCAL_BINDING=1` additionally allows localhost bind/inbound operations.
+
+Example PyPI allowlist:
+
+```sh
+mcp-repl --sandbox workspace-write \
+  --config sandbox_workspace_write.network_access=true \
+  --add-allowed-domain pypi.org \
+  --add-allowed-domain files.pythonhosted.org
+```
+
+Example CRAN allowlist:
+
+```sh
+mcp-repl --sandbox workspace-write \
+  --config sandbox_workspace_write.network_access=true \
+  --add-allowed-domain cran.r-project.org \
+  --add-allowed-domain cloud.r-project.org \
+  --add-allowed-domain '**.r-project.org'
+```
 
 ## Linux behavior
 
@@ -117,8 +144,10 @@ Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock
 - `workspace-write` always includes the per-session temp directory in writable roots.
 - `read-only` is translated to a minimal writable setup for the session temp directory only.
 - default Linux worker setup disables network unless explicitly enabled.
-- `mcp-repl` always uses its own internal Linux sandbox launcher; client-provided
-  helper executable paths are ignored.
+- managed domain allowlists are not enforced on Linux yet; configuring allowed
+  or denied domains with enabled network access currently fails closed.
+- `mcp-repl` always uses its own internal Linux sandbox launcher; helper
+  executable paths provided by an MCP client are ignored.
 - Codex sandbox metadata does not control `mcp-repl`'s optional internal
   `bwrap` stage. That remains a local best-effort setting.
 
@@ -133,6 +162,8 @@ Optional `bwrap` stage:
 
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
 - Python backend is currently unavailable on Windows (it requires a Unix PTY).
+- managed domain allowlists are not enforced on Windows yet; configuring allowed
+  or denied domains with enabled network access currently fails closed.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
   - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.

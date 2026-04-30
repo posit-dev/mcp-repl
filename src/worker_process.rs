@@ -39,7 +39,8 @@ use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
 use crate::sandbox::{
-    R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
+    R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate,
+    prepare_worker_command_with_managed_network,
 };
 use crate::sandbox_cli::{
     MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
@@ -619,6 +620,7 @@ pub struct WorkerManager {
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
+    managed_network_proxy: Option<crate::managed_network::ManagedNetworkProxy>,
     #[cfg(target_os = "windows")]
     windows_sandbox_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
     oversized_output: OversizedOutputMode,
@@ -699,6 +701,7 @@ impl WorkerManager {
             inherited_sandbox_state: None,
             sandbox_defaults,
             sandbox_state,
+            managed_network_proxy: None,
             #[cfg(target_os = "windows")]
             windows_sandbox_launch: None,
             oversized_output,
@@ -740,6 +743,60 @@ impl WorkerManager {
             return Ok(());
         }
         self.ensure_process()
+    }
+
+    fn ensure_managed_network_proxy(&mut self) -> Result<(), WorkerError> {
+        let Some(config) = Self::managed_network_proxy_config_for_state(&self.sandbox_state)?
+        else {
+            self.managed_network_proxy = None;
+            return Ok(());
+        };
+
+        if self
+            .managed_network_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.config() == &config)
+        {
+            return Ok(());
+        }
+
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(config)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        crate::event_log::log(
+            "worker_managed_network_proxy_started",
+            serde_json::json!({
+                "http_addr": proxy.http_addr().to_string(),
+                "socks_addr": proxy.socks_addr().to_string(),
+            }),
+        );
+        self.managed_network_proxy = Some(proxy);
+        Ok(())
+    }
+
+    fn managed_network_proxy_config_for_state(
+        state: &SandboxState,
+    ) -> Result<Option<crate::managed_network::ManagedProxyConfig>, WorkerError> {
+        if !state.managed_network_policy.has_domain_restrictions() {
+            return Ok(None);
+        }
+        if !state.sandbox_policy.has_full_network_access() {
+            return Ok(None);
+        }
+        if !state.sandbox_policy.requires_sandbox() {
+            return Err(WorkerError::Sandbox(
+                "managed network domain restrictions require built-in sandbox enforcement"
+                    .to_string(),
+            ));
+        }
+        if !cfg!(target_os = "macos") {
+            return Err(WorkerError::Sandbox(
+                "managed network domain restrictions are currently supported only on macOS"
+                    .to_string(),
+            ));
+        }
+        crate::managed_network::ManagedProxyConfig::from_policy(&state.managed_network_policy)
+            .map(Some)
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))
     }
 
     pub fn bootstrap_local_inherited_sandbox_state(&mut self) -> Result<bool, WorkerError> {
@@ -3374,6 +3431,7 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
@@ -3385,6 +3443,7 @@ impl WorkerManager {
                 pending_output_tape: self.pending_output_tape.clone(),
                 output_timeline: self.output_timeline.clone(),
                 guardrail: self.guardrail.clone(),
+                managed_network_proxy: self.managed_network_proxy.as_ref(),
                 #[cfg(target_os = "windows")]
                 prepared_windows_launch,
             },
@@ -3450,6 +3509,7 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
+        self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
@@ -3461,6 +3521,7 @@ impl WorkerManager {
                 pending_output_tape: self.pending_output_tape.clone(),
                 output_timeline: self.output_timeline.clone(),
                 guardrail: self.guardrail.clone(),
+                managed_network_proxy: self.managed_network_proxy.as_ref(),
                 #[cfg(target_os = "windows")]
                 prepared_windows_launch,
             },
@@ -4723,11 +4784,12 @@ struct SpawnedWorker {
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
 
-struct WorkerSpawnContext {
+struct WorkerSpawnContext<'a> {
     oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
     output_timeline: OutputTimeline,
     guardrail: GuardrailShared,
+    managed_network_proxy: Option<&'a crate::managed_network::ManagedNetworkProxy>,
     #[cfg(target_os = "windows")]
     prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
@@ -4852,13 +4914,14 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        context: WorkerSpawnContext,
+        context: WorkerSpawnContext<'_>,
     ) -> Result<Self, WorkerError> {
         let WorkerSpawnContext {
             oversized_output,
             pending_output_tape,
             output_timeline,
             guardrail,
+            managed_network_proxy,
             #[cfg(target_os = "windows")]
             prepared_windows_launch,
         } = context;
@@ -4884,14 +4947,18 @@ impl WorkerProcess {
             Backend::R => Self::spawn_r_worker(
                 exe_path,
                 sandbox_state,
+                managed_network_proxy,
                 live_output.clone(),
                 &mut ipc_server,
                 #[cfg(target_os = "windows")]
                 prepared_windows_launch.as_ref(),
             )?,
-            Backend::Python => {
-                Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
-            }
+            Backend::Python => Self::spawn_python_worker(
+                sandbox_state,
+                managed_network_proxy,
+                live_output.clone(),
+                &mut ipc_server,
+            )?,
         };
         #[allow(unused_mut)]
         let mut child = child;
@@ -4973,15 +5040,20 @@ impl WorkerProcess {
     fn spawn_r_worker(
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
         live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
         #[cfg(target_os = "windows")] prepared_windows_launch: Option<
             &crate::windows_sandbox::PreparedSandboxLaunch,
         >,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let prepared =
-            prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
-                .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        let prepared = prepare_worker_command_with_managed_network(
+            exe_path,
+            vec![WORKER_MODE_ARG.to_string()],
+            sandbox_state,
+            managed_network_proxy,
+        )
+        .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         #[cfg(target_os = "windows")]
         let mut prepared = prepared;
         #[cfg(target_os = "windows")]
@@ -5091,12 +5163,14 @@ impl WorkerProcess {
 
     fn spawn_python_worker(
         sandbox_state: &SandboxState,
+        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
         live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = sandbox_state;
+            let _ = managed_network_proxy;
             let _ = live_output;
             let _ = ipc_server;
             Err(WorkerError::Protocol(
@@ -5106,9 +5180,13 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         {
             let python_program = Self::resolve_python_program();
-            let prepared =
-                prepare_worker_command(&python_program, Self::python_command_args(), sandbox_state)
-                    .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+            let prepared = prepare_worker_command_with_managed_network(
+                &python_program,
+                Self::python_command_args(),
+                sandbox_state,
+                managed_network_proxy,
+            )
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
             let session_tmpdir = prepared
                 .env
                 .get(R_SESSION_TMPDIR_ENV)

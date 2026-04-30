@@ -596,10 +596,20 @@ fn prepend_env_path(env: &mut HashMap<String, String>, key: &str, prefix: &Path)
     env.insert(key.to_string(), value);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn prepare_worker_command(
     program: &Path,
     args: Vec<String>,
     state: &SandboxState,
+) -> Result<PreparedCommand, SandboxError> {
+    prepare_worker_command_with_managed_network(program, args, state, None)
+}
+
+pub fn prepare_worker_command_with_managed_network(
+    program: &Path,
+    args: Vec<String>,
+    state: &SandboxState,
+    managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
 ) -> Result<PreparedCommand, SandboxError> {
     let mut env = HashMap::new();
     if !state.sandbox_policy.has_full_network_access() {
@@ -632,6 +642,9 @@ pub fn prepare_worker_command(
             "0".to_string()
         },
     );
+    if let Some(proxy) = managed_network_proxy {
+        proxy.apply_to_env(&mut env);
+    }
 
     ensure_session_temp_dir(&state.session_temp_dir)?;
     {
@@ -675,6 +688,12 @@ pub fn prepare_worker_command(
 
         let mut network_env = sandbox_network_env_snapshot();
         for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
             ALLOW_LOCAL_BINDING_ENV_KEY,
             MANAGED_NETWORK_ENV_KEY,
             MANAGED_ALLOWED_DOMAINS_ENV_KEY,
@@ -2513,6 +2532,64 @@ mod tests {
         let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.contains("localhost:8080"));
         assert!(!rendered.contains("(allow network-inbound)\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+        )
+        .expect("managed proxy");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(
+            prepared.env.get("HTTP_PROXY").map(String::as_str),
+            Some(format!("http://{}", proxy.http_addr()).as_str())
+        );
+        assert_eq!(
+            prepared.env.get("ALL_PROXY").map(String::as_str),
+            Some(format!("socks5h://{}", proxy.socks_addr()).as_str())
+        );
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+        assert!(
+            policy.contains(&format!("localhost:{}", proxy.http_addr().port())),
+            "{policy}"
+        );
+        assert!(
+            policy.contains(&format!("localhost:{}", proxy.socks_addr().port())),
+            "{policy}"
+        );
+        assert!(
+            !policy.contains("(allow network-outbound)\n(allow network-inbound)\n"),
+            "{policy}"
+        );
     }
 
     #[cfg(target_os = "linux")]
