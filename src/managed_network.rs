@@ -478,6 +478,9 @@ fn handle_http_client_impl(client: &mut TcpStream, policy: Arc<HostPolicy>) -> i
     if !policy.allows(&absolute.host) {
         return write_http_error(client, 403, "Connection blocked by network allowlist");
     }
+    if !host_headers_match_target(&header[first_line_end + 2..], &absolute.host, absolute.port) {
+        return write_http_error(client, 403, "Host header does not match proxy target");
+    }
 
     let Some(mut upstream) = connect_upstream(&absolute.host, absolute.port, policy.as_ref())?
     else {
@@ -567,6 +570,45 @@ fn connect_upstream(host: &str, port: u16, policy: &HostPolicy) -> io::Result<Op
         Some(err) => Err(err),
         None => Ok(None),
     }
+}
+
+fn host_headers_match_target(header_tail: &[u8], target_host: &str, target_port: u16) -> bool {
+    for line in header_tail.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if !line[..colon].eq_ignore_ascii_case(b"host") {
+            continue;
+        }
+        let value = trim_ascii_bytes(&line[colon + 1..]);
+        let Ok(authority) = std::str::from_utf8(value) else {
+            return false;
+        };
+        let Some((host, port)) = parse_host_port(authority, target_port) else {
+            return false;
+        };
+        if normalize_host(&host) != normalize_host(target_host) || port != target_port {
+            return false;
+        }
+    }
+    true
+}
+
+fn trim_ascii_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
 fn write_http_error(stream: &mut TcpStream, status: u16, message: &str) -> io::Result<()> {
@@ -901,5 +943,32 @@ mod tests {
             response.contains("blocked by network allowlist"),
             "{response}"
         );
+    }
+
+    #[test]
+    fn managed_http_proxy_rejects_host_header_mismatch() {
+        let proxy = ManagedNetworkProxy::start(ManagedProxyConfig {
+            allowed_domains: vec!["127.0.0.1".to_string()],
+            denied_domains: Vec::new(),
+            allow_local_binding: true,
+        })
+        .expect("proxy");
+
+        let mut client = TcpStream::connect(proxy.http_addr()).expect("connect proxy");
+        client
+            .write_all(
+                b"GET http://127.0.0.1:9/packages HTTP/1.1\r\nHost: not-allowed.invalid\r\nConnection: close\r\n\r\n",
+            )
+            .expect("proxy request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finish request body");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("proxy response");
+
+        assert!(response.contains("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(response.contains("Host header"), "{response}");
     }
 }
