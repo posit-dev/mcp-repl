@@ -487,9 +487,19 @@ fn handle_http_client_impl(client: &mut TcpStream, policy: Arc<HostPolicy>) -> i
     else {
         return write_http_error(client, 403, "Connection blocked by network allowlist");
     };
-    upstream.write_all(format!("{method} {} {version}\r\n", absolute.path).as_bytes())?;
-    upstream.write_all(&header[first_line_end + 2..])?;
-    proxy_bidirectional(client.try_clone()?, upstream)?;
+    let header_tail = &header[first_line_end + 2..];
+    if header_has_name(header_tail, b"transfer-encoding") {
+        return write_http_error(
+            client,
+            400,
+            "chunked HTTP proxy request bodies are not supported",
+        );
+    }
+    let content_length = content_length_from_headers(header_tail)?;
+    write_one_request_http_header(&mut upstream, method, &absolute.path, version, header_tail)?;
+    copy_exact_bytes(client, &mut upstream, content_length)?;
+    let _ = upstream.shutdown(Shutdown::Write);
+    relay_plain_http_response(client, upstream)?;
     Ok(())
 }
 
@@ -597,6 +607,108 @@ fn host_headers_match_target(header_tail: &[u8], target_host: &str, target_port:
         }
     }
     true
+}
+
+fn write_one_request_http_header(
+    upstream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    version: &str,
+    header_tail: &[u8],
+) -> io::Result<()> {
+    upstream.write_all(format!("{method} {path} {version}\r\n").as_bytes())?;
+    let mut wrote_connection_close = false;
+    for line in header_tail.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if header_line_has_name(line, b"proxy-connection") {
+            continue;
+        }
+        if header_line_has_name(line, b"connection") {
+            if !wrote_connection_close {
+                upstream.write_all(b"Connection: close\r\n")?;
+                wrote_connection_close = true;
+            }
+            continue;
+        }
+        upstream.write_all(line)?;
+        upstream.write_all(b"\r\n")?;
+    }
+    if !wrote_connection_close {
+        upstream.write_all(b"Connection: close\r\n")?;
+    }
+    upstream.write_all(b"\r\n")
+}
+
+fn content_length_from_headers(header_tail: &[u8]) -> io::Result<u64> {
+    let mut content_length = None;
+    for line in header_tail.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(value) = header_line_value(line, b"content-length") else {
+            continue;
+        };
+        let value = std::str::from_utf8(trim_ascii_bytes(value)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Content-Length is not UTF-8")
+        })?;
+        let value = value
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Content-Length is invalid"))?;
+        if content_length.is_some_and(|previous| previous != value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conflicting Content-Length headers",
+            ));
+        }
+        content_length = Some(value);
+    }
+    Ok(content_length.unwrap_or(0))
+}
+
+fn header_has_name(header_tail: &[u8], name: &[u8]) -> bool {
+    header_tail
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .take_while(|line| !line.is_empty())
+        .any(|line| header_line_has_name(line, name))
+}
+
+fn header_line_has_name(line: &[u8], name: &[u8]) -> bool {
+    header_line_value(line, name).is_some()
+}
+
+fn header_line_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    if trim_ascii_bytes(&line[..colon]).eq_ignore_ascii_case(name) {
+        Some(&line[colon + 1..])
+    } else {
+        None
+    }
+}
+
+fn copy_exact_bytes(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    mut bytes: u64,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    while bytes > 0 {
+        let chunk_size = buffer.len().min(bytes as usize);
+        reader.read_exact(&mut buffer[..chunk_size])?;
+        writer.write_all(&buffer[..chunk_size])?;
+        bytes -= chunk_size as u64;
+    }
+    Ok(())
+}
+
+fn relay_plain_http_response(client: &mut TcpStream, mut upstream: TcpStream) -> io::Result<()> {
+    let result = io::copy(&mut upstream, &mut *client);
+    let _ = client.shutdown(Shutdown::Write);
+    result.map(|_| ())
 }
 
 fn trim_ascii_bytes(bytes: &[u8]) -> &[u8] {
@@ -910,6 +1022,60 @@ mod tests {
         client
             .read_to_string(&mut response)
             .expect("proxy response");
+
+        assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
+        origin_thread.join().expect("origin thread");
+    }
+
+    #[test]
+    fn managed_http_proxy_closes_plain_http_after_one_request() {
+        let origin = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("origin");
+        let origin_addr = origin.local_addr().expect("origin address");
+        let origin_thread = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("origin accept");
+            let request = read_http_header(&mut stream).expect("request header");
+            let request = String::from_utf8(request).expect("request utf8");
+            assert!(
+                request.starts_with("GET /packages HTTP/1.1\r\n"),
+                "proxy should rewrite absolute-form target: {request}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("origin response");
+            if request.contains("\r\nConnection: close\r\n") {
+                return;
+            }
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("origin read timeout");
+            let _ = stream.read(&mut [0_u8; 1]);
+        });
+        let proxy = ManagedNetworkProxy::start(ManagedProxyConfig {
+            allowed_domains: vec!["127.0.0.1".to_string()],
+            denied_domains: Vec::new(),
+            allow_local_binding: true,
+        })
+        .expect("proxy");
+
+        let mut client = TcpStream::connect(proxy.http_addr()).expect("connect proxy");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client read timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/packages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\n\r\n",
+                    origin_addr.port(),
+                    origin_addr.port()
+                )
+                .as_bytes(),
+            )
+            .expect("proxy request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("proxy should close one-request HTTP connection");
 
         assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("ok"), "{response}");
