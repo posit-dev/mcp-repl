@@ -349,20 +349,44 @@ fn is_non_public_ip(ip: IpAddr) -> bool {
 }
 
 fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _d] = ip.octets();
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_multicast()
+        || a == 0
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 240
 }
 
 fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ipv4_mapped_from_ipv6(ip) {
+        return is_non_public_ipv4(mapped);
+    }
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_unique_local()
         || ip.is_unicast_link_local()
         || ip.is_multicast()
+}
+
+fn ipv4_mapped_from_ipv6(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    if octets[..10] == [0; 10] && octets[10] == 0xff && octets[11] == 0xff {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
 }
 
 fn spawn_http_listener(
@@ -707,6 +731,46 @@ mod tests {
         let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
         assert!(!blocked.allows_socket_addr(loopback));
         assert!(allowed.allows_socket_addr(loopback));
+    }
+
+    #[test]
+    fn non_public_ipv4_classifier_blocks_special_ranges() {
+        for raw in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+        ] {
+            let ip = raw.parse::<Ipv4Addr>().expect("IPv4 address");
+            assert!(is_non_public_ipv4(ip), "{raw} should be non-public");
+        }
+
+        assert!(!is_non_public_ipv4(
+            "8.8.8.8".parse::<Ipv4Addr>().expect("IPv4 address")
+        ));
+    }
+
+    #[test]
+    fn non_public_ipv6_classifier_unwraps_ipv4_mapped_addresses() {
+        for raw in ["::ffff:127.0.0.1", "::ffff:100.64.0.1"] {
+            let ip = raw.parse::<Ipv6Addr>().expect("IPv6 address");
+            assert!(is_non_public_ipv6(ip), "{raw} should be non-public");
+        }
+
+        assert!(!is_non_public_ipv6(
+            "::ffff:8.8.8.8".parse::<Ipv6Addr>().expect("IPv6 address")
+        ));
     }
 
     #[test]
