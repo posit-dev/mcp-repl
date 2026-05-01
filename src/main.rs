@@ -7,6 +7,7 @@ mod html_to_markdown;
 mod input_protocol;
 mod install;
 mod ipc;
+mod managed_network;
 mod output_capture;
 mod output_stream;
 mod output_timeline;
@@ -198,6 +199,10 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
                 if value.is_empty() {
                     return Err("missing value for --add-allowed-domain".into());
                 }
+                crate::managed_network::validate_domain_patterns(
+                    "--add-allowed-domain",
+                    &[value.to_string()],
+                )?;
                 sandbox_args
                     .plan
                     .operations
@@ -208,12 +213,15 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
                 if value.trim().is_empty() {
                     return Err("missing value for --add-allowed-domain".into());
                 }
+                let value = value.trim();
+                crate::managed_network::validate_domain_patterns(
+                    "--add-allowed-domain",
+                    &[value.to_string()],
+                )?;
                 sandbox_args
                     .plan
                     .operations
-                    .push(SandboxCliOperation::AddAllowedDomain(
-                        value.trim().to_string(),
-                    ));
+                    .push(SandboxCliOperation::AddAllowedDomain(value.to_string()));
             }
             "--config" => {
                 let value = parser.next_value("--config")?;
@@ -665,6 +673,35 @@ mod tests {
             SandboxConfigOperation::SetAllowedDomains(values)
                 if values == vec!["pypi.org".to_string(), "files.pythonhosted.org".to_string()]
         ));
+    }
+
+    #[test]
+    fn parse_config_override_rejects_exact_url_allowed_domains() {
+        let err = parse_sandbox_config_override(
+            "permissions.network.allowed_domains=[\"https://pypi.org/simple/\"]",
+        )
+        .expect_err("exact URL domain entry should be rejected");
+        assert!(
+            err.contains("host patterns"),
+            "expected host-pattern error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_exact_url_allowed_domain() {
+        let err = match parse_cli_args_from(vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--add-allowed-domain".to_string(),
+            "https://pypi.org/simple/".to_string(),
+        ]) {
+            Ok(_) => panic!("exact URL domain entry should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("host patterns"),
+            "expected host-pattern error, got: {err}"
+        );
     }
 
     #[test]

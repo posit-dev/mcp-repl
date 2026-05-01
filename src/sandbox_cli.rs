@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::managed_network::validate_domain_patterns;
 use crate::sandbox::{SandboxPolicy, SandboxState};
 
 pub const MISSING_INHERITED_SANDBOX_STATE_MESSAGE: &str =
@@ -134,12 +135,16 @@ pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation
         "sandbox_workspace_write.exclude_slash_tmp" => Ok(
             SandboxConfigOperation::SetWorkspaceExcludeSlashTmp(parse_bool_value(value)?),
         ),
-        "permissions.network.allowed_domains" => Ok(SandboxConfigOperation::SetAllowedDomains(
-            parse_string_array_value(value)?,
-        )),
-        "permissions.network.denied_domains" => Ok(SandboxConfigOperation::SetDeniedDomains(
-            parse_string_array_value(value)?,
-        )),
+        "permissions.network.allowed_domains" => {
+            let values = parse_string_array_value(value)?;
+            validate_domain_patterns("permissions.network.allowed_domains", &values)?;
+            Ok(SandboxConfigOperation::SetAllowedDomains(values))
+        }
+        "permissions.network.denied_domains" => {
+            let values = parse_string_array_value(value)?;
+            validate_domain_patterns("permissions.network.denied_domains", &values)?;
+            Ok(SandboxConfigOperation::SetDeniedDomains(values))
+        }
         "permissions.network.allow_local_binding" => Ok(
             SandboxConfigOperation::SetAllowLocalBinding(parse_bool_value(value)?),
         ),
@@ -290,6 +295,7 @@ fn validate_sandbox_plan_operations(
                 if domain.trim().is_empty() {
                     return Err("--add-allowed-domain requires a non-empty value".to_string());
                 }
+                validate_domain_patterns("--add-allowed-domain", std::slice::from_ref(domain))?;
             }
             SandboxCliOperation::Config(config_op) => match config_op {
                 SandboxConfigOperation::SetMode(next_mode) => {

@@ -1655,6 +1655,9 @@ tryCatch({
                         if normalized_key == "permissionProfile" {
                             continue;
                         }
+                        if normalized_key == "turn_started_at_unix_ms" {
+                            continue;
+                        }
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
@@ -1718,6 +1721,30 @@ tryCatch({
                 "codexLinuxSandboxExe": null
             }),
             "wire snapshots should preserve a null Codex Linux helper path"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_volatile_turn_started_timestamp() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "x-codex-turn-metadata": {
+                "sandbox": "seatbelt",
+                "turn_started_at_unix_ms": 1777651972182_i64
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "x-codex-turn-metadata": {
+                    "sandbox": "<SANDBOX_BACKEND>"
+                }
+            }),
+            "wire snapshots should not retain per-run turn timestamps"
         );
     }
 
