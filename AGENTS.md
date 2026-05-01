@@ -56,6 +56,7 @@ Keep this file short. It is a table of contents, not the full manual.
 
 - For multi-phase refactors, redesigns, or other work that spans discovery, iteration, and implementation, keep a living plan under `docs/plans/active/` until the initiative is complete.
 - Use the plan to capture design decisions, rejected options, phase boundaries, unresolved questions, and the next safe slice of work so a later agent does not need to rediscover them.
+- Plans and future-work notes should include a motivating task, use case, or MRE-style scenario before design details. Capture what the agent, MCP client, server, worker, or user should be able to do, then list constraints and options.
 - If you pause or hand off work mid-task, update the plan before stopping.
 - Do not create plan files for routine, obvious, or low-risk changes. Keep the plans area useful, not noisy.
 - Move completed plans to `docs/plans/completed/`.

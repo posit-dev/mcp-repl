@@ -43,7 +43,7 @@
 
 - Which Linux routing mechanism should become the long-term implementation: the existing internal sandbox helper, a socket bridge, or a separate network namespace path.
 - Whether a future HTTPS MITM mode is worth the certificate-management surface for URL/path-level filtering.
-- Which hardening slice should land first for the current macOS proxy: TLS SNI gating for `CONNECT`, SOCKS removal/gating, explicit TCP allowlists, or split local connect/bind controls. See `docs/futurework/managed-network-hardening.md`.
+- Which managed-network follow-up slice should land first: explicit database TCP connect, local Shiny bind/inbound support, TLS SNI gating for `CONNECT`, SOCKS removal/gating, or split local connect/bind controls. See `docs/futurework/managed-network-follow-up.md`.
 
 ## Next Safe Slice
 
@@ -62,4 +62,4 @@
 - 2026-04-30: Chose a server-owned proxy with environment-variable routing plus OS sandbox egress limits rather than transparent kernel redirection.
 - 2026-04-30: Scoped matching to host/domain patterns after deciding exact HTTPS URL filtering would require a separate MITM design.
 - 2026-04-30: Implemented the macOS slice with a small in-process HTTP/SOCKS proxy in `src/managed_network.rs`, CLI/config validation for host patterns, and worker launch wiring that injects proxy env vars before Seatbelt policy rendering.
-- 2026-05-01: Documented current managed-network hardening gaps and mitigation tradeoffs after demonstrating that an allowlisted `CONNECT` host can be paired with a different TLS SNI on shared edge infrastructure.
+- 2026-05-01: Documented managed-network follow-up scenarios and tradeoffs for package, database, Shiny, local-service, and hardening workflows.
