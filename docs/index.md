@@ -36,6 +36,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: deferred design note on replacing hook/replay plot capture with a device-level path that can emit plots before grouped expressions finish.
+- `docs/futurework/server-backend-boundary.md`: deferred note on removing backend-specific execution semantics from server-side request handling.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
