@@ -30,7 +30,8 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/advisory-worker-write-observations.md`: deferred note on emitting best-effort IPC metadata for worker-owned stdout/stderr writes without replacing pipe capture.
-- `docs/futurework/codex-install-managed-network-defaults.md`: deferred note on adding conservative managed-network package and documentation allowlists to Codex install defaults.
+- `docs/futurework/claude-sandbox-inherit.md`: deferred note on mapping Claude sandbox settings into `mcp-repl` worker sandbox state.
+- `docs/futurework/mcp-client-install-managed-network-defaults.md`: deferred note on adding conservative managed-network package and documentation allowlists to MCP client install defaults.
 - `docs/futurework/composable-tool-descriptions.md`: deferred design note on replacing the current multi-file `repl` description matrix with one composable template plus runtime interpolation.
 - `docs/futurework/offline-manual-surfaces.md`: deferred design note on exposing R manuals and future Python manuals through better offline model-facing surfaces than the current inline `RShowDoc()` flow.
 - `docs/futurework/managed-network-follow-up.md`: target workflows and tradeoffs for package, database, Shiny, local-app, and managed-network follow-up work.
