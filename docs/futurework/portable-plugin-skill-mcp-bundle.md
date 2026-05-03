@@ -153,6 +153,20 @@ Prefer these tools over ad hoc shell execution when session state, plots, or
 runtime-specific help are useful.
 ```
 
+The first useful skill should also capture the operational guidance that is
+hard to infer from the MCP tool schema alone:
+
+- Use `repl_reset` or `\u0004` when the runtime state is stale.
+- Treat plot/image output as first-class but client-rendered: `mcp-repl` returns
+  images, while the MCP client decides how visibly to display them.
+- If package installation or web access fails because the REPL sandbox has no
+  network permission, ask the user to approve a shell install or a project-local
+  `mcp-repl` config edit. Do not ask the `mcp-repl` server to modify its own
+  allowlist.
+- Document that Claude subagents currently share the same MCP connection and
+  therefore the same REPL session, while Codex agents may get separate MCP
+  connection managers.
+
 ## Portability Rule
 
 The most portable plugin uses an MCP server executable that is already
@@ -251,6 +265,7 @@ defaults.
    be installed.
 3. Move the high-signal guidance from
    `docs/futurework/repl-tool-description-extras.md` into the first skill draft.
+   Include the network-approval and Claude-subagent caveats from this note.
 4. Add `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json` with the
    same `name`, `description`, `skills`, and `mcpServers` fields.
 5. Add a Codex local marketplace entry at

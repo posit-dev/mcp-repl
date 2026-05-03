@@ -142,8 +142,19 @@ It should be treated as source material for:
 
 ## Recovered sandbox guidance
 
-- If shell execution is policy-blocked, try equivalent commands through the REPL backend when supported.
-- Common workflows where this matters include test runs, package build/check loops, and rendering workflows.
+- Do not assume the REPL has network access.
+- If a required package is not installed and network access is not already
+  configured for the REPL sandbox, ask the user to approve a shell install or a
+  project-local `mcp-repl` config change instead of running `install.packages()`
+  or `pip install` inside the REPL.
+- Use the REPL after the approved install completes: load the package and verify
+  behavior in the long-lived session.
+- For repeated project needs, prefer project-local allowlist configuration over
+  one-off broad network access.
+- If shell execution is policy-blocked for non-network work, try equivalent
+  commands through the REPL backend when supported.
+- Common workflows where this matters include test runs, package build/check
+  loops, and rendering workflows.
 
 ## Recovered reset/interrupt/session guidance
 

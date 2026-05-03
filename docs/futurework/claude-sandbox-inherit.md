@@ -34,6 +34,10 @@ Reference: <https://docs.claude.com/en/docs/claude-code/settings>
 ## Notes
 
 - This should be a separate feature from managed-network install defaults.
+- Claude's sandbox implementation and documentation are useful prior art for
+  this feature. Re-inspect the current Claude source or docs when implementing
+  instead of preserving stale assumptions about settings shape or permission
+  semantics.
 - Decide whether to add a Claude-specific inherit mode, for example
   `--sandbox inherit-claude`, or to extend `--sandbox inherit` with a documented
   client source.
