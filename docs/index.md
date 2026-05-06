@@ -30,12 +30,20 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/advisory-worker-write-observations.md`: deferred note on emitting best-effort IPC metadata for worker-owned stdout/stderr writes without replacing pipe capture.
+- `docs/futurework/claude-sandbox-inherit.md`: deferred note on mapping Claude sandbox settings into `mcp-repl` worker sandbox state.
+- `docs/futurework/claude-session-lifecycle-and-integration.md`: deferred note on Claude `/clear`, subagent session sharing, install smoke coverage, and protocol drift.
+- `docs/futurework/mcp-client-install-managed-network-defaults.md`: deferred note on adding conservative managed-network package and documentation allowlists to MCP client install defaults.
 - `docs/futurework/composable-tool-descriptions.md`: deferred design note on replacing the current multi-file `repl` description matrix with one composable template plus runtime interpolation.
 - `docs/futurework/offline-manual-surfaces.md`: deferred design note on exposing R manuals and future Python manuals through better offline model-facing surfaces than the current inline `RShowDoc()` flow.
 - `docs/futurework/managed-network-follow-up.md`: target workflows and tradeoffs for package, database, Shiny, local-app, and managed-network follow-up work.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
+- `docs/futurework/portable-plugin-skill-mcp-bundle.md`: futurework note on packaging a shared skill plus MCP server config as a portable Codex/Claude plugin.
+- `docs/futurework/project-local-mcp-repl-config.md`: deferred design note on loading project-local `mcp-repl-config.toml` files from `.agents`, `.codex`, or `.claude`.
+- `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
-- `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: deferred design note on replacing hook/replay plot capture with a device-level path that can emit plots before grouped expressions finish.
+- `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
+- `docs/futurework/server-backend-boundary.md`: deferred note on removing backend-specific execution semantics from server-side request handling.
+- `docs/futurework/sidecar-viewer-observability.md`: deferred note on a local read-only sidecar viewer for transcripts, plots, and output bundles.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.

@@ -23,6 +23,10 @@
 - Linux should route worker traffic through a server-owned proxy from inside the Linux sandbox without allowing direct egress.
 - Windows should use the same policy surface once the Windows sandbox can route worker traffic through a managed proxy.
 - A future UI or approval flow can amend allow/deny rules, but this phase only supports static CLI/config rules.
+- A future HTTP policy layer may support method restrictions such as "allow
+  GET but deny POST", but that is separate from the current host/domain
+  allowlist because ordinary HTTPS proxying does not expose the inner HTTP
+  method without TLS interception or a protocol-specific path.
 
 ## Phase Status
 
@@ -38,11 +42,17 @@
 - Supported patterns are exact hosts, `*.example.com`, and `**.example.com`.
 - Exact URLs are rejected instead of being silently reduced to hosts.
 - Proxy-aware tools are the transparency target; tools that ignore proxy env vars fail closed.
+- `mcp-repl` itself cannot request a permission escalation from an MCP client UI.
+  User-approved network changes must happen through external client config,
+  CLI args, project-local config, or a later non-MCP approval surface.
 
 ## Open Questions
 
 - Which Linux routing mechanism should become the long-term implementation: the existing internal sandbox helper, a socket bridge, or a separate network namespace path.
 - Whether a future HTTPS MITM mode is worth the certificate-management surface for URL/path-level filtering.
+- Whether a GET-only web policy is useful enough to justify TLS visibility work,
+  or whether package mirrors and host/port restrictions cover the practical
+  use cases.
 - Which managed-network follow-up slice should land first: explicit database TCP connect, local Shiny bind/inbound support, TLS SNI gating for `CONNECT`, SOCKS removal/gating, or split local connect/bind controls. See `docs/futurework/managed-network-follow-up.md`.
 
 ## Next Safe Slice

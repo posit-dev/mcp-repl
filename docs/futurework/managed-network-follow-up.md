@@ -20,6 +20,9 @@ The important future tasks are:
 - Let the runtime call an explicitly allowed local service, such as a local API
   used by tests or examples, without also allowing arbitrary remote network
   access.
+- Support a restricted read-only web/data-fetching shape where the runtime can
+  perform HTTP GET requests to allowed hosts but cannot make state-changing
+  requests such as POST.
 
 This note is not a final design. It records the target scenarios, current
 constraints, and implementation tradeoffs so the next slice can choose an
@@ -84,6 +87,24 @@ Minimal task:
 This needs explicit loopback connect permission. It is separate from Shiny app
 iteration, where the worker binds a port and a browser tool connects to it.
 
+### GET-Only Web Access
+
+Minimal task:
+
+1. Start `mcp-repl` with a policy that allows HTTP(S) access to a specific host
+   for read-only retrieval.
+2. The agent asks the runtime to download or inspect a public data resource.
+3. GET requests to the allowed host succeed.
+4. POST, PUT, DELETE, and other non-GET methods fail closed.
+5. Requests to unrelated hosts still fail closed.
+
+This is a distinct policy from domain allowlisting. For plain HTTP proxy
+requests, the proxy can see and enforce the method. For ordinary HTTPS
+`CONNECT`, the proxy sees only the tunnel endpoint, not the inner HTTP method.
+Enforcing GET-only semantics for HTTPS would require TLS interception,
+package/client-specific integration, a controlled mirror, or another design
+that makes request methods visible.
+
 ## Current Shape
 
 - The server starts a server-owned HTTP/SOCKS proxy when domain allow/deny rules
@@ -138,6 +159,9 @@ Open boundaries found during the same investigation:
 - Managed package/web access, explicit TCP connect, and local app serving are
   different capabilities. They may need different policy fields and different
   enforcement paths.
+- HTTP method restrictions, such as GET-only web access, are a separate
+  capability from host/domain allowlisting. Do not imply method-level
+  enforcement for HTTPS until the implementation can actually see the method.
 - Tools that honor proxy environment variables should work transparently.
   Tools that ignore them must still be constrained by the OS sandbox.
 - Local database connect does not imply local app bind. Local app bind does not
@@ -232,6 +256,8 @@ These are implementation options, not a prescribed roadmap.
   example `db.example.com:5432`.
 - Split local loopback connect from local loopback bind/inbound permissions, so
   database workflows and Shiny workflows can be enabled independently.
+- Add GET-only enforcement for visible HTTP proxy requests, with HTTPS support
+  deferred until there is a concrete TLS-visibility or controlled-mirror design.
 - Restrict HTTP `CONNECT` to package-repository-shaped traffic, such as port
   443 by default, unless an explicit TCP policy grants a different port.
 - Add TLS ClientHello SNI validation for `CONNECT` to reduce host/SNI mismatch
@@ -251,6 +277,7 @@ Choose the next design by starting from one concrete task. Good first slices are
 - explicit TCP connect for one database endpoint,
 - explicit loopback bind/inbound for Shiny app iteration,
 - explicit loopback connect for one local service endpoint,
+- GET-only enforcement for plain HTTP plus a documented HTTPS limitation,
 - TLS SNI gating for the existing package-repository proxy path.
 
 Each slice should include a minimal end-to-end scenario that proves the intended
