@@ -2195,9 +2195,6 @@ fn render_active_bundle_contents(
             active,
             0,
         ))
-    } else if active.was_disclosed() && image_bundle_still_needed {
-        active.disclosed = true;
-        Ok(compact_output_bundle_items(inline_items, active))
     } else {
         Ok(materialize_items(inline_items.to_vec()))
     }
@@ -3591,6 +3588,58 @@ mod tests {
         assert!(
             transcript.contains("TAIL\n"),
             "expected later small poll output to append to the existing timeout bundle, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_image_bundle_follow_up_without_detached_prefix_does_not_replay() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+            let image = ReplyImage {
+                id: format!("image-{index}"),
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+            };
+            let retained = bundle
+                .append_image(&mut state.output_store, &image)
+                .expect("timeout image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        bundle.disclosed = true;
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("FOLLOW_UP_OK\n")],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+
+        assert!(
+            text.contains("FOLLOW_UP_OK\n"),
+            "expected fresh follow-up reply inline, got: {text:?}"
+        );
+        assert!(
+            !text.contains("output bundle images"),
+            "did not expect stale timeout bundle notice in fresh follow-up reply: {text:?}"
+        );
+        assert!(
+            images.is_empty(),
+            "did not expect stale timeout bundle anchor images in fresh follow-up reply"
+        );
+        assert!(
+            !state.has_active_timeout_bundle(),
+            "expected completed follow-up to retire the old timeout bundle"
         );
     }
 

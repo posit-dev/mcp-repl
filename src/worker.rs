@@ -164,7 +164,6 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::StdinWrite { .. }) => {}
-                    Some(ServerToWorkerIpcMessage::PlotImageAck { .. }) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         crate::r_session::clear_pending_input();
                     }

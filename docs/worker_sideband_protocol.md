@@ -65,6 +65,7 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   device or figure slot. It is not a response image ID; the server owns response
   image IDs and uses `source` only to keep distinct plot sources from collapsing
   into one response image.
+- There is no plot-image acknowledgement message. Workers must not delay stdout/stderr output waiting for sideband responses.
 - If an update is the first image event for a new server request, the server
   treats it as a new response image and includes a server notice that it updates
   the previously sent image.

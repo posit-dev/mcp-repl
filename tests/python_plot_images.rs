@@ -565,6 +565,80 @@ async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_explicit_repeat_plot_and_show_emit_images_in_same_session() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let plot_input = format!(
+        "{}; plt.figure(21); plt.clf(); plt.plot(list(range(1, 11))); plt.show()",
+        python_plot_preamble()
+    );
+    let first_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let repeat_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let show_result = session
+        .write_stdin_raw_with("plt.show()", Some(30.0))
+        .await?;
+    let noop_result = session.write_stdin_raw_with("1+1", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first plot reported an error: {}",
+        result_text(&first_result)
+    );
+    assert_ne!(
+        repeat_result.is_error,
+        Some(true),
+        "repeat plot reported an error: {}",
+        result_text(&repeat_result)
+    );
+    assert_ne!(
+        show_result.is_error,
+        Some(true),
+        "explicit show reported an error: {}",
+        result_text(&show_result)
+    );
+
+    let first_images = extract_images(&first_result);
+    let repeat_images = extract_images(&repeat_result);
+    let show_images = extract_images(&show_result);
+
+    assert_eq!(
+        first_images.len(),
+        1,
+        "expected first plot to emit one image"
+    );
+    assert_eq!(
+        repeat_images.len(),
+        1,
+        "expected explicit repeat plot to emit one image"
+    );
+    assert_eq!(
+        show_images.len(),
+        1,
+        "expected explicit show to emit one image"
+    );
+    assert_eq!(
+        first_images[0].bytes, repeat_images[0].bytes,
+        "expected explicit repeat plot to preserve image bytes"
+    );
+    assert_eq!(
+        first_images[0].bytes, show_images[0].bytes,
+        "expected explicit show to preserve image bytes"
+    );
+    assert_no_images(&noop_result, "python no-op after explicit repeat plot");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

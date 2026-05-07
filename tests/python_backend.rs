@@ -92,6 +92,10 @@ fn interrupt_recovery_deadline() -> Instant {
     Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
 }
 
+fn python_startup_probe_budget() -> Duration {
+    Duration::from_secs(if cfg!(target_os = "macos") { 30 } else { 10 })
+}
+
 async fn start_python_session_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<Option<common::McpTestSession>> {
@@ -111,12 +115,14 @@ async fn start_python_session_with_env_vars(
         env_vars,
     )
     .await?;
-    let probe = session.write_stdin_raw_with("pass", Some(2.0)).await?;
+    let probe = session
+        .write_stdin_raw_with("print('mcp_repl_python_ready')", Some(2.0))
+        .await?;
     let probe = common::wait_until_not_busy(
         &mut session,
         probe,
         Duration::from_millis(100),
-        Duration::from_secs(10),
+        python_startup_probe_budget(),
     )
     .await?;
     let probe_text = result_text(&probe);

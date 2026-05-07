@@ -51,9 +51,7 @@ _plot_hooks_installed = False
 _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
-_plot_next_sequence = 0
-_plot_acks = set()
-_plot_ack_condition = threading.Condition()
+_plot_emitted_this_request = {}
 
 
 def _close_ipc_in_fork_child():
@@ -99,24 +97,6 @@ def _flush_stdio():
         pass
 
 
-def _next_plot_sequence():
-    global _plot_next_sequence
-    with _plot_ack_condition:
-        _plot_next_sequence += 1
-        return _plot_next_sequence
-
-
-def _wait_for_plot_ack(sequence, timeout_seconds=1.0):
-    deadline = time.monotonic() + timeout_seconds
-    with _plot_ack_condition:
-        while sequence not in _plot_acks:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            _plot_ack_condition.wait(remaining)
-        _plot_acks.discard(sequence)
-
-
 def _ensure_plot_modules():
     global _plot_modules_loaded, _plot_pyplot, _plot_capable, _plot_hooks_installed, _plot_axes_plot, _plot_show
     if not _plot_capable:
@@ -138,7 +118,9 @@ def _ensure_plot_modules():
 
             def _wrapped_plot(self, *args, **kwargs):
                 result = _plot_axes_plot(self, *args, **kwargs)
-                _maybe_emit_plots()
+                fig_num = getattr(getattr(self, "figure", None), "number", None)
+                force_figures = {fig_num} if fig_num is not None else None
+                _maybe_emit_plots(force_figures=force_figures)
                 return result
 
             Axes.plot = _wrapped_plot
@@ -146,7 +128,7 @@ def _ensure_plot_modules():
 
             def _wrapped_show(*args, **kwargs):
                 result = _plot_show(*args, **kwargs)
-                _maybe_emit_plots()
+                _maybe_emit_plots(force_all=True)
                 return result
 
             plt.show = _wrapped_show
@@ -158,14 +140,14 @@ def _ensure_plot_modules():
         return False
 
 
-def _maybe_emit_plots():
+def _maybe_emit_plots(force_figures=None, force_all=False):
     if not _has_request_active():
         return
-    _emit_plots()
+    _emit_plots(force_figures=force_figures, force_all=force_all)
 
 
-def _emit_plots():
-    global _plot_known_figures, _plot_hashes, _plot_emit_in_progress
+def _emit_plots(force_figures=None, force_all=False):
+    global _plot_known_figures, _plot_hashes, _plot_emitted_this_request, _plot_emit_in_progress
     if not _plot_capable:
         return
     if _plot_emit_in_progress:
@@ -188,14 +170,17 @@ def _emit_plots():
         with _plot_lock:
             _plot_known_figures = set()
             _plot_hashes = {}
+            _plot_emitted_this_request = {}
         _plot_emit_in_progress = False
         return
     fig_nums = sorted(fig_nums)
     new_known = set(fig_nums)
+    force_figures = set() if force_figures is None else set(force_figures)
     with _plot_lock:
         prev_known = set(_plot_known_figures)
         for stale_num in set(_plot_hashes) - new_known:
             _plot_hashes.pop(stale_num, None)
+            _plot_emitted_this_request.pop(stale_num, None)
     for fig_num in fig_nums:
         try:
             fig = plt.figure(fig_num)
@@ -206,13 +191,17 @@ def _emit_plots():
         except Exception:
             continue
         digest = hashlib.sha256(data).hexdigest()
+        force_current = force_all or fig_num in force_figures
         with _plot_lock:
-            if _plot_hashes.get(fig_num) == digest:
+            emitted_this_request = _plot_emitted_this_request.get(fig_num) == digest
+            if emitted_this_request:
+                continue
+            if _plot_hashes.get(fig_num) == digest and not force_current:
                 continue
             _plot_hashes[fig_num] = digest
+            _plot_emitted_this_request[fig_num] = digest
         encoded = base64.b64encode(data).decode("ascii")
         is_new = fig_num not in prev_known
-        sequence = _next_plot_sequence()
         _flush_stdio()
         _send(
             {
@@ -221,20 +210,20 @@ def _emit_plots():
                 "data": encoded,
                 "is_update": not bool(is_new),
                 "source": str(fig_num),
-                "sequence": sequence,
             }
         )
-        _wait_for_plot_ack(sequence)
     with _plot_lock:
         _plot_known_figures = new_known
     _plot_emit_in_progress = False
 
 
 def _set_request_active():
-    global _request_active, _interrupt_pending
+    global _request_active, _interrupt_pending, _plot_emitted_this_request
     with _request_lock:
         _request_active = True
         _interrupt_pending = False
+    with _plot_lock:
+        _plot_emitted_this_request = {}
 
 
 def _take_request_active():
@@ -485,12 +474,6 @@ def _ipc_reader():
         msg_type = msg.get("type")
         if msg_type == "stdin_write":
             _set_request_active()
-        elif msg_type == "plot_image_ack":
-            sequence = msg.get("sequence")
-            if isinstance(sequence, int):
-                with _plot_ack_condition:
-                    _plot_acks.add(sequence)
-                    _plot_ack_condition.notify_all()
         elif msg_type == "interrupt":
             with _request_lock:
                 _interrupt_pending = True

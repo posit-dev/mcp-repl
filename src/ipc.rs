@@ -73,7 +73,6 @@ static WORKER_IPC_FORK_CLOSE_READ_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_FORK_CLOSE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
-static NEXT_WORKER_PLOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
@@ -81,7 +80,6 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
     StdinWrite { text: String },
-    PlotImageAck { sequence: u64 },
     Interrupt,
     SessionEnd,
 }
@@ -107,8 +105,6 @@ pub enum WorkerToServerIpcMessage {
         is_update: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sequence: Option<u64>,
     },
     SessionEnd,
 }
@@ -210,7 +206,6 @@ impl ServerIpcConnection {
         let readline_start_handler = handlers.on_readline_start.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
         let session_end_handler = handlers.on_session_end.clone();
-        let server_sender = tx.clone();
         let IpcTransport { reader, writer } = transport;
         let handle = thread::spawn(move || {
             let mut reader = BufReader::new(reader);
@@ -311,7 +306,6 @@ impl ServerIpcConnection {
                         data,
                         is_update,
                         source,
-                        sequence,
                     } => {
                         let (id, is_new, updates_previous_image, readline_results_seen) = {
                             let mut guard = reader_inbox.lock().unwrap();
@@ -340,15 +334,8 @@ impl ServerIpcConnection {
                                 data,
                                 is_update,
                                 source,
-                                sequence,
                             });
                             reader_cvar.notify_all();
-                        }
-                        if let Some(sequence) = sequence {
-                            let _ = send_ipc_message(
-                                &server_sender,
-                                ServerToWorkerIpcMessage::PlotImageAck { sequence },
-                            );
                         }
                     }
                     other => {
@@ -604,7 +591,7 @@ impl WorkerIpcConnection {
 
     pub fn recv(&self, timeout: Option<Duration>) -> Option<ServerToWorkerIpcMessage> {
         let mut guard = self.inbox.lock().unwrap();
-        if let Some(message) = pop_non_ack_message(&mut guard.queue) {
+        if let Some(message) = guard.queue.pop_front() {
             return Some(message);
         }
         if guard.disconnected {
@@ -614,7 +601,7 @@ impl WorkerIpcConnection {
         match timeout {
             None => loop {
                 guard = self.cvar.wait(guard).unwrap();
-                if let Some(message) = pop_non_ack_message(&mut guard.queue) {
+                if let Some(message) = guard.queue.pop_front() {
                     return Some(message);
                 }
                 if guard.disconnected {
@@ -632,7 +619,7 @@ impl WorkerIpcConnection {
                     let (next_guard, timeout_res) =
                         self.cvar.wait_timeout(guard, remaining).unwrap();
                     guard = next_guard;
-                    if let Some(message) = pop_non_ack_message(&mut guard.queue) {
+                    if let Some(message) = guard.queue.pop_front() {
                         return Some(message);
                     }
                     if guard.disconnected {
@@ -645,51 +632,6 @@ impl WorkerIpcConnection {
             }
         }
     }
-
-    pub fn wait_for_plot_image_ack(&self, sequence: u64, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.inbox.lock().unwrap();
-        loop {
-            if let Some(idx) = guard.queue.iter().position(|message| {
-                matches!(
-                    message,
-                    ServerToWorkerIpcMessage::PlotImageAck { sequence: seen }
-                        if *seen == sequence
-                )
-            }) {
-                guard.queue.remove(idx);
-                return true;
-            }
-            if guard.disconnected {
-                return false;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
-            guard = next_guard;
-            if timeout_res.timed_out() {
-                return false;
-            }
-        }
-    }
-}
-
-fn pop_non_ack_message(
-    queue: &mut VecDeque<ServerToWorkerIpcMessage>,
-) -> Option<ServerToWorkerIpcMessage> {
-    let idx = queue
-        .iter()
-        .position(|message| !matches!(message, ServerToWorkerIpcMessage::PlotImageAck { .. }))?;
-    queue.remove(idx)
-}
-
-fn send_ipc_message<T>(sender: &mpsc::Sender<T>, message: T) -> io::Result<()> {
-    sender
-        .send(message)
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ipc writer disconnected"))
 }
 
 fn spawn_writer<T>(rx: mpsc::Receiver<T>, mut writer: Box<dyn Write + Send>)
@@ -1406,17 +1348,12 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
 
 pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
     if let Some(ipc) = global_ipc() {
-        let sequence = NEXT_WORKER_PLOT_SEQUENCE
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            .saturating_add(1);
         let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
             mime_type: mime_type.to_string(),
             data: data.to_string(),
             is_update,
             source: source.map(ToString::to_string),
-            sequence: Some(sequence),
         });
-        let _ = ipc.wait_for_plot_image_ack(sequence, Duration::from_secs(1));
     }
 }
 
@@ -1585,8 +1522,8 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, ServerIpcConnection, WorkerIpcConnection,
-        WorkerToServerIpcMessage,
+        IpcHandlers, IpcTransport, ServerIpcConnection, ServerToWorkerIpcMessage,
+        WorkerIpcConnection, WorkerToServerIpcMessage,
     };
     use serde_json::json;
     use std::io::Write;
@@ -1643,6 +1580,30 @@ mod protocol_tests {
         assert!(
             parsed.is_err(),
             "plot_image should reject old worker-owned image fields"
+        );
+    }
+
+    #[test]
+    fn plot_image_protocol_rejects_sequence_ack_handshake() {
+        let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": false,
+            "sequence": 1
+        }));
+        assert!(
+            worker_to_server.is_err(),
+            "plot_image should not expose worker-side ack sequencing"
+        );
+
+        let server_to_worker = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "plot_image_ack",
+            "sequence": 1
+        }));
+        assert!(
+            server_to_worker.is_err(),
+            "server-to-worker protocol should not include plot_image_ack"
         );
     }
 
