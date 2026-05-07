@@ -14,11 +14,16 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 - `src/server.rs` owns the MCP surface, request handling, timeout model, and worker lifecycle.
 - `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl`/`repl_reset` behavior stable.
+- During steady-state requests, the server should treat the worker as a generic
+  runtime endpoint: stdin carries accepted input, stdout/stderr carry visible
+  text, and sideband events carry structural facts. Backend-specific runtime
+  semantics belong in the worker or in explicitly advertised worker metadata.
 
 ### Worker and backends
 
 - `src/worker.rs`, `src/worker_process.rs`, and `src/worker_protocol.rs` manage the child runtime and the server-to-worker contract.
-- `src/backend.rs` selects between the R and Python implementations.
+- `src/backend.rs` selects between the R and Python implementations at launch
+  and install/configuration boundaries.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
 - Python startup is driven by the worker plus the files under `python/`.

@@ -69,7 +69,7 @@ impl PendingOutputEvent {
 pub(crate) enum PendingSidebandKind {
     ReadlineStart { prompt: String },
     ReadlineResult { prompt: String, line: String },
-    RequestEnd,
+    RequestBoundary,
     SessionEnd,
 }
 
@@ -491,7 +491,7 @@ impl PendingOutputSnapshot {
                             line: line.clone(),
                         });
                     }
-                    PendingSidebandKind::RequestEnd | PendingSidebandKind::SessionEnd => {}
+                    PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd => {}
                 },
             }
         }
@@ -551,7 +551,7 @@ fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
         matches!(
             event,
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::RequestEnd | PendingSidebandKind::SessionEnd,
+                kind: PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd,
                 ..
             }
         )
@@ -1163,7 +1163,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(&[0xC3]);
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
         let first = tape.drain_snapshot();
         assert!(
             first.format_contents().contents.is_empty(),
@@ -1183,7 +1183,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(&[0xC3]);
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
         let first = tape.drain_final_snapshot();
         assert!(
             first.format_contents().contents.is_empty(),
@@ -1246,14 +1246,14 @@ mod tests {
     }
 
     #[test]
-    fn request_end_clears_pending_echo_prefix_after_sideband_only_snapshot() {
+    fn request_boundary_clears_pending_echo_prefix_after_sideband_only_snapshot() {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "x <- 1\n".to_string(),
         });
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
 
         let first = tape.drain_snapshot();
         assert!(

@@ -314,6 +314,19 @@ flush.console()
 "#
 }
 
+fn timeout_then_tail_code_after(wait_secs: f64) -> String {
+    format!(
+        r#"
+Sys.sleep(0.2)
+cat("MID\n")
+flush.console()
+Sys.sleep({wait_secs:.3})
+cat("TAIL\n")
+flush.console()
+"#
+    )
+}
+
 fn timeout_then_paged_tail_code() -> &'static str {
     r#"
 line <- paste(rep("foo", 80), collapse = " ")
@@ -1187,7 +1200,7 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
     let first = session
         .write_stdin_raw_with_meta(
-            timeout_then_tail_code(),
+            timeout_then_tail_code_after(3.0),
             Some(0.05),
             Some(workspace_write_meta(temp.path())),
         )

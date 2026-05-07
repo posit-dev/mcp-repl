@@ -143,6 +143,9 @@ impl LiveOutputCapture {
     }
 
     fn append_image(&self, image: IpcPlotImage) {
+        if image.updates_previous_image {
+            self.append_server_stdout_status_line(PREVIOUS_IMAGE_UPDATE_NOTICE.as_bytes());
+        }
         self.output_timeline.append_image(
             image.id.clone(),
             image.mime_type.clone(),
@@ -158,6 +161,14 @@ impl LiveOutputCapture {
                 image.is_new,
                 image.readline_results_seen,
             );
+        }
+    }
+
+    fn append_server_stdout_status_line(&self, bytes: &[u8]) {
+        self.output_timeline
+            .append_text(bytes, false, ContentOrigin::Server);
+        if let Some(tape) = &self.pending_output_tape {
+            tape.append_stdout_status_line(bytes);
         }
     }
 
@@ -177,6 +188,8 @@ const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 const LINUX_BWRAP_FALLBACK_NOTICE: &str =
     "[repl] Linux bubblewrap sandbox unavailable; continuing without bwrap\n";
+const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
+    "[repl] image update from previous request shown as a new image\n";
 const PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE: &str =
     "worker follow-up needs current sandbox metadata after precheck";
 
@@ -200,6 +213,11 @@ fn prechecked_follow_up_requires_meta_error() -> WorkerError {
 trait BackendDriver: Send {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8>;
     fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection);
+    fn should_settle_output_after_timeout(
+        &self,
+        oversized_output: OversizedOutputMode,
+        pending_input: Option<&str>,
+    ) -> bool;
     fn wait_for_completion(
         &mut self,
         timeout: Duration,
@@ -225,7 +243,7 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.begin_request();
 }
 
-const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
+const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
@@ -233,36 +251,13 @@ fn driver_wait_for_completion(
     if timeout.is_zero() {
         return Err(WorkerError::Timeout(timeout));
     }
-    let start = std::time::Instant::now();
-    let deadline = start + timeout;
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return Err(WorkerError::Timeout(timeout));
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let slice = remaining.min(Duration::from_millis(50));
-        match ipc.wait_for_request_end(slice) {
-            Ok(()) => {
-                return Ok(completion_info_from_ipc(&ipc, false));
-            }
-            Err(IpcWaitError::Timeout) => {
-                if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
-                    && ipc.try_take_request_end()
-                {
-                    return Ok(completion_info_from_ipc(&ipc, false));
-                }
-                continue;
-            }
-            Err(IpcWaitError::SessionEnd) => {
-                return Ok(completion_info_from_ipc(&ipc, true));
-            }
-            Err(IpcWaitError::Disconnected) => {
-                return Err(WorkerError::Protocol(
-                    "ipc disconnected while waiting for request completion".to_string(),
-                ));
-            }
-        }
+    match ipc.wait_for_request_completion(timeout, REQUEST_COMPLETION_STABLE_WAIT) {
+        Ok(()) => Ok(completion_info_from_ipc(&ipc, false)),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true)),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for request completion".to_string(),
+        )),
     }
 }
 
@@ -314,6 +309,19 @@ impl BackendDriver for RBackendDriver {
         driver_on_input_start(text, ipc);
     }
 
+    fn should_settle_output_after_timeout(
+        &self,
+        oversized_output: OversizedOutputMode,
+        pending_input: Option<&str>,
+    ) -> bool {
+        if !matches!(oversized_output, OversizedOutputMode::Files) {
+            return false;
+        }
+        pending_input
+            .map(|input| input.trim_end_matches(['\r', '\n']).contains('\n'))
+            .unwrap_or(false)
+    }
+
     fn wait_for_completion(
         &mut self,
         timeout: Duration,
@@ -362,6 +370,14 @@ impl BackendDriver for PythonBackendDriver {
             // payloads on the control channel so interrupt/session-end messages stay responsive.
             text: String::new(),
         });
+    }
+
+    fn should_settle_output_after_timeout(
+        &self,
+        _oversized_output: OversizedOutputMode,
+        _pending_input: Option<&str>,
+    ) -> bool {
+        false
     }
 
     fn wait_for_completion(
@@ -2073,7 +2089,7 @@ impl WorkerManager {
                     }
                 }
 
-                if self.should_settle_multiline_r_timeout() {
+                if self.should_settle_output_after_timeout() {
                     self.settle_output_after_timeout();
                 }
                 self.pending_request = true;
@@ -2333,7 +2349,11 @@ impl WorkerManager {
         // drain any bytes already written by the worker before we snapshot the ring.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
-        self.settle_output_after_request_end(remaining);
+        if result.is_ok() {
+            self.pending_output_tape
+                .append_sideband(PendingSidebandKind::RequestBoundary);
+        }
+        self.settle_output_after_completion(remaining);
         if self.guardrail_event_pending() {
             let event = self
                 .guardrail
@@ -2347,7 +2367,7 @@ impl WorkerManager {
         result
     }
 
-    fn settle_output_after_request_end(&self, budget: Duration) {
+    fn settle_output_after_completion(&self, budget: Duration) {
         let total = budget.min(Duration::from_millis(120));
         if total.is_zero() {
             return;
@@ -2388,16 +2408,11 @@ impl WorkerManager {
         }
     }
 
-    fn should_settle_multiline_r_timeout(&self) -> bool {
-        if self.backend != Backend::R
-            || !matches!(self.oversized_output, OversizedOutputMode::Files)
-        {
-            return false;
-        }
-        self.pending_request_input
-            .as_deref()
-            .map(|input| input.trim_end_matches(['\r', '\n']).contains('\n'))
-            .unwrap_or(false)
+    fn should_settle_output_after_timeout(&self) -> bool {
+        self.driver.should_settle_output_after_timeout(
+            self.oversized_output,
+            self.pending_request_input.as_deref(),
+        )
     }
 
     fn settle_output_until_stable(&self, total: Duration, stable_needed: Duration) {
@@ -3694,18 +3709,16 @@ impl WorkerManager {
             return;
         };
         let status = if wait.is_zero() {
-            if ipc.try_take_request_end() {
-                Ok(())
-            } else {
-                Err(IpcWaitError::Timeout)
-            }
+            ipc.wait_for_request_completion(Duration::ZERO, REQUEST_COMPLETION_STABLE_WAIT)
         } else {
-            ipc.wait_for_request_end(wait)
+            ipc.wait_for_request_completion(wait, REQUEST_COMPLETION_STABLE_WAIT)
         };
         match status {
             Ok(()) => {
                 let mut settled_completion = completion_info_from_ipc(&ipc, false);
-                self.settle_output_after_request_end(Duration::from_millis(120));
+                self.pending_output_tape
+                    .append_sideband(PendingSidebandKind::RequestBoundary);
+                self.settle_output_after_completion(Duration::from_millis(120));
                 if matches!(self.oversized_output, OversizedOutputMode::Pager) {
                     update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
                 }
@@ -3726,8 +3739,7 @@ impl WorkerManager {
                 self.settled_pending_completion = Some(settled_completion);
             }
             Err(IpcWaitError::SessionEnd) => {
-                self.note_session_end(true);
-                self.clear_pending_request_state();
+                self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
                 let worker_exited = self
@@ -3736,11 +3748,20 @@ impl WorkerManager {
                     .and_then(|process| process.is_running().ok())
                     .is_some_and(|running| !running);
                 if worker_exited {
-                    self.note_session_end(true);
-                    self.clear_pending_request_state();
+                    self.settle_pending_session_end(&ipc);
                 }
             }
         }
+    }
+
+    fn settle_pending_session_end(&mut self, ipc: &ServerIpcConnection) {
+        let settled_completion = completion_info_from_ipc(ipc, true);
+        self.pending_output_tape
+            .append_sideband(PendingSidebandKind::RequestBoundary);
+        self.settle_output_after_completion(Duration::from_millis(120));
+        self.note_session_end(true);
+        self.clear_pending_request_state();
+        self.settled_pending_completion = Some(settled_completion);
     }
 
     fn clear_pending_request_state(&mut self) {
@@ -4982,12 +5003,6 @@ impl WorkerProcess {
                             prompt: event.prompt,
                             line: event.line,
                         });
-                    }))
-                },
-                on_request_end: {
-                    let sideband_capture = live_output.clone();
-                    Some(Arc::new(move || {
-                        sideband_capture.append_sideband(PendingSidebandKind::RequestEnd);
                     }))
                 },
                 on_session_end: {
@@ -6325,7 +6340,7 @@ mod tests {
 
     #[test]
     fn trim_echo_then_append_protocol_warnings_drops_echo_only_multiline_input() {
-        let warning = "ReadlineResult after RequestEnd".to_string();
+        let warning = "late readline result".to_string();
         let echo = "> x <- 1\n> y <- 2\n";
         let mut contents = vec![WorkerContent::stdout(echo)];
 
@@ -6345,7 +6360,7 @@ mod tests {
 
     #[test]
     fn trim_echo_then_append_protocol_warnings_keeps_output_before_warning() {
-        let warning = "ReadlineResult after RequestEnd".to_string();
+        let warning = "late readline result".to_string();
         let mut contents = vec![WorkerContent::stdout("> x <- 1\n[1] 1\n")];
 
         trim_echo_then_append_protocol_warnings(
@@ -6541,7 +6556,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_request_end_when_primary_prompt_reappears() {
+    fn completion_infers_nested_waiting_prompt_that_reuses_primary_prompt_text() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("value <- readline(prompt = \"> \")", &server);
         let prompt = "> ".to_string();
@@ -6556,15 +6571,8 @@ mod tests {
             prompt: prompt.clone(),
         });
 
-        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
-        assert!(
-            matches!(result, Err(WorkerError::Timeout(_))),
-            "expected timeout before request-end when a nested prompt reuses the primary prompt text"
-        );
-
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after request-end");
+            .expect("expected stable waiting prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
         assert_eq!(completion.echo_events[0].prompt, "> ");
@@ -6575,7 +6583,31 @@ mod tests {
     }
 
     #[test]
-    fn completion_still_waits_when_only_continuation_prompt_arrives() {
+    fn completion_infers_stable_waiting_prompt_without_worker_completion_event() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+        let prompt = "> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected stable waiting prompt to complete request");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].line, "1+1\n");
+    }
+
+    #[test]
+    fn completion_infers_stable_continuation_prompt_when_input_is_consumed() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("1+\n1", &server);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
@@ -6589,15 +6621,8 @@ mod tests {
             prompt: "+ ".to_string(),
         });
 
-        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
-        assert!(
-            matches!(result, Err(WorkerError::Timeout(_))),
-            "expected timeout before request-end when only a continuation prompt is visible"
-        );
-
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after request-end");
+            .expect("expected stable continuation prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("+ "));
     }
 
@@ -6623,11 +6648,13 @@ mod tests {
                 prompt: "+ ".to_string(),
                 line: "1\n".to_string(),
             });
-            let _ = delayed_worker.send(WorkerToServerIpcMessage::RequestEnd);
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: "> ".to_string(),
+            });
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after request-end");
+            .expect("expected completion after stable waiting prompt");
         late_sender.join().expect("late sender should join");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
@@ -6640,44 +6667,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_warns_when_readline_result_arrives_after_request_end() {
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server);
-
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: "> ".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
-
-        let delayed_worker = worker.clone();
-        let late_sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1));
-            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "1+1\n".to_string(),
-            });
-        });
-
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after request-end");
-        late_sender.join().expect("late sender should join");
-
-        assert!(
-            completion
-                .protocol_warnings
-                .iter()
-                .any(|warning| warning.contains("ReadlineResult after RequestEnd")),
-            "expected protocol warning, got: {:?}",
-            completion.protocol_warnings
-        );
-    }
-
-    #[test]
     fn next_request_result_is_retained_when_prompt_is_already_active() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         driver_on_input_start("first()", &server);
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -6690,7 +6683,9 @@ mod tests {
             prompt: "> ".to_string(),
             line: "second()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
 
         let second = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected second completion");
@@ -6713,13 +6708,12 @@ mod tests {
             prompt: "> ".to_string(),
             line: "first()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after request-end");
+            .expect("expected completion after stable waiting prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
@@ -6729,7 +6723,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_retains_echo_events_when_session_ends_before_request_end() {
+    fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("quit()", &server);
 
@@ -6741,6 +6735,34 @@ mod tests {
             line: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
+
+        assert!(completion.session_end_seen);
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "quit()\n");
+    }
+
+    #[test]
+    fn completion_reports_session_end_when_prompt_is_also_stable() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("quit()", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        thread::sleep(Duration::from_millis(25));
+        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+        thread::sleep(Duration::from_millis(25));
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected completion after session end");
@@ -6939,7 +6961,7 @@ mod tests {
 
     #[cfg(target_family = "unix")]
     #[test]
-    fn timed_out_request_end_with_exited_worker_reports_session_end_immediately() {
+    fn timed_out_prompt_completion_with_exited_worker_reports_session_end_immediately() {
         let _guard = env_test_mutex().lock().expect("env mutex");
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut manager = WorkerManager::new(
@@ -6964,7 +6986,9 @@ mod tests {
             prompt,
             line: "quit()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: ">>> ".to_string(),
+        });
         drop(worker);
         manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));
         let formatted = manager.drain_final_formatted_output();
@@ -7685,9 +7709,10 @@ mod tests {
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
+            updates_previous_image: false,
             readline_results_seen: 0,
         });
-        capture.append_sideband(PendingSidebandKind::RequestEnd);
+        capture.append_sideband(PendingSidebandKind::RequestBoundary);
 
         assert!(
             tape.drain_final_snapshot().events.is_empty(),

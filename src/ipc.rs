@@ -85,10 +85,9 @@ pub enum ServerToWorkerIpcMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerToServerIpcMessage {
     BackendInfo {
-        language: String,
         #[serde(default)]
         supports_images: bool,
     },
@@ -100,14 +99,10 @@ pub enum WorkerToServerIpcMessage {
         line: String,
     },
     PlotImage {
-        id: String,
         mime_type: String,
         data: String,
-        is_new: bool,
+        is_update: bool,
     },
-    /// Emitted exactly when the backend knows the logical request has consumed all queued input.
-    /// No later `ReadlineResult` should follow for that same request.
-    RequestEnd,
     SessionEnd,
 }
 
@@ -120,7 +115,9 @@ struct ServerIpcInbox {
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
-    request_end_seen: bool,
+    next_image_id: u64,
+    current_image_id: Option<String>,
+    request_image_id: Option<String>,
     protocol_warnings: VecDeque<String>,
     session_end: bool,
     disconnected: bool,
@@ -144,6 +141,7 @@ pub struct IpcPlotImage {
     pub mime_type: String,
     pub data: String,
     pub is_new: bool,
+    pub updates_previous_image: bool,
     pub readline_results_seen: usize,
 }
 
@@ -152,7 +150,6 @@ pub struct IpcHandlers {
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
     pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
-    pub on_request_end: Option<Arc<dyn Fn() + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -204,7 +201,6 @@ impl ServerIpcConnection {
         let plot_handler = handlers.on_plot_image.clone();
         let readline_start_handler = handlers.on_readline_start.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
-        let request_end_handler = handlers.on_request_end.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
         let handle = thread::spawn(move || {
@@ -236,9 +232,6 @@ impl ServerIpcConnection {
                         WorkerToServerIpcMessage::ReadlineStart { prompt } => {
                             let prompt_for_handler = prompt.clone();
                             let mut guard = reader_inbox.lock().unwrap();
-                            if guard.request_end_seen {
-                                reset_after_completed_request(&mut guard);
-                            }
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
                             if guard.readline_unmatched_starts == 1 {
@@ -267,12 +260,6 @@ impl ServerIpcConnection {
                                 line: line.clone(),
                             };
                             let mut guard = reader_inbox.lock().unwrap();
-                            if guard.request_end_seen {
-                                guard.protocol_warnings.push_back(
-                                    "protocol warning: worker emitted ReadlineResult after RequestEnd"
-                                        .to_string(),
-                                );
-                            }
                             guard.readline_result_count =
                                 guard.readline_result_count.saturating_add(1);
                             if guard.readline_unmatched_starts > 0 {
@@ -299,14 +286,37 @@ impl ServerIpcConnection {
                             }
                         }
                         WorkerToServerIpcMessage::PlotImage {
-                            id,
                             mime_type,
                             data,
-                            is_new,
+                            is_update,
                         } => {
-                            let readline_results_seen = {
-                                let guard = reader_inbox.lock().unwrap();
-                                guard.readline_result_count as usize
+                            let (id, is_new, updates_previous_image, readline_results_seen) = {
+                                let mut guard = reader_inbox.lock().unwrap();
+                                let updates_previous_image = is_update
+                                    && guard.current_image_id.is_some()
+                                    && guard.request_image_id.is_none();
+                                let is_new = !is_update
+                                    || guard.current_image_id.is_none()
+                                    || updates_previous_image;
+                                let id = if is_new {
+                                    guard.next_image_id = guard.next_image_id.saturating_add(1);
+                                    let id = format!("image-{}", guard.next_image_id);
+                                    guard.request_image_id = Some(id.clone());
+                                    guard.current_image_id = Some(id.clone());
+                                    id
+                                } else {
+                                    guard
+                                        .request_image_id
+                                        .clone()
+                                        .or_else(|| guard.current_image_id.clone())
+                                        .expect("current image id must exist for updates")
+                                };
+                                (
+                                    id,
+                                    is_new,
+                                    updates_previous_image,
+                                    guard.readline_result_count as usize,
+                                )
                             };
                             if let Some(handler) = plot_handler.as_ref() {
                                 handler(IpcPlotImage {
@@ -314,32 +324,23 @@ impl ServerIpcConnection {
                                     mime_type,
                                     data,
                                     is_new,
+                                    updates_previous_image,
                                     readline_results_seen,
                                 });
                             } else {
                                 let mut guard = reader_inbox.lock().unwrap();
                                 guard.queue.push_back(WorkerToServerIpcMessage::PlotImage {
-                                    id,
                                     mime_type,
                                     data,
-                                    is_new,
+                                    is_update,
                                 });
                                 reader_cvar.notify_all();
                             }
                         }
                         other => {
                             let mut guard = reader_inbox.lock().unwrap();
-                            let is_request_end =
-                                matches!(other, WorkerToServerIpcMessage::RequestEnd);
-                            if is_request_end {
-                                guard.request_end_seen = true;
-                            }
                             guard.queue.push_back(other);
                             reader_cvar.notify_all();
-                            drop(guard);
-                            if is_request_end && let Some(handler) = request_end_handler.as_ref() {
-                                handler();
-                            }
                         }
                     }
                 }
@@ -377,24 +378,10 @@ impl ServerIpcConnection {
 
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
-        guard
-            .queue
-            .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::RequestEnd));
         reset_after_completed_request(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
-    }
-
-    pub fn waiting_for_next_input(&self, min_wait: Duration) -> bool {
-        let guard = self.inbox.lock().unwrap();
-        if guard.readline_result_count == 0 || guard.readline_unmatched_starts == 0 {
-            return false;
-        }
-        let Some(since) = guard.readline_unmatched_since else {
-            return false;
-        };
-        since.elapsed() >= min_wait
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {
@@ -417,18 +404,19 @@ impl ServerIpcConnection {
         guard.protocol_warnings.drain(..).collect()
     }
 
-    pub fn wait_for_request_end(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+    pub fn wait_for_request_completion(
+        &self,
+        timeout: Duration,
+        stable_wait: Duration,
+    ) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if take_request_end(&mut guard) {
-                if take_session_end(&mut guard) {
-                    return Err(IpcWaitError::SessionEnd);
-                }
-                return Ok(());
-            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
+            }
+            if take_request_completion(&mut guard, stable_wait) {
+                return Ok(());
             }
             if guard.disconnected {
                 return Err(IpcWaitError::Disconnected);
@@ -438,11 +426,19 @@ impl ServerIpcConnection {
             if now >= deadline {
                 return Err(IpcWaitError::Timeout);
             }
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = completion_wait_duration(&guard, deadline, stable_wait);
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                return Err(IpcWaitError::Timeout);
+                if take_session_end(&mut guard) {
+                    return Err(IpcWaitError::SessionEnd);
+                }
+                if take_request_completion(&mut guard, stable_wait) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(IpcWaitError::Timeout);
+                }
             }
         }
     }
@@ -508,11 +504,6 @@ impl ServerIpcConnection {
                 return Err(IpcWaitError::Timeout);
             }
         }
-    }
-
-    pub fn try_take_request_end(&self) -> bool {
-        let mut guard = self.inbox.lock().unwrap();
-        take_request_end(&mut guard)
     }
 }
 
@@ -1329,29 +1320,19 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
     }
 }
 
-pub fn emit_plot_image(id: &str, mime_type: &str, data: &str, is_new: bool) {
+pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
-            id: id.to_string(),
             mime_type: mime_type.to_string(),
             data: data.to_string(),
-            is_new,
+            is_update,
         });
     }
 }
 
-pub fn emit_backend_info(language: &str, supports_images: bool) {
+pub fn emit_backend_info(supports_images: bool) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::BackendInfo {
-            language: language.to_string(),
-            supports_images,
-        });
-    }
-}
-
-pub fn emit_request_end() {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = ipc.send(WorkerToServerIpcMessage::BackendInfo { supports_images });
     }
 }
 
@@ -1394,23 +1375,48 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     true
 }
 
-fn take_request_end(guard: &mut ServerIpcInbox) -> bool {
-    let idx = guard
-        .queue
-        .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::RequestEnd));
-    let Some(idx) = idx else {
+fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
+    let Some(since) = guard.readline_unmatched_since else {
         return false;
     };
-    guard.queue.remove(idx);
+    guard.readline_unmatched_starts > 0 && since.elapsed() >= stable_wait
+}
+
+fn take_request_completion(guard: &mut ServerIpcInbox, stable_wait: Duration) -> bool {
+    if !request_completion_ready(guard, stable_wait) {
+        return false;
+    }
+    reset_request_progress(guard);
     true
 }
 
-fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
-    guard.request_end_seen = false;
+fn completion_wait_duration(
+    guard: &ServerIpcInbox,
+    deadline: Instant,
+    stable_wait: Duration,
+) -> Duration {
+    let now = Instant::now();
+    let until_deadline = deadline.saturating_duration_since(now);
+    let Some(since) = guard.readline_unmatched_since else {
+        return until_deadline;
+    };
+    let elapsed = since.elapsed();
+    if elapsed >= stable_wait {
+        Duration::from_millis(0)
+    } else {
+        until_deadline.min(stable_wait.saturating_sub(elapsed))
+    }
+}
+
+fn reset_request_progress(guard: &mut ServerIpcInbox) {
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;
+}
+
+fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
+    reset_request_progress(guard);
+    guard.request_image_id = None;
     guard.last_prompt = None;
 }
 
@@ -1420,6 +1426,141 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
         .iter()
         .position(|msg| matches!(msg, WorkerToServerIpcMessage::BackendInfo { .. }))?;
     guard.queue.remove(idx)
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::{
+        IpcHandlers, IpcTransport, ServerIpcConnection, WorkerIpcConnection,
+        WorkerToServerIpcMessage,
+    };
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn backend_info_protocol_does_not_include_language() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "backend_info",
+            "supports_images": true
+        }));
+
+        assert!(parsed.is_ok(), "backend_info should not require language");
+    }
+
+    #[test]
+    fn backend_info_protocol_rejects_language() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "backend_info",
+            "language": "r",
+            "supports_images": true
+        }));
+
+        assert!(parsed.is_err(), "backend_info should reject language");
+    }
+
+    #[test]
+    fn plot_image_protocol_uses_update_flag_without_worker_id() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": true
+        }));
+
+        assert!(
+            parsed.is_ok(),
+            "plot_image should not require worker image id"
+        );
+    }
+
+    #[test]
+    fn plot_image_protocol_rejects_worker_id_and_is_new() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "plot_image",
+            "id": "plot-1",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_new": true,
+            "is_update": false
+        }));
+
+        assert!(
+            parsed.is_err(),
+            "plot_image should reject old worker-owned image fields"
+        );
+    }
+
+    #[test]
+    fn request_end_is_not_part_of_worker_to_server_protocol() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "request_end"
+        }));
+
+        assert!(parsed.is_err(), "request_end should not deserialize");
+    }
+
+    #[test]
+    fn plot_image_updates_reuse_current_server_image_id() {
+        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
+        let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
+        let images = Arc::new(Mutex::new(Vec::new()));
+        let handler_images = images.clone();
+        let _server = ServerIpcConnection::new(
+            IpcTransport {
+                reader: Box::new(server_read),
+                writer: Box::new(server_write),
+            },
+            IpcHandlers {
+                on_plot_image: Some(Arc::new(move |image| {
+                    handler_images.lock().expect("image mutex").push(image);
+                })),
+                ..IpcHandlers::default()
+            },
+        )
+        .expect("server connection");
+        let worker = WorkerIpcConnection::new(IpcTransport {
+            reader: Box::new(worker_read),
+            writer: Box::new(worker_write),
+        })
+        .expect("worker connection");
+        let first = json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "first",
+            "is_update": false
+        })
+        .to_string();
+        let second = json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "second",
+            "is_update": true
+        })
+        .to_string();
+
+        worker
+            .send(serde_json::from_str(&first).expect("first image message"))
+            .expect("send first image");
+        worker
+            .send(serde_json::from_str(&second).expect("second image message"))
+            .expect("send second image");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            if images.lock().expect("image mutex").len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let images = images.lock().expect("image mutex");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].id, images[1].id);
+        assert!(images[0].is_new);
+        assert!(!images[1].is_new);
+        assert_eq!(images[0].data, "first");
+        assert_eq!(images[1].data, "second");
+    }
 }
 
 #[cfg(all(test, target_family = "windows"))]

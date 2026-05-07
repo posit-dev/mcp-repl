@@ -11,15 +11,19 @@ This future work item covers the larger simplification goal behind the current o
 
 This is intentionally broader than the current branch milestone.
 
-## Why This Is Deferred
+## Status
 
-The immediate milestone is narrower:
+This simplification has started: request completion is now inferred by the
+server from prompt/readline sideband facts instead of a worker-emitted
+request-boundary message. The remaining work is to simplify worker code around
+that contract and broaden the design where needed.
 
-- fix the reported bug where an R plot image can appear after later stdout text,
-- do the refactoring required to fix that ordering correctly,
-- avoid expanding the branch into a full completion-model redesign.
+The original motivation was broader than one bug fix:
 
-The current server and both backends still depend on `request_end` in multiple places. Removing or redefining that contract safely needs a dedicated phase.
+- keep the worker thin and factual,
+- keep timeline interpretation in the server,
+- avoid expanding plot/image ordering code with worker-owned request-boundary
+  state.
 
 ## Intended Direction
 
@@ -29,13 +33,11 @@ The current server and both backends still depend on `request_end` in multiple p
 
 ## Likely Follow-On Work
 
-- Revisit whether `request_end` is needed for R once server-side completion inference is well-defined.
 - Separate top-level idle-prompt detection from nested prompt flows such as `browser()` and `readline()`.
 - Decide whether the same simplification should apply to Python or whether Python should keep a different completion contract.
 - Re-evaluate the current R plot-capture mechanism independently from request-completion semantics.
 
 ## Non-Goals For The Current Branch
 
-- Removing `request_end` across the whole system.
 - Redesigning Python completion.
 - Landing a broader R worker architecture rewrite.

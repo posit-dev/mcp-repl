@@ -191,10 +191,9 @@ def _emit_plots():
         _send(
             {
                 "type": "plot_image",
-                "id": f"plot-{_plot_pid}-{fig_num}",
                 "mime_type": "image/png",
                 "data": encoded,
-                "is_new": bool(is_new),
+                "is_update": not bool(is_new),
             }
         )
     with _plot_lock:
@@ -227,7 +226,6 @@ def _emit_backend_info():
     _send(
         {
             "type": "backend_info",
-            "language": "python",
             "supports_images": _plot_capable,
         }
     )
@@ -242,9 +240,9 @@ class _Prompt(str):
     def __str__(self):
         global _last_prompt
         _last_prompt = super().__str__()
-        # Emit prompt + request_end even if readline pre_input_hook is not invoked (e.g. after some
-        # interrupts). Only emit for the primary prompt; continuation prompts are handled by the
-        # pre_input hook and emitting from sys.ps2 can interfere with prompt selection.
+        # Emit prompt even if readline pre_input_hook is not invoked (e.g. after some interrupts).
+        # Only emit for the primary prompt; continuation prompts are handled by the pre_input hook
+        # and emitting from sys.ps2 can interfere with prompt selection.
         if self.emit:
             _emit_prompt(_last_prompt)
         return _last_prompt
@@ -265,7 +263,7 @@ def _stdin_has_data():
     # We only want to end a request when Python is about to block waiting on input.
     # When the server sends a multi-line chunk, the interpreter may produce prompts
     # between internal reads while stdin still has buffered data. In that case we
-    # must NOT emit request_end yet.
+    # must NOT finish the request yet.
     try:
         readable, _, _ = select.select([0], [], [], 0)
         return bool(readable)
@@ -363,7 +361,7 @@ def _discard_pending_request_input():
             _interrupt_pending = False
 
 
-def _emit_request_end_if_idle():
+def _finish_request_if_idle():
     if not _has_request_active():
         return
     if _stdin_has_data():
@@ -371,23 +369,22 @@ def _emit_request_end_if_idle():
     _emit_plots()
     if not _take_request_active():
         return
-    # Best-effort: ensure the client observes all output written for the request before the
-    # request_end event. The Rust side uses a short "settle" window after request_end too.
+    # Best-effort: ensure the client observes output written before the prompt that marks the
+    # request as complete. The Rust side also uses a short settle window after completion.
     try:
         sys.stdout.flush()
         sys.stderr.flush()
     except Exception:
         pass
-    _send({"type": "request_end"})
 
 
-def _emit_prompt(prompt=None, emit_request_end=True):
+def _emit_prompt(prompt=None, finish_request=True):
     _discard_pending_request_input()
     if prompt is None:
         prompt = _last_prompt or _primary_prompt or getattr(sys, "ps1", ">>> ")
     _send({"type": "readline_start", "prompt": str(prompt)})
-    if emit_request_end:
-        _emit_request_end_if_idle()
+    if finish_request:
+        _finish_request_if_idle()
 
 
 def _pydoc_plainpager(text, title=""):

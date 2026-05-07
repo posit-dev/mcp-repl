@@ -454,7 +454,11 @@ fn render_plot_transcript(snapshot: &PlotTranscriptSnapshot) -> String {
         }
 
         for line in plot_response_lines(&step.response) {
-            out.push_str(&format!("<<< {line}\n"));
+            if line.is_empty() {
+                out.push_str("<<<\n");
+            } else {
+                out.push_str(&format!("<<< {line}\n"));
+            }
         }
 
         if let Some(reference) = &step.reference {
@@ -617,6 +621,12 @@ async fn plots_emit_images_and_updates() -> TestResult<()> {
     assert_ne!(
         plot_images[0].bytes, update_images[0].bytes,
         "expected updated plot image to differ from initial plot"
+    );
+    assert!(
+        result_text(&update_result)
+            .contains("[repl] image update from previous request shown as a new image"),
+        "expected update response to include server notice, got: {}",
+        result_text(&update_result)
     );
     assert_reference_image("base_plot", &plot_images[0].bytes);
     assert_reference_image("base_plot_update", &update_images[0].bytes);

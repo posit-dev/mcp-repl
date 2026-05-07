@@ -789,9 +789,6 @@ fn complete_active_request(
     emit_session_end: bool,
 ) {
     if let Some(active) = active {
-        // Keep the request boundary coupled to the same R-thread decision that
-        // drained the final queued input line.
-        ipc::emit_request_end();
         let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
     }
@@ -1005,7 +1002,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&plot_id, &mime_type, &data, is_new);
+    ipc::emit_plot_image(&mime_type, &data, !is_new);
 
     Ok(())
 }

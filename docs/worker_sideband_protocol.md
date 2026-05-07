@@ -35,9 +35,14 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 
 ## Direction: worker -> server
 
+Worker-to-server messages are strict: unknown fields are protocol errors.
+
 `backend_info`
-- `{ "type": "backend_info", "language": <string>, "supports_images": <bool> }`
+- `{ "type": "backend_info", "supports_images": <bool> }`
 - Sent once on startup after the sideband connection is established.
+- This is startup metadata. It may describe narrow worker capabilities, but it
+  must not turn steady-state server request handling into language-specific
+  policy.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string> }`
@@ -50,13 +55,12 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 - The server can reconstruct echoed readline bytes as `prompt + line` for conservative
   echo suppression. Output streams remain unframed.
 
-`request_end`
-- `{ "type": "request_end" }`
-- Marks the end of output for the request. This is the primary completion signal.
-
 `plot_image`
-- `{ "type": "plot_image", "id": <string>, "mime_type": <string>, "data": <base64>, "is_new": <bool> }`
+- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool> }`
 - Image payload for plot updates.
+- If an update is the first image event for a new server request, the server
+  treats it as a new response image and includes a server notice that it updates
+  the previously sent image.
 
 `session_end`
 - `{ "type": "session_end" }`
@@ -65,8 +69,13 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 ## Notes
 
 - Output streams (stdout/stderr) remain on the main pipes and are captured separately.
-- The server uses `request_end` as the logical completion signal for a request.
-- To reduce IPC-vs-output capture races, the server applies a short post-`request_end` settle
-  window so output reader threads can drain final bytes before snapshotting output.
-- On timeout, a request may remain pending; later polls can observe the delayed `request_end`
-  and finish the request.
+- The server infers request completion when prompt/readline sideband facts show
+  that the worker is waiting for the next input.
+- To reduce IPC-vs-output capture races, the server applies a short
+  post-completion settle window so output reader threads can drain final bytes
+  before snapshotting output.
+- On timeout, a request may remain pending; later polls can observe the inferred
+  completion state and finish the request.
+- Backend-specific execution rules should be implemented by the worker. Server
+  branching on backend is reserved for interpreter selection, launch setup, tool
+  description selection, or narrow capabilities reported at startup.

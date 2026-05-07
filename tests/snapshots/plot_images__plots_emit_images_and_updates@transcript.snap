@@ -15,6 +15,8 @@ expression: transcript
 
 2) r_repl
 >>> lines(4:8, 4:8)
+<<< [repl] image update from previous request shown as a new image
+<<<
 <<< [image/png blake3:<base_plot_update>]
 === reference base_plot_update via Rscript --vanilla -
 === env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>

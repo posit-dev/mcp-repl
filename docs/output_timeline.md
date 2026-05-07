@@ -9,7 +9,7 @@ The worker emits different kinds of information on different channels:
 
 - stdout/stderr bytes travel on the normal process pipes.
 - Sideband IPC carries structural events such as `readline_start`,
-  `readline_result`, `plot_image`, `request_end`, and `session_end`.
+  `readline_result`, `plot_image`, and `session_end`.
 
 Those channels do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
