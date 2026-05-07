@@ -1250,13 +1250,14 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
         "expected rejected interrupt follow-up to leave the old request running, got: {busy_follow_up_text}"
     );
 
-    let mut final_poll_text = String::new();
+    let mut final_poll_text = busy_follow_up_text.clone();
     for _ in 0..20 {
         let final_poll = session
             .write_stdin_raw_with_meta("", Some(0.2), Some(workspace_write_meta(temp.path())))
             .await?;
-        final_poll_text = common::result_text(&final_poll);
-        if !final_poll_text.contains("<<repl status: busy") {
+        let poll_text = common::result_text(&final_poll);
+        final_poll_text.push_str(&poll_text);
+        if !poll_text.contains("<<repl status: busy") && final_poll_text.contains("TAIL") {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

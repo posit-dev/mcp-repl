@@ -1658,10 +1658,21 @@ tryCatch({
                         if normalized_key == "turn_started_at_unix_ms" {
                             continue;
                         }
+                        if path_matches(path, &["x-codex-turn-metadata"])
+                            && matches!(
+                                normalized_key.as_str(),
+                                "thread_id" | "thread_source" | "model" | "reasoning_effort"
+                            )
+                        {
+                            continue;
+                        }
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
                         map.insert(normalized_key, child);
+                    }
+                    if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
+                        map.insert("form".to_string(), Value::Object(serde_json::Map::new()));
                     }
                 }
                 Value::Array(items) => {
@@ -1745,6 +1756,62 @@ tryCatch({
                 }
             }),
             "wire snapshots should not retain per-run turn timestamps"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_volatile_turn_metadata_fields() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "x-codex-turn-metadata": {
+                "session_id": "session-1",
+                "thread_id": "019e0388-ee09-70a3-8c94-c356d55b7b49",
+                "thread_source": "user",
+                "turn_id": "turn-1",
+                "sandbox": "seatbelt",
+                "model": "gpt-5.5",
+                "reasoning_effort": "medium"
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "x-codex-turn-metadata": {
+                    "session_id": "<SESSION_ID>",
+                    "turn_id": "<TURN_ID>",
+                    "sandbox": "<SANDBOX_BACKEND>"
+                }
+            }),
+            "wire snapshots should not retain volatile Codex turn metadata fields"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_normalizes_empty_elicitation_capability() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "capabilities": {
+                "elicitation": {}
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "capabilities": {
+                    "elicitation": {
+                        "form": {}
+                    }
+                }
+            }),
+            "wire snapshots should normalize Codex elicitation capability shape"
         );
     }
 

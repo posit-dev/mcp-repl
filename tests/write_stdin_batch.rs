@@ -205,12 +205,27 @@ async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestR
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
-    let session = common::spawn_server().await?;
+    let mut session = common::spawn_server().await?;
+
+    let warmup = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let warmup = common::wait_until_not_busy(
+        &mut session,
+        warmup,
+        Duration::from_millis(100),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let warmup_text = collect_text(&warmup);
+    if backend_unavailable(&warmup_text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
     let first = session
         .write_stdin_raw_with(
-            "cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")",
-            Some(0.5),
+            "cat(\"start\\n\"); flush.console(); Sys.sleep(2); cat(\"end\\n\")",
+            Some(1.0),
         )
         .await?;
     let first_text = collect_text(&first);
@@ -228,7 +243,7 @@ async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> 
         "expected timeout status marker, got: {first_text:?}"
     );
 
-    let second = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let second = session.write_stdin_raw_with("", Some(3.0)).await?;
     let second_text = collect_text(&second);
     session.cancel().await?;
 

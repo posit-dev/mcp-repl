@@ -56,7 +56,16 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
 - Emitted after a line is read. Includes the prompt and the line that was consumed.
 - The server can reconstruct echoed readline bytes as `prompt + line` for conservative
-  echo suppression. Output streams remain unframed.
+  echo suppression of raw pipe output.
+
+`output_text`
+- `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64> }`
+- Carries worker-owned text bytes on the ordered IPC stream. The payload is base64
+  so workers can preserve bytes without depending on JSON string encoding.
+- Workers send output-critical frames synchronously: each JSON line is written,
+  newline-terminated, and flushed before the send returns.
+- Workers treat synchronous write failure as IPC failure. They must not silently
+  fall back to stdout or stderr for output that is owned by the worker protocol.
 
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
@@ -76,7 +85,8 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 
 ## Notes
 
-- Output streams (stdout/stderr) remain on the main pipes and are captured separately.
+- Raw stdout/stderr capture remains active for unowned output, such as child
+  processes or direct file-descriptor writes.
 - The server infers request completion when prompt/readline sideband facts show
   that the worker is waiting for the next input.
 - To reduce IPC-vs-output capture races, the server applies a short
