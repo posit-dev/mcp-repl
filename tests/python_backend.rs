@@ -5,7 +5,7 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 use tokio::time::{Duration, Instant, sleep};
@@ -145,6 +145,46 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
 const DETACHED_STDIO_HOLDER_SECS: f64 = 2.5;
 
 #[cfg(unix)]
+struct DetachedHolderProbe {
+    _dir: tempfile::TempDir,
+    marker_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl DetachedHolderProbe {
+    fn new() -> TestResult<Self> {
+        let dir = tempdir()?;
+        Ok(Self {
+            marker_path: dir.path().join("holder-exited"),
+            _dir: dir,
+        })
+    }
+
+    fn marker_literal(&self) -> TestResult<String> {
+        let marker = self
+            .marker_path
+            .to_str()
+            .ok_or("detached holder marker path must be valid utf-8")?;
+        Ok(serde_json::to_string(marker)?)
+    }
+
+    async fn wait_for_exit(&self) -> TestResult<()> {
+        wait_for_detached_holder_exit(&self.marker_path).await
+    }
+}
+
+async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if marker_path.exists() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("detached holder did not exit: {}", marker_path.display()).into())
+}
+
+#[cfg(unix)]
 fn shutdown_completion_budget() -> Duration {
     if cfg!(target_os = "macos") {
         Duration::from_millis(1_500)
@@ -154,12 +194,19 @@ fn shutdown_completion_budget() -> Duration {
 }
 
 #[cfg(unix)]
-async fn arm_detached_stdio_holder(session: &mut common::McpTestSession) -> TestResult<()> {
+async fn arm_detached_stdio_holder(
+    session: &mut common::McpTestSession,
+) -> TestResult<DetachedHolderProbe> {
+    let holder = DetachedHolderProbe::new()?;
+    let marker_literal = holder.marker_literal()?;
     let setup = session
         .write_stdin_raw_with(
             format!(
                 r#"import subprocess, sys
-script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+script = """import pathlib, time
+time.sleep({DETACHED_STDIO_HOLDER_SECS})
+pathlib.Path({marker_literal}).write_text('done')
+"""
 subprocess.Popen(
     [sys.executable, "-c", script],
     stdin=subprocess.DEVNULL,
@@ -180,16 +227,23 @@ print("detached ready")
         setup_text.contains("detached ready"),
         "expected detached-stdio setup reply, got: {setup_text:?}"
     );
-    Ok(())
+    Ok(holder)
 }
 
 #[cfg(unix)]
-async fn arm_background_ipc_holder(session: &mut common::McpTestSession) -> TestResult<()> {
+async fn arm_background_ipc_holder(
+    session: &mut common::McpTestSession,
+) -> TestResult<DetachedHolderProbe> {
+    let holder = DetachedHolderProbe::new()?;
+    let marker_literal = holder.marker_literal()?;
     let setup = session
         .write_stdin_raw_with(
             format!(
                 r#"import subprocess, sys
-script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
+script = """import pathlib, time
+time.sleep({DETACHED_STDIO_HOLDER_SECS})
+pathlib.Path({marker_literal}).write_text('done')
+"""
 subprocess.Popen(
     [sys.executable, "-c", script],
     stdin=subprocess.DEVNULL,
@@ -212,7 +266,7 @@ print("ipc background ready")
         setup_text.contains("ipc background ready"),
         "expected background-ipc setup reply, got: {setup_text:?}"
     );
-    Ok(())
+    Ok(holder)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -411,11 +465,12 @@ exec("pid = os.fork()\nif pid == 0:\n    os._exit(0)\n_, status = os.waitpid(pid
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
-    arm_detached_stdio_holder(&mut session).await?;
+    let holder = arm_detached_stdio_holder(&mut session).await?;
 
     let start = Instant::now();
     let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
@@ -423,6 +478,7 @@ async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()
     let quit_text = result_text(&quit);
     if is_busy_response(&quit_text) {
         eprintln!("python_quit_does_not_wait_for_detached_stdio_holders remained busy on quit");
+        holder.wait_for_exit().await?;
         session.cancel().await?;
         return Ok(());
     }
@@ -440,10 +496,12 @@ async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()
         eprintln!(
             "python_quit_does_not_wait_for_detached_stdio_holders remained busy after respawn"
         );
+        holder.wait_for_exit().await?;
         session.cancel().await?;
         return Ok(());
     }
 
+    holder.wait_for_exit().await?;
     session.cancel().await?;
 
     assert!(
@@ -456,6 +514,7 @@ async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_respawn_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
@@ -523,11 +582,12 @@ print("detached respawn armed")
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
-    arm_background_ipc_holder(&mut session).await?;
+    let holder = arm_background_ipc_holder(&mut session).await?;
 
     let start = Instant::now();
     let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
@@ -535,6 +595,7 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
     let quit_text = result_text(&quit);
     if is_busy_response(&quit_text) {
         eprintln!("python_quit_does_not_wait_for_background_ipc_holders remained busy on quit");
+        holder.wait_for_exit().await?;
         session.cancel().await?;
         return Ok(());
     }
@@ -552,10 +613,12 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
         eprintln!(
             "python_quit_does_not_wait_for_background_ipc_holders remained busy after respawn"
         );
+        holder.wait_for_exit().await?;
         session.cancel().await?;
         return Ok(());
     }
 
+    holder.wait_for_exit().await?;
     session.cancel().await?;
 
     assert!(
@@ -568,6 +631,7 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
@@ -1051,13 +1115,22 @@ print("parent ready")
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let marker_dir = tempdir()?;
+    let marker_path = marker_dir.path().join("idle-tail-written");
+    let marker = marker_path
+        .to_str()
+        .ok_or("idle marker path must be valid utf-8")?;
+    let marker_literal = serde_json::to_string(marker)?;
 
     let arm = session
         .write_stdin_raw_with(
-            "import os, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), os._exit(0)), daemon=True).start()",
+            format!(
+                "import os, pathlib, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), pathlib.Path({marker_literal}).write_text('done'), os._exit(0)), daemon=True).start()"
+            ),
             Some(5.0),
         )
         .await?;
@@ -1074,7 +1147,7 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
         "expected arming output, got: {arm_text:?}"
     );
 
-    sleep(Duration::from_millis(500)).await;
+    wait_for_detached_holder_exit(&marker_path).await?;
     let reply = session
         .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
         .await?;
@@ -1103,6 +1176,7 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
