@@ -40,7 +40,18 @@ pub(crate) fn collapse_echo_with_attribution(
     let bytes = range.bytes;
     let text_spans = range.text_spans;
 
-    let mut anchored_images: BTreeMap<usize, Vec<OutputEventKind>> = BTreeMap::new();
+    let mut anchored_events: BTreeMap<usize, Vec<OutputEventKind>> = BTreeMap::new();
+    let saw_event_output = Cell::new(false);
+    let anchor_idx_for_readline_count = |readline_results_seen: usize| {
+        if echo_event_base > 0 && readline_results_seen <= echo_event_base {
+            // If the matching echo was drained earlier, anchor before the
+            // first remaining echo when there is one. Otherwise keep the event
+            // at its rendered offset in the current snapshot.
+            return (!echo_events.is_empty()).then_some(0);
+        }
+        let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
+        (!echo_events.is_empty() && anchor_idx < echo_events.len()).then_some(anchor_idx)
+    };
 
     let mut events: Vec<(usize, OutputEventKind)> = range
         .events
@@ -50,35 +61,42 @@ pub(crate) fn collapse_echo_with_attribution(
                 return None;
             }
             let rel = event.offset.saturating_sub(base_offset) as usize;
-            match event.kind {
+            let anchor_idx = match &event.kind {
                 OutputEventKind::Image {
                     readline_results_seen,
                     ..
-                } if (echo_event_base > 0 && readline_results_seen <= echo_event_base)
-                    || readline_results_seen.saturating_sub(echo_event_base)
-                        < echo_events.len() =>
-                {
-                    let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
-                    anchored_images
-                        .entry(anchor_idx)
-                        .or_default()
-                        .push(event.kind);
-                    None
-                }
-                kind => Some((rel.min(bytes.len()), kind)),
+                } => anchor_idx_for_readline_count(*readline_results_seen),
+                OutputEventKind::Text {
+                    readline_results_seen: Some(readline_results_seen),
+                    ..
+                } => anchor_idx_for_readline_count(*readline_results_seen),
+                OutputEventKind::Text {
+                    readline_results_seen: None,
+                    ..
+                } => None,
+            };
+            if let Some(anchor_idx) = anchor_idx {
+                anchored_events
+                    .entry(anchor_idx)
+                    .or_default()
+                    .push(event.kind);
+                None
+            } else {
+                Some((rel.min(bytes.len()), event.kind))
             }
         })
         .collect();
     events.sort_by_key(|(offset, _)| *offset);
 
-    let flush_anchored_images =
+    let flush_anchored_events =
         |anchor_idx: usize,
-         anchored_images: &mut BTreeMap<usize, Vec<OutputEventKind>>,
+         anchored_events: &mut BTreeMap<usize, Vec<OutputEventKind>>,
          out_bytes: &Vec<u8>,
          out_events: &mut Vec<(u64, OutputEventKind)>| {
-            if let Some(images) = anchored_images.remove(&anchor_idx) {
-                for image in images {
-                    out_events.push((out_bytes.len() as u64, image));
+            if let Some(events) = anchored_events.remove(&anchor_idx) {
+                for event in events {
+                    saw_event_output.set(true);
+                    out_events.push((out_bytes.len() as u64, event));
                 }
             }
         };
@@ -121,12 +139,19 @@ pub(crate) fn collapse_echo_with_attribution(
     };
 
     let discard_pending_for_event = |pending: &mut PendingEchoRun| {
+        saw_event_output.set(true);
         if pending.is_empty() {
             saw_substantive_output.set(true);
             return;
         }
         pending.take();
         saw_substantive_output.set(true);
+    };
+    let discard_pending_for_ordered_event = |pending: &mut PendingEchoRun| {
+        saw_event_output.set(true);
+        if !pending.is_empty() {
+            pending.take();
+        }
     };
 
     let mut cursor = 0usize;
@@ -144,19 +169,25 @@ pub(crate) fn collapse_echo_with_attribution(
                 &saw_substantive_output,
                 mode,
                 &mut flush_pending,
-                &mut anchored_images,
+                &mut anchored_events,
                 &mut out_bytes,
                 &mut out_text_spans,
                 &mut out_events,
-                &flush_anchored_images,
+                &flush_anchored_events,
             );
             cursor = event_offset;
         }
 
         match &kind {
-            OutputEventKind::Text { .. } => {
+            OutputEventKind::Text {
+                readline_results_seen: None,
+                ..
+            } => {
                 saw_substantive_output.set(true);
                 flush_pending(&mut out_bytes, &mut out_text_spans, &mut pending);
+            }
+            kind if event_has_readline_ordering(kind) => {
+                discard_pending_for_ordered_event(&mut pending);
             }
             _ => discard_pending_for_event(&mut pending),
         }
@@ -175,18 +206,19 @@ pub(crate) fn collapse_echo_with_attribution(
             &saw_substantive_output,
             mode,
             &mut flush_pending,
-            &mut anchored_images,
+            &mut anchored_events,
             &mut out_bytes,
             &mut out_text_spans,
             &mut out_events,
-            &flush_anchored_images,
+            &flush_anchored_events,
         );
     }
 
-    while let Some((_, images)) = anchored_images.pop_first() {
-        discard_pending_for_event(&mut pending);
-        for image in images {
-            out_events.push((out_bytes.len() as u64, image));
+    while let Some((_, events)) = anchored_events.pop_first() {
+        discard_pending_for_ordered_event(&mut pending);
+        for event in events {
+            saw_event_output.set(true);
+            out_events.push((out_bytes.len() as u64, event));
         }
     }
 
@@ -196,6 +228,7 @@ pub(crate) fn collapse_echo_with_attribution(
     if matches!(mode, EchoCollapseMode::Preserve)
         && !pending.is_empty()
         && !saw_substantive_output.get()
+        && !saw_event_output.get()
     {
         let pending = pending.take();
         append_text_with_span(
@@ -212,6 +245,17 @@ pub(crate) fn collapse_echo_with_attribution(
         events: out_events,
         text_spans: out_text_spans,
     }
+}
+
+fn event_has_readline_ordering(kind: &OutputEventKind) -> bool {
+    matches!(
+        kind,
+        OutputEventKind::Image { .. }
+            | OutputEventKind::Text {
+                readline_results_seen: Some(_),
+                ..
+            }
+    )
 }
 
 #[derive(Default)]
@@ -378,11 +422,11 @@ fn consume_text_segment_with_spans(
     saw_substantive_output: &Cell<bool>,
     mode: EchoCollapseMode,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
-    anchored_images: &mut BTreeMap<usize, Vec<OutputEventKind>>,
+    anchored_events: &mut BTreeMap<usize, Vec<OutputEventKind>>,
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
     out_events: &mut Vec<(u64, OutputEventKind)>,
-    flush_anchored_images: &impl Fn(
+    flush_anchored_events: &impl Fn(
         usize,
         &mut BTreeMap<usize, Vec<OutputEventKind>>,
         &Vec<u8>,
@@ -412,11 +456,11 @@ fn consume_text_segment_with_spans(
                 saw_substantive_output,
                 mode,
                 flush_pending,
-                anchored_images,
+                anchored_events,
                 out_bytes,
                 out_text_spans,
                 out_events,
-                flush_anchored_images,
+                flush_anchored_events,
             );
         }
         consume_text_segment(
@@ -430,11 +474,11 @@ fn consume_text_segment_with_spans(
             saw_substantive_output,
             mode,
             flush_pending,
-            anchored_images,
+            anchored_events,
             out_bytes,
             out_text_spans,
             out_events,
-            flush_anchored_images,
+            flush_anchored_events,
         );
         cursor = end;
     }
@@ -450,11 +494,11 @@ fn consume_text_segment_with_spans(
             saw_substantive_output,
             mode,
             flush_pending,
-            anchored_images,
+            anchored_events,
             out_bytes,
             out_text_spans,
             out_events,
-            flush_anchored_images,
+            flush_anchored_events,
         );
     }
 }
@@ -471,11 +515,11 @@ fn consume_text_segment(
     saw_substantive_output: &Cell<bool>,
     mode: EchoCollapseMode,
     flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
-    anchored_images: &mut BTreeMap<usize, Vec<OutputEventKind>>,
+    anchored_events: &mut BTreeMap<usize, Vec<OutputEventKind>>,
     out_bytes: &mut Vec<u8>,
     out_text_spans: &mut Vec<OutputTextSpan>,
     out_events: &mut Vec<(u64, OutputEventKind)>,
-    flush_anchored_images: &impl Fn(
+    flush_anchored_events: &impl Fn(
         usize,
         &mut BTreeMap<usize, Vec<OutputEventKind>>,
         &Vec<u8>,
@@ -500,7 +544,7 @@ fn consume_text_segment(
             None
         };
         if let Some(prefix_len) = echo_prefix {
-            flush_anchored_images(*echo_idx, anchored_images, out_bytes, out_events);
+            flush_anchored_events(*echo_idx, anchored_events, out_bytes, out_events);
             match mode {
                 EchoCollapseMode::Preserve | EchoCollapseMode::CollapseForFinalReply => {
                     if !saw_substantive_output.get() {
@@ -795,6 +839,7 @@ mod tests {
                     text: "[repl] output truncated (older output dropped)\n".to_string(),
                     is_stderr: false,
                     origin: ContentOrigin::Server,
+                    readline_results_seen: None,
                 },
             }],
             text_spans: vec![OutputTextSpan {
@@ -824,6 +869,63 @@ mod tests {
             vec![
                 WorkerContent::stdout("> y500 <- 500\n"),
                 WorkerContent::server_stdout("[repl] output truncated (older output dropped)\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn event_after_final_echo_stays_before_later_output() {
+        let echo = b"> input(); plot(1:10); cat('done\\n')\n";
+        let output = b"done\n";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(echo);
+        bytes.extend_from_slice(output);
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: vec![OutputEvent {
+                offset: echo.len() as u64,
+                kind: OutputEventKind::Image {
+                    data: "img".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "plot-1".to_string(),
+                    is_new: true,
+                    readline_results_seen: 1,
+                },
+            }],
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: echo.len() + output.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "input(); plot(1:10); cat('done\\n')\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            (echo.len() + output.len()) as u64,
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::ContentImage {
+                    data: "img".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "plot-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::stdout("done\n"),
             ]
         );
     }

@@ -479,6 +479,166 @@ async fn python_plots_emit_images_and_updates() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_prompt_time_plot_flushes_before_completion_prompt() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        r#"{}
+import time
+fig = plt.figure(101)
+plt.clf()
+original_savefig = fig.savefig
+def slow_savefig(*args, **kwargs):
+    time.sleep(0.35)
+    return original_savefig(*args, **kwargs)
+fig.savefig = slow_savefig
+plt.scatter([1, 2, 3], [3, 2, 1])"#,
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "scatter plot reported an error: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected prompt-time scatter plot to emit one image in the current response, got {images:?}; response text: {}",
+        result_text(&result)
+    );
+    assert_eq!(images[0].mime_type, "image/png");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let plot_input = format!(
+        "{}; plt.figure(17); plt.clf(); plt.plot([1, 2, 3]); plt.show()",
+        python_plot_preamble()
+    );
+    let plot_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    assert_ne!(
+        plot_result.is_error,
+        Some(true),
+        "plot reported an error: {}",
+        result_text(&plot_result)
+    );
+    assert_eq!(
+        extract_images(&plot_result).len(),
+        1,
+        "expected initial plot request to emit one image"
+    );
+
+    let noop_result = session.write_stdin_raw_with("1+1", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        noop_result.is_error,
+        Some(true),
+        "1+1 reported an error: {}",
+        result_text(&noop_result)
+    );
+    assert_no_images(&noop_result, "python no-op after existing plot");
+    let noop_text = result_text(&noop_result);
+    assert!(
+        !noop_text.contains("[repl] image update from previous request"),
+        "did not expect unchanged figure update notice in no-op response: {noop_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_explicit_repeat_plot_and_show_emit_images_in_same_session() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let plot_input = format!(
+        "{}; plt.figure(21); plt.clf(); plt.plot(list(range(1, 11))); plt.show()",
+        python_plot_preamble()
+    );
+    let first_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let repeat_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let show_result = session
+        .write_stdin_raw_with("plt.show()", Some(30.0))
+        .await?;
+    let noop_result = session.write_stdin_raw_with("1+1", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first plot reported an error: {}",
+        result_text(&first_result)
+    );
+    assert_ne!(
+        repeat_result.is_error,
+        Some(true),
+        "repeat plot reported an error: {}",
+        result_text(&repeat_result)
+    );
+    assert_ne!(
+        show_result.is_error,
+        Some(true),
+        "explicit show reported an error: {}",
+        result_text(&show_result)
+    );
+
+    let first_images = extract_images(&first_result);
+    let repeat_images = extract_images(&repeat_result);
+    let show_images = extract_images(&show_result);
+
+    assert_eq!(
+        first_images.len(),
+        1,
+        "expected first plot to emit one image"
+    );
+    assert_eq!(
+        repeat_images.len(),
+        1,
+        "expected explicit repeat plot to emit one image"
+    );
+    assert_eq!(
+        show_images.len(),
+        1,
+        "expected explicit show to emit one image"
+    );
+    assert_eq!(
+        first_images[0].bytes, repeat_images[0].bytes,
+        "expected explicit repeat plot to preserve image bytes"
+    );
+    assert_eq!(
+        first_images[0].bytes, show_images[0].bytes,
+        "expected explicit show to preserve image bytes"
+    );
+    assert_no_images(&noop_result, "python no-op after explicit repeat plot");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_plots_emit_stable_images_for_repeats() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
@@ -830,6 +990,70 @@ async fn python_plot_updates_in_single_request_collapse() -> TestResult<()> {
         images.len(),
         1,
         "expected a single collapsed image update, got {images:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_multi_figure_updates_in_single_request_keep_distinct_images() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let initial_input = format!(
+        r#"{}
+plt.figure(1)
+plt.clf()
+plt.plot([1, 2, 3], [1, 2, 3])
+plt.figure(2)
+plt.clf()
+plt.plot([1, 2, 3], [3, 2, 1])"#,
+        python_plot_preamble()
+    );
+    let initial_result = session
+        .write_stdin_raw_with(&initial_input, Some(30.0))
+        .await?;
+    assert_ne!(
+        initial_result.is_error,
+        Some(true),
+        "initial multi-figure plot reported an error: {}",
+        result_text(&initial_result)
+    );
+    assert_eq!(
+        extract_images(&initial_result).len(),
+        2,
+        "expected initial request to emit two distinct figures"
+    );
+
+    let update_input = r#"plt.figure(1)
+plt.plot([1, 2, 3], [3, 3, 3])
+plt.figure(2)
+plt.plot([1, 2, 3], [1, 1, 1])"#;
+    let update_result = session
+        .write_stdin_raw_with(update_input, Some(30.0))
+        .await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        update_result.is_error,
+        Some(true),
+        "multi-figure update reported an error: {}",
+        result_text(&update_result)
+    );
+    let update_text = result_text(&update_result);
+    assert_eq!(
+        update_text
+            .matches("[repl] image update from previous request shown as a new image")
+            .count(),
+        2,
+        "expected one update notice per updated figure, got: {update_text:?}"
+    );
+    assert_eq!(
+        extract_images(&update_result).len(),
+        2,
+        "expected updates to two existing figures to remain distinct in one response"
     );
 
     Ok(())

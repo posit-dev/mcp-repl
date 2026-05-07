@@ -38,6 +38,10 @@ expression: serialized
       "response": {
         "content": [
           {
+            "type": "text",
+            "text": "[repl] image update from previous request shown as a new image\n"
+          },
+          {
             "type": "image",
             "data": "blake3:<base_plot_update>",
             "mimeType": "image/png"

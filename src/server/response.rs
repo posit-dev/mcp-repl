@@ -683,33 +683,27 @@ impl ResponseState {
         mut active: ActiveOutputBundle,
         spill_worker_text_chars: usize,
     ) -> FollowUpDetachedPrefix {
-        let contents = if material.detached_prefix_items.is_empty() {
-            Vec::new()
-        } else {
-            match render_active_bundle_contents(
-                &mut self.output_store,
-                &mut active,
-                &material.detached_prefix_items,
-                &material.detached_prefix_inline_items,
-                spill_worker_text_chars,
-            ) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    let protected_bundle_id = active.was_disclosed().then_some(active.id);
-                    if let Err(err) = self.finish_bundle(active) {
-                        eprintln!(
-                            "dropping closed timeout bundle after output-bundle error: {err}"
-                        );
-                    }
-                    return FollowUpDetachedPrefix {
-                        contents: compact_detached_prefix_without_output_bundle(material),
-                        protected_bundle_id,
-                        retained_active_timeout_bundle: None,
-                        retained_staged_timeout_output: None,
-                        retained_bundle_is_detached_prefix_only: false,
-                    };
+        let contents = match render_active_bundle_contents(
+            &mut self.output_store,
+            &mut active,
+            &material.detached_prefix_items,
+            &material.detached_prefix_inline_items,
+            spill_worker_text_chars,
+        ) {
+            Ok(contents) => contents,
+            Err(err) => {
+                eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                let protected_bundle_id = active.was_disclosed().then_some(active.id);
+                if let Err(err) = self.finish_bundle(active) {
+                    eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
                 }
+                return FollowUpDetachedPrefix {
+                    contents: compact_detached_prefix_without_output_bundle(material),
+                    protected_bundle_id,
+                    retained_active_timeout_bundle: None,
+                    retained_staged_timeout_output: None,
+                    retained_bundle_is_detached_prefix_only: false,
+                };
             }
         };
         let protected_bundle_id = active.was_disclosed().then_some(active.id);
@@ -3594,6 +3588,58 @@ mod tests {
         assert!(
             transcript.contains("TAIL\n"),
             "expected later small poll output to append to the existing timeout bundle, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_image_bundle_follow_up_without_detached_prefix_does_not_replay() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        for index in 0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+            let image = ReplyImage {
+                id: format!("image-{index}"),
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+            };
+            let retained = bundle
+                .append_image(&mut state.output_store, &image)
+                .expect("timeout image should append");
+            assert!(matches!(retained, Some(ReplyItem::Image(_))));
+        }
+        bundle.disclosed = true;
+        state.active_timeout_bundle = Some(bundle);
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("FOLLOW_UP_OK\n")],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+
+        assert!(
+            text.contains("FOLLOW_UP_OK\n"),
+            "expected fresh follow-up reply inline, got: {text:?}"
+        );
+        assert!(
+            !text.contains("output bundle images"),
+            "did not expect stale timeout bundle notice in fresh follow-up reply: {text:?}"
+        );
+        assert!(
+            images.is_empty(),
+            "did not expect stale timeout bundle anchor images in fresh follow-up reply"
+        );
+        assert!(
+            !state.has_active_timeout_bundle(),
+            "expected completed follow-up to retire the old timeout bundle"
         );
     }
 

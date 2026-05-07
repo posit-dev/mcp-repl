@@ -92,6 +92,10 @@ fn interrupt_recovery_deadline() -> Instant {
     Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
 }
 
+fn python_startup_probe_budget() -> Duration {
+    Duration::from_secs(if cfg!(target_os = "macos") { 30 } else { 10 })
+}
+
 async fn start_python_session_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<Option<common::McpTestSession>> {
@@ -99,7 +103,7 @@ async fn start_python_session_with_env_vars(
         return Ok(None);
     }
 
-    let session = common::spawn_server_with_args_env(
+    let mut session = common::spawn_server_with_args_env(
         vec![
             "--interpreter".to_string(),
             "python".to_string(),
@@ -111,7 +115,16 @@ async fn start_python_session_with_env_vars(
         env_vars,
     )
     .await?;
-    let probe = session.write_stdin_raw_with("pass", Some(2.0)).await?;
+    let probe = session
+        .write_stdin_raw_with("print('mcp_repl_python_ready')", Some(2.0))
+        .await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
     let probe_text = result_text(&probe);
     if probe_text.contains("worker io error: Permission denied")
         || probe_text.contains("python backend requires a unix-style pty")
@@ -671,6 +684,32 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     assert!(
         !visible.contains("return 3"),
         "did not expect the multiline body to echo back, got: {visible:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_buffered_multiline_prompt_does_not_complete_request_early() -> TestResult<()> {
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "if True:\n    pass\n\nimport time\ntime.sleep(0.5)\nprint('DONE')",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected buffered multiline request to finish in the original call, got: {text:?}"
+    );
+    assert!(
+        text.contains("DONE"),
+        "expected buffered multiline request to include final output, got: {text:?}"
     );
     Ok(())
 }

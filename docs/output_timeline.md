@@ -9,7 +9,7 @@ The worker emits different kinds of information on different channels:
 
 - stdout/stderr bytes travel on the normal process pipes.
 - Sideband IPC carries structural events such as `readline_start`,
-  `readline_result`, `plot_image`, `request_end`, and `session_end`.
+  `readline_result`, `plot_image`, and `session_end`.
 
 Those channels do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
@@ -64,7 +64,8 @@ only as a later presentation step.
 
 Echo matching must be driven by the sideband facts themselves:
 
-- `readline_start` supplies the prompt text the worker actually showed
+- `readline_start` supplies prompt text and whether the prompt is waiting for
+  new client input
 - `readline_result` is emitted by the worker, but it describes the exact
   prompt text and input line that `readline` consumed and echoed
 - the server should match and collapse those exact sideband facts
@@ -87,6 +88,8 @@ That matching is only opportunistic:
 - The server is responsible for timeline reconstruction.
 - The worker must not try to solve cross-channel ordering by pretending to know
   exactly when stdout bytes became visible to the server.
+- The worker also must not delay stdout/stderr on sideband responses. Sideband
+  IPC reports facts; it is not backpressure for the visible text streams.
 
 In practice, that means image-vs-stdout ordering fixes belong in server timeline
 resolution, not in the wire protocol.
@@ -98,8 +101,9 @@ resolution, not in the wire protocol.
   consumed.
 - Sideband `plot_image` events define when plot updates happened relative to
   other sideband events.
-- Visible replies must preserve evaluation order even when text-pipe delivery and
-  sideband delivery race.
+- Visible replies must preserve evaluation order when that order is represented
+  by sideband facts. They must not invent a strict order between unframed
+  stdout/stderr bytes and sideband events that the server did not observe.
 
 The important consequence is that "arrival order at the server" is not always
 the same thing as "execution order in the backend".

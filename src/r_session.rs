@@ -163,10 +163,15 @@ pub(crate) fn complete_active_request_if_idle() -> bool {
     if !guard.input_queue.is_empty() {
         return false;
     }
+    let prompt = guard
+        .last_prompt
+        .clone()
+        .unwrap_or_else(|| "> ".to_string());
     let active = guard.active_request.take();
     let had_active = active.is_some();
     drop(guard);
     if had_active {
+        ipc::emit_readline_start(&prompt, true);
         complete_active_request(state, active, false);
     }
     had_active
@@ -218,6 +223,7 @@ struct SessionState {
 struct SessionStateInner {
     input_queue: VecDeque<String>,
     active_request: Option<ActiveRequest>,
+    last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
 }
@@ -233,6 +239,7 @@ impl SessionState {
             inner: Mutex::new(SessionStateInner {
                 input_queue: VecDeque::new(),
                 active_request: None,
+                last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
             }),
@@ -789,9 +796,6 @@ fn complete_active_request(
     emit_session_end: bool,
 ) {
     if let Some(active) = active {
-        // Keep the request boundary coupled to the same R-thread decision that
-        // drained the final queued input line.
-        ipc::emit_request_end();
         let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
     }
@@ -877,12 +881,18 @@ pub extern "C-unwind" fn r_read_console(
                 .to_string(),
         )
     };
-    ipc::emit_readline_start(prompt_text.as_deref().unwrap_or(""));
+    let prompt = prompt_text.as_deref().unwrap_or("");
+    ipc::emit_readline_start(prompt, false);
+    let mut client_waiting_start_emitted = false;
     let is_save_prompt = prompt_text
         .as_deref()
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
         .unwrap_or(false);
     let state = session_state();
+    {
+        let mut guard = state.inner.lock().unwrap();
+        guard.last_prompt = Some(prompt.to_string());
+    }
 
     loop {
         let mut guard = state.inner.lock().unwrap();
@@ -945,7 +955,6 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let prompt = prompt_text.as_deref().unwrap_or("");
             let line_text = String::from_utf8_lossy(head).to_string();
             let mut echoed = String::with_capacity(prompt.len() + line_text.len());
             echoed.push_str(prompt);
@@ -963,6 +972,11 @@ pub extern "C-unwind" fn r_read_console(
             }
 
             return 1;
+        }
+
+        if !client_waiting_start_emitted && guard.active_request.is_some() {
+            ipc::emit_readline_start(prompt, true);
+            client_waiting_start_emitted = true;
         }
 
         if let Some(active) = guard.active_request.take() {
@@ -1005,7 +1019,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&plot_id, &mime_type, &data, is_new);
+    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
 }

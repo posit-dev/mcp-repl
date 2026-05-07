@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::input_protocol::parse_input_frame_header;
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_backend_info, emit_request_end, set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_backend_info, emit_session_end, set_global_ipc,
 };
 use crate::r_session::RSession;
 use crate::worker_protocol::WORKER_MODE_ARG;
@@ -118,7 +118,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
-    emit_backend_info("r", true);
+    emit_backend_info(true);
     let request_state = state.clone();
     let _request_thread = thread::Builder::new()
         .name("worker-requests".to_string())
@@ -240,7 +240,7 @@ fn request_loop(rx: mpsc::Receiver<QueuedRequest>, state: Arc<WorkerState>) {
         let result = write_stdin_request(request.text);
         if let Err(err) = result {
             emit_stderr_message(&err.message);
-            emit_request_end();
+            emit_session_end();
         }
         state.mark_idle();
     }
@@ -268,7 +268,7 @@ fn handle_write_stdin(
             }
         };
         emit_stderr_message(&message);
-        emit_request_end();
+        emit_session_end();
     }
 }
 

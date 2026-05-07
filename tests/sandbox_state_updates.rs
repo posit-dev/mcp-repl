@@ -314,6 +314,19 @@ flush.console()
 "#
 }
 
+fn timeout_then_tail_code_after(wait_secs: f64) -> String {
+    format!(
+        r#"
+Sys.sleep(0.2)
+cat("MID\n")
+flush.console()
+Sys.sleep({wait_secs:.3})
+cat("TAIL\n")
+flush.console()
+"#
+    )
+}
+
 fn timeout_then_paged_tail_code() -> &'static str {
     r#"
 line <- paste(rep("foo", 80), collapse = " ")
@@ -331,7 +344,7 @@ fn timeout_then_paged_exit_code() -> &'static str {
 line <- paste(rep("foo", 80), collapse = " ")
 for (i in 1:300) cat(sprintf("line%04d %s\n", i, line))
 flush.console()
-Sys.sleep(0.2)
+Sys.sleep(1.0)
 q("no", status = 0, runLast = FALSE)
 "#
 }
@@ -409,7 +422,7 @@ fn timeout_then_large_completion_code() -> &'static str {
              cat(small); \
              cat('\\nFIRST_END\\n'); \
              flush.console(); \
-             Sys.sleep(0.5); \
+             Sys.sleep(1.0); \
              cat('SECOND_START\\n'); \
              cat(big); \
              cat('\\nSECOND_END\\n'); \
@@ -428,7 +441,7 @@ fn timeout_then_large_completion_and_quit_code() -> &'static str {
              cat(small); \
              cat('\\nFIRST_END\\n'); \
              flush.console(); \
-             Sys.sleep(0.5); \
+             Sys.sleep(1.0); \
              cat('SECOND_START\\n'); \
              cat(big); \
              cat('\\nSECOND_END\\n'); \
@@ -872,7 +885,7 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
     let first = session
         .write_stdin_raw_with_meta(
             timeout_then_large_completion_code(),
-            Some(0.05),
+            Some(0.5),
             Some(workspace_write_meta(temp.path())),
         )
         .await?;
@@ -887,7 +900,7 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
         "did not expect the first under-threshold timeout reply to disclose a bundle path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(600, 900)).await;
+    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
 
     let metadata_error = session
         .write_stdin_raw_with_meta(
@@ -1044,7 +1057,7 @@ async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes(
     let timed_out = session
         .write_stdin_raw_with_meta(
             timeout_then_paged_exit_code(),
-            Some(0.05),
+            Some(0.5),
             Some(workspace_write_meta(scratch.path())),
         )
         .await?;
@@ -1058,7 +1071,7 @@ async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes(
         timed_out_text.contains("--More--"),
         "expected timed-out request to leave pager active, got: {timed_out_text}"
     );
-    tokio::time::sleep(test_delay_ms(350, 700)).await;
+    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
 
     let quit = session
         .write_stdin_raw_with_meta(":q", Some(5.0), Some(read_only_meta(scratch.path())))
@@ -1187,7 +1200,7 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
     let first = session
         .write_stdin_raw_with_meta(
-            timeout_then_tail_code(),
+            timeout_then_tail_code_after(3.0),
             Some(0.05),
             Some(workspace_write_meta(temp.path())),
         )
@@ -1611,7 +1624,7 @@ async fn sandbox_inherit_empty_poll_respawn_retires_disclosed_timeout_bundle() -
     let first = session
         .write_stdin_raw_with_meta(
             timeout_then_large_completion_and_quit_code(),
-            Some(0.05),
+            Some(0.5),
             Some(full_access_meta(scratch.path())),
         )
         .await?;
@@ -1985,7 +1998,7 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
     let first = session
         .write_stdin_raw_with_meta(
             timeout_then_large_completion_code(),
-            Some(0.05),
+            Some(0.5),
             Some(read_only_meta(scratch.path())),
         )
         .await?;
@@ -2000,7 +2013,7 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
         "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(900, 1200)).await;
+    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
 
     let second = session
         .write_stdin_raw_with_meta(
@@ -2043,7 +2056,7 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
     let first = session
         .write_stdin_raw_with_meta(
             timeout_then_large_completion_code(),
-            Some(0.05),
+            Some(0.5),
             Some(read_only_meta(scratch.path())),
         )
         .await?;
@@ -2058,7 +2071,7 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
         "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(900, 1200)).await;
+    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
 
     let second = session
         .write_stdin_raw_with_meta(
@@ -2100,7 +2113,7 @@ async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -
     let first = session
         .write_stdin_raw_with_meta(
             timeout_then_large_completion_code(),
-            Some(0.05),
+            Some(0.5),
             Some(read_only_meta(scratch.path())),
         )
         .await?;

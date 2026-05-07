@@ -57,6 +57,29 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn worker_sideband_protocol_keeps_plot_images_one_way() {
+    let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
+
+    for required in [
+        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        "There is no plot-image acknowledgement message.",
+        "Workers must not delay stdout/stderr output waiting for sideband responses.",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "missing {required} in docs/worker_sideband_protocol.md"
+        );
+    }
+
+    for forbidden in ["`plot_image_ack`", r#""sequence": <integer|null>"#] {
+        assert!(
+            !protocol.contains(forbidden),
+            "did not expect {forbidden} in docs/worker_sideband_protocol.md"
+        );
+    }
+}
+
+#[test]
 fn plans_layout_exists() {
     let root = repo_root();
     for required in [
@@ -101,6 +124,7 @@ fn ci_workflow_defines_dev_release_contract() {
     let workflow = read(&repo_root().join(".github/workflows/ci.yml"));
 
     for required in [
+        "workflow_dispatch:",
         "publish-dev:",
         "publish-release:",
         "tags:",
@@ -138,7 +162,6 @@ fn ci_workflow_defines_dev_release_contract() {
     }
 
     for forbidden in [
-        "workflow_dispatch:",
         "stable_tag:",
         "backfill-stable:",
         "- 'v*.*.*'",

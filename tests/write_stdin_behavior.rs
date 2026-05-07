@@ -1525,7 +1525,7 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let mut session = spawn_pager_behavior_session(20_000).await?;
+    let session = spawn_pager_behavior_session(20_000).await?;
 
     let first = session
         .write_stdin_raw_with("Sys.sleep(0.2); 1+1", Some(0.05))
@@ -1538,9 +1538,32 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
     }
 
     sleep(test_delay_ms(260, 700)).await;
-    let follow_up = session.write_stdin_raw_with("3+3", Some(2.0)).await?;
-    let follow_up = wait_until_not_busy(&mut session, follow_up).await?;
-    let follow_up_text = result_text(&follow_up);
+    let mut follow_up = session.write_stdin_raw_with("3+3", Some(2.0)).await?;
+    let mut follow_up_text = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = result_text(&follow_up);
+        follow_up_text.push_str(&text);
+        if text.contains("[1] 6") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("worker did not run fresh pager follow-up: {follow_up_text:?}").into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+        follow_up = if text.contains("input discarded while worker busy")
+            || text.contains("worker is busy")
+            || text.contains("request already running")
+        {
+            session.write_stdin_raw_with("3+3", Some(2.0)).await?
+        } else {
+            session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?
+        };
+    }
 
     session.cancel().await?;
 

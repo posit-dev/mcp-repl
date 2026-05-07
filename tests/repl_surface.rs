@@ -139,6 +139,81 @@ async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn files_poll_after_timeout_keeps_image_before_later_stdout() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let input = concat!(
+        "Sys.sleep(0.25); ",
+        "invisible(.Call('mcp_repl_plot_emit', 'plot-1', charToRaw('img'), 'image/png', TRUE)); ",
+        "Sys.sleep(0.2); ",
+        "cat('done\\n')",
+    );
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected first reply to time out, got: {first_text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("", Some(30.0)).await?;
+    let text = result_text(&result);
+    if busy_response(&text) {
+        eprintln!("repl_surface timeout poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let image_idx = first_image_index(&result).ok_or("expected image in timeout poll")?;
+    let done_idx =
+        first_text_index_containing(&result, "done").ok_or("expected done text in timeout poll")?;
+    assert!(
+        image_idx < done_idx,
+        "expected image before later stdout after timeout poll, got content order: {:?}",
+        result.content
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_plot_emit_returns_text_and_image_without_cross_channel_ordering() -> TestResult<()>
+{
+    let session = common::spawn_server_with_files().await?;
+
+    let input = concat!(
+        "cat('before\\n'); flush.console(); ",
+        "invisible(.Call('mcp_repl_plot_emit', 'plot-1', charToRaw('img'), 'image/png', TRUE)); ",
+        "cat('after\\n'); flush.console()",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _before_idx =
+        first_text_index_containing(&result, "before").ok_or("expected before text in reply")?;
+    let _image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let _after_idx = first_text_index_containing(&result, "after").ok_or("expected after text")?;
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 

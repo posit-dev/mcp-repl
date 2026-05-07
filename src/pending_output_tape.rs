@@ -49,6 +49,13 @@ pub(crate) enum PendingOutputEvent {
         is_new: bool,
         readline_results_seen: usize,
     },
+    TextEvent {
+        seq: u64,
+        text: String,
+        is_stderr: bool,
+        origin: ContentOrigin,
+        readline_results_seen: Option<usize>,
+    },
     Sideband {
         seq: u64,
         kind: PendingSidebandKind,
@@ -60,6 +67,7 @@ impl PendingOutputEvent {
         match self {
             Self::TextFragment { seq, .. }
             | Self::Image { seq, .. }
+            | Self::TextEvent { seq, .. }
             | Self::Sideband { seq, .. } => *seq,
         }
     }
@@ -69,7 +77,7 @@ impl PendingOutputEvent {
 pub(crate) enum PendingSidebandKind {
     ReadlineStart { prompt: String },
     ReadlineResult { prompt: String, line: String },
-    RequestEnd,
+    RequestBoundary,
     SessionEnd,
 }
 
@@ -179,6 +187,30 @@ impl PendingOutputTape {
         );
     }
 
+    pub(crate) fn append_stdout_status_event(&self, text: String, readline_results_seen: usize) {
+        if text.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("pending output tape mutex poisoned");
+        note_progress(&mut guard);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
+        let seq = next_seq(&mut guard);
+        append_event(
+            &mut guard,
+            PendingOutputEvent::TextEvent {
+                seq,
+                text,
+                is_stderr: false,
+                origin: ContentOrigin::Server,
+                readline_results_seen: Some(readline_results_seen),
+            },
+        );
+    }
+
     pub(crate) fn append_image(
         &self,
         id: String,
@@ -228,7 +260,9 @@ impl PendingOutputTape {
         guard.events.iter().any(|event| {
             matches!(
                 event,
-                PendingOutputEvent::TextFragment { .. } | PendingOutputEvent::Image { .. }
+                PendingOutputEvent::TextFragment { .. }
+                    | PendingOutputEvent::Image { .. }
+                    | PendingOutputEvent::TextEvent { .. }
             )
         }) || tail_has_flushable_bytes(&guard.stdout_tail)
             || tail_has_flushable_bytes(&guard.stderr_tail)
@@ -480,6 +514,24 @@ impl PendingOutputSnapshot {
                     });
                     last_rendered_text = None;
                 }
+                PendingOutputEvent::TextEvent {
+                    text,
+                    is_stderr,
+                    origin,
+                    readline_results_seen,
+                    ..
+                } => {
+                    events.push(OutputEvent {
+                        offset: bytes.len() as u64,
+                        kind: OutputEventKind::Text {
+                            text: text.clone(),
+                            is_stderr: *is_stderr,
+                            origin: *origin,
+                            readline_results_seen: *readline_results_seen,
+                        },
+                    });
+                    last_rendered_text = None;
+                }
                 PendingOutputEvent::Sideband { kind, .. } => match kind {
                     PendingSidebandKind::ReadlineStart { prompt } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
@@ -491,7 +543,7 @@ impl PendingOutputSnapshot {
                             line: line.clone(),
                         });
                     }
-                    PendingSidebandKind::RequestEnd | PendingSidebandKind::SessionEnd => {}
+                    PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd => {}
                 },
             }
         }
@@ -541,9 +593,13 @@ fn is_trim_eligible_carryover_prompt(prompt: &str) -> bool {
 }
 
 fn snapshot_has_no_visible_text(events: &[PendingOutputEvent]) -> bool {
-    events
-        .iter()
-        .all(|event| !matches!(event, PendingOutputEvent::TextFragment { bytes, .. } if !render_bytes(bytes).is_empty()))
+    events.iter().all(|event| {
+        !matches!(
+            event,
+            PendingOutputEvent::TextFragment { bytes, .. } if !render_bytes(bytes).is_empty()
+        ) && !matches!(event, PendingOutputEvent::TextEvent { text, .. } if !text.is_empty())
+            && !matches!(event, PendingOutputEvent::Image { .. })
+    })
 }
 
 fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
@@ -551,7 +607,7 @@ fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
         matches!(
             event,
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::RequestEnd | PendingSidebandKind::SessionEnd,
+                kind: PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd,
                 ..
             }
         )
@@ -577,7 +633,9 @@ fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str)
         else {
             if matches!(
                 event,
-                PendingOutputEvent::Sideband { .. } | PendingOutputEvent::Image { .. }
+                PendingOutputEvent::Sideband { .. }
+                    | PendingOutputEvent::Image { .. }
+                    | PendingOutputEvent::TextEvent { .. }
             ) {
                 continue;
             }
@@ -916,7 +974,12 @@ fn append_event(inner: &mut PendingOutputTapeInner, event: PendingOutputEvent) {
 fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u8]> {
     match events.back() {
         Some(PendingOutputEvent::TextFragment { bytes, .. }) => Some(bytes.as_slice()),
-        Some(PendingOutputEvent::Image { .. } | PendingOutputEvent::Sideband { .. }) | None => None,
+        Some(
+            PendingOutputEvent::Image { .. }
+            | PendingOutputEvent::TextEvent { .. }
+            | PendingOutputEvent::Sideband { .. },
+        )
+        | None => None,
     }
 }
 
@@ -941,7 +1004,7 @@ fn rendered_text_state_after<'a>(
                     });
                 }
             }
-            PendingOutputEvent::Image { .. } => state = None,
+            PendingOutputEvent::Image { .. } | PendingOutputEvent::TextEvent { .. } => state = None,
             PendingOutputEvent::Sideband { .. } => {}
         }
     }
@@ -1163,7 +1226,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(&[0xC3]);
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
         let first = tape.drain_snapshot();
         assert!(
             first.format_contents().contents.is_empty(),
@@ -1183,7 +1246,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(&[0xC3]);
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
         let first = tape.drain_final_snapshot();
         assert!(
             first.format_contents().contents.is_empty(),
@@ -1246,14 +1309,14 @@ mod tests {
     }
 
     #[test]
-    fn request_end_clears_pending_echo_prefix_after_sideband_only_snapshot() {
+    fn request_boundary_clears_pending_echo_prefix_after_sideband_only_snapshot() {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "x <- 1\n".to_string(),
         });
-        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
 
         let first = tape.drain_snapshot();
         assert!(
@@ -1268,6 +1331,68 @@ mod tests {
         assert!(
             guard.pending_echo_prefix.is_empty(),
             "request boundary should clear unmatched carried echo"
+        );
+    }
+
+    #[test]
+    fn text_event_keeps_pending_echo_prefix_across_request_boundary() {
+        let tape = PendingOutputTape::new();
+        let status = "[repl] previous plot updated\n".to_string();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_stdout_status_event(status.clone(), 1);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::server_stdout(status)]
+        );
+
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "expected late echo to be trimmed after visible status event"
+        );
+    }
+
+    #[test]
+    fn image_event_keeps_pending_echo_prefix_across_request_boundary() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::ContentImage {
+                data: "AA==".to_string(),
+                mime_type: "image/png".to_string(),
+                id: "img-1".to_string(),
+                is_new: true,
+            }]
+        );
+
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "expected late echo to be trimmed after image event"
         );
     }
 

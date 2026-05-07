@@ -51,6 +51,7 @@ _plot_hooks_installed = False
 _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
+_plot_emitted_this_request = {}
 
 
 def _close_ipc_in_fork_child():
@@ -88,6 +89,14 @@ def _send(obj):
             pass
 
 
+def _flush_stdio():
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _ensure_plot_modules():
     global _plot_modules_loaded, _plot_pyplot, _plot_capable, _plot_hooks_installed, _plot_axes_plot, _plot_show
     if not _plot_capable:
@@ -109,7 +118,9 @@ def _ensure_plot_modules():
 
             def _wrapped_plot(self, *args, **kwargs):
                 result = _plot_axes_plot(self, *args, **kwargs)
-                _maybe_emit_plots()
+                fig_num = getattr(getattr(self, "figure", None), "number", None)
+                force_figures = {fig_num} if fig_num is not None else None
+                _maybe_emit_plots(force_figures=force_figures)
                 return result
 
             Axes.plot = _wrapped_plot
@@ -117,7 +128,7 @@ def _ensure_plot_modules():
 
             def _wrapped_show(*args, **kwargs):
                 result = _plot_show(*args, **kwargs)
-                _maybe_emit_plots()
+                _maybe_emit_plots(force_all=True)
                 return result
 
             plt.show = _wrapped_show
@@ -129,22 +140,14 @@ def _ensure_plot_modules():
         return False
 
 
-def _reset_plot_hashes():
-    global _plot_hashes
-    if not _plot_capable:
-        return
-    with _plot_lock:
-        _plot_hashes = {}
-
-
-def _maybe_emit_plots():
+def _maybe_emit_plots(force_figures=None, force_all=False):
     if not _has_request_active():
         return
-    _emit_plots()
+    _emit_plots(force_figures=force_figures, force_all=force_all)
 
 
-def _emit_plots():
-    global _plot_known_figures, _plot_hashes, _plot_emit_in_progress
+def _emit_plots(force_figures=None, force_all=False):
+    global _plot_known_figures, _plot_hashes, _plot_emitted_this_request, _plot_emit_in_progress
     if not _plot_capable:
         return
     if _plot_emit_in_progress:
@@ -166,12 +169,18 @@ def _emit_plots():
     if not fig_nums:
         with _plot_lock:
             _plot_known_figures = set()
+            _plot_hashes = {}
+            _plot_emitted_this_request = {}
         _plot_emit_in_progress = False
         return
     fig_nums = sorted(fig_nums)
+    new_known = set(fig_nums)
+    force_figures = set() if force_figures is None else set(force_figures)
     with _plot_lock:
         prev_known = set(_plot_known_figures)
-    new_known = set(fig_nums)
+        for stale_num in set(_plot_hashes) - new_known:
+            _plot_hashes.pop(stale_num, None)
+            _plot_emitted_this_request.pop(stale_num, None)
     for fig_num in fig_nums:
         try:
             fig = plt.figure(fig_num)
@@ -182,19 +191,25 @@ def _emit_plots():
         except Exception:
             continue
         digest = hashlib.sha256(data).hexdigest()
+        force_current = force_all or fig_num in force_figures
         with _plot_lock:
-            if _plot_hashes.get(fig_num) == digest:
+            emitted_this_request = _plot_emitted_this_request.get(fig_num) == digest
+            if emitted_this_request:
+                continue
+            if _plot_hashes.get(fig_num) == digest and not force_current:
                 continue
             _plot_hashes[fig_num] = digest
+            _plot_emitted_this_request[fig_num] = digest
         encoded = base64.b64encode(data).decode("ascii")
         is_new = fig_num not in prev_known
+        _flush_stdio()
         _send(
             {
                 "type": "plot_image",
-                "id": f"plot-{_plot_pid}-{fig_num}",
                 "mime_type": "image/png",
                 "data": encoded,
-                "is_new": bool(is_new),
+                "is_update": not bool(is_new),
+                "source": str(fig_num),
             }
         )
     with _plot_lock:
@@ -203,10 +218,12 @@ def _emit_plots():
 
 
 def _set_request_active():
-    global _request_active, _interrupt_pending
+    global _request_active, _interrupt_pending, _plot_emitted_this_request
     with _request_lock:
         _request_active = True
         _interrupt_pending = False
+    with _plot_lock:
+        _plot_emitted_this_request = {}
 
 
 def _take_request_active():
@@ -227,7 +244,6 @@ def _emit_backend_info():
     _send(
         {
             "type": "backend_info",
-            "language": "python",
             "supports_images": _plot_capable,
         }
     )
@@ -242,9 +258,9 @@ class _Prompt(str):
     def __str__(self):
         global _last_prompt
         _last_prompt = super().__str__()
-        # Emit prompt + request_end even if readline pre_input_hook is not invoked (e.g. after some
-        # interrupts). Only emit for the primary prompt; continuation prompts are handled by the
-        # pre_input hook and emitting from sys.ps2 can interfere with prompt selection.
+        # Emit prompt even if readline pre_input_hook is not invoked (e.g. after some interrupts).
+        # Only emit for the primary prompt; continuation prompts are handled by the pre_input hook
+        # and emitting from sys.ps2 can interfere with prompt selection.
         if self.emit:
             _emit_prompt(_last_prompt)
         return _last_prompt
@@ -265,12 +281,21 @@ def _stdin_has_data():
     # We only want to end a request when Python is about to block waiting on input.
     # When the server sends a multi-line chunk, the interpreter may produce prompts
     # between internal reads while stdin still has buffered data. In that case we
-    # must NOT emit request_end yet.
+    # must NOT finish the request yet.
     try:
         readable, _, _ = select.select([0], [], [], 0)
         return bool(readable)
     except Exception:
         return False
+
+
+def _stdin_has_data_soon(timeout_seconds=0.05):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _stdin_has_data():
+            return True
+        time.sleep(0.001)
+    return _stdin_has_data()
 
 
 def _wait_for_request_active(timeout_seconds=0.05):
@@ -363,31 +388,34 @@ def _discard_pending_request_input():
             _interrupt_pending = False
 
 
-def _emit_request_end_if_idle():
+def _finish_request_if_idle():
     if not _has_request_active():
-        return
-    if _stdin_has_data():
-        return
+        return False
+    if _stdin_has_data_soon():
+        return False
     _emit_plots()
     if not _take_request_active():
-        return
-    # Best-effort: ensure the client observes all output written for the request before the
-    # request_end event. The Rust side uses a short "settle" window after request_end too.
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-    _send({"type": "request_end"})
+        return True
+    # Best-effort: ensure the client observes output written before the prompt that marks the
+    # request as complete. The Rust side also uses a short settle window after completion.
+    _flush_stdio()
+    return True
 
 
-def _emit_prompt(prompt=None, emit_request_end=True):
+def _emit_prompt(prompt=None, finish_request=True):
     _discard_pending_request_input()
     if prompt is None:
         prompt = _last_prompt or _primary_prompt or getattr(sys, "ps1", ">>> ")
-    _send({"type": "readline_start", "prompt": str(prompt)})
-    if emit_request_end:
-        _emit_request_end_if_idle()
+    # Buffered stdin means this prompt is an internal interpreter prompt, not a client-waiting
+    # prompt. Do not emit the completion sideband until Python is actually idle.
+    client_waiting = bool(finish_request and _finish_request_if_idle())
+    _send(
+        {
+            "type": "readline_start",
+            "prompt": str(prompt),
+            "client_waiting": client_waiting,
+        }
+    )
 
 
 def _pydoc_plainpager(text, title=""):
@@ -446,7 +474,6 @@ def _ipc_reader():
         msg_type = msg.get("type")
         if msg_type == "stdin_write":
             _set_request_active()
-            _reset_plot_hashes()
         elif msg_type == "interrupt":
             with _request_lock:
                 _interrupt_pending = True
