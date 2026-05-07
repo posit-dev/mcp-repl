@@ -23,6 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::worker_protocol::TextStream;
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SUCCESS,
@@ -90,6 +92,10 @@ pub enum WorkerToServerIpcMessage {
     BackendInfo {
         #[serde(default)]
         supports_images: bool,
+    },
+    OutputText {
+        stream: TextStream,
+        data_b64: String,
     },
     ReadlineStart {
         prompt: String,
@@ -170,6 +176,29 @@ pub struct WorkerIpcConnection {
     sender: mpsc::Sender<WorkerToServerIpcMessage>,
     inbox: Arc<Mutex<WorkerIpcInbox>>,
     cvar: Arc<Condvar>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct OutputCriticalIpcWriter {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+#[allow(dead_code)]
+impl OutputCriticalIpcWriter {
+    pub fn new(writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+
+    pub fn send(&self, message: WorkerToServerIpcMessage) -> io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("ipc writer mutex poisoned"))?;
+        write_ipc_message(&mut **writer, &message)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -651,6 +680,13 @@ where
             }
         }
     });
+}
+
+fn write_ipc_message<T: Serialize>(writer: &mut dyn Write, message: &T) -> io::Result<()> {
+    let payload = serde_json::to_string(message).map_err(io::Error::other)?;
+    writer.write_all(payload.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 #[derive(Debug)]
@@ -1522,12 +1558,15 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, ServerIpcConnection, ServerToWorkerIpcMessage,
-        WorkerIpcConnection, WorkerToServerIpcMessage,
+        IpcHandlers, IpcTransport, OutputCriticalIpcWriter, ServerIpcConnection,
+        ServerToWorkerIpcMessage, WorkerIpcConnection, WorkerToServerIpcMessage,
     };
+    use crate::worker_protocol::TextStream;
+    use base64::Engine as _;
     use serde_json::json;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::io::{BufRead, Write};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1581,6 +1620,32 @@ mod protocol_tests {
             parsed.is_err(),
             "plot_image should reject old worker-owned image fields"
         );
+    }
+
+    #[test]
+    fn output_text_protocol_uses_stream_and_base64_payload() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "output_text",
+            "stream": "stdout",
+            "data_b64": "YWxwaGE="
+        }));
+
+        let Ok(WorkerToServerIpcMessage::OutputText { stream, data_b64 }) = parsed else {
+            panic!("output_text should deserialize");
+        };
+        assert_eq!(stream, TextStream::Stdout);
+        assert_eq!(data_b64, "YWxwaGE=");
+    }
+
+    #[test]
+    fn output_text_protocol_rejects_plain_data_payload() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "output_text",
+            "stream": "stdout",
+            "data": "alpha"
+        }));
+
+        assert!(parsed.is_err(), "output_text should require data_b64");
     }
 
     #[test]
@@ -1646,6 +1711,84 @@ mod protocol_tests {
             matches!(result, Err(super::IpcWaitError::Disconnected)),
             "invalid worker message should disconnect server IPC, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn output_critical_writer_flushes_before_returning() {
+        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
+        let writer = OutputCriticalIpcWriter::new(Box::new(worker_write));
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server_read);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read IPC line");
+            line_tx.send(line).expect("send IPC line");
+        });
+
+        writer
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"alpha"),
+            })
+            .expect("send output_text");
+
+        let line = line_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("IPC line flushed before send returned");
+        assert!(line.contains(r#""type":"output_text""#), "{line}");
+        assert!(line.contains(r#""data_b64":"YWxwaGE=""#), "{line}");
+    }
+
+    #[test]
+    fn output_critical_writer_serializes_shared_writes() {
+        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
+        let writer = OutputCriticalIpcWriter::new(Box::new(worker_write));
+        let second_writer = writer.clone();
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server_read);
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read IPC line");
+                line_tx.send(line).expect("send IPC line");
+            }
+        });
+
+        writer
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"first"),
+            })
+            .expect("send first output_text");
+        second_writer
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stderr,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"second"),
+            })
+            .expect("send second output_text");
+
+        let first = line_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first IPC line");
+        let second = line_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("second IPC line");
+        assert!(first.contains(r#""data_b64":"Zmlyc3Q=""#), "{first}");
+        assert!(second.contains(r#""data_b64":"c2Vjb25k""#), "{second}");
+    }
+
+    #[test]
+    fn synchronous_worker_output_text_reports_broken_pipe() {
+        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
+        drop(server_read);
+        let writer = OutputCriticalIpcWriter::new(Box::new(worker_write));
+
+        let result = writer.send(WorkerToServerIpcMessage::OutputText {
+            stream: TextStream::Stdout,
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"lost"),
+        });
+
+        assert!(result.is_err(), "broken IPC pipe should be reported");
     }
 
     #[test]
