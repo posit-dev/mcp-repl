@@ -434,7 +434,13 @@ const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
-const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
+const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
+    Duration::from_millis(500)
+} else {
+    Duration::from_millis(120)
+};
+#[cfg(target_family = "unix")]
+const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
@@ -4990,9 +4996,13 @@ impl WorkerProcess {
         let ipc = IpcHandle::new();
         #[cfg(any(target_family = "unix", target_family = "windows"))]
         {
+            let output_capture = live_output.clone();
             let image_capture = live_output.clone();
             let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
+                on_output_text: Some(Arc::new(move |text| {
+                    output_capture.append_text(&text.bytes, text.stream);
+                })),
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
                 })),
@@ -5872,15 +5882,12 @@ where
     let (wake_reader, wake_writer) = std::io::pipe()?;
     let (done_tx, done_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop_requested.clone();
     let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         let stream_fd = stream.as_raw_fd();
         let wake_fd = wake_reader.as_raw_fd();
+        let mut stop_deadline = None;
         loop {
-            if thread_stop.load(Ordering::Relaxed) {
-                break;
-            }
             let mut fds = [
                 libc::pollfd {
                     fd: stream_fd,
@@ -5893,7 +5900,9 @@ where
                     revents: 0,
                 },
             ];
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            let timeout_ms = if stop_deadline.is_some() { 0 } else { -1 };
+            let ready =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
             if ready < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -5901,19 +5910,34 @@ where
                 }
                 break;
             }
-            if fds[1].revents != 0 {
+            if ready == 0 {
                 break;
             }
-            if fds[0].revents == 0 {
+            if fds[1].revents != 0 && stop_deadline.is_none() {
+                stop_deadline = Some(std::time::Instant::now() + OUTPUT_READER_STOP_DRAIN_GRACE);
+            }
+            let mut read_stream = false;
+            if fds[0].revents != 0 {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        break;
+                    }
+                    Ok(n) => {
+                        live_output.append_text(&buffer[..n], output_stream);
+                        read_stream = true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if stop_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                break;
+            }
+            if read_stream {
                 continue;
             }
-            match stream.read(&mut buffer) {
-                Ok(0) => {
-                    break;
-                }
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+            if stop_deadline.is_some() {
+                break;
             }
         }
         let _ = done_tx.send(());
@@ -6143,9 +6167,11 @@ mod tests {
         OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSpan,
         ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     };
+    use crate::pending_output_tape::PendingOutputEvent;
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
+    use base64::Engine as _;
     #[cfg(target_os = "linux")]
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -7879,6 +7905,158 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let output_capture = capture.clone();
+        let start_capture = capture.clone();
+        let result_capture = capture.clone();
+        let image_capture = capture.clone();
+        let session_capture = capture.clone();
+        let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
+            on_output_text: Some(Arc::new(move |text| {
+                output_capture.append_text(&text.bytes, text.stream);
+            })),
+            on_readline_start: Some(Arc::new(move |prompt| {
+                start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+            })),
+            on_readline_result: Some(Arc::new(move |event| {
+                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                    prompt: event.prompt,
+                    line: event.line,
+                });
+            })),
+            on_plot_image: Some(Arc::new(move |image| {
+                image_capture.append_image(image);
+            })),
+            on_session_end: Some(Arc::new(move || {
+                session_capture.append_sideband(PendingSidebandKind::SessionEnd);
+                done_tx.send(()).expect("send session end marker");
+            })),
+        })
+        .expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: "> ".to_string(),
+                client_waiting: true,
+            })
+            .expect("send readline_start");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"before\n"),
+            })
+            .expect("send stdout output_text");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "plot(1)\n".to_string(),
+            })
+            .expect("send readline_result");
+        worker
+            .send(WorkerToServerIpcMessage::PlotImage {
+                mime_type: "image/png".to_string(),
+                data: "AA==".to_string(),
+                is_update: false,
+                source: None,
+            })
+            .expect("send plot_image");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stderr,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"err\n"),
+            })
+            .expect("send stderr output_text");
+        worker
+            .send(WorkerToServerIpcMessage::SessionEnd)
+            .expect("send session_end");
+
+        done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("server IPC consumed session_end");
+
+        let snapshot = tape.drain_final_snapshot();
+        assert_eq!(snapshot.events.len(), 6);
+        assert!(matches!(
+            &snapshot.events[0],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineStart { prompt },
+                ..
+            } if prompt == "> "
+        ));
+        assert!(matches!(
+            &snapshot.events[1],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stdout,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"before\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[2],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineResult { prompt, line },
+                ..
+            } if prompt == "> " && line == "plot(1)\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[3],
+            PendingOutputEvent::Image {
+                id,
+                mime_type,
+                readline_results_seen: 1,
+                ..
+            } if id.starts_with("image-") && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &snapshot.events[4],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stderr,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"err\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[5],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::SessionEnd,
+                ..
+            }
+        ));
+
+        let end = output_ring.end_offset();
+        let range = output_ring.read_range(0, end);
+        assert_eq!(range.bytes, b"before\n\nstderr: err\n");
+        let image_event = range
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                OutputEventKind::Image {
+                    id,
+                    mime_type,
+                    readline_results_seen,
+                    ..
+                } => Some((event.offset, id, mime_type, readline_results_seen)),
+                _ => None,
+            })
+            .expect("timeline image event");
+        assert_eq!(image_event.0, b"before\n".len() as u64);
+        assert!(image_event.1.starts_with("image-"));
+        assert_eq!(image_event.2, "image/png");
+        assert_eq!(*image_event.3, 1);
     }
 
     #[test]

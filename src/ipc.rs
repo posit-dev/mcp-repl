@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::worker_protocol::TextStream;
@@ -146,6 +147,12 @@ pub struct IpcEchoEvent {
 }
 
 #[derive(Clone)]
+pub struct IpcOutputText {
+    pub stream: TextStream,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub struct IpcPlotImage {
     pub id: String,
     pub mime_type: String,
@@ -157,6 +164,7 @@ pub struct IpcPlotImage {
 
 #[derive(Default, Clone)]
 pub struct IpcHandlers {
+    pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
     pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
@@ -231,6 +239,7 @@ impl ServerIpcConnection {
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
+        let output_text_handler = handlers.on_output_text.clone();
         let plot_handler = handlers.on_plot_image.clone();
         let readline_start_handler = handlers.on_readline_start.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
@@ -328,6 +337,28 @@ impl ServerIpcConnection {
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
                             handler();
+                        }
+                    }
+                    WorkerToServerIpcMessage::OutputText { stream, data_b64 } => {
+                        let bytes =
+                            match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                                Ok(bytes) => bytes,
+                                Err(_) => {
+                                    let mut guard = reader_inbox.lock().unwrap();
+                                    guard.disconnected = true;
+                                    reader_cvar.notify_all();
+                                    break;
+                                }
+                            };
+                        if let Some(handler) = output_text_handler.as_ref() {
+                            handler(IpcOutputText { stream, bytes });
+                        } else {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard.queue.push_back(WorkerToServerIpcMessage::OutputText {
+                                stream,
+                                data_b64,
+                            });
+                            reader_cvar.notify_all();
                         }
                     }
                     WorkerToServerIpcMessage::PlotImage {
@@ -1407,6 +1438,13 @@ pub fn emit_session_end() {
 
 #[cfg(test)]
 pub(crate) fn test_connection_pair() -> io::Result<(ServerIpcConnection, WorkerIpcConnection)> {
+    test_connection_pair_with_handlers(IpcHandlers::default())
+}
+
+#[cfg(test)]
+pub(crate) fn test_connection_pair_with_handlers(
+    handlers: IpcHandlers,
+) -> io::Result<(ServerIpcConnection, WorkerIpcConnection)> {
     let (server_read, worker_write) = std::io::pipe()?;
     let (worker_read, server_write) = std::io::pipe()?;
     let server = ServerIpcConnection::new(
@@ -1414,7 +1452,7 @@ pub(crate) fn test_connection_pair() -> io::Result<(ServerIpcConnection, WorkerI
             reader: Box::new(server_read),
             writer: Box::new(server_write),
         },
-        IpcHandlers::default(),
+        handlers,
     )?;
     let worker = WorkerIpcConnection::new(IpcTransport {
         reader: Box::new(worker_read),
