@@ -30,7 +30,7 @@
 
 ## Locked Decisions
 
-- Use `output_text { stream, data_b64 }` for worker-owned text.
+- Use `output_text { stream, data_b64, is_continuation }` for worker-owned text.
 - Do not add per-output acknowledgements, byte matching, hashes, or alignment heuristics.
 - Keep raw stdout and stderr readers for output the worker protocol does not own.
 

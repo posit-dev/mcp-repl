@@ -98,6 +98,8 @@ pub enum WorkerToServerIpcMessage {
     OutputText {
         stream: TextStream,
         data_b64: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_continuation: bool,
     },
     ReadlineStart {
         prompt: String,
@@ -151,6 +153,7 @@ pub struct IpcEchoEvent {
 pub struct IpcOutputText {
     pub stream: TextStream,
     pub bytes: Vec<u8>,
+    pub is_continuation: bool,
 }
 
 #[derive(Clone)]
@@ -340,7 +343,11 @@ impl ServerIpcConnection {
                             handler();
                         }
                     }
-                    WorkerToServerIpcMessage::OutputText { stream, data_b64 } => {
+                    WorkerToServerIpcMessage::OutputText {
+                        stream,
+                        data_b64,
+                        is_continuation,
+                    } => {
                         let bytes =
                             match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
                                 Ok(bytes) => bytes,
@@ -352,12 +359,17 @@ impl ServerIpcConnection {
                                 }
                             };
                         if let Some(handler) = output_text_handler.as_ref() {
-                            handler(IpcOutputText { stream, bytes });
+                            handler(IpcOutputText {
+                                stream,
+                                bytes,
+                                is_continuation,
+                            });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.queue.push_back(WorkerToServerIpcMessage::OutputText {
                                 stream,
                                 data_b64,
+                                is_continuation,
                             });
                             reader_cvar.notify_all();
                         }
@@ -646,10 +658,11 @@ impl WorkerIpcConnection {
     }
 
     pub fn send_output_text(&self, stream: TextStream, bytes: &[u8]) -> io::Result<()> {
-        for chunk in bytes.chunks(OUTPUT_TEXT_IPC_CHUNK_BYTES) {
+        for (idx, chunk) in bytes.chunks(OUTPUT_TEXT_IPC_CHUNK_BYTES).enumerate() {
             self.send(WorkerToServerIpcMessage::OutputText {
                 stream,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
+                is_continuation: idx > 0,
             })?;
         }
         Ok(())
@@ -1615,6 +1628,10 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod protocol_tests {
     use super::{
@@ -1691,11 +1708,20 @@ mod protocol_tests {
             "data_b64": "YWxwaGE="
         }));
 
-        let Ok(WorkerToServerIpcMessage::OutputText { stream, data_b64 }) = parsed else {
+        let Ok(WorkerToServerIpcMessage::OutputText {
+            stream,
+            data_b64,
+            is_continuation,
+        }) = parsed
+        else {
             panic!("output_text should deserialize");
         };
         assert_eq!(stream, TextStream::Stdout);
         assert_eq!(data_b64, "YWxwaGE=");
+        assert!(
+            !is_continuation,
+            "output_text continuation should default to false"
+        );
     }
 
     #[test]
@@ -1790,6 +1816,7 @@ mod protocol_tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"alpha"),
+                is_continuation: false,
             })
             .expect("send output_text");
 
@@ -1819,12 +1846,14 @@ mod protocol_tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"first"),
+                is_continuation: false,
             })
             .expect("send first output_text");
         second_writer
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"second"),
+                is_continuation: false,
             })
             .expect("send second output_text");
 
@@ -1847,6 +1876,7 @@ mod protocol_tests {
         let result = writer.send(WorkerToServerIpcMessage::OutputText {
             stream: TextStream::Stdout,
             data_b64: base64::engine::general_purpose::STANDARD.encode(b"lost"),
+            is_continuation: false,
         });
 
         assert!(result.is_err(), "broken IPC pipe should be reported");
@@ -1857,7 +1887,9 @@ mod protocol_tests {
         let (chunk_tx, chunk_rx) = mpsc::channel();
         let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
             on_output_text: Some(Arc::new(move |text| {
-                chunk_tx.send(text.bytes).expect("record output text chunk");
+                chunk_tx
+                    .send((text.bytes, text.is_continuation))
+                    .expect("record output text chunk");
             })),
             ..IpcHandlers::default()
         })
@@ -1871,11 +1903,11 @@ mod protocol_tests {
         let mut chunks = Vec::new();
         let mut bytes_seen = 0usize;
         while bytes_seen < payload.len() {
-            let chunk = chunk_rx
+            let (chunk, is_continuation) = chunk_rx
                 .recv_timeout(Duration::from_millis(200))
                 .expect("output_text chunk");
             bytes_seen += chunk.len();
-            chunks.push(chunk);
+            chunks.push((chunk, is_continuation));
         }
         assert!(
             chunks.len() > 1,
@@ -1884,10 +1916,21 @@ mod protocol_tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| chunk.len() <= OUTPUT_TEXT_IPC_CHUNK_BYTES),
+                .all(|(chunk, _)| chunk.len() <= OUTPUT_TEXT_IPC_CHUNK_BYTES),
             "output_text chunks should be bounded"
         );
-        let reassembled = chunks.concat();
+        assert!(
+            !chunks.first().expect("first chunk").1
+                && chunks
+                    .iter()
+                    .skip(1)
+                    .all(|(_, is_continuation)| *is_continuation),
+            "only chunks after the first should be marked as continuations"
+        );
+        let reassembled = chunks
+            .iter()
+            .flat_map(|(chunk, _)| chunk.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(reassembled, payload);
     }
 

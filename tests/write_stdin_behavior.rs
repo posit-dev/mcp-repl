@@ -531,6 +531,31 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_long_r_stderr_keeps_one_stream_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(40_000).await?;
+
+    let result = session
+        .write_stdin_raw_with("message(strrep('x', 20000))", Some(30.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    let prefix_count = text.matches("stderr: ").count();
+    assert_eq!(
+        prefix_count, 1,
+        "expected one stderr prefix for one R stderr write, got {prefix_count}: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

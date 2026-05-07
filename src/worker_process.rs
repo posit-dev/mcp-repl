@@ -123,7 +123,7 @@ impl LiveOutputCapture {
         }
     }
 
-    fn append_text(&self, bytes: &[u8], stream: TextStream) {
+    fn append_text(&self, bytes: &[u8], stream: TextStream, is_continuation: bool) {
         match stream {
             TextStream::Stdout => {
                 self.output_timeline
@@ -133,8 +133,12 @@ impl LiveOutputCapture {
                 }
             }
             TextStream::Stderr => {
-                self.output_timeline
-                    .append_text(bytes, true, ContentOrigin::Worker);
+                self.output_timeline.append_text_with_continuation(
+                    bytes,
+                    true,
+                    ContentOrigin::Worker,
+                    is_continuation,
+                );
                 if let Some(tape) = &self.pending_output_tape {
                     tape.append_stderr_bytes(bytes);
                 }
@@ -5001,7 +5005,7 @@ impl WorkerProcess {
             let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
                 on_output_text: Some(Arc::new(move |text| {
-                    output_capture.append_text(&text.bytes, text.stream);
+                    output_capture.append_text(&text.bytes, text.stream, text.is_continuation);
                 })),
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
@@ -5923,7 +5927,7 @@ where
                         break;
                     }
                     Ok(n) => {
-                        live_output.append_text(&buffer[..n], output_stream);
+                        live_output.append_text(&buffer[..n], output_stream, false);
                         read_stream = true;
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -6000,7 +6004,7 @@ where
             }
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream, false),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -6032,7 +6036,7 @@ where
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream, false),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -7827,7 +7831,7 @@ mod tests {
             tape.clone(),
             OutputTimeline::new(output_ring.clone()),
         );
-        capture.append_text(b"pager output\n", TextStream::Stdout);
+        capture.append_text(b"pager output\n", TextStream::Stdout, false);
         capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
@@ -7886,7 +7890,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
+        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
         let contents = tape
             .drain_final_snapshot()
@@ -7925,7 +7929,7 @@ mod tests {
         let session_capture = capture.clone();
         let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
             on_output_text: Some(Arc::new(move |text| {
-                output_capture.append_text(&text.bytes, text.stream);
+                output_capture.append_text(&text.bytes, text.stream, text.is_continuation);
             })),
             on_readline_start: Some(Arc::new(move |prompt| {
                 start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
@@ -7956,6 +7960,7 @@ mod tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"before\n"),
+                is_continuation: false,
             })
             .expect("send stdout output_text");
         worker
@@ -7976,6 +7981,7 @@ mod tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"err\n"),
+                is_continuation: false,
             })
             .expect("send stderr output_text");
         worker
@@ -8076,7 +8082,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
+        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
         let end = output_ring.end_offset();
         let collapsed = collapse_echo_with_attribution(

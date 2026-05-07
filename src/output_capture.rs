@@ -78,11 +78,25 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
+        self.append_text_with_continuation(bytes, is_stderr, origin, false);
+    }
+
+    pub(crate) fn append_text_with_continuation(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        is_continuation: bool,
+    ) {
         if bytes.is_empty() {
             return;
         }
         if !is_stderr {
             self.ring.append_bytes(bytes, false, origin);
+            return;
+        }
+        if is_continuation {
+            self.ring.append_bytes(bytes, true, origin);
             return;
         }
 
