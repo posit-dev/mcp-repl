@@ -9,12 +9,12 @@
 
 - State: active
 - Last updated: 2026-05-07
-- Current phase: phase 1 pending
+- Current phase: phase 2 pending
 
 ## Current Direction
 
-- Add the internal `output_text` frame and synchronous worker IPC writer first.
-- Then teach the server to consume `output_text` as worker-owned text before routing R console callbacks through it.
+- Route R console callbacks and readline echo through `output_text` now that the
+  protocol and server consumption path are in place.
 
 ## Long-Term Direction
 
@@ -24,7 +24,7 @@
 ## Phase Status
 
 - Phase 0: completed - protocol frame and synchronous worker IPC writer.
-- Phase 1: pending - append `output_text` into server timelines.
+- Phase 1: completed - append `output_text` into server timelines.
 - Phase 2: pending - route R console callbacks and readline echo through `output_text`.
 - Phase 3: pending - remove race-tolerant handling that only existed for R-owned output.
 
@@ -40,7 +40,7 @@
 
 ## Next Safe Slice
 
-- Append `output_text` frames directly to the server pending-output tape and output timeline while leaving raw stdout and stderr readers active.
+- Route R console callbacks and readline echo through `output_text`.
 
 ## Stop Conditions
 
@@ -51,3 +51,4 @@
 
 - 2026-05-07: Start with the protocol and synchronous worker writer so later routing can be reviewed separately from server timeline consumption.
 - 2026-05-07: Completed the protocol foundation without changing existing raw stdout/stderr capture or asynchronous non-output IPC sends.
+- 2026-05-07: Completed server-side `output_text` consumption by decoding worker-owned text in the IPC reader and appending it through the existing live output capture path.

@@ -4990,9 +4990,13 @@ impl WorkerProcess {
         let ipc = IpcHandle::new();
         #[cfg(any(target_family = "unix", target_family = "windows"))]
         {
+            let output_capture = live_output.clone();
             let image_capture = live_output.clone();
             let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
+                on_output_text: Some(Arc::new(move |text| {
+                    output_capture.append_text(&text.bytes, text.stream);
+                })),
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
                 })),
@@ -6143,9 +6147,11 @@ mod tests {
         OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSpan,
         ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     };
+    use crate::pending_output_tape::PendingOutputEvent;
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
+    use base64::Engine as _;
     #[cfg(target_os = "linux")]
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -7879,6 +7885,158 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let output_capture = capture.clone();
+        let start_capture = capture.clone();
+        let result_capture = capture.clone();
+        let image_capture = capture.clone();
+        let session_capture = capture.clone();
+        let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
+            on_output_text: Some(Arc::new(move |text| {
+                output_capture.append_text(&text.bytes, text.stream);
+            })),
+            on_readline_start: Some(Arc::new(move |prompt| {
+                start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+            })),
+            on_readline_result: Some(Arc::new(move |event| {
+                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                    prompt: event.prompt,
+                    line: event.line,
+                });
+            })),
+            on_plot_image: Some(Arc::new(move |image| {
+                image_capture.append_image(image);
+            })),
+            on_session_end: Some(Arc::new(move || {
+                session_capture.append_sideband(PendingSidebandKind::SessionEnd);
+                done_tx.send(()).expect("send session end marker");
+            })),
+        })
+        .expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: "> ".to_string(),
+                client_waiting: true,
+            })
+            .expect("send readline_start");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"before\n"),
+            })
+            .expect("send stdout output_text");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "plot(1)\n".to_string(),
+            })
+            .expect("send readline_result");
+        worker
+            .send(WorkerToServerIpcMessage::PlotImage {
+                mime_type: "image/png".to_string(),
+                data: "AA==".to_string(),
+                is_update: false,
+                source: None,
+            })
+            .expect("send plot_image");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stderr,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"err\n"),
+            })
+            .expect("send stderr output_text");
+        worker
+            .send(WorkerToServerIpcMessage::SessionEnd)
+            .expect("send session_end");
+
+        done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("server IPC consumed session_end");
+
+        let snapshot = tape.drain_final_snapshot();
+        assert_eq!(snapshot.events.len(), 6);
+        assert!(matches!(
+            &snapshot.events[0],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineStart { prompt },
+                ..
+            } if prompt == "> "
+        ));
+        assert!(matches!(
+            &snapshot.events[1],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stdout,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"before\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[2],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineResult { prompt, line },
+                ..
+            } if prompt == "> " && line == "plot(1)\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[3],
+            PendingOutputEvent::Image {
+                id,
+                mime_type,
+                readline_results_seen: 1,
+                ..
+            } if id.starts_with("image-") && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &snapshot.events[4],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stderr,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"err\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[5],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::SessionEnd,
+                ..
+            }
+        ));
+
+        let end = output_ring.end_offset();
+        let range = output_ring.read_range(0, end);
+        assert_eq!(range.bytes, b"before\n\nstderr: err\n");
+        let image_event = range
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                OutputEventKind::Image {
+                    id,
+                    mime_type,
+                    readline_results_seen,
+                    ..
+                } => Some((event.offset, id, mime_type, readline_results_seen)),
+                _ => None,
+            })
+            .expect("timeline image event");
+        assert_eq!(image_event.0, b"before\n".len() as u64);
+        assert!(image_event.1.starts_with("image-"));
+        assert_eq!(image_event.2, "image/png");
+        assert_eq!(*image_event.3, 1);
     }
 
     #[test]
