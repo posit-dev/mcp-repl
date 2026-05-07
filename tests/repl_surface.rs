@@ -182,6 +182,43 @@ async fn files_poll_after_timeout_keeps_image_before_later_stdout() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_plot_emit_preserves_stdout_before_image() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let input = concat!(
+        "cat('before\\n'); ",
+        "invisible(.Call('mcp_repl_plot_emit', 'plot-1', charToRaw('img'), 'image/png', TRUE)); ",
+        "cat('after\\n')",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let before_idx =
+        first_text_index_containing(&result, "before").ok_or("expected before text in reply")?;
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let after_idx =
+        first_text_index_containing(&result, "after").ok_or("expected after text in reply")?;
+    assert!(
+        before_idx < image_idx && image_idx < after_idx,
+        "expected before text, image, then after text, got content order: {:?}",
+        result.content
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 

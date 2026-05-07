@@ -73,6 +73,7 @@ static WORKER_IPC_FORK_CLOSE_READ_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_FORK_CLOSE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKER_PLOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
@@ -80,6 +81,7 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
     StdinWrite { text: String },
+    PlotImageAck { sequence: u64 },
     Interrupt,
     SessionEnd,
 }
@@ -105,6 +107,8 @@ pub enum WorkerToServerIpcMessage {
         is_update: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     SessionEnd,
 }
@@ -206,6 +210,7 @@ impl ServerIpcConnection {
         let readline_start_handler = handlers.on_readline_start.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
         let session_end_handler = handlers.on_session_end.clone();
+        let server_sender = tx.clone();
         let IpcTransport { reader, writer } = transport;
         let handle = thread::spawn(move || {
             let mut reader = BufReader::new(reader);
@@ -231,111 +236,125 @@ impl ServerIpcConnection {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(message) = serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
-                    match message {
-                        WorkerToServerIpcMessage::ReadlineStart {
-                            prompt,
-                            client_waiting,
-                        } => {
-                            let prompt_for_handler = prompt.clone();
+                let message = match serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.disconnected = true;
+                        reader_cvar.notify_all();
+                        break;
+                    }
+                };
+                match message {
+                    WorkerToServerIpcMessage::ReadlineStart {
+                        prompt,
+                        client_waiting,
+                    } => {
+                        let prompt_for_handler = prompt.clone();
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if client_waiting {
+                            guard.readline_unmatched_starts =
+                                guard.readline_unmatched_starts.saturating_add(1);
+                            if guard.readline_unmatched_starts == 1 {
+                                guard.readline_unmatched_since = Some(Instant::now());
+                            }
+                        }
+                        if guard
+                            .prompt_history
+                            .back()
+                            .is_none_or(|last| last != &prompt)
+                        {
+                            guard.prompt_history.push_back(prompt.clone());
+                            if guard.prompt_history.len() > MAX_PROMPT_HISTORY {
+                                guard.prompt_history.pop_front();
+                            }
+                        }
+                        guard.last_prompt = Some(prompt);
+                        reader_cvar.notify_all();
+                        drop(guard);
+                        if let Some(handler) = readline_start_handler.as_ref() {
+                            handler(prompt_for_handler);
+                        }
+                    }
+                    WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
+                        let echo_event = IpcEchoEvent {
+                            prompt: prompt.clone(),
+                            line: line.clone(),
+                        };
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.readline_result_count = guard.readline_result_count.saturating_add(1);
+                        if guard.readline_unmatched_starts > 0 {
+                            guard.readline_unmatched_starts -= 1;
+                            if guard.readline_unmatched_starts == 0 {
+                                guard.readline_unmatched_since = None;
+                            }
+                        }
+                        guard.echo_events.push_back(echo_event.clone());
+                        reader_cvar.notify_all();
+                        drop(guard);
+                        if let Some(handler) = readline_result_handler.as_ref() {
+                            handler(echo_event);
+                        }
+                    }
+                    WorkerToServerIpcMessage::SessionEnd => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.session_end = true;
+                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
+                        reader_cvar.notify_all();
+                        drop(guard);
+                        if let Some(handler) = session_end_handler.as_ref() {
+                            handler();
+                        }
+                    }
+                    WorkerToServerIpcMessage::PlotImage {
+                        mime_type,
+                        data,
+                        is_update,
+                        source,
+                        sequence,
+                    } => {
+                        let (id, is_new, updates_previous_image, readline_results_seen) = {
                             let mut guard = reader_inbox.lock().unwrap();
-                            if client_waiting {
-                                guard.readline_unmatched_starts =
-                                    guard.readline_unmatched_starts.saturating_add(1);
-                                if guard.readline_unmatched_starts == 1 {
-                                    guard.readline_unmatched_since = Some(Instant::now());
-                                }
-                            }
-                            if guard
-                                .prompt_history
-                                .back()
-                                .is_none_or(|last| last != &prompt)
-                            {
-                                guard.prompt_history.push_back(prompt.clone());
-                                if guard.prompt_history.len() > MAX_PROMPT_HISTORY {
-                                    guard.prompt_history.pop_front();
-                                }
-                            }
-                            guard.last_prompt = Some(prompt);
-                            reader_cvar.notify_all();
-                            drop(guard);
-                            if let Some(handler) = readline_start_handler.as_ref() {
-                                handler(prompt_for_handler);
-                            }
-                        }
-                        WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
-                            let echo_event = IpcEchoEvent {
-                                prompt: prompt.clone(),
-                                line: line.clone(),
-                            };
+                            let (id, is_new, updates_previous_image) =
+                                assign_plot_image_id(&mut guard, source.as_deref(), is_update);
+                            (
+                                id,
+                                is_new,
+                                updates_previous_image,
+                                guard.readline_result_count as usize,
+                            )
+                        };
+                        if let Some(handler) = plot_handler.as_ref() {
+                            handler(IpcPlotImage {
+                                id,
+                                mime_type,
+                                data,
+                                is_new,
+                                updates_previous_image,
+                                readline_results_seen,
+                            });
+                        } else {
                             let mut guard = reader_inbox.lock().unwrap();
-                            guard.readline_result_count =
-                                guard.readline_result_count.saturating_add(1);
-                            if guard.readline_unmatched_starts > 0 {
-                                guard.readline_unmatched_starts -= 1;
-                                if guard.readline_unmatched_starts == 0 {
-                                    guard.readline_unmatched_since = None;
-                                }
-                            }
-                            guard.echo_events.push_back(echo_event.clone());
-                            reader_cvar.notify_all();
-                            drop(guard);
-                            if let Some(handler) = readline_result_handler.as_ref() {
-                                handler(echo_event);
-                            }
-                        }
-                        WorkerToServerIpcMessage::SessionEnd => {
-                            let mut guard = reader_inbox.lock().unwrap();
-                            guard.session_end = true;
-                            guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
-                            reader_cvar.notify_all();
-                            drop(guard);
-                            if let Some(handler) = session_end_handler.as_ref() {
-                                handler();
-                            }
-                        }
-                        WorkerToServerIpcMessage::PlotImage {
-                            mime_type,
-                            data,
-                            is_update,
-                            source,
-                        } => {
-                            let (id, is_new, updates_previous_image, readline_results_seen) = {
-                                let mut guard = reader_inbox.lock().unwrap();
-                                let (id, is_new, updates_previous_image) =
-                                    assign_plot_image_id(&mut guard, source.as_deref(), is_update);
-                                (
-                                    id,
-                                    is_new,
-                                    updates_previous_image,
-                                    guard.readline_result_count as usize,
-                                )
-                            };
-                            if let Some(handler) = plot_handler.as_ref() {
-                                handler(IpcPlotImage {
-                                    id,
-                                    mime_type,
-                                    data,
-                                    is_new,
-                                    updates_previous_image,
-                                    readline_results_seen,
-                                });
-                            } else {
-                                let mut guard = reader_inbox.lock().unwrap();
-                                guard.queue.push_back(WorkerToServerIpcMessage::PlotImage {
-                                    mime_type,
-                                    data,
-                                    is_update,
-                                    source,
-                                });
-                                reader_cvar.notify_all();
-                            }
-                        }
-                        other => {
-                            let mut guard = reader_inbox.lock().unwrap();
-                            guard.queue.push_back(other);
+                            guard.queue.push_back(WorkerToServerIpcMessage::PlotImage {
+                                mime_type,
+                                data,
+                                is_update,
+                                source,
+                                sequence,
+                            });
                             reader_cvar.notify_all();
                         }
+                        if let Some(sequence) = sequence {
+                            let _ = send_ipc_message(
+                                &server_sender,
+                                ServerToWorkerIpcMessage::PlotImageAck { sequence },
+                            );
+                        }
+                    }
+                    other => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.queue.push_back(other);
+                        reader_cvar.notify_all();
                     }
                 }
             }
@@ -552,11 +571,18 @@ impl WorkerIpcConnection {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(message) = serde_json::from_str::<ServerToWorkerIpcMessage>(trimmed) {
-                    let mut guard = reader_inbox.lock().unwrap();
-                    guard.queue.push_back(message);
-                    reader_cvar.notify_all();
-                }
+                let message = match serde_json::from_str::<ServerToWorkerIpcMessage>(trimmed) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.disconnected = true;
+                        reader_cvar.notify_all();
+                        break;
+                    }
+                };
+                let mut guard = reader_inbox.lock().unwrap();
+                guard.queue.push_back(message);
+                reader_cvar.notify_all();
             }
         });
 
@@ -578,7 +604,7 @@ impl WorkerIpcConnection {
 
     pub fn recv(&self, timeout: Option<Duration>) -> Option<ServerToWorkerIpcMessage> {
         let mut guard = self.inbox.lock().unwrap();
-        if let Some(message) = guard.queue.pop_front() {
+        if let Some(message) = pop_non_ack_message(&mut guard.queue) {
             return Some(message);
         }
         if guard.disconnected {
@@ -588,7 +614,7 @@ impl WorkerIpcConnection {
         match timeout {
             None => loop {
                 guard = self.cvar.wait(guard).unwrap();
-                if let Some(message) = guard.queue.pop_front() {
+                if let Some(message) = pop_non_ack_message(&mut guard.queue) {
                     return Some(message);
                 }
                 if guard.disconnected {
@@ -606,7 +632,7 @@ impl WorkerIpcConnection {
                     let (next_guard, timeout_res) =
                         self.cvar.wait_timeout(guard, remaining).unwrap();
                     guard = next_guard;
-                    if let Some(message) = guard.queue.pop_front() {
+                    if let Some(message) = pop_non_ack_message(&mut guard.queue) {
                         return Some(message);
                     }
                     if guard.disconnected {
@@ -619,6 +645,51 @@ impl WorkerIpcConnection {
             }
         }
     }
+
+    pub fn wait_for_plot_image_ack(&self, sequence: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(idx) = guard.queue.iter().position(|message| {
+                matches!(
+                    message,
+                    ServerToWorkerIpcMessage::PlotImageAck { sequence: seen }
+                        if *seen == sequence
+                )
+            }) {
+                guard.queue.remove(idx);
+                return true;
+            }
+            if guard.disconnected {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return false;
+            }
+        }
+    }
+}
+
+fn pop_non_ack_message(
+    queue: &mut VecDeque<ServerToWorkerIpcMessage>,
+) -> Option<ServerToWorkerIpcMessage> {
+    let idx = queue
+        .iter()
+        .position(|message| !matches!(message, ServerToWorkerIpcMessage::PlotImageAck { .. }))?;
+    queue.remove(idx)
+}
+
+fn send_ipc_message<T>(sender: &mpsc::Sender<T>, message: T) -> io::Result<()> {
+    sender
+        .send(message)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ipc writer disconnected"))
 }
 
 fn spawn_writer<T>(rx: mpsc::Receiver<T>, mut writer: Box<dyn Write + Send>)
@@ -1335,12 +1406,17 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
 
 pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
     if let Some(ipc) = global_ipc() {
+        let sequence = NEXT_WORKER_PLOT_SEQUENCE
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
         let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
             mime_type: mime_type.to_string(),
             data: data.to_string(),
             is_update,
             source: source.map(ToString::to_string),
+            sequence: Some(sequence),
         });
+        let _ = ipc.wait_for_plot_image_ack(sequence, Duration::from_secs(1));
     }
 }
 
@@ -1513,6 +1589,7 @@ mod protocol_tests {
         WorkerToServerIpcMessage,
     };
     use serde_json::json;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1576,6 +1653,38 @@ mod protocol_tests {
         }));
 
         assert!(parsed.is_err(), "request_end should not deserialize");
+    }
+
+    #[test]
+    fn invalid_worker_message_disconnects_server_ipc() {
+        let (server_read, mut worker_write) = std::io::pipe().expect("server pipe");
+        let (_worker_read, server_write) = std::io::pipe().expect("worker pipe");
+        let server = ServerIpcConnection::new(
+            IpcTransport {
+                reader: Box::new(server_read),
+                writer: Box::new(server_write),
+            },
+            IpcHandlers::default(),
+        )
+        .expect("server connection");
+
+        writeln!(
+            worker_write,
+            "{}",
+            json!({
+                "type": "backend_info",
+                "language": "r",
+                "supports_images": true
+            })
+        )
+        .expect("invalid worker message");
+
+        let result = server.wait_for_backend_info(Duration::from_millis(200));
+
+        assert!(
+            matches!(result, Err(super::IpcWaitError::Disconnected)),
+            "invalid worker message should disconnect server IPC, got: {result:?}"
+        );
     }
 
     #[test]

@@ -51,6 +51,9 @@ _plot_hooks_installed = False
 _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
+_plot_next_sequence = 0
+_plot_acks = set()
+_plot_ack_condition = threading.Condition()
 
 
 def _close_ipc_in_fork_child():
@@ -86,6 +89,32 @@ def _send(obj):
             readline.set_pre_input_hook(None)
         except Exception:
             pass
+
+
+def _flush_stdio():
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _next_plot_sequence():
+    global _plot_next_sequence
+    with _plot_ack_condition:
+        _plot_next_sequence += 1
+        return _plot_next_sequence
+
+
+def _wait_for_plot_ack(sequence, timeout_seconds=1.0):
+    deadline = time.monotonic() + timeout_seconds
+    with _plot_ack_condition:
+        while sequence not in _plot_acks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            _plot_ack_condition.wait(remaining)
+        _plot_acks.discard(sequence)
 
 
 def _ensure_plot_modules():
@@ -183,6 +212,8 @@ def _emit_plots():
             _plot_hashes[fig_num] = digest
         encoded = base64.b64encode(data).decode("ascii")
         is_new = fig_num not in prev_known
+        sequence = _next_plot_sequence()
+        _flush_stdio()
         _send(
             {
                 "type": "plot_image",
@@ -190,8 +221,10 @@ def _emit_plots():
                 "data": encoded,
                 "is_update": not bool(is_new),
                 "source": str(fig_num),
+                "sequence": sequence,
             }
         )
+        _wait_for_plot_ack(sequence)
     with _plot_lock:
         _plot_known_figures = new_known
     _plot_emit_in_progress = False
@@ -376,11 +409,7 @@ def _finish_request_if_idle():
         return True
     # Best-effort: ensure the client observes output written before the prompt that marks the
     # request as complete. The Rust side also uses a short settle window after completion.
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
+    _flush_stdio()
     return True
 
 
@@ -456,6 +485,12 @@ def _ipc_reader():
         msg_type = msg.get("type")
         if msg_type == "stdin_write":
             _set_request_active()
+        elif msg_type == "plot_image_ack":
+            sequence = msg.get("sequence")
+            if isinstance(sequence, int):
+                with _plot_ack_condition:
+                    _plot_acks.add(sequence)
+                    _plot_ack_condition.notify_all()
         elif msg_type == "interrupt":
             with _request_lock:
                 _interrupt_pending = True

@@ -99,7 +99,7 @@ async fn start_python_session_with_env_vars(
         return Ok(None);
     }
 
-    let session = common::spawn_server_with_args_env(
+    let mut session = common::spawn_server_with_args_env(
         vec![
             "--interpreter".to_string(),
             "python".to_string(),
@@ -112,6 +112,13 @@ async fn start_python_session_with_env_vars(
     )
     .await?;
     let probe = session.write_stdin_raw_with("pass", Some(2.0)).await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        Duration::from_secs(10),
+    )
+    .await?;
     let probe_text = result_text(&probe);
     if probe_text.contains("worker io error: Permission denied")
         || probe_text.contains("python backend requires a unix-style pty")

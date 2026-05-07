@@ -50,7 +50,7 @@ pub(crate) fn collapse_echo_with_attribution(
             return (!echo_events.is_empty()).then_some(0);
         }
         let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
-        (!echo_events.is_empty() && anchor_idx <= echo_events.len()).then_some(anchor_idx)
+        (!echo_events.is_empty() && anchor_idx < echo_events.len()).then_some(anchor_idx)
     };
 
     let mut events: Vec<(usize, OutputEventKind)> = range
@@ -561,7 +561,6 @@ fn consume_text_segment(
                 }
             }
             *echo_idx = echo_idx.saturating_add(1);
-            flush_anchored_events(*echo_idx, anchored_events, out_bytes, out_events);
             if prefix_len == line.len() {
                 continue;
             }
@@ -887,63 +886,6 @@ mod tests {
             bytes,
             events: vec![OutputEvent {
                 offset: echo.len() as u64,
-                kind: OutputEventKind::Image {
-                    data: "img".to_string(),
-                    mime_type: "image/png".to_string(),
-                    id: "plot-1".to_string(),
-                    is_new: true,
-                    readline_results_seen: 1,
-                },
-            }],
-            text_spans: vec![OutputTextSpan {
-                start_byte: 0,
-                end_byte: echo.len() + output.len(),
-                is_stderr: false,
-                origin: ContentOrigin::Worker,
-            }],
-        };
-
-        let collapsed = collapse_echo_with_attribution(
-            range,
-            &[echo_event("> ", "input(); plot(1:10); cat('done\\n')\n")],
-            0,
-            &["> ".to_string()],
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let contents = pager::contents_from_collapsed_output(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            (echo.len() + output.len()) as u64,
-        );
-
-        assert_eq!(
-            contents,
-            vec![
-                WorkerContent::ContentImage {
-                    data: "img".to_string(),
-                    mime_type: "image/png".to_string(),
-                    id: "plot-1".to_string(),
-                    is_new: true,
-                },
-                WorkerContent::stdout("done\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn event_after_final_echo_anchors_before_later_output_when_raw_offset_is_late() {
-        let echo = b"> input(); plot(1:10); cat('done\\n')\n";
-        let output = b"done\n";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(echo);
-        bytes.extend_from_slice(output);
-        let range = OutputRange {
-            start_offset: 0,
-            end_offset: bytes.len() as u64,
-            bytes,
-            events: vec![OutputEvent {
-                offset: (echo.len() + output.len()) as u64,
                 kind: OutputEventKind::Image {
                     data: "img".to_string(),
                     mime_type: "image/png".to_string(),
