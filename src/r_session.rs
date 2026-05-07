@@ -11,6 +11,7 @@ use std::thread;
 use crate::ipc;
 #[cfg(target_family = "unix")]
 use crate::sandbox::R_SESSION_TMPDIR_ENV;
+use crate::worker_protocol::TextStream;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
@@ -579,18 +580,11 @@ fn is_eof_input(input: &str) -> bool {
     saw_eot
 }
 
-fn write_stdout_bytes(bytes: &[u8]) {
+fn emit_output_text(stream: TextStream, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    crate::output_stream::write_stdout_bytes(bytes);
-}
-
-fn write_stderr_bytes(bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    crate::output_stream::write_stderr_bytes(bytes);
+    ipc::emit_output_text(stream, bytes).expect("failed to send R output over worker IPC");
 }
 
 #[cfg(target_family = "windows")]
@@ -811,11 +805,12 @@ pub extern "C-unwind" fn r_write_console(buf: *const c_char, buflen: c_int, otyp
     }
     let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, buflen as usize) };
     let bytes = decode_console_bytes_for_channel(otype, bytes);
-    if otype == 0 {
-        write_stdout_bytes(&bytes);
+    let stream = if otype == 0 {
+        TextStream::Stdout
     } else {
-        write_stderr_bytes(&bytes);
-    }
+        TextStream::Stderr
+    };
+    emit_output_text(stream, &bytes);
 }
 
 #[unsafe(no_mangle)]
@@ -824,8 +819,10 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
         return;
     }
     let message = unsafe { CStr::from_ptr(buf) }.to_string_lossy();
-    write_stderr_bytes(message.as_bytes());
-    write_stderr_bytes(b"\n");
+    let mut bytes = Vec::with_capacity(message.len() + 1);
+    bytes.extend_from_slice(message.as_bytes());
+    bytes.push(b'\n');
+    emit_output_text(TextStream::Stderr, &bytes);
 }
 
 #[unsafe(no_mangle)]
@@ -961,7 +958,7 @@ pub extern "C-unwind" fn r_read_console(
             echoed.push_str(&line_text);
             ipc::emit_readline_result(prompt, &line_text);
             if !echoed.is_empty() {
-                write_stdout_bytes(echoed.as_bytes());
+                emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
 
             if !buf.is_null() {

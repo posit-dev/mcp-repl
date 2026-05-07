@@ -11,6 +11,7 @@ static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
 static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
+const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
 const STDERR_PREFIX: &[u8] = b"stderr: ";
 
 pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
@@ -337,8 +338,9 @@ impl OutputRing {
 
         let mut dropped_any = false;
         let mut remaining = bytes;
+        let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
         while !remaining.is_empty() {
-            let chunk_len = remaining.len().min(self.capacity_bytes.max(1));
+            let chunk_len = remaining.len().min(max_chunk_len);
             let (head, tail) = remaining.split_at(chunk_len);
             remaining = tail;
 
@@ -375,7 +377,9 @@ impl OutputRing {
         }
 
         if dropped_any {
-            self.append_truncation_notice(self.end_offset(), 0);
+            let mut guard = self.inner.lock().unwrap();
+            let notice_offset = guard.end_offset;
+            self.append_truncation_notice_locked(&mut guard, notice_offset, 0);
         }
     }
 
@@ -625,11 +629,6 @@ impl OutputRing {
         }
     }
 
-    fn append_truncation_notice(&self, offset: u64, extra_bytes: usize) {
-        let mut guard = self.inner.lock().unwrap();
-        self.append_truncation_notice_locked(&mut guard, offset, extra_bytes);
-    }
-
     fn append_truncation_notice_locked(
         &self,
         guard: &mut OutputRingInner,
@@ -815,6 +814,13 @@ fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
         bytes.extend_from_slice(&slice.bytes[slice.range.clone()]);
     }
     bytes
+}
+
+fn output_ring_append_chunk_len(capacity_bytes: usize) -> usize {
+    capacity_bytes
+        .max(1)
+        .saturating_div(16)
+        .clamp(1, OUTPUT_RING_APPEND_CHUNK_MAX_BYTES)
 }
 
 #[cfg(test)]

@@ -9,12 +9,12 @@
 
 - State: active
 - Last updated: 2026-05-07
-- Current phase: phase 2 pending
+- Current phase: phase 3 pending
 
 ## Current Direction
 
-- Route R console callbacks and readline echo through `output_text` now that the
-  protocol and server consumption path are in place.
+- Add broader ordering and backpressure coverage, then remove race-tolerant
+  handling that only applied to R-owned raw pipe output.
 
 ## Long-Term Direction
 
@@ -25,7 +25,7 @@
 
 - Phase 0: completed - protocol frame and synchronous worker IPC writer.
 - Phase 1: completed - append `output_text` into server timelines.
-- Phase 2: pending - route R console callbacks and readline echo through `output_text`.
+- Phase 2: completed - route R console callbacks and readline echo through `output_text`.
 - Phase 3: pending - remove race-tolerant handling that only existed for R-owned output.
 
 ## Locked Decisions
@@ -40,7 +40,8 @@
 
 ## Next Safe Slice
 
-- Route R console callbacks and readline echo through `output_text`.
+- Add focused ordering coverage for R-owned stdout, stderr, readline echo, plots,
+  direct file-descriptor writes, and large-output backpressure.
 
 ## Stop Conditions
 
@@ -52,3 +53,5 @@
 - 2026-05-07: Start with the protocol and synchronous worker writer so later routing can be reviewed separately from server timeline consumption.
 - 2026-05-07: Completed the protocol foundation without changing existing raw stdout/stderr capture or asynchronous non-output IPC sends.
 - 2026-05-07: Completed server-side `output_text` consumption by decoding worker-owned text in the IPC reader and appending it through the existing live output capture path.
+- 2026-05-07: Routed R console callbacks and readline echo through ordered IPC
+  output text, leaving raw stdout and stderr capture for unowned fd output.

@@ -181,7 +181,7 @@ pub struct ServerIpcConnection {
 
 #[derive(Clone)]
 pub struct WorkerIpcConnection {
-    sender: mpsc::Sender<WorkerToServerIpcMessage>,
+    writer: OutputCriticalIpcWriter,
     inbox: Arc<Mutex<WorkerIpcInbox>>,
     cvar: Arc<Condvar>,
 }
@@ -587,13 +587,13 @@ impl ServerIpcConnection {
 
 impl WorkerIpcConnection {
     fn new(transport: IpcTransport) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
         let inbox = Arc::new(Mutex::new(WorkerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
         let IpcTransport { reader, writer } = transport;
+        let writer = OutputCriticalIpcWriter::new(writer);
         thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
@@ -633,20 +633,15 @@ impl WorkerIpcConnection {
             }
         });
 
-        spawn_writer(rx, writer);
-
         Ok(Self {
-            sender: tx,
+            writer,
             inbox,
             cvar,
         })
     }
 
-    pub fn send(
-        &self,
-        message: WorkerToServerIpcMessage,
-    ) -> Result<(), mpsc::SendError<WorkerToServerIpcMessage>> {
-        self.sender.send(message)
+    pub fn send(&self, message: WorkerToServerIpcMessage) -> io::Result<()> {
+        self.writer.send(message)
     }
 
     pub fn recv(&self, timeout: Option<Duration>) -> Option<ServerToWorkerIpcMessage> {
@@ -1411,6 +1406,14 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
             line: line.to_string(),
         });
     }
+}
+
+pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
+    let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
+    ipc.send(WorkerToServerIpcMessage::OutputText {
+        stream,
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
