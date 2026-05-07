@@ -683,33 +683,27 @@ impl ResponseState {
         mut active: ActiveOutputBundle,
         spill_worker_text_chars: usize,
     ) -> FollowUpDetachedPrefix {
-        let contents = if material.detached_prefix_items.is_empty() {
-            Vec::new()
-        } else {
-            match render_active_bundle_contents(
-                &mut self.output_store,
-                &mut active,
-                &material.detached_prefix_items,
-                &material.detached_prefix_inline_items,
-                spill_worker_text_chars,
-            ) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    let protected_bundle_id = active.was_disclosed().then_some(active.id);
-                    if let Err(err) = self.finish_bundle(active) {
-                        eprintln!(
-                            "dropping closed timeout bundle after output-bundle error: {err}"
-                        );
-                    }
-                    return FollowUpDetachedPrefix {
-                        contents: compact_detached_prefix_without_output_bundle(material),
-                        protected_bundle_id,
-                        retained_active_timeout_bundle: None,
-                        retained_staged_timeout_output: None,
-                        retained_bundle_is_detached_prefix_only: false,
-                    };
+        let contents = match render_active_bundle_contents(
+            &mut self.output_store,
+            &mut active,
+            &material.detached_prefix_items,
+            &material.detached_prefix_inline_items,
+            spill_worker_text_chars,
+        ) {
+            Ok(contents) => contents,
+            Err(err) => {
+                eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                let protected_bundle_id = active.was_disclosed().then_some(active.id);
+                if let Err(err) = self.finish_bundle(active) {
+                    eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
                 }
+                return FollowUpDetachedPrefix {
+                    contents: compact_detached_prefix_without_output_bundle(material),
+                    protected_bundle_id,
+                    retained_active_timeout_bundle: None,
+                    retained_staged_timeout_output: None,
+                    retained_bundle_is_detached_prefix_only: false,
+                };
             }
         };
         let protected_bundle_id = active.was_disclosed().then_some(active.id);
@@ -2201,6 +2195,9 @@ fn render_active_bundle_contents(
             active,
             0,
         ))
+    } else if active.was_disclosed() && image_bundle_still_needed {
+        active.disclosed = true;
+        Ok(compact_output_bundle_items(inline_items, active))
     } else {
         Ok(materialize_items(inline_items.to_vec()))
     }

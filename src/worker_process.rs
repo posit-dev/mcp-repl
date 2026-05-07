@@ -144,7 +144,18 @@ impl LiveOutputCapture {
 
     fn append_image(&self, image: IpcPlotImage) {
         if image.updates_previous_image {
-            self.append_server_stdout_status_line(PREVIOUS_IMAGE_UPDATE_NOTICE.as_bytes());
+            self.output_timeline.append_text_event(
+                PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
+                false,
+                ContentOrigin::Server,
+                Some(image.readline_results_seen),
+            );
+            if let Some(tape) = &self.pending_output_tape {
+                tape.append_stdout_status_event(
+                    PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
+                    image.readline_results_seen,
+                );
+            }
         }
         self.output_timeline.append_image(
             image.id.clone(),
@@ -161,14 +172,6 @@ impl LiveOutputCapture {
                 image.is_new,
                 image.readline_results_seen,
             );
-        }
-    }
-
-    fn append_server_stdout_status_line(&self, bytes: &[u8]) {
-        self.output_timeline
-            .append_text(bytes, false, ContentOrigin::Server);
-        if let Some(tape) = &self.pending_output_tape {
-            tape.append_stdout_status_line(bytes);
         }
     }
 
@@ -6562,6 +6565,7 @@ mod tests {
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: false,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
@@ -6569,6 +6573,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: true,
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -6589,6 +6594,7 @@ mod tests {
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: false,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
@@ -6596,10 +6602,38 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: true,
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected stable waiting prompt to complete request");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].line, "1+1\n");
+    }
+
+    #[test]
+    fn completion_settle_after_prompt_does_not_count_as_execution_timeout() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+        let prompt = "> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+            client_waiting: true,
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+            client_waiting: true,
+        });
+        thread::sleep(Duration::from_millis(1));
+
+        let completion = driver_wait_for_completion(Duration::from_millis(5), server)
+            .expect("expected prompt seen before timeout to complete after stable settle");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
@@ -6612,6 +6646,7 @@ mod tests {
         driver_on_input_start("1+\n1", &server);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -6619,6 +6654,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
+            client_waiting: true,
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -6635,6 +6671,7 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: false,
         });
 
         let late_sender = thread::spawn(move || {
@@ -6650,6 +6687,7 @@ mod tests {
             });
             let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineStart {
                 prompt: "> ".to_string(),
+                client_waiting: true,
             });
         });
 
@@ -6667,12 +6705,64 @@ mod tests {
     }
 
     #[test]
+    fn completion_waits_for_client_waiting_prompt_after_buffered_readline_start() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+\n1", &server);
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+            client_waiting: false,
+        });
+        thread::sleep(REQUEST_COMPLETION_STABLE_WAIT + Duration::from_millis(5));
+        let early = server
+            .wait_for_request_completion(Duration::from_millis(1), REQUEST_COMPLETION_STABLE_WAIT);
+        assert!(
+            matches!(early, Err(IpcWaitError::Timeout)),
+            "did not expect buffered readline start to complete request, got {early:?}"
+        );
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "+ ".to_string(),
+            client_waiting: false,
+        });
+        thread::sleep(REQUEST_COMPLETION_STABLE_WAIT + Duration::from_millis(5));
+        let continuation = server
+            .wait_for_request_completion(Duration::from_millis(1), REQUEST_COMPLETION_STABLE_WAIT);
+        assert!(
+            matches!(continuation, Err(IpcWaitError::Timeout)),
+            "did not expect buffered continuation start to complete request, got {continuation:?}"
+        );
+
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "+ ".to_string(),
+            line: "1\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+            client_waiting: true,
+        });
+
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after final client-waiting prompt");
+
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 2);
+        assert_eq!(completion.echo_events[0].line, "1+\n");
+        assert_eq!(completion.echo_events[1].line, "1\n");
+    }
+
+    #[test]
     fn next_request_result_is_retained_when_prompt_is_already_active() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         driver_on_input_start("first()", &server);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
             .expect("expected first completion");
@@ -6685,6 +6775,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
 
         let second = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -6703,6 +6794,7 @@ mod tests {
         driver_on_input_start("first()", &server);
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -6710,6 +6802,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -6729,6 +6822,7 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -6752,6 +6846,7 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -6759,6 +6854,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
+            client_waiting: true,
         });
         thread::sleep(Duration::from_millis(25));
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
@@ -6981,6 +7077,7 @@ mod tests {
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
+            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt,
@@ -6988,6 +7085,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: ">>> ".to_string(),
+            client_waiting: true,
         });
         drop(worker);
         manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));
@@ -7737,6 +7835,97 @@ mod tests {
                 )
             }),
             "pager mode should keep image events in the output timeline"
+        );
+    }
+
+    #[test]
+    fn files_output_capture_anchors_update_notice_before_late_echo() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring),
+        );
+
+        capture.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "lines(4:8, 4:8)\n".to_string(),
+        });
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: true,
+            readline_results_seen: 1,
+        });
+        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
+
+        let contents = tape
+            .drain_final_snapshot()
+            .format_contents_for_reply()
+            .contents;
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pager_output_capture_anchors_update_notice_before_late_echo() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Pager,
+            PendingOutputTape::new(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: true,
+            readline_results_seen: 1,
+        });
+        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
+
+        let end = output_ring.end_offset();
+        let collapsed = collapse_echo_with_attribution(
+            output_ring.read_range(0, end),
+            &[echo_event("> ", "lines(4:8, 4:8)\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            end,
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
         );
     }
 

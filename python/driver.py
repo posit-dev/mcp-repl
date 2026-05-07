@@ -129,14 +129,6 @@ def _ensure_plot_modules():
         return False
 
 
-def _reset_plot_hashes():
-    global _plot_hashes
-    if not _plot_capable:
-        return
-    with _plot_lock:
-        _plot_hashes = {}
-
-
 def _maybe_emit_plots():
     if not _has_request_active():
         return
@@ -166,12 +158,15 @@ def _emit_plots():
     if not fig_nums:
         with _plot_lock:
             _plot_known_figures = set()
+            _plot_hashes = {}
         _plot_emit_in_progress = False
         return
     fig_nums = sorted(fig_nums)
+    new_known = set(fig_nums)
     with _plot_lock:
         prev_known = set(_plot_known_figures)
-    new_known = set(fig_nums)
+        for stale_num in set(_plot_hashes) - new_known:
+            _plot_hashes.pop(stale_num, None)
     for fig_num in fig_nums:
         try:
             fig = plt.figure(fig_num)
@@ -194,6 +189,7 @@ def _emit_plots():
                 "mime_type": "image/png",
                 "data": encoded,
                 "is_update": not bool(is_new),
+                "source": str(fig_num),
             }
         )
     with _plot_lock:
@@ -269,6 +265,15 @@ def _stdin_has_data():
         return bool(readable)
     except Exception:
         return False
+
+
+def _stdin_has_data_soon(timeout_seconds=0.05):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _stdin_has_data():
+            return True
+        time.sleep(0.001)
+    return _stdin_has_data()
 
 
 def _wait_for_request_active(timeout_seconds=0.05):
@@ -363,12 +368,12 @@ def _discard_pending_request_input():
 
 def _finish_request_if_idle():
     if not _has_request_active():
-        return
-    if _stdin_has_data():
-        return
+        return False
+    if _stdin_has_data_soon():
+        return False
     _emit_plots()
     if not _take_request_active():
-        return
+        return True
     # Best-effort: ensure the client observes output written before the prompt that marks the
     # request as complete. The Rust side also uses a short settle window after completion.
     try:
@@ -376,15 +381,23 @@ def _finish_request_if_idle():
         sys.stderr.flush()
     except Exception:
         pass
+    return True
 
 
 def _emit_prompt(prompt=None, finish_request=True):
     _discard_pending_request_input()
     if prompt is None:
         prompt = _last_prompt or _primary_prompt or getattr(sys, "ps1", ">>> ")
-    _send({"type": "readline_start", "prompt": str(prompt)})
-    if finish_request:
-        _finish_request_if_idle()
+    # Buffered stdin means this prompt is an internal interpreter prompt, not a client-waiting
+    # prompt. Do not emit the completion sideband until Python is actually idle.
+    client_waiting = bool(finish_request and _finish_request_if_idle())
+    _send(
+        {
+            "type": "readline_start",
+            "prompt": str(prompt),
+            "client_waiting": client_waiting,
+        }
+    )
 
 
 def _pydoc_plainpager(text, title=""):
@@ -443,7 +456,6 @@ def _ipc_reader():
         msg_type = msg.get("type")
         if msg_type == "stdin_write":
             _set_request_active()
-            _reset_plot_hashes()
         elif msg_type == "interrupt":
             with _request_lock:
                 _interrupt_pending = True

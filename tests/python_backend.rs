@@ -676,6 +676,32 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_buffered_multiline_prompt_does_not_complete_request_early() -> TestResult<()> {
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "if True:\n    pass\n\nimport time\ntime.sleep(0.5)\nprint('DONE')",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected buffered multiline request to finish in the original call, got: {text:?}"
+    );
+    assert!(
+        text.contains("DONE"),
+        "expected buffered multiline request to include final output, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_roundtrip() -> TestResult<()> {
     let Some(session) = start_python_session().await? else {
         return Ok(());

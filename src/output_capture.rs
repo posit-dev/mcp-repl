@@ -112,6 +112,17 @@ impl OutputTimeline {
         self.ring
             .append_image_event(id, mime_type, data, is_new, readline_results_seen);
     }
+
+    pub(crate) fn append_text_event(
+        &self,
+        text: String,
+        is_stderr: bool,
+        origin: ContentOrigin,
+        readline_results_seen: Option<usize>,
+    ) {
+        self.ring
+            .append_text_event(text, is_stderr, origin, readline_results_seen);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -283,6 +294,7 @@ pub(crate) enum OutputEventKind {
         text: String,
         is_stderr: bool,
         origin: ContentOrigin,
+        readline_results_seen: Option<usize>,
     },
 }
 
@@ -411,6 +423,38 @@ impl OutputRing {
             data,
             mime_type,
             is_new,
+            readline_results_seen,
+        };
+        let event_bytes = event_size_bytes(&kind);
+        if event_bytes > self.capacity_bytes {
+            return;
+        }
+
+        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+        let mut event_offset = guard.end_offset.max(guard.start_offset);
+        if dropped.dropped_any() {
+            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+            event_offset = event_offset.max(guard.start_offset);
+        }
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    pub(crate) fn append_text_event(
+        &self,
+        text: String,
+        is_stderr: bool,
+        origin: ContentOrigin,
+        readline_results_seen: Option<usize>,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        let kind = OutputEventKind::Text {
+            text,
+            is_stderr,
+            origin,
             readline_results_seen,
         };
         let event_bytes = event_size_bytes(&kind);
@@ -596,6 +640,7 @@ impl OutputRing {
             text: "[repl] output truncated (older output dropped)\n".to_string(),
             is_stderr: false,
             origin: ContentOrigin::Server,
+            readline_results_seen: None,
         };
         let notice_bytes = event_size_bytes(&notice_kind);
         if notice_bytes.saturating_add(extra_bytes) > self.capacity_bytes {
@@ -920,6 +965,7 @@ mod tests {
                         text,
                         is_stderr: false,
                         origin: ContentOrigin::Worker,
+                        readline_results_seen: None,
                     },
                 );
             }

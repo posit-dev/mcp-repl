@@ -5,3 +5,4 @@ mcp-repl-startup.log
 .Rproj.user
 .venv
 /eval
+.agents

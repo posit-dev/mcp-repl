@@ -1664,6 +1664,7 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
             text,
             is_stderr,
             origin,
+            ..
         } => {
             if *is_stderr {
                 match origin {
@@ -3989,6 +3990,7 @@ mod tests {
                     text: "[repl] output truncated (older output dropped)\n".to_string(),
                     is_stderr: false,
                     origin: ContentOrigin::Server,
+                    readline_results_seen: None,
                 },
             )],
             vec![

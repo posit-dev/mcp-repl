@@ -3,7 +3,7 @@
     allow(dead_code)
 )]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 #[cfg(target_family = "windows")]
 use std::ffi::c_void;
 #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -16,9 +16,8 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 #[cfg(target_family = "unix")]
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
-#[cfg(target_family = "windows")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,6 +72,7 @@ static WORKER_IPC_ALLOWED: AtomicBool = AtomicBool::new(true);
 static WORKER_IPC_FORK_CLOSE_READ_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_FORK_CLOSE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
@@ -93,6 +93,7 @@ pub enum WorkerToServerIpcMessage {
     },
     ReadlineStart {
         prompt: String,
+        client_waiting: bool,
     },
     ReadlineResult {
         prompt: String,
@@ -102,6 +103,8 @@ pub enum WorkerToServerIpcMessage {
         mime_type: String,
         data: String,
         is_update: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     SessionEnd,
 }
@@ -115,9 +118,10 @@ struct ServerIpcInbox {
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
-    next_image_id: u64,
     current_image_id: Option<String>,
     request_image_id: Option<String>,
+    plot_source_image_ids: HashMap<String, String>,
+    request_plot_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
     session_end: bool,
     disconnected: bool,
@@ -229,13 +233,18 @@ impl ServerIpcConnection {
                 }
                 if let Ok(message) = serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
                     match message {
-                        WorkerToServerIpcMessage::ReadlineStart { prompt } => {
+                        WorkerToServerIpcMessage::ReadlineStart {
+                            prompt,
+                            client_waiting,
+                        } => {
                             let prompt_for_handler = prompt.clone();
                             let mut guard = reader_inbox.lock().unwrap();
-                            guard.readline_unmatched_starts =
-                                guard.readline_unmatched_starts.saturating_add(1);
-                            if guard.readline_unmatched_starts == 1 {
-                                guard.readline_unmatched_since = Some(Instant::now());
+                            if client_waiting {
+                                guard.readline_unmatched_starts =
+                                    guard.readline_unmatched_starts.saturating_add(1);
+                                if guard.readline_unmatched_starts == 1 {
+                                    guard.readline_unmatched_since = Some(Instant::now());
+                                }
                             }
                             if guard
                                 .prompt_history
@@ -289,28 +298,12 @@ impl ServerIpcConnection {
                             mime_type,
                             data,
                             is_update,
+                            source,
                         } => {
                             let (id, is_new, updates_previous_image, readline_results_seen) = {
                                 let mut guard = reader_inbox.lock().unwrap();
-                                let updates_previous_image = is_update
-                                    && guard.current_image_id.is_some()
-                                    && guard.request_image_id.is_none();
-                                let is_new = !is_update
-                                    || guard.current_image_id.is_none()
-                                    || updates_previous_image;
-                                let id = if is_new {
-                                    guard.next_image_id = guard.next_image_id.saturating_add(1);
-                                    let id = format!("image-{}", guard.next_image_id);
-                                    guard.request_image_id = Some(id.clone());
-                                    guard.current_image_id = Some(id.clone());
-                                    id
-                                } else {
-                                    guard
-                                        .request_image_id
-                                        .clone()
-                                        .or_else(|| guard.current_image_id.clone())
-                                        .expect("current image id must exist for updates")
-                                };
+                                let (id, is_new, updates_previous_image) =
+                                    assign_plot_image_id(&mut guard, source.as_deref(), is_update);
                                 (
                                     id,
                                     is_new,
@@ -333,6 +326,7 @@ impl ServerIpcConnection {
                                     mime_type,
                                     data,
                                     is_update,
+                                    source,
                                 });
                                 reader_cvar.notify_all();
                             }
@@ -410,6 +404,7 @@ impl ServerIpcConnection {
         stable_wait: Duration,
     ) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
+        let allow_completion_settle_after_deadline = !timeout.is_zero();
         let mut guard = self.inbox.lock().unwrap();
         loop {
             if take_session_end(&mut guard) {
@@ -423,10 +418,21 @@ impl ServerIpcConnection {
             }
 
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline
+                && !request_completion_observed_before_deadline(
+                    &guard,
+                    deadline,
+                    allow_completion_settle_after_deadline,
+                )
+            {
                 return Err(IpcWaitError::Timeout);
             }
-            let remaining = completion_wait_duration(&guard, deadline, stable_wait);
+            let remaining = completion_wait_duration(
+                &guard,
+                deadline,
+                stable_wait,
+                allow_completion_settle_after_deadline,
+            );
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
@@ -436,7 +442,13 @@ impl ServerIpcConnection {
                 if take_request_completion(&mut guard, stable_wait) {
                     return Ok(());
                 }
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline
+                    && !request_completion_observed_before_deadline(
+                        &guard,
+                        deadline,
+                        allow_completion_settle_after_deadline,
+                    )
+                {
                     return Err(IpcWaitError::Timeout);
                 }
             }
@@ -831,7 +843,7 @@ fn random_pipe_suffix() -> io::Result<String> {
 
 #[cfg(target_family = "windows")]
 fn next_pipe_name() -> io::Result<String> {
-    let nonce = PIPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = PIPE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
     let random = random_pipe_suffix()?;
     Ok(format!(
         r"\\.\pipe\mcp-repl-ipc-{}-{nonce}-{random}",
@@ -1303,10 +1315,11 @@ fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd) -> io::Res
     Ok(())
 }
 
-pub fn emit_readline_start(prompt: &str) {
+pub fn emit_readline_start(prompt: &str, client_waiting: bool) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.to_string(),
+            client_waiting,
         });
     }
 }
@@ -1320,12 +1333,13 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
     }
 }
 
-pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool) {
+pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
             mime_type: mime_type.to_string(),
             data: data.to_string(),
             is_update,
+            source: source.map(ToString::to_string),
         });
     }
 }
@@ -1390,10 +1404,23 @@ fn take_request_completion(guard: &mut ServerIpcInbox, stable_wait: Duration) ->
     true
 }
 
+fn request_completion_observed_before_deadline(
+    guard: &ServerIpcInbox,
+    deadline: Instant,
+    allow_completion_settle_after_deadline: bool,
+) -> bool {
+    allow_completion_settle_after_deadline
+        && guard.readline_unmatched_starts > 0
+        && guard
+            .readline_unmatched_since
+            .is_some_and(|since| since <= deadline)
+}
+
 fn completion_wait_duration(
     guard: &ServerIpcInbox,
     deadline: Instant,
     stable_wait: Duration,
+    allow_completion_settle_after_deadline: bool,
 ) -> Duration {
     let now = Instant::now();
     let until_deadline = deadline.saturating_duration_since(now);
@@ -1403,9 +1430,59 @@ fn completion_wait_duration(
     let elapsed = since.elapsed();
     if elapsed >= stable_wait {
         Duration::from_millis(0)
+    } else if allow_completion_settle_after_deadline && since <= deadline {
+        stable_wait.saturating_sub(elapsed)
     } else {
         until_deadline.min(stable_wait.saturating_sub(elapsed))
     }
+}
+
+fn allocate_plot_image_id() -> String {
+    let id = NEXT_SERVER_IMAGE_ID
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        .saturating_add(1);
+    format!("image-{id}")
+}
+
+fn assign_plot_image_id(
+    guard: &mut ServerIpcInbox,
+    source: Option<&str>,
+    is_update: bool,
+) -> (String, bool, bool) {
+    if let Some(source) = source {
+        if is_update && let Some(id) = guard.request_plot_source_image_ids.get(source) {
+            guard.current_image_id = Some(id.clone());
+            return (id.clone(), false, false);
+        }
+
+        let updates_previous_image = is_update && guard.plot_source_image_ids.contains_key(source);
+        let id = allocate_plot_image_id();
+        guard
+            .plot_source_image_ids
+            .insert(source.to_string(), id.clone());
+        guard
+            .request_plot_source_image_ids
+            .insert(source.to_string(), id.clone());
+        guard.current_image_id = Some(id.clone());
+        return (id, true, updates_previous_image);
+    }
+
+    let updates_previous_image =
+        is_update && guard.current_image_id.is_some() && guard.request_image_id.is_none();
+    let is_new = !is_update || guard.current_image_id.is_none() || updates_previous_image;
+    let id = if is_new {
+        let id = allocate_plot_image_id();
+        guard.request_image_id = Some(id.clone());
+        guard.current_image_id = Some(id.clone());
+        id
+    } else {
+        guard
+            .request_image_id
+            .clone()
+            .or_else(|| guard.current_image_id.clone())
+            .expect("current image id must exist for updates")
+    };
+    (id, is_new, updates_previous_image)
 }
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
@@ -1417,6 +1494,7 @@ fn reset_request_progress(guard: &mut ServerIpcInbox) {
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     reset_request_progress(guard);
     guard.request_image_id = None;
+    guard.request_plot_source_image_ids.clear();
     guard.last_prompt = None;
 }
 
@@ -1560,6 +1638,62 @@ mod protocol_tests {
         assert!(!images[1].is_new);
         assert_eq!(images[0].data, "first");
         assert_eq!(images[1].data, "second");
+    }
+
+    #[test]
+    fn plot_image_ids_do_not_repeat_across_server_connections() {
+        fn next_connection_image_id() -> String {
+            let (server_read, worker_write) = std::io::pipe().expect("server pipe");
+            let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
+            let images = Arc::new(Mutex::new(Vec::new()));
+            let handler_images = images.clone();
+            let _server = ServerIpcConnection::new(
+                IpcTransport {
+                    reader: Box::new(server_read),
+                    writer: Box::new(server_write),
+                },
+                IpcHandlers {
+                    on_plot_image: Some(Arc::new(move |image| {
+                        handler_images.lock().expect("image mutex").push(image);
+                    })),
+                    ..IpcHandlers::default()
+                },
+            )
+            .expect("server connection");
+            let worker = WorkerIpcConnection::new(IpcTransport {
+                reader: Box::new(worker_read),
+                writer: Box::new(worker_write),
+            })
+            .expect("worker connection");
+            let image = json!({
+                "type": "plot_image",
+                "mime_type": "image/png",
+                "data": "image",
+                "is_update": false
+            })
+            .to_string();
+
+            worker
+                .send(serde_json::from_str(&image).expect("image message"))
+                .expect("send image");
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                if let Some(image) = images.lock().expect("image mutex").first() {
+                    return image.id.clone();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("timed out waiting for image");
+        }
+
+        let first = next_connection_image_id();
+        let second = next_connection_image_id();
+
+        assert_ne!(
+            first, second,
+            "server-generated image IDs must stay unique across worker IPC connections"
+        );
     }
 }
 

@@ -45,9 +45,12 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   policy.
 
 `readline_start`
-- `{ "type": "readline_start", "prompt": <string> }`
-- Emitted before each readline call to indicate the prompt that will be shown.
-  The prompt string is required; use an empty string if the backend did not supply one.
+- `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
+- Emitted for readline prompts. The prompt string is required; use an empty string
+  if the backend did not supply one.
+- `client_waiting` is true only when the backend knows the prompt is waiting for
+  new client input. Prompts that will immediately consume buffered input should
+  use false.
 
 `readline_result`
 - `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
@@ -56,8 +59,12 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   echo suppression. Output streams remain unframed.
 
 `plot_image`
-- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool> }`
+- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
 - Image payload for plot updates.
+- `source` is optional worker-local plot source identity, such as a graphics
+  device or figure slot. It is not a response image ID; the server owns response
+  image IDs and uses `source` only to keep distinct plot sources from collapsing
+  into one response image.
 - If an update is the first image event for a new server request, the server
   treats it as a new response image and includes a server notice that it updates
   the previously sent image.

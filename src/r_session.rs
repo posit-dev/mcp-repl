@@ -874,7 +874,9 @@ pub extern "C-unwind" fn r_read_console(
                 .to_string(),
         )
     };
-    ipc::emit_readline_start(prompt_text.as_deref().unwrap_or(""));
+    let prompt = prompt_text.as_deref().unwrap_or("");
+    ipc::emit_readline_start(prompt, false);
+    let mut client_waiting_start_emitted = false;
     let is_save_prompt = prompt_text
         .as_deref()
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
@@ -942,7 +944,6 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let prompt = prompt_text.as_deref().unwrap_or("");
             let line_text = String::from_utf8_lossy(head).to_string();
             let mut echoed = String::with_capacity(prompt.len() + line_text.len());
             echoed.push_str(prompt);
@@ -960,6 +961,11 @@ pub extern "C-unwind" fn r_read_console(
             }
 
             return 1;
+        }
+
+        if !client_waiting_start_emitted && guard.active_request.is_some() {
+            ipc::emit_readline_start(prompt, true);
+            client_waiting_start_emitted = true;
         }
 
         if let Some(active) = guard.active_request.take() {
@@ -1002,7 +1008,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&mime_type, &data, !is_new);
+    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
 }
