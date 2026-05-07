@@ -93,7 +93,7 @@ fn interrupt_recovery_deadline() -> Instant {
 }
 
 fn python_startup_probe_budget() -> Duration {
-    Duration::from_secs(if cfg!(target_os = "macos") { 30 } else { 10 })
+    Duration::from_secs(if cfg!(target_os = "macos") { 60 } else { 10 })
 }
 
 async fn start_python_session_with_env_vars(
@@ -1045,18 +1045,27 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let marker_dir = tempdir()?;
+    let marker_path = marker_dir.path().join("detached-idle-written");
+    let marker = marker_path
+        .to_str()
+        .ok_or("detached idle marker path must be valid utf-8")?;
+    let marker_literal = serde_json::to_string(marker)?;
 
     let setup = session
         .write_stdin_raw_with(
-            r#"import subprocess, sys
-script = """import sys, time
+            format!(
+                r#"import subprocess, sys
+script = """import pathlib, sys, time
 time.sleep(0.3)
 for i in range(160):
     sys.stdout.write("IDLE_%03d " % i + ("x" * 80) + "\\n")
 sys.stdout.flush()
+pathlib.Path({marker_literal}).write_text("done")
 """
 subprocess.Popen(
     [sys.executable, "-c", script],
@@ -1064,7 +1073,8 @@ subprocess.Popen(
     close_fds=False,
 )
 print("parent ready")
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -1079,7 +1089,7 @@ print("parent ready")
         "expected detached-idle setup reply, got: {setup_text:?}"
     );
 
-    sleep(Duration::from_millis(1500)).await;
+    wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
         .await?;
@@ -1238,18 +1248,27 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
+    let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let marker_dir = tempdir()?;
+    let marker_path = marker_dir.path().join("detached-incomplete-written");
+    let marker = marker_path
+        .to_str()
+        .ok_or("detached incomplete marker path must be valid utf-8")?;
+    let marker_literal = serde_json::to_string(marker)?;
 
     let setup = session
         .write_stdin_raw_with(
-            r#"import subprocess, sys
-script = """import os, sys, time
+            format!(
+                r#"import subprocess, sys
+script = """import os, pathlib, sys, time
 time.sleep(0.3)
 for i in range(160):
     os.write(sys.stdout.fileno(), ("IDLE_%03d " % i + ("x" * 80) + "\\n").encode())
 os.write(sys.stdout.fileno(), bytes([0xC3]))
+pathlib.Path({marker_literal}).write_text("done")
 """
 subprocess.Popen(
     [sys.executable, "-c", script],
@@ -1257,7 +1276,8 @@ subprocess.Popen(
     close_fds=False,
 )
 print("parent ready")
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -1272,7 +1292,7 @@ print("parent ready")
         "expected detached-incomplete setup reply, got: {setup_text:?}"
     );
 
-    sleep(Duration::from_millis(700)).await;
+    wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with(
             "import os, sys\nos.write(sys.stdout.fileno(), bytes([0xA9, 0x0A]))\nprint('FOLLOWUP_OK')",
