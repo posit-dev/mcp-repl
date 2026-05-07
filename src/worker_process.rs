@@ -439,6 +439,7 @@ const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
 } else {
     Duration::from_millis(120)
 };
+#[cfg(target_family = "unix")]
 const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
