@@ -69,6 +69,7 @@ pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
+const OUTPUT_TEXT_IPC_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ALLOWED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_family = "unix")]
@@ -642,6 +643,16 @@ impl WorkerIpcConnection {
 
     pub fn send(&self, message: WorkerToServerIpcMessage) -> io::Result<()> {
         self.writer.send(message)
+    }
+
+    pub fn send_output_text(&self, stream: TextStream, bytes: &[u8]) -> io::Result<()> {
+        for chunk in bytes.chunks(OUTPUT_TEXT_IPC_CHUNK_BYTES) {
+            self.send(WorkerToServerIpcMessage::OutputText {
+                stream,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
+            })?;
+        }
+        Ok(())
     }
 
     pub fn recv(&self, timeout: Option<Duration>) -> Option<ServerToWorkerIpcMessage> {
@@ -1362,6 +1373,17 @@ pub fn global_ipc() -> Option<&'static WorkerIpcConnection> {
     IPC_GLOBAL.get()
 }
 
+pub fn worker_ipc_disabled_for_process() -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        !WORKER_IPC_ALLOWED.load(AtomicOrdering::SeqCst)
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_family = "unix")]
 extern "C" fn close_worker_ipc_in_fork_child() {
     WORKER_IPC_ALLOWED.store(false, AtomicOrdering::SeqCst);
@@ -1410,10 +1432,7 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
 
 pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
     let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
-    ipc.send(WorkerToServerIpcMessage::OutputText {
-        stream,
-        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    })
+    ipc.send_output_text(stream, bytes)
 }
 
 pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
@@ -1599,8 +1618,9 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, OutputCriticalIpcWriter, ServerIpcConnection,
-        ServerToWorkerIpcMessage, WorkerIpcConnection, WorkerToServerIpcMessage,
+        IpcHandlers, IpcTransport, OUTPUT_TEXT_IPC_CHUNK_BYTES, OutputCriticalIpcWriter,
+        ServerIpcConnection, ServerToWorkerIpcMessage, WorkerIpcConnection,
+        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -1830,6 +1850,45 @@ mod protocol_tests {
         });
 
         assert!(result.is_err(), "broken IPC pipe should be reported");
+    }
+
+    #[test]
+    fn worker_output_text_chunks_large_buffers_before_encoding() {
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+            on_output_text: Some(Arc::new(move |text| {
+                chunk_tx.send(text.bytes).expect("record output text chunk");
+            })),
+            ..IpcHandlers::default()
+        })
+        .expect("test IPC pair");
+        let payload = vec![b'x'; OUTPUT_TEXT_IPC_CHUNK_BYTES * 2 + 17];
+
+        worker
+            .send_output_text(TextStream::Stdout, &payload)
+            .expect("send chunked output_text");
+
+        let mut chunks = Vec::new();
+        let mut bytes_seen = 0usize;
+        while bytes_seen < payload.len() {
+            let chunk = chunk_rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("output_text chunk");
+            bytes_seen += chunk.len();
+            chunks.push(chunk);
+        }
+        assert!(
+            chunks.len() > 1,
+            "large output_text buffer should be split before IPC framing"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= OUTPUT_TEXT_IPC_CHUNK_BYTES),
+            "output_text chunks should be bounded"
+        );
+        let reassembled = chunks.concat();
+        assert_eq!(reassembled, payload);
     }
 
     #[test]

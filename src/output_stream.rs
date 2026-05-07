@@ -43,6 +43,17 @@ impl Drop for OutputLockGuard<'_> {
     }
 }
 
+pub(crate) fn write_stdout_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    with_output_lock(|| {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        let _ = write_all_bytes(&mut stdout, bytes);
+    });
+}
+
 pub(crate) fn write_stderr_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;

@@ -584,7 +584,14 @@ fn emit_output_text(stream: TextStream, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    ipc::emit_output_text(stream, bytes).expect("failed to send R output over worker IPC");
+    match ipc::emit_output_text(stream, bytes) {
+        Ok(()) => {}
+        Err(_) if ipc::worker_ipc_disabled_for_process() => match stream {
+            TextStream::Stdout => crate::output_stream::write_stdout_bytes(bytes),
+            TextStream::Stderr => crate::output_stream::write_stderr_bytes(bytes),
+        },
+        Err(err) => panic!("failed to send R output over worker IPC: {err}"),
+    }
 }
 
 #[cfg(target_family = "windows")]

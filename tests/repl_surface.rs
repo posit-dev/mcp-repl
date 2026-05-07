@@ -218,6 +218,44 @@ async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> {
+    let session = common::spawn_server().await?;
+
+    let input = concat!(
+        "if (.Platform$OS.type == 'windows') { ",
+        "cat('SKIP_FORK\\n') ",
+        "} else { ",
+        "job <- parallel::mcparallel({ cat('child\\n'); flush.console(); 42L }, silent = FALSE); ",
+        "parallel::mccollect(job, wait = TRUE); ",
+        "cat('parent\\n') ",
+        "}",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("SKIP_FORK") {
+        eprintln!("repl_surface fork output fallback unsupported on this platform; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        return Err(format!("fork child console output remained busy: {text:?}").into());
+    }
+
+    assert!(
+        text.contains("child") && text.contains("parent"),
+        "expected child and parent output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 
