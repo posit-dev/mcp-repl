@@ -439,6 +439,7 @@ const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
 } else {
     Duration::from_millis(120)
 };
+const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
@@ -5880,15 +5881,12 @@ where
     let (wake_reader, wake_writer) = std::io::pipe()?;
     let (done_tx, done_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop_requested.clone();
     let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         let stream_fd = stream.as_raw_fd();
         let wake_fd = wake_reader.as_raw_fd();
+        let mut stop_deadline = None;
         loop {
-            if thread_stop.load(Ordering::Relaxed) {
-                break;
-            }
             let mut fds = [
                 libc::pollfd {
                     fd: stream_fd,
@@ -5901,7 +5899,9 @@ where
                     revents: 0,
                 },
             ];
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            let timeout_ms = if stop_deadline.is_some() { 0 } else { -1 };
+            let ready =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
             if ready < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -5909,19 +5909,34 @@ where
                 }
                 break;
             }
-            if fds[1].revents != 0 {
+            if ready == 0 {
                 break;
             }
-            if fds[0].revents == 0 {
+            if fds[1].revents != 0 && stop_deadline.is_none() {
+                stop_deadline = Some(std::time::Instant::now() + OUTPUT_READER_STOP_DRAIN_GRACE);
+            }
+            let mut read_stream = false;
+            if fds[0].revents != 0 {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        break;
+                    }
+                    Ok(n) => {
+                        live_output.append_text(&buffer[..n], output_stream);
+                        read_stream = true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if stop_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                break;
+            }
+            if read_stream {
                 continue;
             }
-            match stream.read(&mut buffer) {
-                Ok(0) => {
-                    break;
-                }
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+            if stop_deadline.is_some() {
+                break;
             }
         }
         let _ = done_tx.send(());
