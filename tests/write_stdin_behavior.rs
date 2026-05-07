@@ -556,6 +556,34 @@ async fn pager_long_r_stderr_keeps_one_stream_prefix() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_truncated_r_stderr_keeps_stream_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(40_000).await?;
+
+    let result = session
+        .write_stdin_raw_with("message(strrep('x', 6 * 1024 * 1024))", Some(30.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        text.contains("output truncated"),
+        "expected output ring truncation notice, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: "),
+        "expected truncated stderr tail to keep a visible stderr prefix, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

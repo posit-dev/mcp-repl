@@ -95,11 +95,15 @@ impl OutputTimeline {
             self.ring.append_bytes(bytes, false, origin);
             return;
         }
-        if is_continuation {
+        if is_continuation && !self.ring.has_truncated_output() {
             self.ring.append_bytes(bytes, true, origin);
             return;
         }
 
+        self.append_prefixed_stderr(bytes, origin);
+    }
+
+    fn append_prefixed_stderr(&self, bytes: &[u8], origin: ContentOrigin) {
         // Keep stderr attribution in-band (as text) while ensuring the prefix starts on a new
         // line. This avoids confusing merges like `> xstderr: ...` when stdout/stderr reader
         // threads append chunks out-of-order.
@@ -404,6 +408,11 @@ impl OutputRing {
     fn is_empty(&self) -> bool {
         let guard = self.inner.lock().unwrap();
         guard.chunks.is_empty() && guard.events.is_empty()
+    }
+
+    fn has_truncated_output(&self) -> bool {
+        let guard = self.inner.lock().unwrap();
+        guard.start_offset > 0
     }
 
     #[cfg(test)]
