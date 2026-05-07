@@ -1,6 +1,5 @@
 ---
 source: tests/codex_approvals_tui.rs
-assertion_line: 2490
 expression: snapshot
 ---
 {
@@ -30,7 +29,6 @@ expression: snapshot
           "progressToken": 1,
           "x-codex-turn-metadata": {
             "session_id": "<SESSION_ID>",
-            "thread_source": "user",
             "turn_id": "<TURN_ID>",
             "workspaces": {
               "<WORKSPACE>": {
