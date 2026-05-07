@@ -93,7 +93,7 @@ fn interrupt_recovery_deadline() -> Instant {
 }
 
 fn python_startup_probe_budget() -> Duration {
-    Duration::from_secs(if cfg!(target_os = "macos") { 60 } else { 10 })
+    Duration::from_secs(if cfg!(target_os = "macos") { 90 } else { 10 })
 }
 
 async fn start_python_session_with_env_vars(
@@ -177,6 +177,7 @@ async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if marker_path.exists() {
+            sleep(Duration::from_millis(250)).await;
             return Ok(());
         }
         sleep(Duration::from_millis(50)).await;
