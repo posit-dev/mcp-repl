@@ -13,6 +13,7 @@ static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
 const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
 const STDERR_PREFIX: &[u8] = b"stderr: ";
+const OUTPUT_TRUNCATION_NOTICE: &str = "[repl] output truncated (older output dropped)\n";
 
 pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
     OUTPUT_RING
@@ -95,7 +96,7 @@ impl OutputTimeline {
             self.ring.append_bytes(bytes, false, origin);
             return;
         }
-        if is_continuation && !self.ring.has_truncated_output() {
+        if is_continuation {
             self.ring.append_bytes(bytes, true, origin);
             return;
         }
@@ -410,11 +411,6 @@ impl OutputRing {
         guard.chunks.is_empty() && guard.events.is_empty()
     }
 
-    fn has_truncated_output(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.start_offset > 0
-    }
-
     #[cfg(test)]
     pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
@@ -505,6 +501,7 @@ impl OutputRing {
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
         let collected = self.collect_range(start_offset, Some(end_offset));
         let bytes = assemble_bytes(&collected.slices);
+        let leading_stderr_prefix_origin = leading_stderr_prefix_needed(&collected.slices);
         let mut text_spans: Vec<OutputTextSpan> = Vec::new();
         let mut cursor = 0usize;
         for slice in &collected.slices {
@@ -530,11 +527,15 @@ impl OutputRing {
             }
             cursor = end_byte;
         }
+        let mut events = collected.events;
+        if let Some(origin) = leading_stderr_prefix_origin {
+            insert_leading_stderr_prefix_event(&mut events, collected.start_offset, origin);
+        }
         OutputRange {
             start_offset: collected.start_offset,
             end_offset: collected.end_offset,
             bytes,
-            events: collected.events,
+            events,
             text_spans,
         }
     }
@@ -659,7 +660,7 @@ impl OutputRing {
         extra_bytes: usize,
     ) {
         let notice_kind = OutputEventKind::Text {
-            text: "[repl] output truncated (older output dropped)\n".to_string(),
+            text: OUTPUT_TRUNCATION_NOTICE.to_string(),
             is_stderr: false,
             origin: ContentOrigin::Server,
             readline_results_seen: None,
@@ -819,6 +820,40 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             .saturating_add(32),
         OutputEventKind::Text { text, .. } => text.len().saturating_add(16),
     }
+}
+
+fn leading_stderr_prefix_needed(slices: &[OutputSlice]) -> Option<ContentOrigin> {
+    let first = slices.first()?;
+    if !first.is_stderr {
+        return None;
+    }
+    let bytes = &first.bytes[first.range.clone()];
+    (!starts_with_stderr_prefix(bytes)).then_some(first.origin)
+}
+
+fn starts_with_stderr_prefix(bytes: &[u8]) -> bool {
+    bytes.starts_with(STDERR_PREFIX) || bytes.starts_with(b"\nstderr: ")
+}
+
+fn insert_leading_stderr_prefix_event(
+    events: &mut Vec<OutputEvent>,
+    offset: u64,
+    origin: ContentOrigin,
+) {
+    let event = OutputEvent {
+        offset,
+        kind: OutputEventKind::Text {
+            text: String::from_utf8_lossy(STDERR_PREFIX).into_owned(),
+            is_stderr: true,
+            origin,
+            readline_results_seen: None,
+        },
+    };
+    let insert_at = events
+        .iter()
+        .position(|existing| existing.offset > offset)
+        .unwrap_or(events.len());
+    events.insert(insert_at, event);
 }
 
 fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {

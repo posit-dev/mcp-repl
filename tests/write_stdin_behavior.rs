@@ -556,6 +556,41 @@ async fn pager_long_r_stderr_keeps_one_stream_prefix() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_long_r_stderr_after_prior_reply_keeps_one_stream_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(40_000).await?;
+
+    let warmup = session
+        .write_stdin_raw_with("cat('warmup\\n')", Some(30.0))
+        .await?;
+    let warmup = wait_until_not_busy(&mut session, warmup).await?;
+    let warmup_text = result_text(&warmup);
+    if backend_unavailable(&warmup_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        warmup_text.contains("warmup"),
+        "expected warmup reply, got: {warmup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("message(strrep('x', 20000))", Some(30.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    let prefix_count = text.matches("stderr: ").count();
+    assert_eq!(
+        prefix_count, 1,
+        "expected one stderr prefix after prior consumed output, got {prefix_count}: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_truncated_r_stderr_keeps_stream_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(40_000).await?;
