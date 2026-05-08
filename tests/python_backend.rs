@@ -1143,19 +1143,44 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
         return Ok(());
     };
     let marker_dir = tempdir()?;
-    let marker_path = marker_dir.path().join("idle-tail-written");
+    let marker_path = marker_dir.path().join("idle-worker-exited");
     let marker = marker_path
         .to_str()
         .ok_or("idle marker path must be valid utf-8")?;
     let marker_literal = serde_json::to_string(marker)?;
+    let script = format!(
+        r#"import os, subprocess, sys, threading, time
+exit_marker = {marker_literal}
+r, w = os.pipe()
+watcher = """import os, pathlib, sys
+fd = int(sys.argv[1])
+while os.read(fd, 8192):
+    pass
+pathlib.Path(sys.argv[2]).write_text("done")
+"""
+subprocess.Popen(
+    [sys.executable, "-c", watcher, str(r), exit_marker],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+    pass_fds=(r,),
+    start_new_session=True,
+)
+os.close(r)
+print("armed")
+def exit_after_idle_tail():
+    time.sleep(0.2)
+    sys.stdout.write("IDLE_TAIL\n")
+    sys.stdout.flush()
+    time.sleep(0.2)
+    os._exit(0)
+threading.Thread(target=exit_after_idle_tail, daemon=True).start()"#
+    );
+    let script_literal = serde_json::to_string(&script)?;
 
     let arm = session
-        .write_stdin_raw_with(
-            format!(
-                "import os, pathlib, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), pathlib.Path({marker_literal}).write_text('done'), time.sleep(0.2), os._exit(0)), daemon=True).start()"
-            ),
-            Some(5.0),
-        )
+        .write_stdin_raw_with(format!("exec({script_literal})"), Some(5.0))
         .await?;
     let arm_text = result_text(&arm);
     if is_busy_response(&arm_text) {
