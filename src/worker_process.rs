@@ -219,7 +219,12 @@ fn prechecked_follow_up_requires_meta_error() -> WorkerError {
 
 trait BackendDriver: Send {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8>;
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError>;
+    fn on_input_start(
+        &mut self,
+        text: &str,
+        ipc: &ServerIpcConnection,
+        timeout: Duration,
+    ) -> Result<(), WorkerError>;
     fn should_settle_output_after_timeout(
         &self,
         oversized_output: OversizedOutputMode,
@@ -313,7 +318,12 @@ impl BackendDriver for RBackendDriver {
         payload
     }
 
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    fn on_input_start(
+        &mut self,
+        text: &str,
+        ipc: &ServerIpcConnection,
+        _timeout: Duration,
+    ) -> Result<(), WorkerError> {
         driver_on_input_start(text, ipc)
     }
 
@@ -371,7 +381,12 @@ impl BackendDriver for PythonBackendDriver {
         data.into_bytes()
     }
 
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    fn on_input_start(
+        &mut self,
+        text: &str,
+        ipc: &ServerIpcConnection,
+        timeout: Duration,
+    ) -> Result<(), WorkerError> {
         driver_on_input_start(text, ipc)?;
         ipc.send(ServerToWorkerIpcMessage::StdinWrite {
             // Python-side IPC only needs a request-start signal; avoid duplicating large stdin
@@ -379,7 +394,7 @@ impl BackendDriver for PythonBackendDriver {
             text: String::new(),
         })
         .map_err(|_| WorkerError::Protocol("python request-start ipc unavailable".to_string()))?;
-        wait_for_python_stdin_ready(ipc)
+        wait_for_python_stdin_ready(ipc, timeout)
     }
 
     fn should_settle_output_after_timeout(
@@ -573,9 +588,18 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
     }
 }
 
-fn wait_for_python_stdin_ready(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-    match ipc.wait_for_stdin_ready(PYTHON_STDIN_READY_TIMEOUT) {
+fn wait_for_python_stdin_ready(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    if timeout.is_zero() {
+        return Err(WorkerError::Timeout(timeout));
+    }
+    let wait_timeout = timeout.min(PYTHON_STDIN_READY_TIMEOUT);
+    let request_timeout_capped = timeout <= PYTHON_STDIN_READY_TIMEOUT;
+    match ipc.wait_for_stdin_ready(wait_timeout) {
         Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) if request_timeout_capped => Err(WorkerError::Timeout(timeout)),
         Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
             "timed out waiting for python request-start acknowledgement".to_string(),
         )),
@@ -1942,14 +1966,23 @@ impl WorkerManager {
         if server_timeout.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        self.driver.on_input_start(&text, &ipc)?;
+        let server_deadline = started_at + server_timeout;
+        let remaining = server_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(WorkerError::Timeout(server_timeout));
+        }
+        self.driver.on_input_start(&text, &ipc, remaining)?;
         let payload = self.driver.prepare_input_payload(&text);
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
+        let remaining = server_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(WorkerError::Timeout(server_timeout));
+        }
         self.process
             .as_mut()
             .expect("worker process should be available")
-            .write_stdin_payload(payload, server_timeout)?;
+            .write_stdin_payload(payload, remaining)?;
         Ok(RequestState {
             timeout: worker_timeout,
             started_at,
@@ -8158,11 +8191,44 @@ mod tests {
         });
 
         driver
-            .on_input_start(&big_input, &server)
+            .on_input_start(&big_input, &server, Duration::from_secs(1))
             .expect("begin request");
         worker_thread
             .join()
             .expect("request-start test worker thread should not panic");
+    }
+
+    #[test]
+    fn python_driver_request_start_ack_respects_call_timeout() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let mut driver = PythonBackendDriver::new();
+
+        let worker_thread = std::thread::spawn(move || {
+            let msg = worker
+                .recv(Some(Duration::from_millis(200)))
+                .expect("expected stdin_write control message");
+            assert!(
+                matches!(msg, ServerToWorkerIpcMessage::StdinWrite { .. }),
+                "expected stdin_write control message"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let start = std::time::Instant::now();
+        let err = driver
+            .on_input_start("print(1)", &server, Duration::from_millis(20))
+            .expect_err("missing stdin_ready should respect the caller timeout");
+        assert!(
+            matches!(err, WorkerError::Timeout(timeout) if timeout <= Duration::from_millis(20)),
+            "expected caller timeout while waiting for stdin_ready, got: {err}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "stdin_ready wait should not use the fixed 5s protocol timeout"
+        );
+        worker_thread
+            .join()
+            .expect("request-start timeout test worker thread should not panic");
     }
 
     #[cfg(target_family = "unix")]
