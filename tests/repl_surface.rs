@@ -399,6 +399,54 @@ async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let input = concat!(
+        "if (.Platform$OS.type == 'windows') {\n",
+        "  cat('SKIP_CHILD_STDOUT\\n')\n",
+        "} else {\n",
+        "  invisible(system(\"printf '> 1 + 1\\\\n'\"))\n",
+        "}\n",
+        "1 + 1\n",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("SKIP_CHILD_STDOUT") {
+        eprintln!("repl_surface child stdout output unsupported on this platform; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        return Err(format!("child stdout prompt text remained busy: {text:?}").into());
+    }
+
+    let matching_lines = text.matches("> 1 + 1\n").count();
+    assert_eq!(
+        matching_lines, 2,
+        "expected raw child text plus later matching R echo, got: {text:?}"
+    );
+    let raw_child_line = text
+        .find("> 1 + 1\n")
+        .expect("matching line count already checked");
+    let value_line = text
+        .find("[1] 2")
+        .ok_or_else(|| format!("expected later R result, got: {text:?}"))?;
+    assert!(
+        raw_child_line < value_line,
+        "expected raw child text to remain visible before later result, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 
