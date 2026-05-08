@@ -85,10 +85,11 @@ That matching is only opportunistic:
 - if exact sideband-to-stdout matching fails or becomes ambiguous, the server
   should degrade softly to raw captured stdout/stderr for that region, without
   eliding echo or inventing a cleaned-up transcript
-- sideband-first carryover is source-aware: Python-style raw prompt echo can
-  trim only raw text, and R-style prompt echo can trim only `output_text` frames
-  when an IPC reader drain boundary splits `readline_result` from the following
-  worker-owned echo
+- sideband-first carryover is source-aware: the backend records whether a
+  `readline_result` echo should arrive as raw stdout or as `output_text`, and
+  carryover only trims later text from that same source. Prompt spelling only
+  decides whether a prompt shape is eligible for carryover; it does not decide
+  the source.
 
 ## Ownership split
 

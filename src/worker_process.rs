@@ -37,7 +37,9 @@ use crate::output_capture::{
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
-use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
+use crate::pending_output_tape::{
+    FormattedPendingOutput, PendingOutputTape, PendingSidebandKind, PendingTextSource,
+};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate,
     prepare_worker_command_with_managed_network,
@@ -5043,6 +5045,10 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
+        let readline_echo_source = match backend {
+            Backend::R => PendingTextSource::Ipc,
+            Backend::Python => PendingTextSource::Raw,
+        };
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -5097,6 +5103,7 @@ impl WorkerProcess {
                         sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                             prompt: event.prompt,
                             line: event.line,
+                            echo_source: readline_echo_source,
                         });
                     }))
                 },
@@ -7479,6 +7486,7 @@ mod tests {
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
 
         let formatted = manager.drain_formatted_output();
@@ -7507,6 +7515,7 @@ mod tests {
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
         manager.pending_output_tape.append_stdout_bytes(b"start\n");
 
@@ -7536,6 +7545,7 @@ mod tests {
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
 
         let context = manager.prepare_input_context_files();
@@ -7980,6 +7990,7 @@ mod tests {
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
         capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
@@ -8037,6 +8048,7 @@ mod tests {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                     prompt: event.prompt,
                     line: event.line,
+                    echo_source: PendingTextSource::Ipc,
                 });
             })),
             on_plot_image: Some(Arc::new(move |image| {
@@ -8112,7 +8124,7 @@ mod tests {
         assert!(matches!(
             &snapshot.events[2],
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineResult { prompt, line },
+                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
                 ..
             } if prompt == "> " && line == "plot(1)\n"
         ));

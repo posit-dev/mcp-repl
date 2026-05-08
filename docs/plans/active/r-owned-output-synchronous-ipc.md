@@ -60,6 +60,7 @@
   R-owned stdout, stderr, readline echo, plots, direct file-descriptor writes,
   child output, and large output.
 - 2026-05-08: Narrowed files-mode sideband-first echo carryover so ordinary R
-  prompts no longer trim later raw stdout. R-owned `output_text` echo remains
-  eligible for source-aware carryover when a drain boundary splits it from its
-  `readline_result`.
+  prompts no longer trim later raw stdout. The backend now records the expected
+  echo source on `readline_result`, so Python raw prompt echo and R-owned
+  `output_text` echo can both carry across drain boundaries without deriving
+  the source from prompt spelling.
