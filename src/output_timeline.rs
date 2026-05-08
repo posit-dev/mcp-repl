@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use crate::ipc::IpcEchoEvent;
-use crate::output_capture::{OutputEventKind, OutputRange, OutputTextSpan};
+use crate::output_capture::{OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan};
 use crate::worker_protocol::ContentOrigin;
 
 pub(crate) struct CollapsedOutput {
@@ -126,6 +126,7 @@ pub(crate) fn collapse_echo_with_attribution(
                 marker.as_bytes(),
                 false,
                 ContentOrigin::Worker,
+                OutputTextSource::Ipc,
             );
         } else {
             append_text_with_span(
@@ -134,6 +135,7 @@ pub(crate) fn collapse_echo_with_attribution(
                 &summarize_echo_line_for_output(tail),
                 false,
                 ContentOrigin::Worker,
+                OutputTextSource::Ipc,
             );
         }
     };
@@ -237,6 +239,7 @@ pub(crate) fn collapse_echo_with_attribution(
             &pending.raw,
             false,
             ContentOrigin::Worker,
+            OutputTextSource::Ipc,
         );
     }
 
@@ -387,6 +390,7 @@ fn append_text_with_span(
     bytes: &[u8],
     is_stderr: bool,
     origin: ContentOrigin,
+    source: OutputTextSource,
 ) {
     if bytes.is_empty() {
         return;
@@ -397,6 +401,7 @@ fn append_text_with_span(
     if let Some(last) = out_text_spans.last_mut()
         && last.is_stderr == is_stderr
         && last.origin == origin
+        && last.source == source
         && last.end_byte == start_byte
     {
         last.end_byte = end_byte;
@@ -406,6 +411,7 @@ fn append_text_with_span(
             end_byte,
             is_stderr,
             origin,
+            source,
         });
     }
 }
@@ -449,6 +455,7 @@ fn consume_text_segment_with_spans(
                 &segment[cursor - segment_start..start - segment_start],
                 false,
                 ContentOrigin::Worker,
+                OutputTextSource::Raw,
                 echo_events,
                 echo_idx,
                 prompt_variants,
@@ -467,6 +474,7 @@ fn consume_text_segment_with_spans(
             &segment[start - segment_start..end - segment_start],
             span.is_stderr,
             span.origin,
+            span.source,
             echo_events,
             echo_idx,
             prompt_variants,
@@ -487,6 +495,7 @@ fn consume_text_segment_with_spans(
             &segment[cursor - segment_start..],
             false,
             ContentOrigin::Worker,
+            OutputTextSource::Raw,
             echo_events,
             echo_idx,
             prompt_variants,
@@ -508,6 +517,7 @@ fn consume_text_segment(
     segment: &[u8],
     is_stderr: bool,
     origin: ContentOrigin,
+    source: OutputTextSource,
     echo_events: &[IpcEchoEvent],
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
@@ -538,7 +548,11 @@ fn consume_text_segment(
         let line = &segment[start..end];
         start = end;
 
-        let echo_prefix = if *echo_idx < echo_events.len() {
+        let echo_prefix = if !is_stderr
+            && matches!(origin, ContentOrigin::Worker)
+            && *echo_idx < echo_events.len()
+            && source == echo_events[*echo_idx].source
+        {
             echo_event_prefix_len(line, &echo_events[*echo_idx])
         } else {
             None
@@ -556,6 +570,7 @@ fn consume_text_segment(
                             &line[..prefix_len],
                             is_stderr,
                             origin,
+                            source,
                         );
                     }
                 }
@@ -577,7 +592,7 @@ fn consume_text_segment(
         if substantive {
             flush_pending(out_bytes, out_text_spans, pending);
         }
-        append_text_with_span(out_bytes, out_text_spans, line, is_stderr, origin);
+        append_text_with_span(out_bytes, out_text_spans, line, is_stderr, origin, source);
         if substantive {
             saw_substantive_output.set(true);
         }
@@ -595,6 +610,7 @@ mod tests {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
+            source: OutputTextSource::Ipc,
         }
     }
 
@@ -620,6 +636,7 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -676,6 +693,7 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -723,6 +741,7 @@ mod tests {
                 end_byte: 14,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -744,6 +763,74 @@ mod tests {
     }
 
     #[test]
+    fn raw_stdout_does_not_satisfy_ipc_echo_event() {
+        let first_echo = b"> system(\"printf '> 1+1\\\\n'\")\n";
+        let child_stdout = b"> 1+1\n";
+        let second_echo = b"> 1+1\n";
+        let output = b"[1] 2\n";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(first_echo);
+        bytes.extend_from_slice(child_stdout);
+        bytes.extend_from_slice(second_echo);
+        bytes.extend_from_slice(output);
+
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: first_echo.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+                OutputTextSpan {
+                    start_byte: first_echo.len(),
+                    end_byte: first_echo.len() + child_stdout.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Raw,
+                },
+                OutputTextSpan {
+                    start_byte: first_echo.len() + child_stdout.len(),
+                    end_byte: first_echo.len()
+                        + child_stdout.len()
+                        + second_echo.len()
+                        + output.len(),
+                    is_stderr: false,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+            ],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[
+                echo_event("> ", "system(\"printf '> 1+1\\\\n'\")\n"),
+                echo_event("> ", "1+1\n"),
+            ],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            (first_echo.len() + child_stdout.len() + second_echo.len() + output.len()) as u64,
+        );
+
+        assert_eq!(
+            contents,
+            vec![WorkerContent::stdout("> 1+1\n> 1+1\n[1] 2\n")]
+        );
+    }
+
+    #[test]
     fn collapse_for_final_reply_preserves_non_repl_readline_transcript() {
         let bytes = b"FIRST> alpha\nSECOND> ".to_vec();
         let range = OutputRange {
@@ -756,6 +843,7 @@ mod tests {
                 end_byte: 21,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -798,6 +886,7 @@ mod tests {
                 end_byte: 13,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -847,6 +936,7 @@ mod tests {
                 end_byte: 14,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -899,6 +989,7 @@ mod tests {
                 end_byte: echo.len() + output.len(),
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 

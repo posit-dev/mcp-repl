@@ -3,7 +3,9 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use crate::ipc::IpcEchoEvent;
-use crate::output_capture::{OutputEvent, OutputEventKind, OutputRange, OutputTextSpan};
+use crate::output_capture::{
+    OutputEvent, OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan,
+};
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::pager;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
@@ -586,7 +588,7 @@ impl PendingOutputSnapshot {
                 PendingOutputEvent::TextFragment {
                     stream,
                     origin,
-                    source: _,
+                    source,
                     bytes: fragment,
                     terminated,
                     ..
@@ -612,6 +614,7 @@ impl PendingOutputSnapshot {
                         text.as_bytes(),
                         *stream,
                         *origin,
+                        (*source).into(),
                     );
                     last_rendered_text = Some(RenderedTextState {
                         stream: *stream,
@@ -661,11 +664,16 @@ impl PendingOutputSnapshot {
                     PendingSidebandKind::ReadlineStart { prompt } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                     }
-                    PendingSidebandKind::ReadlineResult { prompt, line, .. } => {
+                    PendingSidebandKind::ReadlineResult {
+                        prompt,
+                        line,
+                        echo_source,
+                    } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                         echo_events.push(IpcEchoEvent {
                             prompt: prompt.clone(),
                             line: line.clone(),
+                            source: (*echo_source).into(),
                         });
                     }
                     PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd => {}
@@ -933,6 +941,7 @@ fn append_rendered_text(
     text: &[u8],
     stream: TextStream,
     origin: ContentOrigin,
+    source: OutputTextSource,
 ) {
     if text.is_empty() {
         return;
@@ -944,6 +953,7 @@ fn append_rendered_text(
     if let Some(last) = text_spans.last_mut()
         && last.is_stderr == is_stderr
         && last.origin == origin
+        && last.source == source
         && last.end_byte == start_byte
     {
         last.end_byte = end_byte;
@@ -953,7 +963,17 @@ fn append_rendered_text(
             end_byte,
             is_stderr,
             origin,
+            source,
         });
+    }
+}
+
+impl From<PendingTextSource> for OutputTextSource {
+    fn from(source: PendingTextSource) -> Self {
+        match source {
+            PendingTextSource::Raw => OutputTextSource::Raw,
+            PendingTextSource::Ipc => OutputTextSource::Ipc,
+        }
     }
 }
 

@@ -394,6 +394,76 @@ async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_multiline_r_echo_for_output_attribution() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            "cat('FIRST\\n')\ncat('SECOND\\n')\ncat('THIRD\\n')",
+            Some(30.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior multi-line attribution output still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        text.contains("FIRST\n") && text.contains("SECOND\n") && text.contains("THIRD\n"),
+        "expected all expression output, got: {text:?}"
+    );
+    assert!(
+        text.contains("> cat('SECOND\\n')"),
+        "expected second submitted expression echo for attribution, got: {text:?}"
+    );
+    assert!(
+        text.contains("> cat('THIRD\\n')"),
+        "expected third submitted expression echo for attribution, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"system("printf '> 1+1\\n'")
+1+1"#,
+            Some(30.0),
+        )
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
+    assert!(
+        text.matches("> 1+1").count() >= 2,
+        "expected raw child stdout and later R echo to both remain visible, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
@@ -1139,9 +1209,14 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = spawn_behavior_session().await?;
+    let mut session = spawn_behavior_session().await?;
+    let tail_gate = tempdir()?;
+    let tail_gate_path = tail_gate.path().join("tail-ready");
+    let tail_gate_literal = serde_json::to_string(&tail_gate_path.to_string_lossy())?;
 
-    let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.35); cat('tail\\n')";
+    let input = format!(
+        "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); while (!file.exists({tail_gate_literal})) Sys.sleep(0.05); cat('tail\\n')"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1164,10 +1239,16 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
             panic!("expected transcript path in first oversized poll reply, got: {spilled_text:?}")
         }
     };
+    let spilled_before_delete =
+        wait_until_file_contains_via_polls(&mut session, &transcript_path, "mid080").await?;
+    assert!(
+        !spilled_before_delete.contains("tail"),
+        "did not expect tail before test releases the R-side gate, got: {spilled_before_delete:?}"
+    );
 
     fs::remove_file(&transcript_path)?;
+    fs::write(&tail_gate_path, b"ready")?;
 
-    sleep(Duration::from_millis(450)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<repl status: busy") {

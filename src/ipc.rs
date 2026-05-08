@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{
@@ -148,6 +149,7 @@ struct WorkerIpcInbox {
 pub struct IpcEchoEvent {
     pub prompt: String,
     pub line: String,
+    pub source: OutputTextSource,
 }
 
 #[derive(Clone)]
@@ -318,6 +320,7 @@ impl ServerIpcConnection {
                         let echo_event = IpcEchoEvent {
                             prompt: prompt.clone(),
                             line: line.clone(),
+                            source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.readline_result_count = guard.readline_result_count.saturating_add(1);

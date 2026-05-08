@@ -1618,6 +1618,7 @@ mod tests {
                 end_byte: line.len(),
                 is_stderr: false,
                 origin: ContentOrigin::Server,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
             line.len() as u64,
         );
