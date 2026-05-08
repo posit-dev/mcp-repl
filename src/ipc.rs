@@ -69,6 +69,7 @@ pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
+const OUTPUT_TEXT_IPC_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ALLOWED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_family = "unix")]
@@ -94,9 +95,12 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         supports_images: bool,
     },
+    StdinReady,
     OutputText {
         stream: TextStream,
         data_b64: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_continuation: bool,
     },
     ReadlineStart {
         prompt: String,
@@ -150,6 +154,7 @@ pub struct IpcEchoEvent {
 pub struct IpcOutputText {
     pub stream: TextStream,
     pub bytes: Vec<u8>,
+    pub is_continuation: bool,
 }
 
 #[derive(Clone)]
@@ -181,7 +186,7 @@ pub struct ServerIpcConnection {
 
 #[derive(Clone)]
 pub struct WorkerIpcConnection {
-    sender: mpsc::Sender<WorkerToServerIpcMessage>,
+    writer: OutputCriticalIpcWriter,
     inbox: Arc<Mutex<WorkerIpcInbox>>,
     cvar: Arc<Condvar>,
 }
@@ -339,7 +344,11 @@ impl ServerIpcConnection {
                             handler();
                         }
                     }
-                    WorkerToServerIpcMessage::OutputText { stream, data_b64 } => {
+                    WorkerToServerIpcMessage::OutputText {
+                        stream,
+                        data_b64,
+                        is_continuation,
+                    } => {
                         let bytes =
                             match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
                                 Ok(bytes) => bytes,
@@ -351,12 +360,17 @@ impl ServerIpcConnection {
                                 }
                             };
                         if let Some(handler) = output_text_handler.as_ref() {
-                            handler(IpcOutputText { stream, bytes });
+                            handler(IpcOutputText {
+                                stream,
+                                bytes,
+                                is_continuation,
+                            });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.queue.push_back(WorkerToServerIpcMessage::OutputText {
                                 stream,
                                 data_b64,
+                                is_continuation,
                             });
                             reader_cvar.notify_all();
                         }
@@ -439,6 +453,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
+        drop_queued_stdin_ready(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -583,17 +598,47 @@ impl ServerIpcConnection {
             }
         }
     }
+
+    pub fn wait_for_stdin_ready(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if take_stdin_ready(&mut guard) {
+                return Ok(());
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                if take_stdin_ready(&mut guard) {
+                    return Ok(());
+                }
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
 }
 
 impl WorkerIpcConnection {
     fn new(transport: IpcTransport) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
         let inbox = Arc::new(Mutex::new(WorkerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
         let IpcTransport { reader, writer } = transport;
+        let writer = OutputCriticalIpcWriter::new(writer);
         thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
@@ -633,20 +678,26 @@ impl WorkerIpcConnection {
             }
         });
 
-        spawn_writer(rx, writer);
-
         Ok(Self {
-            sender: tx,
+            writer,
             inbox,
             cvar,
         })
     }
 
-    pub fn send(
-        &self,
-        message: WorkerToServerIpcMessage,
-    ) -> Result<(), mpsc::SendError<WorkerToServerIpcMessage>> {
-        self.sender.send(message)
+    pub fn send(&self, message: WorkerToServerIpcMessage) -> io::Result<()> {
+        self.writer.send(message)
+    }
+
+    pub fn send_output_text(&self, stream: TextStream, bytes: &[u8]) -> io::Result<()> {
+        for (idx, chunk) in bytes.chunks(OUTPUT_TEXT_IPC_CHUNK_BYTES).enumerate() {
+            self.send(WorkerToServerIpcMessage::OutputText {
+                stream,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
+                is_continuation: idx > 0,
+            })?;
+        }
+        Ok(())
     }
 
     pub fn recv(&self, timeout: Option<Duration>) -> Option<ServerToWorkerIpcMessage> {
@@ -1367,6 +1418,17 @@ pub fn global_ipc() -> Option<&'static WorkerIpcConnection> {
     IPC_GLOBAL.get()
 }
 
+pub fn worker_ipc_disabled_for_process() -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        !WORKER_IPC_ALLOWED.load(AtomicOrdering::SeqCst)
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_family = "unix")]
 extern "C" fn close_worker_ipc_in_fork_child() {
     WORKER_IPC_ALLOWED.store(false, AtomicOrdering::SeqCst);
@@ -1411,6 +1473,11 @@ pub fn emit_readline_result(prompt: &str, line: &str) {
             line: line.to_string(),
         });
     }
+}
+
+pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
+    let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
+    ipc.send_output_text(stream, bytes)
 }
 
 pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
@@ -1593,11 +1660,34 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
+fn take_stdin_ready(guard: &mut ServerIpcInbox) -> bool {
+    let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinReady))
+    else {
+        return false;
+    };
+    guard.queue.remove(idx);
+    true
+}
+
+fn drop_queued_stdin_ready(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinReady));
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, OutputCriticalIpcWriter, ServerIpcConnection,
-        ServerToWorkerIpcMessage, WorkerIpcConnection, WorkerToServerIpcMessage,
+        IpcHandlers, IpcTransport, OUTPUT_TEXT_IPC_CHUNK_BYTES, OutputCriticalIpcWriter,
+        ServerIpcConnection, ServerToWorkerIpcMessage, WorkerIpcConnection,
+        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -1668,11 +1758,20 @@ mod protocol_tests {
             "data_b64": "YWxwaGE="
         }));
 
-        let Ok(WorkerToServerIpcMessage::OutputText { stream, data_b64 }) = parsed else {
+        let Ok(WorkerToServerIpcMessage::OutputText {
+            stream,
+            data_b64,
+            is_continuation,
+        }) = parsed
+        else {
             panic!("output_text should deserialize");
         };
         assert_eq!(stream, TextStream::Stdout);
         assert_eq!(data_b64, "YWxwaGE=");
+        assert!(
+            !is_continuation,
+            "output_text continuation should default to false"
+        );
     }
 
     #[test]
@@ -1717,6 +1816,18 @@ mod protocol_tests {
         }));
 
         assert!(parsed.is_err(), "request_end should not deserialize");
+    }
+
+    #[test]
+    fn stdin_ready_is_a_worker_to_server_request_start_ack() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "stdin_ready"
+        }));
+
+        assert!(
+            matches!(parsed, Ok(WorkerToServerIpcMessage::StdinReady)),
+            "stdin_ready should deserialize as the Python request-start acknowledgement"
+        );
     }
 
     #[test]
@@ -1767,6 +1878,7 @@ mod protocol_tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"alpha"),
+                is_continuation: false,
             })
             .expect("send output_text");
 
@@ -1796,12 +1908,14 @@ mod protocol_tests {
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"first"),
+                is_continuation: false,
             })
             .expect("send first output_text");
         second_writer
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(b"second"),
+                is_continuation: false,
             })
             .expect("send second output_text");
 
@@ -1824,9 +1938,62 @@ mod protocol_tests {
         let result = writer.send(WorkerToServerIpcMessage::OutputText {
             stream: TextStream::Stdout,
             data_b64: base64::engine::general_purpose::STANDARD.encode(b"lost"),
+            is_continuation: false,
         });
 
         assert!(result.is_err(), "broken IPC pipe should be reported");
+    }
+
+    #[test]
+    fn worker_output_text_chunks_large_buffers_before_encoding() {
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+            on_output_text: Some(Arc::new(move |text| {
+                chunk_tx
+                    .send((text.bytes, text.is_continuation))
+                    .expect("record output text chunk");
+            })),
+            ..IpcHandlers::default()
+        })
+        .expect("test IPC pair");
+        let payload = vec![b'x'; OUTPUT_TEXT_IPC_CHUNK_BYTES * 2 + 17];
+
+        worker
+            .send_output_text(TextStream::Stdout, &payload)
+            .expect("send chunked output_text");
+
+        let mut chunks = Vec::new();
+        let mut bytes_seen = 0usize;
+        while bytes_seen < payload.len() {
+            let (chunk, is_continuation) = chunk_rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("output_text chunk");
+            bytes_seen += chunk.len();
+            chunks.push((chunk, is_continuation));
+        }
+        assert!(
+            chunks.len() > 1,
+            "large output_text buffer should be split before IPC framing"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|(chunk, _)| chunk.len() <= OUTPUT_TEXT_IPC_CHUNK_BYTES),
+            "output_text chunks should be bounded"
+        );
+        assert!(
+            !chunks.first().expect("first chunk").1
+                && chunks
+                    .iter()
+                    .skip(1)
+                    .all(|(_, is_continuation)| *is_continuation),
+            "only chunks after the first should be marked as continuations"
+        );
+        let reassembled = chunks
+            .iter()
+            .flat_map(|(chunk, _)| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(reassembled, payload);
     }
 
     #[test]

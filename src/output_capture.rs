@@ -11,7 +11,9 @@ static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
 static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
+const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
 const STDERR_PREFIX: &[u8] = b"stderr: ";
+const OUTPUT_TRUNCATION_NOTICE: &str = "[repl] output truncated (older output dropped)\n";
 
 pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
     OUTPUT_RING
@@ -77,6 +79,16 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
+        self.append_text_with_continuation(bytes, is_stderr, origin, false);
+    }
+
+    pub(crate) fn append_text_with_continuation(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        is_continuation: bool,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -84,7 +96,15 @@ impl OutputTimeline {
             self.ring.append_bytes(bytes, false, origin);
             return;
         }
+        if is_continuation {
+            self.ring.append_bytes(bytes, true, origin);
+            return;
+        }
 
+        self.append_prefixed_stderr(bytes, origin);
+    }
+
+    fn append_prefixed_stderr(&self, bytes: &[u8], origin: ContentOrigin) {
         // Keep stderr attribution in-band (as text) while ensuring the prefix starts on a new
         // line. This avoids confusing merges like `> xstderr: ...` when stdout/stderr reader
         // threads append chunks out-of-order.
@@ -337,8 +357,9 @@ impl OutputRing {
 
         let mut dropped_any = false;
         let mut remaining = bytes;
+        let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
         while !remaining.is_empty() {
-            let chunk_len = remaining.len().min(self.capacity_bytes.max(1));
+            let chunk_len = remaining.len().min(max_chunk_len);
             let (head, tail) = remaining.split_at(chunk_len);
             remaining = tail;
 
@@ -375,7 +396,9 @@ impl OutputRing {
         }
 
         if dropped_any {
-            self.append_truncation_notice(self.end_offset(), 0);
+            let mut guard = self.inner.lock().unwrap();
+            let notice_offset = guard.end_offset;
+            self.append_truncation_notice_locked(&mut guard, notice_offset, 0);
         }
     }
 
@@ -478,6 +501,7 @@ impl OutputRing {
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
         let collected = self.collect_range(start_offset, Some(end_offset));
         let bytes = assemble_bytes(&collected.slices);
+        let leading_stderr_prefix_origin = leading_stderr_prefix_needed(&collected.slices);
         let mut text_spans: Vec<OutputTextSpan> = Vec::new();
         let mut cursor = 0usize;
         for slice in &collected.slices {
@@ -503,11 +527,15 @@ impl OutputRing {
             }
             cursor = end_byte;
         }
+        let mut events = collected.events;
+        if let Some(origin) = leading_stderr_prefix_origin {
+            insert_leading_stderr_prefix_event(&mut events, collected.start_offset, origin);
+        }
         OutputRange {
             start_offset: collected.start_offset,
             end_offset: collected.end_offset,
             bytes,
-            events: collected.events,
+            events,
             text_spans,
         }
     }
@@ -625,11 +653,6 @@ impl OutputRing {
         }
     }
 
-    fn append_truncation_notice(&self, offset: u64, extra_bytes: usize) {
-        let mut guard = self.inner.lock().unwrap();
-        self.append_truncation_notice_locked(&mut guard, offset, extra_bytes);
-    }
-
     fn append_truncation_notice_locked(
         &self,
         guard: &mut OutputRingInner,
@@ -637,7 +660,7 @@ impl OutputRing {
         extra_bytes: usize,
     ) {
         let notice_kind = OutputEventKind::Text {
-            text: "[repl] output truncated (older output dropped)\n".to_string(),
+            text: OUTPUT_TRUNCATION_NOTICE.to_string(),
             is_stderr: false,
             origin: ContentOrigin::Server,
             readline_results_seen: None,
@@ -799,6 +822,40 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
     }
 }
 
+fn leading_stderr_prefix_needed(slices: &[OutputSlice]) -> Option<ContentOrigin> {
+    let first = slices.first()?;
+    if !first.is_stderr {
+        return None;
+    }
+    let bytes = &first.bytes[first.range.clone()];
+    (!starts_with_stderr_prefix(bytes)).then_some(first.origin)
+}
+
+fn starts_with_stderr_prefix(bytes: &[u8]) -> bool {
+    bytes.starts_with(STDERR_PREFIX) || bytes.starts_with(b"\nstderr: ")
+}
+
+fn insert_leading_stderr_prefix_event(
+    events: &mut Vec<OutputEvent>,
+    offset: u64,
+    origin: ContentOrigin,
+) {
+    let event = OutputEvent {
+        offset,
+        kind: OutputEventKind::Text {
+            text: String::from_utf8_lossy(STDERR_PREFIX).into_owned(),
+            is_stderr: true,
+            origin,
+            readline_results_seen: None,
+        },
+    };
+    let insert_at = events
+        .iter()
+        .position(|existing| existing.offset > offset)
+        .unwrap_or(events.len());
+    events.insert(insert_at, event);
+}
+
 fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
     if slices.is_empty() {
         return Vec::new();
@@ -815,6 +872,13 @@ fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
         bytes.extend_from_slice(&slice.bytes[slice.range.clone()]);
     }
     bytes
+}
+
+fn output_ring_append_chunk_len(capacity_bytes: usize) -> usize {
+    capacity_bytes
+        .max(1)
+        .saturating_div(16)
+        .clamp(1, OUTPUT_RING_APPEND_CHUNK_MAX_BYTES)
 }
 
 #[cfg(test)]

@@ -182,8 +182,7 @@ async fn files_poll_after_timeout_keeps_image_before_later_stdout() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn explicit_plot_emit_returns_text_and_image_without_cross_channel_ordering() -> TestResult<()>
-{
+async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 
     let input = concat!(
@@ -204,10 +203,53 @@ async fn explicit_plot_emit_returns_text_and_image_without_cross_channel_orderin
         return Ok(());
     }
 
-    let _before_idx =
+    let before_idx =
         first_text_index_containing(&result, "before").ok_or("expected before text in reply")?;
-    let _image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
-    let _after_idx = first_text_index_containing(&result, "after").ok_or("expected after text")?;
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let after_idx = first_text_index_containing(&result, "after").ok_or("expected after text")?;
+    assert!(
+        before_idx < image_idx && image_idx < after_idx,
+        "expected R-owned output to preserve order around image, got content order: {:?}",
+        result.content
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> {
+    let session = common::spawn_server().await?;
+
+    let input = concat!(
+        "if (.Platform$OS.type == 'windows') { ",
+        "cat('SKIP_FORK\\n') ",
+        "} else { ",
+        "job <- parallel::mcparallel({ cat('child\\n'); flush.console(); 42L }, silent = FALSE); ",
+        "parallel::mccollect(job, wait = TRUE); ",
+        "cat('parent\\n') ",
+        "}",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("SKIP_FORK") {
+        eprintln!("repl_surface fork output fallback unsupported on this platform; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        return Err(format!("fork child console output remained busy: {text:?}").into());
+    }
+
+    assert!(
+        text.contains("child") && text.contains("parent"),
+        "expected child and parent output, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())

@@ -44,6 +44,13 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   must not turn steady-state server request handling into language-specific
   policy.
 
+`stdin_ready`
+- `{ "type": "stdin_ready" }`
+- Sent after a worker has processed `stdin_write` and marked the request active.
+- A backend that needs request-start sideband state before raw stdin is delivered
+  can use this as a narrow acknowledgement. It is not an acknowledgement for
+  stdout/stderr, plot images, or request completion.
+
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
 - Emitted for readline prompts. The prompt string is required; use an empty string
@@ -59,13 +66,17 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   echo suppression of raw pipe output.
 
 `output_text`
-- `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64> }`
+- `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
 - Carries worker-owned text bytes on the ordered IPC stream. The payload is base64
   so workers can preserve bytes without depending on JSON string encoding.
+- `is_continuation` marks bounded transport chunks that continue the same worker-owned
+  output write. It defaults to `false`.
 - Workers send output-critical frames synchronously: each JSON line is written,
   newline-terminated, and flushed before the send returns.
 - Workers treat synchronous write failure as IPC failure. They must not silently
   fall back to stdout or stderr for output that is owned by the worker protocol.
+- Forked child processes with sideband IPC intentionally disabled are outside this
+  worker-owned path and may continue to use inherited raw output streams.
 
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
