@@ -57,6 +57,16 @@ async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     .await
 }
 
+async fn spawn_interrupt_files_session() -> TestResult<common::McpTestSession> {
+    common::spawn_server_with_args(vec![
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+        "--oversized-output".to_string(),
+        "files".to_string(),
+    ])
+    .await
+}
+
 #[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
@@ -145,6 +155,64 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 
     session.cancel().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
+    session: common::McpTestSession,
+) -> TestResult<()> {
+    let input = "Sys.sleep(0.3); invisible(system(\"printf '> '\"))";
+    let timeout_result = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout_text = result_text(&timeout_result);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected child stdout request to time out, got: {timeout_text:?}"
+    );
+
+    sleep(Duration::from_millis(700)).await;
+
+    let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_text = result_text(&interrupt_result);
+    if backend_unavailable(&interrupt_text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&interrupt_text) {
+        eprintln!("interrupt drain did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_eq!(
+        interrupt_text, "> > ",
+        "expected raw prompt-shaped output plus completion prompt, got: {interrupt_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_drain_preserves_prompt_shaped_child_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    assert_interrupt_drain_preserves_prompt_shaped_child_stdout(spawn_interrupt_session().await?)
+        .await
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn files_interrupt_drain_preserves_prompt_shaped_child_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
+        spawn_interrupt_files_session().await?,
+    )
+    .await
 }
 
 #[cfg(unix)]

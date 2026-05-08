@@ -2736,12 +2736,7 @@ impl WorkerManager {
                 WorkerReply::Output { prompt, .. } => prompt.clone(),
             };
             let WorkerReply::Output { contents, .. } = &mut reply.reply;
-            if let Some(prompt) = prompt.as_deref() {
-                strip_trailing_prompt(contents, prompt);
-            }
-            if let Some(prompt) = prompt {
-                append_prompt_if_missing(contents, Some(prompt));
-            }
+            reconcile_polled_completion_prompt(contents, prompt, self.backend);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end_with_options(
                 deferred_sandbox_state_update,
@@ -2792,11 +2787,16 @@ impl WorkerManager {
         };
         self.remember_prompt(resolved_prompt.clone());
         if !session_end {
-            if let Some(prompt_text) = resolved_prompt.as_deref() {
-                strip_trailing_prompt(&mut contents, prompt_text);
-            }
             if !timed_out {
-                append_prompt_if_missing(&mut contents, resolved_prompt.clone());
+                reconcile_trailing_completion_prompt(
+                    &mut contents,
+                    resolved_prompt.clone(),
+                    self.backend,
+                );
+            } else if matches!(self.backend, Backend::Python)
+                && let Some(prompt_text) = resolved_prompt.as_deref()
+            {
+                strip_trailing_prompt(&mut contents, prompt_text);
             }
         }
 
@@ -2902,12 +2902,11 @@ impl WorkerManager {
             };
             let WorkerReply::Output { contents, .. } = &mut reply.reply;
             if !pager_active {
-                if let Some(prompt) = prompt.as_deref() {
-                    strip_trailing_prompt(contents, prompt);
-                }
-                if let Some(prompt) = prompt {
-                    append_prompt_if_missing(contents, Some(prompt));
-                }
+                reconcile_polled_completion_prompt(contents, prompt, self.backend);
+            } else if matches!(self.backend, Backend::Python)
+                && let Some(prompt) = prompt.as_deref()
+            {
+                strip_trailing_prompt(contents, prompt);
             }
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end_with_options(
@@ -2979,11 +2978,16 @@ impl WorkerManager {
             self.pager_prompt = resolved_prompt.clone();
         }
         if !session_end {
-            if let Some(prompt_text) = resolved_prompt.as_deref() {
-                strip_trailing_prompt(&mut contents, prompt_text);
-            }
             if !timed_out && !self.pager.is_active() {
-                append_prompt_if_missing(&mut contents, resolved_prompt.clone());
+                reconcile_trailing_completion_prompt(
+                    &mut contents,
+                    resolved_prompt.clone(),
+                    self.backend,
+                );
+            } else if matches!(self.backend, Backend::Python)
+                && let Some(prompt_text) = resolved_prompt.as_deref()
+            {
+                strip_trailing_prompt(&mut contents, prompt_text);
             }
         }
 
@@ -4720,6 +4724,40 @@ fn reconcile_completion_prompt(
         Backend::Python => {
             if let Some(prompt_text) = prompt.as_deref() {
                 strip_prompt_from_contents(contents, prompt_text);
+            }
+            append_prompt_if_missing(contents, prompt);
+        }
+    }
+}
+
+fn reconcile_trailing_completion_prompt(
+    contents: &mut Vec<WorkerContent>,
+    prompt: Option<String>,
+    backend: Backend,
+) {
+    match backend {
+        // R reports completion prompts as framed IPC facts. Prompt-shaped raw
+        // stdout can come from child processes and must stay visible.
+        Backend::R => append_prompt(contents, prompt),
+        Backend::Python => {
+            if let Some(prompt_text) = prompt.as_deref() {
+                strip_trailing_prompt(contents, prompt_text);
+            }
+            append_prompt_if_missing(contents, prompt);
+        }
+    }
+}
+
+fn reconcile_polled_completion_prompt(
+    contents: &mut Vec<WorkerContent>,
+    prompt: Option<String>,
+    backend: Backend,
+) {
+    match backend {
+        Backend::R => {}
+        Backend::Python => {
+            if let Some(prompt_text) = prompt.as_deref() {
+                strip_trailing_prompt(contents, prompt_text);
             }
             append_prompt_if_missing(contents, prompt);
         }

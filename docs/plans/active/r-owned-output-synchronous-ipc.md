@@ -68,4 +68,5 @@
   the source from prompt spelling.
 - 2026-05-08: Stopped treating R raw stdout that equals the primary prompt as
   the completion prompt. The server now appends the R completion prompt from
-  framed IPC facts while leaving prompt-shaped child stdout visible.
+  framed IPC facts, including interrupt-drained completions, while leaving
+  prompt-shaped child stdout visible.
