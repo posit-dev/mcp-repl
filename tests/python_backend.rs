@@ -1157,19 +1157,29 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
         .to_str()
         .ok_or("idle exit marker path must be valid utf-8")?;
     let exit_marker_literal = serde_json::to_string(exit_marker)?;
+    let release_marker_path = marker_dir.path().join("idle-tail-release");
+    let release_marker = release_marker_path
+        .to_str()
+        .ok_or("idle tail release marker path must be valid utf-8")?;
+    let release_marker_literal = serde_json::to_string(release_marker)?;
     let script = format!(
         r#"import os, pathlib, subprocess, sys, threading, time
 tail_marker = {tail_marker_literal}
 exit_marker = {exit_marker_literal}
-writer = """import pathlib, sys, time
-time.sleep(0.2)
+release_marker = {release_marker_literal}
+writer = """import os, pathlib, sys, time
+deadline = time.monotonic() + 5
+while not os.path.exists(sys.argv[2]):
+    if time.monotonic() >= deadline:
+        sys.exit(2)
+    time.sleep(0.02)
 sys.stdout.write("IDLE_TAIL\\n")
 sys.stdout.flush()
 pathlib.Path(sys.argv[1]).write_text("done")
 time.sleep(0.2)
 """
 subprocess.Popen(
-    [sys.executable, "-c", writer, tail_marker],
+    [sys.executable, "-c", writer, tail_marker, release_marker],
     stdin=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
@@ -1202,6 +1212,7 @@ threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
         "expected arming output, got: {arm_text:?}"
     );
 
+    fs::write(&release_marker_path, "go")?;
     wait_for_detached_holder_exit(&exit_marker_path).await?;
     let reply = session
         .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
