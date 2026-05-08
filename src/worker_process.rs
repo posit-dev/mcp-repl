@@ -37,7 +37,9 @@ use crate::output_capture::{
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
-use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
+use crate::pending_output_tape::{
+    FormattedPendingOutput, PendingOutputTape, PendingSidebandKind, PendingTextSource,
+};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate,
     prepare_worker_command_with_managed_network,
@@ -123,13 +125,31 @@ impl LiveOutputCapture {
         }
     }
 
-    fn append_text(&self, bytes: &[u8], stream: TextStream, is_continuation: bool) {
+    fn append_output_text(&self, bytes: &[u8], stream: TextStream, is_continuation: bool) {
+        self.append_text(bytes, stream, is_continuation, true);
+    }
+
+    fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
+        self.append_text(bytes, stream, false, false);
+    }
+
+    fn append_text(
+        &self,
+        bytes: &[u8],
+        stream: TextStream,
+        is_continuation: bool,
+        is_output_text: bool,
+    ) {
         match stream {
             TextStream::Stdout => {
                 self.output_timeline
                     .append_text(bytes, false, ContentOrigin::Worker);
                 if let Some(tape) = &self.pending_output_tape {
-                    tape.append_stdout_bytes(bytes);
+                    if is_output_text {
+                        tape.append_stdout_ipc_bytes(bytes);
+                    } else {
+                        tape.append_stdout_bytes(bytes);
+                    }
                 }
             }
             TextStream::Stderr => {
@@ -140,7 +160,11 @@ impl LiveOutputCapture {
                     is_continuation,
                 );
                 if let Some(tape) = &self.pending_output_tape {
-                    tape.append_stderr_bytes(bytes);
+                    if is_output_text {
+                        tape.append_stderr_ipc_bytes(bytes);
+                    } else {
+                        tape.append_stderr_bytes(bytes);
+                    }
                 }
             }
         }
@@ -5021,6 +5045,10 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
+        let readline_echo_source = match backend {
+            Backend::R => PendingTextSource::Ipc,
+            Backend::Python => PendingTextSource::Raw,
+        };
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -5057,7 +5085,11 @@ impl WorkerProcess {
             let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
                 on_output_text: Some(Arc::new(move |text| {
-                    output_capture.append_text(&text.bytes, text.stream, text.is_continuation);
+                    output_capture.append_output_text(
+                        &text.bytes,
+                        text.stream,
+                        text.is_continuation,
+                    );
                 })),
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
@@ -5071,6 +5103,7 @@ impl WorkerProcess {
                         sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                             prompt: event.prompt,
                             line: event.line,
+                            echo_source: readline_echo_source,
                         });
                     }))
                 },
@@ -5992,7 +6025,7 @@ where
                         break;
                     }
                     Ok(n) => {
-                        live_output.append_text(&buffer[..n], output_stream, false);
+                        live_output.append_raw_text(&buffer[..n], output_stream);
                         read_stream = true;
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -6066,7 +6099,7 @@ where
             }
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream, false),
+                Ok(n) => live_output.append_raw_text(&buffer[..n], output_stream),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -6098,7 +6131,7 @@ where
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => live_output.append_text(&buffer[..n], output_stream, false),
+                Ok(n) => live_output.append_raw_text(&buffer[..n], output_stream),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -7447,12 +7480,13 @@ mod tests {
 
         manager
             .pending_output_tape
-            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
         manager
             .pending_output_tape
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
 
         let formatted = manager.drain_formatted_output();
@@ -7475,12 +7509,13 @@ mod tests {
 
         manager
             .pending_output_tape
-            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
         manager
             .pending_output_tape
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
         manager.pending_output_tape.append_stdout_bytes(b"start\n");
 
@@ -7504,12 +7539,13 @@ mod tests {
 
         manager
             .pending_output_tape
-            .append_stdout_bytes(b"> Sys.sleep(5)\n");
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
         manager
             .pending_output_tape
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
             });
 
         let context = manager.prepare_input_context_files();
@@ -7904,7 +7940,7 @@ mod tests {
             tape.clone(),
             OutputTimeline::new(output_ring.clone()),
         );
-        capture.append_text(b"pager output\n", TextStream::Stdout, false);
+        capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
         capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
@@ -7954,6 +7990,7 @@ mod tests {
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
         capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
@@ -7963,7 +8000,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
         let contents = tape
             .drain_final_snapshot()
@@ -8002,7 +8039,7 @@ mod tests {
         let session_capture = capture.clone();
         let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
             on_output_text: Some(Arc::new(move |text| {
-                output_capture.append_text(&text.bytes, text.stream, text.is_continuation);
+                output_capture.append_output_text(&text.bytes, text.stream, text.is_continuation);
             })),
             on_readline_start: Some(Arc::new(move |prompt| {
                 start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
@@ -8011,6 +8048,7 @@ mod tests {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                     prompt: event.prompt,
                     line: event.line,
+                    echo_source: PendingTextSource::Ipc,
                 });
             })),
             on_plot_image: Some(Arc::new(move |image| {
@@ -8086,7 +8124,7 @@ mod tests {
         assert!(matches!(
             &snapshot.events[2],
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineResult { prompt, line },
+                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
                 ..
             } if prompt == "> " && line == "plot(1)\n"
         ));
@@ -8155,7 +8193,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
         let end = output_ring.end_offset();
         let collapsed = collapse_echo_with_attribution(

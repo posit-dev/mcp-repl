@@ -21,7 +21,7 @@ struct PendingOutputTapeInner {
     stdout_tail: PendingTextTail,
     stderr_tail: PendingTextTail,
     drained_readline_results: usize,
-    pending_echo_prefix: String,
+    pending_echo_prefix: Option<PendingEchoPrefix>,
     last_rendered_text: Option<RenderedTextState>,
 }
 
@@ -29,6 +29,7 @@ struct PendingOutputTapeInner {
 struct PendingTextTail {
     bytes: Vec<u8>,
     origin: Option<ContentOrigin>,
+    source: Option<PendingTextSource>,
     start_seq: Option<u64>,
 }
 
@@ -38,6 +39,7 @@ pub(crate) enum PendingOutputEvent {
         seq: u64,
         stream: TextStream,
         origin: ContentOrigin,
+        source: PendingTextSource,
         bytes: Vec<u8>,
         terminated: bool,
     },
@@ -75,8 +77,14 @@ impl PendingOutputEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingSidebandKind {
-    ReadlineStart { prompt: String },
-    ReadlineResult { prompt: String, line: String },
+    ReadlineStart {
+        prompt: String,
+    },
+    ReadlineResult {
+        prompt: String,
+        line: String,
+        echo_source: PendingTextSource,
+    },
     RequestBoundary,
     SessionEnd,
 }
@@ -85,7 +93,7 @@ pub(crate) enum PendingSidebandKind {
 pub(crate) struct PendingOutputSnapshot {
     pub events: Vec<PendingOutputEvent>,
     readline_result_base: usize,
-    leading_echo_prefix: Option<String>,
+    leading_echo_prefix: Option<PendingEchoPrefix>,
     prior_rendered_text: Option<RenderedTextState>,
 }
 
@@ -109,6 +117,72 @@ struct RenderedTextState {
     terminated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingTextSource {
+    Raw,
+    Ipc,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingEchoPrefix {
+    segments: Vec<PendingEchoSegment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingEchoSegment {
+    text: String,
+    source: PendingTextSource,
+}
+
+impl PendingEchoPrefix {
+    fn push(&mut self, source: PendingTextSource, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.segments.last_mut()
+            && last.source == source
+        {
+            last.text.push_str(&text);
+            return;
+        }
+        self.segments.push(PendingEchoSegment { text, source });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.iter().all(|segment| segment.text.is_empty())
+    }
+
+    fn text_prefix(&self, mut byte_len: usize) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            if byte_len == 0 {
+                break;
+            }
+            let take = byte_len.min(segment.text.len());
+            text.push_str(&segment.text[..take]);
+            byte_len -= take;
+        }
+        text
+    }
+
+    fn suffix_after(&self, mut byte_len: usize) -> Option<Self> {
+        let mut segments = Vec::new();
+        for (idx, segment) in self.segments.iter().enumerate() {
+            if byte_len >= segment.text.len() {
+                byte_len -= segment.text.len();
+                continue;
+            }
+            segments.push(PendingEchoSegment {
+                text: segment.text[byte_len..].to_string(),
+                source: segment.source,
+            });
+            segments.extend(self.segments[idx.saturating_add(1)..].iter().cloned());
+            break;
+        }
+        (!segments.is_empty()).then_some(Self { segments })
+    }
+}
+
 struct RenderedPendingOutput {
     range: OutputRange,
     echo_events: Vec<IpcEchoEvent>,
@@ -122,15 +196,48 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn append_stdout_bytes(&self, bytes: &[u8]) {
-        self.append_bytes(bytes, TextStream::Stdout, ContentOrigin::Worker);
+        self.append_bytes(
+            bytes,
+            TextStream::Stdout,
+            ContentOrigin::Worker,
+            PendingTextSource::Raw,
+        );
+    }
+
+    pub(crate) fn append_stdout_ipc_bytes(&self, bytes: &[u8]) {
+        self.append_bytes(
+            bytes,
+            TextStream::Stdout,
+            ContentOrigin::Worker,
+            PendingTextSource::Ipc,
+        );
     }
 
     pub(crate) fn append_stderr_bytes(&self, bytes: &[u8]) {
-        self.append_bytes(bytes, TextStream::Stderr, ContentOrigin::Worker);
+        self.append_bytes(
+            bytes,
+            TextStream::Stderr,
+            ContentOrigin::Worker,
+            PendingTextSource::Raw,
+        );
+    }
+
+    pub(crate) fn append_stderr_ipc_bytes(&self, bytes: &[u8]) {
+        self.append_bytes(
+            bytes,
+            TextStream::Stderr,
+            ContentOrigin::Worker,
+            PendingTextSource::Ipc,
+        );
     }
 
     pub(crate) fn append_server_stderr_bytes(&self, bytes: &[u8]) {
-        self.append_bytes(bytes, TextStream::Stderr, ContentOrigin::Server);
+        self.append_bytes(
+            bytes,
+            TextStream::Stderr,
+            ContentOrigin::Server,
+            PendingTextSource::Raw,
+        );
     }
 
     pub(crate) fn append_server_stderr_status_line(&self, bytes: &[u8]) {
@@ -156,6 +263,7 @@ impl PendingOutputTape {
             &mut guard,
             TextStream::Stderr,
             ContentOrigin::Server,
+            PendingTextSource::Raw,
             &status_line,
         );
     }
@@ -183,6 +291,7 @@ impl PendingOutputTape {
             &mut guard,
             TextStream::Stdout,
             ContentOrigin::Server,
+            PendingTextSource::Raw,
             &status_line,
         );
     }
@@ -350,23 +459,22 @@ impl PendingOutputTape {
         guard.drained_readline_results = guard
             .drained_readline_results
             .saturating_add(drained_readline_results);
-        // `pending_echo_prefix` only carries trim-eligible REPL echo that was
-        // observed sideband-first in an earlier drain. Current-snapshot echo is
-        // resolved from the mixed text/event timeline below.
-        let leading_echo_prefix =
-            (!guard.pending_echo_prefix.is_empty()).then(|| guard.pending_echo_prefix.clone());
+        // `pending_echo_prefix` only carries echo that was observed
+        // sideband-first in an earlier drain. Raw Python prompt echo and
+        // R-owned IPC echo use the same visible bytes, but they must only trim
+        // text delivered on their own channel.
+        let leading_echo_prefix = guard.pending_echo_prefix.clone();
         append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
-        if !guard.pending_echo_prefix.is_empty() {
-            let echo_prefix = guard.pending_echo_prefix.clone();
+        if let Some(echo_prefix) = guard.pending_echo_prefix.clone() {
             let (matched_bytes, keep_remaining_suffix) =
                 leading_echo_match_progress(&events, &echo_prefix);
             if keep_remaining_suffix
                 && !(snapshot_has_no_visible_text(&events)
                     && snapshot_crossed_request_boundary(&events))
             {
-                guard.pending_echo_prefix = echo_prefix[matched_bytes..].to_string();
+                guard.pending_echo_prefix = echo_prefix.suffix_after(matched_bytes);
             } else {
-                guard.pending_echo_prefix.clear();
+                guard.pending_echo_prefix = None;
             }
         }
         if snapshot_crossed_request_boundary(&events) {
@@ -381,7 +489,13 @@ impl PendingOutputTape {
         }
     }
 
-    fn append_bytes(&self, bytes: &[u8], stream: TextStream, origin: ContentOrigin) {
+    fn append_bytes(
+        &self,
+        bytes: &[u8],
+        stream: TextStream,
+        origin: ContentOrigin,
+        source: PendingTextSource,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -394,6 +508,9 @@ impl PendingOutputTape {
         if tail_mut(&mut guard, stream)
             .origin
             .is_some_and(|tail_origin| tail_origin != origin)
+            || tail_mut(&mut guard, stream)
+                .source
+                .is_some_and(|tail_source| tail_source != source)
         {
             flush_tail(&mut guard, stream, true);
         }
@@ -405,6 +522,9 @@ impl PendingOutputTape {
         let tail = tail_mut(&mut guard, stream);
         if tail.origin.is_none() {
             tail.origin = Some(origin);
+        }
+        if tail.source.is_none() {
+            tail.source = Some(source);
         }
         tail.bytes.extend_from_slice(bytes);
         commit_complete_lines(&mut guard, stream);
@@ -441,7 +561,11 @@ impl PendingOutputSnapshot {
             collapsed.text_spans,
             source_end,
         );
-        maybe_trim_leading_echo_prefix(self.leading_echo_prefix.as_deref(), &mut contents);
+        maybe_trim_leading_echo_prefix(
+            self.leading_echo_prefix.as_ref(),
+            &self.events,
+            &mut contents,
+        );
         FormattedPendingOutput {
             contents,
             saw_stderr,
@@ -462,6 +586,7 @@ impl PendingOutputSnapshot {
                 PendingOutputEvent::TextFragment {
                     stream,
                     origin,
+                    source: _,
                     bytes: fragment,
                     terminated,
                     ..
@@ -536,7 +661,7 @@ impl PendingOutputSnapshot {
                     PendingSidebandKind::ReadlineStart { prompt } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                     }
-                    PendingSidebandKind::ReadlineResult { prompt, line } => {
+                    PendingSidebandKind::ReadlineResult { prompt, line, .. } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                         echo_events.push(IpcEchoEvent {
                             prompt: prompt.clone(),
@@ -563,33 +688,65 @@ impl PendingOutputSnapshot {
     }
 }
 
-fn maybe_trim_leading_echo_prefix(echo_prefix: Option<&str>, contents: &mut Vec<WorkerContent>) {
+fn maybe_trim_leading_echo_prefix(
+    echo_prefix: Option<&PendingEchoPrefix>,
+    events: &[PendingOutputEvent],
+    contents: &mut Vec<WorkerContent>,
+) {
     let Some(echo_prefix) = echo_prefix else {
         return;
     };
-    trim_matching_echo_prefix_from_contents(contents, echo_prefix);
+    let (matched_bytes, _) = leading_echo_match_progress(events, echo_prefix);
+    if matched_bytes == 0 {
+        return;
+    }
+    trim_matching_echo_prefix_from_contents(contents, &echo_prefix.text_prefix(matched_bytes));
 }
 
-fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[PendingOutputEvent]) {
+fn append_readline_results_to_echo_prefix(
+    echo_prefix: &mut Option<PendingEchoPrefix>,
+    events: &[PendingOutputEvent],
+) {
     for event in events {
         if let PendingOutputEvent::Sideband {
-            kind: PendingSidebandKind::ReadlineResult { prompt, line },
+            kind:
+                PendingSidebandKind::ReadlineResult {
+                    prompt,
+                    line,
+                    echo_source,
+                },
             ..
         } = event
         {
             if !is_trim_eligible_carryover_prompt(prompt) {
                 continue;
             }
-            echo_prefix.push_str(prompt);
-            echo_prefix.push_str(line);
+            let prefix = echo_prefix.get_or_insert_with(PendingEchoPrefix::default);
+            let mut text = String::with_capacity(prompt.len().saturating_add(line.len()));
+            text.push_str(prompt);
+            text.push_str(line);
+            prefix.push(*echo_source, text);
         }
+    }
+    if echo_prefix
+        .as_ref()
+        .is_some_and(PendingEchoPrefix::is_empty)
+    {
+        *echo_prefix = None;
     }
 }
 
 fn is_trim_eligible_carryover_prompt(prompt: &str) -> bool {
     let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    matches!(core, ">" | "+" | ">>>" | "...")
+    if matches!(core, ">>>" | "...") {
+        return true;
+    }
+    if matches!(core, ">" | "+")
         || (core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')))
+    {
+        return true;
+    }
+    false
 }
 
 fn snapshot_has_no_visible_text(events: &[PendingOutputEvent]) -> bool {
@@ -614,12 +771,16 @@ fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
     })
 }
 
-fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str) -> (usize, bool) {
+fn leading_echo_match_progress(
+    events: &[PendingOutputEvent],
+    echo_prefix: &PendingEchoPrefix,
+) -> (usize, bool) {
     if echo_prefix.is_empty() {
         return (0, false);
     }
 
-    let mut remaining = echo_prefix;
+    let mut segment_idx = 0usize;
+    let mut segment_offset = 0usize;
     let mut matched_bytes = 0usize;
     let mut saw_visible_content = false;
 
@@ -627,6 +788,7 @@ fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str)
         let PendingOutputEvent::TextFragment {
             stream,
             origin,
+            source,
             bytes,
             ..
         } = event
@@ -652,16 +814,40 @@ fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str)
         }
 
         saw_visible_content = true;
-        if remaining.is_empty() {
-            return (matched_bytes, false);
-        }
 
-        let common = common_prefix_len(remaining, &rendered);
-        matched_bytes = matched_bytes.saturating_add(common);
-        remaining = &remaining[common..];
+        let mut remaining_rendered = rendered.as_str();
+        while !remaining_rendered.is_empty() {
+            let Some(segment) = echo_prefix.segments.get(segment_idx) else {
+                return (matched_bytes, false);
+            };
+            if *source != segment.source {
+                return (matched_bytes, false);
+            }
 
-        if common < rendered.len() {
-            return (matched_bytes, false);
+            let remaining_segment = &segment.text[segment_offset..];
+            if remaining_segment.is_empty() {
+                segment_idx = segment_idx.saturating_add(1);
+                segment_offset = 0;
+                continue;
+            }
+
+            let before_len = remaining_rendered.len();
+            let common = common_prefix_len(remaining_segment, remaining_rendered);
+            if common == 0 {
+                return (matched_bytes, false);
+            }
+            matched_bytes = matched_bytes.saturating_add(common);
+            segment_offset = segment_offset.saturating_add(common);
+            remaining_rendered = &remaining_rendered[common..];
+
+            let segment_complete = segment_offset == segment.text.len();
+            if segment_complete {
+                segment_idx = segment_idx.saturating_add(1);
+                segment_offset = 0;
+            }
+            if common < before_len && !segment_complete {
+                return (matched_bytes, false);
+            }
         }
     }
 
@@ -669,7 +855,7 @@ fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str)
         return (matched_bytes, true);
     }
 
-    (matched_bytes, !remaining.is_empty())
+    (matched_bytes, segment_idx < echo_prefix.segments.len())
 }
 
 fn trim_matching_echo_prefix_from_contents(contents: &mut Vec<WorkerContent>, echo_prefix: &str) {
@@ -856,6 +1042,7 @@ fn append_complete_bytes(
     inner: &mut PendingOutputTapeInner,
     stream: TextStream,
     origin: ContentOrigin,
+    source: PendingTextSource,
     bytes: &[u8],
 ) {
     if bytes.is_empty() {
@@ -868,6 +1055,7 @@ fn append_complete_bytes(
             seq,
             stream,
             origin,
+            source,
             bytes: bytes.to_vec(),
             terminated: bytes.ends_with(b"\n"),
         },
@@ -876,7 +1064,7 @@ fn append_complete_bytes(
 
 fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream) {
     loop {
-        let (seq, origin, line, tail_empty) = {
+        let (seq, origin, source, line, tail_empty) = {
             let tail = tail_mut(inner, stream);
             let Some(newline_idx) = tail.bytes.iter().position(|byte| *byte == b'\n') else {
                 break;
@@ -887,13 +1075,17 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
             let origin = tail
                 .origin
                 .expect("text tail should record origin while bytes are buffered");
+            let source = tail
+                .source
+                .expect("text tail should record source while bytes are buffered");
             let line = tail.bytes.drain(..=newline_idx).collect::<Vec<u8>>();
             let tail_empty = tail.bytes.is_empty();
             if tail_empty {
                 tail.origin = None;
+                tail.source = None;
                 tail.start_seq = None;
             }
-            (seq, origin, line, tail_empty)
+            (seq, origin, source, line, tail_empty)
         };
         append_event(
             inner,
@@ -901,6 +1093,7 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
                 seq,
                 stream,
                 origin,
+                source,
                 bytes: line,
                 terminated: true,
             },
@@ -914,7 +1107,7 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
 }
 
 fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_incomplete: bool) {
-    let (seq, origin, bytes, tail_empty) = {
+    let (seq, origin, source, bytes, tail_empty) = {
         let tail = tail_mut(inner, stream);
         if tail.bytes.is_empty() {
             return;
@@ -932,13 +1125,17 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_inco
         let origin = tail
             .origin
             .expect("text tail should record origin while bytes are buffered");
+        let source = tail
+            .source
+            .expect("text tail should record source while bytes are buffered");
         let bytes = tail.bytes.drain(..flush_len).collect::<Vec<u8>>();
         let tail_empty = tail.bytes.is_empty();
         if tail_empty {
             tail.origin = None;
+            tail.source = None;
             tail.start_seq = None;
         }
-        (seq, origin, bytes, tail_empty)
+        (seq, origin, source, bytes, tail_empty)
     };
     append_event(
         inner,
@@ -946,6 +1143,7 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_inco
             seq,
             stream,
             origin,
+            source,
             bytes,
             terminated: false,
         },
@@ -1054,6 +1252,7 @@ mod tests {
                     seq: 0,
                     stream: TextStream::Stdout,
                     origin: ContentOrigin::Worker,
+                    source: PendingTextSource::Raw,
                     bytes: b"abc".to_vec(),
                     terminated: false,
                 },
@@ -1061,6 +1260,7 @@ mod tests {
                     seq: 1,
                     stream: TextStream::Stderr,
                     origin: ContentOrigin::Worker,
+                    source: PendingTextSource::Raw,
                     bytes: b"boom\n".to_vec(),
                     terminated: true,
                 },
@@ -1071,10 +1271,11 @@ mod tests {
     #[test]
     fn sideband_events_preserve_order_with_text() {
         let tape = PendingOutputTape::new();
-        tape.append_stdout_bytes(b"> 1+\n");
+        tape.append_stdout_ipc_bytes(b"> 1+\n");
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "1+\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
         tape.append_stdout_bytes(b"[1] 2\n");
 
@@ -1188,6 +1389,7 @@ mod tests {
                     seq: 0,
                     stream: TextStream::Stderr,
                     origin: ContentOrigin::Server,
+                    source: PendingTextSource::Raw,
                     bytes: b"[repl] guardrail".to_vec(),
                     terminated: false,
                 },
@@ -1195,6 +1397,7 @@ mod tests {
                     seq: 1,
                     stream: TextStream::Stdout,
                     origin: ContentOrigin::Worker,
+                    source: PendingTextSource::Raw,
                     bytes: b"ok\n".to_vec(),
                     terminated: true,
                 },
@@ -1284,8 +1487,9 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "1+\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1293,7 +1497,7 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_bytes(b"> 1");
+        tape.append_stdout_bytes(b">>> 1");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1313,8 +1517,9 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "x <- 1\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         tape.append_sideband(PendingSidebandKind::RequestBoundary);
 
@@ -1329,7 +1534,7 @@ mod tests {
             .lock()
             .expect("pending output tape mutex poisoned");
         assert!(
-            guard.pending_echo_prefix.is_empty(),
+            guard.pending_echo_prefix.is_none(),
             "request boundary should clear unmatched carried echo"
         );
     }
@@ -1340,8 +1545,9 @@ mod tests {
         let status = "[repl] previous plot updated\n".to_string();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         tape.append_stdout_status_event(status.clone(), 1);
         tape.append_sideband(PendingSidebandKind::RequestBoundary);
@@ -1352,7 +1558,7 @@ mod tests {
             vec![WorkerContent::server_stdout(status)]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1365,8 +1571,9 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         tape.append_image(
             "img-1".to_string(),
@@ -1388,7 +1595,7 @@ mod tests {
             }]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1401,12 +1608,14 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "x <- 1\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "y <- 2\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1414,18 +1623,18 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_bytes(b"> x <- 1\nok\n");
+        tape.append_stdout_bytes(b">>> x <- 1\nok\n");
         let second = tape.drain_snapshot();
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("ok\n")]
         );
 
-        tape.append_stdout_bytes(b"> y <- 2\n");
+        tape.append_stdout_bytes(b">>> y <- 2\n");
         let third = tape.drain_snapshot();
         assert_eq!(
             third.format_contents().contents,
-            vec![WorkerContent::stdout("> y <- 2\n")]
+            vec![WorkerContent::stdout(">>> y <- 2\n")]
         );
     }
 
@@ -1522,6 +1731,7 @@ mod tests {
                     seq: 0,
                     stream: TextStream::Stdout,
                     origin: ContentOrigin::Worker,
+                    source: PendingTextSource::Raw,
                     bytes: vec![0xC3],
                     terminated: false,
                 },
@@ -1529,6 +1739,7 @@ mod tests {
                     seq: 1,
                     stream: TextStream::Stdout,
                     origin: ContentOrigin::Server,
+                    source: PendingTextSource::Raw,
                     bytes: b"\n[repl] session ended\n".to_vec(),
                     terminated: true,
                 },
@@ -1550,6 +1761,7 @@ mod tests {
                     seq: 0,
                     stream: TextStream::Stderr,
                     origin: ContentOrigin::Server,
+                    source: PendingTextSource::Raw,
                     bytes: vec![0xC3],
                     terminated: false,
                 },
@@ -1557,6 +1769,7 @@ mod tests {
                     seq: 1,
                     stream: TextStream::Stderr,
                     origin: ContentOrigin::Worker,
+                    source: PendingTextSource::Raw,
                     bytes: b"boom\n".to_vec(),
                     terminated: true,
                 },
@@ -1568,12 +1781,13 @@ mod tests {
     fn reply_format_anchors_image_before_later_echoed_input_and_stdout() {
         let tape = PendingOutputTape::new();
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_ipc_bytes(b"> plot(1:10)\n");
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
-        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1585,6 +1799,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
 
         let snapshot = tape.drain_snapshot();
@@ -1606,12 +1821,13 @@ mod tests {
     fn nonfinal_format_drops_leading_repl_echo_once_output_arrives() {
         let tape = PendingOutputTape::new();
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_ipc_bytes(b"> plot(1:10)\n");
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
-        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1623,6 +1839,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
 
         let snapshot = tape.drain_snapshot();
@@ -1648,6 +1865,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "FIRST> ".to_string(),
             line: "alpha\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         tape.append_sideband(PendingSidebandKind::ReadlineStart {
             prompt: "SECOND> ".to_string(),
@@ -1667,6 +1885,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1674,7 +1893,7 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1686,6 +1905,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
         });
 
         let second = tape.drain_snapshot();
@@ -1704,12 +1924,118 @@ mod tests {
     }
 
     #[test]
+    fn r_prompt_carryover_does_not_trim_late_raw_stdout() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1 + 1\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> 1 + 1\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("> 1 + 1\n")]
+        );
+    }
+
+    #[test]
+    fn python_r_shaped_prompt_carryover_trims_late_raw_echo() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "answer\n".to_string(),
+            echo_source: PendingTextSource::Raw,
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> answer\n");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "expected Python raw prompt echo to be trimmed"
+        );
+    }
+
+    #[test]
+    fn mixed_prompt_source_carryover_does_not_panic() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "first\n".to_string(),
+            echo_source: PendingTextSource::Raw,
+        });
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
+        });
+
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b">>> first\n");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "expected raw segment to be trimmed"
+        );
+
+        tape.append_stdout_ipc_bytes(b"> second\n");
+        let third = tape.drain_snapshot();
+        assert!(
+            third.format_contents().contents.is_empty(),
+            "expected IPC segment to be trimmed"
+        );
+    }
+
+    #[test]
+    fn r_prompt_carryover_trims_late_ipc_output_text() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1 + 1\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_ipc_bytes(b"> 1 + 1\n");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "expected late R-owned output_text echo to be trimmed"
+        );
+    }
+
+    #[test]
     fn custom_prompt_carryover_does_not_trim_real_output() {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "FIRST> ".to_string(),
             line: "alpha\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1730,8 +2056,9 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
+            echo_source: PendingTextSource::Raw,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1757,7 +2084,7 @@ mod tests {
             }]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\ndone\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\ndone\n");
         let third = tape.drain_snapshot();
         assert_eq!(
             third.format_contents().contents,
