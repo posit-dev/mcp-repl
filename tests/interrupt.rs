@@ -57,6 +57,7 @@ async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     .await
 }
 
+#[cfg(unix)]
 async fn spawn_interrupt_files_session() -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args(vec![
         "--sandbox".to_string(),
