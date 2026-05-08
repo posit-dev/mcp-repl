@@ -1152,7 +1152,7 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
     let arm = session
         .write_stdin_raw_with(
             format!(
-                "import os, pathlib, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), pathlib.Path({marker_literal}).write_text('done'), os._exit(0)), daemon=True).start()"
+                "import os, pathlib, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), pathlib.Path({marker_literal}).write_text('done'), time.sleep(0.2), os._exit(0)), daemon=True).start()"
             ),
             Some(5.0),
         )
