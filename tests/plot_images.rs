@@ -1635,7 +1635,7 @@ async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappea
         ("TMPDIR".to_string(), temp.path().display().to_string()),
         (
             "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
-            "12000".to_string(),
+            "200000".to_string(),
         ),
     ])
     .await?;
@@ -1722,7 +1722,7 @@ Sys.sleep(8)
         }
     };
     assert!(
-        damaged_text.contains("events.log"),
+        damaged_text.contains("output-0001"),
         "expected bundle-file deletion poll to keep disclosing the output bundle, got: {damaged_text:?}"
     );
     assert_eq!(
