@@ -350,9 +350,10 @@ impl PendingOutputTape {
         guard.drained_readline_results = guard
             .drained_readline_results
             .saturating_add(drained_readline_results);
-        // `pending_echo_prefix` only carries trim-eligible REPL echo that was
-        // observed sideband-first in an earlier drain. Current-snapshot echo is
-        // resolved from the mixed text/event timeline below.
+        // `pending_echo_prefix` only carries non-R raw REPL echo that was
+        // observed sideband-first in an earlier drain. R-owned echo now travels
+        // through ordered `output_text` frames and is resolved in the current
+        // mixed text/event timeline below.
         let leading_echo_prefix =
             (!guard.pending_echo_prefix.is_empty()).then(|| guard.pending_echo_prefix.clone());
         append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
@@ -588,8 +589,7 @@ fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[Pe
 
 fn is_trim_eligible_carryover_prompt(prompt: &str) -> bool {
     let core = prompt.trim_end_matches(|ch: char| ch.is_whitespace());
-    matches!(core, ">" | "+" | ">>>" | "...")
-        || (core.starts_with("Browse[") && (core.ends_with('>') || core.ends_with('+')))
+    matches!(core, ">>>" | "...")
 }
 
 fn snapshot_has_no_visible_text(events: &[PendingOutputEvent]) -> bool {
@@ -1284,7 +1284,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "1+\n".to_string(),
         });
         let first = tape.drain_snapshot();
@@ -1293,7 +1293,7 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_bytes(b"> 1");
+        tape.append_stdout_bytes(b">>> 1");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1313,7 +1313,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "x <- 1\n".to_string(),
         });
         tape.append_sideband(PendingSidebandKind::RequestBoundary);
@@ -1340,7 +1340,7 @@ mod tests {
         let status = "[repl] previous plot updated\n".to_string();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
         });
         tape.append_stdout_status_event(status.clone(), 1);
@@ -1352,7 +1352,7 @@ mod tests {
             vec![WorkerContent::server_stdout(status)]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1365,7 +1365,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
         });
         tape.append_image(
@@ -1388,7 +1388,7 @@ mod tests {
             }]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
         let second = tape.drain_snapshot();
         assert!(
             second.format_contents().contents.is_empty(),
@@ -1401,11 +1401,11 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "x <- 1\n".to_string(),
         });
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "y <- 2\n".to_string(),
         });
         let first = tape.drain_snapshot();
@@ -1414,18 +1414,18 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_bytes(b"> x <- 1\nok\n");
+        tape.append_stdout_bytes(b">>> x <- 1\nok\n");
         let second = tape.drain_snapshot();
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("ok\n")]
         );
 
-        tape.append_stdout_bytes(b"> y <- 2\n");
+        tape.append_stdout_bytes(b">>> y <- 2\n");
         let third = tape.drain_snapshot();
         assert_eq!(
             third.format_contents().contents,
-            vec![WorkerContent::stdout("> y <- 2\n")]
+            vec![WorkerContent::stdout(">>> y <- 2\n")]
         );
     }
 
@@ -1704,6 +1704,28 @@ mod tests {
     }
 
     #[test]
+    fn r_prompt_carryover_does_not_trim_late_raw_stdout() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1 + 1\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> 1 + 1\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("> 1 + 1\n")]
+        );
+    }
+
+    #[test]
     fn custom_prompt_carryover_does_not_trim_real_output() {
         let tape = PendingOutputTape::new();
 
@@ -1730,7 +1752,7 @@ mod tests {
         let tape = PendingOutputTape::new();
 
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
+            prompt: ">>> ".to_string(),
             line: "plot(1:10)\n".to_string(),
         });
         let first = tape.drain_snapshot();
@@ -1757,7 +1779,7 @@ mod tests {
             }]
         );
 
-        tape.append_stdout_bytes(b"> plot(1:10)\ndone\n");
+        tape.append_stdout_bytes(b">>> plot(1:10)\ndone\n");
         let third = tape.drain_snapshot();
         assert_eq!(
             third.format_contents().contents,

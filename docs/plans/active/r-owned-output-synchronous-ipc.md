@@ -8,8 +8,8 @@
 ## Status
 
 - State: active
-- Last updated: 2026-05-07
-- Current phase: phase 3 pending
+- Last updated: 2026-05-08
+- Current phase: phase 3 in progress
 
 ## Current Direction
 
@@ -25,7 +25,8 @@
 - Phase 0: completed - protocol frame and synchronous worker IPC writer.
 - Phase 1: completed - append `output_text` into server timelines.
 - Phase 2: completed - route R console callbacks and readline echo through `output_text`.
-- Phase 3: pending - remove race-tolerant handling that only existed for R-owned output.
+- Phase 3: in progress - R prompt carryover removed from the files-mode
+  sideband-first fallback; remaining carryover is for non-R raw prompt echo.
 
 ## Locked Decisions
 
@@ -39,8 +40,8 @@
 
 ## Next Safe Slice
 
-- Remove or narrow race-tolerant handling that was only needed when R-owned text
-  traveled through raw stdout and stderr pipes.
+- Review remaining prompt-fallback cleanup in `src/worker_process.rs` and keep
+  any fallback documented as non-R raw pipe behavior.
 
 ## Stop Conditions
 
@@ -57,3 +58,6 @@
 - 2026-05-08: Added focused ordering and raw-output fallback coverage for
   R-owned stdout, stderr, readline echo, plots, direct file-descriptor writes,
   child output, and large output.
+- 2026-05-08: Narrowed files-mode sideband-first echo carryover so ordinary R
+  prompts no longer trim later raw stdout. Python-style raw prompt echo remains
+  eligible for carryover.
