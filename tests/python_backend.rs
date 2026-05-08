@@ -1179,6 +1179,7 @@ print("armed")
 def exit_after_detached_tail():
     while not os.path.exists(tail_marker):
         time.sleep(0.02)
+    time.sleep(0.4)
     pathlib.Path(exit_marker).write_text("done")
     os._exit(0)
 threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
