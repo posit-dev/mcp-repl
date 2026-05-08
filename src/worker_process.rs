@@ -30,8 +30,8 @@ use crate::ipc::{IpcHandlers, IpcPlotImage};
 #[cfg(test)]
 use crate::output_capture::OutputRange;
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputTextSpan, OutputTimeline,
-    ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputTextSource, OutputTextSpan,
+    OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     set_last_reply_marker_offset, update_last_reply_marker_offset_max,
 };
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
@@ -142,8 +142,17 @@ impl LiveOutputCapture {
     ) {
         match stream {
             TextStream::Stdout => {
-                self.output_timeline
-                    .append_text(bytes, false, ContentOrigin::Worker);
+                if is_output_text {
+                    self.output_timeline.append_ipc_text_with_continuation(
+                        bytes,
+                        false,
+                        ContentOrigin::Worker,
+                        is_continuation,
+                    );
+                } else {
+                    self.output_timeline
+                        .append_text(bytes, false, ContentOrigin::Worker);
+                }
                 if let Some(tape) = &self.pending_output_tape {
                     if is_output_text {
                         tape.append_stdout_ipc_bytes(bytes);
@@ -153,12 +162,21 @@ impl LiveOutputCapture {
                 }
             }
             TextStream::Stderr => {
-                self.output_timeline.append_text_with_continuation(
-                    bytes,
-                    true,
-                    ContentOrigin::Worker,
-                    is_continuation,
-                );
+                if is_output_text {
+                    self.output_timeline.append_ipc_text_with_continuation(
+                        bytes,
+                        true,
+                        ContentOrigin::Worker,
+                        is_continuation,
+                    );
+                } else {
+                    self.output_timeline.append_text_with_continuation(
+                        bytes,
+                        true,
+                        ContentOrigin::Worker,
+                        is_continuation,
+                    );
+                }
                 if let Some(tape) = &self.pending_output_tape {
                     if is_output_text {
                         tape.append_stderr_ipc_bytes(bytes);
@@ -224,6 +242,13 @@ const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
 const PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE: &str =
     "worker follow-up needs current sandbox metadata after precheck";
 
+fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
+    match backend {
+        Backend::R => OutputTextSource::Ipc,
+        Backend::Python => OutputTextSource::Raw,
+    }
+}
+
 #[derive(Debug)]
 pub enum WorkerError {
     Io(std::io::Error),
@@ -284,14 +309,15 @@ const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
+    echo_source: OutputTextSource,
 ) -> Result<CompletionInfo, WorkerError> {
     if timeout.is_zero() {
         return Err(WorkerError::Timeout(timeout));
     }
     match ipc.wait_for_request_completion(timeout, REQUEST_COMPLETION_STABLE_WAIT) {
-        Ok(()) => Ok(completion_info_from_ipc(&ipc, false)),
+        Ok(()) => Ok(completion_info_from_ipc(&ipc, false, echo_source)),
         Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true)),
+        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true, echo_source)),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected while waiting for request completion".to_string(),
         )),
@@ -369,7 +395,7 @@ impl BackendDriver for RBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc)
+        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -434,7 +460,7 @@ impl BackendDriver for PythonBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc)
+        driver_wait_for_completion(timeout, ipc, OutputTextSource::Raw)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -595,7 +621,11 @@ struct CompletionInfo {
     session_end_seen: bool,
 }
 
-fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -> CompletionInfo {
+fn completion_info_from_ipc(
+    ipc: &ServerIpcConnection,
+    session_end_seen: bool,
+    echo_source: OutputTextSource,
+) -> CompletionInfo {
     let (prompt, prompt_variants) = if session_end_seen {
         (None, None)
     } else {
@@ -603,10 +633,15 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
         (prompt, Some(prompt_variants))
     };
 
+    let mut echo_events = ipc.take_echo_events();
+    for event in &mut echo_events {
+        event.source = echo_source;
+    }
+
     CompletionInfo {
         prompt,
         prompt_variants,
-        echo_events: ipc.take_echo_events(),
+        echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
     }
@@ -3363,7 +3398,11 @@ impl WorkerManager {
         let prompt = self.last_prompt.clone();
         let prompt_variants = prompt.clone().map(|prompt| vec![prompt]);
         let echo_events = match (prompt, self.pending_request_input.clone()) {
-            (Some(prompt), Some(line)) => vec![IpcEchoEvent { prompt, line }],
+            (Some(prompt), Some(line)) => vec![IpcEchoEvent {
+                prompt,
+                line,
+                source: output_echo_source_for_backend(self.backend),
+            }],
             _ => Vec::new(),
         };
         self.settled_pending_completion = Some(CompletionInfo {
@@ -3812,7 +3851,11 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
-                let mut settled_completion = completion_info_from_ipc(&ipc, false);
+                let mut settled_completion = completion_info_from_ipc(
+                    &ipc,
+                    false,
+                    output_echo_source_for_backend(self.backend),
+                );
                 self.pending_output_tape
                     .append_sideband(PendingSidebandKind::RequestBoundary);
                 self.settle_output_after_completion(Duration::from_millis(120));
@@ -3852,7 +3895,8 @@ impl WorkerManager {
     }
 
     fn settle_pending_session_end(&mut self, ipc: &ServerIpcConnection) {
-        let settled_completion = completion_info_from_ipc(ipc, true);
+        let settled_completion =
+            completion_info_from_ipc(ipc, true, output_echo_source_for_backend(self.backend));
         self.pending_output_tape
             .append_sideband(PendingSidebandKind::RequestBoundary);
         self.settle_output_after_completion(Duration::from_millis(120));
@@ -6375,6 +6419,7 @@ mod tests {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
+            source: OutputTextSource::Ipc,
         }
     }
 
@@ -6409,6 +6454,7 @@ mod tests {
                 end_byte: text.len(),
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
             source_end,
         )
@@ -6639,6 +6685,7 @@ mod tests {
                 end_byte: 27,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -6680,6 +6727,7 @@ mod tests {
                 end_byte: 42,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 
@@ -6782,8 +6830,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected stable waiting prompt to complete request");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected stable waiting prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
         assert_eq!(completion.echo_events[0].prompt, "> ");
@@ -6811,8 +6860,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected stable waiting prompt to complete request");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected stable waiting prompt to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
@@ -6838,8 +6888,9 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(1));
 
-        let completion = driver_wait_for_completion(Duration::from_millis(5), server)
-            .expect("expected prompt seen before timeout to complete after stable settle");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(5), server, OutputTextSource::Ipc)
+                .expect("expected prompt seen before timeout to complete after stable settle");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
@@ -6863,8 +6914,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected stable continuation prompt to complete request");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected stable continuation prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("+ "));
     }
 
@@ -6897,8 +6949,9 @@ mod tests {
             });
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after stable waiting prompt");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected completion after stable waiting prompt");
         late_sender.join().expect("late sender should join");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
@@ -6952,8 +7005,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after final client-waiting prompt");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected completion after final client-waiting prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 2);
@@ -6970,8 +7024,12 @@ mod tests {
             prompt: "> ".to_string(),
             client_waiting: true,
         });
-        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
-            .expect("expected first completion");
+        let first = driver_wait_for_completion(
+            Duration::from_millis(200),
+            server.clone(),
+            OutputTextSource::Ipc,
+        )
+        .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
         driver_on_input_start("second()", &server).expect("begin request");
@@ -6984,8 +7042,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let second = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected second completion");
+        let second =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected second completion");
 
         assert!(second.protocol_warnings.is_empty());
         assert_eq!(second.echo_events.len(), 1);
@@ -7011,8 +7070,9 @@ mod tests {
             client_waiting: true,
         });
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after stable waiting prompt");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected completion after stable waiting prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
@@ -7036,8 +7096,9 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after session end");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
         assert_eq!(completion.echo_events.len(), 1);
@@ -7066,8 +7127,9 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
         thread::sleep(Duration::from_millis(25));
 
-        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after session end");
+        let completion =
+            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
+                .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
         assert_eq!(completion.echo_events.len(), 1);
@@ -7762,6 +7824,7 @@ mod tests {
                 end_byte: 25,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
             }],
         };
 

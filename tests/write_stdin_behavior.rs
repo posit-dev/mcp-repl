@@ -394,6 +394,76 @@ async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_multiline_r_echo_for_output_attribution() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            "cat('FIRST\\n')\ncat('SECOND\\n')\ncat('THIRD\\n')",
+            Some(30.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_behavior multi-line attribution output still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        text.contains("FIRST\n") && text.contains("SECOND\n") && text.contains("THIRD\n"),
+        "expected all expression output, got: {text:?}"
+    );
+    assert!(
+        text.contains("> cat('SECOND\\n')"),
+        "expected second submitted expression echo for attribution, got: {text:?}"
+    );
+    assert!(
+        text.contains("> cat('THIRD\\n')"),
+        "expected third submitted expression echo for attribution, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"system("printf '> 1+1\\n'")
+1+1"#,
+            Some(30.0),
+        )
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
+    assert!(
+        text.matches("> 1+1").count() >= 2,
+        "expected raw child stdout and later R echo to both remain visible, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

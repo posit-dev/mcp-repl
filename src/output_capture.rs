@@ -79,7 +79,7 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
-        self.append_text_with_continuation(bytes, is_stderr, origin, false);
+        self.append_text_with_source(bytes, is_stderr, origin, false, OutputTextSource::Raw);
     }
 
     pub(crate) fn append_text_with_continuation(
@@ -89,22 +89,62 @@ impl OutputTimeline {
         origin: ContentOrigin,
         is_continuation: bool,
     ) {
+        self.append_text_with_source(
+            bytes,
+            is_stderr,
+            origin,
+            is_continuation,
+            OutputTextSource::Raw,
+        );
+    }
+
+    pub(crate) fn append_ipc_text_with_continuation(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        is_continuation: bool,
+    ) {
+        self.append_text_with_source(
+            bytes,
+            is_stderr,
+            origin,
+            is_continuation,
+            OutputTextSource::Ipc,
+        );
+    }
+
+    fn append_text_with_source(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        is_continuation: bool,
+        source: OutputTextSource,
+    ) {
         if bytes.is_empty() {
             return;
         }
         if !is_stderr {
-            self.ring.append_bytes(bytes, false, origin);
+            self.ring
+                .append_bytes_with_source(bytes, false, origin, source);
             return;
         }
         if is_continuation {
-            self.ring.append_bytes(bytes, true, origin);
+            self.ring
+                .append_bytes_with_source(bytes, true, origin, source);
             return;
         }
 
-        self.append_prefixed_stderr(bytes, origin);
+        self.append_prefixed_stderr(bytes, origin, source);
     }
 
-    fn append_prefixed_stderr(&self, bytes: &[u8], origin: ContentOrigin) {
+    fn append_prefixed_stderr(
+        &self,
+        bytes: &[u8],
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
         // Keep stderr attribution in-band (as text) while ensuring the prefix starts on a new
         // line. This avoids confusing merges like `> xstderr: ...` when stdout/stderr reader
         // threads append chunks out-of-order.
@@ -118,7 +158,8 @@ impl OutputTimeline {
         }
         payload.extend_from_slice(STDERR_PREFIX);
         payload.extend_from_slice(bytes);
-        self.ring.append_bytes(&payload, true, origin);
+        self.ring
+            .append_bytes_with_source(&payload, true, origin, source);
     }
 
     pub(crate) fn append_image(
@@ -258,6 +299,7 @@ struct OutputChunk {
     range: Range<usize>,
     is_stderr: bool,
     origin: ContentOrigin,
+    source: OutputTextSource,
 }
 
 struct OutputSlice {
@@ -265,6 +307,14 @@ struct OutputSlice {
     range: Range<usize>,
     is_stderr: bool,
     origin: ContentOrigin,
+    source: OutputTextSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OutputTextSource {
+    #[default]
+    Raw,
+    Ipc,
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +323,7 @@ pub(crate) struct OutputTextSpan {
     pub end_byte: usize,
     pub is_stderr: bool,
     pub origin: ContentOrigin,
+    pub source: OutputTextSource,
 }
 
 pub(crate) struct OutputRange {
@@ -350,7 +401,18 @@ impl OutputRing {
         self.inner.lock().unwrap().start_offset
     }
 
+    #[cfg(test)]
     pub(crate) fn append_bytes(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
+        self.append_bytes_with_source(bytes, is_stderr, origin, OutputTextSource::Raw);
+    }
+
+    pub(crate) fn append_bytes_with_source(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -392,6 +454,7 @@ impl OutputRing {
                 range: 0..bytes_len,
                 is_stderr,
                 origin,
+                source,
             });
         }
 
@@ -514,6 +577,7 @@ impl OutputRing {
             if let Some(last) = text_spans.last_mut()
                 && last.is_stderr == slice.is_stderr
                 && last.origin == slice.origin
+                && last.source == slice.source
                 && last.end_byte == start_byte
             {
                 last.end_byte = end_byte;
@@ -523,6 +587,7 @@ impl OutputRing {
                     end_byte,
                     is_stderr: slice.is_stderr,
                     origin: slice.origin,
+                    source: slice.source,
                 });
             }
             cursor = end_byte;
@@ -628,6 +693,7 @@ impl OutputRing {
                     range: slice_start..slice_end,
                     is_stderr: chunk.is_stderr,
                     origin: chunk.origin,
+                    source: chunk.source,
                 });
             }
         }
