@@ -319,7 +319,7 @@ async fn direct_stdout_fd_write_falls_back_to_raw_stream() -> TestResult<()> {
         "if (!file.exists('/dev/stdout')) { ",
         "cat('SKIP_DIRECT_FD\\n') ",
         "} else { ",
-        "con <- file('/dev/stdout', open = 'wb'); ",
+        "con <- suppressWarnings(file('/dev/stdout', open = 'wb')); ",
         "writeBin(charToRaw('direct-fd\\n'), con); ",
         "flush(con); close(con); ",
         "cat('r-owned\\n') ",
@@ -348,6 +348,54 @@ async fn direct_stdout_fd_write_falls_back_to_raw_stream() -> TestResult<()> {
 
     session.cancel().await?;
     Ok(())
+}
+
+async fn assert_child_stdout_prompt_text_remains_ordinary_output(
+    session: common::McpTestSession,
+) -> TestResult<()> {
+    let input = concat!(
+        "if (.Platform$OS.type == 'windows') { ",
+        "cat('SKIP_CHILD_STDOUT\\n') ",
+        "} else { ",
+        "invisible(system(\"printf '> '\")) ",
+        "}",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("SKIP_CHILD_STDOUT") {
+        eprintln!("repl_surface child stdout output unsupported on this platform; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        return Err(format!("child stdout prompt text remained busy: {text:?}").into());
+    }
+
+    assert_eq!(
+        text, "> > ",
+        "expected raw prompt-shaped output plus completion prompt, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn child_stdout_prompt_text_remains_ordinary_output() -> TestResult<()> {
+    assert_child_stdout_prompt_text_remains_ordinary_output(common::spawn_server().await?).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<()> {
+    assert_child_stdout_prompt_text_remains_ordinary_output(
+        common::spawn_server_with_files().await?,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
