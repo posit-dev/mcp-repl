@@ -171,6 +171,10 @@ impl DetachedHolderProbe {
     async fn wait_for_exit(&self) -> TestResult<()> {
         wait_for_detached_holder_exit(&self.marker_path).await
     }
+
+    fn has_exited(&self) -> bool {
+        self.marker_path.exists()
+    }
 }
 
 async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
@@ -489,7 +493,7 @@ async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()
     }
 
     assert!(
-        elapsed < shutdown_completion_budget(),
+        !holder.has_exited(),
         "expected quit() to finish before detached child exit, got {elapsed:?}: {quit_text:?}"
     );
 
@@ -606,7 +610,7 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
     }
 
     assert!(
-        elapsed < shutdown_completion_budget(),
+        !holder.has_exited(),
         "expected quit() to finish before background IPC holder exit, got {elapsed:?}: {quit_text:?}"
     );
 
@@ -1151,31 +1155,27 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
     let script = format!(
         r#"import os, subprocess, sys, threading, time
 exit_marker = {marker_literal}
-r, w = os.pipe()
-watcher = """import os, pathlib, sys
-fd = int(sys.argv[1])
-while os.read(fd, 8192):
-    pass
-pathlib.Path(sys.argv[2]).write_text("done")
+writer = """import pathlib, sys, time
+time.sleep(0.2)
+sys.stdout.write("IDLE_TAIL\\n")
+sys.stdout.flush()
+pathlib.Path(sys.argv[1]).write_text("done")
+time.sleep(0.2)
 """
 subprocess.Popen(
-    [sys.executable, "-c", watcher, str(r), exit_marker],
+    [sys.executable, "-c", writer, exit_marker],
     stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
-    pass_fds=(r,),
     start_new_session=True,
 )
-os.close(r)
 print("armed")
-def exit_after_idle_tail():
-    time.sleep(0.2)
-    sys.stdout.write("IDLE_TAIL\n")
-    sys.stdout.flush()
+def exit_after_detached_tail():
+    while not os.path.exists(exit_marker):
+        time.sleep(0.02)
     time.sleep(0.2)
     os._exit(0)
-threading.Thread(target=exit_after_idle_tail, daemon=True).start()"#
+threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
     );
     let script_literal = serde_json::to_string(&script)?;
 

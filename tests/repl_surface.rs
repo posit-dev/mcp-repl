@@ -218,6 +218,62 @@ async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_plot_emit_orders_r_owned_stderr_and_stdout_around_image() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let input = concat!(
+        "cat('stdout-before\\n'); flush.console(); ",
+        "message('stderr-before'); ",
+        "invisible(.Call('mcp_repl_plot_emit', 'plot-1', charToRaw('img'), 'image/png', TRUE)); ",
+        "message('stderr-after'); ",
+        "cat('stdout-after\\n'); flush.console()",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let stdout_before = text
+        .find("stdout-before")
+        .ok_or("expected stdout-before text in reply")?;
+    let stderr_before = text
+        .find("stderr-before")
+        .ok_or("expected stderr-before text in reply")?;
+    let stderr_after = text
+        .find("stderr-after")
+        .ok_or("expected stderr-after text in reply")?;
+    let stdout_after = text
+        .find("stdout-after")
+        .ok_or("expected stdout-after text in reply")?;
+    assert!(
+        stdout_before < stderr_before && stderr_after < stdout_after,
+        "expected stdout/stderr text order to match R callback order, got: {text:?}"
+    );
+
+    let before_idx = first_text_index_containing(&result, "stderr-before")
+        .ok_or("expected stderr-before text item in reply")?;
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    let after_idx = first_text_index_containing(&result, "stderr-after")
+        .ok_or("expected stderr-after text item in reply")?;
+    assert!(
+        before_idx < image_idx && image_idx < after_idx,
+        "expected R-owned stderr to preserve order around image, got content order: {:?}",
+        result.content
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> {
     let session = common::spawn_server().await?;
 
@@ -249,6 +305,45 @@ async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> 
     assert!(
         text.contains("child") && text.contains("parent"),
         "expected child and parent output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_stdout_fd_write_falls_back_to_raw_stream() -> TestResult<()> {
+    let session = common::spawn_server().await?;
+
+    let input = concat!(
+        "if (!file.exists('/dev/stdout')) { ",
+        "cat('SKIP_DIRECT_FD\\n') ",
+        "} else { ",
+        "con <- file('/dev/stdout', open = 'wb'); ",
+        "writeBin(charToRaw('direct-fd\\n'), con); ",
+        "flush(con); close(con); ",
+        "cat('r-owned\\n') ",
+        "}",
+    );
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("SKIP_DIRECT_FD") {
+        eprintln!("repl_surface direct fd output unsupported on this platform; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        return Err(format!("direct stdout fd write remained busy: {text:?}").into());
+    }
+
+    assert!(
+        text.contains("direct-fd") && text.contains("r-owned"),
+        "expected direct fd and R-owned output, got: {text:?}"
     );
 
     session.cancel().await?;
