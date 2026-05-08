@@ -13,8 +13,7 @@
 
 ## Current Direction
 
-- Add broader ordering and backpressure coverage, then remove race-tolerant
-  handling that only applied to R-owned raw pipe output.
+- Remove race-tolerant handling that only applied to R-owned raw pipe output.
 
 ## Long-Term Direction
 
@@ -40,8 +39,8 @@
 
 ## Next Safe Slice
 
-- Add focused ordering coverage for R-owned stdout, stderr, readline echo, plots,
-  direct file-descriptor writes, and large-output backpressure.
+- Remove or narrow race-tolerant handling that was only needed when R-owned text
+  traveled through raw stdout and stderr pipes.
 
 ## Stop Conditions
 
@@ -55,3 +54,6 @@
 - 2026-05-07: Completed server-side `output_text` consumption by decoding worker-owned text in the IPC reader and appending it through the existing live output capture path.
 - 2026-05-07: Routed R console callbacks and readline echo through ordered IPC
   output text, leaving raw stdout and stderr capture for unowned fd output.
+- 2026-05-08: Added focused ordering and raw-output fallback coverage for
+  R-owned stdout, stderr, readline echo, plots, direct file-descriptor writes,
+  child output, and large output.

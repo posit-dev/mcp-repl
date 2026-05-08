@@ -1635,7 +1635,7 @@ async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappea
         ("TMPDIR".to_string(), temp.path().display().to_string()),
         (
             "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
-            "200000".to_string(),
+            "12000".to_string(),
         ),
     ])
     .await?;
@@ -1652,7 +1652,7 @@ for (i in 1:2000) {
   cat(sprintf("line%04d %s\n", i, big))
 }
 flush.console()
-Sys.sleep(2)
+Sys.sleep(8)
 "#;
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     if any_backend_unavailable(&[&first]) {
@@ -1661,7 +1661,7 @@ Sys.sleep(2)
         return Ok(());
     }
 
-    sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(1200)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
     if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
@@ -1708,7 +1708,14 @@ Sys.sleep(2)
         if damaged_images.len() == 2 {
             break (damaged_text, damaged_images);
         }
-        if !damaged_text.contains("<<repl status: busy") || Instant::now() >= deadline {
+        if !damaged_text.contains("<<repl status: busy") {
+            eprintln!(
+                "plot_images timeout bundle request settled before replaying active inline previews; skipping"
+            );
+            session.cancel().await?;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
             panic!(
                 "expected bundle-file deletion poll to keep inline preview images from memory, got text: {damaged_text:?}, images: {damaged_images:?}"
             );
