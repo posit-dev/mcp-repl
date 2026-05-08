@@ -9,7 +9,7 @@
 
 - State: active
 - Last updated: 2026-05-08
-- Current phase: phase 3 in progress
+- Current phase: phase 3 completed
 
 ## Current Direction
 
@@ -25,10 +25,12 @@
 - Phase 0: completed - protocol frame and synchronous worker IPC writer.
 - Phase 1: completed - append `output_text` into server timelines.
 - Phase 2: completed - route R console callbacks and readline echo through `output_text`.
-- Phase 3: in progress - R-shaped raw stdout is no longer trimmed by files-mode
+- Phase 3: completed - R-shaped raw stdout is no longer trimmed by files-mode
   sideband-first carryover; R-owned `output_text` echo still has source-aware
   carryover for drain boundaries. R completion prompts are now appended from
-  framed prompt facts instead of stripping prompt-shaped raw stdout.
+  framed prompt facts instead of stripping prompt-shaped raw stdout. A public
+  files-mode regression covers raw child stdout that exactly matches a later
+  R-owned prompt/input echo.
 
 ## Locked Decisions
 
@@ -43,8 +45,7 @@
 ## Next Safe Slice
 
 - Review remaining prompt-fallback cleanup in `src/worker_process.rs`; keep raw
-  pipe fallback separate from source-aware IPC echo carryover. Next, make
-  same-drain echo collapse source-aware instead of matching by prompt text only.
+  pipe fallback separate from source-aware IPC echo carryover.
 
 ## Stop Conditions
 
@@ -70,3 +71,8 @@
   the completion prompt. The server now appends the R completion prompt from
   framed IPC facts, including interrupt-drained completions, while leaving
   prompt-shaped child stdout visible.
+- 2026-05-08: Completed the files-mode prompt/readline cleanup slice with a
+  public regression proving raw child stdout that exactly matches a later
+  R-owned prompt/input echo remains visible. No runtime change was needed
+  because same-drain and carryover echo collapse already require matching
+  `readline_result` source facts.
