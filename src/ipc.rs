@@ -95,6 +95,7 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         supports_images: bool,
     },
+    StdinReady,
     OutputText {
         stream: TextStream,
         data_b64: String,
@@ -452,6 +453,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
+        drop_queued_stdin_ready(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -592,6 +594,36 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    pub fn wait_for_stdin_ready(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if take_stdin_ready(&mut guard) {
+                return Ok(());
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                if take_stdin_ready(&mut guard) {
+                    return Ok(());
+                }
                 return Err(IpcWaitError::Timeout);
             }
         }
@@ -1628,6 +1660,24 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
+fn take_stdin_ready(guard: &mut ServerIpcInbox) -> bool {
+    let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinReady))
+    else {
+        return false;
+    };
+    guard.queue.remove(idx);
+    true
+}
+
+fn drop_queued_stdin_ready(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinReady));
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1766,6 +1816,18 @@ mod protocol_tests {
         }));
 
         assert!(parsed.is_err(), "request_end should not deserialize");
+    }
+
+    #[test]
+    fn stdin_ready_is_a_worker_to_server_request_start_ack() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "stdin_ready"
+        }));
+
+        assert!(
+            matches!(parsed, Ok(WorkerToServerIpcMessage::StdinReady)),
+            "stdin_ready should deserialize as the Python request-start acknowledgement"
+        );
     }
 
     #[test]

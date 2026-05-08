@@ -44,6 +44,13 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   must not turn steady-state server request handling into language-specific
   policy.
 
+`stdin_ready`
+- `{ "type": "stdin_ready" }`
+- Sent after a worker has processed `stdin_write` and marked the request active.
+- A backend that needs request-start sideband state before raw stdin is delivered
+  can use this as a narrow acknowledgement. It is not an acknowledgement for
+  stdout/stderr, plot images, or request completion.
+
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
 - Emitted for readline prompts. The prompt string is required; use an empty string

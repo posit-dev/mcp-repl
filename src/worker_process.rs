@@ -219,7 +219,7 @@ fn prechecked_follow_up_requires_meta_error() -> WorkerError {
 
 trait BackendDriver: Send {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8>;
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection);
+    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError>;
     fn should_settle_output_after_timeout(
         &self,
         oversized_output: OversizedOutputMode,
@@ -246,8 +246,9 @@ impl RBackendDriver {
     }
 }
 
-fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
+fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
+    Ok(())
 }
 
 const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
@@ -312,8 +313,8 @@ impl BackendDriver for RBackendDriver {
         payload
     }
 
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) {
-        driver_on_input_start(text, ipc);
+    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        driver_on_input_start(text, ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -370,13 +371,15 @@ impl BackendDriver for PythonBackendDriver {
         data.into_bytes()
     }
 
-    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) {
-        driver_on_input_start(text, ipc);
-        let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
+    fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        driver_on_input_start(text, ipc)?;
+        ipc.send(ServerToWorkerIpcMessage::StdinWrite {
             // Python-side IPC only needs a request-start signal; avoid duplicating large stdin
             // payloads on the control channel so interrupt/session-end messages stay responsive.
             text: String::new(),
-        });
+        })
+        .map_err(|_| WorkerError::Protocol("python request-start ipc unavailable".to_string()))?;
+        wait_for_python_stdin_ready(ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -433,6 +436,7 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+const PYTHON_STDIN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -566,6 +570,21 @@ fn completion_info_from_ipc(ipc: &ServerIpcConnection, session_end_seen: bool) -
         echo_events: ipc.take_echo_events(),
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
+    }
+}
+
+fn wait_for_python_stdin_ready(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    match ipc.wait_for_stdin_ready(PYTHON_STDIN_READY_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
+            "timed out waiting for python request-start acknowledgement".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "python worker ended before request-start acknowledgement".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before python request-start acknowledgement".to_string(),
+        )),
     }
 }
 
@@ -1920,10 +1939,10 @@ impl WorkerManager {
             .as_ref()
             .and_then(|process| process.ipc.get())
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        self.driver.on_input_start(&text, &ipc);
         if server_timeout.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
+        self.driver.on_input_start(&text, &ipc)?;
         let payload = self.driver.prepare_input_payload(&text);
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
@@ -6591,7 +6610,8 @@ mod tests {
     #[test]
     fn completion_infers_nested_waiting_prompt_that_reuses_primary_prompt_text() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("value <- readline(prompt = \"> \")", &server);
+        driver_on_input_start("value <- readline(prompt = \"> \")", &server)
+            .expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
@@ -6620,7 +6640,7 @@ mod tests {
     #[test]
     fn completion_infers_stable_waiting_prompt_without_worker_completion_event() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server);
+        driver_on_input_start("1+1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
@@ -6646,7 +6666,7 @@ mod tests {
     #[test]
     fn completion_settle_after_prompt_does_not_count_as_execution_timeout() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server);
+        driver_on_input_start("1+1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
@@ -6673,7 +6693,7 @@ mod tests {
     #[test]
     fn completion_infers_stable_continuation_prompt_when_input_is_consumed() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server);
+        driver_on_input_start("1+\n1", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
             client_waiting: true,
@@ -6695,7 +6715,7 @@ mod tests {
     #[test]
     fn completion_settle_waits_for_late_echo_events() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server);
+        driver_on_input_start("1+\n1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let delayed_worker = worker.clone();
 
@@ -6737,7 +6757,7 @@ mod tests {
     #[test]
     fn completion_waits_for_client_waiting_prompt_after_buffered_readline_start() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server);
+        driver_on_input_start("1+\n1", &server).expect("begin request");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
@@ -6789,7 +6809,7 @@ mod tests {
     fn next_request_result_is_retained_when_prompt_is_already_active() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        driver_on_input_start("first()", &server);
+        driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
             client_waiting: true,
@@ -6798,7 +6818,7 @@ mod tests {
             .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
-        driver_on_input_start("second()", &server);
+        driver_on_input_start("second()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
             line: "second()\n".to_string(),
@@ -6821,7 +6841,7 @@ mod tests {
     fn completion_preserves_echo_events_when_next_prompt_arrives_immediately() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        driver_on_input_start("first()", &server);
+        driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
             client_waiting: true,
@@ -6848,7 +6868,7 @@ mod tests {
     #[test]
     fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("quit()", &server);
+        driver_on_input_start("quit()", &server).expect("begin request");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
@@ -6872,7 +6892,7 @@ mod tests {
     #[test]
     fn completion_reports_session_end_when_prompt_is_also_stable() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("quit()", &server);
+        driver_on_input_start("quit()", &server).expect("begin request");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
@@ -8119,20 +8139,30 @@ mod tests {
         let mut driver = PythonBackendDriver::new();
         let big_input = "x".repeat(256 * 1024);
 
-        driver.on_input_start(&big_input, &server);
-
-        let msg = worker
-            .recv(Some(Duration::from_millis(200)))
-            .expect("expected stdin_write control message");
-        match msg {
-            ServerToWorkerIpcMessage::StdinWrite { text } => {
-                assert!(
-                    text.is_empty(),
-                    "expected request-start signal without copying stdin payload"
-                );
+        let worker_thread = std::thread::spawn(move || {
+            let msg = worker
+                .recv(Some(Duration::from_millis(200)))
+                .expect("expected stdin_write control message");
+            match msg {
+                ServerToWorkerIpcMessage::StdinWrite { text } => {
+                    assert!(
+                        text.is_empty(),
+                        "expected request-start signal without copying stdin payload"
+                    );
+                }
+                _ => panic!("expected stdin_write control message"),
             }
-            _ => panic!("expected stdin_write control message"),
-        }
+            worker
+                .send(WorkerToServerIpcMessage::StdinReady)
+                .expect("send stdin_ready acknowledgement");
+        });
+
+        driver
+            .on_input_start(&big_input, &server)
+            .expect("begin request");
+        worker_thread
+            .join()
+            .expect("request-start test worker thread should not panic");
     }
 
     #[cfg(target_family = "unix")]

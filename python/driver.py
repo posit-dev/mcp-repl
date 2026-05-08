@@ -474,6 +474,7 @@ def _ipc_reader():
         msg_type = msg.get("type")
         if msg_type == "stdin_write":
             _set_request_active()
+            _send({"type": "stdin_ready"})
         elif msg_type == "interrupt":
             with _request_lock:
                 _interrupt_pending = True
