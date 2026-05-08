@@ -85,10 +85,10 @@ That matching is only opportunistic:
 - if exact sideband-to-stdout matching fails or becomes ambiguous, the server
   should degrade softly to raw captured stdout/stderr for that region, without
   eliding echo or inventing a cleaned-up transcript
-- sideband-first carryover is reserved for raw prompt echo that can still arrive
-  after its `readline_result`, such as Python PTY echo; ordinary R-owned echo is
-  ordered IPC text and is resolved within the mixed timeline for the current
-  snapshot
+- sideband-first carryover is source-aware: Python-style raw prompt echo can
+  trim only raw text, and R-style prompt echo can trim only `output_text` frames
+  when an IPC reader drain boundary splits `readline_result` from the following
+  worker-owned echo
 
 ## Ownership split
 
