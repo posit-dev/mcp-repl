@@ -2164,6 +2164,8 @@ fn render_active_bundle_contents(
     let retained_image_count = count_images(&append.retained_items);
     let retained_worker_text = worker_text_from_items(&append.retained_items);
     let has_incremental_content = !append.retained_items.is_empty();
+    let has_worker_or_image_incremental_content =
+        retained_image_count > 0 || !retained_worker_text.is_empty();
     let image_bundle_still_needed = active.next_image_number > 0
         && should_use_output_bundle(active.history_image_count, spill_worker_text_chars);
 
@@ -2188,6 +2190,13 @@ fn render_active_bundle_contents(
             &retained_worker_text,
             active,
         ))
+    } else if active.was_disclosed()
+        && image_bundle_still_needed
+        && has_incremental_content
+        && !has_worker_or_image_incremental_content
+    {
+        active.disclosed = true;
+        Ok(compact_output_bundle_items(inline_items, active))
     } else if active.was_disclosed() && image_bundle_still_needed && has_incremental_content {
         active.disclosed = true;
         Ok(materialize_items_with_output_bundle_notice(

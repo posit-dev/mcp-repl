@@ -77,6 +77,15 @@ fn events_log_path(text: &str) -> Option<PathBuf> {
         .map(|path| PathBuf::from(path.as_str()))
 }
 
+fn images_dir_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE
+        .get_or_init(|| Regex::new(r"(/[^]\s]+/images)").expect("images-dir regex should compile"));
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
 fn top_level_entry_names(dir: &Path) -> TestResult<Vec<String>> {
     let mut names = fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
@@ -1631,13 +1640,10 @@ Sys.sleep(1)
 async fn timeout_output_bundle_keeps_inline_previews_after_bundle_files_disappear() -> TestResult<()>
 {
     let temp = tempdir()?;
-    let mut session = spawn_server_with_files_env_vars(vec![
-        ("TMPDIR".to_string(), temp.path().display().to_string()),
-        (
-            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
-            "200000".to_string(),
-        ),
-    ])
+    let mut session = spawn_server_with_files_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
     .await?;
 
     let input = r#"
@@ -1654,38 +1660,53 @@ for (i in 1:2000) {
 flush.console()
 Sys.sleep(8)
 "#;
-    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first = session.write_stdin_raw_with(input, Some(2.0)).await?;
     if any_backend_unavailable(&[&first]) {
         eprintln!("plot_images backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
 
-    sleep(Duration::from_millis(1200)).await;
-    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
-    let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
-        eprintln!("plot_images timeout bundle poll did not flush image history yet; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+    let bundled_text = result_text(&first);
 
-    let events_log = events_log_path(&bundled_text).unwrap_or_else(|| {
-        panic!("expected output bundle events.log path in timeout poll, got: {bundled_text:?}")
-    });
-    let bundle_dir = events_log
+    let events_log = events_log_path(&bundled_text);
+    let images_dir = match &events_log {
+        Some(events_log) => events_log
+            .parent()
+            .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"))
+            .join("images"),
+        None => images_dir_path(&bundled_text).unwrap_or_else(|| {
+            panic!("expected output bundle images path in timeout poll, got: {bundled_text:?}")
+        }),
+    };
+    let bundle_dir = images_dir
         .parent()
-        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
-    let events = fs::read_to_string(&events_log)?;
-    let image_paths = parse_image_event_paths(&events);
+        .unwrap_or_else(|| panic!("images dir missing parent: {images_dir:?}"));
+    let image_paths: Vec<PathBuf> = match events_log {
+        Some(events_log) => {
+            let events = fs::read_to_string(&events_log)?;
+            parse_image_event_paths(&events)
+                .into_iter()
+                .map(|path| bundle_dir.join(path))
+                .collect()
+        }
+        None => relative_file_paths(&images_dir.join("history"))?
+            .into_iter()
+            .map(|path| images_dir.join("history").join(path))
+            .collect(),
+    };
+    assert!(
+        image_paths.len() >= 2,
+        "expected first and last bundled image history files, got: {image_paths:?}"
+    );
     let first_image_history = image_paths
         .first()
-        .map(|path| bundle_dir.join(path))
-        .unwrap_or_else(|| panic!("expected first image entry in events.log, got: {events:?}"));
+        .expect("image_paths length was checked")
+        .clone();
     let last_image_history = image_paths
         .last()
-        .map(|path| bundle_dir.join(path))
-        .unwrap_or_else(|| panic!("expected last image entry in events.log, got: {events:?}"));
+        .expect("image_paths length was checked")
+        .clone();
     let first_image_alias = alias_path_for_history_image(bundle_dir, &first_image_history);
     let last_image_alias = alias_path_for_history_image(bundle_dir, &last_image_history);
     fs::remove_file(&first_image_history)?;
@@ -1708,14 +1729,7 @@ Sys.sleep(8)
         if damaged_images.len() == 2 {
             break (damaged_text, damaged_images);
         }
-        if !damaged_text.contains("<<repl status: busy") {
-            eprintln!(
-                "plot_images timeout bundle request settled before replaying active inline previews; skipping"
-            );
-            session.cancel().await?;
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
+        if !damaged_text.contains("<<repl status: busy") || Instant::now() >= deadline {
             panic!(
                 "expected bundle-file deletion poll to keep inline preview images from memory, got text: {damaged_text:?}, images: {damaged_images:?}"
             );
