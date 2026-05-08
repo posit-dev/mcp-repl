@@ -27,7 +27,8 @@
 - Phase 2: completed - route R console callbacks and readline echo through `output_text`.
 - Phase 3: in progress - R-shaped raw stdout is no longer trimmed by files-mode
   sideband-first carryover; R-owned `output_text` echo still has source-aware
-  carryover for drain boundaries.
+  carryover for drain boundaries. R completion prompts are now appended from
+  framed prompt facts instead of stripping prompt-shaped raw stdout.
 
 ## Locked Decisions
 
@@ -42,7 +43,8 @@
 ## Next Safe Slice
 
 - Review remaining prompt-fallback cleanup in `src/worker_process.rs`; keep raw
-  pipe fallback separate from source-aware IPC echo carryover.
+  pipe fallback separate from source-aware IPC echo carryover. Next, make
+  same-drain echo collapse source-aware instead of matching by prompt text only.
 
 ## Stop Conditions
 
@@ -64,3 +66,7 @@
   echo source on `readline_result`, so Python raw prompt echo and R-owned
   `output_text` echo can both carry across drain boundaries without deriving
   the source from prompt spelling.
+- 2026-05-08: Stopped treating R raw stdout that equals the primary prompt as
+  the completion prompt. The server now appends the R completion prompt from
+  framed IPC facts, including interrupt-drained completions, while leaving
+  prompt-shaped child stdout visible.

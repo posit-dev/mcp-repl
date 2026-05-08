@@ -1147,14 +1147,20 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
         return Ok(());
     };
     let marker_dir = tempdir()?;
-    let marker_path = marker_dir.path().join("idle-worker-exited");
-    let marker = marker_path
+    let tail_marker_path = marker_dir.path().join("idle-tail-written");
+    let tail_marker = tail_marker_path
         .to_str()
-        .ok_or("idle marker path must be valid utf-8")?;
-    let marker_literal = serde_json::to_string(marker)?;
+        .ok_or("idle tail marker path must be valid utf-8")?;
+    let tail_marker_literal = serde_json::to_string(tail_marker)?;
+    let exit_marker_path = marker_dir.path().join("idle-worker-exiting");
+    let exit_marker = exit_marker_path
+        .to_str()
+        .ok_or("idle exit marker path must be valid utf-8")?;
+    let exit_marker_literal = serde_json::to_string(exit_marker)?;
     let script = format!(
-        r#"import os, subprocess, sys, threading, time
-exit_marker = {marker_literal}
+        r#"import os, pathlib, subprocess, sys, threading, time
+tail_marker = {tail_marker_literal}
+exit_marker = {exit_marker_literal}
 writer = """import pathlib, sys, time
 time.sleep(0.2)
 sys.stdout.write("IDLE_TAIL\\n")
@@ -1163,7 +1169,7 @@ pathlib.Path(sys.argv[1]).write_text("done")
 time.sleep(0.2)
 """
 subprocess.Popen(
-    [sys.executable, "-c", writer, exit_marker],
+    [sys.executable, "-c", writer, tail_marker],
     stdin=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
@@ -1171,9 +1177,9 @@ subprocess.Popen(
 )
 print("armed")
 def exit_after_detached_tail():
-    while not os.path.exists(exit_marker):
+    while not os.path.exists(tail_marker):
         time.sleep(0.02)
-    time.sleep(0.2)
+    pathlib.Path(exit_marker).write_text("done")
     os._exit(0)
 threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
     );
@@ -1195,7 +1201,7 @@ threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
         "expected arming output, got: {arm_text:?}"
     );
 
-    wait_for_detached_holder_exit(&marker_path).await?;
+    wait_for_detached_holder_exit(&exit_marker_path).await?;
     let reply = session
         .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
         .await?;
