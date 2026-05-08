@@ -5935,7 +5935,7 @@ where
     let Some(mut stream) = stream else {
         return Ok(None);
     };
-    let (wake_reader, wake_writer) = std::io::pipe()?;
+    let (mut wake_reader, wake_writer) = std::io::pipe()?;
     let (done_tx, done_rx) = mpsc::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
     let handle = thread::spawn(move || {
@@ -5956,7 +5956,15 @@ where
                     revents: 0,
                 },
             ];
-            let timeout_ms = if stop_deadline.is_some() { 0 } else { -1 };
+            let timeout_ms = match stop_deadline {
+                Some(deadline) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    poll_timeout_until(deadline)
+                }
+                None => -1,
+            };
             let ready =
                 unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
             if ready < 0 {
@@ -5969,8 +5977,13 @@ where
             if ready == 0 {
                 break;
             }
-            if fds[1].revents != 0 && stop_deadline.is_none() {
-                stop_deadline = Some(std::time::Instant::now() + OUTPUT_READER_STOP_DRAIN_GRACE);
+            if fds[1].revents != 0 {
+                let mut wake_buffer = [0u8; 16];
+                let _ = wake_reader.read(&mut wake_buffer);
+                if stop_deadline.is_none() {
+                    stop_deadline =
+                        Some(std::time::Instant::now() + OUTPUT_READER_STOP_DRAIN_GRACE);
+                }
             }
             let mut read_stream = false;
             if fds[0].revents != 0 {
@@ -5991,9 +6004,6 @@ where
             }
             if read_stream {
                 continue;
-            }
-            if stop_deadline.is_some() {
-                break;
             }
         }
         let _ = done_tx.send(());
@@ -6134,6 +6144,16 @@ fn duration_to_millis(duration: Duration) -> u64 {
     } else {
         millis as u64
     }
+}
+
+#[cfg(target_family = "unix")]
+fn poll_timeout_until(deadline: std::time::Instant) -> i32 {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return 0;
+    }
+    let millis = remaining.as_millis().max(1).min(i32::MAX as u128);
+    millis as i32
 }
 
 fn shutdown_term_delay(timeout: Duration) -> Duration {
@@ -8202,6 +8222,7 @@ mod tests {
     fn python_driver_request_start_ack_respects_call_timeout() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = PythonBackendDriver::new();
+        let (release_worker, worker_released) = std::sync::mpsc::channel();
 
         let worker_thread = std::thread::spawn(move || {
             let msg = worker
@@ -8211,7 +8232,9 @@ mod tests {
                 matches!(msg, ServerToWorkerIpcMessage::StdinWrite { .. }),
                 "expected stdin_write control message"
             );
-            std::thread::sleep(Duration::from_millis(100));
+            worker_released
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timeout test should release worker ipc");
         });
 
         let start = std::time::Instant::now();
@@ -8226,6 +8249,9 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "stdin_ready wait should not use the fixed 5s protocol timeout"
         );
+        release_worker
+            .send(())
+            .expect("release timeout test worker ipc");
         worker_thread
             .join()
             .expect("request-start timeout test worker thread should not panic");
