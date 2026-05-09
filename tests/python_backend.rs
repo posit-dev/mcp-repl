@@ -65,9 +65,7 @@ fn require_python() -> bool {
 }
 
 fn python_backend_unavailable(text: &str) -> bool {
-    common::backend_unavailable(text)
-        || text.contains("python backend requires a unix-style pty")
-        || text.contains("worker io error: Permission denied")
+    common::backend_unavailable(text) || text.contains("worker io error: Permission denied")
 }
 
 fn is_busy_response(text: &str) -> bool {
@@ -126,9 +124,7 @@ async fn start_python_session_with_env_vars(
     )
     .await?;
     let probe_text = result_text(&probe);
-    if probe_text.contains("worker io error: Permission denied")
-        || probe_text.contains("python backend requires a unix-style pty")
-    {
+    if probe_text.contains("worker io error: Permission denied") {
         eprintln!("python backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(None);
@@ -289,6 +285,69 @@ async fn python_smoke() -> TestResult<()> {
         return Ok(());
     }
     assert!(text.contains("2"), "expected 2, got: {text:?}");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_backend_runs_inside_mcp_repl_worker() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os, pathlib, subprocess, sys
+if sys.platform == "linux":
+    print(pathlib.Path(os.readlink("/proc/self/exe")).name)
+elif sys.platform == "darwin":
+    command = ["/bin/ps", "-p", str(os.getpid()), "-o", "comm="]
+    print(pathlib.Path(subprocess.check_output(command, text=True).strip()).name)
+else:
+    print(pathlib.Path(sys.argv[0]).name)
+
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.lines().any(|line| line.trim() == "mcp-repl"),
+        "expected Python worker process image to be mcp-repl, got: {text:?}"
+    );
+    assert!(
+        !text.contains("mcp-repl-python-worker"),
+        "did not expect a separate Python worker binary, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdin_exposes_worker_stdin_fd() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys\nprint('STDIN_FD', sys.stdin.fileno())",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.stdin.fileno() remained busy".into());
+    }
+    assert!(
+        text.contains("STDIN_FD 0"),
+        "expected sys.stdin to expose worker fd 0, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())

@@ -917,6 +917,7 @@ dependencies = [
  "insta",
  "landlock",
  "libc",
+ "libloading",
  "libr",
  "memchr",
  "portable-pty",

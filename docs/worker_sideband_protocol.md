@@ -18,8 +18,13 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 ## Direction: server -> worker
 
 `stdin_write`
-- `{ "type": "stdin_write", "text": <string> }`
-- Emitted before the server writes the input payload to stdin.
+- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize> }`
+- Emitted before the server writes the raw input payload bytes to stdin.
+- The payload itself is not carried on IPC and stdin contains no protocol
+  header.
+- `line_count` is optional for older senders and defaults to `0`. Python worker
+  mode uses it to know how many CPython readline calls belong to the active
+  request.
 
 `interrupt`
 - `{ "type": "interrupt" }`
@@ -44,14 +49,14 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   must not turn steady-state server request handling into language-specific
   policy.
 
-`stdin_ready`
-- `{ "type": "stdin_ready" }`
-- Sent after a worker has processed `stdin_write` and marked the request active.
-- A backend that needs request-start sideband state before raw stdin is delivered
-  can use this as a narrow acknowledgement. It is not an acknowledgement for
-  stdout/stderr, plot images, or request completion.
-- `stdin_ready` is not an output-drain barrier.
-  A future output-drain gate should use a separate protocol step.
+`stdin_write_ack`
+- `{ "type": "stdin_write_ack" }`
+- Sent after a worker has processed `stdin_write` and installed request metadata
+  for the upcoming raw stdin bytes.
+- This only acknowledges request-boundary state. It is not an acknowledgement
+  for stdout/stderr, plot images, or request completion.
+- `stdin_write_ack` is not an output-drain barrier. A future output-drain gate
+  should use a separate protocol step.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`

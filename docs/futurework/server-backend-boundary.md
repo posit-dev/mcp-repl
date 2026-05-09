@@ -86,8 +86,6 @@ Initial candidates:
 
 - `supports_images`: already present in `backend_info`; controls whether image
   events are expected.
-- `input_framing`: whether server stdin payloads are raw text or length-framed
-  records.
 - `stdin_write_control`: whether a request-start sideband message is needed
   before stdin bytes are written.
 - `backend_info_startup_timeout`: whether startup may continue after a short

@@ -37,7 +37,8 @@ We still want to keep stdin as the primary request channel for worker payloads a
 - Let the worker use the IPC envelope to know when the current stdin payload is complete, while still feeding raw stdin through the interpreter-facing path.
 - For line-oriented runtimes such as embedded R, expect a single logical request to be satisfied across multiple `readline` or `ReadConsole` calls.
 
-The current embedded R implementation uses framed stdin messages to preserve request boundaries on a long-lived stream. That is implementation drift from the intended model and should be removed as part of this follow-up.
+The current embedded worker implementation keeps stdin raw and preserves request
+boundaries with IPC metadata.
 
 ## Observed Windows Failure
 

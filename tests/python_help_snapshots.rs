@@ -7,9 +7,7 @@ use regex_lite::Regex;
 
 #[cfg(not(windows))]
 fn python_backend_unavailable(text: &str) -> bool {
-    common::backend_unavailable(text)
-        || text.contains("python backend requires a unix-style pty")
-        || text.contains("worker io error: Permission denied")
+    common::backend_unavailable(text) || text.contains("worker io error: Permission denied")
 }
 
 #[cfg(not(windows))]
@@ -103,6 +101,11 @@ fn normalize_python_help_intro(text: String) -> String {
             && line.contains("Welcome to Python <VERSION>'s help utility!")
         {
             out.push(r#"      "text": "help()\n<PYTHON HELP BANNER>""#.to_string());
+            continue;
+        }
+
+        if line.contains(r#""text": "Welcome to Python <VERSION>'s help utility!"#) {
+            out.push(r#"      "text": "<PYTHON HELP BANNER>""#.to_string());
             continue;
         }
 

@@ -2,8 +2,6 @@
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
-#[cfg(target_family = "unix")]
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,8 +13,9 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::backend::Backend;
-use crate::input_protocol::format_input_frame_header;
 #[cfg(target_family = "windows")]
 use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
@@ -54,7 +53,7 @@ use crate::worker_protocol::{
 };
 
 #[cfg(target_family = "unix")]
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
@@ -241,11 +240,12 @@ const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
     "[repl] image update from previous request shown as a new image\n";
 const PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE: &str =
     "worker follow-up needs current sandbox metadata after precheck";
+const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
 
 fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
     match backend {
         Backend::R => OutputTextSource::Ipc,
-        Backend::Python => OutputTextSource::Raw,
+        Backend::Python => OutputTextSource::Ipc,
     }
 }
 
@@ -271,6 +271,7 @@ trait BackendDriver: Send {
     fn on_input_start(
         &mut self,
         text: &str,
+        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError>;
@@ -303,6 +304,34 @@ impl RBackendDriver {
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
     Ok(())
+}
+
+fn driver_announce_stdin_write(
+    byte_len: usize,
+    line_count: usize,
+    ipc: &ServerIpcConnection,
+) -> Result<(), WorkerError> {
+    ipc.send(ServerToWorkerIpcMessage::StdinWrite {
+        byte_len,
+        line_count,
+    })
+    .map_err(WorkerError::Io)
+}
+
+fn driver_wait_for_stdin_write_ack(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_stdin_write_ack(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before accepting stdin".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before worker accepted stdin".to_string(),
+        )),
+    }
 }
 
 const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
@@ -361,20 +390,18 @@ fn driver_refresh_backend_info(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let header = format_input_frame_header(text.len());
-        let mut payload = Vec::with_capacity(header.len() + text.len());
-        payload.extend_from_slice(header.as_bytes());
-        payload.extend_from_slice(text.as_bytes());
-        payload
+        text.as_bytes().to_vec()
     }
 
     fn on_input_start(
         &mut self,
         text: &str,
+        payload: &[u8],
         ipc: &ServerIpcConnection,
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_on_input_start(text, ipc)
+        driver_on_input_start(text, ipc)?;
+        driver_announce_stdin_write(payload.len(), 0, ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -424,27 +451,24 @@ impl PythonBackendDriver {
 
 impl BackendDriver for PythonBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut data = text.to_string();
-        if !data.ends_with('\n') && !data.ends_with('\r') {
-            data.push('\n');
+        let mut payload = text.as_bytes().to_vec();
+        if !payload.is_empty() && !payload.ends_with(b"\n") {
+            payload.push(b'\n');
         }
-        data.into_bytes()
+        payload
     }
 
     fn on_input_start(
         &mut self,
         text: &str,
+        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
         driver_on_input_start(text, ipc)?;
-        ipc.send(ServerToWorkerIpcMessage::StdinWrite {
-            // Python-side IPC only needs a request-start signal; avoid duplicating large stdin
-            // payloads on the control channel so interrupt/session-end messages stay responsive.
-            text: String::new(),
-        })
-        .map_err(|_| WorkerError::Protocol("python request-start ipc unavailable".to_string()))?;
-        wait_for_python_stdin_ready(ipc, timeout)
+        let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
+        driver_announce_stdin_write(payload.len(), line_count, ipc)?;
+        driver_wait_for_stdin_write_ack(ipc, timeout)
     }
 
     fn should_settle_output_after_timeout(
@@ -460,7 +484,7 @@ impl BackendDriver for PythonBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Raw)
+        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -501,7 +525,6 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-const PYTHON_STDIN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -644,30 +667,6 @@ fn completion_info_from_ipc(
         echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
-    }
-}
-
-fn wait_for_python_stdin_ready(
-    ipc: &ServerIpcConnection,
-    timeout: Duration,
-) -> Result<(), WorkerError> {
-    if timeout.is_zero() {
-        return Err(WorkerError::Timeout(timeout));
-    }
-    let wait_timeout = timeout.min(PYTHON_STDIN_READY_TIMEOUT);
-    let request_timeout_capped = timeout <= PYTHON_STDIN_READY_TIMEOUT;
-    match ipc.wait_for_stdin_ready(wait_timeout) {
-        Ok(()) => Ok(()),
-        Err(IpcWaitError::Timeout) if request_timeout_capped => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
-            "timed out waiting for python request-start acknowledgement".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "python worker ended before request-start acknowledgement".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected before python request-start acknowledgement".to_string(),
-        )),
     }
 }
 
@@ -2028,8 +2027,9 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        self.driver.on_input_start(&text, &ipc, remaining)?;
         let payload = self.driver.prepare_input_payload(&text);
+        self.driver
+            .on_input_start(&text, &payload, &ipc, remaining)?;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(std::time::Instant::now());
@@ -5018,6 +5018,94 @@ struct WorkerSpawnContext<'a> {
     prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
 
+struct PythonRuntimeConfig {
+    executable: PathBuf,
+    libpython: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct PythonRuntimeProbe {
+    executable: String,
+    base_executable: String,
+    prefix: String,
+    base_prefix: String,
+    exec_prefix: String,
+    base_exec_prefix: String,
+    version: [u64; 2],
+    ldlibrary: String,
+    instsoname: String,
+    libdir: String,
+    libpl: String,
+    pythonframeworkprefix: String,
+    pythonframeworkinstalldir: String,
+}
+
+fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    push_python_library_candidates(&mut candidates, probe, &probe.ldlibrary);
+    if probe.instsoname != probe.ldlibrary {
+        push_python_library_candidates(&mut candidates, probe, &probe.instsoname);
+    }
+
+    let version = format!("{}.{}", probe.version[0], probe.version[1]);
+    for root in [
+        probe.base_exec_prefix.as_str(),
+        probe.exec_prefix.as_str(),
+        probe.base_prefix.as_str(),
+        probe.prefix.as_str(),
+    ] {
+        if root.is_empty() {
+            continue;
+        }
+        candidates.push(
+            Path::new(root)
+                .join("lib")
+                .join(format!("libpython{version}.so")),
+        );
+        candidates.push(
+            Path::new(root)
+                .join("lib")
+                .join(format!("libpython{version}.dylib")),
+        );
+        candidates.push(Path::new(root).join("Python"));
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn push_python_library_candidates(
+    candidates: &mut Vec<PathBuf>,
+    probe: &PythonRuntimeProbe,
+    library: &str,
+) {
+    let Some(library) = non_empty(library) else {
+        return;
+    };
+    let path = Path::new(library);
+    if path.is_absolute() {
+        candidates.push(path.to_path_buf());
+    }
+    for root in [
+        probe.libdir.as_str(),
+        probe.libpl.as_str(),
+        probe.pythonframeworkprefix.as_str(),
+        probe.pythonframeworkinstalldir.as_str(),
+    ] {
+        if let Some(root) = non_empty(root) {
+            candidates.push(Path::new(root).join(library));
+        }
+    }
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    values.into_iter().find_map(non_empty)
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
     done_rx: mpsc::Receiver<()>,
@@ -5051,20 +5139,37 @@ impl OutputReader {
 }
 
 impl WorkerProcess {
-    #[cfg(target_family = "unix")]
     const PYTHON_PROGRAM: &'static str = "python3";
-    #[cfg(target_family = "unix")]
     const PYTHON_PROGRAM_FALLBACK: &'static str = "python";
-    #[cfg(target_family = "unix")]
-    const PYTHON_STARTUP_SNIPPET: &'static str = include_str!("../python/driver.py");
+    const PYTHON_CONFIG_SNIPPET: &'static str = r#"
+import json
+import sys
+import sysconfig
 
-    #[cfg(target_family = "unix")]
+def var(name):
+    value = sysconfig.get_config_var(name)
+    return "" if value is None else str(value)
+
+print(json.dumps({
+    "executable": sys.executable,
+    "base_executable": getattr(sys, "_base_executable", sys.executable),
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
+    "exec_prefix": sys.exec_prefix,
+    "base_exec_prefix": sys.base_exec_prefix,
+    "version": [sys.version_info[0], sys.version_info[1]],
+    "ldlibrary": var("LDLIBRARY"),
+    "instsoname": var("INSTSONAME"),
+    "libdir": var("LIBDIR"),
+    "libpl": var("LIBPL"),
+    "pythonframeworkprefix": var("PYTHONFRAMEWORKPREFIX"),
+    "pythonframeworkinstalldir": var("PYTHONFRAMEWORKINSTALLDIR"),
+}))
+"#;
+
     fn resolve_python_program() -> PathBuf {
-        // Prefer a local `.venv` (common with uv and other tooling) so the Python backend runs in
-        // the project environment without requiring any explicit configuration.
-        //
-        // Search the current working directory and its parents, stopping at `$HOME` (inclusive)
-        // when available, otherwise at the filesystem root.
+        // Prefer a local `.venv` (common with uv and other tooling) so child Python processes
+        // launched from the embedded backend behave like they did with the old subprocess backend.
         fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
             let home = std::env::var_os("HOME").map(PathBuf::from);
             let stop_at_home = home
@@ -5134,6 +5239,43 @@ impl WorkerProcess {
             .unwrap_or_else(|| PathBuf::from(Self::PYTHON_PROGRAM))
     }
 
+    fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, WorkerError> {
+        let executable = Self::resolve_python_program();
+        let output = Command::new(&executable)
+            .arg("-c")
+            .arg(Self::PYTHON_CONFIG_SNIPPET)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(WorkerError::Io)?;
+        if !output.status.success() {
+            return Err(WorkerError::Protocol(format!(
+                "failed to query Python runtime config from {}: {}",
+                executable.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let probe: PythonRuntimeProbe = serde_json::from_slice(&output.stdout).map_err(|err| {
+            WorkerError::Protocol(format!(
+                "failed to parse Python runtime config from {}: {err}",
+                executable.display()
+            ))
+        })?;
+        let libpython = resolve_libpython_path(&probe).ok_or_else(|| {
+            WorkerError::Protocol(format!(
+                "failed to locate a shared libpython for {}",
+                executable.display()
+            ))
+        })?;
+        let executable =
+            first_non_empty([probe.executable.as_str(), probe.base_executable.as_str()])
+                .map(PathBuf::from)
+                .unwrap_or(executable);
+        Ok(PythonRuntimeConfig {
+            executable,
+            libpython,
+        })
+    }
+
     fn spawn(
         backend: Backend,
         exe_path: &Path,
@@ -5161,7 +5303,7 @@ impl WorkerProcess {
         );
         let readline_echo_source = match backend {
             Backend::R => PendingTextSource::Ipc,
-            Backend::Python => PendingTextSource::Raw,
+            Backend::Python => PendingTextSource::Ipc,
         };
         let SpawnedWorker {
             child,
@@ -5172,7 +5314,8 @@ impl WorkerProcess {
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match backend {
-            Backend::R => Self::spawn_r_worker(
+            Backend::R => Self::spawn_embedded_worker(
+                Backend::R,
                 exe_path,
                 sandbox_state,
                 managed_network_proxy,
@@ -5181,11 +5324,15 @@ impl WorkerProcess {
                 #[cfg(target_os = "windows")]
                 prepared_windows_launch.as_ref(),
             )?,
-            Backend::Python => Self::spawn_python_worker(
+            Backend::Python => Self::spawn_embedded_worker(
+                Backend::Python,
+                exe_path,
                 sandbox_state,
                 managed_network_proxy,
                 live_output.clone(),
                 &mut ipc_server,
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch.as_ref(),
             )?,
         };
         #[allow(unused_mut)]
@@ -5268,7 +5415,8 @@ impl WorkerProcess {
         })
     }
 
-    fn spawn_r_worker(
+    fn spawn_embedded_worker(
+        backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
         managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
@@ -5307,6 +5455,18 @@ impl WorkerProcess {
         }
         command.args(&prepared.args);
         command.envs(prepared.env.iter());
+        command.env(
+            crate::backend::INTERPRETER_ENV,
+            match backend {
+                Backend::R => "r",
+                Backend::Python => "python",
+            },
+        );
+        if matches!(backend, Backend::Python) {
+            let python = Self::resolve_python_runtime_config()?;
+            command.env(PYTHON_EXECUTABLE_ENV, python.executable);
+            command.env(crate::python_session::PYTHON_LIB_ENV, python.libpython);
+        }
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -5381,123 +5541,6 @@ impl WorkerProcess {
         })
     }
 
-    #[cfg(target_family = "unix")]
-    fn python_command_args() -> Vec<String> {
-        vec![
-            "-i".to_string(),
-            "-u".to_string(),
-            "-q".to_string(),
-            "-c".to_string(),
-            Self::PYTHON_STARTUP_SNIPPET.to_string(),
-        ]
-    }
-
-    fn spawn_python_worker(
-        sandbox_state: &SandboxState,
-        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
-        live_output: LiveOutputCapture,
-        ipc_server: &mut IpcServer,
-    ) -> Result<SpawnedWorker, WorkerError> {
-        #[cfg(not(target_family = "unix"))]
-        {
-            let _ = sandbox_state;
-            let _ = managed_network_proxy;
-            let _ = live_output;
-            let _ = ipc_server;
-            Err(WorkerError::Protocol(
-                "python backend requires a unix-style pty".to_string(),
-            ))
-        }
-        #[cfg(target_family = "unix")]
-        {
-            let python_program = Self::resolve_python_program();
-            let prepared = prepare_worker_command_with_managed_network(
-                &python_program,
-                Self::python_command_args(),
-                sandbox_state,
-                managed_network_proxy,
-            )
-            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
-            let session_tmpdir = prepared
-                .env
-                .get(R_SESSION_TMPDIR_ENV)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from);
-
-            let mut command = Command::new(&prepared.program);
-            if let Some(arg0) = &prepared.arg0 {
-                set_command_arg0(&mut command, arg0);
-            }
-            command.args(&prepared.args);
-            command.envs(prepared.env.iter());
-            // Python 3.13 defaults to the new _pyrepl UI, which emits terminal control sequences
-            // and bypasses readline hooks we use for prompt/request accounting.
-            command.env("PYTHON_BASIC_REPL", "1");
-
-            let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
-                WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
-            })?;
-            command.env(IPC_READ_FD_ENV, client_fds.read_fd.to_string());
-            command.env(IPC_WRITE_FD_ENV, client_fds.write_fd.to_string());
-
-            let (master, slave) = open_pty_pair()?;
-            let slave_fd = slave.as_raw_fd();
-            let stdin = slave.try_clone()?;
-            let stdout = slave.try_clone()?;
-            let stderr = slave;
-            command
-                .stdin(Stdio::from(stdin))
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
-
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-
-            let mut child = command.spawn()?;
-            unsafe {
-                libc::close(client_fds.read_fd);
-                libc::close(client_fds.write_fd);
-            }
-            if let Some(status) = child.try_wait()? {
-                maybe_report_sandbox_exec_failure(&prepared.program, status)?;
-                return Err(WorkerError::Protocol(format!(
-                    "worker process exited immediately with status {status}"
-                )));
-            }
-
-            let master_reader = master.try_clone()?;
-            let stdin_tx = spawn_stdin_writer(master);
-            // Python runs under a PTY so stdout/stderr are merged.
-            let stdout_reader =
-                spawn_output_reader(Some(master_reader), TextStream::Stdout, live_output.clone())?;
-
-            #[cfg(target_os = "macos")]
-            let mut denial_logger = prepared.denial_logger;
-            #[cfg(target_os = "macos")]
-            if let Some(logger) = denial_logger.as_mut() {
-                logger.on_child_spawn(&child);
-            }
-
-            Ok(SpawnedWorker {
-                child,
-                stdin_tx,
-                session_tmpdir,
-                stdout_reader,
-                stderr_reader: None,
-                #[cfg(target_os = "macos")]
-                denial_logger,
-            })
-        }
-    }
     fn write_stdin_payload(
         &mut self,
         payload: Vec<u8>,
@@ -6027,47 +6070,6 @@ fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
         }
         _ => false,
     }
-}
-
-#[cfg(target_family = "unix")]
-fn set_cloexec(fd: RawFd, enabled: bool) -> Result<(), WorkerError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    let new_flags = if enabled {
-        flags | libc::FD_CLOEXEC
-    } else {
-        flags & !libc::FD_CLOEXEC
-    };
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, new_flags) };
-    if rc < 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-#[cfg(target_family = "unix")]
-fn open_pty_pair() -> Result<(File, File), WorkerError> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let result = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if result != 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    set_cloexec(master, true)?;
-    set_cloexec(slave, false)?;
-    let master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
-    Ok((master, slave))
 }
 
 #[cfg(target_family = "unix")]
@@ -7551,10 +7553,11 @@ mod tests {
         manager.last_prompt = Some(">>> ".to_string());
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.output.start_capture();
-        manager.output_timeline.append_text(
+        manager.output_timeline.append_ipc_text_with_continuation(
             b">>> import time; time.sleep(0.2)\nDETACHED_OK\n",
             false,
             ContentOrigin::Worker,
+            false,
         );
 
         manager.reset_output_state_pager_preserving_detached_output(false);
@@ -8355,77 +8358,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn python_driver_uses_small_ipc_request_start_signal() {
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        let mut driver = PythonBackendDriver::new();
-        let big_input = "x".repeat(256 * 1024);
-
-        let worker_thread = std::thread::spawn(move || {
-            let msg = worker
-                .recv(Some(Duration::from_millis(200)))
-                .expect("expected stdin_write control message");
-            match msg {
-                ServerToWorkerIpcMessage::StdinWrite { text } => {
-                    assert!(
-                        text.is_empty(),
-                        "expected request-start signal without copying stdin payload"
-                    );
-                }
-                _ => panic!("expected stdin_write control message"),
-            }
-            worker
-                .send(WorkerToServerIpcMessage::StdinReady)
-                .expect("send stdin_ready acknowledgement");
-        });
-
-        driver
-            .on_input_start(&big_input, &server, Duration::from_secs(1))
-            .expect("begin request");
-        worker_thread
-            .join()
-            .expect("request-start test worker thread should not panic");
-    }
-
-    #[test]
-    fn python_driver_request_start_ack_respects_call_timeout() {
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        let mut driver = PythonBackendDriver::new();
-        let (release_worker, worker_released) = std::sync::mpsc::channel();
-
-        let worker_thread = std::thread::spawn(move || {
-            let msg = worker
-                .recv(Some(Duration::from_millis(200)))
-                .expect("expected stdin_write control message");
-            assert!(
-                matches!(msg, ServerToWorkerIpcMessage::StdinWrite { .. }),
-                "expected stdin_write control message"
-            );
-            worker_released
-                .recv_timeout(Duration::from_secs(1))
-                .expect("timeout test should release worker ipc");
-        });
-
-        let start = std::time::Instant::now();
-        let err = driver
-            .on_input_start("print(1)", &server, Duration::from_millis(20))
-            .expect_err("missing stdin_ready should respect the caller timeout");
-        assert!(
-            matches!(err, WorkerError::Timeout(timeout) if timeout <= Duration::from_millis(20)),
-            "expected caller timeout while waiting for stdin_ready, got: {err}"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "stdin_ready wait should not use the fixed 5s protocol timeout"
-        );
-        release_worker
-            .send(())
-            .expect("release timeout test worker ipc");
-        worker_thread
-            .join()
-            .expect("request-start timeout test worker thread should not panic");
     }
 
     #[cfg(target_family = "unix")]

@@ -26,7 +26,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
   and install/configuration boundaries.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
-- Python startup is driven by the worker plus the files under `python/`.
+- Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python.
 
 ### Sandbox and process isolation
 

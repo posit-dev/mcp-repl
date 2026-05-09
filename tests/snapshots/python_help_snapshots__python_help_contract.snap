@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     }
   ]
 }
@@ -39,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "import pydoc; pydoc.help(len)\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     }
   ]
 }
@@ -59,7 +59,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "help()\n<PYTHON HELP BANNER>"
+      "text": "<PYTHON HELP BANNER>"
     },
     {
       "type": "text",
@@ -83,7 +83,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "len\nHelp on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     },
     {
       "type": "text",
@@ -107,7 +107,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "q\n\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
+      "text": "\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
     }
   ]
 }
@@ -127,7 +127,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "1+1\n2"
+      "text": "2"
     }
   ]
 }

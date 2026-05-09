@@ -270,9 +270,14 @@ startup logs, sandbox-state tracing, and the external wire-trace proxy.
 - If `R_HOME` is not set, `mcp-repl` discovers it from `R` on `PATH` (via `R RHOME`).
 - To verify which R is active, run `R.home()` in the REPL session.
 
-### Python interpreter: which Python installation is used
+### Python interpreter: embedded runtime and child executable
 
-Interpreter resolution order:
+The Python backend embeds CPython in the worker process. `mcp-repl` uses the
+same executable for server mode, R worker mode, and Python worker mode; Python
+worker mode dynamically loads the selected interpreter's CPython library at
+runtime.
+
+Python runtime selection uses this resolution order:
 - nearest `.venv/bin/python` from current working directory upward
 - nearest `.venv/bin/python3` from current working directory upward
 - first executable `python3` on `PATH`
@@ -281,13 +286,18 @@ Interpreter resolution order:
 
 Notes:
 - Upward `.venv` search stops at `$HOME` (inclusive) when applicable, otherwise at filesystem root.
-- Python backend starts in basic REPL mode (`PYTHON_BASIC_REPL=1`) and loads `python/driver.py`.
+- The selected Python must expose a loadable CPython library through its
+  `sysconfig` metadata.
+- Python runtime-owned stdout/stderr is routed through worker IPC. Raw file
+  descriptor writes and child-process output are still captured from the
+  worker's stdout/stderr pipes.
 
 ## Platform support
 
 - **macOS**: supported.
 - **Linux**: supported. Dev binaries are a glibc build produced on Ubuntu 22.04.
-- **Windows**: experimental for the R backend. The Python backend currently requires a Unix PTY and is not available on Windows.
+- **Windows**: experimental for the R backend. Python support depends on the
+  embedded CPython build and is not part of the stable Windows surface yet.
 
 ## Sandbox
 
