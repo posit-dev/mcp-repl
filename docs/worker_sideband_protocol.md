@@ -22,16 +22,20 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 - Emitted before the server writes the raw input payload bytes to stdin.
 - The payload itself is not carried on IPC and stdin contains no protocol
   header.
-- `line_count` is optional for older senders and defaults to `0`. Python worker
-  mode uses it to know how many CPython readline calls belong to the active
-  request.
+- R worker mode uses `byte_len` to make its worker-owned stdin reader consume
+  exactly one raw payload before handing it to embedded R.
+- Python worker mode lets CPython own stdin. It ignores `byte_len` after request
+  acceptance and uses `line_count` to know how many CPython readline calls
+  belong to the active request.
+- `line_count` is optional for older senders and defaults to `0`.
 
 `interrupt`
 - `{ "type": "interrupt" }`
 - Sent when the server issues an interrupt.
 - For R, worker-side handlers clear any pending queued input.
-- Indicates that readline/prompt handling should discard any remaining buffered stdin bytes
-  from the pending request before normal completion signaling resumes.
+- For Python, the worker invokes CPython's interrupt API and discards pending
+  stdin bytes from the current request before normal completion signaling
+  resumes.
 
 `session_end`
 - `{ "type": "session_end" }`
@@ -53,6 +57,9 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - `{ "type": "stdin_write_ack" }`
 - Sent after a worker has processed `stdin_write` and installed request metadata
   for the upcoming raw stdin bytes.
+- Currently emitted by Python worker mode. R worker mode does not emit it
+  because the server does not need an acceptance barrier before writing the raw
+  payload to R's worker-owned stdin reader.
 - This only acknowledges request-boundary state. It is not an acknowledgement
   for stdout/stderr, plot images, or request completion.
 - `stdin_write_ack` is not an output-drain barrier. A future output-drain gate
@@ -76,6 +83,9 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
 - Carries worker-owned text bytes on the ordered IPC stream. The payload is base64
   so workers can preserve bytes without depending on JSON string encoding.
+- R uses this for R-owned console output and prompts. Python uses this for
+  Python-level `sys.stdout` and `sys.stderr` after installing embedded stream
+  objects.
 - `is_continuation` marks bounded transport chunks that continue the same worker-owned
   output write. It defaults to `false`.
 - Workers send output-critical frames synchronously: each JSON line is written,
