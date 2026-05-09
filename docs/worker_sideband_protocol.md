@@ -1,7 +1,8 @@
 # Worker Sideband Protocol (JSON Lines)
 
-This document describes the minimal sideband protocol between the server and a worker process.
-The channel is a JSON-lines stream (one JSON object per line) carried over an IPC pipe.
+This document describes the minimal sideband protocol between the server and a
+worker process. The channel is a JSON-lines stream (one JSON object per line)
+carried over an IPC pipe.
 
 ## Transport
 
@@ -9,8 +10,8 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
   - Unix: worker inherits two file descriptors via environment variables:
     - `MCP_REPL_IPC_READ_FD`
     - `MCP_REPL_IPC_WRITE_FD`
-  - Windows: worker connects to two server-created named pipes via
-    environment variables:
+  - Windows: worker connects to two server-created named pipes via environment
+    variables:
     - `MCP_REPL_IPC_PIPE_TO_WORKER`
     - `MCP_REPL_IPC_PIPE_FROM_WORKER`
 - Messages are serialized as UTF-8 JSON, one message per line.
@@ -39,8 +40,10 @@ The channel is a JSON-lines stream (one JSON object per line) carried over an IP
 
 `session_end`
 - `{ "type": "session_end" }`
-- Sent when the server is ending the current session (for example restart/shutdown).
-- Worker treats this as shutdown intent and stops consuming further stdin payloads.
+- Sent when the server is ending the current session (for example
+  restart/shutdown).
+- Worker treats this as shutdown intent and stops consuming further stdin
+  payloads.
 
 ## Direction: worker -> server
 
@@ -67,33 +70,35 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
-- Emitted for readline prompts. The prompt string is required; use an empty string
-  if the backend did not supply one.
+- Emitted for readline prompts. The prompt string is required; use an empty
+  string if the backend did not supply one.
 - `client_waiting` is true only when the backend knows the prompt is waiting for
   new client input. Prompts that will immediately consume buffered input should
   use false.
 
 `readline_result`
 - `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
-- Emitted after a line is read. Includes the prompt and the line that was consumed.
-- The server can reconstruct echoed readline bytes as `prompt + line` for conservative
-  echo suppression of raw pipe output.
+- Emitted after a line is read. Includes the prompt and the line that was
+  consumed.
+- The server can reconstruct echoed readline bytes as `prompt + line` for
+  conservative echo suppression of raw pipe output.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
-- Carries worker-owned text bytes on the ordered IPC stream. The payload is base64
-  so workers can preserve bytes without depending on JSON string encoding.
+- Carries worker-owned text bytes on the ordered IPC stream. The payload is
+  base64 so workers can preserve bytes without depending on JSON string
+  encoding.
 - R uses this for R-owned console output and prompts. Python uses this for
   Python-level `sys.stdout` and `sys.stderr` after installing embedded stream
   objects.
-- `is_continuation` marks bounded transport chunks that continue the same worker-owned
-  output write. It defaults to `false`.
+- `is_continuation` marks bounded transport chunks that continue the same
+  worker-owned output write. It defaults to `false`.
 - Workers send output-critical frames synchronously: each JSON line is written,
   newline-terminated, and flushed before the send returns.
 - Workers treat synchronous write failure as IPC failure. They must not silently
   fall back to stdout or stderr for output that is owned by the worker protocol.
-- Forked child processes with sideband IPC intentionally disabled are outside this
-  worker-owned path and may continue to use inherited raw output streams.
+- Forked child processes with sideband IPC intentionally disabled are outside
+  this worker-owned path and may continue to use inherited raw output streams.
 
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
@@ -102,7 +107,8 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   device or figure slot. It is not a response image ID; the server owns response
   image IDs and uses `source` only to keep distinct plot sources from collapsing
   into one response image.
-- There is no plot-image acknowledgement message. Workers must not delay stdout/stderr output waiting for sideband responses.
+- There is no plot-image acknowledgement message. Workers must not delay
+  stdout/stderr output waiting for sideband responses.
 - If an update is the first image event for a new server request, the server
   treats it as a new response image and includes a server notice that it updates
   the previously sent image.
