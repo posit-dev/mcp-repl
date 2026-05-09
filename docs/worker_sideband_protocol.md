@@ -50,6 +50,8 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - A backend that needs request-start sideband state before raw stdin is delivered
   can use this as a narrow acknowledgement. It is not an acknowledgement for
   stdout/stderr, plot images, or request completion.
+- `stdin_ready` is not an output-drain barrier.
+  A future output-drain gate should use a separate protocol step.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
@@ -103,6 +105,11 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - To reduce IPC-vs-output capture races, the server applies a short
   post-completion settle window so output reader threads can drain final bytes
   before snapshotting output.
+- A future pre-input drain gate may let the server hold back the next stdin
+  payload while it drains raw stdout/stderr from the previous boundary for a
+  small bounded budget, for example about 200 ms with a hard stop. Child output
+  that arrives after that boundary belongs to the next response. This would be a
+  request-boundary coordination step, not a per-output acknowledgement.
 - On timeout, a request may remain pending; later polls can observe the inferred
   completion state and finish the request.
 - Backend-specific execution rules should be implemented by the worker. Server

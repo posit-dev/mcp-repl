@@ -31,21 +31,33 @@
   framed prompt facts instead of stripping prompt-shaped raw stdout. A public
   files-mode regression covers raw child stdout that exactly matches a later
   R-owned prompt/input echo.
+- Phase 4: planned - evaluate a bounded pre-input drain gate. `stdin_ready`
+  remains a request-start fact; any raw-output drain gate should be a separate
+  request-boundary protocol step.
 
 ## Locked Decisions
 
 - Use `output_text { stream, data_b64, is_continuation }` for worker-owned text.
 - Do not add per-output acknowledgements, byte matching, hashes, or alignment heuristics.
+- A pre-input drain gate, if added, must be request-boundary coordination with a
+  bounded server-side drain budget, not per-output acknowledgement.
 - Keep raw stdout and stderr readers for output the worker protocol does not own.
 
 ## Open Questions
 
-- None for the current protocol slice.
+- What exact protocol shape should gate delivery of the next stdin payload while
+  the server drains raw stdout/stderr from the previous boundary?
+- Should the initial drain budget be 200 ms, and should it apply to both R and
+  Python or only to backends that still use raw stdin echo?
 
 ## Next Safe Slice
 
 - Review remaining prompt-fallback cleanup in `src/worker_process.rs`; keep raw
   pipe fallback separate from source-aware IPC echo carryover.
+- Design the smallest pre-input drain-gate slice: the worker pauses before
+  consuming new input, the server drains raw stdout/stderr for a fixed budget,
+  then input delivery continues. Child output after that boundary belongs to the
+  next response.
 
 ## Stop Conditions
 
@@ -76,3 +88,10 @@
   R-owned prompt/input echo remains visible. No runtime change was needed
   because same-drain and carryover echo collapse already require matching
   `readline_result` source facts.
+- 2026-05-08: Kept ACK-gated input delivery open as a request-boundary tool, not
+  a per-output ACK. The useful shape is: before the worker consumes the next
+  input, the server gets a bounded opportunity to drain raw stdout/stderr from
+  the previous boundary, with a hard stop around a small budget such as 200 ms.
+  Child output that arrives after the gate belongs to the next response. This
+  may simplify timeline reconstruction for child-process and direct-fd output
+  without changing the R-owned `output_text` path.
