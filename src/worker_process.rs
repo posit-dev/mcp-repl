@@ -485,7 +485,9 @@ fn python_has_open_block_suite(text: &str) -> bool {
     for line in text.lines() {
         let code = python_line_code_before_comment(line).trim_end();
         if code.trim().is_empty() {
-            has_block_header_since_blank = false;
+            if line.trim().is_empty() {
+                has_block_header_since_blank = false;
+            }
             continue;
         }
         if code.ends_with(':') {

@@ -1385,6 +1385,26 @@ async fn python_commented_block_header_reports_continuation_prompt() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_comment_only_block_body_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    # comment", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("... "),
+        "expected comment-only Python block body to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_decorator_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
