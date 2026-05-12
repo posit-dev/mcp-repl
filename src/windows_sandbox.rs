@@ -1940,8 +1940,6 @@ unsafe fn create_process_as_user(
     let env_block = make_env_block(env_map);
     let mut startup_info: STARTUPINFOW = std::mem::zeroed();
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let desktop = to_wide("Winsta0\\Default");
-    startup_info.lpDesktop = desktop.as_ptr() as *mut u16;
     if let Some((stdin_handle, stdout_handle, stderr_handle)) = stdio {
         for handle in [stdin_handle, stdout_handle, stderr_handle] {
             if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
@@ -3976,6 +3974,7 @@ mod tests {
 
     #[test]
     fn stable_capability_sid_ignores_session_temp_dir() {
+        let _env_guard = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4565,6 +4564,73 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         }
 
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn sandboxed_command_can_start_windows_r_frontend() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let Some(r_home) = harp::command::r_home_setup().ok() else {
+            eprintln!("R_HOME unavailable; skipping");
+            return;
+        };
+        let r_exe = r_home.join("bin").join("x64").join("R.exe");
+        if !r_exe.is_file() {
+            eprintln!("Windows R frontend unavailable; skipping");
+            return;
+        }
+
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let command = vec![
+            r_exe.to_string_lossy().to_string(),
+            "--no-restore".to_string(),
+            "--no-save".to_string(),
+            "--no-site-file".to_string(),
+            "--no-init-file".to_string(),
+            "--slave".to_string(),
+            "-e".to_string(),
+            "cat('R_FRONTEND_OK\\n')".to_string(),
+        ];
+
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        env_map.extend(sandbox_acl_env_map(&session_temp_dir));
+        env_map.insert("R_HOME".to_string(), r_home.to_string_lossy().to_string());
+        env_map.insert(
+            "R_USER".to_string(),
+            session_temp_dir.to_string_lossy().to_string(),
+        );
+        env_map.insert(
+            "HOME".to_string(),
+            session_temp_dir.to_string_lossy().to_string(),
+        );
+        let status = run_sandboxed_command_with_env_map(
+            &policy,
+            &cwd,
+            &command,
+            prepared.capability_sid(),
+            env_map,
+        )
+        .expect("sandboxed command should run");
+
+        unsafe {
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), session_temp_dir.as_path()],
+            );
+        }
+
+        assert_eq!(status, 0, "sandboxed R frontend should start");
     }
 
     #[test]

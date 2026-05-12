@@ -366,6 +366,14 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
+#[cfg(windows)]
+fn driver_prompt_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
+    if let Some(ipc) = process.ipc.get() {
+        let _ = ipc.send(ServerToWorkerIpcMessage::PromptInterrupt);
+    }
+    Ok(())
+}
+
 fn driver_refresh_backend_info(
     ipc: ServerIpcConnection,
     timeout: Duration,
@@ -2957,6 +2965,22 @@ impl WorkerManager {
         }
     }
 
+    fn should_wake_python_prompt_stdin(&self) -> bool {
+        cfg!(windows)
+            && matches!(self.backend, Backend::Python)
+            && self.python_prompt_waiting_for_input
+    }
+
+    #[cfg(windows)]
+    fn wake_python_prompt_stdin(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            let _ = process.write_stdin_payload(b"\n".to_vec(), Duration::from_millis(500));
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn wake_python_prompt_stdin(&mut self) {}
+
     fn interrupt_files(
         &mut self,
         timeout: Duration,
@@ -2972,24 +2996,40 @@ impl WorkerManager {
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
         let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
+        let wake_python_prompt_stdin = self.should_wake_python_prompt_stdin();
         if should_interrupt_worker {
             self.ensure_process()?;
         }
-        if should_interrupt_worker
-            && let Err(err) = self.driver.interrupt(
-                self.process
-                    .as_mut()
-                    .expect("worker process should be available"),
-            )
-        {
-            self.reset()?;
-            crate::event_log::log(
-                "worker_interrupt_error",
-                serde_json::json!({
-                    "error": err.to_string(),
-                }),
-            );
-            return Err(err);
+        if should_interrupt_worker {
+            let process = self
+                .process
+                .as_mut()
+                .expect("worker process should be available");
+            let interrupt_result = if wake_python_prompt_stdin {
+                #[cfg(windows)]
+                {
+                    driver_prompt_interrupt(process)
+                }
+                #[cfg(not(windows))]
+                {
+                    self.driver.interrupt(process)
+                }
+            } else {
+                self.driver.interrupt(process)
+            };
+            if let Err(err) = interrupt_result {
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                return Err(err);
+            }
+        }
+        if wake_python_prompt_stdin {
+            self.wake_python_prompt_stdin();
         }
         if self.python_prompt_waiting_for_input {
             self.python_prompt_waiting_for_input = false;
@@ -3139,24 +3179,40 @@ impl WorkerManager {
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
         let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
+        let wake_python_prompt_stdin = self.should_wake_python_prompt_stdin();
         if should_interrupt_worker {
             self.ensure_process()?;
         }
-        if should_interrupt_worker
-            && let Err(err) = self.driver.interrupt(
-                self.process
-                    .as_mut()
-                    .expect("worker process should be available"),
-            )
-        {
-            self.reset()?;
-            crate::event_log::log(
-                "worker_interrupt_error",
-                serde_json::json!({
-                    "error": err.to_string(),
-                }),
-            );
-            return Err(err);
+        if should_interrupt_worker {
+            let process = self
+                .process
+                .as_mut()
+                .expect("worker process should be available");
+            let interrupt_result = if wake_python_prompt_stdin {
+                #[cfg(windows)]
+                {
+                    driver_prompt_interrupt(process)
+                }
+                #[cfg(not(windows))]
+                {
+                    self.driver.interrupt(process)
+                }
+            } else {
+                self.driver.interrupt(process)
+            };
+            if let Err(err) = interrupt_result {
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                return Err(err);
+            }
+        }
+        if wake_python_prompt_stdin {
+            self.wake_python_prompt_stdin();
         }
         if self.python_prompt_waiting_for_input {
             self.python_prompt_waiting_for_input = false;

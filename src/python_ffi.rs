@@ -111,6 +111,8 @@ pub struct PythonApi {
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_interrupt: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
+    #[cfg(windows)]
+    pub pyos_sigint_event: Option<unsafe extern "C" fn() -> *mut c_void>,
 }
 
 static PYTHON_API: OnceLock<PythonApi> = OnceLock::new();
@@ -183,6 +185,8 @@ impl PythonApi {
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_interrupt: unsafe { load_symbol(&library, b"PyErr_SetInterrupt\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
+            #[cfg(windows)]
+            pyos_sigint_event: unsafe { load_optional_symbol(&library, b"_PyOS_SigintEvent\0") },
             _library: library,
         };
         Ok(api)
@@ -461,6 +465,11 @@ unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, Stri
             .map_err(|err| format!("failed to load Python symbol {}: {err}", symbol_name(name)))?
     };
     Ok(*symbol)
+}
+
+#[cfg(windows)]
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+    unsafe { library.get::<T>(name).ok().map(|symbol| *symbol) }
 }
 
 fn symbol_name(name: &[u8]) -> String {

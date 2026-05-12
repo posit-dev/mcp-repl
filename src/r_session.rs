@@ -2,9 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
-use std::path::Path;
-#[cfg(target_family = "unix")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 
@@ -275,6 +273,7 @@ fn handle_requests(requests: mpsc::Receiver<RRequest>, state: Arc<SessionState>)
 
 fn initialize_r() -> Result<(), String> {
     let start = std::time::Instant::now();
+    prepare_r_home_env();
     let r_home = r_home_setup().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
     crate::diagnostics::startup_log(format!(
         "r-session: r_home_setup {} ms",
@@ -283,6 +282,8 @@ fn initialize_r() -> Result<(), String> {
     configure_r_env_vars(&r_home);
     #[cfg(target_family = "unix")]
     configure_r_tempdir();
+    #[cfg(windows)]
+    configure_windows_r_dll_search(&r_home);
 
     let libs_start = std::time::Instant::now();
     let libraries = RLibraries::from_r_home_path(&r_home);
@@ -335,6 +336,127 @@ fn initialize_r() -> Result<(), String> {
         crate::diagnostics::elapsed_ms(start.elapsed())
     ));
     Ok(())
+}
+
+#[cfg(windows)]
+fn configure_windows_r_dll_search(r_home: &Path) {
+    let r_bin = if cfg!(target_arch = "aarch64") {
+        r_home.join("bin")
+    } else {
+        r_home.join("bin").join("x64")
+    };
+    if r_bin.is_dir() {
+        let mut paths = vec![r_bin];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            unsafe {
+                std::env::set_var("PATH", joined);
+            }
+        }
+    }
+    harp::sys::library::set_use_standard_dll_search_path(true);
+}
+
+fn prepare_r_home_env() {
+    normalize_empty_r_home_env();
+    #[cfg(windows)]
+    prepare_windows_r_user_env();
+    #[cfg(windows)]
+    if std::env::var_os("R_HOME").is_none()
+        && let Some(r_home) = discover_windows_r_home()
+    {
+        unsafe {
+            std::env::set_var("R_HOME", r_home);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn prepare_windows_r_user_env() {
+    let Some(home) = windows_r_user_home() else {
+        return;
+    };
+    for key in ["R_USER", "HOME"] {
+        if std::env::var_os(key).is_none_or(|value| value.is_empty()) {
+            unsafe {
+                std::env::set_var(key, &home);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_r_user_home() -> Option<PathBuf> {
+    for key in [crate::sandbox::R_SESSION_TMPDIR_ENV, "TEMP", "TMP"] {
+        let Some(path) = std::env::var_os(key).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if path.is_absolute() && path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn normalize_empty_r_home_env() {
+    let empty_keys: Vec<_> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let is_r_home = key
+                .to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case("R_HOME"));
+            (is_r_home && value.is_empty()).then_some(key)
+        })
+        .collect();
+    for key in empty_keys {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn discover_windows_r_home() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    for key in ["ProgramW6432", "ProgramFiles"] {
+        if let Some(root) = std::env::var_os(key).map(PathBuf::from) {
+            roots.push(root.join("R"));
+        }
+    }
+    roots.push(PathBuf::from(r"C:\Program Files\R"));
+    roots.sort();
+    roots.dedup();
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_versioned_r_dir = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("R-"));
+            if is_versioned_r_dir && is_windows_r_home_candidate(&path) {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.pop()
+}
+
+#[cfg(windows)]
+fn is_windows_r_home_candidate(path: &Path) -> bool {
+    path.join("share").is_dir()
+        && path.join("include").is_dir()
+        && path.join("doc").is_dir()
+        && (path.join("bin").join("x64").join("R.dll").is_file()
+            || path.join("bin").join("R.dll").is_file())
 }
 
 fn configure_r_help_output() -> Result<(), String> {
@@ -395,7 +517,12 @@ fn configure_r_env_vars(r_home: &Path) {
     let result = r_command(|command| {
         command
             .stdin(std::process::Stdio::null())
-            .arg("--vanilla")
+            .args([
+                "--no-restore",
+                "--no-save",
+                "--no-site-file",
+                "--no-init-file",
+            ])
             .arg("--slave")
             .arg("-e")
             .arg(r#"cat(paste(R.home("share"), R.home("include"), R.home("doc"), sep=";"))"#);

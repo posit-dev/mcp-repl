@@ -10,6 +10,16 @@ use serde::Deserialize;
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
 use crate::worker_protocol::TextStream;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::ReadFile;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::SetEvent;
 
 pub const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
@@ -37,6 +47,7 @@ print(json.dumps({
     "instsoname": var("INSTSONAME"),
     "libdir": var("LIBDIR"),
     "libpl": var("LIBPL"),
+    "bindir": var("BINDIR"),
     "pythonframeworkprefix": var("PYTHONFRAMEWORKPREFIX"),
     "pythonframeworkinstalldir": var("PYTHONFRAMEWORKINSTALLDIR"),
 }))
@@ -61,6 +72,7 @@ struct PythonRuntimeProbe {
     instsoname: String,
     libdir: String,
     libpl: String,
+    bindir: String,
     pythonframeworkprefix: String,
     pythonframeworkinstalldir: String,
 }
@@ -188,9 +200,57 @@ fn take_exit_requested() -> bool {
 pub(crate) fn interrupt() {
     discard_pending_stdin();
     finish_active_request_at_next_read();
-    if let Some(api) = PythonApi::try_global() {
-        unsafe { (api.py_err_set_interrupt)() };
+    let prompt_interrupt = mark_interrupt_requested();
+    if !prompt_interrupt && let Some(api) = PythonApi::try_global() {
+        unsafe {
+            (api.py_err_set_interrupt)();
+            wake_python_sigint_event(api);
+        }
     }
+}
+
+pub(crate) fn interrupt_prompt() {
+    discard_pending_stdin();
+    finish_active_request_at_next_read();
+    mark_interrupt_requested();
+}
+
+#[cfg(windows)]
+unsafe fn wake_python_sigint_event(api: &PythonApi) {
+    let Some(sigint_event) = api.pyos_sigint_event else {
+        return;
+    };
+    let event = unsafe { sigint_event() };
+    if !event.is_null() {
+        unsafe {
+            SetEvent(event);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+unsafe fn wake_python_sigint_event(_api: &PythonApi) {}
+
+fn mark_interrupt_requested() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let prompt_interrupt = guard.current_prompt.is_some()
+        || (guard.active_request.is_none() && guard.waiting_for_input);
+    guard.interrupt_requested = true;
+    state.cvar.notify_all();
+    prompt_interrupt
+}
+
+fn take_interrupt_requested() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let requested = guard.interrupt_requested;
+    guard.interrupt_requested = false;
+    requested
 }
 
 pub(crate) fn mark_stdin_write_complete() {
@@ -205,7 +265,12 @@ pub(crate) fn mark_stdin_write_complete() {
         let waiting_for_input = guard.waiting_for_input;
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
-            if waiting_for_input && request_input_drained(active) {
+            let should_complete = if active.repl_turn_finished {
+                request_repl_turn_should_complete(active)
+            } else {
+                request_prompt_wait_should_complete(active, current_prompt_from_state.as_deref())
+            };
+            if waiting_for_input && should_complete {
                 prompt = Some(
                     current_prompt_from_state
                         .or_else(|| active.fallback_prompt.clone())
@@ -245,8 +310,60 @@ fn discard_pending_stdin() {
     drain_stdin_fd();
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+fn discard_pending_stdin() {
+    let stdin = PYTHON_STDIN_FILE.load(Ordering::SeqCst);
+    if !stdin.is_null() {
+        unsafe {
+            libc::fflush(stdin);
+        }
+    }
+    drain_stdin_pipe();
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 fn discard_pending_stdin() {}
+
+#[cfg(windows)]
+fn drain_stdin_pipe() {
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let mut buffer = [0u8; 8192];
+    loop {
+        let mut available = 0u32;
+        let ok = unsafe {
+            PeekNamedPipe(
+                handle,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut available,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || available == 0 {
+            break;
+        }
+
+        let to_read = available.min(buffer.len() as u32);
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                buffer.as_mut_ptr().cast(),
+                to_read,
+                &mut read,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            break;
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 unsafe fn purge_stdio_input(file: *mut libc::FILE) {
@@ -578,6 +695,7 @@ fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
     if probe.instsoname != probe.ldlibrary {
         push_python_library_candidates(&mut candidates, probe, &probe.instsoname);
     }
+    push_windows_python_library_candidates(&mut candidates, probe);
 
     let version = format!("{}.{}", probe.version[0], probe.version[1]);
     for root in [
@@ -603,6 +721,42 @@ fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
     }
 
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(windows)]
+fn push_windows_python_library_candidates(
+    candidates: &mut Vec<PathBuf>,
+    probe: &PythonRuntimeProbe,
+) {
+    let compact_version = format!("{}{}", probe.version[0], probe.version[1]);
+    let library_names = [
+        format!("python{compact_version}.dll"),
+        "python3.dll".to_string(),
+    ];
+
+    for root in [
+        Path::new(probe.executable.as_str()).parent(),
+        Path::new(probe.base_executable.as_str()).parent(),
+        non_empty(&probe.bindir).map(Path::new),
+        non_empty(&probe.base_exec_prefix).map(Path::new),
+        non_empty(&probe.exec_prefix).map(Path::new),
+        non_empty(&probe.base_prefix).map(Path::new),
+        non_empty(&probe.prefix).map(Path::new),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for library in &library_names {
+            candidates.push(root.join(library));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn push_windows_python_library_candidates(
+    _candidates: &mut Vec<PathBuf>,
+    _probe: &PythonRuntimeProbe,
+) {
 }
 
 fn push_python_library_candidates(
@@ -706,6 +860,7 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
             return Ok(());
         }
         emit_plots();
+        finish_repl_turn_request();
         if status == PYTHON_EOF {
             flush_original_stdio();
             return Ok(());
@@ -756,6 +911,7 @@ fn begin_tracked_request(
         consumed_lines: 0,
         skip_next_hook,
         stdin_write_complete: false,
+        repl_turn_finished: false,
     });
     guard.plot_reset_pending = true;
     state.cvar.notify_all();
@@ -794,8 +950,11 @@ fn handle_input_hook() {
             } else {
                 note_input_hook_consumed_line(active);
             }
-            let should_complete = request_should_complete(active);
-            guard.waiting_for_input = true;
+            let should_complete = if active.repl_turn_finished {
+                request_repl_turn_should_complete(active)
+            } else {
+                request_prompt_wait_should_complete(active, current_prompt_from_state.as_deref())
+            };
             if should_complete {
                 prompt = Some(current_prompt);
                 completed = guard.active_request.take();
@@ -832,22 +991,95 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
     }
 }
 
-fn request_should_complete(active: &ActiveRequest) -> bool {
+fn request_prompt_wait_should_complete(
+    active: &ActiveRequest,
+    current_prompt: Option<&str>,
+) -> bool {
     #[cfg(target_family = "unix")]
     {
         request_input_drained(active)
     }
-    #[cfg(not(target_family = "unix"))]
+    #[cfg(windows)]
+    {
+        prompt_can_complete_before_repl_turn(active, current_prompt)
+            && active.byte_len > 0
+            && stdin_pending_byte_count() == Some(0)
+    }
+    #[cfg(not(any(target_family = "unix", windows)))]
     {
         active.consumed_lines >= active.line_count
     }
 }
 
+fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        request_input_drained(active)
+    }
+    #[cfg(windows)]
+    {
+        active.line_count == 1 || (active.byte_len > 0 && stdin_pending_byte_count() == Some(0))
+    }
+    #[cfg(not(any(target_family = "unix", windows)))]
+    {
+        active.consumed_lines >= active.line_count
+    }
+}
+
+#[cfg(windows)]
+fn prompt_can_complete_before_repl_turn(
+    active: &ActiveRequest,
+    current_prompt: Option<&str>,
+) -> bool {
+    current_prompt.is_some_and(|prompt| prompt != ">>> ")
+        || active
+            .fallback_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt != ">>> ")
+}
+
+#[cfg(target_family = "unix")]
 fn request_input_drained(active: &ActiveRequest) -> bool {
     if !active.stdin_write_complete || active.byte_len == 0 {
         return false;
     }
     stdin_pending_byte_count() == Some(0)
+}
+
+fn finish_repl_turn_request() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut completed = None;
+    let mut prompt = None;
+    {
+        let mut guard = state.inner.lock().unwrap();
+        let current_prompt_from_state = guard.current_prompt.clone();
+        guard.interrupt_requested = false;
+        if guard.active_request.is_some() {
+            guard.waiting_for_input = true;
+        }
+        if let Some(active) = guard.active_request.as_mut() {
+            active.repl_turn_finished = true;
+            if active.line_count == 1 {
+                active.consumed_lines = active.consumed_lines.max(1);
+            }
+            if request_repl_turn_should_complete(active) {
+                prompt = Some(
+                    current_prompt_from_state
+                        .or_else(|| active.fallback_prompt.clone())
+                        .unwrap_or_else(|| ">>> ".to_string()),
+                );
+                completed = guard.active_request.take();
+            }
+        }
+    }
+
+    if let Some(active) = completed {
+        flush_original_stdio();
+        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        complete_active_request(state, Some(active), false);
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -861,7 +1093,28 @@ fn stdin_pending_byte_count() -> Option<usize> {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+fn stdin_pending_byte_count() -> Option<usize> {
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut available = 0u32;
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &mut available,
+            ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available as usize)
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 fn stdin_pending_byte_count() -> Option<usize> {
     None
 }
@@ -962,6 +1215,10 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     handle_input_hook();
     let bytes = read_stdio_line_bytes(stdin);
     clear_current_readline_prompt();
+    if take_interrupt_requested() {
+        set_callback_error("Python input interrupted");
+        return CStdinLine::Error;
+    }
     if bytes.is_empty() {
         CStdinLine::Eof
     } else {
@@ -1049,6 +1306,7 @@ struct SessionStateInner {
     shutdown: bool,
     session_end_emitted: bool,
     plot_reset_pending: bool,
+    interrupt_requested: bool,
 }
 
 struct ActiveRequest {
@@ -1059,6 +1317,7 @@ struct ActiveRequest {
     consumed_lines: usize,
     skip_next_hook: bool,
     stdin_write_complete: bool,
+    repl_turn_finished: bool,
 }
 
 impl SessionState {
@@ -1072,6 +1331,7 @@ impl SessionState {
                 shutdown: false,
                 session_end_emitted: false,
                 plot_reset_pending: false,
+                interrupt_requested: false,
             }),
             cvar: Condvar::new(),
         }
@@ -1321,6 +1581,25 @@ mod tests {
         }
     }
 
+    fn runtime_probe_for(executable: &str) -> PythonRuntimeProbe {
+        PythonRuntimeProbe {
+            executable: executable.to_string(),
+            base_executable: executable.to_string(),
+            prefix: String::new(),
+            base_prefix: String::new(),
+            exec_prefix: String::new(),
+            base_exec_prefix: String::new(),
+            version: [3, 11],
+            ldlibrary: String::new(),
+            instsoname: String::new(),
+            libdir: String::new(),
+            libpl: String::new(),
+            bindir: String::new(),
+            pythonframeworkprefix: String::new(),
+            pythonframeworkinstalldir: String::new(),
+        }
+    }
+
     #[test]
     fn python_program_selection_falls_back_after_broken_python3_candidate() {
         let selected = select_python_program(
@@ -1372,5 +1651,19 @@ mod tests {
 
         assert_eq!(attempts, vec![PathBuf::from("custom-python")]);
         assert!(err.contains("custom-python is not usable"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_libpython_path_finds_windows_dll_next_to_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let python = temp.path().join("python.exe");
+        let dll = temp.path().join("python311.dll");
+        std::fs::write(&python, "").expect("python placeholder");
+        std::fs::write(&dll, "").expect("dll placeholder");
+
+        let probe = runtime_probe_for(&python.to_string_lossy());
+
+        assert_eq!(resolve_libpython_path(&probe), Some(dll));
     }
 }
