@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use serde::Deserialize;
 
 use crate::ipc;
-use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PythonApi};
+use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
 use crate::worker_protocol::TextStream;
 
 pub const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
@@ -280,7 +280,15 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    if let Err(err) = initialize_python(api, &runtime_config.executable) {
+    let thread_state = match initialize_python(api, &runtime_config.executable) {
+        Ok(thread_state) => thread_state,
+        Err(err) => {
+            init.mark_failed(err.clone());
+            return Err(err);
+        }
+    };
+    if thread_state.is_null() {
+        let err = "failed to release initialized Python thread state".to_string();
         init.mark_failed(err.clone());
         return Err(err);
     }
@@ -302,8 +310,12 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     ipc::emit_backend_info(plot_capable());
 
     let result = run_repl(&runtime);
+    let finalize_result = finalize_python(api, thread_state);
+    finish_session_end();
     crate::diagnostics::startup_log("python-session: repl exited");
-    result
+    result?;
+    finalize_result?;
+    Ok(())
 }
 
 fn open_python_runtime() -> Result<PythonRuntime, String> {
@@ -525,7 +537,10 @@ fn non_empty(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn initialize_python(api: &'static PythonApi, executable: &Path) -> Result<(), String> {
+fn initialize_python(
+    api: &'static PythonApi,
+    executable: &Path,
+) -> Result<*mut PyThreadState, String> {
     let module_name = CString::new("_mcp_repl").expect("module name must not contain NUL");
     let module_name = module_name.into_raw();
     let rc = unsafe { (api.py_import_append_inittab)(module_name, initialize_mcp_repl_module) };
@@ -534,16 +549,17 @@ fn initialize_python(api: &'static PythonApi, executable: &Path) -> Result<(), S
     }
 
     unsafe {
-        if (api.py_is_initialized)() == 0 {
-            api.set_program_name(executable)?;
-            api.set_interactive_flags()?;
-            (api.py_initialize_ex)(1);
-            api.install_readline_function(mcp_repl_readline)?;
-            (api.py_eval_save_thread)();
+        if (api.py_is_initialized)() != 0 {
+            return Err("embedded Python interpreter was already initialized".to_string());
         }
+        api.set_program_name(executable)?;
+        api.set_interactive_flags()?;
+        (api.py_initialize_ex)(1);
+        api.install_readline_function(mcp_repl_readline)?;
+        let thread_state = (api.py_eval_save_thread)();
+        api.install_input_hook(pyos_input_hook)?;
+        Ok(thread_state)
     }
-    api.install_input_hook(pyos_input_hook)?;
-    Ok(())
 }
 
 fn configure_python(api: &'static PythonApi) -> Result<(), String> {
@@ -576,13 +592,24 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
             }
         };
         if take_exit_requested() {
-            finish_session_end();
             return Ok(());
         }
         emit_plots();
         if status == PYTHON_EOF {
-            finish_session_end();
             return Ok(());
+        }
+    }
+}
+
+fn finalize_python(
+    api: &'static PythonApi,
+    thread_state: *mut PyThreadState,
+) -> Result<(), String> {
+    unsafe {
+        (api.py_eval_restore_thread)(thread_state);
+        match (api.py_finalize_ex)() {
+            0 => Ok(()),
+            _ => Err("CPython finalization failed".to_string()),
         }
     }
 }
@@ -743,7 +770,7 @@ unsafe extern "C" fn mcp_repl_readline(
     }
 
     let api = PythonApi::global();
-    let result = unsafe { (api.py_mem_malloc)(bytes.len().saturating_add(1)) }.cast::<c_char>();
+    let result = unsafe { (api.py_mem_raw_malloc)(bytes.len().saturating_add(1)) }.cast::<c_char>();
     if result.is_null() {
         return ptr::null_mut();
     }

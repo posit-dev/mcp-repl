@@ -594,6 +594,51 @@ async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let temp = tempdir()?;
+    let marker = temp.path().join("atexit-marker.txt");
+    let marker_literal = serde_json::to_string(
+        marker
+            .to_str()
+            .ok_or("atexit marker path must be valid utf-8")?,
+    )?;
+    let result = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import atexit, pathlib, sys
+atexit.register(lambda: pathlib.Path({marker_literal}).write_text("atexit ran"))
+sys.exit()
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.exit() with atexit remained busy".into());
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_ATEXIT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_ATEXIT"),
+        "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
+    );
+    assert_eq!(fs::read_to_string(&marker)?, "atexit ran");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_reads_from_sys_stdin() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1242,6 +1287,51 @@ async fn python_input_roundtrip() -> TestResult<()> {
     assert!(text.contains("hello"), "expected echo, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_roundtrip_under_debug_allocator() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) =
+        start_python_session_with_env_vars(vec![("PYTHONMALLOC".to_string(), "debug".to_string())])
+            .await?
+    else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('debug> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("debug>") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python debug-allocator input roundtrip remained busy before prompt".into());
+    }
+    assert!(text.contains("debug>"), "expected prompt, got: {text:?}");
+
+    let answer = session
+        .write_stdin_raw_with("value\nprint('DEBUG_ALLOCATOR_INPUT', value)", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&answer_text),
+        "expected debug-allocator input reply to complete, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("DEBUG_ALLOCATOR_INPUT value"),
+        "expected input() to survive debug allocator checks, got: {answer_text:?}"
+    );
     Ok(())
 }
 
