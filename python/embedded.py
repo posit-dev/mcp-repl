@@ -317,11 +317,21 @@ class McpOutputStream:
     def write(self, message):
         return _mcp_repl.write(self._stream, str(message))
 
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
     def flush(self):
         pass
 
+    def readable(self):
+        return False
+
     def writable(self):
         return True
+
+    def seekable(self):
+        return False
 
     def isatty(self):
         return True

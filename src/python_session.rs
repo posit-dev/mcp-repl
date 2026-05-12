@@ -754,17 +754,7 @@ unsafe extern "C" fn mcp_repl_readline(
     }
     handle_input_hook();
 
-    let mut bytes = Vec::new();
-    loop {
-        let ch = unsafe { libc::fgetc(stdin) };
-        if ch == libc::EOF {
-            break;
-        }
-        bytes.push(ch as u8);
-        if ch == b'\n' as i32 {
-            break;
-        }
-    }
+    let bytes = read_stdio_line_bytes(stdin);
     if prompt_text.is_some() {
         clear_current_readline_prompt();
     }
@@ -779,6 +769,21 @@ unsafe extern "C" fn mcp_repl_readline(
         *result.add(bytes.len()) = 0;
     }
     result
+}
+
+fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let ch = unsafe { libc::fgetc(stdin) };
+        if ch == libc::EOF {
+            break;
+        }
+        bytes.push(ch as u8);
+        if ch == b'\n' as i32 {
+            break;
+        }
+    }
+    bytes
 }
 
 fn set_current_readline_prompt(prompt: &str) {
@@ -804,10 +809,8 @@ enum CStdinLine {
 }
 
 fn read_c_stdin_line(prompt: &str) -> CStdinLine {
-    let api = PythonApi::global();
     let stdin = PYTHON_STDIN_FILE.load(Ordering::SeqCst);
-    let stdout = PYTHON_STDOUT_FILE.load(Ordering::SeqCst);
-    if stdin.is_null() || stdout.is_null() {
+    if stdin.is_null() {
         set_callback_error("Python stdio files are not initialized");
         return CStdinLine::Error;
     }
@@ -821,13 +824,9 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     };
 
     set_current_readline_prompt(prompt_for_sideband.to_str().unwrap_or(""));
-    let ptr = unsafe { (api.py_os_readline)(stdin, stdout, c"".as_ptr()) };
+    handle_input_hook();
+    let bytes = read_stdio_line_bytes(stdin);
     clear_current_readline_prompt();
-    if ptr.is_null() {
-        return CStdinLine::Error;
-    }
-    let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes().to_vec();
-    unsafe { (api.py_mem_free)(ptr.cast()) };
     if bytes.is_empty() {
         CStdinLine::Eof
     } else {

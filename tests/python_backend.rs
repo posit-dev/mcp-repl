@@ -478,6 +478,33 @@ print("BYTE_READ", first, rest, len(first), len(rest))
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_stdin_buffer_preserves_nul_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys\ndata = sys.stdin.buffer.read(3)\nA\0B\nprint('NUL_BYTES', repr(data), len(data))",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python stdin.buffer NUL byte read remained busy".into());
+    }
+    assert!(
+        text.contains(r#"NUL_BYTES b'A\x00B' 3"#),
+        "expected stdin.buffer read to preserve NUL bytes, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_raw_fd_stdin_read_completes_request() -> TestResult<()> {
@@ -695,6 +722,46 @@ print("COUNT", count)
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_stdout_stderr_expose_text_stream_methods() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+print("STDOUT_FLAGS", sys.stdout.readable(), sys.stdout.writable(), sys.stdout.seekable())
+print("STDERR_FLAGS", sys.stderr.readable(), sys.stderr.writable(), sys.stderr.seekable())
+sys.stdout.writelines(["OUT_A", "OUT_B\n"])
+sys.stderr.writelines(["ERR_A", "ERR_B\n"])
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STDOUT_FLAGS False True False"),
+        "expected stdout text stream flags, got: {text:?}"
+    );
+    assert!(
+        text.contains("STDERR_FLAGS False True False"),
+        "expected stderr text stream flags, got: {text:?}"
+    );
+    assert!(
+        text.contains("OUT_AOUT_B"),
+        "expected stdout.writelines() output, got: {text:?}"
+    );
+    assert!(
+        text.contains("ERR_AERR_B"),
+        "expected stderr.writelines() output, got: {text:?}"
+    );
     Ok(())
 }
 

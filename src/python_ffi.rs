@@ -90,8 +90,6 @@ pub struct PythonApi {
     ) -> *mut PyObject,
     pub py_run_interactive_one_flags:
         unsafe extern "C" fn(*mut libc::FILE, *const c_char, *mut c_void) -> c_int,
-    pub py_os_readline:
-        unsafe extern "C" fn(*mut libc::FILE, *mut libc::FILE, *const c_char) -> *mut c_char,
     pub py_object_get_attr_string:
         unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut PyObject,
     pub py_object_call_object: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
@@ -107,7 +105,6 @@ pub struct PythonApi {
     pub py_long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_build_value: unsafe extern "C" fn(*const c_char, ...) -> *mut PyObject,
-    pub py_mem_free: unsafe extern "C" fn(*mut c_void),
     pub py_mem_raw_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
     pub py_err_print: unsafe extern "C" fn(),
@@ -161,7 +158,6 @@ impl PythonApi {
             py_run_interactive_one_flags: unsafe {
                 load_symbol(&library, b"PyRun_InteractiveOneFlags\0")?
             },
-            py_os_readline: unsafe { load_symbol(&library, b"PyOS_Readline\0")? },
             py_object_get_attr_string: unsafe {
                 load_symbol(&library, b"PyObject_GetAttrString\0")?
             },
@@ -181,7 +177,6 @@ impl PythonApi {
             py_long_from_long: unsafe { load_symbol(&library, b"PyLong_FromLong\0")? },
             py_bool_from_long: unsafe { load_symbol(&library, b"PyBool_FromLong\0")? },
             py_build_value: unsafe { load_symbol(&library, b"Py_BuildValue\0")? },
-            py_mem_free: unsafe { load_symbol(&library, b"PyMem_Free\0")? },
             py_mem_raw_malloc: unsafe { load_symbol(&library, b"PyMem_RawMalloc\0")? },
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
