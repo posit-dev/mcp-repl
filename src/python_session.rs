@@ -995,15 +995,17 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
 
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
-    _current_prompt: Option<&str>,
+    current_prompt: Option<&str>,
 ) -> bool {
     #[cfg(target_family = "unix")]
     {
-        request_input_drained(active)
+        prompt_wait_can_complete(active, current_prompt)
+            && (single_line_client_input_prompt(active, current_prompt)
+                || request_input_drained(active))
     }
     #[cfg(windows)]
     {
-        prompt_can_complete_before_repl_turn(active, _current_prompt)
+        prompt_can_complete_before_repl_turn(active, current_prompt)
             && active.byte_len > 0
             && stdin_pending_byte_count() == Some(0)
     }
@@ -1011,6 +1013,21 @@ fn request_prompt_wait_should_complete(
     {
         active.consumed_lines >= active.line_count
     }
+}
+
+#[cfg(target_family = "unix")]
+fn prompt_wait_can_complete(active: &ActiveRequest, current_prompt: Option<&str>) -> bool {
+    active.consumed_lines >= active.line_count
+        || current_prompt.is_some_and(|prompt| prompt != ">>> ")
+        || active
+            .fallback_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt != ">>> ")
+}
+
+#[cfg(target_family = "unix")]
+fn single_line_client_input_prompt(active: &ActiveRequest, current_prompt: Option<&str>) -> bool {
+    active.line_count == 1 && current_prompt.is_some_and(|prompt| prompt != ">>> ")
 }
 
 fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
@@ -1133,18 +1150,19 @@ unsafe extern "C" fn mcp_repl_readline(
                 .into_owned()
         })
         .filter(|prompt| !prompt.is_empty());
+    if let Some(prompt_text) = &prompt_text {
+        set_current_readline_prompt(prompt_text);
+    }
+    handle_input_hook();
     if prompt_text.is_some() {
         unsafe {
             libc::fputs(prompt, stdout);
             libc::fflush(stdout);
         }
     }
-    if let Some(prompt_text) = &prompt_text {
-        set_current_readline_prompt(prompt_text);
-    }
-    handle_input_hook();
 
     let bytes = read_stdio_line_bytes(stdin);
+    note_stdin_line_read(&bytes);
     if prompt_text.is_some() {
         clear_current_readline_prompt();
     }
@@ -1215,7 +1233,9 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
 
     set_current_readline_prompt(prompt_for_sideband.to_str().unwrap_or(""));
     handle_input_hook();
+    emit_output_text(TextStream::Stdout, prompt.as_bytes());
     let bytes = read_stdio_line_bytes(stdin);
+    note_stdin_line_read(&bytes);
     clear_current_readline_prompt();
     if take_interrupt_requested() {
         set_callback_error("Python input interrupted");
@@ -1227,6 +1247,23 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         CStdinLine::Line(String::from_utf8_lossy(&bytes).to_string())
     }
 }
+
+#[cfg(target_family = "unix")]
+fn note_stdin_line_read(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if let Some(active) = guard.active_request.as_mut() {
+        active.consumed_lines = active.consumed_lines.saturating_add(1);
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn note_stdin_line_read(_bytes: &[u8]) {}
 
 fn plot_capable() -> bool {
     let _gil = GilGuard::acquire();
@@ -1581,6 +1618,41 @@ mod tests {
             executable: PathBuf::from(path),
             libpython: PathBuf::from("python.dll"),
         }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn active_request_for_prompt_wait(
+        line_count: usize,
+        consumed_lines: usize,
+        fallback_prompt: Option<&str>,
+    ) -> ActiveRequest {
+        let (reply, _rx) = std::sync::mpsc::channel();
+        ActiveRequest {
+            reply,
+            byte_len: 1,
+            line_count,
+            fallback_prompt: fallback_prompt.map(str::to_string),
+            consumed_lines,
+            skip_next_hook: false,
+            stdin_write_complete: true,
+            repl_turn_finished: false,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_prompt_wait_requires_progress_for_primary_prompt() {
+        let active = active_request_for_prompt_wait(3, 1, None);
+
+        assert!(!prompt_wait_can_complete(&active, None));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_prompt_wait_allows_client_input_prompt() {
+        let active = active_request_for_prompt_wait(1, 0, None);
+
+        assert!(prompt_wait_can_complete(&active, Some("input> ")));
     }
 
     #[test]

@@ -30,13 +30,13 @@ _plot_emitted_this_request = {}
 
 def _input(prompt=""):
     prompt = str(prompt)
-    if prompt:
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
     stdin = sys.stdin
     if isinstance(stdin, McpInputStream):
         line = stdin._readline_for_input(prompt)
     else:
+        if prompt:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
         line = stdin.readline()
     if line == "":
         raise EOFError

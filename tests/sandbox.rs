@@ -894,6 +894,7 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
     }
     if text.contains("requested data wasn't found in the cache")
         || text.contains("Failed to download `")
+        || text.contains("Packages were unavailable because the network was disabled")
     {
         eprintln!("sandbox_reticulate_keras_backend offline cache unavailable; skipping");
         session.cancel().await?;

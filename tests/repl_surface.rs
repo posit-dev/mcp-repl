@@ -7,6 +7,16 @@ use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use tokio::sync::{Mutex, MutexGuard};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+async fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    test_mutex().lock().await
+}
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -78,6 +88,7 @@ fn events_log_path(text: &str) -> Option<PathBuf> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let result = session
@@ -108,6 +119,7 @@ async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let result = session
@@ -140,6 +152,7 @@ async fn pager_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn files_poll_after_timeout_keeps_image_before_later_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let input = concat!(
@@ -183,6 +196,7 @@ async fn files_poll_after_timeout_keeps_image_before_later_stdout() -> TestResul
 
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let input = concat!(
@@ -219,6 +233,7 @@ async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_plot_emit_orders_r_owned_stderr_and_stdout_around_image() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let input = concat!(
@@ -275,6 +290,7 @@ async fn explicit_plot_emit_orders_r_owned_stderr_and_stdout_around_image() -> T
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let input = concat!(
@@ -313,6 +329,7 @@ async fn fork_child_console_output_falls_back_to_raw_stream() -> TestResult<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_stdout_fd_write_falls_back_to_raw_stream() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let input = concat!(
@@ -387,11 +404,13 @@ async fn assert_child_stdout_prompt_text_remains_ordinary_output(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn child_stdout_prompt_text_remains_ordinary_output() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     assert_child_stdout_prompt_text_remains_ordinary_output(common::spawn_server().await?).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     assert_child_stdout_prompt_text_remains_ordinary_output(
         common::spawn_server_with_files().await?,
     )
@@ -400,6 +419,7 @@ async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<
 
 #[tokio::test(flavor = "multi_thread")]
 async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let input = concat!(
@@ -448,6 +468,7 @@ async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResul
 
 #[tokio::test(flavor = "multi_thread")]
 async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let result = session
@@ -480,6 +501,7 @@ async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_reset_clears_state() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let set_var = session
@@ -536,6 +558,7 @@ async fn repl_reset_clears_state() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
     let result = session
@@ -570,6 +593,7 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let result = session
@@ -612,6 +636,7 @@ async fn first_base_plot_emits_one_nontrivial_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multiple_base_plots_in_one_reply_emit_each_image() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let result = session
@@ -657,6 +682,7 @@ async fn multiple_base_plots_in_one_reply_emit_each_image() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn base_plots_above_inline_limit_use_bundle_and_keep_two_anchors() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
     let result = session

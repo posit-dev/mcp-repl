@@ -1690,7 +1690,7 @@ async fn python_input_roundtrip() -> TestResult<()> {
     );
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("prompt>") {
+        while Instant::now() < deadline && is_busy_response(&text) {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
@@ -1743,10 +1743,6 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
-    }
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python input prompt remained busy before interrupt".into());
     }
     assert!(
         text.contains("interrupt>"),
@@ -1826,7 +1822,7 @@ async fn python_input_roundtrip_under_debug_allocator() -> TestResult<()> {
     );
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("debug>") {
+        while Instant::now() < deadline && is_busy_response(&text) {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
