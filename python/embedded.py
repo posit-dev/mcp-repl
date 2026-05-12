@@ -315,9 +315,12 @@ class McpOutputStream:
         self.buffer = McpOutputBuffer(stream)
 
     def write(self, message):
-        text = str(message)
-        self.buffer.write(text.encode(self.encoding, self.errors))
-        return len(text)
+        if not isinstance(message, str):
+            raise TypeError(
+                f"write() argument must be str, not {type(message).__name__}"
+            )
+        self.buffer.write(message.encode(self.encoding, self.errors))
+        return len(message)
 
     def writelines(self, lines):
         for line in lines:

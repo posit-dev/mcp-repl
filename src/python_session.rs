@@ -970,6 +970,7 @@ fn handle_input_hook() {
 
     if let Some(active) = completed {
         emit_plots();
+        flush_original_stdio();
         ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {

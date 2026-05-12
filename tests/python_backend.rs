@@ -856,6 +856,53 @@ print("COUNT", count)
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_text_write_rejects_non_string_values() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+for name in ("stdout", "stderr"):
+    stream = getattr(sys, name)
+    try:
+        stream.write(b"bytes")
+    except TypeError:
+        print("TYPE_ERROR", name)
+    else:
+        print("NO_ERROR", name)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python non-string text write test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("TYPE_ERROR stdout"),
+        "expected stdout.write(bytes) to raise TypeError, got: {text:?}"
+    );
+    assert!(
+        text.contains("TYPE_ERROR stderr"),
+        "expected stderr.write(bytes) to raise TypeError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("NO_ERROR"),
+        "expected non-string writes to fail, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_stdout_stderr_expose_text_stream_methods() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1722,6 +1769,75 @@ async fn python_input_roundtrip() -> TestResult<()> {
     assert!(text.contains("hello"), "expected echo, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_original_stdout_flushes_before_input_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+
+class DeferredStdout:
+    def __init__(self):
+        self.pending = []
+
+    def write(self, message):
+        self.pending.append(message)
+        return len(message)
+
+    def flush(self):
+        while self.pending:
+            sys.stdout.write(self.pending.pop(0))
+
+sys.__stdout__ = DeferredStdout()
+sys.__stdout__.write("ORIGINAL_BEFORE_INPUT\\n")
+value = input("original> ")
+""")
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let mut prompt_text = result_text(&prompt);
+    if is_busy_response(&prompt_text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&prompt_text)
+            && !prompt_text.contains("original>")
+        {
+            sleep(Duration::from_millis(50)).await;
+            prompt_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&prompt_text) {
+        session.cancel().await?;
+        return Err("python original stdout input prompt remained busy".into());
+    }
+
+    let answer = session
+        .write_stdin_raw_with("answer\nprint('VALUE', value)", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        prompt_text.contains("ORIGINAL_BEFORE_INPUT"),
+        "expected original stdout before input() to flush with prompt, got prompt reply: {prompt_text:?}; answer reply: {answer_text:?}"
+    );
+    assert!(
+        prompt_text.contains("original>"),
+        "expected input prompt, got: {prompt_text:?}"
+    );
+    assert!(
+        answer_text.contains("VALUE answer"),
+        "expected input answer to complete, got: {answer_text:?}"
+    );
     Ok(())
 }
 
