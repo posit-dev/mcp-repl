@@ -759,11 +759,7 @@ const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
-const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
-    Duration::from_millis(500)
-} else {
-    Duration::from_millis(120)
-};
+const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
 const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
     Duration::from_millis(80)
 } else {
