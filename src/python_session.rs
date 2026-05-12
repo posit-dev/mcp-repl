@@ -72,6 +72,7 @@ struct PythonRuntimeProbe {
     instsoname: String,
     libdir: String,
     libpl: String,
+    #[cfg(windows)]
     bindir: String,
     pythonframeworkprefix: String,
     pythonframeworkinstalldir: String,
@@ -955,6 +956,7 @@ fn handle_input_hook() {
             } else {
                 request_prompt_wait_should_complete(active, current_prompt_from_state.as_deref())
             };
+            guard.waiting_for_input = true;
             if should_complete {
                 prompt = Some(current_prompt);
                 completed = guard.active_request.take();
@@ -993,7 +995,7 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
 
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
-    current_prompt: Option<&str>,
+    _current_prompt: Option<&str>,
 ) -> bool {
     #[cfg(target_family = "unix")]
     {
@@ -1001,7 +1003,7 @@ fn request_prompt_wait_should_complete(
     }
     #[cfg(windows)]
     {
-        prompt_can_complete_before_repl_turn(active, current_prompt)
+        prompt_can_complete_before_repl_turn(active, _current_prompt)
             && active.byte_len > 0
             && stdin_pending_byte_count() == Some(0)
     }
@@ -1581,25 +1583,6 @@ mod tests {
         }
     }
 
-    fn runtime_probe_for(executable: &str) -> PythonRuntimeProbe {
-        PythonRuntimeProbe {
-            executable: executable.to_string(),
-            base_executable: executable.to_string(),
-            prefix: String::new(),
-            base_prefix: String::new(),
-            exec_prefix: String::new(),
-            base_exec_prefix: String::new(),
-            version: [3, 11],
-            ldlibrary: String::new(),
-            instsoname: String::new(),
-            libdir: String::new(),
-            libpl: String::new(),
-            bindir: String::new(),
-            pythonframeworkprefix: String::new(),
-            pythonframeworkinstalldir: String::new(),
-        }
-    }
-
     #[test]
     fn python_program_selection_falls_back_after_broken_python3_candidate() {
         let selected = select_python_program(
@@ -1656,6 +1639,25 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_libpython_path_finds_windows_dll_next_to_executable() {
+        fn runtime_probe_for(executable: &str) -> PythonRuntimeProbe {
+            PythonRuntimeProbe {
+                executable: executable.to_string(),
+                base_executable: executable.to_string(),
+                prefix: String::new(),
+                base_prefix: String::new(),
+                exec_prefix: String::new(),
+                base_exec_prefix: String::new(),
+                version: [3, 11],
+                ldlibrary: String::new(),
+                instsoname: String::new(),
+                libdir: String::new(),
+                libpl: String::new(),
+                bindir: String::new(),
+                pythonframeworkprefix: String::new(),
+                pythonframeworkinstalldir: String::new(),
+            }
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         let python = temp.path().join("python.exe");
         let dll = temp.path().join("python311.dll");
