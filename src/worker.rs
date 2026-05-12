@@ -188,6 +188,7 @@ fn init_ipc(
                             std::process::exit(0);
                         }
                     }
+                    Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         crate::r_session::clear_pending_input();
                     }

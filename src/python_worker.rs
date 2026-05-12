@@ -110,6 +110,9 @@ fn init_ipc(
                             &request_tx,
                         );
                     }
+                    Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {
+                        python_session::mark_stdin_write_complete();
+                    }
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();
                     }

@@ -271,6 +271,9 @@ trait BackendDriver: Send {
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError>;
+    fn on_input_written(&mut self, _ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        Ok(())
+    }
     fn should_settle_output_after_timeout(
         &self,
         oversized_output: OversizedOutputMode,
@@ -314,6 +317,11 @@ fn driver_announce_stdin_write(
         final_prompt,
     })
     .map_err(WorkerError::Io)
+}
+
+fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
+        .map_err(WorkerError::Io)
 }
 
 fn driver_wait_for_stdin_write_ack(
@@ -464,12 +472,27 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     let code_last = python_line_code_before_comment(trimmed_last).trim_end();
     if code_last.ends_with(':')
         || code_last.trim_start().starts_with('@')
-        || (has_previous_line && last_line.starts_with(char::is_whitespace))
+        || (has_previous_line && python_has_open_block_suite(text))
     {
         Some("... ".to_string())
     } else {
         None
     }
+}
+
+fn python_has_open_block_suite(text: &str) -> bool {
+    let mut has_block_header_since_blank = false;
+    for line in text.lines() {
+        let code = python_line_code_before_comment(line).trim_end();
+        if code.trim().is_empty() {
+            has_block_header_since_blank = false;
+            continue;
+        }
+        if code.ends_with(':') {
+            has_block_header_since_blank = true;
+        }
+    }
+    has_block_header_since_blank
 }
 
 fn python_line_code_before_comment(line: &str) -> &str {
@@ -644,6 +667,10 @@ impl BackendDriver for PythonBackendDriver {
         let final_prompt = python_final_prompt_hint(text);
         driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
         driver_wait_for_stdin_write_ack(ipc, timeout)
+    }
+
+    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        driver_announce_stdin_write_complete(ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -2217,6 +2244,7 @@ impl WorkerManager {
             .as_mut()
             .expect("worker process should be available")
             .write_stdin_payload(payload, remaining)?;
+        self.driver.on_input_written(&ipc)?;
         Ok(RequestState {
             timeout: worker_timeout,
             started_at,

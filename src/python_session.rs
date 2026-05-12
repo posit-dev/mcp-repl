@@ -192,6 +192,36 @@ pub(crate) fn interrupt() {
     }
 }
 
+pub(crate) fn mark_stdin_write_complete() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut completed = None;
+    let mut prompt = None;
+    {
+        let mut guard = state.inner.lock().unwrap();
+        let current_prompt_from_state = guard.current_prompt.clone();
+        let waiting_for_input = guard.waiting_for_input;
+        if let Some(active) = guard.active_request.as_mut() {
+            active.stdin_write_complete = true;
+            if waiting_for_input && request_input_drained(active) {
+                prompt = Some(
+                    current_prompt_from_state
+                        .or_else(|| active.fallback_prompt.clone())
+                        .unwrap_or_else(|| ">>> ".to_string()),
+                );
+                completed = guard.active_request.take();
+            }
+        }
+    }
+
+    if let Some(active) = completed {
+        emit_plots();
+        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        complete_active_request(state, Some(active), false);
+    }
+}
+
 fn finish_active_request_at_next_read() {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -301,6 +331,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     };
 
     if let Err(err) = configure_python(api) {
+        let _gil = GilGuard::acquire();
         api.print_error();
         init.mark_failed(err.clone());
         return Err(err);
@@ -645,6 +676,7 @@ fn begin_tracked_request(
         fallback_prompt,
         consumed_lines: 0,
         skip_next_hook,
+        stdin_write_complete: false,
     });
     guard.plot_reset_pending = true;
     state.cvar.notify_all();
@@ -698,6 +730,7 @@ fn handle_input_hook() {
     }
 
     if let Some(active) = completed {
+        emit_plots();
         ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {
@@ -711,7 +744,7 @@ unsafe extern "C" fn pyos_input_hook() -> c_int {
 }
 
 fn request_input_drained(active: &ActiveRequest) -> bool {
-    if active.byte_len == 0 || active.consumed_lines == 0 {
+    if !active.stdin_write_complete || active.byte_len == 0 || active.consumed_lines == 0 {
         return false;
     }
     stdin_pending_byte_count() == Some(0)
@@ -925,6 +958,7 @@ struct ActiveRequest {
     fallback_prompt: Option<String>,
     consumed_lines: usize,
     skip_next_hook: bool,
+    stdin_write_complete: bool,
 }
 
 impl SessionState {

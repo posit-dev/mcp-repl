@@ -93,6 +93,7 @@ pub enum ServerToWorkerIpcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_prompt: Option<String>,
     },
+    StdinWriteComplete,
     Interrupt,
     SessionEnd,
 }

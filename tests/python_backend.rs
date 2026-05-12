@@ -556,6 +556,62 @@ async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_closed_indented_expression_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("print(\n    'CLOSED_INDENT')", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("CLOSED_INDENT"),
+        "expected closed indented expression to execute, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected closed indented expression to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected closed indented expression not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut filler = String::new();
+    for idx in 0..40_000 {
+        filler.push_str("# filler ");
+        filler.push_str(&idx.to_string());
+        filler.push('\n');
+    }
+    let input = format!(
+        "import os\nchunk = os.read(0, 1048576)\n{filler}print('RAW_LARGE_DONE', len(chunk))"
+    );
+    let result = session.write_stdin_raw_with(&input, Some(20.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("RAW_LARGE_DONE"),
+        "expected large raw fd read request to complete after the full payload, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

@@ -520,6 +520,42 @@ plt.scatter([1, 2, 3], [3, 2, 1])"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_plot_before_input_flushes_with_input_prompt() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        r#"{}
+plt.figure(191)
+plt.clf()
+plt.gcf().text(0.5, 0.5, 'prompt plot')
+answer = input('next? ')"#,
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "plot-before-input request reported an error: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected plot before input() to emit one image with the prompt response, got {images:?}; response text: {}",
+        result_text(&result)
+    );
+    assert_eq!(images[0].mime_type, "image/png");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
