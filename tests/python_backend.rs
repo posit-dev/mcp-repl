@@ -1475,6 +1475,34 @@ async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_syntax_error_dedent_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    print(1)\nprint(2)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SyntaxError"),
+        "expected dedented incomplete suite to raise SyntaxError, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected dedented SyntaxError to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected dedented SyntaxError not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_stdout_replaces_lone_surrogates() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1614,6 +1642,42 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     assert!(
         follow_up_text.contains("AFTER_INPUT_INTERRUPT"),
         "expected follow-up to run after input prompt interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with("value = input()", Some(5.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        !is_busy_response(&prompt_text),
+        "expected empty Python input prompt to complete the first request, got: {prompt_text:?}"
+    );
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected empty input prompt interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_EMPTY_INPUT_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_EMPTY_INPUT_INTERRUPT"),
+        "expected follow-up to run after empty input prompt interrupt, got: {follow_up_text:?}"
     );
     Ok(())
 }

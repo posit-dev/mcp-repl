@@ -481,20 +481,33 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
 }
 
 fn python_has_open_block_suite(text: &str) -> bool {
-    let mut has_block_header_since_blank = false;
+    let mut block_indents = Vec::new();
     for line in text.lines() {
         let code = python_line_code_before_comment(line).trim_end();
         if code.trim().is_empty() {
             if line.trim().is_empty() {
-                has_block_header_since_blank = false;
+                block_indents.clear();
             }
             continue;
         }
+        let indent = python_line_indent(line);
+        while block_indents
+            .last()
+            .is_some_and(|block_indent| indent <= *block_indent)
+        {
+            block_indents.pop();
+        }
         if code.ends_with(':') {
-            has_block_header_since_blank = true;
+            block_indents.push(indent);
         }
     }
-    has_block_header_since_blank
+    !block_indents.is_empty()
+}
+
+fn python_line_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count()
 }
 
 fn python_line_code_before_comment(line: &str) -> &str {
@@ -743,7 +756,7 @@ const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
 const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
-    let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
+    let mut prompt = ipc.try_take_prompt();
     let mut prompt_variants = ipc.take_prompt_history();
     let mut echo_event_count = ipc.pending_echo_event_count();
     let mut saw_late_echo_event = false;
@@ -752,7 +765,7 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
     let mut stable_for = Duration::from_millis(0);
     while start.elapsed() < COMPLETION_METADATA_SETTLE_MAX {
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
-        let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
+        let next_prompt = ipc.try_take_prompt();
         let mut next_prompt_variants = ipc.take_prompt_history();
         let next_echo_event_count = ipc.pending_echo_event_count();
         if next_echo_event_count > echo_event_count {
@@ -1850,13 +1863,13 @@ impl WorkerManager {
         }
 
         let session_end = completion.session_end_seen;
-        let resolved_prompt = normalize_prompt(completion.prompt.clone());
-        let resolved_prompt = if session_end || timed_out {
+        let raw_prompt = if session_end || timed_out {
             None
         } else {
-            resolved_prompt
+            completion.prompt.clone()
         };
-        self.remember_prompt(resolved_prompt.clone());
+        let resolved_prompt = normalize_prompt(raw_prompt.clone());
+        self.remember_prompt(raw_prompt);
         let has_fallback_input_transcript = fallback_input_transcript.is_some();
         let trim_enabled = !timed_out
             && if completion.echo_events.is_empty() {
@@ -2030,13 +2043,13 @@ impl WorkerManager {
         );
 
         let session_end = completion.session_end_seen;
-        let resolved_prompt = normalize_prompt(completion.prompt.clone());
-        let resolved_prompt = if session_end || timed_out {
+        let raw_prompt = if session_end || timed_out {
             None
         } else {
-            resolved_prompt
+            completion.prompt.clone()
         };
-        self.remember_prompt(resolved_prompt.clone());
+        let resolved_prompt = normalize_prompt(raw_prompt.clone());
+        self.remember_prompt(raw_prompt);
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }
@@ -2341,12 +2354,13 @@ impl WorkerManager {
                 let formatted = self.drain_final_formatted_output();
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
-                let resolved_prompt = if session_end {
+                let raw_prompt = if session_end {
                     None
                 } else {
-                    normalize_prompt(completion.prompt.clone())
+                    completion.prompt.clone()
                 };
-                self.remember_prompt(resolved_prompt.clone());
+                let resolved_prompt = normalize_prompt(raw_prompt.clone());
+                self.remember_prompt(raw_prompt);
                 let fallback_input = self.take_input_fallback(&completion);
                 let fallback_input_transcript = fallback_input.transcript.clone();
                 let has_fallback_input_transcript = fallback_input_transcript.is_some();
@@ -2504,12 +2518,13 @@ impl WorkerManager {
                     buffer,
                     last_range,
                 );
-                let resolved_prompt = if session_end {
+                let raw_prompt = if session_end {
                     None
                 } else {
-                    normalize_prompt(completion.prompt.clone())
+                    completion.prompt.clone()
                 };
-                self.remember_prompt(resolved_prompt.clone());
+                let resolved_prompt = normalize_prompt(raw_prompt.clone());
+                self.remember_prompt(raw_prompt);
                 if self.pager.is_active() && !session_end {
                     self.pager_prompt = resolved_prompt.clone();
                 }
@@ -3025,13 +3040,13 @@ impl WorkerManager {
         }
 
         let session_end = self.session_end_seen;
-        let resolved_prompt = normalize_prompt(prompt.clone());
-        let resolved_prompt = if session_end || timed_out {
+        let raw_prompt = if session_end || timed_out {
             None
         } else {
-            resolved_prompt
+            prompt.clone()
         };
-        self.remember_prompt(resolved_prompt.clone());
+        let resolved_prompt = normalize_prompt(raw_prompt.clone());
+        self.remember_prompt(raw_prompt);
         if !session_end {
             if !timed_out {
                 reconcile_trailing_completion_prompt(
@@ -3217,13 +3232,13 @@ impl WorkerManager {
         );
 
         let session_end = self.session_end_seen;
-        let resolved_prompt = normalize_prompt(prompt.clone());
-        let resolved_prompt = if session_end || timed_out {
+        let raw_prompt = if session_end || timed_out {
             None
         } else {
-            resolved_prompt
+            prompt.clone()
         };
-        self.remember_prompt(resolved_prompt.clone());
+        let resolved_prompt = normalize_prompt(raw_prompt.clone());
+        self.remember_prompt(raw_prompt);
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }
@@ -3706,11 +3721,11 @@ impl WorkerManager {
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
-        let prompt = normalize_prompt(prompt);
         if matches!(self.backend, Backend::Python) {
             self.python_prompt_waiting_for_input =
                 prompt.as_deref().is_some_and(|prompt| prompt != ">>> ");
         }
+        let prompt = normalize_prompt(prompt);
         if let Some(prompt) = prompt {
             self.last_prompt = Some(prompt);
         }
