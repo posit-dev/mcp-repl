@@ -456,16 +456,16 @@ impl PythonBackendDriver {
 }
 
 fn python_final_prompt_hint(text: &str) -> Option<String> {
-    if text_ends_with_blank_line(text) {
-        return None;
-    }
-    let text = text.trim_end_matches(['\r', '\n']);
     if text.trim().is_empty() {
         return None;
     }
     if python_requires_continuation(text) {
         return Some("... ".to_string());
     }
+    if text_ends_with_blank_line(text) {
+        return None;
+    }
+    let text = text.trim_end_matches(['\r', '\n']);
     let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
     let has_previous_line = text.contains(['\n', '\r']);
     let trimmed_last = last_line.trim_end();

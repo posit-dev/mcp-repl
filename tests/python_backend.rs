@@ -556,6 +556,50 @@ async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_blank_line_inside_bracket_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("x = [\n\n", Some(5.0)).await?;
+    let text = result_text(&result);
+
+    assert!(
+        !is_busy_response(&text),
+        "expected blank line inside bracket to return a continuation prompt, got: {text:?}"
+    );
+    assert!(
+        text.contains("... "),
+        "expected blank line inside bracket to report continuation prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains(">>> "),
+        "expected blank line inside bracket not to report primary prompt, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("]\nprint('BLANK_LIST', x)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected follow-up line after blank continuation not to stay busy, got: {text:?}"
+    );
+    assert!(
+        text.contains("BLANK_LIST []"),
+        "expected follow-up line after blank continuation to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected completed follow-up line to report primary prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_closed_indented_expression_reports_primary_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

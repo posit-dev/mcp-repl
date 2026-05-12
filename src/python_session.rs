@@ -1009,11 +1009,7 @@ fn complete_active_request_with_options(
     state: &Arc<SessionState>,
     active: Option<ActiveRequest>,
     emit_session_end: bool,
-    flush_stdio: bool,
 ) {
-    if active.is_some() && flush_stdio {
-        flush_original_stdio();
-    }
     if let Some(active) = active {
         let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
@@ -1028,7 +1024,7 @@ fn complete_active_request(
     active: Option<ActiveRequest>,
     emit_session_end: bool,
 ) {
-    complete_active_request_with_options(state, active, emit_session_end, true);
+    complete_active_request_with_options(state, active, emit_session_end);
 }
 
 fn finish_session_end() {
@@ -1039,7 +1035,7 @@ fn finish_session_end() {
     guard.shutdown = true;
     let active = guard.active_request.take();
     drop(guard);
-    complete_active_request_with_options(state, active, should_emit, false);
+    complete_active_request_with_options(state, active, should_emit);
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
