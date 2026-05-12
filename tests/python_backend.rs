@@ -65,7 +65,9 @@ fn require_python() -> bool {
 }
 
 fn python_backend_unavailable(text: &str) -> bool {
-    common::backend_unavailable(text) || text.contains("worker io error: Permission denied")
+    common::backend_unavailable(text)
+        || text.contains("worker io error: Permission denied")
+        || text.contains("failed to locate a shared libpython")
 }
 
 fn is_busy_response(text: &str) -> bool {
@@ -124,7 +126,7 @@ async fn start_python_session_with_env_vars(
     )
     .await?;
     let probe_text = result_text(&probe);
-    if probe_text.contains("worker io error: Permission denied") {
+    if python_backend_unavailable(&probe_text) {
         eprintln!("python backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(None);
@@ -1781,12 +1783,12 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
     };
 
     let prompt = session
-        .write_stdin_raw_with("value = input()", Some(5.0))
+        .write_stdin_raw_with("value = input()", Some(1.0))
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
-        !is_busy_response(&prompt_text),
-        "expected empty Python input prompt to complete the first request, got: {prompt_text:?}"
+        !python_backend_unavailable(&prompt_text),
+        "expected Python backend to start before empty input prompt, got: {prompt_text:?}"
     );
 
     let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;

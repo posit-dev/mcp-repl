@@ -7,7 +7,9 @@ use regex_lite::Regex;
 
 #[cfg(not(windows))]
 fn python_backend_unavailable(text: &str) -> bool {
-    common::backend_unavailable(text) || text.contains("worker io error: Permission denied")
+    common::backend_unavailable(text)
+        || text.contains("worker io error: Permission denied")
+        || text.contains("failed to locate a shared libpython")
 }
 
 #[cfg(not(windows))]
