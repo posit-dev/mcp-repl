@@ -459,6 +459,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
+        drop_stdin_write_acks(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -1548,6 +1549,12 @@ fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     }
 }
 
+fn drop_stdin_write_acks(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinWriteAck));
+}
+
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
     let Some(since) = guard.readline_unmatched_since else {
         return false;
@@ -1672,9 +1679,9 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, OUTPUT_TEXT_IPC_CHUNK_BYTES, OutputCriticalIpcWriter,
-        ServerIpcConnection, ServerToWorkerIpcMessage, WorkerIpcConnection,
-        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
+        IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
+        OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
+        WorkerIpcConnection, WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -1822,6 +1829,52 @@ mod protocol_tests {
             parsed.is_err(),
             "stdin_write_ack should not deserialize as a server-to-worker message"
         );
+    }
+
+    #[test]
+    fn begin_request_drops_stale_stdin_write_acks() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("send stale ack");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut guard = server.inbox.lock().unwrap();
+        while !guard
+            .queue
+            .iter()
+            .any(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "expected stale stdin_write_ack to reach server inbox"
+            );
+            let (next_guard, timeout_res) = server.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            assert!(
+                !timeout_res.timed_out(),
+                "expected stale stdin_write_ack to reach server inbox"
+            );
+        }
+        drop(guard);
+
+        server.begin_request();
+        assert!(
+            matches!(
+                server.wait_for_stdin_write_ack(Duration::ZERO),
+                Err(IpcWaitError::Timeout)
+            ),
+            "begin_request should discard stale stdin_write_ack messages"
+        );
+
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("send fresh ack");
+        server
+            .wait_for_stdin_write_ack(Duration::from_secs(1))
+            .expect("fresh ack should still be accepted");
     }
 
     #[test]
