@@ -13,8 +13,6 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
-
 use crate::backend::Backend;
 #[cfg(target_family = "windows")]
 use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
@@ -240,8 +238,6 @@ const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
     "[repl] image update from previous request shown as a new image\n";
 const PRECHECKED_FOLLOW_UP_REQUIRES_META_MESSAGE: &str =
     "worker follow-up needs current sandbox metadata after precheck";
-const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
-
 fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
     match backend {
         Backend::R => OutputTextSource::Ipc,
@@ -309,11 +305,13 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), W
 fn driver_announce_stdin_write(
     byte_len: usize,
     line_count: usize,
+    final_prompt: Option<String>,
     ipc: &ServerIpcConnection,
 ) -> Result<(), WorkerError> {
     ipc.send(ServerToWorkerIpcMessage::StdinWrite {
         byte_len,
         line_count,
+        final_prompt,
     })
     .map_err(WorkerError::Io)
 }
@@ -401,7 +399,7 @@ impl BackendDriver for RBackendDriver {
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
         driver_on_input_start(text, ipc)?;
-        driver_announce_stdin_write(payload.len(), 0, ipc)
+        driver_announce_stdin_write(payload.len(), 0, None, ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -449,6 +447,121 @@ impl PythonBackendDriver {
     }
 }
 
+fn python_final_prompt_hint(text: &str) -> Option<String> {
+    if text_ends_with_blank_line(text) {
+        return None;
+    }
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.is_empty() {
+        return None;
+    }
+    if python_requires_continuation(text) {
+        return Some("... ".to_string());
+    }
+    let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
+    let trimmed_last = last_line.trim_end();
+    if trimmed_last.ends_with(':') || last_line.starts_with(char::is_whitespace) {
+        Some("... ".to_string())
+    } else {
+        None
+    }
+}
+
+fn python_requires_continuation(text: &str) -> bool {
+    has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
+}
+
+fn final_line_continues_with_backslash(text: &str) -> bool {
+    let Some(line) = text.lines().last() else {
+        return false;
+    };
+    line.trim_end()
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn has_unclosed_python_group_or_string(text: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<(char, bool)> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some((delimiter, triple)) = quote {
+            if triple {
+                if ch == delimiter && take_next_two(&mut chars, delimiter) {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => {
+                for next in chars.by_ref() {
+                    if matches!(next, '\n' | '\r') {
+                        break;
+                    }
+                }
+            }
+            '\'' | '"' => {
+                let triple = take_next_two(&mut chars, ch);
+                quote = Some((ch, triple));
+            }
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ')' | ']' | '}' if stack.last() == Some(&ch) => {
+                stack.pop();
+            }
+            ')' | ']' | '}' => {}
+            _ => {}
+        }
+    }
+
+    quote.is_some() || !stack.is_empty()
+}
+
+fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
+    let mut clone = chars.clone();
+    if clone.next() != Some(expected) || clone.next() != Some(expected) {
+        return false;
+    }
+    chars.next();
+    chars.next();
+    true
+}
+
+fn text_ends_with_blank_line(text: &str) -> bool {
+    let Some(text) = strip_one_line_ending(text) else {
+        return false;
+    };
+    text.ends_with('\n') || text.ends_with('\r')
+}
+
+fn strip_one_line_ending(text: &str) -> Option<&str> {
+    text.strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .or_else(|| text.strip_suffix('\r'))
+}
+
 impl BackendDriver for PythonBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
         let mut payload = text.as_bytes().to_vec();
@@ -467,7 +580,8 @@ impl BackendDriver for PythonBackendDriver {
     ) -> Result<(), WorkerError> {
         driver_on_input_start(text, ipc)?;
         let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
-        driver_announce_stdin_write(payload.len(), line_count, ipc)?;
+        let final_prompt = python_final_prompt_hint(text);
+        driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
         driver_wait_for_stdin_write_ack(ipc, timeout)
     }
 
@@ -5018,94 +5132,6 @@ struct WorkerSpawnContext<'a> {
     prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
 
-struct PythonRuntimeConfig {
-    executable: PathBuf,
-    libpython: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct PythonRuntimeProbe {
-    executable: String,
-    base_executable: String,
-    prefix: String,
-    base_prefix: String,
-    exec_prefix: String,
-    base_exec_prefix: String,
-    version: [u64; 2],
-    ldlibrary: String,
-    instsoname: String,
-    libdir: String,
-    libpl: String,
-    pythonframeworkprefix: String,
-    pythonframeworkinstalldir: String,
-}
-
-fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    push_python_library_candidates(&mut candidates, probe, &probe.ldlibrary);
-    if probe.instsoname != probe.ldlibrary {
-        push_python_library_candidates(&mut candidates, probe, &probe.instsoname);
-    }
-
-    let version = format!("{}.{}", probe.version[0], probe.version[1]);
-    for root in [
-        probe.base_exec_prefix.as_str(),
-        probe.exec_prefix.as_str(),
-        probe.base_prefix.as_str(),
-        probe.prefix.as_str(),
-    ] {
-        if root.is_empty() {
-            continue;
-        }
-        candidates.push(
-            Path::new(root)
-                .join("lib")
-                .join(format!("libpython{version}.so")),
-        );
-        candidates.push(
-            Path::new(root)
-                .join("lib")
-                .join(format!("libpython{version}.dylib")),
-        );
-        candidates.push(Path::new(root).join("Python"));
-    }
-
-    candidates.into_iter().find(|candidate| candidate.is_file())
-}
-
-fn push_python_library_candidates(
-    candidates: &mut Vec<PathBuf>,
-    probe: &PythonRuntimeProbe,
-    library: &str,
-) {
-    let Some(library) = non_empty(library) else {
-        return;
-    };
-    let path = Path::new(library);
-    if path.is_absolute() {
-        candidates.push(path.to_path_buf());
-    }
-    for root in [
-        probe.libdir.as_str(),
-        probe.libpl.as_str(),
-        probe.pythonframeworkprefix.as_str(),
-        probe.pythonframeworkinstalldir.as_str(),
-    ] {
-        if let Some(root) = non_empty(root) {
-            candidates.push(Path::new(root).join(library));
-        }
-    }
-}
-
-fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    values.into_iter().find_map(non_empty)
-}
-
-fn non_empty(value: &str) -> Option<&str> {
-    let value = value.trim();
-    if value.is_empty() { None } else { Some(value) }
-}
-
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
     done_rx: mpsc::Receiver<()>,
@@ -5139,143 +5165,6 @@ impl OutputReader {
 }
 
 impl WorkerProcess {
-    const PYTHON_PROGRAM: &'static str = "python3";
-    const PYTHON_PROGRAM_FALLBACK: &'static str = "python";
-    const PYTHON_CONFIG_SNIPPET: &'static str = r#"
-import json
-import sys
-import sysconfig
-
-def var(name):
-    value = sysconfig.get_config_var(name)
-    return "" if value is None else str(value)
-
-print(json.dumps({
-    "executable": sys.executable,
-    "base_executable": getattr(sys, "_base_executable", sys.executable),
-    "prefix": sys.prefix,
-    "base_prefix": sys.base_prefix,
-    "exec_prefix": sys.exec_prefix,
-    "base_exec_prefix": sys.base_exec_prefix,
-    "version": [sys.version_info[0], sys.version_info[1]],
-    "ldlibrary": var("LDLIBRARY"),
-    "instsoname": var("INSTSONAME"),
-    "libdir": var("LIBDIR"),
-    "libpl": var("LIBPL"),
-    "pythonframeworkprefix": var("PYTHONFRAMEWORKPREFIX"),
-    "pythonframeworkinstalldir": var("PYTHONFRAMEWORKINSTALLDIR"),
-}))
-"#;
-
-    fn resolve_python_program() -> PathBuf {
-        // Prefer a local `.venv` (common with uv and other tooling) so child Python processes
-        // launched from the embedded backend behave like they did with the old subprocess backend.
-        fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let stop_at_home = home
-                .as_ref()
-                .filter(|home| start.starts_with(home))
-                .cloned();
-
-            let mut dir = start.to_path_buf();
-            loop {
-                for candidate in [
-                    dir.join(".venv").join("bin").join("python"),
-                    dir.join(".venv").join("bin").join("python3"),
-                ] {
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-
-                if let Some(stop) = stop_at_home.as_ref()
-                    && &dir == stop
-                {
-                    break;
-                }
-
-                let Some(parent) = dir.parent() else {
-                    break;
-                };
-                if parent == dir {
-                    break;
-                }
-                dir = parent.to_path_buf();
-            }
-            None
-        }
-
-        fn find_program_on_path(name: &str) -> Option<PathBuf> {
-            let path = std::env::var_os("PATH")?;
-            for dir in std::env::split_paths(&path) {
-                let candidate = dir.join(name);
-                if !candidate.is_file() {
-                    continue;
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(meta) = std::fs::metadata(&candidate)
-                        && meta.permissions().mode() & 0o111 != 0
-                    {
-                        return Some(candidate);
-                    }
-                }
-
-                #[cfg(not(unix))]
-                {
-                    return Some(candidate);
-                }
-            }
-            None
-        }
-
-        std::env::current_dir()
-            .ok()
-            .and_then(|cwd| find_dot_venv_python(&cwd))
-            .or_else(|| find_program_on_path(Self::PYTHON_PROGRAM))
-            .or_else(|| find_program_on_path(Self::PYTHON_PROGRAM_FALLBACK))
-            .unwrap_or_else(|| PathBuf::from(Self::PYTHON_PROGRAM))
-    }
-
-    fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, WorkerError> {
-        let executable = Self::resolve_python_program();
-        let output = Command::new(&executable)
-            .arg("-c")
-            .arg(Self::PYTHON_CONFIG_SNIPPET)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(WorkerError::Io)?;
-        if !output.status.success() {
-            return Err(WorkerError::Protocol(format!(
-                "failed to query Python runtime config from {}: {}",
-                executable.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let probe: PythonRuntimeProbe = serde_json::from_slice(&output.stdout).map_err(|err| {
-            WorkerError::Protocol(format!(
-                "failed to parse Python runtime config from {}: {err}",
-                executable.display()
-            ))
-        })?;
-        let libpython = resolve_libpython_path(&probe).ok_or_else(|| {
-            WorkerError::Protocol(format!(
-                "failed to locate a shared libpython for {}",
-                executable.display()
-            ))
-        })?;
-        let executable =
-            first_non_empty([probe.executable.as_str(), probe.base_executable.as_str()])
-                .map(PathBuf::from)
-                .unwrap_or(executable);
-        Ok(PythonRuntimeConfig {
-            executable,
-            libpython,
-        })
-    }
-
     fn spawn(
         backend: Backend,
         exe_path: &Path,
@@ -5463,9 +5352,10 @@ print(json.dumps({
             },
         );
         if matches!(backend, Backend::Python) {
-            let python = Self::resolve_python_runtime_config()?;
-            command.env(PYTHON_EXECUTABLE_ENV, python.executable);
-            command.env(crate::python_session::PYTHON_LIB_ENV, python.libpython);
+            command.env(
+                crate::python_session::PYTHON_EXECUTABLE_ENV,
+                crate::python_session::resolve_python_program(),
+            );
         }
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {

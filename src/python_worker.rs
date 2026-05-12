@@ -47,7 +47,9 @@ impl Default for WorkerState {
 }
 
 struct QueuedRequest {
+    byte_len: usize,
     line_count: usize,
+    final_prompt: Option<String>,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,10 +98,17 @@ fn init_ipc(
             loop {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::StdinWrite {
-                        byte_len: _,
+                        byte_len,
                         line_count,
+                        final_prompt,
                     }) => {
-                        handle_write_stdin(line_count, state.clone(), &request_tx);
+                        handle_write_stdin(
+                            byte_len,
+                            line_count,
+                            final_prompt,
+                            state.clone(),
+                            &request_tx,
+                        );
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();
@@ -122,7 +131,8 @@ fn init_ipc(
 
 fn request_loop(rx: mpsc::Receiver<QueuedRequest>, state: Arc<WorkerState>) {
     for request in rx {
-        let result = write_stdin_request(request.line_count);
+        let result =
+            write_stdin_request(request.byte_len, request.line_count, request.final_prompt);
         if let Err(err) = result {
             emit_stderr_message(&err.message);
             emit_session_end();
@@ -132,7 +142,9 @@ fn request_loop(rx: mpsc::Receiver<QueuedRequest>, state: Arc<WorkerState>) {
 }
 
 fn handle_write_stdin(
+    byte_len: usize,
     line_count: usize,
+    final_prompt: Option<String>,
     state: Arc<WorkerState>,
     request_tx: &mpsc::SyncSender<QueuedRequest>,
 ) {
@@ -145,7 +157,11 @@ fn handle_write_stdin(
         return;
     }
 
-    if let Err(err) = request_tx.try_send(QueuedRequest { line_count }) {
+    if let Err(err) = request_tx.try_send(QueuedRequest {
+        byte_len,
+        line_count,
+        final_prompt,
+    }) {
         state.mark_idle();
         let message = match err {
             mpsc::TrySendError::Full(_) => "worker is busy; request already running".to_string(),
@@ -170,11 +186,15 @@ impl WorkerExecError {
     }
 }
 
-fn write_stdin_request(line_count: usize) -> Result<(), WorkerExecError> {
+fn write_stdin_request(
+    byte_len: usize,
+    line_count: usize,
+    final_prompt: Option<String>,
+) -> Result<(), WorkerExecError> {
     let session = wait_for_python_session()
         .map_err(|err| WorkerExecError::new(format!("failed to start Python session: {err}")))?;
     let reply_rx = session
-        .begin_request(line_count)
+        .begin_request(byte_len, line_count, final_prompt)
         .map_err(WorkerExecError::new)?;
     emit_stdin_write_ack();
     reply_rx

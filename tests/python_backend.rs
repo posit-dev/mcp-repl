@@ -299,12 +299,16 @@ async fn python_backend_runs_inside_mcp_repl_worker() -> TestResult<()> {
 
     let result = session
         .write_stdin_raw_with(
-            r#"import os, pathlib, subprocess, sys
+            r#"import os, pathlib, sys
 if sys.platform == "linux":
     print(pathlib.Path(os.readlink("/proc/self/exe")).name)
 elif sys.platform == "darwin":
-    command = ["/bin/ps", "-p", str(os.getpid()), "-o", "comm="]
-    print(pathlib.Path(subprocess.check_output(command, text=True).strip()).name)
+    import ctypes, ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    buf = ctypes.create_string_buffer(4096)
+    if libc.proc_pidpath(os.getpid(), buf, len(buf)) <= 0:
+        raise OSError(ctypes.get_errno(), "proc_pidpath failed")
+    print(pathlib.Path(os.fsdecode(buf.value)).name)
 else:
     print(pathlib.Path(sys.argv[0]).name)
 
@@ -320,6 +324,329 @@ else:
     assert!(
         !text.contains("mcp-repl-python-worker"),
         "did not expect a separate Python worker binary, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdin_supports_file_like_reads() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+first = sys.stdin.read(3)
+abcdef
+second = sys.stdin.readline(2)
+third = sys.stdin.readline()
+print("READS", repr(first), repr(second), repr(third))
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.stdin file-like read test remained busy".into());
+    }
+    assert!(
+        text.contains(r#"READS 'abc' 'de' 'f\n'"#),
+        "expected sys.stdin read APIs to preserve buffered text, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdio_supports_binary_buffers() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+out_count = sys.stdout.buffer.write(b"BINOUT\n")
+sys.stdout.buffer.flush()
+err_count = sys.stderr.buffer.write(b"BINERR\n")
+data = sys.stdin.buffer.read(4)
+abc
+line = sys.stdin.buffer.readline()
+def
+print("BUFFERS", out_count, err_count, data, line)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python binary stdio buffer test remained busy".into());
+    }
+    assert!(
+        text.contains("BINOUT"),
+        "expected stdout.buffer bytes, got: {text:?}"
+    );
+    assert!(
+        text.contains("BINERR"),
+        "expected stderr.buffer bytes, got: {text:?}"
+    );
+    assert!(
+        text.contains(r#"BUFFERS 7 7 b'abc\n' b'def\n'"#),
+        "expected binary stdio buffers to read and write bytes, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_path_includes_current_working_directory() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let temp = tempdir()?;
+    fs::write(
+        temp.path().join("local_import_probe.py"),
+        "VALUE = 'local-ok'\n",
+    )?;
+    let cwd = serde_json::to_string(temp.path().to_str().ok_or("temp path must be utf-8")?)?;
+    let result = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os
+os.chdir({cwd})
+import local_import_probe
+print("LOCAL_IMPORT", local_import_probe.VALUE)
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python local cwd import test remained busy".into());
+    }
+    assert!(
+        text.contains("LOCAL_IMPORT local-ok"),
+        "expected cwd import to resolve local module, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_stdin_buffer_read_counts_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+first = sys.stdin.buffer.read(1)
+é
+rest = sys.stdin.buffer.read(2)
+print("BYTE_READ", first, rest, len(first), len(rest))
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python stdin buffer byte count test remained busy".into());
+    }
+    assert!(
+        text.contains(r#"BYTE_READ b'\xc3' b'\xa9\n' 1 2"#),
+        "expected stdin.buffer reads to count bytes, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_completes_request() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 5)
+abcd
+print("RAW_FD", data)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err(format!("python raw fd stdin read remained busy: {text:?}").into());
+    }
+    assert!(
+        text.contains(r#"RAW_FD b'abcd\n'"#),
+        "expected raw fd stdin read output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("x = (", Some(5.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("... "),
+        "expected bracket continuation prompt, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    print('BLOCK_DONE')\n\n", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python terminated block remained busy".into());
+    }
+    assert!(
+        text.contains("BLOCK_DONE"),
+        "expected terminated block output, got: {text:?}"
+    );
+    assert!(
+        !text.contains(r#"prompt: "... ""#),
+        "expected primary prompt after terminated block, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("import sys; sys.exit(7)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.exit() remained busy".into());
+    }
+    assert!(
+        !text.contains("Traceback") && !text.contains("SystemExit"),
+        "expected sys.exit() to terminate without traceback, got: {text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_SYS_EXIT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        session.cancel().await?;
+        return Err("python follow-up after sys.exit() remained busy".into());
+    }
+    assert!(
+        follow_up_text.contains("AFTER_SYS_EXIT"),
+        "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_reads_from_sys_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import io, sys
+sys.stdin = io.StringIO("replacement\n")
+print("INPUT", input())
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python input() sys.stdin replacement test remained busy".into());
+    }
+    assert!(
+        text.contains("INPUT replacement"),
+        "expected input() to read from sys.stdin, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_text_write_returns_character_count() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+count = sys.stdout.write("é")
+print("COUNT", count)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python text write count test remained busy".into());
+    }
+    assert!(
+        text.contains("COUNT 1"),
+        "expected TextIO.write() to return character count, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -845,6 +1172,26 @@ async fn python_buffered_multiline_prompt_does_not_complete_request_early() -> T
     assert!(
         text.contains("DONE"),
         "expected buffered multiline request to include final output, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_incomplete_block_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    print('x')", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("... "),
+        "expected incomplete Python block to report continuation prompt, got: {text:?}"
     );
     Ok(())
 }

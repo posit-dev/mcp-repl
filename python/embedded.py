@@ -12,10 +12,8 @@ import _mcp_repl
 
 os.environ.setdefault("MPLBACKEND", "agg")
 sys.argv = ["mcp-repl"]
-_executable = _mcp_repl.executable()
-if _executable:
-    sys.executable = _executable
-    sys._base_executable = _executable
+if "" not in sys.path:
+    sys.path.insert(0, "")
 
 _plot_capable = importlib.util.find_spec("matplotlib") is not None
 _plot_modules_loaded = False
@@ -35,8 +33,12 @@ def _input(prompt=""):
     if prompt:
         sys.stdout.write(prompt)
         sys.stdout.flush()
-    line = _mcp_repl.readline(prompt)
-    if line is None:
+    stdin = sys.stdin
+    if isinstance(stdin, McpInputStream):
+        line = stdin._readline_for_input(prompt)
+    else:
+        line = stdin.readline()
+    if line == "":
         raise EOFError
     if line.endswith("\n"):
         line = line[:-1]
@@ -52,14 +54,176 @@ def _pydoc_plainpager(text, title=""):
 class McpInputStream:
     encoding = "utf-8"
     errors = "replace"
-    closed = False
+    newlines = None
+
+    def __init__(self):
+        self._buffer = b""
+        self.buffer = McpInputBuffer(self)
+        self.closed = False
+
+    def _check_open(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+
+    def _normalize_size(self, size):
+        if size is None:
+            return -1
+        return int(size)
+
+    def _read_backend_line(self, prompt=""):
+        line = _mcp_repl.readline(prompt)
+        if line is None:
+            return None
+        return line.encode(self.encoding)
+
+    def _take_buffered(self, size):
+        chunk = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return chunk
+
+    def _read_bytes(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+        if size < 0:
+            chunks = [self._buffer]
+            self._buffer = b""
+            while True:
+                line = self._read_backend_line()
+                if line is None:
+                    break
+                chunks.append(line)
+            return b"".join(chunks)
+
+        chunks = []
+        remaining = size
+        if self._buffer:
+            chunk = self._take_buffered(remaining)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        while remaining > 0:
+            line = self._read_backend_line()
+            if line is None:
+                break
+            chunks.append(line[:remaining])
+            if len(line) > remaining:
+                self._buffer = line[remaining:] + self._buffer
+            remaining -= len(chunks[-1])
+        return b"".join(chunks)
+
+    def _readline_bytes(self, size=-1, prompt=""):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+
+        newline_index = self._buffer.find(b"\n")
+        if newline_index >= 0:
+            end = newline_index + 1
+            if size > 0:
+                end = min(end, size)
+            return self._take_buffered(end)
+        if size > 0 and len(self._buffer) >= size:
+            return self._take_buffered(size)
+
+        line = self._read_backend_line(prompt)
+        if line is None:
+            return self._take_buffered(len(self._buffer))
+        self._buffer += line
+        newline_index = self._buffer.find(b"\n")
+        end = len(self._buffer) if newline_index < 0 else newline_index + 1
+        if size > 0:
+            end = min(end, size)
+        return self._take_buffered(end)
+
+    def _decode_buffer(self):
+        return self._buffer.decode(self.encoding, self.errors)
+
+    def _take_text(self, size):
+        text = self._decode_buffer()
+        chunk = text[:size]
+        byte_len = len(chunk.encode(self.encoding))
+        self._buffer = self._buffer[byte_len:]
+        return chunk
+
+    def read(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return ""
+        if size < 0:
+            return self._read_bytes(-1).decode(self.encoding, self.errors)
+
+        while len(self._decode_buffer()) < size:
+            line = self._read_backend_line()
+            if line is None:
+                break
+            self._buffer += line
+        return self._take_text(min(size, len(self._decode_buffer())))
+
+    def _readline(self, size=-1, prompt=""):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return ""
+
+        prompt_for_read = prompt
+        while True:
+            text = self._decode_buffer()
+            newline_index = text.find("\n")
+            if newline_index >= 0:
+                end = newline_index + 1
+                if size > 0:
+                    end = min(end, size)
+                return self._take_text(end)
+            if size > 0 and len(text) >= size:
+                return self._take_text(size)
+
+            line = self._read_backend_line(prompt_for_read)
+            prompt_for_read = ""
+            if line is None:
+                return self._take_text(len(self._decode_buffer()))
+            self._buffer += line
 
     def readline(self, size=-1):
-        line = _mcp_repl.readline("")
-        return "" if line is None else line
+        return self._readline(size)
+
+    def _readline_for_input(self, prompt):
+        return self._readline(-1, prompt)
+
+    def readlines(self, hint=-1):
+        self._check_open()
+        hint = self._normalize_size(hint)
+        lines = []
+        total = 0
+        while True:
+            line = self.readline()
+            if line == "":
+                break
+            lines.append(line)
+            total += len(line)
+            if hint > 0 and total >= hint:
+                break
+        return lines
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
 
     def readable(self):
         return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
 
     def isatty(self):
         return False
@@ -68,7 +232,74 @@ class McpInputStream:
         return 0
 
     def close(self):
+        self.closed = True
+
+    def flush(self):
         pass
+
+
+class McpInputBuffer:
+    def __init__(self, text_stream):
+        self._text_stream = text_stream
+
+    @property
+    def closed(self):
+        return self._text_stream.closed
+
+    def _check_open(self):
+        self._text_stream._check_open()
+
+    def read(self, size=-1):
+        self._check_open()
+        return self._text_stream._read_bytes(size)
+
+    def readline(self, size=-1):
+        self._check_open()
+        return self._text_stream._readline_bytes(size)
+
+    def readlines(self, hint=-1):
+        self._check_open()
+        hint = self._text_stream._normalize_size(hint)
+        lines = []
+        total = 0
+        while True:
+            line = self.readline()
+            if line == b"":
+                break
+            lines.append(line)
+            total += len(line)
+            if hint > 0 and total >= hint:
+                break
+        return lines
+
+    def readinto(self, target):
+        data = self.read(len(target))
+        target[: len(data)] = data
+        return len(data)
+
+    def read1(self, size=-1):
+        return self.read(size)
+
+    def readinto1(self, target):
+        return self.readinto(target)
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return 0
+
+    def close(self):
+        self._text_stream.close()
 
     def flush(self):
         pass
@@ -81,6 +312,7 @@ class McpOutputStream:
 
     def __init__(self, stream):
         self._stream = stream
+        self.buffer = McpOutputBuffer(stream)
 
     def write(self, message):
         return _mcp_repl.write(self._stream, str(message))
@@ -90,6 +322,38 @@ class McpOutputStream:
 
     def writable(self):
         return True
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return 1 if self._stream == "stdout" else 2
+
+    def close(self):
+        pass
+
+
+class McpOutputBuffer:
+    closed = False
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        data = bytes(data)
+        return _mcp_repl.write_bytes(self._stream, data)
+
+    def flush(self):
+        pass
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return False
 
     def isatty(self):
         return True
@@ -241,8 +505,19 @@ def _mcp_repl_plot_capable():
     return bool(_plot_capable)
 
 
+_original_excepthook = sys.excepthook
+
+
+def _mcp_repl_excepthook(exc_type, exc, traceback):
+    if issubclass(exc_type, SystemExit):
+        _mcp_repl.request_exit()
+        return
+    _original_excepthook(exc_type, exc, traceback)
+
+
 builtins.input = _input
 pydoc.pager = _pydoc_plainpager
+sys.excepthook = _mcp_repl_excepthook
 sys.ps1 = ""
 sys.ps2 = ""
 sys.stdin = McpInputStream()

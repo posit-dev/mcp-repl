@@ -54,8 +54,20 @@ Install-McpRepl
 ```
 
 Append `--dev` (or `-Dev`) for the rolling `dev` prerelease. Direct downloads
-live on the [releases page](https://github.com/posit-dev/mcp-repl/releases).
-Linux x86_64 builds require glibc 2.35+ (Ubuntu 22.04+).
+live on the [latest release page](https://github.com/posit-dev/mcp-repl/releases/latest).
+Linux x86_64 builds require glibc 2.35+; the glibc build produced on Ubuntu 22.04 supports Ubuntu 22.04+.
+
+Latest release binaries:
+
+- Linux x86_64: https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+- macOS arm64: https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-aarch64-apple-darwin.tar.gz
+- Windows x86_64: https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-pc-windows-msvc.zip
+
+Download prebuilt dev binaries:
+
+- Linux x86_64: https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+- macOS arm64: https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz
+- Windows x86_64: https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip
 
 Prebuilt binaries do not bundle R or Python; install those separately.
 

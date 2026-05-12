@@ -28,6 +28,8 @@ pub enum PyThreadState {}
 pub type PyCFunction = unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject;
 pub type PyGILStateState = c_int;
 pub type PyOsInputHookCallback = unsafe extern "C" fn() -> c_int;
+pub type PyOsReadlineCallback =
+    unsafe extern "C" fn(*mut libc::FILE, *mut libc::FILE, *const c_char) -> *mut c_char;
 
 #[repr(C)]
 struct PyMethodDef {
@@ -65,6 +67,8 @@ pub struct ModuleMethod {
 
 pub struct PythonApi {
     _library: Library,
+    py_decode_locale: unsafe extern "C" fn(*const c_char, *mut usize) -> *mut libc::wchar_t,
+    py_set_program_name: unsafe extern "C" fn(*const libc::wchar_t),
     pub py_initialize_ex: unsafe extern "C" fn(c_int),
     pub py_is_initialized: unsafe extern "C" fn() -> c_int,
     pub py_eval_save_thread: unsafe extern "C" fn() -> *mut PyThreadState,
@@ -96,9 +100,12 @@ pub struct PythonApi {
         unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     pub py_unicode_as_utf8_and_size:
         unsafe extern "C" fn(*mut PyObject, *mut PySsizeT) -> *const c_char,
+    py_bytes_as_string_and_size:
+        unsafe extern "C" fn(*mut PyObject, *mut *mut c_char, *mut PySsizeT) -> c_int,
     pub py_long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_build_value: unsafe extern "C" fn(*const c_char, ...) -> *mut PyObject,
+    pub py_mem_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
     pub py_mem_free: unsafe extern "C" fn(*mut c_void),
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
     pub py_err_print: unsafe extern "C" fn(),
@@ -133,6 +140,8 @@ impl PythonApi {
     unsafe fn load(lib_path: &Path) -> Result<Self, String> {
         let library = load_library_global(lib_path)?;
         let api = Self {
+            py_decode_locale: unsafe { load_symbol(&library, b"Py_DecodeLocale\0")? },
+            py_set_program_name: unsafe { load_symbol(&library, b"Py_SetProgramName\0")? },
             py_initialize_ex: unsafe { load_symbol(&library, b"Py_InitializeEx\0")? },
             py_is_initialized: unsafe { load_symbol(&library, b"Py_IsInitialized\0")? },
             py_eval_save_thread: unsafe { load_symbol(&library, b"PyEval_SaveThread\0")? },
@@ -162,9 +171,13 @@ impl PythonApi {
             py_unicode_as_utf8_and_size: unsafe {
                 load_symbol(&library, b"PyUnicode_AsUTF8AndSize\0")?
             },
+            py_bytes_as_string_and_size: unsafe {
+                load_symbol(&library, b"PyBytes_AsStringAndSize\0")?
+            },
             py_long_from_long: unsafe { load_symbol(&library, b"PyLong_FromLong\0")? },
             py_bool_from_long: unsafe { load_symbol(&library, b"PyBool_FromLong\0")? },
             py_build_value: unsafe { load_symbol(&library, b"Py_BuildValue\0")? },
+            py_mem_malloc: unsafe { load_symbol(&library, b"PyMem_Malloc\0")? },
             py_mem_free: unsafe { load_symbol(&library, b"PyMem_Free\0")? },
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
@@ -271,6 +284,21 @@ impl PythonApi {
         Some(String::from_utf8_lossy(bytes).to_string())
     }
 
+    pub fn bytes_arg(&self, args: *mut PyObject, index: PySsizeT) -> Option<Vec<u8>> {
+        let item = unsafe { (self.py_tuple_get_item)(args, index) };
+        if item.is_null() {
+            return None;
+        }
+        let mut ptr: *mut c_char = ptr::null_mut();
+        let mut size: PySsizeT = 0;
+        let rc = unsafe { (self.py_bytes_as_string_and_size)(item, &mut ptr, &mut size) };
+        if rc != 0 || ptr.is_null() || size < 0 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize) };
+        Some(bytes.to_vec())
+    }
+
     pub fn tuple_size(&self, args: *mut PyObject) -> PySsizeT {
         unsafe { (self.py_tuple_size)(args) }
     }
@@ -305,6 +333,18 @@ impl PythonApi {
         Ok(())
     }
 
+    pub fn install_readline_function(&self, callback: PyOsReadlineCallback) -> Result<(), String> {
+        let symbol = unsafe {
+            self._library
+                .get::<*mut Option<PyOsReadlineCallback>>(b"PyOS_ReadlineFunctionPointer\0")
+                .map_err(|err| format!("failed to load PyOS_ReadlineFunctionPointer: {err}"))?
+        };
+        unsafe {
+            **symbol = Some(callback);
+        }
+        Ok(())
+    }
+
     pub fn set_interactive_flags(&self) -> Result<(), String> {
         unsafe {
             **self
@@ -316,6 +356,18 @@ impl PythonApi {
                 .get::<*mut c_int>(b"Py_InspectFlag\0")
                 .map_err(|err| format!("failed to load Py_InspectFlag: {err}"))? = 1;
         }
+        Ok(())
+    }
+
+    pub fn set_program_name(&self, executable: &Path) -> Result<(), String> {
+        let executable = CString::new(executable.to_string_lossy().as_bytes())
+            .map_err(|_| "Python executable path contains NUL".to_string())?;
+        let mut size = 0;
+        let decoded = unsafe { (self.py_decode_locale)(executable.as_ptr(), &mut size) };
+        if decoded.is_null() {
+            return Err("failed to decode Python executable path".to_string());
+        }
+        unsafe { (self.py_set_program_name)(decoded) };
         Ok(())
     }
 

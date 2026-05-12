@@ -1,16 +1,68 @@
-use std::ffi::{CStr, CString, c_int, c_long};
-use std::path::PathBuf;
+use std::ffi::{CStr, CString, c_char, c_int, c_long};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+
+use serde::Deserialize;
 
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PythonApi};
 use crate::worker_protocol::TextStream;
 
-pub const PYTHON_LIB_ENV: &str = "MCP_REPL_PYTHON_LIB";
+pub const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
+const PYTHON_PROGRAM: &str = "python3";
+const PYTHON_PROGRAM_FALLBACK: &str = "python";
+const PYTHON_CONFIG_SNIPPET: &str = r#"
+import json
+import sys
+import sysconfig
+
+def var(name):
+    value = sysconfig.get_config_var(name)
+    return "" if value is None else str(value)
+
+print(json.dumps({
+    "executable": sys.executable,
+    "base_executable": getattr(sys, "_base_executable", sys.executable),
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
+    "exec_prefix": sys.exec_prefix,
+    "base_exec_prefix": sys.base_exec_prefix,
+    "version": [sys.version_info[0], sys.version_info[1]],
+    "ldlibrary": var("LDLIBRARY"),
+    "instsoname": var("INSTSONAME"),
+    "libdir": var("LIBDIR"),
+    "libpl": var("LIBPL"),
+    "pythonframeworkprefix": var("PYTHONFRAMEWORKPREFIX"),
+    "pythonframeworkinstalldir": var("PYTHONFRAMEWORKINSTALLDIR"),
+}))
+"#;
+
+struct PythonRuntimeConfig {
+    executable: PathBuf,
+    libpython: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct PythonRuntimeProbe {
+    executable: String,
+    base_executable: String,
+    prefix: String,
+    base_prefix: String,
+    exec_prefix: String,
+    base_exec_prefix: String,
+    version: [u64; 2],
+    ldlibrary: String,
+    instsoname: String,
+    libdir: String,
+    libpl: String,
+    pythonframeworkprefix: String,
+    pythonframeworkinstalldir: String,
+}
 
 #[derive(Debug)]
 pub struct RequestCompleted;
@@ -41,11 +93,13 @@ impl PythonSession {
 
     pub fn begin_request(
         &self,
+        byte_len: usize,
         line_count: usize,
+        fallback_prompt: Option<String>,
     ) -> Result<mpsc::Receiver<RequestCompleted>, String> {
         self.wait_until_ready()?;
         let (reply_tx, reply_rx) = mpsc::channel();
-        begin_tracked_request(line_count, reply_tx)?;
+        begin_tracked_request(byte_len, line_count, fallback_prompt, reply_tx)?;
         Ok(reply_rx)
     }
 }
@@ -111,6 +165,25 @@ pub fn request_shutdown() -> bool {
     true
 }
 
+fn request_exit() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.exit_requested = true;
+    state.cvar.notify_all();
+}
+
+fn take_exit_requested() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let requested = guard.exit_requested;
+    guard.exit_requested = false;
+    requested
+}
+
 pub(crate) fn interrupt() {
     discard_pending_stdin();
     finish_active_request_at_next_read();
@@ -126,6 +199,7 @@ fn finish_active_request_at_next_read() {
     let mut guard = state.inner.lock().unwrap();
     if let Some(active) = guard.active_request.as_mut() {
         active.line_count = active.consumed_lines.saturating_add(1);
+        active.fallback_prompt = None;
         active.skip_next_hook = false;
         guard.waiting_for_input = false;
     }
@@ -192,21 +266,21 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         return Err(message);
     }
 
-    let lib_path = match python_library_path() {
-        Ok(lib_path) => lib_path,
+    let runtime_config = match resolve_python_runtime_config() {
+        Ok(runtime_config) => runtime_config,
         Err(err) => {
             init.mark_failed(err.clone());
             return Err(err);
         }
     };
-    let api = match PythonApi::initialize(&lib_path) {
+    let api = match PythonApi::initialize(&runtime_config.libpython) {
         Ok(api) => api,
         Err(err) => {
             init.mark_failed(err.clone());
             return Err(err);
         }
     };
-    if let Err(err) = initialize_python(api) {
+    if let Err(err) = initialize_python(api, &runtime_config.executable) {
         init.mark_failed(err.clone());
         return Err(err);
     }
@@ -234,6 +308,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 
 fn open_python_runtime() -> Result<PythonRuntime, String> {
     let stdin = open_stdio_file(0, c"r")?;
+    set_stdio_unbuffered(stdin, 0)?;
     let stdout = open_stdio_file(1, c"w")?;
     PYTHON_STDIN_FILE.store(stdin, Ordering::SeqCst);
     PYTHON_STDOUT_FILE.store(stdout, Ordering::SeqCst);
@@ -252,13 +327,205 @@ fn open_stdio_file(fd: libc::c_int, mode: &CStr) -> Result<*mut libc::FILE, Stri
     }
 }
 
-fn python_library_path() -> Result<PathBuf, String> {
-    std::env::var_os(PYTHON_LIB_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{PYTHON_LIB_ENV} is not set"))
+fn set_stdio_unbuffered(file: *mut libc::FILE, fd: libc::c_int) -> Result<(), String> {
+    let rc = unsafe { libc::setvbuf(file, ptr::null_mut(), libc::_IONBF, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("failed to configure worker fd {fd} as unbuffered"))
+    }
 }
 
-fn initialize_python(api: &'static PythonApi) -> Result<(), String> {
+pub(crate) fn resolve_python_program() -> PathBuf {
+    fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // Search HOME itself, then stop. Do not ascend to HOME's parent.
+        let stop_at_home = home
+            .as_ref()
+            .filter(|home| start.starts_with(home.as_path()))
+            .cloned();
+        let mut dir = start.to_path_buf();
+        loop {
+            for candidate in [
+                dir.join(".venv").join("bin").join("python"),
+                dir.join(".venv").join("bin").join("python3"),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+
+            if let Some(stop) = stop_at_home.as_ref()
+                && &dir == stop
+            {
+                break;
+            }
+
+            let Some(parent) = dir.parent() else {
+                break;
+            };
+            if parent == dir {
+                break;
+            }
+            dir = parent.to_path_buf();
+        }
+        None
+    }
+
+    fn find_program_on_path(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return Some(candidate);
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_dot_venv_python(&cwd))
+        .or_else(|| find_program_on_path(PYTHON_PROGRAM))
+        .or_else(|| find_program_on_path(PYTHON_PROGRAM_FALLBACK))
+        .unwrap_or_else(|| PathBuf::from(PYTHON_PROGRAM))
+}
+
+fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, String> {
+    let executable = std::env::var_os(PYTHON_EXECUTABLE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(resolve_python_program);
+    let output = Command::new(&executable)
+        .arg("-I")
+        .arg("-c")
+        .arg(PYTHON_CONFIG_SNIPPET)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to query Python runtime config from {}: {err}",
+                executable.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to query Python runtime config from {}: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let probe: PythonRuntimeProbe = serde_json::from_slice(&output.stdout).map_err(|err| {
+        format!(
+            "failed to parse Python runtime config from {}: {err}",
+            executable.display()
+        )
+    })?;
+    let libpython = resolve_libpython_path(&probe).ok_or_else(|| {
+        format!(
+            "failed to locate a shared libpython for {}",
+            executable.display()
+        )
+    })?;
+    let executable = first_non_empty([probe.executable.as_str(), probe.base_executable.as_str()])
+        .map(PathBuf::from)
+        .unwrap_or(executable);
+    Ok(PythonRuntimeConfig {
+        executable,
+        libpython,
+    })
+}
+
+fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    push_python_library_candidates(&mut candidates, probe, &probe.ldlibrary);
+    if probe.instsoname != probe.ldlibrary {
+        push_python_library_candidates(&mut candidates, probe, &probe.instsoname);
+    }
+
+    let version = format!("{}.{}", probe.version[0], probe.version[1]);
+    for root in [
+        probe.base_exec_prefix.as_str(),
+        probe.exec_prefix.as_str(),
+        probe.base_prefix.as_str(),
+        probe.prefix.as_str(),
+    ] {
+        if root.is_empty() {
+            continue;
+        }
+        candidates.push(
+            Path::new(root)
+                .join("lib")
+                .join(format!("libpython{version}.so")),
+        );
+        candidates.push(
+            Path::new(root)
+                .join("lib")
+                .join(format!("libpython{version}.dylib")),
+        );
+        candidates.push(Path::new(root).join("Python"));
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn push_python_library_candidates(
+    candidates: &mut Vec<PathBuf>,
+    probe: &PythonRuntimeProbe,
+    library: &str,
+) {
+    let Some(library) = non_empty(library) else {
+        return;
+    };
+    let path = Path::new(library);
+    if path.is_absolute() {
+        candidates.push(path.to_path_buf());
+    }
+    for executable in [probe.executable.as_str(), probe.base_executable.as_str()] {
+        let Some(executable) = non_empty(executable) else {
+            continue;
+        };
+        let Some(parent) = Path::new(executable).parent() else {
+            continue;
+        };
+        candidates.push(parent.join(library));
+    }
+    for root in [
+        probe.libdir.as_str(),
+        probe.libpl.as_str(),
+        probe.pythonframeworkprefix.as_str(),
+        probe.pythonframeworkinstalldir.as_str(),
+    ] {
+        if let Some(root) = non_empty(root) {
+            candidates.push(Path::new(root).join(library));
+        }
+    }
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    values.into_iter().find_map(non_empty)
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn initialize_python(api: &'static PythonApi, executable: &Path) -> Result<(), String> {
     let module_name = CString::new("_mcp_repl").expect("module name must not contain NUL");
     let module_name = module_name.into_raw();
     let rc = unsafe { (api.py_import_append_inittab)(module_name, initialize_mcp_repl_module) };
@@ -268,8 +535,10 @@ fn initialize_python(api: &'static PythonApi) -> Result<(), String> {
 
     unsafe {
         if (api.py_is_initialized)() == 0 {
+            api.set_program_name(executable)?;
             api.set_interactive_flags()?;
             (api.py_initialize_ex)(1);
+            api.install_readline_function(mcp_repl_readline)?;
             (api.py_eval_save_thread)();
         }
     }
@@ -306,6 +575,10 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
                 )
             }
         };
+        if take_exit_requested() {
+            finish_session_end();
+            return Ok(());
+        }
         emit_plots();
         if status == PYTHON_EOF {
             finish_session_end();
@@ -315,7 +588,9 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
 }
 
 fn begin_tracked_request(
+    byte_len: usize,
     line_count: usize,
+    fallback_prompt: Option<String>,
     reply: mpsc::Sender<RequestCompleted>,
 ) -> Result<(), String> {
     let state = session_state();
@@ -336,7 +611,9 @@ fn begin_tracked_request(
     guard.waiting_for_input = false;
     guard.active_request = Some(ActiveRequest {
         reply,
+        byte_len,
         line_count,
+        fallback_prompt,
         consumed_lines: 0,
         skip_next_hook,
     });
@@ -345,10 +622,11 @@ fn begin_tracked_request(
     Ok(())
 }
 
-fn input_hook_prompt(guard: &SessionStateInner) -> String {
+fn input_hook_prompt(guard: &SessionStateInner, fallback_prompt: Option<&str>) -> String {
     guard
         .current_prompt
         .clone()
+        .or_else(|| fallback_prompt.map(str::to_string))
         .unwrap_or_else(|| ">>> ".to_string())
 }
 
@@ -364,14 +642,20 @@ fn handle_input_hook() {
         if guard.shutdown {
             return;
         }
-        let current_prompt = input_hook_prompt(&guard);
+        let current_prompt_from_state = guard.current_prompt.clone();
+        let idle_prompt = input_hook_prompt(&guard, None);
         if let Some(active) = guard.active_request.as_mut() {
+            let current_prompt = current_prompt_from_state
+                .clone()
+                .or_else(|| active.fallback_prompt.clone())
+                .unwrap_or_else(|| ">>> ".to_string());
             if active.skip_next_hook {
                 active.skip_next_hook = false;
             } else {
                 active.consumed_lines = active.consumed_lines.saturating_add(1);
             }
-            let should_complete = active.consumed_lines >= active.line_count;
+            let should_complete =
+                active.consumed_lines >= active.line_count || request_input_drained(active);
             guard.waiting_for_input = true;
             if should_complete {
                 prompt = Some(current_prompt);
@@ -379,7 +663,7 @@ fn handle_input_hook() {
             }
         } else if !guard.waiting_for_input {
             guard.waiting_for_input = true;
-            prompt = Some(current_prompt);
+            prompt = Some(idle_prompt);
             emit_idle = true;
         }
     }
@@ -395,6 +679,79 @@ fn handle_input_hook() {
 unsafe extern "C" fn pyos_input_hook() -> c_int {
     handle_input_hook();
     0
+}
+
+fn request_input_drained(active: &ActiveRequest) -> bool {
+    if active.byte_len == 0 || active.consumed_lines == 0 {
+        return false;
+    }
+    stdin_pending_byte_count() == Some(0)
+}
+
+#[cfg(target_family = "unix")]
+fn stdin_pending_byte_count() -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut count) };
+    if rc == 0 && count >= 0 {
+        Some(count as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn stdin_pending_byte_count() -> Option<usize> {
+    None
+}
+
+unsafe extern "C" fn mcp_repl_readline(
+    stdin: *mut libc::FILE,
+    stdout: *mut libc::FILE,
+    prompt: *const c_char,
+) -> *mut c_char {
+    let prompt_text = (!prompt.is_null())
+        .then(|| {
+            unsafe { CStr::from_ptr(prompt) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|prompt| !prompt.is_empty());
+    if prompt_text.is_some() {
+        unsafe {
+            libc::fputs(prompt, stdout);
+            libc::fflush(stdout);
+        }
+    }
+    if let Some(prompt_text) = &prompt_text {
+        set_current_readline_prompt(prompt_text);
+    }
+    handle_input_hook();
+
+    let mut bytes = Vec::new();
+    loop {
+        let ch = unsafe { libc::fgetc(stdin) };
+        if ch == libc::EOF {
+            break;
+        }
+        bytes.push(ch as u8);
+        if ch == b'\n' as i32 {
+            break;
+        }
+    }
+    if prompt_text.is_some() {
+        clear_current_readline_prompt();
+    }
+
+    let api = PythonApi::global();
+    let result = unsafe { (api.py_mem_malloc)(bytes.len().saturating_add(1)) }.cast::<c_char>();
+    if result.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), result, bytes.len());
+        *result.add(bytes.len()) = 0;
+    }
+    result
 }
 
 fn set_current_readline_prompt(prompt: &str) {
@@ -497,6 +854,7 @@ struct SessionStateInner {
     active_request: Option<ActiveRequest>,
     current_prompt: Option<String>,
     waiting_for_input: bool,
+    exit_requested: bool,
     shutdown: bool,
     session_end_emitted: bool,
     plot_reset_pending: bool,
@@ -504,7 +862,9 @@ struct SessionStateInner {
 
 struct ActiveRequest {
     reply: mpsc::Sender<RequestCompleted>,
+    byte_len: usize,
     line_count: usize,
+    fallback_prompt: Option<String>,
     consumed_lines: usize,
     skip_next_hook: bool,
 }
@@ -516,6 +876,7 @@ impl SessionState {
                 active_request: None,
                 current_prompt: None,
                 waiting_for_input: false,
+                exit_requested: false,
                 shutdown: false,
                 session_end_emitted: false,
                 plot_reset_pending: false,
@@ -582,6 +943,14 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
             function: py_write,
         },
         ModuleMethod {
+            name: "write_bytes",
+            function: py_write_bytes,
+        },
+        ModuleMethod {
+            name: "request_exit",
+            function: py_request_exit,
+        },
+        ModuleMethod {
             name: "emit_plot_image",
             function: py_emit_plot_image,
         },
@@ -592,10 +961,6 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
         ModuleMethod {
             name: "take_plot_reset_pending",
             function: py_take_plot_reset_pending,
-        },
-        ModuleMethod {
-            name: "executable",
-            function: py_executable,
         },
     ];
     api.create_module("_mcp_repl", &methods)
@@ -641,7 +1006,41 @@ unsafe extern "C" fn py_write(_self: *mut PyObject, args: *mut PyObject) -> *mut
         }
     };
     emit_output_text(stream, message.as_bytes());
-    api.long_result(message.len() as c_long)
+    api.long_result(message.chars().count() as c_long)
+}
+
+unsafe extern "C" fn py_write_bytes(_self: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    let api = PythonApi::global();
+    if api.tuple_size(args) != 2 {
+        set_callback_error("write_bytes expects exactly two arguments");
+        return ptr::null_mut();
+    }
+    let Some(stream) = api.unicode_arg(args, 0) else {
+        return ptr::null_mut();
+    };
+    let Some(bytes) = api.bytes_arg(args, 1) else {
+        return ptr::null_mut();
+    };
+    let stream = match stream.as_str() {
+        "stdout" => TextStream::Stdout,
+        "stderr" => TextStream::Stderr,
+        _ => {
+            set_callback_error("write_bytes stream must be 'stdout' or 'stderr'");
+            return ptr::null_mut();
+        }
+    };
+    emit_output_text(stream, &bytes);
+    api.long_result(bytes.len() as c_long)
+}
+
+unsafe extern "C" fn py_request_exit(_self: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    let api = PythonApi::global();
+    if api.tuple_size(args) != 0 {
+        set_callback_error("request_exit expects no arguments");
+        return ptr::null_mut();
+    }
+    request_exit();
+    api.none()
 }
 
 unsafe extern "C" fn py_emit_plot_image(
@@ -695,17 +1094,6 @@ unsafe extern "C" fn py_take_plot_reset_pending(
     let pending = guard.plot_reset_pending;
     guard.plot_reset_pending = false;
     PythonApi::global().bool_result(pending)
-}
-
-unsafe extern "C" fn py_executable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
-    let api = PythonApi::global();
-    match std::env::var("MCP_REPL_PYTHON_EXECUTABLE") {
-        Ok(value) if !value.is_empty() => match api.unicode(&value) {
-            Ok(value) => value.into_raw(),
-            Err(_) => ptr::null_mut(),
-        },
-        _ => api.none(),
-    }
 }
 
 fn set_callback_error(message: &str) {

@@ -90,6 +90,8 @@ pub enum ServerToWorkerIpcMessage {
         byte_len: usize,
         #[serde(default)]
         line_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_prompt: Option<String>,
     },
     Interrupt,
     SessionEnd,

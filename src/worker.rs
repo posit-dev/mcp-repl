@@ -182,6 +182,7 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
                         line_count: _,
+                        final_prompt: _,
                     }) => {
                         if stdin_tx.send(StdinReadCommand::Read { byte_len }).is_err() {
                             std::process::exit(0);
