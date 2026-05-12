@@ -5479,9 +5479,12 @@ impl WorkerProcess {
             },
         );
         if matches!(backend, Backend::Python) {
+            let python_executable = std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(crate::python_session::resolve_python_program);
             command.env(
                 crate::python_session::PYTHON_EXECUTABLE_ENV,
-                crate::python_session::resolve_python_program(),
+                python_executable,
             );
         }
         #[cfg(target_family = "unix")]

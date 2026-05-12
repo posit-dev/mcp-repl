@@ -3306,6 +3306,33 @@ mod tests {
         }
     }
 
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn remove_junction(path: &Path) {
         if !path.exists() {
@@ -4455,10 +4482,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
         let probe = session_temp_dir.join("probe.txt");
         let command = vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            format!("Set-Content -LiteralPath '{}' -Value 'OK'", probe.display()),
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo OK>%TEMP%\\probe.txt".to_string(),
         ];
 
         let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
@@ -4502,6 +4528,46 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
     }
 
     #[test]
+    fn sandboxed_cmd_exe_can_start_with_prepared_launch() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let command = vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "exit 0".to_string(),
+        ];
+
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        env_map.extend(sandbox_acl_env_map(&session_temp_dir));
+        let status = run_sandboxed_command_with_env_map(
+            &policy,
+            &cwd,
+            &command,
+            prepared.capability_sid(),
+            env_map,
+        )
+        .expect("sandboxed cmd.exe should run");
+
+        unsafe {
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), session_temp_dir.as_path()],
+            );
+        }
+
+        assert_eq!(status, 0);
+    }
+
+    #[test]
     fn sandboxed_command_keeps_in_workspace_temp_children_off_stable_sid() {
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
@@ -4512,26 +4578,26 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         let session_temp_dir = temp_root.join("mcp-repl-session-test");
         let r_tempdir = session_temp_dir.join("Rtmp123");
         let temp_file = r_tempdir.join("artifact.txt");
-        let original_temp = std::env::var_os("TEMP");
-        let original_tmp = std::env::var_os("TMP");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         std::fs::create_dir_all(&temp_root).expect("temp root");
-        unsafe {
-            std::env::set_var("TEMP", &temp_root);
-            std::env::set_var("TMP", &temp_root);
-        }
+        let _temp_guard = ScopedEnvVar::set("TEMP", &temp_root);
+        let _tmp_guard = ScopedEnvVar::set("TMP", &temp_root);
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
 
         let policy = workspace_policy(Vec::new(), false, false);
         let prepared =
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let r_tempdir_relative = Path::new("temp-root")
+            .join("mcp-repl-session-test")
+            .join("Rtmp123");
+        let temp_file_relative = r_tempdir_relative.join("artifact.txt");
         let command = vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
+            "cmd.exe".to_string(),
+            "/C".to_string(),
             format!(
-                "$targetDir = $env:TEMP + '\\\\Rtmp123'; New-Item -ItemType Directory -Path $targetDir -Force | Out-Null; Set-Content -LiteralPath '{}' -Value 'OK'",
-                temp_file.display()
+                "mkdir {} && echo OK>{}",
+                r_tempdir_relative.display(),
+                temp_file_relative.display()
             ),
         ];
 
@@ -4573,23 +4639,6 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                     temp_file.as_path(),
                 ],
             );
-        }
-
-        match original_temp {
-            Some(value) => unsafe {
-                std::env::set_var("TEMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TEMP");
-            },
-        }
-        match original_tmp {
-            Some(value) => unsafe {
-                std::env::set_var("TMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TMP");
-            },
         }
     }
 

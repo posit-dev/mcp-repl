@@ -42,6 +42,7 @@ print(json.dumps({
 }))
 "#;
 
+#[derive(Debug)]
 struct PythonRuntimeConfig {
     executable: PathBuf,
     libpython: PathBuf,
@@ -379,81 +380,99 @@ fn set_stdio_unbuffered(file: *mut libc::FILE, fd: libc::c_int) -> Result<(), St
     }
 }
 
-pub(crate) fn resolve_python_program() -> PathBuf {
-    fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        // Search HOME itself, then stop. Do not ascend to HOME's parent.
-        let stop_at_home = home
-            .as_ref()
-            .filter(|home| start.starts_with(home.as_path()))
-            .cloned();
-        let mut dir = start.to_path_buf();
-        loop {
-            for candidate in [
-                dir.join(".venv").join("bin").join("python"),
-                dir.join(".venv").join("bin").join("python3"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Search HOME itself, then stop. Do not ascend to HOME's parent.
+    let stop_at_home = home
+        .as_ref()
+        .filter(|home| start.starts_with(home.as_path()))
+        .cloned();
+    let mut dir = start.to_path_buf();
+    loop {
+        for candidate in [
+            dir.join(".venv").join("bin").join("python"),
+            dir.join(".venv").join("bin").join("python3"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
             }
-
-            if let Some(stop) = stop_at_home.as_ref()
-                && &dir == stop
-            {
-                break;
-            }
-
-            let Some(parent) = dir.parent() else {
-                break;
-            };
-            if parent == dir {
-                break;
-            }
-            dir = parent.to_path_buf();
         }
-        None
+
+        if let Some(stop) = stop_at_home.as_ref()
+            && &dir == stop
+        {
+            break;
+        }
+
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        if parent == dir {
+            break;
+        }
+        dir = parent.to_path_buf();
     }
+    None
+}
 
-    fn find_program_on_path(name: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if !candidate.is_file() {
-                continue;
-            }
+fn find_program_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&candidate)
-                    && meta.permissions().mode() & 0o111 != 0
-                {
-                    return Some(candidate);
-                }
-            }
-
-            #[cfg(not(unix))]
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.permissions().mode() & 0o111 != 0
             {
                 return Some(candidate);
             }
         }
-        None
-    }
 
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| find_dot_venv_python(&cwd))
-        .or_else(|| find_program_on_path(PYTHON_PROGRAM))
-        .or_else(|| find_program_on_path(PYTHON_PROGRAM_FALLBACK))
-        .unwrap_or_else(|| PathBuf::from(PYTHON_PROGRAM))
+        #[cfg(not(unix))]
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
-fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, String> {
-    let executable = std::env::var_os(PYTHON_EXECUTABLE_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(resolve_python_program);
-    let output = Command::new(&executable)
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn python_program_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(venv_python) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_dot_venv_python(&cwd))
+    {
+        push_unique_path(&mut candidates, venv_python);
+    }
+    push_unique_path(
+        &mut candidates,
+        find_program_on_path(PYTHON_PROGRAM).unwrap_or_else(|| PathBuf::from(PYTHON_PROGRAM)),
+    );
+    push_unique_path(
+        &mut candidates,
+        find_program_on_path(PYTHON_PROGRAM_FALLBACK)
+            .unwrap_or_else(|| PathBuf::from(PYTHON_PROGRAM_FALLBACK)),
+    );
+    candidates
+}
+
+pub(crate) fn resolve_python_program() -> PathBuf {
+    select_python_program(python_program_candidates(), python_program_starts)
+}
+
+fn query_python_runtime_config(executable: &Path) -> Result<PythonRuntimeConfig, String> {
+    let output = Command::new(executable)
         .arg("-I")
         .arg("-c")
         .arg(PYTHON_CONFIG_SNIPPET)
@@ -486,11 +505,71 @@ fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, String> {
     })?;
     let executable = first_non_empty([probe.executable.as_str(), probe.base_executable.as_str()])
         .map(PathBuf::from)
-        .unwrap_or(executable);
+        .unwrap_or_else(|| executable.to_path_buf());
     Ok(PythonRuntimeConfig {
         executable,
         libpython,
     })
+}
+
+fn python_program_starts(program: &Path) -> bool {
+    Command::new(program)
+        .args(["-c", "import sys; sys.exit(0)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn select_python_program(
+    mut candidates: Vec<PathBuf>,
+    mut starts: impl FnMut(&Path) -> bool,
+) -> PathBuf {
+    if candidates.is_empty() {
+        candidates.push(PathBuf::from(PYTHON_PROGRAM));
+    }
+    candidates
+        .iter()
+        .find(|candidate| starts(candidate))
+        .cloned()
+        .unwrap_or_else(|| candidates.remove(0))
+}
+
+fn select_python_runtime_config(
+    executable_override: Option<PathBuf>,
+    mut candidates: Vec<PathBuf>,
+    mut query: impl FnMut(&Path) -> Result<PythonRuntimeConfig, String>,
+) -> Result<PythonRuntimeConfig, String> {
+    if let Some(executable) = executable_override {
+        return query(&executable);
+    }
+
+    if candidates.is_empty() {
+        candidates.push(PathBuf::from(PYTHON_PROGRAM));
+    }
+
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match query(&candidate) {
+            Ok(config) => return Ok(config),
+            Err(err) => errors.push(format!("{}: {err}", candidate.display())),
+        }
+    }
+
+    Err(format!(
+        "failed to query Python runtime config from candidate interpreters: {}",
+        errors.join("; ")
+    ))
+}
+
+fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, String> {
+    select_python_runtime_config(
+        std::env::var_os(PYTHON_EXECUTABLE_ENV).map(PathBuf::from),
+        python_program_candidates(),
+        query_python_runtime_config,
+    )
 }
 
 fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
@@ -1230,3 +1309,68 @@ static SESSION: OnceLock<PythonSession> = OnceLock::new();
 static RUNTIME_ERROR: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
 static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime_config_for(path: &str) -> PythonRuntimeConfig {
+        PythonRuntimeConfig {
+            executable: PathBuf::from(path),
+            libpython: PathBuf::from("python.dll"),
+        }
+    }
+
+    #[test]
+    fn python_program_selection_falls_back_after_broken_python3_candidate() {
+        let selected = select_python_program(
+            vec![PathBuf::from("python3"), PathBuf::from("python")],
+            |candidate| candidate == Path::new("python"),
+        );
+
+        assert_eq!(selected, PathBuf::from("python"));
+    }
+
+    #[test]
+    fn python_runtime_config_falls_back_after_broken_python3_candidate() {
+        let mut attempts = Vec::new();
+
+        let config = select_python_runtime_config(
+            None,
+            vec![PathBuf::from("python3"), PathBuf::from("python")],
+            |candidate| {
+                attempts.push(candidate.to_path_buf());
+                if candidate == Path::new("python3") {
+                    Err("store alias is not a usable interpreter".to_string())
+                } else {
+                    Ok(runtime_config_for("python"))
+                }
+            },
+        )
+        .expect("python fallback should be used after python3 fails");
+
+        assert_eq!(
+            attempts,
+            vec![PathBuf::from("python3"), PathBuf::from("python")]
+        );
+        assert_eq!(config.executable, PathBuf::from("python"));
+    }
+
+    #[test]
+    fn python_runtime_config_env_override_does_not_fallback() {
+        let mut attempts = Vec::new();
+
+        let err = select_python_runtime_config(
+            Some(PathBuf::from("custom-python")),
+            vec![PathBuf::from("python3"), PathBuf::from("python")],
+            |candidate| {
+                attempts.push(candidate.to_path_buf());
+                Err(format!("{} is not usable", candidate.display()))
+            },
+        )
+        .expect_err("explicit Python override should not fall back");
+
+        assert_eq!(attempts, vec![PathBuf::from("custom-python")]);
+        assert!(err.contains("custom-python is not usable"));
+    }
+}
