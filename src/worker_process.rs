@@ -884,6 +884,7 @@ pub struct WorkerManager {
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
+    python_prompt_waiting_for_input: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -968,6 +969,7 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
+            python_prompt_waiting_for_input: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {
@@ -2859,10 +2861,11 @@ impl WorkerManager {
         );
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        if self.pending_request {
+        let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
+        if should_interrupt_worker {
             self.ensure_process()?;
         }
-        if self.pending_request
+        if should_interrupt_worker
             && let Err(err) = self.driver.interrupt(
                 self.process
                     .as_mut()
@@ -2877,6 +2880,9 @@ impl WorkerManager {
                 }),
             );
             return Err(err);
+        }
+        if self.python_prompt_waiting_for_input {
+            self.python_prompt_waiting_for_input = false;
         }
 
         if interrupt_drains_existing_completion {
@@ -3022,10 +3028,11 @@ impl WorkerManager {
         );
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        if self.pending_request {
+        let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
+        if should_interrupt_worker {
             self.ensure_process()?;
         }
-        if self.pending_request
+        if should_interrupt_worker
             && let Err(err) = self.driver.interrupt(
                 self.process
                     .as_mut()
@@ -3040,6 +3047,9 @@ impl WorkerManager {
                 }),
             );
             return Err(err);
+        }
+        if self.python_prompt_waiting_for_input {
+            self.python_prompt_waiting_for_input = false;
         }
 
         let page_bytes = pager::resolve_page_bytes(None);
@@ -3486,6 +3496,7 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
+        self.python_prompt_waiting_for_input = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3555,6 +3566,7 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
+        self.python_prompt_waiting_for_input = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3603,7 +3615,12 @@ impl WorkerManager {
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
-        if let Some(prompt) = normalize_prompt(prompt) {
+        let prompt = normalize_prompt(prompt);
+        if matches!(self.backend, Backend::Python) {
+            self.python_prompt_waiting_for_input =
+                prompt.as_deref().is_some_and(|prompt| prompt != ">>> ");
+        }
+        if let Some(prompt) = prompt {
             self.last_prompt = Some(prompt);
         }
     }
