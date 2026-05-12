@@ -764,6 +764,12 @@ const OUTPUT_READER_QUIESCE_GRACE: Duration = if cfg!(target_os = "macos") {
 } else {
     Duration::from_millis(120)
 };
+const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
+    Duration::from_millis(80)
+} else {
+    Duration::from_millis(15)
+};
+const OUTPUT_READER_TIMEOUT_SETTLE_MAX: Duration = Duration::from_millis(900);
 #[cfg(target_family = "unix")]
 const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
@@ -2730,16 +2736,16 @@ impl WorkerManager {
     }
 
     fn settle_output_after_completion(&self, budget: Duration) {
-        let total = budget.min(Duration::from_millis(120));
+        let total = budget.min(OUTPUT_READER_QUIESCE_GRACE);
         if total.is_zero() {
             return;
         }
-        let stable_needed = Duration::from_millis(15).min(total);
+        let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(total);
         self.settle_output_until_stable(total, stable_needed);
     }
 
     fn settle_output_after_timeout(&self) {
-        let total = Duration::from_millis(2500);
+        let total = OUTPUT_READER_TIMEOUT_SETTLE_MAX;
         let stable_needed = Duration::from_millis(40);
         let poll = Duration::from_millis(5);
         let start = std::time::Instant::now();
