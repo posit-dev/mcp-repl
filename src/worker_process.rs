@@ -460,11 +460,56 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     }
     let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
     let trimmed_last = last_line.trim_end();
-    if trimmed_last.ends_with(':') || last_line.starts_with(char::is_whitespace) {
+    let code_last = python_line_code_before_comment(trimmed_last).trim_end();
+    if code_last.ends_with(':')
+        || code_last.trim_start().starts_with('@')
+        || last_line.starts_with(char::is_whitespace)
+    {
         Some("... ".to_string())
     } else {
         None
     }
+}
+
+fn python_line_code_before_comment(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    let mut quote: Option<(char, bool)> = None;
+    let mut escaped = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some((delimiter, triple)) = quote {
+            if triple {
+                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => return &line[..idx],
+            '\'' | '"' => {
+                let triple = take_next_two_indexed(&mut chars, ch);
+                quote = Some((ch, triple));
+            }
+            _ => {}
+        }
+    }
+
+    line
 }
 
 fn python_requires_continuation(text: &str) -> bool {
@@ -542,6 +587,21 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
     let mut clone = chars.clone();
     if clone.next() != Some(expected) || clone.next() != Some(expected) {
+        return false;
+    }
+    chars.next();
+    chars.next();
+    true
+}
+
+fn take_next_two_indexed(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    expected: char,
+) -> bool {
+    let mut clone = chars.clone();
+    if clone.next().map(|(_, ch)| ch) != Some(expected)
+        || clone.next().map(|(_, ch)| ch) != Some(expected)
+    {
         return false;
     }
     chars.next();
