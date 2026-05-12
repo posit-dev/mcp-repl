@@ -513,6 +513,11 @@ def _mcp_repl_emit_plots():
     _emit_plots()
 
 
+def _mcp_repl_flush_original_stdio():
+    sys.__stdout__.flush()
+    sys.__stderr__.flush()
+
+
 def _mcp_repl_plot_capable():
     return bool(_plot_capable)
 

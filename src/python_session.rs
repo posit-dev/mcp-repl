@@ -592,10 +592,12 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
             }
         };
         if take_exit_requested() {
+            flush_original_stdio();
             return Ok(());
         }
         emit_plots();
         if status == PYTHON_EOF {
+            flush_original_stdio();
             return Ok(());
         }
     }
@@ -871,6 +873,36 @@ fn emit_plots() {
     }
 }
 
+fn flush_original_stdio() {
+    {
+        let _gil = GilGuard::acquire();
+        let api = PythonApi::global();
+        let Ok(main) = api.import_module("__main__") else {
+            api.clear_error();
+            unsafe {
+                libc::fflush(ptr::null_mut());
+            }
+            return;
+        };
+        let Ok(func) = api.get_attr_string(main.as_ptr(), "_mcp_repl_flush_original_stdio") else {
+            api.clear_error();
+            unsafe {
+                libc::fflush(ptr::null_mut());
+            }
+            return;
+        };
+        let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
+        if result.is_null() {
+            api.clear_error();
+        } else {
+            drop(PyPtr::from_owned(result, "original stdio flush result"));
+        }
+    }
+    unsafe {
+        libc::fflush(ptr::null_mut());
+    }
+}
+
 struct SessionState {
     inner: Mutex<SessionStateInner>,
     cvar: Condvar,
@@ -918,11 +950,15 @@ fn session_state() -> &'static Arc<SessionState> {
         .expect("Python session state was not initialized")
 }
 
-fn complete_active_request(
+fn complete_active_request_with_options(
     state: &Arc<SessionState>,
     active: Option<ActiveRequest>,
     emit_session_end: bool,
+    flush_stdio: bool,
 ) {
+    if active.is_some() && flush_stdio {
+        flush_original_stdio();
+    }
     if let Some(active) = active {
         let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
@@ -930,6 +966,14 @@ fn complete_active_request(
     if emit_session_end {
         ipc::emit_session_end();
     }
+}
+
+fn complete_active_request(
+    state: &Arc<SessionState>,
+    active: Option<ActiveRequest>,
+    emit_session_end: bool,
+) {
+    complete_active_request_with_options(state, active, emit_session_end, true);
 }
 
 fn finish_session_end() {
@@ -940,7 +984,7 @@ fn finish_session_end() {
     guard.shutdown = true;
     let active = guard.active_request.take();
     drop(guard);
-    complete_active_request(state, active, should_emit);
+    complete_active_request_with_options(state, active, should_emit, false);
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
