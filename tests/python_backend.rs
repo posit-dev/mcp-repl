@@ -1531,6 +1531,32 @@ async fn python_syntax_error_dedent_reports_primary_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("x = 'abc", Some(5.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SyntaxError"),
+        "expected unterminated single quote to raise SyntaxError, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected unterminated single quote to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected unterminated single quote not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_stdout_replaces_lone_surrogates() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1573,6 +1599,35 @@ async fn python_original_stdout_is_flushed_before_reply() -> TestResult<()> {
     assert!(
         text.contains("ORIG_STDOUT"),
         "expected original stdout writes to be visible in the completing reply, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_original_stdout_preserves_order_with_replacement_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys\nsys.__stdout__.write('ORIG_BEFORE\\n')\nprint('REPLACED_AFTER')",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    let original = text
+        .find("ORIG_BEFORE")
+        .ok_or_else(|| format!("missing original stdout write, got: {text:?}"))?;
+    let replacement = text
+        .find("REPLACED_AFTER")
+        .ok_or_else(|| format!("missing replacement stdout write, got: {text:?}"))?;
+    assert!(
+        original < replacement,
+        "expected original stdout write to precede replacement stdout write, got: {text:?}"
     );
     Ok(())
 }

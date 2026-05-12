@@ -620,7 +620,11 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
         }
     }
 
-    quote.is_some() || !stack.is_empty()
+    match quote {
+        Some((_, true)) => true,
+        Some((_, false)) => false,
+        None => !stack.is_empty(),
+    }
 }
 
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {

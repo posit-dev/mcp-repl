@@ -354,6 +354,10 @@ impl PythonApi {
                 ._library
                 .get::<*mut c_int>(b"Py_InspectFlag\0")
                 .map_err(|err| format!("failed to load Py_InspectFlag: {err}"))? = 1;
+            **self
+                ._library
+                .get::<*mut c_int>(b"Py_UnbufferedStdioFlag\0")
+                .map_err(|err| format!("failed to load Py_UnbufferedStdioFlag: {err}"))? = 1;
         }
         Ok(())
     }
