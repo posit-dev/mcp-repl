@@ -2342,8 +2342,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     if needs_direct_allow {
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions =
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessPermissions = allow_access_mask();
         explicit.grfAccessMode = GRANT_ACCESS;
         explicit.grfInheritance = if inherit_children {
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
@@ -2355,8 +2354,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     }
     if needs_inherit_only {
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions =
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessPermissions = allow_access_mask();
         explicit.grfAccessMode = GRANT_ACCESS;
         explicit.grfInheritance =
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
@@ -2497,6 +2495,10 @@ fn deny_write_mask() -> u32 {
         | FILE_DELETE_CHILD
 }
 
+fn allow_access_mask() -> u32 {
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD
+}
+
 unsafe fn dacl_size_info(dacl: *mut ACL) -> Option<ACL_SIZE_INFORMATION> {
     if dacl.is_null() {
         return None;
@@ -2517,9 +2519,7 @@ unsafe fn ace_sid_ptr(ace: *mut c_void) -> *mut c_void {
 }
 
 fn allow_ace_satisfies_requirements(mask: u32, ace_flags: u8, require_inheritance: bool) -> bool {
-    if (mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE))
-        != (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE)
-    {
+    if (mask & allow_access_mask()) != allow_access_mask() {
         return false;
     }
     if require_inheritance
