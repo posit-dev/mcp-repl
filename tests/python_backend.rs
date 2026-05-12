@@ -612,6 +612,34 @@ async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_long_physical_line_does_not_complete_before_execution() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let filler = "x = 1; ".repeat(40);
+    let input = format!("import time; {filler}time.sleep(0.5); print('LONG_LINE_DONE')");
+    let result = session.write_stdin_raw_with(&input, Some(0.1)).await?;
+    let text = result_text(&result);
+    assert!(
+        is_busy_response(&text),
+        "expected long physical line to stay busy until execution finishes, got: {text:?}"
+    );
+
+    sleep(Duration::from_millis(700)).await;
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll_text = result_text(&poll);
+    session.cancel().await?;
+
+    assert!(
+        poll_text.contains("LONG_LINE_DONE"),
+        "expected long physical line output after execution, got: {poll_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

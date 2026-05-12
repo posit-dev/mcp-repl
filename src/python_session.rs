@@ -713,10 +713,9 @@ fn handle_input_hook() {
             if active.skip_next_hook {
                 active.skip_next_hook = false;
             } else {
-                active.consumed_lines = active.consumed_lines.saturating_add(1);
+                note_input_hook_consumed_line(active);
             }
-            let should_complete =
-                active.consumed_lines >= active.line_count || request_input_drained(active);
+            let should_complete = request_should_complete(active);
             guard.waiting_for_input = true;
             if should_complete {
                 prompt = Some(current_prompt);
@@ -743,8 +742,30 @@ unsafe extern "C" fn pyos_input_hook() -> c_int {
     0
 }
 
+fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
+    #[cfg(not(target_family = "unix"))]
+    {
+        active.consumed_lines = active.consumed_lines.saturating_add(1);
+    }
+    #[cfg(target_family = "unix")]
+    {
+        let _ = active;
+    }
+}
+
+fn request_should_complete(active: &ActiveRequest) -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        request_input_drained(active)
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        active.consumed_lines >= active.line_count
+    }
+}
+
 fn request_input_drained(active: &ActiveRequest) -> bool {
-    if !active.stdin_write_complete || active.byte_len == 0 || active.consumed_lines == 0 {
+    if !active.stdin_write_complete || active.byte_len == 0 {
         return false;
     }
     stdin_pending_byte_count() == Some(0)
