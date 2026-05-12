@@ -315,7 +315,9 @@ class McpOutputStream:
         self.buffer = McpOutputBuffer(stream)
 
     def write(self, message):
-        return _mcp_repl.write(self._stream, str(message))
+        text = str(message)
+        self.buffer.write(text.encode(self.encoding, self.errors))
+        return len(text)
 
     def writelines(self, lines):
         for line in lines:

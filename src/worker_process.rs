@@ -452,18 +452,19 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
         return None;
     }
     let text = text.trim_end_matches(['\r', '\n']);
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return None;
     }
     if python_requires_continuation(text) {
         return Some("... ".to_string());
     }
     let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
+    let has_previous_line = text.contains(['\n', '\r']);
     let trimmed_last = last_line.trim_end();
     let code_last = python_line_code_before_comment(trimmed_last).trim_end();
     if code_last.ends_with(':')
         || code_last.trim_start().starts_with('@')
-        || last_line.starts_with(char::is_whitespace)
+        || (has_previous_line && last_line.starts_with(char::is_whitespace))
     {
         Some("... ".to_string())
     } else {

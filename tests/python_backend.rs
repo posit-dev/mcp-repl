@@ -1349,6 +1349,80 @@ async fn python_decorator_reports_continuation_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_whitespace_only_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("   ", Some(5.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains(">>> "),
+        "expected whitespace-only Python input to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected whitespace-only Python input not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("    print(1)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("IndentationError"),
+        "expected invalid top-level indent to raise IndentationError, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected invalid top-level indent to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected invalid top-level indent not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_stdout_replaces_lone_surrogates() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("print('\\udcff')", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("UnicodeEncodeError"),
+        "expected stdout to apply replacement error handling, got: {text:?}"
+    );
+    assert!(
+        text.contains("?\n"),
+        "expected stdout to write replacement byte for lone surrogate, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_roundtrip() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
