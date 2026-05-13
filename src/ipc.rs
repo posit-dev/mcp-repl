@@ -1733,6 +1733,7 @@ pub(crate) fn test_connection_pair_with_handlers(
         reader: Box::new(worker_read),
         writer: Box::new(worker_write),
     })?;
+    server.inbox.lock().unwrap().startup_message_seen = true;
     Ok((server, worker))
 }
 
@@ -1932,7 +1933,7 @@ mod protocol_tests {
     use super::{
         IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
         OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
-        WorkerIpcConnection, WorkerToServerIpcMessage, test_connection_pair_with_handlers,
+        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -2155,8 +2156,8 @@ mod protocol_tests {
         let result = server.wait_for_backend_info(Duration::from_millis(200));
 
         assert!(
-            matches!(result, Err(super::IpcWaitError::Disconnected)),
-            "invalid worker message should disconnect server IPC, got: {result:?}"
+            matches!(result, Err(super::IpcWaitError::Protocol(ref message)) if message.starts_with("invalid worker sideband JSON:")),
+            "invalid worker message should report a protocol error, got: {result:?}"
         );
     }
 
@@ -2296,28 +2297,15 @@ mod protocol_tests {
 
     #[test]
     fn plot_image_updates_reuse_current_server_image_id() {
-        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
-        let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
         let images = Arc::new(Mutex::new(Vec::new()));
         let handler_images = images.clone();
-        let _server = ServerIpcConnection::new(
-            IpcTransport {
-                reader: Box::new(server_read),
-                writer: Box::new(server_write),
-            },
-            IpcHandlers {
-                on_plot_image: Some(Arc::new(move |image| {
-                    handler_images.lock().expect("image mutex").push(image);
-                })),
-                ..IpcHandlers::default()
-            },
-        )
-        .expect("server connection");
-        let worker = WorkerIpcConnection::new(IpcTransport {
-            reader: Box::new(worker_read),
-            writer: Box::new(worker_write),
+        let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+            on_plot_image: Some(Arc::new(move |image| {
+                handler_images.lock().expect("image mutex").push(image);
+            })),
+            ..IpcHandlers::default()
         })
-        .expect("worker connection");
+        .expect("ipc pair");
         let first = json!({
             "type": "plot_image",
             "mime_type": "image/png",
@@ -2359,28 +2347,15 @@ mod protocol_tests {
     #[test]
     fn plot_image_ids_do_not_repeat_across_server_connections() {
         fn next_connection_image_id() -> String {
-            let (server_read, worker_write) = std::io::pipe().expect("server pipe");
-            let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
             let images = Arc::new(Mutex::new(Vec::new()));
             let handler_images = images.clone();
-            let _server = ServerIpcConnection::new(
-                IpcTransport {
-                    reader: Box::new(server_read),
-                    writer: Box::new(server_write),
-                },
-                IpcHandlers {
-                    on_plot_image: Some(Arc::new(move |image| {
-                        handler_images.lock().expect("image mutex").push(image);
-                    })),
-                    ..IpcHandlers::default()
-                },
-            )
-            .expect("server connection");
-            let worker = WorkerIpcConnection::new(IpcTransport {
-                reader: Box::new(worker_read),
-                writer: Box::new(worker_write),
+            let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+                on_plot_image: Some(Arc::new(move |image| {
+                    handler_images.lock().expect("image mutex").push(image);
+                })),
+                ..IpcHandlers::default()
             })
-            .expect("worker connection");
+            .expect("ipc pair");
             let image = json!({
                 "type": "plot_image",
                 "mime_type": "image/png",
