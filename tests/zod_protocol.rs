@@ -234,3 +234,49 @@ async fn zod_worker_busy_follow_up_does_not_reach_stdin() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_invalid_output_base64_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-output-base64",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid output_text base64"),
+        "expected invalid base64 protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "misreport-input different",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("readline_input text does not match active stdin"),
+        "expected readline_input accounting protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}

@@ -66,8 +66,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        writer.send(&WorkerToServer::ReadlineInput { text: line.clone() })?;
         let command = line.trim_end_matches(['\r', '\n']);
+        let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
+            format!("{text}\n")
+        } else {
+            line.clone()
+        };
+        writer.send(&WorkerToServer::ReadlineInput {
+            text: reported_input,
+        })?;
         if command == "exit" {
             writer.send(&WorkerToServer::SessionEnd {
                 reason: "runtime_exit".to_string(),
@@ -118,6 +125,11 @@ fn run_command(
             data_b64: base64::engine::general_purpose::STANDARD.encode(TINY_PNG),
             update: false,
         })?;
+        return Ok(());
+    }
+
+    if command == "bad-output-base64" {
+        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
         return Ok(());
     }
 
@@ -253,6 +265,16 @@ impl IpcWriter {
             stream: stream.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         })
+    }
+
+    fn send_raw_json(&self, payload: &str) -> io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("ipc writer mutex poisoned"))?;
+        writer.write_all(payload.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()
     }
 }
 
