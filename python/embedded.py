@@ -379,7 +379,7 @@ class McpOutputStream:
         return False
 
     def isatty(self):
-        return True
+        return False
 
     def fileno(self):
         return 1 if self._stream == "stdout" else 2
@@ -411,7 +411,7 @@ class McpOutputBuffer:
         return False
 
     def isatty(self):
-        return True
+        return False
 
     def fileno(self):
         return 1 if self._stream == "stdout" else 2

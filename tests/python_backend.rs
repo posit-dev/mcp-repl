@@ -1003,9 +1003,12 @@ async fn python_stdout_stderr_expose_text_stream_methods() -> TestResult<()> {
 
     let result = session
         .write_stdin_raw_with(
-            r#"import sys
-print("STDOUT_FLAGS", sys.stdout.readable(), sys.stdout.writable(), sys.stdout.seekable())
-print("STDERR_FLAGS", sys.stderr.readable(), sys.stderr.writable(), sys.stderr.seekable())
+            r#"import os, sys
+print("STDOUT_FLAGS", sys.stdout.readable(), sys.stdout.writable(), sys.stdout.seekable(), sys.stdout.isatty(), sys.stdout.buffer.isatty())
+print("STDERR_FLAGS", sys.stderr.readable(), sys.stderr.writable(), sys.stderr.seekable(), sys.stderr.isatty(), sys.stderr.buffer.isatty())
+sys.stdout.isatty() and os.get_terminal_size(sys.stdout.fileno())
+sys.stderr.isatty() and os.get_terminal_size(sys.stderr.fileno())
+print("TERMINAL_FLAGS_OK")
 sys.stdout.writelines(["OUT_A", "OUT_B\n"])
 sys.stderr.writelines(["ERR_A", "ERR_B\n"])
 "#,
@@ -1016,12 +1019,16 @@ sys.stderr.writelines(["ERR_A", "ERR_B\n"])
     session.cancel().await?;
 
     assert!(
-        text.contains("STDOUT_FLAGS False True False"),
+        text.contains("STDOUT_FLAGS False True False False False"),
         "expected stdout text stream flags, got: {text:?}"
     );
     assert!(
-        text.contains("STDERR_FLAGS False True False"),
+        text.contains("STDERR_FLAGS False True False False False"),
         "expected stderr text stream flags, got: {text:?}"
+    );
+    assert!(
+        text.contains("TERMINAL_FLAGS_OK"),
+        "expected non-tty stdout/stderr to avoid terminal-size ioctls, got: {text:?}"
     );
     assert!(
         text.contains("OUT_AOUT_B"),
