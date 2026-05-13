@@ -475,7 +475,7 @@ fn set_stdio_unbuffered(file: *mut libc::FILE, fd: libc::c_int) -> Result<(), St
     }
 }
 
-fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
+fn find_dot_venv_pythons(start: &Path) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     // Search HOME itself, then stop. Do not ascend to HOME's parent.
     let stop_at_home = home
@@ -484,13 +484,17 @@ fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
         .cloned();
     let mut dir = start.to_path_buf();
     loop {
+        let mut candidates = Vec::new();
         for candidate in [
             dir.join(".venv").join("bin").join("python"),
             dir.join(".venv").join("bin").join("python3"),
         ] {
             if candidate.is_file() {
-                return Some(candidate);
+                candidates.push(candidate);
             }
+        }
+        if !candidates.is_empty() {
+            return candidates;
         }
 
         if let Some(stop) = stop_at_home.as_ref()
@@ -507,7 +511,7 @@ fn find_dot_venv_python(start: &Path) -> Option<PathBuf> {
         }
         dir = parent.to_path_buf();
     }
-    None
+    Vec::new()
 }
 
 fn find_program_on_path(name: &str) -> Option<PathBuf> {
@@ -544,11 +548,10 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn python_program_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(venv_python) = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| find_dot_venv_python(&cwd))
-    {
-        push_unique_path(&mut candidates, venv_python);
+    if let Ok(cwd) = std::env::current_dir() {
+        for venv_python in find_dot_venv_pythons(&cwd) {
+            push_unique_path(&mut candidates, venv_python);
+        }
     }
     push_unique_path(
         &mut candidates,

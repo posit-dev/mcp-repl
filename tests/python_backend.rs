@@ -141,6 +141,24 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
 }
 
+#[cfg(unix)]
+fn real_python_executable() -> TestResult<String> {
+    let real_python = common::python_program().ok_or("python should be available")?;
+    let real_executable = std::process::Command::new(real_python)
+        .args(["-c", "import sys; print(sys.executable)"])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    assert!(
+        real_executable.status.success(),
+        "expected real Python executable probe to succeed"
+    );
+    let real_executable = String::from_utf8(real_executable.stdout)?
+        .trim()
+        .to_string();
+    assert!(!real_executable.is_empty(), "real Python executable path");
+    Ok(real_executable)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
@@ -210,19 +228,7 @@ async fn python_discovery_skips_static_libpython_archive_candidate() -> TestResu
     };
     baseline.cancel().await?;
 
-    let real_python = common::python_program().ok_or("python should be available")?;
-    let real_executable = std::process::Command::new(real_python)
-        .args(["-c", "import sys; print(sys.executable)"])
-        .stdin(std::process::Stdio::null())
-        .output()?;
-    assert!(
-        real_executable.status.success(),
-        "expected real Python executable probe to succeed"
-    );
-    let real_executable = String::from_utf8(real_executable.stdout)?
-        .trim()
-        .to_string();
-    assert!(!real_executable.is_empty(), "real Python executable path");
+    let real_executable = real_python_executable()?;
 
     let temp = tempdir()?;
     let bin = temp.path().join("bin");
@@ -303,6 +309,105 @@ async fn python_discovery_skips_static_libpython_archive_candidate() -> TestResu
     assert!(
         text.contains("STATIC_LIBPYTHON_FALLBACK_OK"),
         "expected fallback Python candidate to run, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_discovery_uses_venv_python3_after_broken_venv_python() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_some() {
+        eprintln!("explicit Python executable set; skipping venv python3 fallback test");
+        return Ok(());
+    }
+
+    let Some(baseline) = start_python_session().await? else {
+        return Ok(());
+    };
+    baseline.cancel().await?;
+
+    let real_executable = real_python_executable()?;
+    let workspace = tempdir()?;
+    let venv_bin = workspace.path().join(".venv").join("bin");
+    let external_bin = workspace.path().join("external-bin");
+    fs::create_dir_all(&venv_bin)?;
+    fs::create_dir_all(&external_bin)?;
+
+    let broken_python = venv_bin.join("python");
+    fs::write(&broken_python, "#!/bin/sh\nexit 1\n")?;
+    let mut permissions = fs::metadata(&broken_python)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&broken_python, permissions)?;
+
+    let venv_python3_marker = workspace.path().join("venv-python3-probed");
+    let venv_python3 = venv_bin.join("python3");
+    fs::write(
+        &venv_python3,
+        "#!/bin/sh\nprintf probed > \"$MCP_REPL_VENV_PYTHON3_MARKER\"\nexec \"$MCP_REPL_REAL_PYTHON\" \"$@\"\n",
+    )?;
+    let mut permissions = fs::metadata(&venv_python3)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&venv_python3, permissions)?;
+
+    let path_python3_marker = workspace.path().join("path-python3-probed");
+    let path_python3 = external_bin.join("python3");
+    fs::write(
+        &path_python3,
+        "#!/bin/sh\nprintf probed > \"$MCP_REPL_PATH_PYTHON3_MARKER\"\nexit 1\n",
+    )?;
+    let mut permissions = fs::metadata(&path_python3)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path_python3, permissions)?;
+
+    let mut session = common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![
+            ("PATH".to_string(), external_bin.display().to_string()),
+            ("MCP_REPL_REAL_PYTHON".to_string(), real_executable),
+            (
+                "MCP_REPL_VENV_PYTHON3_MARKER".to_string(),
+                venv_python3_marker.display().to_string(),
+            ),
+            (
+                "MCP_REPL_PATH_PYTHON3_MARKER".to_string(),
+                path_python3_marker.display().to_string(),
+            ),
+        ],
+        Some(workspace.path().to_path_buf()),
+    )
+    .await?;
+    let probe = session
+        .write_stdin_raw_with("print('VENV_PYTHON3_FALLBACK_OK')", Some(2.0))
+        .await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let text = result_text(&probe);
+    session.cancel().await?;
+
+    assert!(
+        venv_python3_marker.exists(),
+        "expected Python discovery to probe .venv/bin/python3 after broken .venv/bin/python"
+    );
+    assert!(
+        !path_python3_marker.exists(),
+        "expected .venv/bin/python3 to be tried before PATH python3"
+    );
+    assert!(
+        text.contains("VENV_PYTHON3_FALLBACK_OK"),
+        "expected same-venv python3 fallback to run, got: {text:?}"
     );
     Ok(())
 }
