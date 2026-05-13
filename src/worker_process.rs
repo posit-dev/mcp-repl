@@ -2429,6 +2429,9 @@ impl WorkerManager {
                 } else {
                     completion.prompt.clone()
                 };
+                if raw_prompt.as_deref() == Some("") {
+                    contents.push(stdin_wait_status_content());
+                }
                 let resolved_prompt = normalize_prompt(raw_prompt.clone());
                 self.remember_prompt(raw_prompt);
                 let fallback_input = self.take_input_fallback(&completion);
@@ -2593,6 +2596,9 @@ impl WorkerManager {
                 } else {
                     completion.prompt.clone()
                 };
+                if raw_prompt.as_deref() == Some("") {
+                    contents.push(stdin_wait_status_content());
+                }
                 let resolved_prompt = normalize_prompt(raw_prompt.clone());
                 self.remember_prompt(raw_prompt);
                 if self.pager.is_active() && !session_end {
@@ -5073,6 +5079,10 @@ fn timeout_status_content(timeout: Duration) -> WorkerContent {
 
 fn idle_status_content() -> WorkerContent {
     WorkerContent::server_stdout("<<repl status: idle>>")
+}
+
+fn stdin_wait_status_content() -> WorkerContent {
+    WorkerContent::server_stdout("<<repl status: waiting for stdin>>")
 }
 
 fn append_protocol_warnings(contents: &mut Vec<WorkerContent>, warnings: &[String]) {

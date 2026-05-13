@@ -2086,8 +2086,12 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "expected Python backend to start before empty input prompt, got: {prompt_text:?}"
     );
     assert!(
-        prompt_text.contains("stdin> "),
-        "expected empty input prompt to return a visible waiting prompt, got: {prompt_text:?}"
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected empty input prompt to return a visible waiting status, got: {prompt_text:?}"
+    );
+    assert!(
+        !prompt_text.contains("stdin> "),
+        "did not expect a fabricated prompt for empty input, got: {prompt_text:?}"
     );
 
     let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
