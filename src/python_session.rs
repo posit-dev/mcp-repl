@@ -708,7 +708,21 @@ fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
         candidates.push(Path::new(root).join("Python"));
     }
 
-    candidates.into_iter().find(|candidate| candidate.is_file())
+    candidates
+        .into_iter()
+        .find(|candidate| is_loadable_libpython_candidate(candidate))
+}
+
+fn is_loadable_libpython_candidate(candidate: &Path) -> bool {
+    if !candidate.is_file() {
+        return false;
+    }
+    !candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("a") || extension.eq_ignore_ascii_case("lib")
+        })
 }
 
 #[cfg(windows)]
@@ -1768,6 +1782,32 @@ mod tests {
         }
     }
 
+    fn runtime_probe_for_libpython(
+        executable: &Path,
+        version: [u64; 2],
+        ldlibrary: &Path,
+        libdir: &Path,
+        prefix: &Path,
+    ) -> PythonRuntimeProbe {
+        PythonRuntimeProbe {
+            executable: executable.to_string_lossy().into_owned(),
+            base_executable: executable.to_string_lossy().into_owned(),
+            prefix: prefix.to_string_lossy().into_owned(),
+            base_prefix: prefix.to_string_lossy().into_owned(),
+            exec_prefix: prefix.to_string_lossy().into_owned(),
+            base_exec_prefix: prefix.to_string_lossy().into_owned(),
+            version,
+            ldlibrary: ldlibrary.to_string_lossy().into_owned(),
+            instsoname: ldlibrary.to_string_lossy().into_owned(),
+            libdir: libdir.to_string_lossy().into_owned(),
+            libpl: libdir.to_string_lossy().into_owned(),
+            #[cfg(windows)]
+            bindir: String::new(),
+            pythonframeworkprefix: String::new(),
+            pythonframeworkinstalldir: String::new(),
+        }
+    }
+
     #[cfg(target_family = "unix")]
     fn active_request_for_prompt_wait(
         line_count: usize,
@@ -1879,6 +1919,25 @@ mod tests {
 
         assert_eq!(attempts, vec![PathBuf::from("custom-python")]);
         assert!(err.contains("custom-python is not usable"));
+    }
+
+    #[test]
+    fn resolve_libpython_path_skips_static_archive_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        let lib = temp.path().join("lib");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        std::fs::create_dir_all(&lib).expect("lib dir");
+        let executable = bin.join("python3");
+        let archive = lib.join("libpython3.11.a");
+        let shared = lib.join("libpython3.11.so");
+        std::fs::write(&executable, "").expect("python placeholder");
+        std::fs::write(&archive, "!<arch>\n").expect("archive placeholder");
+        std::fs::write(&shared, "").expect("shared placeholder");
+
+        let probe = runtime_probe_for_libpython(&executable, [3, 11], &archive, &lib, temp.path());
+
+        assert_eq!(resolve_libpython_path(&probe), Some(shared));
     }
 
     #[cfg(windows)]

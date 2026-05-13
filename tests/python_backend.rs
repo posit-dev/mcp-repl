@@ -5,6 +5,8 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
@@ -190,6 +192,117 @@ async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
     assert!(
         !marker.exists(),
         "Python discovery probe wrote outside the sandbox; reply was: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_discovery_skips_static_libpython_archive_candidate() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_some() {
+        eprintln!("explicit Python executable set; skipping discovery fallback test");
+        return Ok(());
+    }
+
+    let Some(baseline) = start_python_session().await? else {
+        return Ok(());
+    };
+    baseline.cancel().await?;
+
+    let real_python = common::python_program().ok_or("python should be available")?;
+    let real_executable = std::process::Command::new(real_python)
+        .args(["-c", "import sys; print(sys.executable)"])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    assert!(
+        real_executable.status.success(),
+        "expected real Python executable probe to succeed"
+    );
+    let real_executable = String::from_utf8(real_executable.stdout)?
+        .trim()
+        .to_string();
+    assert!(!real_executable.is_empty(), "real Python executable path");
+
+    let temp = tempdir()?;
+    let bin = temp.path().join("bin");
+    let lib = temp.path().join("lib");
+    fs::create_dir_all(&bin)?;
+    fs::create_dir_all(&lib)?;
+    let static_libpython = lib.join("libpython3.11.a");
+    fs::write(&static_libpython, b"!<arch>\n")?;
+
+    let fake_python3 = bin.join("python3");
+    let fake_probe_marker = temp.path().join("fake-python3-probed");
+    let fake_json = serde_json::json!({
+        "executable": fake_python3,
+        "base_executable": fake_python3,
+        "prefix": temp.path(),
+        "base_prefix": temp.path(),
+        "exec_prefix": temp.path(),
+        "base_exec_prefix": temp.path(),
+        "version": [3, 11],
+        "ldlibrary": static_libpython,
+        "instsoname": static_libpython,
+        "libdir": lib,
+        "libpl": lib,
+        "pythonframeworkprefix": "",
+        "pythonframeworkinstalldir": "",
+    });
+    fs::write(
+        &fake_python3,
+        format!(
+            "#!/bin/sh\nprintf probed > \"$MCP_REPL_FAKE_PYTHON3_PROBE_MARKER\"\ncat <<'JSON'\n{fake_json}\nJSON\n"
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_python3)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python3, permissions)?;
+    symlink(real_executable, bin.join("python"))?;
+
+    let mut session = common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![
+            ("PATH".to_string(), bin.display().to_string()),
+            (
+                "MCP_REPL_FAKE_PYTHON3_PROBE_MARKER".to_string(),
+                fake_probe_marker.display().to_string(),
+            ),
+        ],
+        Some(temp.path().to_path_buf()),
+    )
+    .await?;
+    let probe = session
+        .write_stdin_raw_with("print('STATIC_LIBPYTHON_FALLBACK_OK')", Some(2.0))
+        .await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let text = result_text(&probe);
+    session.cancel().await?;
+
+    assert!(
+        fake_probe_marker.exists(),
+        "expected Python discovery to probe fake python3 candidate"
+    );
+    assert!(
+        !python_backend_unavailable(&text),
+        "expected static libpython archive candidate to be rejected before fallback, got: {text:?}"
+    );
+    assert!(
+        text.contains("STATIC_LIBPYTHON_FALLBACK_OK"),
+        "expected fallback Python candidate to run, got: {text:?}"
     );
     Ok(())
 }
@@ -1192,7 +1305,7 @@ async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_f
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_fork_child_closes_raw_ipc_fds_without_wrapper_close() -> TestResult<()> {
+async fn python_fork_child_closes_raw_ipc_fds_without_python_close() -> TestResult<()> {
     let _guard = lock_test_mutex();
     if !require_python() {
         return Ok(());
@@ -1200,39 +1313,25 @@ async fn python_fork_child_closes_raw_ipc_fds_without_wrapper_close() -> TestRes
 
     let temp = tempdir()?;
     let marker_path = temp.path().join("fork-close.log");
+    let installed_path = temp.path().join("fork-close-installed");
     fs::write(
         temp.path().join("sitecustomize.py"),
         r#"import os
-_real_fdopen = os.fdopen
-_target_fds = {
-    int(os.environ["MCP_REPL_IPC_READ_FD"]),
-    int(os.environ["MCP_REPL_IPC_WRITE_FD"]),
-}
+from pathlib import Path
+
+_real_close = os.close
 _marker = os.environ["MCP_REPL_FORK_CLOSE_MARKER"]
+Path(os.environ["MCP_REPL_FORK_CLOSE_INSTALLED_MARKER"]).write_text(
+    "installed",
+    encoding="utf-8",
+)
 
-class _SpyStream:
-    def __init__(self, stream, fd):
-        self._stream = stream
-        self._fd = fd
+def _wrapped_close(fd):
+    with open(_marker, "a", encoding="utf-8") as handle:
+        handle.write(f"{fd}\n")
+    return _real_close(fd)
 
-    def __iter__(self):
-        return iter(self._stream)
-
-    def close(self):
-        with open(_marker, "a", encoding="utf-8") as handle:
-            handle.write(f"{{self._fd}}\n")
-        return self._stream.close()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-def _wrapped_fdopen(fd, *args, **kwargs):
-    stream = _real_fdopen(fd, *args, **kwargs)
-    if fd in _target_fds:
-        return _SpyStream(stream, fd)
-    return stream
-
-os.fdopen = _wrapped_fdopen
+os.close = _wrapped_close
 "#,
     )?;
 
@@ -1241,6 +1340,10 @@ os.fdopen = _wrapped_fdopen
         (
             "MCP_REPL_FORK_CLOSE_MARKER".to_string(),
             marker_path.display().to_string(),
+        ),
+        (
+            "MCP_REPL_FORK_CLOSE_INSTALLED_MARKER".to_string(),
+            installed_path.display().to_string(),
         ),
     ])
     .await?
@@ -1269,8 +1372,12 @@ exec("pid = os.fork()\nif pid == 0:\n    os._exit(0)\n_, status = os.waitpid(pid
     session.cancel().await?;
 
     assert!(
+        installed_path.exists(),
+        "expected fork-close spy to be installed by sitecustomize"
+    );
+    assert!(
         !marker_path.exists(),
-        "expected at-fork cleanup to bypass wrapped stream close, got marker contents: {:?}",
+        "expected at-fork cleanup to bypass Python os.close, got marker contents: {:?}",
         fs::read_to_string(&marker_path).ok()
     );
     Ok(())

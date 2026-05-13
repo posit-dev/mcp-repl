@@ -19,7 +19,7 @@ carried over an IPC pipe.
 ## Direction: server -> worker
 
 `stdin_write`
-- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize> }`
+- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
 - Emitted before the server writes the raw input payload bytes to stdin.
 - The payload itself is not carried on IPC and stdin contains no protocol
   header.
@@ -29,6 +29,19 @@ carried over an IPC pipe.
   acceptance and uses `line_count` to know how many CPython readline calls
   belong to the active request.
 - `line_count` is optional for older senders and defaults to `0`.
+- `final_prompt` is optional and is currently sent by the Python backend driver.
+  It is a best-effort fallback prompt hint for the request payload, used only
+  while the worker is still waiting for the current request to finish.
+
+`stdin_write_complete`
+- `{ "type": "stdin_write_complete" }`
+- Emitted after the server has written the raw input payload bytes to stdin.
+- Python worker mode uses this frame to distinguish "no more bytes will arrive
+  for this request" from "stdin may still be draining", so it can finish a
+  request only after both CPython readline progress and payload write completion
+  agree.
+- R worker mode currently ignores this frame because the R stdin reader owns
+  exact payload consumption through `byte_len`.
 
 `interrupt`
 - `{ "type": "interrupt" }`
