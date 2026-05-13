@@ -2158,7 +2158,7 @@ impl WorkerManager {
             } else if matches!(self.backend, Backend::Python)
                 && let Some(prompt_text) = resolved_prompt.as_deref()
             {
-                strip_prompt_from_contents(&mut contents, prompt_text);
+                strip_trailing_worker_stdout_prompt(&mut contents, prompt_text);
             }
         }
 
@@ -2668,7 +2668,7 @@ impl WorkerManager {
                     } else if matches!(self.backend, Backend::Python)
                         && let Some(prompt_text) = resolved_prompt.as_deref()
                     {
-                        strip_prompt_from_contents(&mut contents, prompt_text);
+                        strip_trailing_worker_stdout_prompt(&mut contents, prompt_text);
                     }
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -5138,7 +5138,7 @@ fn reconcile_completion_prompt(
         Backend::R => append_prompt(contents, prompt),
         Backend::Python => {
             if let Some(prompt_text) = prompt.as_deref() {
-                strip_prompt_from_contents(contents, prompt_text);
+                strip_trailing_worker_stdout_prompt(contents, prompt_text);
             }
             append_prompt_if_missing(contents, prompt);
         }
@@ -5156,7 +5156,7 @@ fn reconcile_trailing_completion_prompt(
         Backend::R => append_prompt(contents, prompt),
         Backend::Python => {
             if let Some(prompt_text) = prompt.as_deref() {
-                strip_trailing_prompt(contents, prompt_text);
+                strip_trailing_worker_stdout_prompt(contents, prompt_text);
             }
             append_prompt_if_missing(contents, prompt);
         }
@@ -5172,7 +5172,7 @@ fn reconcile_polled_completion_prompt(
         Backend::R => {}
         Backend::Python => {
             if let Some(prompt_text) = prompt.as_deref() {
-                strip_trailing_prompt(contents, prompt_text);
+                strip_trailing_worker_stdout_prompt(contents, prompt_text);
             }
             append_prompt_if_missing(contents, prompt);
         }
@@ -5206,40 +5206,44 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
     }
 }
 
-fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
+fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
     if prompt.is_empty() {
         return;
     }
-    let mut idx = 0usize;
-    while idx < contents.len() {
-        let remove = match &contents[idx] {
-            WorkerContent::ContentText { text, stream, .. } => {
-                if !matches!(stream, crate::worker_protocol::TextStream::Stdout) {
-                    false
-                } else if text == prompt {
-                    true
-                } else if let Some(prefix) = text.strip_suffix(prompt) {
-                    if prefix.is_empty() {
-                        true
-                    } else {
-                        contents[idx] = WorkerContent::ContentText {
-                            text: prefix.to_string(),
-                            stream: *stream,
-                            origin: crate::worker_protocol::ContentOrigin::Worker,
-                        };
-                        false
-                    }
+
+    let mut idx = contents.len();
+    while idx > 0 {
+        idx = idx.saturating_sub(1);
+        match &contents[idx] {
+            WorkerContent::ContentText {
+                origin: ContentOrigin::Server,
+                ..
+            } => continue,
+            WorkerContent::ContentText {
+                text,
+                stream: TextStream::Stdout,
+                origin: ContentOrigin::Worker,
+            } => {
+                let Some(prefix) = text.strip_suffix(prompt) else {
+                    return;
+                };
+                if prefix.is_empty() {
+                    contents.remove(idx);
                 } else {
-                    false
+                    contents[idx] = WorkerContent::ContentText {
+                        text: prefix.to_string(),
+                        stream: TextStream::Stdout,
+                        origin: ContentOrigin::Worker,
+                    };
                 }
+                return;
             }
-            _ => false,
+            WorkerContent::ContentText {
+                origin: ContentOrigin::Worker,
+                ..
+            }
+            | WorkerContent::ContentImage { .. } => return,
         };
-        if remove {
-            contents.remove(idx);
-        } else {
-            idx = idx.saturating_add(1);
-        }
     }
 }
 

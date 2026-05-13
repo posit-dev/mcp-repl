@@ -141,6 +141,38 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
 }
 
+async fn start_python_pager_session() -> TestResult<Option<common::McpTestSession>> {
+    if !require_python() {
+        return Ok(None);
+    }
+
+    let mut session = common::spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+    ])
+    .await?;
+    let probe = session
+        .write_stdin_raw_with("print('mcp_repl_python_ready')", Some(2.0))
+        .await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let probe_text = result_text(&probe);
+    if python_backend_unavailable(&probe_text) {
+        eprintln!("python backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(None);
+    }
+
+    Ok(Some(session))
+}
+
 #[cfg(unix)]
 fn real_python_executable() -> TestResult<String> {
     let real_python = common::python_program().ok_or("python should be available")?;
@@ -3055,6 +3087,38 @@ async fn python_stderr_merged_into_output() -> TestResult<()> {
     assert!(text.contains("err"), "missing stderr, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_prompt_shaped_stdout_before_stderr_stays_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_pager_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys\n_ = sys.stdout.write('foo >>> ')\nsys.stdout.flush()\n_ = sys.stderr.write('ERR\\n')\nsys.stderr.flush()\n_ = sys.stdout.write('bar\\n')\nsys.stdout.flush()",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    let prompt_shaped_stdout = text
+        .find("foo >>> ")
+        .ok_or_else(|| format!("expected prompt-shaped stdout suffix, got: {text:?}"))?;
+    let stderr = text
+        .find("ERR")
+        .ok_or_else(|| format!("expected stderr, got: {text:?}"))?;
+    let trailing_stdout = text
+        .find("bar")
+        .ok_or_else(|| format!("expected trailing stdout, got: {text:?}"))?;
+    assert!(
+        prompt_shaped_stdout < stderr && stderr < trailing_stdout,
+        "expected prompt-shaped stdout before stderr before trailing stdout, got: {text:?}"
+    );
     Ok(())
 }
 
