@@ -622,7 +622,8 @@ fn final_line_continues_with_backslash(text: &str) -> bool {
     let Some(line) = text.lines().last() else {
         return false;
     };
-    line.trim_end()
+    python_line_code_before_comment(line)
+        .trim_end()
         .chars()
         .rev()
         .take_while(|ch| *ch == '\\')

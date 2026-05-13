@@ -1618,6 +1618,43 @@ async fn python_comment_only_block_body_reports_continuation_prompt() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("x = 1 # note \\", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        !is_busy_response(&text),
+        "expected comment backslash input to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected comment backslash input to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected comment backslash input not to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("print('COMMENT_BACKSLASH', x)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("COMMENT_BACKSLASH 1"),
+        "expected next turn to run after comment backslash input, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_decorator_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
