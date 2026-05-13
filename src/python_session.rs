@@ -585,10 +585,6 @@ fn python_program_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-pub(crate) fn resolve_python_program() -> PathBuf {
-    select_python_program(python_program_candidates(), python_program_starts)
-}
-
 fn query_python_runtime_config(executable: &Path) -> Result<PythonRuntimeConfig, String> {
     let output = Command::new(executable)
         .arg("-I")
@@ -630,17 +626,7 @@ fn query_python_runtime_config(executable: &Path) -> Result<PythonRuntimeConfig,
     })
 }
 
-fn python_program_starts(program: &Path) -> bool {
-    Command::new(program)
-        .args(["-c", "import sys; sys.exit(0)"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
+#[cfg(test)]
 fn select_python_program(
     mut candidates: Vec<PathBuf>,
     mut starts: impl FnMut(&Path) -> bool,
@@ -1166,6 +1152,10 @@ unsafe extern "C" fn mcp_repl_readline(
     note_stdin_line_read(&bytes);
     if prompt_text.is_some() {
         clear_current_readline_prompt();
+    }
+    if take_interrupt_requested() {
+        set_callback_error("Python input interrupted");
+        return ptr::null_mut();
     }
 
     let api = PythonApi::global();

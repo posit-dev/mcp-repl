@@ -139,6 +139,61 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !common::sandbox_exec_available() {
+        eprintln!("sandbox not available; skipping");
+        return Ok(());
+    }
+    if std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_some() {
+        eprintln!("explicit Python executable set; skipping discovery test");
+        return Ok(());
+    }
+
+    let _guard = lock_test_mutex();
+    let workspace = tempdir()?;
+    let outside = tempdir()?;
+    let marker = outside.path().join("python-discovery-marker");
+    let marker_text = marker
+        .to_str()
+        .ok_or("marker path must be valid utf-8")?
+        .to_string();
+    let venv_bin = workspace.path().join(".venv").join("bin");
+    fs::create_dir_all(&venv_bin)?;
+    let shim = venv_bin.join("python");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nprintf probe > \"$MCP_REPL_TEST_PYTHON_PROBE_MARKER\"\nexit 1\n",
+    )?;
+    let mut permissions = fs::metadata(&shim)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions)?;
+
+    let session = common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+        ],
+        vec![("MCP_REPL_TEST_PYTHON_PROBE_MARKER".to_string(), marker_text)],
+        Some(workspace.path().to_path_buf()),
+    )
+    .await?;
+    let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !marker.exists(),
+        "Python discovery probe wrote outside the sandbox; reply was: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 const DETACHED_STDIO_HOLDER_SECS: f64 = 2.5;
 
@@ -1881,6 +1936,62 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     assert!(
         follow_up_text.contains("AFTER_INPUT_INTERRUPT"),
         "expected follow-up to run after input prompt interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("if True:\n    print('SHOULD_NOT_RUN')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("... ") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python continuation prompt remained busy before interrupt".into());
+    }
+    assert!(
+        text.contains("... "),
+        "expected continuation prompt before interrupt, got: {text:?}"
+    );
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected continuation prompt interrupt to complete, got: {interrupt_text:?}"
+    );
+    assert!(
+        !interrupt_text.contains("SHOULD_NOT_RUN"),
+        "interrupt submitted the pending block: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_CONTINUATION_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("SHOULD_NOT_RUN"),
+        "pending block leaked into follow-up: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_CONTINUATION_INTERRUPT"),
+        "expected follow-up to run after continuation interrupt, got: {follow_up_text:?}"
     );
     Ok(())
 }

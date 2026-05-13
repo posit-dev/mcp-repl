@@ -5536,10 +5536,10 @@ impl WorkerProcess {
                 Backend::Python => "python",
             },
         );
-        if matches!(backend, Backend::Python) {
-            let python_executable = std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
-                .map(PathBuf::from)
-                .unwrap_or_else(crate::python_session::resolve_python_program);
+        if matches!(backend, Backend::Python)
+            && let Some(python_executable) =
+                std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
+        {
             command.env(
                 crate::python_session::PYTHON_EXECUTABLE_ENV,
                 python_executable,
