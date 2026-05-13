@@ -121,6 +121,14 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("raw-prompt-then-sleep ") {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"zod> raw stdout\n")?;
+        stdout.flush()?;
+        sleep_for(parse_millis(millis)?, interrupted, false);
+        return Ok(());
+    }
+
     if let Some(millis) = command.strip_prefix("interruptible ") {
         sleep_for(parse_millis(millis)?, interrupted, true);
         return Ok(());

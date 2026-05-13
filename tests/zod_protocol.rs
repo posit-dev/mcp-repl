@@ -108,6 +108,34 @@ async fn zod_worker_echoes_input_and_returns_worker_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_preserves_existing_trailing_newline() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "already newline\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("already newline\n"),
+        "expected Zod to receive existing newline, got: {text:?}"
+    );
+    assert!(
+        !text.contains("already newline\n\n"),
+        "server must not append a second trailing newline, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_prompt_shaped_stdout() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
@@ -129,6 +157,48 @@ async fn zod_worker_preserves_prompt_shaped_stdout() -> TestResult<()> {
     assert!(
         text.contains("zod> "),
         "expected worker-supplied prompt in response, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_raw_prompt_shaped_stdout_does_not_complete_turn() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "raw-prompt-then-sleep 150",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("zod> raw stdout\n"),
+        "expected raw prompt-shaped stdout to remain visible, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "raw prompt-shaped stdout must not complete the turn, got: {first_text:?}"
+    );
+
+    let poll = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        poll_text.contains("zod> "),
+        "expected later poll to observe sideband prompt, got: {poll_text:?}"
     );
 
     session.cancel().await?;
