@@ -26,6 +26,38 @@ _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
 _plot_emitted_this_request = {}
+_mcp_repl_ps1 = ">>> "
+_mcp_repl_ps2 = "... "
+
+
+class _McpSuppressedPrompt:
+    def __init__(self, prompt_name):
+        self._prompt_name = prompt_name
+
+    def __str__(self):
+        return ""
+
+    def __repr__(self):
+        if self._prompt_name == "ps1":
+            return repr(_mcp_repl_ps1)
+        return repr(_mcp_repl_ps2)
+
+
+_mcp_repl_suppressed_ps1 = _McpSuppressedPrompt("ps1")
+_mcp_repl_suppressed_ps2 = _McpSuppressedPrompt("ps2")
+
+
+def _mcp_repl_capture_prompts():
+    global _mcp_repl_ps1, _mcp_repl_ps2
+    ps1 = getattr(sys, "ps1", _mcp_repl_suppressed_ps1)
+    ps2 = getattr(sys, "ps2", _mcp_repl_suppressed_ps2)
+    if ps1 is not _mcp_repl_suppressed_ps1:
+        _mcp_repl_ps1 = str(ps1)
+    if ps2 is not _mcp_repl_suppressed_ps2:
+        _mcp_repl_ps2 = str(ps2)
+    _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
+    sys.ps1 = _mcp_repl_suppressed_ps1
+    sys.ps2 = _mcp_repl_suppressed_ps2
 
 
 def _input(prompt=""):
@@ -546,8 +578,9 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
 builtins.input = _input
 pydoc.pager = _pydoc_plainpager
 sys.excepthook = _mcp_repl_excepthook
-sys.ps1 = ""
-sys.ps2 = ""
+_mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
+sys.ps1 = _mcp_repl_suppressed_ps1
+sys.ps2 = _mcp_repl_suppressed_ps2
 sys.stdin = McpInputStream()
 sys.stdout = McpOutputStream("stdout")
 sys.stderr = McpOutputStream("stderr")

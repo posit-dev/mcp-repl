@@ -255,6 +255,8 @@ pub(crate) fn mark_stdin_write_complete() {
         let mut guard = state.inner.lock().unwrap();
         let current_prompt_from_state = guard.current_prompt.clone();
         let current_readline_state = guard.current_readline_state;
+        let primary_prompt = guard.python_primary_prompt.clone();
+        let continuation_prompt = guard.python_continuation_prompt.clone();
         let waiting_for_input = guard.waiting_for_input;
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
@@ -264,11 +266,13 @@ pub(crate) fn mark_stdin_write_complete() {
                 request_prompt_wait_should_complete(active, current_readline_state)
             };
             if waiting_for_input && should_complete {
-                prompt = Some(
-                    current_prompt_from_state
-                        .or_else(|| active.fallback_prompt.clone())
-                        .unwrap_or_else(|| ">>> ".to_string()),
-                );
+                prompt = Some(repl_prompt_for(
+                    current_prompt_from_state.clone(),
+                    active.fallback_prompt.as_deref(),
+                    current_readline_state,
+                    &primary_prompt,
+                    &continuation_prompt,
+                ));
                 completed = guard.active_request.take();
             }
         }
@@ -827,13 +831,15 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
         let status = {
             let _gil = GilGuard::acquire();
             begin_repl_turn();
-            unsafe {
+            let status = unsafe {
                 (api.py_run_interactive_one_flags)(
                     runtime.stdin,
                     c"<stdin>".as_ptr(),
                     ptr::null_mut(),
                 )
-            }
+            };
+            capture_python_prompts(api)?;
+            status
         };
         if take_exit_requested() {
             flush_original_stdio();
@@ -846,6 +852,15 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
             return Ok(());
         }
     }
+}
+
+fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
+    let main = api.import_module("__main__")?;
+    let func = api.get_attr_string(main.as_ptr(), "_mcp_repl_capture_prompts")?;
+    let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
+    let result = PyPtr::from_owned(result, "Python prompt capture failed")?;
+    drop(result);
+    Ok(())
 }
 
 fn finalize_python(
@@ -898,12 +913,41 @@ fn begin_tracked_request(
     Ok(())
 }
 
+fn set_python_prompts(primary: String, continuation: String) {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.python_primary_prompt = primary;
+    guard.python_continuation_prompt = continuation;
+}
+
+fn repl_prompt_for(
+    current_prompt: Option<String>,
+    fallback_prompt: Option<&str>,
+    readline_state: Option<PythonReadlineState>,
+    primary_prompt: &str,
+    continuation_prompt: &str,
+) -> String {
+    if let Some(prompt) = current_prompt {
+        return prompt;
+    }
+    if fallback_prompt.is_some()
+        || matches!(readline_state, Some(PythonReadlineState::Continuation))
+    {
+        return continuation_prompt.to_string();
+    }
+    primary_prompt.to_string()
+}
+
 fn input_hook_prompt(guard: &SessionStateInner, fallback_prompt: Option<&str>) -> String {
-    guard
-        .current_prompt
-        .clone()
-        .or_else(|| fallback_prompt.map(str::to_string))
-        .unwrap_or_else(|| ">>> ".to_string())
+    repl_prompt_for(
+        guard.current_prompt.clone(),
+        fallback_prompt,
+        guard.current_readline_state,
+        &guard.python_primary_prompt,
+        &guard.python_continuation_prompt,
+    )
 }
 
 fn handle_input_hook() {
@@ -920,12 +964,17 @@ fn handle_input_hook() {
         }
         let current_prompt_from_state = guard.current_prompt.clone();
         let current_readline_state = guard.current_readline_state;
+        let primary_prompt = guard.python_primary_prompt.clone();
+        let continuation_prompt = guard.python_continuation_prompt.clone();
         let idle_prompt = input_hook_prompt(&guard, None);
         if let Some(active) = guard.active_request.as_mut() {
-            let current_prompt = current_prompt_from_state
-                .clone()
-                .or_else(|| active.fallback_prompt.clone())
-                .unwrap_or_else(|| ">>> ".to_string());
+            let current_prompt = repl_prompt_for(
+                current_prompt_from_state.clone(),
+                active.fallback_prompt.as_deref(),
+                current_readline_state,
+                &primary_prompt,
+                &continuation_prompt,
+            );
             if active.skip_next_hook {
                 active.skip_next_hook = false;
             } else {
@@ -1064,6 +1113,9 @@ fn finish_repl_turn_request() {
     {
         let mut guard = state.inner.lock().unwrap();
         let current_prompt_from_state = guard.current_prompt.clone();
+        let current_readline_state = guard.current_readline_state;
+        let primary_prompt = guard.python_primary_prompt.clone();
+        let continuation_prompt = guard.python_continuation_prompt.clone();
         guard.interrupt_requested = false;
         if guard.active_request.is_some() {
             guard.waiting_for_input = true;
@@ -1074,11 +1126,13 @@ fn finish_repl_turn_request() {
                 active.consumed_lines = active.consumed_lines.max(1);
             }
             if request_repl_turn_should_complete(active) {
-                prompt = Some(
-                    current_prompt_from_state
-                        .or_else(|| active.fallback_prompt.clone())
-                        .unwrap_or_else(|| ">>> ".to_string()),
-                );
+                prompt = Some(repl_prompt_for(
+                    current_prompt_from_state.clone(),
+                    active.fallback_prompt.as_deref(),
+                    current_readline_state,
+                    &primary_prompt,
+                    &continuation_prompt,
+                ));
                 completed = guard.active_request.take();
             }
         }
@@ -1130,7 +1184,7 @@ fn stdin_pending_byte_count() -> Option<usize> {
 
 unsafe extern "C" fn mcp_repl_readline(
     stdin: *mut libc::FILE,
-    stdout: *mut libc::FILE,
+    _stdout: *mut libc::FILE,
     prompt: *const c_char,
 ) -> *mut c_char {
     let prompt_text = (!prompt.is_null())
@@ -1144,12 +1198,6 @@ unsafe extern "C" fn mcp_repl_readline(
         set_current_repl_readline_prompt(prompt_text);
     }
     handle_input_hook();
-    if prompt_text.is_some() {
-        unsafe {
-            libc::fputs(prompt, stdout);
-            libc::fflush(stdout);
-        }
-    }
 
     let bytes = read_stdio_line_bytes(stdin);
     note_stdin_line_read(&bytes);
@@ -1400,6 +1448,8 @@ struct SessionStateInner {
     active_request: Option<ActiveRequest>,
     current_prompt: Option<String>,
     current_readline_state: Option<PythonReadlineState>,
+    python_primary_prompt: String,
+    python_continuation_prompt: String,
     repl_readline_count: usize,
     waiting_for_input: bool,
     exit_requested: bool,
@@ -1427,6 +1477,8 @@ impl SessionState {
                 active_request: None,
                 current_prompt: None,
                 current_readline_state: None,
+                python_primary_prompt: ">>> ".to_string(),
+                python_continuation_prompt: "... ".to_string(),
                 repl_readline_count: 0,
                 waiting_for_input: false,
                 exit_requested: false,
@@ -1515,6 +1567,10 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
         ModuleMethod {
             name: "emit_plot_image",
             function: py_emit_plot_image,
+        },
+        ModuleMethod {
+            name: "set_python_prompts",
+            function: py_set_python_prompts,
         },
         ModuleMethod {
             name: "has_request_active",
@@ -1632,6 +1688,25 @@ unsafe extern "C" fn py_emit_plot_image(
         return ptr::null_mut();
     };
     ipc::emit_plot_image(&mime_type, &data, is_update == 1, Some(&source));
+    api.none()
+}
+
+unsafe extern "C" fn py_set_python_prompts(
+    _self: *mut PyObject,
+    args: *mut PyObject,
+) -> *mut PyObject {
+    let api = PythonApi::global();
+    if api.tuple_size(args) != 2 {
+        set_callback_error("set_python_prompts expects exactly two arguments");
+        return ptr::null_mut();
+    }
+    let Some(primary) = api.unicode_arg(args, 0) else {
+        return ptr::null_mut();
+    };
+    let Some(continuation) = api.unicode_arg(args, 1) else {
+        return ptr::null_mut();
+    };
+    set_python_prompts(primary, continuation);
     api.none()
 }
 

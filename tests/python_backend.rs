@@ -2115,6 +2115,51 @@ async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_custom_prompts_do_not_escape_as_stderr() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            "import sys\nsys.ps1 = 'custom> '\nsys.ps2 = 'more... '\nprint('CUSTOM_PROMPT_OK')",
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+
+    assert!(
+        setup_text.contains("CUSTOM_PROMPT_OK"),
+        "expected request output after custom prompts, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("custom> "),
+        "expected custom primary prompt metadata, got: {setup_text:?}"
+    );
+    assert_ne!(setup.is_error, Some(true));
+    assert!(
+        !setup_text.contains("stderr: custom> "),
+        "custom primary prompt should not be attributed to stderr, got: {setup_text:?}"
+    );
+
+    let continuation = session.write_stdin_raw_with("if True:", Some(5.0)).await?;
+    let continuation_text = result_text(&continuation);
+    session.cancel().await?;
+
+    assert!(
+        continuation_text.contains("more... "),
+        "expected custom continuation prompt metadata, got: {continuation_text:?}"
+    );
+    assert_ne!(continuation.is_error, Some(true));
+    assert!(
+        !continuation_text.contains("stderr: more... "),
+        "custom continuation prompt should not be attributed to stderr, got: {continuation_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
