@@ -106,7 +106,9 @@ fn normalize_python_help_intro(text: String) -> String {
             continue;
         }
 
-        if line.contains(r#""text": "Welcome to Python <VERSION>'s help utility!"#) {
+        if line.contains(r#""text": ""#)
+            && line.contains("Welcome to Python <VERSION>'s help utility!")
+        {
             out.push(r#"      "text": "<PYTHON HELP BANNER>""#.to_string());
             continue;
         }
@@ -138,6 +140,17 @@ fn normalizes_help_banner_after_whitespace_only_transcript_line() {
         transcript,
         ">>> help()\n<<< <PYTHON HELP BANNER>\n<<< help>"
     );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn normalizes_rendered_help_banner_after_leading_newline() {
+    let rendered = normalize_python_help_banner(
+        r#"      "text": "\nWelcome to Python 3.12's help utility!\n\nIf this is your first time using Python, you should definitely check out\nhelp> ""#
+            .to_string(),
+    );
+
+    assert_eq!(rendered, r#"      "text": "<PYTHON HELP BANNER>""#);
 }
 
 #[cfg(not(windows))]
