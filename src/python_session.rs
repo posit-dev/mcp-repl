@@ -18,8 +18,6 @@ use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::SetEvent;
 
 pub const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
@@ -202,29 +200,7 @@ pub(crate) fn interrupt() {
     discard_pending_stdin();
     finish_active_request_at_next_read();
     mark_interrupt_requested();
-    if let Some(api) = PythonApi::try_global() {
-        unsafe {
-            (api.py_err_set_interrupt)();
-            wake_python_sigint_event(api);
-        }
-    }
 }
-
-#[cfg(windows)]
-unsafe fn wake_python_sigint_event(api: &PythonApi) {
-    let Some(sigint_event) = api.pyos_sigint_event else {
-        return;
-    };
-    let event = unsafe { sigint_event() };
-    if !event.is_null() {
-        unsafe {
-            SetEvent(event);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-unsafe fn wake_python_sigint_event(_api: &PythonApi) {}
 
 fn mark_interrupt_requested() {
     let Some(state) = SESSION_STATE.get() else {
