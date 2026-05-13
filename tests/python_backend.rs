@@ -801,6 +801,56 @@ async fn python_blank_line_inside_bracket_reports_continuation_prompt() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_blank_line_inside_triple_quoted_block_reports_continuation_prompt() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    x = \"\"\"\n    \n    \"\"\"", Some(1.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected blank line inside triple-quoted block to return a continuation prompt, got: {text:?}"
+    );
+    assert!(
+        text.contains("... "),
+        "expected blank line inside triple-quoted block to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_blank_line_inside_parenthesized_block_reports_continuation_prompt() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("if True:\n    x = (\n    \n        1\n    )", Some(1.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected blank line inside parenthesized block to return a continuation prompt, got: {text:?}"
+    );
+    assert!(
+        text.contains("... "),
+        "expected blank line inside parenthesized block to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_closed_indented_expression_reports_primary_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

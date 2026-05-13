@@ -492,7 +492,7 @@ fn python_has_open_block_suite(text: &str) -> bool {
         let code = python_line_code_before_comment_with_state(line, &mut scan_state);
         let code = code.trim_end();
         if code.trim().is_empty() {
-            if line.trim().is_empty() {
+            if line.trim().is_empty() && !scan_state.continuation_active() {
                 block_indents.clear();
             }
             continue;
@@ -515,6 +515,13 @@ fn python_has_open_block_suite(text: &str) -> bool {
 struct PythonLineScanState {
     quote: Option<(char, bool)>,
     escaped: bool,
+    groups: Vec<char>,
+}
+
+impl PythonLineScanState {
+    fn continuation_active(&self) -> bool {
+        self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
+    }
 }
 
 fn python_line_code_before_comment_with_state(
@@ -552,6 +559,25 @@ fn python_line_code_before_comment_with_state(
             '\'' | '"' => {
                 let triple = take_next_two_indexed(&mut chars, ch);
                 state.quote = Some((ch, triple));
+            }
+            '(' => {
+                state.groups.push(')');
+                code.push(ch);
+            }
+            '[' => {
+                state.groups.push(']');
+                code.push(ch);
+            }
+            '{' => {
+                state.groups.push('}');
+                code.push(ch);
+            }
+            ')' | ']' | '}' if state.groups.last() == Some(&ch) => {
+                state.groups.pop();
+                code.push(ch);
+            }
+            ')' | ']' | '}' => {
+                code.push(ch);
             }
             _ => code.push(ch),
         }
