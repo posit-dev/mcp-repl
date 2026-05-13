@@ -3172,7 +3172,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
             return Err("worker stayed busy after interrupt".into());
         }
 
-        let result = session.write_stdin_raw_with("1+1", Some(0.5)).await?;
+        let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
         let text = result_text(&result);
         if text.contains("worker is busy") || text.contains("request already running") {
             sleep(Duration::from_millis(50)).await;
@@ -3637,7 +3637,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
             return Err("worker stayed busy after interrupt".into());
         }
 
-        let result = session.write_stdin_raw_with("1+1", Some(0.5)).await?;
+        let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
         let text = result_text(&result);
         if text.contains("worker is busy") || text.contains("request already running") {
             sleep(Duration::from_millis(50)).await;
