@@ -189,6 +189,7 @@ fn default_true() -> bool {
 #[derive(Default)]
 struct ServerIpcInbox {
     queue: VecDeque<WorkerToServerIpcMessage>,
+    startup_message_seen: bool,
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
@@ -352,6 +353,26 @@ impl ServerIpcConnection {
                         break;
                     }
                 };
+                {
+                    let mut guard = reader_inbox.lock().unwrap();
+                    if !guard.startup_message_seen {
+                        let startup_message = matches!(
+                            &message,
+                            WorkerToServerIpcMessage::BackendInfo { .. }
+                                | WorkerToServerIpcMessage::WorkerReady { .. }
+                                | WorkerToServerIpcMessage::SessionEnd { .. }
+                        );
+                        if !startup_message {
+                            guard.protocol_error = Some(
+                                "first worker sideband message must be worker_ready or backend_info"
+                                    .to_string(),
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        guard.startup_message_seen = true;
+                    }
+                }
                 match message {
                     WorkerToServerIpcMessage::ReadlineStart {
                         prompt,

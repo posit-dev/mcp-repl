@@ -141,6 +141,7 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
+    let mut backend_seen = false;
     let mut worker_spec = None;
     let mut oversized_output = OversizedOutputMode::Pager;
     let mut oversized_output_seen = false;
@@ -298,13 +299,19 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
                 oversized_output_seen = true;
             }
             _ => match parse_backend_arg(&arg, &mut parser)? {
-                Some(parsed_backend) => backend = Some(parsed_backend),
+                Some(parsed_backend) => {
+                    backend = Some(parsed_backend);
+                    backend_seen = true;
+                }
                 None => return Err(format!("unknown argument: {arg}").into()),
             },
         }
     }
 
     let worker_launch = if let Some(path) = worker_spec {
+        if backend_seen {
+            return Err("--worker-spec cannot be combined with --interpreter".into());
+        }
         WorkerLaunch::Custom(CustomWorkerSpec::from_json_file(&path)?)
     } else {
         WorkerLaunch::Builtin(backend.unwrap_or(Backend::R))
@@ -553,6 +560,24 @@ mod tests {
             panic!("expected server command");
         };
         assert_eq!(options.oversized_output, OversizedOutputMode::Files);
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_worker_spec_with_interpreter() {
+        let result = parse_cli_args_from(vec![
+            "--worker-spec".to_string(),
+            "/tmp/zod-worker.json".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ]);
+        let err = match result {
+            Ok(_) => panic!("worker spec and interpreter should conflict"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

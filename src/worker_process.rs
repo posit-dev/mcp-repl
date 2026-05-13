@@ -1193,6 +1193,18 @@ struct PreparedSandboxStateUpdate {
 
 impl WorkerManager {
     pub fn new(
+        backend: Backend,
+        sandbox_plan: SandboxCliPlan,
+        oversized_output: OversizedOutputMode,
+    ) -> Result<Self, WorkerError> {
+        Self::new_with_launch(
+            WorkerLaunch::Builtin(backend),
+            sandbox_plan,
+            oversized_output,
+        )
+    }
+
+    pub fn new_with_launch(
         worker_launch: WorkerLaunch,
         sandbox_plan: SandboxCliPlan,
         oversized_output: OversizedOutputMode,
@@ -5843,8 +5855,8 @@ impl WorkerProcess {
             set_command_arg0(&mut command, arg0);
         }
         command.args(&prepared.args);
-        command.envs(prepared.env.iter());
         command.envs(spec.env.iter());
+        command.envs(prepared.env.iter());
         match &spec.working_dir {
             CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit) => {}
             CustomWorkerWorkingDir::Path { path } => {

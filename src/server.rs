@@ -81,7 +81,11 @@ impl SharedServer {
         Ok(Self {
             accepts_sandbox_state_meta,
             state: Arc::new(Mutex::new(ServerState {
-                worker: WorkerManager::new(worker_launch, sandbox_plan, oversized_output)?,
+                worker: WorkerManager::new_with_launch(
+                    worker_launch,
+                    sandbox_plan,
+                    oversized_output,
+                )?,
                 response: ResponseState::new()?,
                 oversized_output,
             })),
