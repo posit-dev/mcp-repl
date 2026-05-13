@@ -14,6 +14,17 @@ fn assert_exists(path: &Path) {
     assert!(path.exists(), "expected {} to exist", path.display());
 }
 
+fn normalized_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn assert_contains_wrapped_text(document: &str, required: &str, source: &str) {
+    assert!(
+        normalized_whitespace(document).contains(&normalized_whitespace(required)),
+        "missing {required} in {source}"
+    );
+}
+
 #[test]
 fn agents_is_short_and_points_to_main_docs() {
     let agents = read(&repo_root().join("AGENTS.md"));
@@ -111,12 +122,17 @@ fn readme_documents_dev_binary_download_contract() {
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz",
         "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip",
+    ] {
+        assert!(readme.contains(required), "missing {required} in README.md");
+    }
+
+    for required in [
         "binaries do not bundle R or Python",
         "glibc 2.35+",
         "glibc build produced on Ubuntu 22.04",
         "**Windows**: experimental",
     ] {
-        assert!(readme.contains(required), "missing {required} in README.md");
+        assert_contains_wrapped_text(&readme, required, "README.md");
     }
 }
 
