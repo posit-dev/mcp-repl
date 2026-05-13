@@ -1185,6 +1185,36 @@ fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> Vec<u8> {
     bytes
 }
 
+fn read_stdio_line_bytes_allowing_python_threads(stdin: *mut libc::FILE) -> Vec<u8> {
+    // _mcp_repl.readline is called from Python with the GIL held. Release it
+    // while stdin blocks so the IPC completion path can flush prompt-time plots.
+    let _allow_threads = PythonThreadsAllowed::new();
+    read_stdio_line_bytes(stdin)
+}
+
+struct PythonThreadsAllowed {
+    api: &'static PythonApi,
+    thread_state: *mut PyThreadState,
+}
+
+impl PythonThreadsAllowed {
+    fn new() -> Self {
+        let api = PythonApi::global();
+        let thread_state = unsafe { (api.py_eval_save_thread)() };
+        assert!(
+            !thread_state.is_null(),
+            "PyEval_SaveThread returned a null thread state"
+        );
+        Self { api, thread_state }
+    }
+}
+
+impl Drop for PythonThreadsAllowed {
+    fn drop(&mut self) {
+        unsafe { (self.api.py_eval_restore_thread)(self.thread_state) };
+    }
+}
+
 fn set_current_readline_prompt(prompt: &str) {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -1225,7 +1255,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     set_current_readline_prompt(prompt_for_sideband.to_str().unwrap_or(""));
     handle_input_hook();
     emit_output_text(TextStream::Stdout, prompt.as_bytes());
-    let bytes = read_stdio_line_bytes(stdin);
+    let bytes = read_stdio_line_bytes_allowing_python_threads(stdin);
     note_stdin_line_read(&bytes);
     clear_current_readline_prompt();
     if take_interrupt_requested() {

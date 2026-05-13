@@ -2820,3 +2820,69 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_releases_gil_while_waiting_for_line() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import sys, threading, time
+sys.setswitchinterval(1.0)
+background_seen = None
+answer_seen = None
+background_started = threading.Event()
+def background():
+    global background_seen
+    background_started.set()
+    time.sleep(0.1)
+    background_seen = time.monotonic()
+
+def wait_and_print():
+    global answer_seen
+    answer = input('p> ')
+    answer_seen = time.monotonic()
+    print('answer', answer)
+
+threading.Thread(target=background, daemon=True).start()
+background_started.wait()
+wait_and_print()
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        !is_busy_response(&text),
+        "expected input prompt, got: {text:?}"
+    );
+    assert!(text.contains("p> "), "expected input prompt, got: {text:?}");
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("ok", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("answer ok"),
+        "expected input answer output, got: {answer_text:?}"
+    );
+
+    let order = session
+        .write_stdin_raw_with(
+            "time.sleep(0.2)\nprint('background-before-answer', background_seen is not None and answer_seen is not None and background_seen < answer_seen)",
+            Some(5.0),
+        )
+        .await?;
+    let order_text = result_text(&order);
+    assert!(
+        order_text.contains("background-before-answer True"),
+        "expected background thread to run while input() was waiting for a line, got: {order_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
