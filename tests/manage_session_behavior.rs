@@ -87,6 +87,7 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
             || text.contains("request already running")
             || text.contains("input discarded while worker busy")
             || text.contains("<<repl status: busy")
+            || (text.contains(">") && !text.contains("2"))
         {
             sleep(Duration::from_millis(50)).await;
             continue;

@@ -249,6 +249,10 @@ pub(crate) fn mark_stdin_write_complete() {
                 request_repl_turn_should_complete(active)
             } else {
                 request_prompt_wait_should_complete(active, current_readline_state)
+                    || windows_continuation_prompt_write_should_complete(
+                        active,
+                        current_readline_state,
+                    )
             };
             if waiting_for_input && should_complete {
                 let fallback_prompt = if active.repl_turn_finished {
@@ -279,6 +283,22 @@ pub(crate) fn mark_stdin_write_complete() {
         ipc::emit_readline_start(prompt, true);
         complete_active_request(state, Some(active), false);
     }
+}
+
+#[cfg(windows)]
+fn windows_continuation_prompt_write_should_complete(
+    active: &ActiveRequest,
+    _current_readline_state: Option<PythonReadlineState>,
+) -> bool {
+    active.started_after_continuation_prompt && active.line_count == 1
+}
+
+#[cfg(not(windows))]
+fn windows_continuation_prompt_write_should_complete(
+    _active: &ActiveRequest,
+    _current_readline_state: Option<PythonReadlineState>,
+) -> bool {
+    false
 }
 
 fn finish_active_request_at_next_read() {

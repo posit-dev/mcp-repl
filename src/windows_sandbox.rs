@@ -4149,8 +4149,6 @@ mod tests {
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
-        let original_temp = std::env::var_os("TEMP");
-        let original_tmp = std::env::var_os("TMP");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         std::fs::create_dir_all(&temp_root).expect("temp root");
         let scrub_script = format!(
@@ -4166,10 +4164,8 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             .status()
             .expect("scrub workspace acl status");
         assert!(scrub_status.success(), "workspace ACL scrub should succeed");
-        unsafe {
-            std::env::set_var("TEMP", &temp_root);
-            std::env::set_var("TMP", &temp_root);
-        }
+        let _temp_guard = ScopedEnvVar::set("TEMP", &temp_root);
+        let _tmp_guard = ScopedEnvVar::set("TMP", &temp_root);
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
 
         let policy = workspace_policy(Vec::new(), false, false);
@@ -4208,7 +4204,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                 "files created in an in-workspace session temp tree should stay off the shared stable SID"
             );
             assert!(
-                path_has_allow_ace(&temp_file, launch_sid),
+                path_has_effective_allow_ace(&temp_file, launch_sid),
                 "files created in an in-workspace session temp tree should keep the launch SID"
             );
 
@@ -4225,22 +4221,6 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                     temp_file.as_path(),
                 ],
             );
-        }
-        match original_temp {
-            Some(value) => unsafe {
-                std::env::set_var("TEMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TEMP");
-            },
-        }
-        match original_tmp {
-            Some(value) => unsafe {
-                std::env::set_var("TMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TMP");
-            },
         }
     }
 
@@ -5020,6 +5000,50 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         has_ace
     }
 
+    unsafe fn path_has_effective_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && (allowed.Mask & allow_direct_access_mask()) == allow_direct_access_mask()
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
     unsafe fn path_has_inheritable_allow_ace(path: &Path, sid: *mut c_void) -> bool {
         let mut security_descriptor: *mut c_void = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -5611,11 +5635,11 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             .expect("runtime refresh prepared ACL state");
 
             assert!(
-                path_has_allow_ace(&nested_dir, stable_sid),
+                path_has_effective_allow_ace(&nested_dir, stable_sid),
                 "runtime refresh should restore the stable allow ACE on scrubbed nested workspace directories"
             );
             assert!(
-                path_has_allow_ace(&artifact, stable_sid),
+                path_has_effective_allow_ace(&artifact, stable_sid),
                 "runtime refresh should restore the stable allow ACE on scrubbed nested workspace files"
             );
 
@@ -6667,19 +6691,14 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         let session_temp_dir = temp_root.join("mcp-repl-session-a");
         let sibling_session_temp_dir = temp_root.join("mcp-repl-session-b");
         let sibling_nested = sibling_session_temp_dir.join("nested");
-        let original_temp = std::env::var_os("TEMP");
-        let original_tmp = std::env::var_os("TMP");
         std::fs::create_dir_all(&workspace_nested).expect("workspace nested dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
             .expect("prepare session temp dir");
         crate::sandbox::prepare_session_temp_dir(&sibling_session_temp_dir)
             .expect("prepare sibling session temp dir");
         std::fs::create_dir_all(&sibling_nested).expect("sibling session temp nested dir");
-
-        unsafe {
-            std::env::set_var("TEMP", &session_temp_dir);
-            std::env::set_var("TMP", &session_temp_dir);
-        }
+        let _temp_guard = ScopedEnvVar::set("TEMP", &session_temp_dir);
+        let _tmp_guard = ScopedEnvVar::set("TMP", &session_temp_dir);
 
         let policy = workspace_policy(Vec::new(), false, false);
         let prepared_sid = stable_cap_sid_string(&policy, &cwd);
@@ -6700,23 +6719,6 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             LocalFree(sid as HLOCAL);
             result
         };
-
-        match original_temp {
-            Some(value) => unsafe {
-                std::env::set_var("TEMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TEMP");
-            },
-        }
-        match original_tmp {
-            Some(value) => unsafe {
-                std::env::set_var("TMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TMP");
-            },
-        }
 
         let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
 
