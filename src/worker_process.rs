@@ -2927,6 +2927,11 @@ impl WorkerManager {
                 .append_sideband(PendingSidebandKind::RequestBoundary);
         }
         self.settle_output_after_completion(remaining);
+        if result.is_ok()
+            && let Some(message) = ipc.take_protocol_error()
+        {
+            return Err(WorkerError::Protocol(message));
+        }
         if self.guardrail_event_pending() {
             let event = self
                 .guardrail

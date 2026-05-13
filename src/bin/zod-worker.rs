@@ -82,6 +82,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             return Ok(());
         }
+        if command == "bad-output-after-session-end" {
+            writer.send(&WorkerToServer::SessionEnd {
+                reason: "runtime_exit".to_string(),
+                message_b64: None,
+            })?;
+            writer.output_text("stdout", b"late output\n")?;
+            return Ok(());
+        }
         run_command(&writer, &interrupted, command, &line, &mut next_prompt)?;
         writer.send(&WorkerToServer::ReadlineStart {
             prompt: std::mem::replace(&mut next_prompt, "zod> ".to_string()),

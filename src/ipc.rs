@@ -204,6 +204,7 @@ struct ServerIpcInbox {
     protocol_warnings: VecDeque<String>,
     protocol_error: Option<String>,
     session_end: bool,
+    session_end_final: bool,
     disconnected: bool,
 }
 
@@ -355,6 +356,12 @@ impl ServerIpcConnection {
                 };
                 {
                     let mut guard = reader_inbox.lock().unwrap();
+                    if guard.session_end_final {
+                        guard.protocol_error =
+                            Some("worker sideband message after session_end".to_string());
+                        reader_cvar.notify_all();
+                        break;
+                    }
                     if !guard.startup_message_seen {
                         let startup_message = matches!(
                             &message,
@@ -458,6 +465,7 @@ impl ServerIpcConnection {
                     } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.session_end = true;
+                        guard.session_end_final = true;
                         guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
                             reason,
                             message_b64,
@@ -659,6 +667,11 @@ impl ServerIpcConnection {
         guard.protocol_warnings.drain(..).collect()
     }
 
+    pub fn take_protocol_error(&self) -> Option<String> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.protocol_error.take()
+    }
+
     pub fn wait_for_request_completion(
         &self,
         timeout: Duration,
@@ -668,11 +681,11 @@ impl ServerIpcConnection {
         let allow_completion_settle_after_deadline = !timeout.is_zero();
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if take_session_end(&mut guard) {
-                return Err(IpcWaitError::SessionEnd);
-            }
             if let Some(message) = guard.protocol_error.take() {
                 return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
             }
             if take_request_completion(&mut guard, stable_wait) {
                 return Ok(());
@@ -700,11 +713,11 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if take_session_end(&mut guard) {
-                    return Err(IpcWaitError::SessionEnd);
-                }
                 if let Some(message) = guard.protocol_error.take() {
                     return Err(IpcWaitError::Protocol(message));
+                }
+                if take_session_end(&mut guard) {
+                    return Err(IpcWaitError::SessionEnd);
                 }
                 if take_request_completion(&mut guard, stable_wait) {
                     return Ok(());
@@ -726,11 +739,11 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if take_session_end(&mut guard) {
-                return Err(IpcWaitError::SessionEnd);
-            }
             if let Some(message) = guard.protocol_error.take() {
                 return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
             }
             if guard.disconnected {
                 return Err(IpcWaitError::Disconnected);
