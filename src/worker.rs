@@ -192,9 +192,6 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         crate::r_session::clear_pending_input();
                     }
-                    Some(ServerToWorkerIpcMessage::PromptInterrupt) => {
-                        crate::r_session::clear_pending_input();
-                    }
                     Some(ServerToWorkerIpcMessage::SessionEnd) => {
                         state.begin_shutdown();
                         crate::r_session::clear_pending_input();

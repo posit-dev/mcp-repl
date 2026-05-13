@@ -32,7 +32,10 @@ carried over an IPC pipe.
 
 `interrupt`
 - `{ "type": "interrupt" }`
-- Sent when the server issues an interrupt.
+- Sent when the server issues an interrupt to an existing worker process.
+- Interrupt routing must not depend on prompt text. Prompt strings are visible
+  output data, not control metadata; for example, a user-code prompt may look
+  like a primary REPL prompt or may be empty.
 - For R, worker-side handlers clear any pending queued input.
 - For Python, the worker invokes CPython's interrupt API and discards pending
   stdin bytes from the current request before normal completion signaling
@@ -136,3 +139,6 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - Backend-specific execution rules should be implemented by the worker. Server
   branching on backend is reserved for interpreter selection, launch setup, tool
   description selection, or narrow capabilities reported at startup.
+- Control-only interrupts are still server-owned routing decisions: if a worker
+  process already exists, the server forwards the interrupt to it; if no worker
+  exists, the server must not spawn one only to interrupt nothing.

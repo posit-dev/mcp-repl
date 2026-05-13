@@ -95,7 +95,6 @@ pub enum ServerToWorkerIpcMessage {
     },
     StdinWriteComplete,
     Interrupt,
-    PromptInterrupt,
     SessionEnd,
 }
 

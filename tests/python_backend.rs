@@ -2015,6 +2015,106 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('>>> ')", Some(5.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains(">>> ") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) || text.contains("timed out") {
+        session.cancel().await?;
+        return Err(format!(
+            "expected primary-shaped input prompt request to complete, got: {text:?}"
+        )
+        .into());
+    }
+    assert!(
+        text.contains(">>> "),
+        "expected primary-shaped input prompt, got: {text:?}"
+    );
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(1.0)).await?;
+    let interrupt_text = result_text(&interrupt);
+    if interrupt_text.contains("timed out") {
+        session.cancel().await?;
+        return Err(format!(
+            "expected primary-shaped input prompt interrupt to complete, got: {interrupt_text:?}"
+        )
+        .into());
+    }
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected primary-shaped input prompt interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT"),
+        "expected follow-up to run after primary-shaped input prompt interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            "import sys\nsys.ps1 = 'custom> '\nprint('CUSTOM_READY')",
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        setup_text.contains("CUSTOM_READY") && setup_text.contains("custom> "),
+        "expected custom primary prompt after setup, got: {setup_text:?}"
+    );
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(1.0)).await?;
+    let interrupt_text = result_text(&interrupt);
+    if !interrupt_text.contains("KeyboardInterrupt") || interrupt_text.contains("timed out") {
+        session.cancel().await?;
+        return Err(format!(
+            "expected idle custom prompt interrupt to reach Python, got: {interrupt_text:?}"
+        )
+        .into());
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_CUSTOM_PROMPT_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_CUSTOM_PROMPT_INTERRUPT"),
+        "expected follow-up after idle custom prompt interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

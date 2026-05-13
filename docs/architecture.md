@@ -19,6 +19,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
   carry worker-owned text, raw stdout/stderr carry unowned visible text, and
   other sideband events carry structural facts. Backend-specific runtime
   semantics belong in the worker or in explicitly advertised worker metadata.
+- Control-only interrupts are routed to an existing worker process without
+  interpreting prompt text. Prompt text is display data, so it must not decide
+  whether Ctrl-C reaches the runtime.
 
 ### Worker and backends
 

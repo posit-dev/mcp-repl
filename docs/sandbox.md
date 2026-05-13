@@ -41,8 +41,9 @@ More specifically:
   advance ignore sandbox metadata until a later tool call actually interacts
   with the worker again. Bare `Ctrl-D` is not pager navigation; it remains an
   explicit restart even when the pager is active.
-- Bare `Ctrl-C` is the one non-empty `repl` follow-up that stays local and does
-  not force a sandbox-driven restart.
+- Bare `Ctrl-C` is the one non-empty `repl` follow-up that stays local for
+  sandbox metadata and does not force a sandbox-driven restart. If a worker
+  process already exists, the interrupt is still forwarded to that worker.
 - Every other non-empty `repl` call must have valid current
   `_meta["codex/sandbox-state-meta"]`.
 - A non-empty retry after the memory guardrail aborts a worker is an ordinary

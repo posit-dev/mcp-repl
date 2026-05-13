@@ -116,9 +116,6 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();
                     }
-                    Some(ServerToWorkerIpcMessage::PromptInterrupt) => {
-                        python_session::interrupt_prompt();
-                    }
                     Some(ServerToWorkerIpcMessage::SessionEnd) => {
                         state.begin_shutdown();
                         let _ = python_session::request_shutdown();

@@ -201,19 +201,13 @@ fn take_exit_requested() -> bool {
 pub(crate) fn interrupt() {
     discard_pending_stdin();
     finish_active_request_at_next_read();
-    let prompt_interrupt = mark_interrupt_requested();
-    if !prompt_interrupt && let Some(api) = PythonApi::try_global() {
+    mark_interrupt_requested();
+    if let Some(api) = PythonApi::try_global() {
         unsafe {
             (api.py_err_set_interrupt)();
             wake_python_sigint_event(api);
         }
     }
-}
-
-pub(crate) fn interrupt_prompt() {
-    discard_pending_stdin();
-    finish_active_request_at_next_read();
-    mark_interrupt_requested();
 }
 
 #[cfg(windows)]
@@ -232,16 +226,13 @@ unsafe fn wake_python_sigint_event(api: &PythonApi) {
 #[cfg(not(windows))]
 unsafe fn wake_python_sigint_event(_api: &PythonApi) {}
 
-fn mark_interrupt_requested() -> bool {
+fn mark_interrupt_requested() {
     let Some(state) = SESSION_STATE.get() else {
-        return false;
+        return;
     };
     let mut guard = state.inner.lock().unwrap();
-    let prompt_interrupt = guard.current_prompt.is_some()
-        || (guard.active_request.is_none() && guard.waiting_for_input);
     guard.interrupt_requested = true;
     state.cvar.notify_all();
-    prompt_interrupt
 }
 
 fn take_interrupt_requested() -> bool {
@@ -263,13 +254,14 @@ pub(crate) fn mark_stdin_write_complete() {
     {
         let mut guard = state.inner.lock().unwrap();
         let current_prompt_from_state = guard.current_prompt.clone();
+        let current_readline_state = guard.current_readline_state;
         let waiting_for_input = guard.waiting_for_input;
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
             let should_complete = if active.repl_turn_finished {
                 request_repl_turn_should_complete(active)
             } else {
-                request_prompt_wait_should_complete(active, current_prompt_from_state.as_deref())
+                request_prompt_wait_should_complete(active, current_readline_state)
             };
             if waiting_for_input && should_complete {
                 prompt = Some(
@@ -834,6 +826,7 @@ fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
     loop {
         let status = {
             let _gil = GilGuard::acquire();
+            begin_repl_turn();
             unsafe {
                 (api.py_run_interactive_one_flags)(
                     runtime.stdin,
@@ -926,6 +919,7 @@ fn handle_input_hook() {
             return;
         }
         let current_prompt_from_state = guard.current_prompt.clone();
+        let current_readline_state = guard.current_readline_state;
         let idle_prompt = input_hook_prompt(&guard, None);
         if let Some(active) = guard.active_request.as_mut() {
             let current_prompt = current_prompt_from_state
@@ -940,7 +934,7 @@ fn handle_input_hook() {
             let should_complete = if active.repl_turn_finished {
                 request_repl_turn_should_complete(active)
             } else {
-                request_prompt_wait_should_complete(active, current_prompt_from_state.as_deref())
+                request_prompt_wait_should_complete(active, current_readline_state)
             };
             guard.waiting_for_input = true;
             if should_complete {
@@ -982,17 +976,17 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
 
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
-    current_prompt: Option<&str>,
+    current_readline_state: Option<PythonReadlineState>,
 ) -> bool {
     #[cfg(target_family = "unix")]
     {
-        prompt_wait_can_complete(active, current_prompt)
-            && (single_line_client_input_prompt(active, current_prompt)
+        prompt_wait_can_complete(active, current_readline_state)
+            && (single_line_client_input_prompt(active, current_readline_state)
                 || request_input_drained(active))
     }
     #[cfg(windows)]
     {
-        prompt_can_complete_before_repl_turn(active, current_prompt)
+        prompt_can_complete_before_repl_turn(active, current_readline_state)
             && active.byte_len > 0
             && stdin_pending_byte_count() == Some(0)
     }
@@ -1003,18 +997,28 @@ fn request_prompt_wait_should_complete(
 }
 
 #[cfg(target_family = "unix")]
-fn prompt_wait_can_complete(active: &ActiveRequest, current_prompt: Option<&str>) -> bool {
+fn prompt_wait_can_complete(
+    active: &ActiveRequest,
+    current_readline_state: Option<PythonReadlineState>,
+) -> bool {
     active.consumed_lines >= active.line_count
-        || current_prompt.is_some_and(|prompt| prompt != ">>> ")
-        || active
-            .fallback_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt != ">>> ")
+        || matches!(
+            current_readline_state,
+            Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
+        )
+        || active.fallback_prompt.is_some()
 }
 
 #[cfg(target_family = "unix")]
-fn single_line_client_input_prompt(active: &ActiveRequest, current_prompt: Option<&str>) -> bool {
-    active.line_count == 1 && current_prompt.is_some_and(|prompt| prompt != ">>> ")
+fn single_line_client_input_prompt(
+    active: &ActiveRequest,
+    current_readline_state: Option<PythonReadlineState>,
+) -> bool {
+    active.line_count == 1
+        && matches!(
+            current_readline_state,
+            Some(PythonReadlineState::ClientInput)
+        )
 }
 
 fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
@@ -1035,13 +1039,12 @@ fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
 #[cfg(windows)]
 fn prompt_can_complete_before_repl_turn(
     active: &ActiveRequest,
-    current_prompt: Option<&str>,
+    current_readline_state: Option<PythonReadlineState>,
 ) -> bool {
-    current_prompt.is_some_and(|prompt| prompt != ">>> ")
-        || active
-            .fallback_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt != ">>> ")
+    matches!(
+        current_readline_state,
+        Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
+    ) || active.fallback_prompt.is_some()
 }
 
 #[cfg(target_family = "unix")]
@@ -1138,7 +1141,7 @@ unsafe extern "C" fn mcp_repl_readline(
         })
         .filter(|prompt| !prompt.is_empty());
     if let Some(prompt_text) = &prompt_text {
-        set_current_readline_prompt(prompt_text);
+        set_current_repl_readline_prompt(prompt_text);
     }
     handle_input_hook();
     if prompt_text.is_some() {
@@ -1215,12 +1218,43 @@ impl Drop for PythonThreadsAllowed {
     }
 }
 
-fn set_current_readline_prompt(prompt: &str) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PythonReadlineState {
+    Primary,
+    Continuation,
+    ClientInput,
+}
+
+fn begin_repl_turn() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.repl_readline_count = 0;
+}
+
+fn set_current_repl_readline_prompt(prompt: &str) {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let readline_state = if guard.repl_readline_count == 0 {
+        PythonReadlineState::Primary
+    } else {
+        PythonReadlineState::Continuation
+    };
+    guard.repl_readline_count = guard.repl_readline_count.saturating_add(1);
+    guard.current_prompt = Some(prompt.to_string());
+    guard.current_readline_state = Some(readline_state);
+}
+
+fn set_current_readline_prompt(prompt: &str, readline_state: PythonReadlineState) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
     guard.current_prompt = Some(prompt.to_string());
+    guard.current_readline_state = Some(readline_state);
 }
 
 fn clear_current_readline_prompt() {
@@ -1229,6 +1263,7 @@ fn clear_current_readline_prompt() {
     };
     let mut guard = state.inner.lock().unwrap();
     guard.current_prompt = None;
+    guard.current_readline_state = None;
 }
 
 enum CStdinLine {
@@ -1252,7 +1287,10 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         }
     };
 
-    set_current_readline_prompt(prompt_for_sideband.to_str().unwrap_or(""));
+    set_current_readline_prompt(
+        prompt_for_sideband.to_str().unwrap_or(""),
+        PythonReadlineState::ClientInput,
+    );
     handle_input_hook();
     emit_output_text(TextStream::Stdout, prompt.as_bytes());
     let bytes = read_stdio_line_bytes_allowing_python_threads(stdin);
@@ -1361,6 +1399,8 @@ struct SessionState {
 struct SessionStateInner {
     active_request: Option<ActiveRequest>,
     current_prompt: Option<String>,
+    current_readline_state: Option<PythonReadlineState>,
+    repl_readline_count: usize,
     waiting_for_input: bool,
     exit_requested: bool,
     shutdown: bool,
@@ -1386,6 +1426,8 @@ impl SessionState {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
                 current_prompt: None,
+                current_readline_state: None,
+                repl_readline_count: 0,
                 waiting_for_input: false,
                 exit_requested: false,
                 shutdown: false,
@@ -1673,7 +1715,32 @@ mod tests {
     fn unix_prompt_wait_allows_client_input_prompt() {
         let active = active_request_for_prompt_wait(1, 0, None);
 
-        assert!(prompt_wait_can_complete(&active, Some("input> ")));
+        assert!(prompt_wait_can_complete(
+            &active,
+            Some(PythonReadlineState::ClientInput)
+        ));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_prompt_wait_allows_continuation_prompt() {
+        let active = active_request_for_prompt_wait(2, 1, None);
+
+        assert!(prompt_wait_can_complete(
+            &active,
+            Some(PythonReadlineState::Continuation)
+        ));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_prompt_wait_requires_progress_for_custom_primary_prompt() {
+        let active = active_request_for_prompt_wait(1, 0, None);
+
+        assert!(!prompt_wait_can_complete(
+            &active,
+            Some(PythonReadlineState::Primary)
+        ));
     }
 
     #[test]

@@ -49,7 +49,7 @@ This keeps the same server/worker protocol shape as R without linking or loading
 - The initial implementation targets one embedded CPython session per worker process.
 - `sys.executable` is populated from the same Python executable used to locate the dynamically loaded CPython library.
 - The main `mcp-repl` binary must not link CPython, and R worker mode must not load CPython.
-- Server interrupts for Python call the dynamically loaded `PyErr_SetInterrupt` and clear queued input so buffered tail expressions do not run after interruption.
+- Python worker interrupts call the dynamically loaded `PyErr_SetInterrupt` and clear queued input so buffered tail expressions do not run after interruption.
 
 ## Follow-Up Questions
 

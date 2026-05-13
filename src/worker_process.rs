@@ -366,14 +366,6 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
-#[cfg(windows)]
-fn driver_prompt_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc.get() {
-        let _ = ipc.send(ServerToWorkerIpcMessage::PromptInterrupt);
-    }
-    Ok(())
-}
-
 fn driver_refresh_backend_info(
     ipc: ServerIpcConnection,
     timeout: Duration,
@@ -1057,7 +1049,6 @@ pub struct WorkerManager {
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
-    python_prompt_waiting_for_input: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -1142,7 +1133,6 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
-            python_prompt_waiting_for_input: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {
@@ -3029,21 +3019,12 @@ impl WorkerManager {
         }
     }
 
-    fn should_wake_python_prompt_stdin(&self) -> bool {
-        cfg!(windows)
-            && matches!(self.backend, Backend::Python)
-            && self.python_prompt_waiting_for_input
-    }
-
-    #[cfg(windows)]
-    fn wake_python_prompt_stdin(&mut self) {
-        if let Some(process) = self.process.as_mut() {
-            let _ = process.write_stdin_payload(b"\n".to_vec(), Duration::from_millis(500));
+    fn interrupt_target_running(&mut self) -> Result<bool, WorkerError> {
+        match self.process.as_mut() {
+            Some(process) => process.is_running(),
+            None => Ok(false),
         }
     }
-
-    #[cfg(not(windows))]
-    fn wake_python_prompt_stdin(&mut self) {}
 
     fn interrupt_files(
         &mut self,
@@ -3059,28 +3040,13 @@ impl WorkerManager {
         );
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
-        let wake_python_prompt_stdin = self.should_wake_python_prompt_stdin();
-        if should_interrupt_worker {
-            self.ensure_process()?;
-        }
+        let should_interrupt_worker = self.interrupt_target_running()?;
         if should_interrupt_worker {
             let process = self
                 .process
                 .as_mut()
                 .expect("worker process should be available");
-            let interrupt_result = if wake_python_prompt_stdin {
-                #[cfg(windows)]
-                {
-                    driver_prompt_interrupt(process)
-                }
-                #[cfg(not(windows))]
-                {
-                    self.driver.interrupt(process)
-                }
-            } else {
-                self.driver.interrupt(process)
-            };
+            let interrupt_result = self.driver.interrupt(process);
             if let Err(err) = interrupt_result {
                 self.reset()?;
                 crate::event_log::log(
@@ -3091,12 +3057,6 @@ impl WorkerManager {
                 );
                 return Err(err);
             }
-        }
-        if wake_python_prompt_stdin {
-            self.wake_python_prompt_stdin();
-        }
-        if self.python_prompt_waiting_for_input {
-            self.python_prompt_waiting_for_input = false;
         }
 
         if interrupt_drains_existing_completion {
@@ -3242,28 +3202,13 @@ impl WorkerManager {
         );
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        let should_interrupt_worker = self.pending_request || self.python_prompt_waiting_for_input;
-        let wake_python_prompt_stdin = self.should_wake_python_prompt_stdin();
-        if should_interrupt_worker {
-            self.ensure_process()?;
-        }
+        let should_interrupt_worker = self.interrupt_target_running()?;
         if should_interrupt_worker {
             let process = self
                 .process
                 .as_mut()
                 .expect("worker process should be available");
-            let interrupt_result = if wake_python_prompt_stdin {
-                #[cfg(windows)]
-                {
-                    driver_prompt_interrupt(process)
-                }
-                #[cfg(not(windows))]
-                {
-                    self.driver.interrupt(process)
-                }
-            } else {
-                self.driver.interrupt(process)
-            };
+            let interrupt_result = self.driver.interrupt(process);
             if let Err(err) = interrupt_result {
                 self.reset()?;
                 crate::event_log::log(
@@ -3274,12 +3219,6 @@ impl WorkerManager {
                 );
                 return Err(err);
             }
-        }
-        if wake_python_prompt_stdin {
-            self.wake_python_prompt_stdin();
-        }
-        if self.python_prompt_waiting_for_input {
-            self.python_prompt_waiting_for_input = false;
         }
 
         let page_bytes = pager::resolve_page_bytes(None);
@@ -3726,7 +3665,6 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
-        self.python_prompt_waiting_for_input = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3796,7 +3734,6 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
-        self.python_prompt_waiting_for_input = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3845,10 +3782,6 @@ impl WorkerManager {
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
-        if matches!(self.backend, Backend::Python) {
-            self.python_prompt_waiting_for_input =
-                prompt.as_deref().is_some_and(|prompt| prompt != ">>> ");
-        }
         let prompt = normalize_prompt(prompt);
         if let Some(prompt) = prompt {
             self.last_prompt = Some(prompt);
@@ -4114,11 +4047,8 @@ impl WorkerManager {
         let Some(ipc) = process.ipc.get() else {
             return;
         };
-        if let Some(prompt) = ipc
-            .try_take_prompt()
-            .and_then(|p| normalize_prompt(Some(p)))
-        {
-            self.last_prompt = Some(prompt);
+        if let Some(raw_prompt) = ipc.try_take_prompt() {
+            self.remember_prompt(Some(raw_prompt));
             return;
         }
         match ipc.wait_for_prompt(Duration::from_millis(200)) {
