@@ -344,6 +344,7 @@ fn driver_wait_for_stdin_write_ack(
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected before worker accepted stdin".to_string(),
         )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
@@ -363,6 +364,7 @@ fn driver_wait_for_completion(
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected while waiting for request completion".to_string(),
         )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
@@ -398,6 +400,7 @@ fn driver_refresh_backend_info(
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
             "worker session ended before backend info".to_string(),
         )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
@@ -427,6 +430,7 @@ fn driver_refresh_worker_ready(
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
             "worker session ended before worker_ready".to_string(),
         )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
@@ -858,12 +862,13 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn on_input_start(
         &mut self,
-        text: &str,
-        _payload: &[u8],
+        _text: &str,
+        payload: &[u8],
         ipc: &ServerIpcConnection,
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_on_input_start(text, ipc)
+        ipc.begin_request_with_stdin(payload);
+        Ok(())
     }
 
     fn should_settle_output_after_timeout(
@@ -3226,6 +3231,7 @@ impl WorkerManager {
                 Err(IpcWaitError::Disconnected) => {
                     // IPC is optional for the R backend; fall back to prompt-as-output.
                 }
+                Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
             }
         }
 
@@ -3394,6 +3400,7 @@ impl WorkerManager {
                     self.note_session_end(true);
                 }
                 Err(IpcWaitError::Disconnected) => {}
+                Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
             }
         }
 
@@ -4223,7 +4230,12 @@ impl WorkerManager {
                     self.last_prompt = Some(prompt);
                 }
             }
-            Err(IpcWaitError::Timeout | IpcWaitError::SessionEnd | IpcWaitError::Disconnected) => {}
+            Err(
+                IpcWaitError::Timeout
+                | IpcWaitError::SessionEnd
+                | IpcWaitError::Disconnected
+                | IpcWaitError::Protocol(_),
+            ) => {}
         }
     }
 
@@ -4340,7 +4352,7 @@ impl WorkerManager {
             Err(IpcWaitError::SessionEnd) => {
                 self.settle_pending_session_end(&ipc);
             }
-            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
+            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected | IpcWaitError::Protocol(_)) => {
                 let worker_exited = self
                     .process
                     .as_mut()

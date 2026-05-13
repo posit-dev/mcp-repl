@@ -192,6 +192,7 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
+    active_stdin: Option<VecDeque<u8>>,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
@@ -200,6 +201,7 @@ struct ServerIpcInbox {
     plot_source_image_ids: HashMap<String, String>,
     request_plot_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
+    protocol_error: Option<String>,
     session_end: bool,
     disconnected: bool,
 }
@@ -343,9 +345,9 @@ impl ServerIpcConnection {
                 }
                 let message = match serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
                     Ok(message) => message,
-                    Err(_) => {
+                    Err(err) => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.disconnected = true;
+                        guard.protocol_error = Some(format!("invalid worker sideband JSON: {err}"));
                         reader_cvar.notify_all();
                         break;
                     }
@@ -357,7 +359,13 @@ impl ServerIpcConnection {
                     } => {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
-                        if client_waiting {
+                        let waiting_for_new_input =
+                            if let Some(active_stdin) = guard.active_stdin.as_ref() {
+                                active_stdin.is_empty()
+                            } else {
+                                client_waiting
+                            };
+                        if waiting_for_new_input {
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
                             if guard.readline_unmatched_starts == 1 {
@@ -380,6 +388,27 @@ impl ServerIpcConnection {
                         if let Some(handler) = readline_start_handler.as_ref() {
                             handler(prompt_for_handler);
                         }
+                    }
+                    WorkerToServerIpcMessage::ReadlineInput { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) = account_active_stdin(&mut guard, &text, "readline_input")
+                        {
+                            guard.protocol_error = Some(err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::ReadlineDiscard { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) =
+                            account_active_stdin(&mut guard, &text, "readline_discard")
+                        {
+                            guard.protocol_error = Some(err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
                         let echo_event = IpcEchoEvent {
@@ -428,7 +457,8 @@ impl ServerIpcConnection {
                                 Ok(bytes) => bytes,
                                 Err(_) => {
                                     let mut guard = reader_inbox.lock().unwrap();
-                                    guard.disconnected = true;
+                                    guard.protocol_error =
+                                        Some("invalid output_text base64".to_string());
                                     reader_cvar.notify_all();
                                     break;
                                 }
@@ -492,6 +522,15 @@ impl ServerIpcConnection {
                         data_b64,
                         update,
                     } => {
+                        if base64::engine::general_purpose::STANDARD
+                            .decode(&data_b64)
+                            .is_err()
+                        {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard.protocol_error = Some("invalid output_image base64".to_string());
+                            reader_cvar.notify_all();
+                            break;
+                        }
                         let (id, is_new, updates_previous_image, readline_results_seen) = {
                             let mut guard = reader_inbox.lock().unwrap();
                             let (id, is_new, updates_previous_image) =
@@ -565,6 +604,18 @@ impl ServerIpcConnection {
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
+        guard.protocol_error = None;
+    }
+
+    pub fn begin_request_with_stdin(&self, payload: &[u8]) {
+        let mut guard = self.inbox.lock().unwrap();
+        reset_after_completed_request(&mut guard);
+        drop_stdin_write_acks(&mut guard);
+        guard.active_stdin = Some(payload.iter().copied().collect());
+        guard.echo_events.clear();
+        guard.prompt_history.clear();
+        guard.protocol_warnings.clear();
+        guard.protocol_error = None;
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {
@@ -599,6 +650,9 @@ impl ServerIpcConnection {
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_request_completion(&mut guard, stable_wait) {
                 return Ok(());
             }
@@ -628,6 +682,9 @@ impl ServerIpcConnection {
                 if take_session_end(&mut guard) {
                     return Err(IpcWaitError::SessionEnd);
                 }
+                if let Some(message) = guard.protocol_error.take() {
+                    return Err(IpcWaitError::Protocol(message));
+                }
                 if take_request_completion(&mut guard, stable_wait) {
                     return Ok(());
                 }
@@ -650,6 +707,9 @@ impl ServerIpcConnection {
         loop {
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
+            }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
             }
             if guard.disconnected {
                 return Err(IpcWaitError::Disconnected);
@@ -687,6 +747,9 @@ impl ServerIpcConnection {
                 let _ = take_session_end(&mut guard);
                 return Ok(info);
             }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -714,6 +777,9 @@ impl ServerIpcConnection {
             if take_stdin_write_ack(&mut guard) {
                 return Ok(());
             }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -731,6 +797,9 @@ impl ServerIpcConnection {
             if timeout_res.timed_out() {
                 if take_stdin_write_ack(&mut guard) {
                     return Ok(());
+                }
+                if let Some(message) = guard.protocol_error.take() {
+                    return Err(IpcWaitError::Protocol(message));
                 }
                 return Err(IpcWaitError::Timeout);
             }
@@ -865,6 +934,7 @@ pub enum IpcWaitError {
     Timeout,
     SessionEnd,
     Disconnected,
+    Protocol(String),
 }
 
 pub struct IpcServer {
@@ -1641,6 +1711,38 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     true
 }
 
+fn account_active_stdin(
+    guard: &mut ServerIpcInbox,
+    text: &str,
+    event_type: &str,
+) -> Result<(), String> {
+    let Some(active_stdin) = guard.active_stdin.as_mut() else {
+        if text.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("{event_type} reported input with no active turn"));
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() > active_stdin.len() {
+        return Err(format!(
+            "{event_type} reported {} bytes but only {} active stdin bytes remain",
+            bytes.len(),
+            active_stdin.len()
+        ));
+    }
+    for (idx, expected) in bytes.iter().enumerate() {
+        if active_stdin.get(idx) != Some(expected) {
+            return Err(format!(
+                "{event_type} text does not match active stdin at byte {idx}"
+            ));
+        }
+    }
+    for _ in bytes {
+        active_stdin.pop_front();
+    }
+    Ok(())
+}
+
 fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue
@@ -1757,6 +1859,7 @@ fn assign_plot_image_id(
 }
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
+    guard.active_stdin = None;
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;
