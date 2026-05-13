@@ -1671,9 +1671,28 @@ pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Opt
     }
 }
 
-pub fn emit_backend_info(supports_images: bool) {
+pub fn emit_worker_ready(
+    worker_name: &str,
+    supports_images: bool,
+    graceful_shutdown_stdin: Option<&str>,
+) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::BackendInfo { supports_images });
+        let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
+            protocol: WorkerProtocol {
+                name: "mcp-repl-worker".to_string(),
+                version: 1,
+            },
+            worker: WorkerIdentity {
+                name: worker_name.to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            capabilities: WorkerCapabilities {
+                images: supports_images,
+            },
+            graceful_shutdown: graceful_shutdown_stdin.map(|stdin| WorkerGracefulShutdown {
+                stdin: stdin.to_string(),
+            }),
+        });
     }
 }
 

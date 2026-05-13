@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::backend::{Backend, backend_from_env};
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_backend_info, emit_session_end, set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_worker_ready, set_global_ipc,
 };
 use crate::r_session::RSession;
 use crate::worker_protocol::WORKER_MODE_ARG;
@@ -131,7 +131,7 @@ fn run_r_worker() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
-    emit_backend_info(true);
+    emit_worker_ready("r", true, Some("quit(\"no\")\n"));
     let request_state = state.clone();
     let _request_thread = thread::Builder::new()
         .name("worker-requests".to_string())

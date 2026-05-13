@@ -382,6 +382,15 @@ fn driver_refresh_backend_info(
 ) -> Result<(), WorkerError> {
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
+        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+                return Err(WorkerError::Protocol(format!(
+                    "unsupported worker protocol {} version {}",
+                    protocol.name, protocol.version
+                )));
+            }
+            Ok(())
+        }
         Ok(_) => Err(WorkerError::Protocol(
             "unexpected ipc message while waiting for backend info".to_string(),
         )),

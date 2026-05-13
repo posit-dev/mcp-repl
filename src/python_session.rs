@@ -469,7 +469,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    ipc::emit_backend_info(plot_capable());
+    ipc::emit_worker_ready("python", plot_capable(), Some("exit()\n"));
 
     let result = run_repl(&runtime);
     let finalize_result = finalize_python(api, thread_state);
