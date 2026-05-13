@@ -421,6 +421,37 @@ print("READS", repr(first), repr(second), repr(third))
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_stdin_data_suffix_does_not_force_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys; data = sys.stdin.readline(); print('STDIN_DATA', data.strip())\n:\n",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STDIN_DATA :"),
+        "expected Python code to consume the colon as stdin data, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected primary prompt after stdin data was consumed, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "stdin data that resembles Python syntax should not force continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_sys_stdio_supports_binary_buffers() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

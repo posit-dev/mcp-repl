@@ -266,9 +266,14 @@ pub(crate) fn mark_stdin_write_complete() {
                 request_prompt_wait_should_complete(active, current_readline_state)
             };
             if waiting_for_input && should_complete {
+                let fallback_prompt = if active.repl_turn_finished {
+                    None
+                } else {
+                    active.fallback_prompt.as_deref()
+                };
                 prompt = Some(repl_prompt_for(
                     current_prompt_from_state.clone(),
-                    active.fallback_prompt.as_deref(),
+                    fallback_prompt,
                     current_readline_state,
                     &primary_prompt,
                     &continuation_prompt,
@@ -968,9 +973,14 @@ fn handle_input_hook() {
         let continuation_prompt = guard.python_continuation_prompt.clone();
         let idle_prompt = input_hook_prompt(&guard, None);
         if let Some(active) = guard.active_request.as_mut() {
+            let fallback_prompt = if active.repl_turn_finished {
+                None
+            } else {
+                active.fallback_prompt.as_deref()
+            };
             let current_prompt = repl_prompt_for(
                 current_prompt_from_state.clone(),
-                active.fallback_prompt.as_deref(),
+                fallback_prompt,
                 current_readline_state,
                 &primary_prompt,
                 &continuation_prompt,
@@ -1128,7 +1138,7 @@ fn finish_repl_turn_request() {
             if request_repl_turn_should_complete(active) {
                 prompt = Some(repl_prompt_for(
                     current_prompt_from_state.clone(),
-                    active.fallback_prompt.as_deref(),
+                    None,
                     current_readline_state,
                     &primary_prompt,
                     &continuation_prompt,
