@@ -2760,6 +2760,86 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with("value = input()", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected empty input prompt to return waiting status, got: {prompt_text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(1.0)).await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        poll_text.contains("<<repl status: waiting for stdin>>"),
+        "expected empty poll to preserve stdin wait status, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("<<repl status: idle>>"),
+        "did not expect empty poll to report idle while input() is waiting, got: {poll_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_with("answer\nprint('EMPTY_INPUT_VALUE', value)", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("EMPTY_INPUT_VALUE answer"),
+        "expected answer to be consumed by input(), got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with("import time\ntime.sleep(0.3)\nvalue = input()", Some(0.1))
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        is_busy_response(&first_text),
+        "expected first request to time out before input(), got: {first_text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        poll_text.contains("<<repl status: waiting for stdin>>"),
+        "expected poll to report empty input prompt, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("<<repl status: idle>>"),
+        "did not expect poll to report idle while input() is waiting, got: {poll_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_with("answer\nprint('TIMED_EMPTY_INPUT_VALUE', value)", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("TIMED_EMPTY_INPUT_VALUE answer"),
+        "expected answer to be consumed after timed prompt, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_roundtrip_under_debug_allocator() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) =

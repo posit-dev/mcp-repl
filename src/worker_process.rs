@@ -1080,6 +1080,7 @@ pub struct WorkerManager {
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
+    stdin_waiting: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -1164,6 +1165,7 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
+            stdin_waiting: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {
@@ -1959,6 +1961,9 @@ impl WorkerManager {
         } else {
             completion.prompt.clone()
         };
+        if raw_prompt.as_deref() == Some("") {
+            contents.push(stdin_wait_status_content());
+        }
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
         self.remember_prompt(raw_prompt);
         let has_fallback_input_transcript = fallback_input_transcript.is_some();
@@ -2139,6 +2144,9 @@ impl WorkerManager {
         } else {
             completion.prompt.clone()
         };
+        if raw_prompt.as_deref() == Some("") {
+            contents.push(stdin_wait_status_content());
+        }
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
         self.remember_prompt(raw_prompt);
         if self.pager.is_active() && !session_end {
@@ -2977,6 +2985,7 @@ impl WorkerManager {
 
     fn note_session_end(&mut self, include_notice: bool) {
         self.session_end_seen = true;
+        self.stdin_waiting = false;
         if let Some(process) = self.process.as_mut() {
             process.note_expected_exit();
             if include_notice {
@@ -3696,6 +3705,7 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
+        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3765,6 +3775,7 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
+        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -3813,13 +3824,21 @@ impl WorkerManager {
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
+        if prompt.as_deref() == Some("") {
+            self.stdin_waiting = true;
+            return;
+        }
         let prompt = normalize_prompt(prompt);
         if let Some(prompt) = prompt {
+            self.stdin_waiting = false;
             self.last_prompt = Some(prompt);
         }
     }
 
     fn current_prompt_hint(&self) -> Option<String> {
+        if self.stdin_waiting {
+            return None;
+        }
         let prompt = self
             .process
             .as_ref()
@@ -3846,6 +3865,18 @@ impl WorkerManager {
     }
 
     fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
+        if self.stdin_waiting {
+            return ReplyWithOffset {
+                reply: WorkerReply::Output {
+                    contents: vec![stdin_wait_status_content()],
+                    is_error: false,
+                    error_code: None,
+                    prompt: None,
+                    prompt_variants: None,
+                },
+                end_offset: 0,
+            };
+        }
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
@@ -3863,6 +3894,18 @@ impl WorkerManager {
     }
 
     fn build_idle_poll_reply_pager(&mut self) -> ReplyWithOffset {
+        if self.stdin_waiting {
+            return ReplyWithOffset {
+                reply: WorkerReply::Output {
+                    contents: vec![stdin_wait_status_content()],
+                    is_error: false,
+                    error_code: None,
+                    prompt: None,
+                    prompt_variants: None,
+                },
+                end_offset: self.output.end_offset().unwrap_or(0),
+            };
+        }
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
