@@ -298,10 +298,10 @@ impl IpcTransport {
             let write_fd = env_fd(IPC_WRITE_FD_ENV)?;
             let reader = unsafe { File::from_raw_fd(read_fd) };
             let writer = unsafe { File::from_raw_fd(write_fd) };
-            return Ok(Self {
+            Ok(Self {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
-            });
+            })
         }
 
         #[cfg(target_family = "windows")]
@@ -310,10 +310,10 @@ impl IpcTransport {
             let from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV).map_err(io::Error::other)?;
             let reader = std::fs::OpenOptions::new().read(true).open(to_worker)?;
             let writer = std::fs::OpenOptions::new().write(true).open(from_worker)?;
-            return Ok(Self {
+            Ok(Self {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
-            });
+            })
         }
 
         #[cfg(not(any(target_family = "unix", target_family = "windows")))]
