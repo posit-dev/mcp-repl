@@ -245,7 +245,10 @@ pub(crate) fn mark_stdin_write_complete() {
                 let fallback_prompt = if active.repl_turn_finished {
                     None
                 } else {
-                    active.fallback_prompt.as_deref()
+                    active
+                        .fallback_prompt
+                        .as_deref()
+                        .or_else(|| active.started_after_continuation_prompt.then_some(""))
                 };
                 prompt = Some(repl_prompt_for(
                     current_prompt_from_state.clone(),
@@ -262,7 +265,9 @@ pub(crate) fn mark_stdin_write_complete() {
     if let Some(active) = completed {
         emit_plots();
         // Python object flushes run from handle_input_hook on the Python thread.
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        let prompt = prompt.as_deref().unwrap_or(">>> ");
+        remember_emitted_prompt(prompt);
+        ipc::emit_readline_start(prompt, true);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -896,6 +901,7 @@ fn begin_tracked_request(
     }
 
     let skip_next_hook = !guard.waiting_for_input;
+    let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.waiting_for_input = false;
     guard.active_request = Some(ActiveRequest {
         reply,
@@ -906,6 +912,7 @@ fn begin_tracked_request(
         skip_next_hook,
         stdin_write_complete: false,
         repl_turn_finished: false,
+        started_after_continuation_prompt,
     });
     guard.plot_reset_pending = true;
     state.cvar.notify_all();
@@ -971,7 +978,10 @@ fn handle_input_hook() {
             let fallback_prompt = if active.repl_turn_finished {
                 None
             } else {
-                active.fallback_prompt.as_deref()
+                active
+                    .fallback_prompt
+                    .as_deref()
+                    .or_else(|| active.started_after_continuation_prompt.then_some(""))
             };
             let current_prompt = repl_prompt_for(
                 current_prompt_from_state.clone(),
@@ -1009,10 +1019,14 @@ fn handle_input_hook() {
     } else if let Some(active) = completed {
         emit_plots();
         flush_original_stdio();
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        let prompt = prompt.as_deref().unwrap_or(">>> ");
+        remember_emitted_prompt(prompt);
+        ipc::emit_readline_start(prompt, true);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), false);
+        let prompt = prompt.as_deref().unwrap_or(">>> ");
+        remember_emitted_prompt(prompt);
+        ipc::emit_readline_start(prompt, false);
     }
 }
 
@@ -1038,9 +1052,10 @@ fn request_prompt_wait_should_complete(
 ) -> bool {
     #[cfg(target_family = "unix")]
     {
-        prompt_wait_can_complete(active, current_readline_state)
-            && (single_line_client_input_prompt(active, current_readline_state)
-                || request_input_drained(active))
+        let input_drained = request_input_drained(active);
+        (prompt_wait_can_complete(active, current_readline_state)
+            && (single_line_client_input_prompt(active, current_readline_state) || input_drained))
+            || (active.started_after_continuation_prompt && input_drained)
     }
     #[cfg(windows)]
     {
@@ -1149,7 +1164,9 @@ fn finish_repl_turn_request() {
 
     if let Some(active) = completed {
         flush_original_stdio();
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        let prompt = prompt.as_deref().unwrap_or(">>> ");
+        remember_emitted_prompt(prompt);
+        ipc::emit_readline_start(prompt, true);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -1196,23 +1213,19 @@ unsafe extern "C" fn mcp_repl_readline(
     _stdout: *mut libc::FILE,
     prompt: *const c_char,
 ) -> *mut c_char {
-    let prompt_text = (!prompt.is_null())
-        .then(|| {
-            unsafe { CStr::from_ptr(prompt) }
-                .to_string_lossy()
-                .into_owned()
-        })
-        .filter(|prompt| !prompt.is_empty());
-    if let Some(prompt_text) = &prompt_text {
-        set_current_repl_readline_prompt(prompt_text);
-    }
+    let prompt_text = if prompt.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(prompt) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    set_current_repl_readline_prompt(&prompt_text);
     handle_input_hook();
 
     let bytes = read_stdio_line_bytes(stdin);
     note_stdin_line_read(&bytes);
-    if prompt_text.is_some() {
-        clear_current_readline_prompt();
-    }
+    clear_current_readline_prompt();
     if take_interrupt_requested() {
         set_callback_error("Python input interrupted");
         return ptr::null_mut();
@@ -1295,14 +1308,33 @@ fn set_current_repl_readline_prompt(prompt: &str) {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
-    let readline_state = if guard.repl_readline_count == 0 {
-        PythonReadlineState::Primary
-    } else {
+    let started_after_continuation_prompt = guard
+        .active_request
+        .as_ref()
+        .is_some_and(|active| active.started_after_continuation_prompt);
+    let readline_state = if prompt == guard.python_continuation_prompt
+        || guard.repl_readline_count > 0
+        || (prompt.is_empty() && started_after_continuation_prompt)
+    {
         PythonReadlineState::Continuation
+    } else {
+        PythonReadlineState::Primary
     };
     guard.repl_readline_count = guard.repl_readline_count.saturating_add(1);
-    guard.current_prompt = Some(prompt.to_string());
+    guard.current_prompt = if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt.to_string())
+    };
     guard.current_readline_state = Some(readline_state);
+}
+
+fn remember_emitted_prompt(prompt: &str) {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.last_prompt_was_continuation = prompt == guard.python_continuation_prompt;
 }
 
 fn set_current_readline_prompt(prompt: &str, readline_state: PythonReadlineState) {
@@ -1460,6 +1492,7 @@ struct SessionStateInner {
     python_primary_prompt: String,
     python_continuation_prompt: String,
     repl_readline_count: usize,
+    last_prompt_was_continuation: bool,
     waiting_for_input: bool,
     exit_requested: bool,
     shutdown: bool,
@@ -1477,6 +1510,7 @@ struct ActiveRequest {
     skip_next_hook: bool,
     stdin_write_complete: bool,
     repl_turn_finished: bool,
+    started_after_continuation_prompt: bool,
 }
 
 impl SessionState {
@@ -1489,6 +1523,7 @@ impl SessionState {
                 python_primary_prompt: ">>> ".to_string(),
                 python_continuation_prompt: "... ".to_string(),
                 repl_readline_count: 0,
+                last_prompt_was_continuation: false,
                 waiting_for_input: false,
                 exit_requested: false,
                 shutdown: false,
@@ -1809,6 +1844,7 @@ mod tests {
             skip_next_hook: false,
             stdin_write_complete: true,
             repl_turn_finished: false,
+            started_after_continuation_prompt: false,
         }
     }
 

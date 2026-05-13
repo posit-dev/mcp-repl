@@ -862,6 +862,44 @@ async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_line_by_line_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("x = (", Some(5.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("... "),
+        "expected opening bracket to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("1", Some(5.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        !is_busy_response(&text),
+        "expected bracket item to return a continuation prompt, got: {text:?}"
+    );
+    assert!(
+        text.contains("... "),
+        "expected bracket item to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(")\nprint('LINE_BY_LINE_BRACKET', x)", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("LINE_BY_LINE_BRACKET 1"),
+        "expected bracket expression to complete, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_blank_line_inside_bracket_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1873,6 +1911,44 @@ async fn python_incomplete_block_reports_continuation_prompt() -> TestResult<()>
     assert!(
         text.contains("... "),
         "expected incomplete Python block to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_line_by_line_block_body_reports_continuation_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("if True:", Some(5.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("... "),
+        "expected block header to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("    pass", Some(5.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        !is_busy_response(&text),
+        "expected block body to return a continuation prompt, got: {text:?}"
+    );
+    assert!(
+        text.contains("... "),
+        "expected block body to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("\nprint('LINE_BY_LINE_BLOCK_DONE')", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("LINE_BY_LINE_BLOCK_DONE"),
+        "expected block to complete after blank line, got: {text:?}"
     );
     Ok(())
 }
