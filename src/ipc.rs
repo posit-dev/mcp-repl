@@ -121,8 +121,6 @@ pub enum WorkerToServerIpcMessage {
     },
     ReadlineStart {
         prompt: String,
-        #[serde(default = "default_true")]
-        client_waiting: bool,
     },
     ReadlineInput {
         text: String,
@@ -180,10 +178,6 @@ pub struct WorkerCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct WorkerGracefulShutdown {
     pub stdin: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Default)]
@@ -381,17 +375,13 @@ impl ServerIpcConnection {
                     }
                 }
                 match message {
-                    WorkerToServerIpcMessage::ReadlineStart {
-                        prompt,
-                        client_waiting,
-                    } => {
+                    WorkerToServerIpcMessage::ReadlineStart { prompt } => {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
-                        let active_turn_input_drained = guard
+                        let waiting_for_new_input = guard
                             .active_stdin
                             .as_ref()
                             .is_none_or(|active_stdin| active_stdin.is_empty());
-                        let waiting_for_new_input = client_waiting && active_turn_input_drained;
                         if waiting_for_new_input {
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
@@ -1647,11 +1637,10 @@ fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd) -> io::Res
     Ok(())
 }
 
-pub fn emit_readline_start(prompt: &str, client_waiting: bool) {
+pub fn emit_readline_start(prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.to_string(),
-            client_waiting,
         });
     }
 }
@@ -2039,6 +2028,22 @@ mod protocol_tests {
         }));
 
         assert!(parsed.is_err(), "output_text should require data_b64");
+    }
+
+    #[test]
+    fn readline_start_protocol_only_carries_prompt() {
+        let value = serde_json::to_value(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "zod> ".to_string(),
+        })
+        .expect("serialize readline_start");
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "readline_start",
+                "prompt": "zod> "
+            })
+        );
     }
 
     #[test]

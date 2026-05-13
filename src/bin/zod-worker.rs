@@ -49,7 +49,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     writer.send(&WorkerToServer::ReadlineStart {
         prompt: "zod> ".to_string(),
-        client_waiting: true,
     })?;
 
     let stdin = io::stdin();
@@ -94,7 +93,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_command(&writer, &interrupted, command, &line, &mut next_prompt)?;
         writer.send(&WorkerToServer::ReadlineStart {
             prompt: std::mem::replace(&mut next_prompt, "zod> ".to_string()),
-            client_waiting: true,
         })?;
     }
 }
@@ -131,10 +129,9 @@ fn run_command(
         return Ok(());
     }
 
-    if let Some(millis) = command.strip_prefix("client-busy-then-sleep ") {
+    if let Some(millis) = command.strip_prefix("prompt-then-sleep ") {
         writer.send(&WorkerToServer::ReadlineStart {
             prompt: "buffered> ".to_string(),
-            client_waiting: false,
         })?;
         sleep_for(parse_millis(millis)?, interrupted, false);
         return Ok(());
@@ -240,7 +237,6 @@ enum WorkerToServer {
     },
     ReadlineStart {
         prompt: String,
-        client_waiting: bool,
     },
     ReadlineInput {
         text: String,

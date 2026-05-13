@@ -7245,7 +7245,6 @@ mod tests {
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: false,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
@@ -7253,7 +7252,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: true,
         });
 
         let completion =
@@ -7275,7 +7273,6 @@ mod tests {
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: false,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
@@ -7283,7 +7280,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: true,
         });
 
         let completion =
@@ -7302,7 +7298,6 @@ mod tests {
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
@@ -7310,7 +7305,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: true,
         });
         thread::sleep(Duration::from_millis(1));
 
@@ -7329,7 +7323,6 @@ mod tests {
         driver_on_input_start("1+\n1", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7337,7 +7330,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
-            client_waiting: true,
         });
 
         let completion =
@@ -7355,7 +7347,6 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: false,
         });
 
         let late_sender = thread::spawn(move || {
@@ -7371,7 +7362,6 @@ mod tests {
             });
             let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineStart {
                 prompt: "> ".to_string(),
-                client_waiting: true,
             });
         });
 
@@ -7390,13 +7380,12 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_client_waiting_prompt_after_buffered_readline_start() {
+    fn completion_waits_for_active_stdin_accounting_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server).expect("begin request");
+        server.begin_request_with_stdin(b"1+\n1\n");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: false,
         });
         thread::sleep(REQUEST_COMPLETION_STABLE_WAIT + Duration::from_millis(5));
         let early = server
@@ -7406,13 +7395,15 @@ mod tests {
             "did not expect buffered readline start to complete request, got {early:?}"
         );
 
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
+            text: "1+\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
             line: "1+\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
-            client_waiting: false,
         });
         thread::sleep(REQUEST_COMPLETION_STABLE_WAIT + Duration::from_millis(5));
         let continuation = server
@@ -7422,18 +7413,20 @@ mod tests {
             "did not expect buffered continuation start to complete request, got {continuation:?}"
         );
 
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
+            text: "1\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "+ ".to_string(),
             line: "1\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
 
         let completion =
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after final client-waiting prompt");
+                .expect("expected completion after final unsatisfied prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 2);
@@ -7448,7 +7441,6 @@ mod tests {
         driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         let first = driver_wait_for_completion(
             Duration::from_millis(200),
@@ -7465,7 +7457,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
 
         let second =
@@ -7485,7 +7476,6 @@ mod tests {
         driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7493,7 +7483,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
 
         let completion =
@@ -7514,7 +7503,6 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7542,7 +7530,6 @@ mod tests {
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7550,7 +7537,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
-            client_waiting: true,
         });
         thread::sleep(Duration::from_millis(25));
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
@@ -7777,7 +7763,6 @@ mod tests {
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
-            client_waiting: true,
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt,
@@ -7785,7 +7770,6 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: ">>> ".to_string(),
-            client_waiting: true,
         });
         drop(worker);
         manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));
@@ -8630,7 +8614,6 @@ mod tests {
         worker
             .send(WorkerToServerIpcMessage::ReadlineStart {
                 prompt: "> ".to_string(),
-                client_waiting: true,
             })
             .expect("send readline_start");
         worker

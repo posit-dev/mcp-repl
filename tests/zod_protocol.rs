@@ -272,14 +272,14 @@ async fn zod_worker_timeout_poll_waits_for_unsatisfied_prompt() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_client_busy_prompt_does_not_complete_turn() -> TestResult<()> {
+async fn zod_worker_buffered_prompt_does_not_complete_turn() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
     let first = session
         .call_tool_raw(
             "repl",
             json!({
-                "input": "client-busy-then-sleep 150",
+                "input": "prompt-then-sleep 150\nbuffered input",
                 "timeout_ms": 10
             }),
         )
@@ -287,7 +287,7 @@ async fn zod_worker_client_busy_prompt_does_not_complete_turn() -> TestResult<()
     let first_text = result_text(&first);
     assert!(
         first_text.contains("<<repl status: busy"),
-        "client_waiting=false prompt must not complete the turn, got: {first_text:?}"
+        "prompt with remaining active stdin must not complete the turn, got: {first_text:?}"
     );
 
     let poll = session
@@ -301,8 +301,8 @@ async fn zod_worker_client_busy_prompt_does_not_complete_turn() -> TestResult<()
         .await?;
     let poll_text = result_text(&poll);
     assert!(
-        poll_text.contains("zod> "),
-        "expected poll to complete on later client_waiting=true prompt, got: {poll_text:?}"
+        poll_text.contains("buffered input\n") && poll_text.contains("zod> "),
+        "expected poll to complete after buffered input was accounted for, got: {poll_text:?}"
     );
 
     session.cancel().await?;

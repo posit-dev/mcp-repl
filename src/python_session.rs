@@ -280,7 +280,7 @@ pub(crate) fn mark_stdin_write_complete() {
         // Python object flushes run from handle_input_hook on the Python thread.
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -1050,12 +1050,12 @@ fn handle_input_hook() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, false);
+        ipc::emit_readline_start(prompt);
     }
 }
 
@@ -1195,7 +1195,7 @@ fn finish_repl_turn_request() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     }
 }
