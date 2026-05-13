@@ -387,12 +387,11 @@ impl ServerIpcConnection {
                     } => {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
-                        let waiting_for_new_input =
-                            if let Some(active_stdin) = guard.active_stdin.as_ref() {
-                                active_stdin.is_empty()
-                            } else {
-                                client_waiting
-                            };
+                        let active_turn_input_drained = guard
+                            .active_stdin
+                            .as_ref()
+                            .is_none_or(|active_stdin| active_stdin.is_empty());
+                        let waiting_for_new_input = client_waiting && active_turn_input_drained;
                         if waiting_for_new_input {
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
@@ -633,7 +632,6 @@ impl ServerIpcConnection {
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
-        guard.protocol_error = None;
     }
 
     pub fn begin_request_with_stdin(&self, payload: &[u8]) {
@@ -644,7 +642,6 @@ impl ServerIpcConnection {
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
-        guard.protocol_error = None;
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {

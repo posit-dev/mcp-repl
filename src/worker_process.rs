@@ -309,6 +309,9 @@ impl RBackendDriver {
 
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
+    if let Some(message) = ipc.take_protocol_error() {
+        return Err(WorkerError::Protocol(message));
+    }
     Ok(())
 }
 
@@ -877,6 +880,9 @@ impl BackendDriver for ProtocolBackendDriver {
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
         ipc.begin_request_with_stdin(payload);
+        if let Some(message) = ipc.take_protocol_error() {
+            return Err(WorkerError::Protocol(message));
+        }
         Ok(())
     }
 

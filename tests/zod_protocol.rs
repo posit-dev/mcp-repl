@@ -272,6 +272,44 @@ async fn zod_worker_timeout_poll_waits_for_unsatisfied_prompt() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_client_busy_prompt_does_not_complete_turn() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "client-busy-then-sleep 150",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "client_waiting=false prompt must not complete the turn, got: {first_text:?}"
+    );
+
+    let poll = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        poll_text.contains("zod> "),
+        "expected poll to complete on later client_waiting=true prompt, got: {poll_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_busy_follow_up_does_not_reach_stdin() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
@@ -318,6 +356,46 @@ async fn zod_worker_busy_follow_up_does_not_reach_stdin() -> TestResult<()> {
     assert!(
         !poll_text.contains("second input"),
         "busy follow-up should not have reached Zod stdin, got: {poll_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_idle_protocol_error_is_latched_for_next_request() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-output-while-idle 250",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("zod> "),
+        "expected first request to finish before delayed protocol error, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "after idle protocol error",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("invalid output_text base64"),
+        "expected latched protocol error on next request, got: {second_text:?}"
     );
 
     session.cancel().await?;
