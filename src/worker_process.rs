@@ -245,6 +245,11 @@ fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn backend_prepares_windows_sandbox_launch(backend: Backend) -> bool {
+    matches!(backend, Backend::R | Backend::Python)
+}
+
 #[derive(Debug)]
 pub enum WorkerError {
     Io(std::io::Error),
@@ -4071,7 +4076,9 @@ impl WorkerManager {
     fn ensure_windows_sandbox_launch(
         &mut self,
     ) -> Result<Option<crate::windows_sandbox::PreparedSandboxLaunch>, WorkerError> {
-        if self.backend != Backend::R || !self.sandbox_state.sandbox_policy.requires_sandbox() {
+        if !backend_prepares_windows_sandbox_launch(self.backend)
+            || !self.sandbox_state.sandbox_policy.requires_sandbox()
+        {
             self.windows_sandbox_launch = None;
             return Ok(None);
         }
@@ -6489,6 +6496,14 @@ mod tests {
         crate::output_capture::output_ring_test_mutex()
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn python_backend_prepares_windows_sandbox_launch() {
+        assert!(
+            backend_prepares_windows_sandbox_launch(Backend::Python),
+            "Python uses the embedded worker wrapper and needs the prepared Windows capability SID"
+        );
     }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
@@ -9405,6 +9420,41 @@ mod tests {
         assert!(
             manager.windows_sandbox_launch.is_none(),
             "failed launch preparation should not cache a prepared launch"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_python_sandbox_prepare_access_denied_fails_fast() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(Some(
+            "failed to prepare writable ACL on 'C:\\workspace': SetNamedSecurityInfoW failed: 5"
+                .to_string(),
+        ));
+
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let result = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkerError::Sandbox(ref message))
+                    if message.contains("SetNamedSecurityInfoW failed: 5")
+            ),
+            "Python access-denied prepare failures should abort launch preparation, got: {result:?}"
+        );
+        assert!(
+            manager.windows_sandbox_launch.is_none(),
+            "failed Python launch preparation should not cache a prepared launch"
         );
     }
 
