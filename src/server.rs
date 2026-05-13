@@ -25,7 +25,7 @@ use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
 
-use crate::backend::Backend;
+use crate::backend::{Backend, WorkerLaunch};
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox::{SANDBOX_STATE_META_CAPABILITY, SandboxStateUpdate};
 use crate::sandbox_cli::{
@@ -73,7 +73,7 @@ struct ServerState {
 
 impl SharedServer {
     fn new(
-        backend: Backend,
+        worker_launch: WorkerLaunch,
         sandbox_plan: SandboxCliPlan,
         oversized_output: OversizedOutputMode,
     ) -> Result<Self, WorkerError> {
@@ -81,7 +81,7 @@ impl SharedServer {
         Ok(Self {
             accepts_sandbox_state_meta,
             state: Arc::new(Mutex::new(ServerState {
-                worker: WorkerManager::new(backend, sandbox_plan, oversized_output)?,
+                worker: WorkerManager::new(worker_launch, sandbox_plan, oversized_output)?,
                 response: ResponseState::new()?,
                 oversized_output,
             })),
@@ -546,12 +546,12 @@ macro_rules! define_backend_tool_server {
         #[tool_router]
         impl $server_ty {
             fn new(
-                backend: Backend,
+                worker_launch: WorkerLaunch,
                 sandbox_plan: SandboxCliPlan,
                 oversized_output: OversizedOutputMode,
             ) -> Result<Self, WorkerError> {
                 Ok(Self {
-                    shared: SharedServer::new(backend, sandbox_plan, oversized_output)?,
+                    shared: SharedServer::new(worker_launch, sandbox_plan, oversized_output)?,
                     tool_router: Self::tool_router(),
                 })
             }
@@ -777,35 +777,38 @@ where
 }
 
 pub async fn run(
-    backend: Backend,
+    worker_launch: WorkerLaunch,
     sandbox_plan: SandboxCliPlan,
     oversized_output: OversizedOutputMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
+    let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
     crate::event_log::log(
         "server_run_begin",
         json!({
-            "backend": format!("{backend:?}"),
+            "backend": worker_launch.label(),
         }),
     );
     match backend {
         Backend::R => match oversized_output {
             OversizedOutputMode::Files => {
-                let service = RFilesToolServer::new(backend, sandbox_plan, oversized_output)?;
+                let service = RFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
                 run_backend_server(service.clone(), service.shared.state()).await
             }
             OversizedOutputMode::Pager => {
-                let service = RPagerToolServer::new(backend, sandbox_plan, oversized_output)?;
+                let service = RPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
                 run_backend_server(service.clone(), service.shared.state()).await
             }
         },
         Backend::Python => match oversized_output {
             OversizedOutputMode::Files => {
-                let service = PythonFilesToolServer::new(backend, sandbox_plan, oversized_output)?;
+                let service =
+                    PythonFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
                 run_backend_server(service.clone(), service.shared.state()).await
             }
             OversizedOutputMode::Pager => {
-                let service = PythonPagerToolServer::new(backend, sandbox_plan, oversized_output)?;
+                let service =
+                    PythonPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
                 run_backend_server(service.clone(), service.shared.state()).await
             }
         },

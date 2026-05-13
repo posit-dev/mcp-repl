@@ -13,7 +13,9 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use crate::backend::Backend;
+use crate::backend::{
+    Backend, CustomWorkerSpec, CustomWorkerWorkingDir, CustomWorkerWorkingDirPolicy, WorkerLaunch,
+};
 #[cfg(target_family = "windows")]
 use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
@@ -395,6 +397,35 @@ fn driver_refresh_backend_info(
         )),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
             "worker session ended before backend info".to_string(),
+        )),
+    }
+}
+
+fn driver_refresh_worker_ready(
+    ipc: ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_backend_info(timeout) {
+        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+                return Err(WorkerError::Protocol(format!(
+                    "unsupported worker protocol {} version {}",
+                    protocol.name, protocol.version
+                )));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(WorkerError::Protocol(
+            "expected worker_ready before user input".to_string(),
+        )),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
+            "timed out waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before worker_ready".to_string(),
         )),
     }
 }
@@ -807,6 +838,63 @@ impl BackendDriver for PythonBackendDriver {
         driver_refresh_backend_info(ipc, timeout, false)
     }
 }
+
+struct ProtocolBackendDriver;
+
+impl ProtocolBackendDriver {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl BackendDriver for ProtocolBackendDriver {
+    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
+        let mut payload = text.as_bytes().to_vec();
+        if !payload.is_empty() && !payload.ends_with(b"\n") {
+            payload.push(b'\n');
+        }
+        payload
+    }
+
+    fn on_input_start(
+        &mut self,
+        text: &str,
+        _payload: &[u8],
+        ipc: &ServerIpcConnection,
+        _timeout: Duration,
+    ) -> Result<(), WorkerError> {
+        driver_on_input_start(text, ipc)
+    }
+
+    fn should_settle_output_after_timeout(
+        &self,
+        _oversized_output: OversizedOutputMode,
+        _pending_input: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    fn wait_for_completion(
+        &mut self,
+        timeout: Duration,
+        ipc: ServerIpcConnection,
+    ) -> Result<CompletionInfo, WorkerError> {
+        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+    }
+
+    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
+        driver_interrupt(process)
+    }
+
+    fn refresh_backend_info(
+        &mut self,
+        ipc: ServerIpcConnection,
+        timeout: Duration,
+    ) -> Result<(), WorkerError> {
+        driver_refresh_worker_ready(ipc, timeout)
+    }
+}
+
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1054,6 +1142,7 @@ fn worker_context_event_payload(
 
 pub struct WorkerManager {
     exe_path: PathBuf,
+    worker_launch: WorkerLaunch,
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
@@ -1099,11 +1188,12 @@ struct PreparedSandboxStateUpdate {
 
 impl WorkerManager {
     pub fn new(
-        backend: Backend,
+        worker_launch: WorkerLaunch,
         sandbox_plan: SandboxCliPlan,
         oversized_output: OversizedOutputMode,
     ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
+        let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
         let sandbox_state = if plan_requests_inherited_state {
@@ -1136,6 +1226,7 @@ impl WorkerManager {
         };
         Ok(Self {
             exe_path,
+            worker_launch: worker_launch.clone(),
             backend,
             process: None,
             sandbox_plan,
@@ -1150,9 +1241,10 @@ impl WorkerManager {
             output: OutputBuffer::default(),
             pager: Pager::default(),
             output_timeline,
-            driver: match backend {
-                Backend::R => Box::new(RBackendDriver::new()),
-                Backend::Python => Box::new(PythonBackendDriver::new()),
+            driver: match worker_launch {
+                WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
+                WorkerLaunch::Builtin(Backend::Python) => Box::new(PythonBackendDriver::new()),
+                WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
             },
             pending_request: false,
             pending_request_started_at: None,
@@ -3954,7 +4046,7 @@ impl WorkerManager {
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
-            self.backend,
+            self.worker_launch.clone(),
             &self.exe_path,
             &self.sandbox_state,
             WorkerSpawnContext {
@@ -4032,7 +4124,7 @@ impl WorkerManager {
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
         let process = WorkerProcess::spawn(
-            self.backend,
+            self.worker_launch.clone(),
             &self.exe_path,
             &self.sandbox_state,
             WorkerSpawnContext {
@@ -5427,7 +5519,7 @@ impl OutputReader {
 
 impl WorkerProcess {
     fn spawn(
-        backend: Backend,
+        worker_launch: WorkerLaunch,
         exe_path: &Path,
         sandbox_state: &SandboxState,
         context: WorkerSpawnContext<'_>,
@@ -5451,10 +5543,7 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
-        let readline_echo_source = match backend {
-            Backend::R => PendingTextSource::Ipc,
-            Backend::Python => PendingTextSource::Ipc,
-        };
+        let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -5463,8 +5552,8 @@ impl WorkerProcess {
             stderr_reader,
             #[cfg(target_os = "macos")]
             denial_logger,
-        } = match backend {
-            Backend::R => Self::spawn_embedded_worker(
+        } = match &worker_launch {
+            WorkerLaunch::Builtin(Backend::R) => Self::spawn_embedded_worker(
                 Backend::R,
                 exe_path,
                 sandbox_state,
@@ -5474,9 +5563,18 @@ impl WorkerProcess {
                 #[cfg(target_os = "windows")]
                 prepared_windows_launch.as_ref(),
             )?,
-            Backend::Python => Self::spawn_embedded_worker(
+            WorkerLaunch::Builtin(Backend::Python) => Self::spawn_embedded_worker(
                 Backend::Python,
                 exe_path,
+                sandbox_state,
+                managed_network_proxy,
+                live_output.clone(),
+                &mut ipc_server,
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch.as_ref(),
+            )?,
+            WorkerLaunch::Custom(spec) => Self::spawn_custom_worker(
+                spec,
                 sandbox_state,
                 managed_network_proxy,
                 live_output.clone(),
@@ -5620,6 +5718,126 @@ impl WorkerProcess {
                 crate::python_session::PYTHON_EXECUTABLE_ENV,
                 python_executable,
             );
+        }
+        #[cfg(target_family = "unix")]
+        let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
+            WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
+        })?;
+        #[cfg(target_family = "unix")]
+        {
+            command.env(IPC_READ_FD_ENV, client_fds.read_fd.to_string());
+            command.env(IPC_WRITE_FD_ENV, client_fds.write_fd.to_string());
+        }
+        #[cfg(target_family = "windows")]
+        let (pipe_to_worker, pipe_from_worker) = ipc_server.take_pipe_names().ok_or_else(|| {
+            WorkerError::Protocol("IPC pipe setup failed; missing pipe names".to_string())
+        })?;
+        #[cfg(target_family = "windows")]
+        {
+            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
+        #[cfg(target_family = "unix")]
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        #[cfg(target_family = "unix")]
+        {
+            unsafe {
+                libc::close(client_fds.read_fd);
+                libc::close(client_fds.write_fd);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            maybe_report_sandbox_exec_failure(&prepared.program, status)?;
+            return Err(WorkerError::Protocol(format!(
+                "worker process exited immediately with status {status}"
+            )));
+        }
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
+        let stdin_tx = spawn_stdin_writer(stdin);
+        let stdout_reader =
+            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
+        let stderr_reader =
+            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone())?;
+
+        #[cfg(target_os = "macos")]
+        let mut denial_logger = prepared.denial_logger;
+        #[cfg(target_os = "macos")]
+        if let Some(logger) = denial_logger.as_mut() {
+            logger.on_child_spawn(&child);
+        }
+
+        Ok(SpawnedWorker {
+            child,
+            stdin_tx,
+            session_tmpdir,
+            stdout_reader,
+            stderr_reader,
+            #[cfg(target_os = "macos")]
+            denial_logger,
+        })
+    }
+
+    fn spawn_custom_worker(
+        spec: &CustomWorkerSpec,
+        sandbox_state: &SandboxState,
+        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
+        live_output: LiveOutputCapture,
+        ipc_server: &mut IpcServer,
+        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
+            &crate::windows_sandbox::PreparedSandboxLaunch,
+        >,
+    ) -> Result<SpawnedWorker, WorkerError> {
+        let prepared = prepare_worker_command_with_managed_network(
+            &spec.executable,
+            spec.args.clone(),
+            sandbox_state,
+            managed_network_proxy,
+        )
+        .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut prepared = prepared;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = prepared_windows_launch {
+            crate::sandbox::append_windows_prepared_capability_sid(
+                &mut prepared.args,
+                prepared_windows_launch.capability_sid(),
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
+        let session_tmpdir = prepared
+            .env
+            .get(R_SESSION_TMPDIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
+        let mut command = Command::new(&prepared.program);
+        if let Some(arg0) = &prepared.arg0 {
+            set_command_arg0(&mut command, arg0);
+        }
+        command.args(&prepared.args);
+        command.envs(prepared.env.iter());
+        command.envs(spec.env.iter());
+        match &spec.working_dir {
+            CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit) => {}
+            CustomWorkerWorkingDir::Path { path } => {
+                command.current_dir(path);
+            }
         }
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
@@ -7258,7 +7476,10 @@ mod tests {
             prompt: "> ".to_string(),
             line: "quit()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
+            reason: None,
+            message_b64: None,
+        });
 
         let completion =
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
@@ -7288,7 +7509,10 @@ mod tests {
             client_waiting: true,
         });
         thread::sleep(Duration::from_millis(25));
-        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
+            reason: None,
+            message_b64: None,
+        });
         thread::sleep(Duration::from_millis(25));
 
         let completion =
@@ -8394,7 +8618,10 @@ mod tests {
             })
             .expect("send stderr output_text");
         worker
-            .send(WorkerToServerIpcMessage::SessionEnd)
+            .send(WorkerToServerIpcMessage::SessionEnd {
+                reason: None,
+                message_b64: None,
+            })
             .expect("send session_end");
 
         done_rx

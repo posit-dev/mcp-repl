@@ -11,6 +11,10 @@
   name = "mcp-repl"
   path = "src/main.rs"
 
+[[bin]]
+  name = "zod-worker"
+  path = "src/bin/zod-worker.rs"
+
 [dependencies]
   ctor = "0.6.3"
   base64 = "0.22.1"

@@ -101,6 +101,13 @@ pub enum ServerToWorkerIpcMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerToServerIpcMessage {
+    WorkerReady {
+        protocol: WorkerProtocol,
+        worker: WorkerIdentity,
+        capabilities: WorkerCapabilities,
+        #[serde(default)]
+        graceful_shutdown: Option<WorkerGracefulShutdown>,
+    },
     BackendInfo {
         #[serde(default)]
         supports_images: bool,
@@ -114,7 +121,14 @@ pub enum WorkerToServerIpcMessage {
     },
     ReadlineStart {
         prompt: String,
+        #[serde(default = "default_true")]
         client_waiting: bool,
+    },
+    ReadlineInput {
+        text: String,
+    },
+    ReadlineDiscard {
+        text: String,
     },
     ReadlineResult {
         prompt: String,
@@ -127,7 +141,49 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    SessionEnd,
+    OutputImage {
+        image_id: String,
+        mime_type: String,
+        data_b64: String,
+        update: bool,
+    },
+    SessionEnd {
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        message_b64: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProtocol {
+    pub name: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCapabilities {
+    #[serde(default)]
+    pub images: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerGracefulShutdown {
+    pub stdin: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Default)]
@@ -346,10 +402,16 @@ impl ServerIpcConnection {
                             handler(echo_event);
                         }
                     }
-                    WorkerToServerIpcMessage::SessionEnd => {
+                    WorkerToServerIpcMessage::SessionEnd {
+                        reason,
+                        message_b64,
+                    } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.session_end = true;
-                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
+                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
+                            reason,
+                            message_b64,
+                        });
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
@@ -421,6 +483,45 @@ impl ServerIpcConnection {
                                 is_update,
                                 source,
                             });
+                            reader_cvar.notify_all();
+                        }
+                    }
+                    WorkerToServerIpcMessage::OutputImage {
+                        image_id,
+                        mime_type,
+                        data_b64,
+                        update,
+                    } => {
+                        let (id, is_new, updates_previous_image, readline_results_seen) = {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            let (id, is_new, updates_previous_image) =
+                                assign_plot_image_id(&mut guard, Some(&image_id), update);
+                            (
+                                id,
+                                is_new,
+                                updates_previous_image,
+                                guard.readline_result_count as usize,
+                            )
+                        };
+                        if let Some(handler) = plot_handler.as_ref() {
+                            handler(IpcPlotImage {
+                                id,
+                                mime_type,
+                                data: data_b64,
+                                is_new,
+                                updates_previous_image,
+                                readline_results_seen,
+                            });
+                        } else {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard
+                                .queue
+                                .push_back(WorkerToServerIpcMessage::OutputImage {
+                                    image_id,
+                                    mime_type,
+                                    data_b64,
+                                    update,
+                                });
                             reader_cvar.notify_all();
                         }
                     }
@@ -1493,7 +1594,10 @@ pub fn emit_stdin_write_ack() {
 
 pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd);
+        let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
+            reason: None,
+            message_b64: None,
+        });
     }
 }
 
@@ -1530,7 +1634,7 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue
         .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::SessionEnd))
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::SessionEnd { .. }))
     {
         guard.queue.remove(idx);
     }
@@ -1666,10 +1770,13 @@ fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
 }
 
 fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
-    let idx = guard
-        .queue
-        .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::BackendInfo { .. }))?;
+    let idx = guard.queue.iter().position(|msg| {
+        matches!(
+            msg,
+            WorkerToServerIpcMessage::BackendInfo { .. }
+                | WorkerToServerIpcMessage::WorkerReady { .. }
+        )
+    })?;
     guard.queue.remove(idx)
 }
 

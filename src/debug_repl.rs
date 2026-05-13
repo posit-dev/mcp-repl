@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use rmcp::model::{CallToolResult, RawContent};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, WorkerLaunch};
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::server::response::{
@@ -43,7 +43,11 @@ pub(crate) fn run(
     let mut stderr = io::stderr();
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
-    let mut worker = WorkerManager::new(backend, sandbox_plan, oversized_output)?;
+    let mut worker = WorkerManager::new(
+        WorkerLaunch::Builtin(backend),
+        sandbox_plan,
+        oversized_output,
+    )?;
     let mut response = if oversized_output == OversizedOutputMode::Files {
         Some(ResponseState::new()?)
     } else {
