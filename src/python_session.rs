@@ -200,6 +200,7 @@ pub(crate) fn interrupt() {
     discard_pending_stdin();
     finish_active_request_at_next_read();
     mark_interrupt_requested();
+    request_platform_interrupt();
 }
 
 fn mark_interrupt_requested() {
@@ -210,6 +211,14 @@ fn mark_interrupt_requested() {
     guard.interrupt_requested = true;
     state.cvar.notify_all();
 }
+
+#[cfg(windows)]
+fn request_platform_interrupt() {
+    let _ = unsafe { libc::raise(libc::SIGINT) };
+}
+
+#[cfg(not(windows))]
+fn request_platform_interrupt() {}
 
 fn take_interrupt_requested() -> bool {
     let Some(state) = SESSION_STATE.get() else {

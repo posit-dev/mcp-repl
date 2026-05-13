@@ -3106,6 +3106,82 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_wakes_time_sleep_signal_handler() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import signal, time
+def handle_sigint(signum, frame):
+    print("PY_SLEEP_SIGINT")
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, handle_sigint)
+print("PY_SLEEP_READY", flush=True)
+try:
+    time.sleep(30)
+except KeyboardInterrupt:
+    print("PY_SLEEP_INTERRUPTED")
+""")
+"#,
+            Some(0.2),
+        )
+        .await?;
+    let mut text = result_text(&timeout_result);
+    assert!(
+        is_busy_response(&text),
+        "expected sleep call to time out, got: {text:?}"
+    );
+
+    let ready_deadline = interrupt_recovery_deadline();
+    while !text.contains("PY_SLEEP_READY") {
+        if Instant::now() >= ready_deadline {
+            session.cancel().await?;
+            return Err(format!("sleep request did not report readiness: {text:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        text = result_text(&poll);
+        assert!(
+            is_busy_response(&text) || text.contains("PY_SLEEP_READY"),
+            "expected sleep request to stay busy before interrupt, got: {text:?}"
+        );
+    }
+
+    let interrupt_deadline = interrupt_recovery_deadline();
+    text = result_text(&session.write_stdin_raw_with("\u{3}", Some(5.0)).await?);
+    while is_busy_response(&text) {
+        if Instant::now() >= interrupt_deadline {
+            session.cancel().await?;
+            return Err(format!("sleep interrupt did not finish: {text:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        text = result_text(&poll);
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with("print('PY_SLEEP_AFTER_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("PY_SLEEP_SIGINT") && text.contains("PY_SLEEP_INTERRUPTED"),
+        "expected SIGINT handler to wake sleep, got: {text:?}"
+    );
+    assert!(
+        follow_up_text.contains("PY_SLEEP_AFTER_INTERRUPT"),
+        "expected follow-up after sleep interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
