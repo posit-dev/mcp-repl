@@ -261,6 +261,7 @@ pub(crate) fn mark_stdin_write_complete() {
 
     if let Some(active) = completed {
         emit_plots();
+        // Python object flushes run from handle_input_hook on the Python thread.
         ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
         complete_active_request(state, Some(active), false);
     }
@@ -955,6 +956,7 @@ fn handle_input_hook() {
     let mut completed = None;
     let mut prompt = None;
     let mut emit_idle = false;
+    let mut flush_before_wait = false;
     {
         let mut guard = state.inner.lock().unwrap();
         if guard.shutdown {
@@ -992,6 +994,8 @@ fn handle_input_hook() {
             if should_complete {
                 prompt = Some(current_prompt);
                 completed = guard.active_request.take();
+            } else {
+                flush_before_wait = true;
             }
         } else if !guard.waiting_for_input {
             guard.waiting_for_input = true;
@@ -1000,7 +1004,9 @@ fn handle_input_hook() {
         }
     }
 
-    if let Some(active) = completed {
+    if flush_before_wait {
+        flush_original_stdio();
+    } else if let Some(active) = completed {
         emit_plots();
         flush_original_stdio();
         ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
