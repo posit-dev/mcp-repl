@@ -684,6 +684,43 @@ async fn python_closed_indented_expression_reports_primary_prompt() -> TestResul
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("x = '''label:\n    value'''", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        !is_busy_response(&text),
+        "expected closed multiline string to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains(">>> "),
+        "expected closed multiline string to report primary prompt, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "expected closed multiline string not to report continuation prompt, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("print('STRING_AFTER', x.splitlines()[0])", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STRING_AFTER label:"),
+        "expected next turn to run after closed multiline string, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> TestResult<()> {

@@ -490,8 +490,10 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
 
 fn python_has_open_block_suite(text: &str) -> bool {
     let mut block_indents = Vec::new();
+    let mut scan_state = PythonLineScanState::default();
     for line in text.lines() {
-        let code = python_line_code_before_comment(line).trim_end();
+        let code = python_line_code_before_comment_with_state(line, &mut scan_state);
+        let code = code.trim_end();
         if code.trim().is_empty() {
             if line.trim().is_empty() {
                 block_indents.clear();
@@ -510,6 +512,59 @@ fn python_has_open_block_suite(text: &str) -> bool {
         }
     }
     !block_indents.is_empty()
+}
+
+#[derive(Default)]
+struct PythonLineScanState {
+    quote: Option<(char, bool)>,
+    escaped: bool,
+}
+
+fn python_line_code_before_comment_with_state(
+    line: &str,
+    state: &mut PythonLineScanState,
+) -> String {
+    let mut code = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((_, ch)) = chars.next() {
+        if let Some((delimiter, triple)) = state.quote {
+            if triple {
+                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
+                    state.quote = None;
+                }
+                continue;
+            }
+
+            if state.escaped {
+                state.escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                state.escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                state.quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => break,
+            '\'' | '"' => {
+                let triple = take_next_two_indexed(&mut chars, ch);
+                state.quote = Some((ch, triple));
+            }
+            _ => code.push(ch),
+        }
+    }
+
+    if state.quote.is_some_and(|(_, triple)| !triple) {
+        state.quote = None;
+        state.escaped = false;
+    }
+    code
 }
 
 fn python_line_indent(line: &str) -> usize {
