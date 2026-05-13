@@ -284,7 +284,7 @@ pub(crate) fn mark_stdin_write_complete() {
 
     if let Some(active) = completed {
         emit_plots();
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        ipc::emit_readline_start(visible_readline_prompt(prompt.as_deref()), true);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -913,6 +913,13 @@ fn input_hook_prompt(guard: &SessionStateInner, fallback_prompt: Option<&str>) -
         .unwrap_or_else(|| ">>> ".to_string())
 }
 
+fn visible_readline_prompt(prompt: Option<&str>) -> &str {
+    match prompt {
+        Some("") | None => "stdin> ",
+        Some(prompt) => prompt,
+    }
+}
+
 fn handle_input_hook() {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -957,10 +964,10 @@ fn handle_input_hook() {
     if let Some(active) = completed {
         emit_plots();
         flush_original_stdio();
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        ipc::emit_readline_start(visible_readline_prompt(prompt.as_deref()), true);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), false);
+        ipc::emit_readline_start(visible_readline_prompt(prompt.as_deref()), false);
     }
 }
 
@@ -1083,7 +1090,7 @@ fn finish_repl_turn_request() {
 
     if let Some(active) = completed {
         flush_original_stdio();
-        ipc::emit_readline_start(prompt.as_deref().unwrap_or(">>> "), true);
+        ipc::emit_readline_start(visible_readline_prompt(prompt.as_deref()), true);
         complete_active_request(state, Some(active), false);
     }
 }
