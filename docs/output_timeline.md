@@ -9,7 +9,8 @@ The worker emits different kinds of information on different channels:
 
 - Worker-owned text may travel as ordered `output_text` IPC frames.
 - Raw stdout/stderr bytes still capture unowned output from child processes,
-  direct file-descriptor writes, or backends that use a PTY.
+  direct file-descriptor writes, or runtime/native code that bypasses the
+  worker-owned output callbacks.
 - Sideband IPC carries structural events such as `readline_start`,
   `readline_result`, `plot_image`, and `session_end`.
 

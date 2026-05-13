@@ -12,22 +12,25 @@ The remaining follow-up is broader than that point fix. We still need to tighten
 
 - The Windows `reticulate` hang was a concrete symptom of stdin ownership problems in the worker model.
 - The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
-- Future embedded interpreters can run into similar issues if worker stdin ownership drifts again.
-- The current embedded R stdin path still has implementation drift from the intended worker/server contract.
+- Future embedded interpreters can run into similar issues if worker stdin
+  ownership drifts again.
+- The current R and Python paths now keep stdin raw and use sideband metadata
+  for request boundaries, but their in-worker stdin ownership differs.
 
 ## Current Scope
 
-This repo now avoids the immediate Windows deadlock by stopping the background stdin reader from blocking on fd `0` while a request is running.
+This repo now uses raw stdin for worker payloads and sideband IPC for request
+metadata:
 
-That mitigation should be treated as an initial slice, not the completion of this item:
+- R worker mode owns stdin in a worker-side reader thread. The server announces
+  the payload byte length on sideband IPC; the worker reader consumes exactly
+  that many raw bytes and submits them to embedded R.
+- Python worker mode lets CPython own stdin. The server announces request
+  metadata on sideband IPC, waits for `stdin_write_ack`, then writes raw bytes
+  for CPython's interactive loop to consume.
 
-- It is Windows-only.
-- It reduces simultaneous stdin readers during active requests.
-- It does not yet make stdin ownership explicit end-to-end.
-- It does not remove the embedded R framing layer.
-- It does not yet establish the final request-envelope split between raw stdin payloads and IPC metadata.
-
-We still want to keep stdin as the primary request channel for worker payloads and address the broader stdin ownership and transport shape in a dedicated follow-up refactor.
+The remaining follow-up is to make this ownership split more explicit in code
+and reduce server-side backend branching around request metadata.
 
 ## Intended Transport Model
 
@@ -37,7 +40,8 @@ We still want to keep stdin as the primary request channel for worker payloads a
 - Let the worker use the IPC envelope to know when the current stdin payload is complete, while still feeding raw stdin through the interpreter-facing path.
 - For line-oriented runtimes such as embedded R, expect a single logical request to be satisfied across multiple `readline` or `ReadConsole` calls.
 
-The current embedded R implementation uses framed stdin messages to preserve request boundaries on a long-lived stream. That is implementation drift from the intended model and should be removed as part of this follow-up.
+The current embedded worker implementation keeps stdin raw and preserves request
+boundaries with IPC metadata.
 
 ## Observed Windows Failure
 
@@ -58,8 +62,9 @@ The following patterns reproduced locally on Windows:
 ## Intended Follow-Up
 
 - Keep stdin as the primary worker payload transport.
-- Refactor the worker so stdin has a single owner.
-- Avoid a permanently blocked background stdin reader while embedded runtimes may also inspect or wrap fd `0`.
-- Treat the current active-request pause as a temporary safety rail, not the final transport architecture.
-- Remove stdin framing for the embedded R worker and rely on IPC for request envelope metadata instead.
-- Prefer demand-driven reads from stdin, or another single-owner design, so future interpreters like Julia can fit the same transport model.
+- Make stdin ownership explicit per backend instead of relying on scattered
+  server-side branching.
+- Avoid a permanently blocked background stdin reader while embedded runtimes
+  may also inspect or wrap fd `0`.
+- Prefer demand-driven reads from stdin, or another single-owner design, so
+  future interpreters can fit the same transport model.

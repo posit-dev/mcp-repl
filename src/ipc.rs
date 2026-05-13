@@ -18,7 +18,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 #[cfg(target_family = "unix")]
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+#[cfg(target_family = "windows")]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -84,7 +86,14 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
-    StdinWrite { text: String },
+    StdinWrite {
+        byte_len: usize,
+        #[serde(default)]
+        line_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_prompt: Option<String>,
+    },
+    StdinWriteComplete,
     Interrupt,
     SessionEnd,
 }
@@ -96,7 +105,7 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         supports_images: bool,
     },
-    StdinReady,
+    StdinWriteAck,
     OutputText {
         stream: TextStream,
         data_b64: String,
@@ -180,7 +189,7 @@ pub struct IpcHandlers {
 
 #[derive(Clone)]
 pub struct ServerIpcConnection {
-    sender: mpsc::Sender<ServerToWorkerIpcMessage>,
+    writer: OutputCriticalIpcWriter,
     inbox: Arc<Mutex<ServerIpcInbox>>,
     cvar: Arc<Condvar>,
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
@@ -207,7 +216,7 @@ impl OutputCriticalIpcWriter {
         }
     }
 
-    pub fn send(&self, message: WorkerToServerIpcMessage) -> io::Result<()> {
+    pub fn send<T: Serialize>(&self, message: T) -> io::Result<()> {
         let mut writer = self
             .writer
             .lock()
@@ -239,7 +248,6 @@ impl IpcHandle {
 
 impl ServerIpcConnection {
     fn new(transport: IpcTransport, handlers: IpcHandlers) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
         let inbox = Arc::new(Mutex::new(ServerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
         let reader_thread = Arc::new(Mutex::new(None));
@@ -252,6 +260,7 @@ impl ServerIpcConnection {
         let readline_result_handler = handlers.on_readline_result.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
+        let writer = OutputCriticalIpcWriter::new(writer);
         let handle = thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
@@ -425,21 +434,16 @@ impl ServerIpcConnection {
         });
         *reader_thread.lock().unwrap() = Some(handle);
 
-        spawn_writer(rx, writer);
-
         Ok(Self {
-            sender: tx,
+            writer,
             inbox,
             cvar,
             reader_thread,
         })
     }
 
-    pub fn send(
-        &self,
-        message: ServerToWorkerIpcMessage,
-    ) -> Result<(), mpsc::SendError<ServerToWorkerIpcMessage>> {
-        self.sender.send(message)
+    pub fn send(&self, message: ServerToWorkerIpcMessage) -> io::Result<()> {
+        self.writer.send(message)
     }
 
     pub fn join_reader_thread(&self) -> io::Result<()> {
@@ -456,7 +460,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        drop_queued_stdin_ready(&mut guard);
+        drop_stdin_write_acks(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -602,11 +606,11 @@ impl ServerIpcConnection {
         }
     }
 
-    pub fn wait_for_stdin_ready(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+    pub fn wait_for_stdin_write_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if take_stdin_ready(&mut guard) {
+            if take_stdin_write_ack(&mut guard) {
                 return Ok(());
             }
             if take_session_end(&mut guard) {
@@ -624,7 +628,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if take_stdin_ready(&mut guard) {
+                if take_stdin_write_ack(&mut guard) {
                     return Ok(());
                 }
                 return Err(IpcWaitError::Timeout);
@@ -746,25 +750,6 @@ impl WorkerIpcConnection {
             }
         }
     }
-}
-
-fn spawn_writer<T>(rx: mpsc::Receiver<T>, mut writer: Box<dyn Write + Send>)
-where
-    T: Serialize + Send + 'static,
-{
-    thread::spawn(move || {
-        for message in rx {
-            if let Ok(payload) = serde_json::to_string(&message) {
-                if writer.write_all(payload.as_bytes()).is_err() {
-                    break;
-                }
-                if writer.write_all(b"\n").is_err() {
-                    break;
-                }
-                let _ = writer.flush();
-            }
-        }
-    });
 }
 
 fn write_ipc_message<T: Serialize>(writer: &mut dyn Write, message: &T) -> io::Result<()> {
@@ -1500,6 +1485,12 @@ pub fn emit_backend_info(supports_images: bool) {
     }
 }
 
+pub fn emit_stdin_write_ack() {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::StdinWriteAck);
+    }
+}
+
 pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd);
@@ -1544,6 +1535,25 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
         guard.queue.remove(idx);
     }
     true
+}
+
+fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
+    if let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+    {
+        guard.queue.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
+fn drop_stdin_write_acks(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinWriteAck));
 }
 
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
@@ -1663,24 +1673,6 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
-fn take_stdin_ready(guard: &mut ServerIpcInbox) -> bool {
-    let Some(idx) = guard
-        .queue
-        .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinReady))
-    else {
-        return false;
-    };
-    guard.queue.remove(idx);
-    true
-}
-
-fn drop_queued_stdin_ready(guard: &mut ServerIpcInbox) {
-    guard
-        .queue
-        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinReady));
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1688,9 +1680,9 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod protocol_tests {
     use super::{
-        IpcHandlers, IpcTransport, OUTPUT_TEXT_IPC_CHUNK_BYTES, OutputCriticalIpcWriter,
-        ServerIpcConnection, ServerToWorkerIpcMessage, WorkerIpcConnection,
-        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
+        IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
+        OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
+        WorkerIpcConnection, WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -1822,15 +1814,68 @@ mod protocol_tests {
     }
 
     #[test]
-    fn stdin_ready_is_a_worker_to_server_request_start_ack() {
+    fn stdin_write_ack_is_worker_to_server_only() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "stdin_ready"
+            "type": "stdin_write_ack"
         }));
-
         assert!(
-            matches!(parsed, Ok(WorkerToServerIpcMessage::StdinReady)),
-            "stdin_ready should deserialize as the Python request-start acknowledgement"
+            matches!(parsed, Ok(WorkerToServerIpcMessage::StdinWriteAck)),
+            "stdin_write_ack should deserialize as the worker-side stdin acceptance signal"
         );
+
+        let parsed = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "stdin_write_ack"
+        }));
+        assert!(
+            parsed.is_err(),
+            "stdin_write_ack should not deserialize as a server-to-worker message"
+        );
+    }
+
+    #[test]
+    fn begin_request_drops_stale_stdin_write_acks() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("send stale ack");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut guard = server.inbox.lock().unwrap();
+        while !guard
+            .queue
+            .iter()
+            .any(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "expected stale stdin_write_ack to reach server inbox"
+            );
+            let (next_guard, timeout_res) = server.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            assert!(
+                !timeout_res.timed_out(),
+                "expected stale stdin_write_ack to reach server inbox"
+            );
+        }
+        drop(guard);
+
+        server.begin_request();
+        assert!(
+            matches!(
+                server.wait_for_stdin_write_ack(Duration::ZERO),
+                Err(IpcWaitError::Timeout)
+            ),
+            "begin_request should discard stale stdin_write_ack messages"
+        );
+
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("send fresh ack");
+        server
+            .wait_for_stdin_write_ack(Duration::from_secs(1))
+            .expect("fresh ack should still be accepted");
     }
 
     #[test]

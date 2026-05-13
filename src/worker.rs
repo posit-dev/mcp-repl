@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 #[cfg(windows)]
@@ -6,7 +6,7 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::input_protocol::parse_input_frame_header;
+use crate::backend::{Backend, backend_from_env};
 use crate::ipc::{
     ServerToWorkerIpcMessage, connect_from_env, emit_backend_info, emit_session_end, set_global_ipc,
 };
@@ -104,6 +104,11 @@ struct QueuedRequest {
     text: String,
 }
 
+enum StdinReadCommand {
+    Read { byte_len: usize },
+    Shutdown,
+}
+
 pub fn is_worker_mode() -> bool {
     let bare = std::ffi::OsStr::new(WORKER_MODE_ARG);
     let flag = std::ffi::OsString::from(format!("--{WORKER_MODE_ARG}"));
@@ -111,10 +116,18 @@ pub fn is_worker_mode() -> bool {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    match backend_from_env()?.unwrap_or(Backend::R) {
+        Backend::R => run_r_worker(),
+        Backend::Python => crate::python_worker::run(),
+    }
+}
+
+fn run_r_worker() -> Result<(), Box<dyn std::error::Error>> {
     crate::diagnostics::startup_log("worker: run begin");
     let state = Arc::new(WorkerState::default());
     let (request_tx, request_rx) = mpsc::sync_channel(1);
-    init_ipc(state.clone()).map_err(|err| {
+    let (stdin_tx, stdin_rx) = mpsc::channel();
+    init_ipc(state.clone(), stdin_tx.clone()).map_err(|err| {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
@@ -130,7 +143,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _stdin_thread = thread::Builder::new()
         .name("worker-stdin".to_string())
         .spawn(move || {
-            if let Err(err) = stdin_loop(stdin_state, stdin_requests) {
+            if let Err(err) = stdin_loop(stdin_state, stdin_rx, stdin_requests) {
                 eprintln!("worker stdin error: {err}");
             }
         })
@@ -155,7 +168,10 @@ fn wait_for_r_session() -> Result<&'static RSession, String> {
     }
 }
 
-fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
+fn init_ipc(
+    state: Arc<WorkerState>,
+    stdin_tx: mpsc::Sender<StdinReadCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = connect_from_env(Duration::from_secs(2))?;
     set_global_ipc(conn.clone());
     if let Err(err) = thread::Builder::new()
@@ -163,7 +179,16 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::StdinWrite { .. }) => {}
+                    Some(ServerToWorkerIpcMessage::StdinWrite {
+                        byte_len,
+                        line_count: _,
+                        final_prompt: _,
+                    }) => {
+                        if stdin_tx.send(StdinReadCommand::Read { byte_len }).is_err() {
+                            std::process::exit(0);
+                        }
+                    }
+                    Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         crate::r_session::clear_pending_input();
                     }
@@ -171,6 +196,7 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
                         state.begin_shutdown();
                         crate::r_session::clear_pending_input();
                         let _ = crate::r_session::request_shutdown();
+                        let _ = stdin_tx.send(StdinReadCommand::Shutdown);
                     }
                     None => {
                         // Without IPC, the worker cannot participate in turn accounting (prompt,
@@ -188,48 +214,44 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn stdin_loop(
     state: Arc<WorkerState>,
+    stdin_rx: mpsc::Receiver<StdinReadCommand>,
     request_tx: mpsc::SyncSender<QueuedRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin);
-    let mut line = String::new();
-    loop {
+    for command in stdin_rx {
+        let StdinReadCommand::Read { byte_len } = command else {
+            break;
+        };
+        if state.is_shutting_down() {
+            break;
+        }
+
+        let mut buffer = vec![0u8; byte_len];
         #[cfg(windows)]
         {
-            // Embedded CPython can hang if another thread stays blocked on fd 0 while a request
-            // is active.
             if !state.wait_until_stdin_read_allowed() {
                 break;
             }
         }
-        line.clear();
-        let bytes = reader.read_line(&mut line);
+        let read_result = reader.read_exact(&mut buffer);
         #[cfg(windows)]
         state.finish_stdin_read();
-        let bytes = bytes?;
-        if bytes == 0 {
+        if let Err(err) = read_result {
             state.begin_shutdown();
             if !crate::r_session::request_shutdown() {
                 crate::ipc::emit_session_end();
                 std::process::exit(0);
             }
-            break;
+            return Err(err.into());
         }
 
-        // Once shutdown is requested, stop consuming stdin immediately.
-        // Remaining bytes can stay unread because this worker is terminating.
         if state.is_shutting_down() {
             break;
         }
 
-        if let Some(len) = parse_input_frame_header(&line) {
-            let mut buffer = vec![0u8; len];
-            reader.read_exact(&mut buffer)?;
-            let text = String::from_utf8_lossy(&buffer).to_string();
-            handle_write_stdin(text, state.clone(), &request_tx);
-        } else {
-            handle_write_stdin(line.clone(), state.clone(), &request_tx);
-        }
+        let text = String::from_utf8_lossy(&buffer).to_string();
+        handle_write_stdin(text, state.clone(), &request_tx);
     }
 
     Ok(())
@@ -287,15 +309,11 @@ impl WorkerExecError {
 fn write_stdin_request(text: String) -> Result<(), WorkerExecError> {
     let session = wait_for_r_session()
         .map_err(|err| WorkerExecError::new(format!("failed to start R session: {err}")))?;
-
     let reply_rx = session.send_request(text).map_err(WorkerExecError::new)?;
-
-    match reply_rx.recv() {
-        Ok(_reply) => Ok(()),
-        Err(err) => Err(WorkerExecError::new(format!(
-            "R session reply error: {err}"
-        ))),
-    }
+    reply_rx
+        .recv()
+        .map(|_| ())
+        .map_err(|err| WorkerExecError::new(format!("R session reply error: {err}")))
 }
 
 fn emit_stderr_message(message: &str) {

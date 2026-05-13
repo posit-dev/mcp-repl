@@ -159,6 +159,20 @@ fn extract_images(result: &CallToolResult) -> Vec<ImageData> {
         .collect()
 }
 
+fn first_image_index(result: &CallToolResult) -> Option<usize> {
+    result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+}
+
+fn first_text_index_containing(result: &CallToolResult, needle: &str) -> Option<usize> {
+    result.content.iter().position(|item| match &item.raw {
+        RawContent::Text(text) => text.text.contains(needle),
+        _ => false,
+    })
+}
+
 fn python_plot_preamble() -> &'static str {
     r#"import matplotlib.pyplot as plt; plt.rcParams["figure.dpi"] = 96; plt.rcParams["figure.figsize"] = (8.3333333333, 6.25)"#
 }
@@ -512,6 +526,102 @@ plt.scatter([1, 2, 3], [3, 2, 1])"#,
         images.len(),
         1,
         "expected prompt-time scatter plot to emit one image in the current response, got {images:?}; response text: {}",
+        result_text(&result)
+    );
+    assert_eq!(images[0].mime_type, "image/png");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_original_stdout_flushes_before_plot_image() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        r#"exec("""
+{}
+import sys
+
+class DeferredStdout:
+    def __init__(self):
+        self.pending = []
+
+    def write(self, message):
+        self.pending.append(message)
+        return len(message)
+
+    def flush(self):
+        while self.pending:
+            sys.stdout.write(self.pending.pop(0))
+
+sys.__stdout__ = DeferredStdout()
+marker = "ORIGINAL" + "_BEFORE_PLOT"
+sys.__stdout__.write(marker + "\\n")
+plt.figure(1129)
+plt.clf()
+plt.plot([1, 2, 3], [3, 2, 1])
+""")"#,
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "plot with original stdout reported an error: {}",
+        result_text(&result)
+    );
+    let before_idx =
+        first_text_index_containing(&result, "ORIGINAL_BEFORE_PLOT").unwrap_or_else(|| {
+            panic!(
+                "expected original stdout text in reply, got text: {:?}; content: {:?}",
+                result_text(&result),
+                result.content
+            )
+        });
+    let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
+    assert!(
+        before_idx < image_idx,
+        "expected original stdout before plot image, got content order: {:?}",
+        result.content
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_plot_before_input_flushes_with_input_prompt() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        r#"{}
+plt.figure(191)
+plt.clf()
+plt.gcf().text(0.5, 0.5, 'prompt plot')
+answer = input('next? ')"#,
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "plot-before-input request reported an error: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected plot before input() to emit one image with the prompt response, got {images:?}; response text: {}",
         result_text(&result)
     );
     assert_eq!(images[0].mime_type, "image/png");

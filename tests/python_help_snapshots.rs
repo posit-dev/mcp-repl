@@ -8,8 +8,8 @@ use regex_lite::Regex;
 #[cfg(not(windows))]
 fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
-        || text.contains("python backend requires a unix-style pty")
         || text.contains("worker io error: Permission denied")
+        || text.contains("failed to locate a shared libpython")
 }
 
 #[cfg(not(windows))]
@@ -106,6 +106,13 @@ fn normalize_python_help_intro(text: String) -> String {
             continue;
         }
 
+        if line.contains(r#""text": ""#)
+            && line.contains("Welcome to Python <VERSION>'s help utility!")
+        {
+            out.push(r#"      "text": "<PYTHON HELP BANNER>""#.to_string());
+            continue;
+        }
+
         if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
             out.push("<<< <PYTHON HELP BANNER>".to_string());
             skipping_transcript_intro = true;
@@ -133,6 +140,17 @@ fn normalizes_help_banner_after_whitespace_only_transcript_line() {
         transcript,
         ">>> help()\n<<< <PYTHON HELP BANNER>\n<<< help>"
     );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn normalizes_rendered_help_banner_after_leading_newline() {
+    let rendered = normalize_python_help_banner(
+        r#"      "text": "\nWelcome to Python 3.12's help utility!\n\nIf this is your first time using Python, you should definitely check out\nhelp> ""#
+            .to_string(),
+    );
+
+    assert_eq!(rendered, r#"      "text": "<PYTHON HELP BANNER>""#);
 }
 
 #[cfg(not(windows))]

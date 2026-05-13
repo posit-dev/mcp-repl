@@ -17,8 +17,10 @@ description selection.
 The intended contract is a narrow server/worker boundary:
 
 - stdin carries user input to the worker,
-- stdout/stderr carry visible worker text back to the server,
-- sideband IPC carries structural facts such as prompts, readline results,
+- `output_text` sideband frames carry worker-owned text back to the server,
+- raw stdout/stderr carry unowned visible text from child processes or direct
+  file-descriptor writes,
+- sideband IPC also carries structural facts such as prompts, readline results,
   images, request completion, and session end,
 - the server formats replies from those streams without understanding the
   runtime's internal implementation.
@@ -39,7 +41,7 @@ should not leak into steady-state server request semantics.
 
 ## Backend Branching Audit
 
-As of 2026-05-06, production server-side backend branching falls into these
+As of 2026-05-09, production server-side backend branching falls into these
 buckets:
 
 - `src/main.rs` parses `Backend` from CLI/env and renders install-time config.
@@ -49,15 +51,17 @@ buckets:
   is documentation wiring, not request execution policy, and should move with
   `docs/futurework/composable-tool-descriptions.md`.
 - `src/worker_process.rs` selects a `BackendDriver` at `WorkerManager`
-  creation. The driver owns request payload framing, Python's request-start
-  sideband nudge, interrupt behavior, completion waiting, and backend-info
+  creation. The driver owns backend-specific request metadata such as Python
+  newline normalization, Python `line_count`, whether to wait for
+  `stdin_write_ack`, interrupt behavior, completion waiting, and backend-info
   startup tolerance. This is acceptable only as a server-side adapter until the
   worker can advertise these narrow capabilities.
-- `src/worker_process.rs` also branches at spawn time between the in-binary R
-  worker and the Python PTY process. This is launch-time configuration.
-- On Windows, `src/worker_process.rs` prepares a sandbox launch only for R
-  because the Python backend currently reports a Unix-PTY requirement. This is
-  launch/platform gating, not steady-state request semantics.
+- `src/worker_process.rs` also branches at spawn time to configure R worker mode
+  or Python worker mode in the same `mcp-repl` executable. Python launch setup
+  additionally resolves the selected interpreter executable and loadable
+  CPython library. This is launch-time configuration.
+- On Windows, `src/worker_process.rs` still has platform-specific launch setup,
+  but Python no longer depends on a Unix PTY.
 - The main steady-state leak found by this audit was the former
   `WorkerManager::should_settle_multiline_r_timeout()` branch. The behavior now
   sits behind the backend driver as timeout-output-settle policy; a later
@@ -68,8 +72,8 @@ buckets:
 
 - Treat `--interpreter r|python` as user-facing worker selection.
 - Keep backend-specific runtime behavior in the worker process.
-- Keep the server's steady-state contract generic: stdin in, stdout/stderr plus
-  sideband facts out.
+- Keep the server's steady-state contract generic: stdin in, worker-owned
+  `output_text` plus raw stdout/stderr and sideband facts out.
 - Prefer worker-advertised capabilities or narrow launch-time metadata over
   server-side branching on backend.
 - Coordinate tool-description cleanup with
@@ -86,10 +90,8 @@ Initial candidates:
 
 - `supports_images`: already present in `backend_info`; controls whether image
   events are expected.
-- `input_framing`: whether server stdin payloads are raw text or length-framed
-  records.
-- `stdin_write_control`: whether a request-start sideband message is needed
-  before stdin bytes are written.
+- `stdin_write_ack`: whether the server must wait for worker acceptance after
+  `stdin_write` before writing raw stdin bytes.
 - `backend_info_startup_timeout`: whether startup may continue after a short
   backend-info timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional

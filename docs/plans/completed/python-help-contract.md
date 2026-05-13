@@ -21,7 +21,8 @@
 ## Long-Term Direction
 
 - The long-term contract is simple: documentation and inspection helpers in the Python backend are ordinary inline text output, not nested terminal UIs.
-- This slice should not grow into generic support for external pagers, `less`, or arbitrary terminal applications inside the worker PTY.
+- This slice should not grow into generic support for external pagers, `less`,
+  or arbitrary terminal applications inside the worker.
 - Terminal-environment cleanup is separate follow-up work if it still matters after direct coverage lands.
 
 ## Locked Decisions
@@ -43,7 +44,8 @@
 
 - Added direct regression coverage for `help(len)`, `pydoc.help(len)`, and an interactive `help()` roundtrip that asserts output stays inline, does not show `Press RETURN` or `--More--`, and does not leave the session busy.
 - Added files-mode snapshots for the same public Python help flow.
-- Patched `python/driver.py` to use `pydoc.plainpager` before the first prompt.
+- Installed the startup-time `pydoc.plainpager` override in the embedded Python
+  bootstrap before the first prompt.
 
 ## Stop Conditions
 
