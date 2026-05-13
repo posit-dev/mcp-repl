@@ -2305,7 +2305,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     let path_is_dir = path.is_dir();
     let needs_direct_allow =
         !dacl_has_allow_for_sid_with_inheritance(dacl, sid, inherit_children && path_is_dir);
-    let needs_inherit_only = add_inherit_only_companion
+    let needs_inherit_only = (add_inherit_only_companion || inherit_children)
         && path_is_dir
         && !dacl_has_inherit_only_allow_for_sid(dacl, sid);
     if !needs_direct_allow && !needs_inherit_only {
@@ -2314,10 +2314,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
         }
         return Ok(false);
     }
-    if needs_direct_allow
-        && !inherit_children
-        && path_is_dir
-        && dacl_has_explicit_allow_for_sid(dacl, sid, false)
+    if (needs_direct_allow || needs_inherit_only) && dacl_has_any_explicit_allow_for_sid(dacl, sid)
     {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
@@ -2342,7 +2339,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     if needs_direct_allow {
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions = allow_access_mask();
+        explicit.grfAccessPermissions = allow_direct_access_mask();
         explicit.grfAccessMode = GRANT_ACCESS;
         explicit.grfInheritance = if inherit_children {
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
@@ -2354,7 +2351,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     }
     if needs_inherit_only {
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions = allow_access_mask();
+        explicit.grfAccessPermissions = allow_inherited_access_mask();
         explicit.grfAccessMode = GRANT_ACCESS;
         explicit.grfInheritance =
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
@@ -2495,8 +2492,12 @@ fn deny_write_mask() -> u32 {
         | FILE_DELETE_CHILD
 }
 
-fn allow_access_mask() -> u32 {
-    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD
+fn allow_direct_access_mask() -> u32 {
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD
+}
+
+fn allow_inherited_access_mask() -> u32 {
+    allow_direct_access_mask() | DELETE
 }
 
 unsafe fn dacl_size_info(dacl: *mut ACL) -> Option<ACL_SIZE_INFORMATION> {
@@ -2518,13 +2519,29 @@ unsafe fn ace_sid_ptr(ace: *mut c_void) -> *mut c_void {
     (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void
 }
 
-fn allow_ace_satisfies_requirements(mask: u32, ace_flags: u8, require_inheritance: bool) -> bool {
-    if (mask & allow_access_mask()) != allow_access_mask() {
+fn direct_allow_ace_satisfies_requirements(
+    mask: u32,
+    ace_flags: u8,
+    require_inheritance: bool,
+) -> bool {
+    if (mask & allow_direct_access_mask()) != allow_direct_access_mask() || (mask & DELETE) != 0 {
         return false;
     }
     if require_inheritance
         && ((ace_flags & (CONTAINER_INHERIT_ACE as u8)) == 0
             || (ace_flags & (OBJECT_INHERIT_ACE as u8)) == 0)
+    {
+        return false;
+    }
+    true
+}
+
+fn inherited_allow_ace_satisfies_requirements(mask: u32, ace_flags: u8) -> bool {
+    if (mask & allow_inherited_access_mask()) != allow_inherited_access_mask() {
+        return false;
+    }
+    if (ace_flags & (CONTAINER_INHERIT_ACE as u8)) == 0
+        || (ace_flags & (OBJECT_INHERIT_ACE as u8)) == 0
     {
         return false;
     }
@@ -2556,7 +2573,11 @@ unsafe fn dacl_has_allow_for_sid(
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
         if EqualSid(ace_sid_ptr(ace), sid) != 0
-            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
+            && direct_allow_ace_satisfies_requirements(
+                allowed.Mask,
+                header.AceFlags,
+                require_inheritance,
+            )
         {
             return true;
         }
@@ -2564,11 +2585,7 @@ unsafe fn dacl_has_allow_for_sid(
     false
 }
 
-unsafe fn dacl_has_explicit_allow_for_sid(
-    dacl: *mut ACL,
-    sid: *mut c_void,
-    require_inheritance: bool,
-) -> bool {
+unsafe fn dacl_has_any_explicit_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
     let Some(info) = dacl_size_info(dacl) else {
         return false;
     };
@@ -2584,10 +2601,7 @@ unsafe fn dacl_has_explicit_allow_for_sid(
         {
             continue;
         }
-        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
-        if EqualSid(ace_sid_ptr(ace), sid) != 0
-            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
-        {
+        if EqualSid(ace_sid_ptr(ace), sid) != 0 {
             return true;
         }
     }
@@ -2613,7 +2627,7 @@ unsafe fn dacl_has_allow_for_sid_with_inheritance(
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
         if EqualSid(ace_sid_ptr(ace), sid) == 0
-            || !allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, false)
+            || !direct_allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, false)
         {
             continue;
         }
@@ -2639,7 +2653,7 @@ unsafe fn dacl_has_inherit_only_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) 
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
         if EqualSid(ace_sid_ptr(ace), sid) != 0
-            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+            && inherited_allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags)
         {
             return true;
         }
@@ -5036,7 +5050,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                 }
                 let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
                 if EqualSid(ace_sid_ptr(ace), sid) != 0
-                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                    && direct_allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
                 {
                     has_ace = true;
                     break;
@@ -5080,7 +5094,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                 }
                 let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
                 if EqualSid(ace_sid_ptr(ace), sid) != 0
-                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                    && inherited_allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags)
                 {
                     has_ace = true;
                     break;
@@ -5092,6 +5106,50 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             LocalFree(security_descriptor as HLOCAL);
         }
         has_ace
+    }
+
+    unsafe fn path_explicit_allow_mask(path: &Path, sid: *mut c_void, inherit_only: bool) -> u32 {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return 0;
+        }
+
+        let mut mask = 0;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERITED_ACE) != 0 {
+                    continue;
+                }
+                if ((header.AceFlags & INHERIT_ONLY_ACE) != 0) != inherit_only {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0 {
+                    mask |= allowed.Mask;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        mask
     }
 
     unsafe fn path_has_write_deny_ace(path: &Path, sid: *mut c_void) -> bool {
@@ -5390,6 +5448,65 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                 &[
                     cwd.as_path(),
                     missing_root.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_prepare_does_not_grant_delete_on_writable_roots() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let extra_root = workspace.path().join("extra-root");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra root");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            let workspace_mask = path_explicit_allow_mask(&cwd, sid, false);
+            let extra_root_mask = path_explicit_allow_mask(&extra_root, sid, false);
+            let extra_root_inherit_mask = path_explicit_allow_mask(&extra_root, sid, true);
+            assert_eq!(
+                workspace_mask & DELETE,
+                0,
+                "workspace root direct allow ACE should not grant DELETE"
+            );
+            assert_eq!(
+                extra_root_mask & DELETE,
+                0,
+                "extra writable root direct allow ACE should not grant DELETE"
+            );
+            assert_ne!(
+                workspace_mask & FILE_DELETE_CHILD,
+                0,
+                "workspace root should still be able to delete child entries"
+            );
+            assert_ne!(
+                extra_root_mask & FILE_DELETE_CHILD,
+                0,
+                "extra writable root should still be able to delete child entries"
+            );
+            assert_ne!(
+                extra_root_inherit_mask & DELETE,
+                0,
+                "extra writable root inherit-only ACE should grant DELETE to descendants"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
                     session_temp_dir.as_path(),
                 ],
             );
@@ -5775,6 +5892,16 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             assert!(
                 path_has_allow_ace(&moved_file, launch_sid),
                 "runtime launch ACL state should restore access on files already under writable roots"
+            );
+            assert_eq!(
+                path_explicit_allow_mask(&cwd, launch_sid, false) & DELETE,
+                0,
+                "runtime launch ACL should not grant DELETE on the workspace root itself"
+            );
+            assert_ne!(
+                path_explicit_allow_mask(&cwd, launch_sid, true) & DELETE,
+                0,
+                "runtime launch ACL should grant DELETE only through child inheritance"
             );
 
             cleanup_capability_acl_state(&launch_guards, launch_sid, false);
