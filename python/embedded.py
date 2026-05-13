@@ -76,6 +76,10 @@ class McpInputStream:
             return None
         return line.encode(self.encoding)
 
+    def _emit_prompt(self, prompt):
+        if prompt:
+            _mcp_repl.write("stdout", prompt)
+
     def _take_buffered(self, size):
         chunk = self._buffer[:size]
         self._buffer = self._buffer[size:]
@@ -120,11 +124,13 @@ class McpInputStream:
 
         newline_index = self._buffer.find(b"\n")
         if newline_index >= 0:
+            self._emit_prompt(prompt)
             end = newline_index + 1
             if size > 0:
                 end = min(end, size)
             return self._take_buffered(end)
         if size > 0 and len(self._buffer) >= size:
+            self._emit_prompt(prompt)
             return self._take_buffered(size)
 
         line = self._read_backend_line(prompt)
@@ -173,11 +179,13 @@ class McpInputStream:
             text = self._decode_buffer()
             newline_index = text.find("\n")
             if newline_index >= 0:
+                self._emit_prompt(prompt_for_read)
                 end = newline_index + 1
                 if size > 0:
                     end = min(end, size)
                 return self._take_text(end)
             if size > 0 and len(text) >= size:
+                self._emit_prompt(prompt_for_read)
                 return self._take_text(size)
 
             line = self._read_backend_line(prompt_for_read)

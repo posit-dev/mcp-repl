@@ -2904,6 +2904,44 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_input_emits_prompt_before_buffered_read() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+first = sys.stdin.read(1)
+z
+answer = input('p> ')
+print("MIXED", repr(first), repr(answer))
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python buffered input prompt test remained busy".into());
+    }
+    let prompt_index = text
+        .find("p> ")
+        .ok_or_else(|| format!("expected buffered input prompt, got: {text:?}"))?;
+    let output_index = text
+        .find(r#"MIXED 'z' ''"#)
+        .ok_or_else(|| format!("expected mixed buffered input output, got: {text:?}"))?;
+    assert!(
+        prompt_index < output_index,
+        "expected prompt before buffered input output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_releases_gil_while_waiting_for_line() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
