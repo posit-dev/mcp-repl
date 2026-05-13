@@ -350,3 +350,41 @@ async fn zod_worker_emits_image_output() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_tail_runs_after_recovery() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interruptible 1000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}tail after interrupt",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("tail after interrupt\n"),
+        "expected interrupt tail to run after recovery, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
