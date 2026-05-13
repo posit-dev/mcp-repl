@@ -17,6 +17,25 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn result_text_items(result: &rmcp::model::CallToolResult) -> Vec<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, RawContent::Image(_)))
+        .count()
+}
+
 fn zod_worker_path() -> TestResult<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_zod-worker") {
         return Ok(PathBuf::from(path));
@@ -275,6 +294,57 @@ async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()
     assert!(
         text.contains("readline_input text does not match active stdin"),
         "expected readline_input accounting protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_preserves_mixed_output_order() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "mixed-output",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let items = result_text_items(&result);
+    let joined = items.join("");
+    let before = joined.find("stdout-before\n");
+    let middle = joined.find("stderr-middle\n");
+    let after = joined.find("stdout-after\n");
+    assert!(
+        matches!((before, middle, after), (Some(before), Some(middle), Some(after)) if before < middle && middle < after),
+        "expected mixed output in sideband order, got: {items:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_emits_image_output() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "image",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    assert_eq!(
+        result_image_count(&result),
+        1,
+        "expected one Zod image, got content: {:?}",
+        result.content
     );
 
     session.cancel().await?;

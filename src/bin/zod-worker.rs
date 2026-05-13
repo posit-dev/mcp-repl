@@ -128,6 +128,13 @@ fn run_command(
         return Ok(());
     }
 
+    if command == "mixed-output" {
+        writer.output_text("stdout", b"stdout-before\n")?;
+        writer.output_text("stderr", b"stderr-middle\n")?;
+        writer.output_text("stdout", b"stdout-after\n")?;
+        return Ok(());
+    }
+
     if command == "bad-output-base64" {
         writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
         return Ok(());
