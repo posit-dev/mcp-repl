@@ -3,9 +3,9 @@ use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
 use std::fs::File;
 #[cfg(target_family = "unix")]
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_family = "unix")]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
@@ -189,7 +189,7 @@ struct RuntimeStdinBridgeInner {
     input: VecDeque<u8>,
     sideband_input: Vec<u8>,
     pending_read: bool,
-    raw_read_pending: bool,
+    pending_raw_read_size: Option<usize>,
     eof: bool,
     interrupted: bool,
     writer: Option<std::io::PipeWriter>,
@@ -203,7 +203,7 @@ impl RuntimeStdinBridge {
                 input: VecDeque::new(),
                 sideband_input: Vec::new(),
                 pending_read: false,
-                raw_read_pending: false,
+                pending_raw_read_size: None,
                 eof: false,
                 interrupted: false,
                 writer: Some(writer),
@@ -216,7 +216,11 @@ impl RuntimeStdinBridge {
         ipc::emit_readline_start(prompt);
         let mut guard = self.inner.lock().unwrap();
         guard.pending_read = true;
-        Self::deliver_if_ready(&mut guard)
+        let delivered = Self::deliver_if_ready(&mut guard);
+        if !delivered {
+            self.cvar.notify_all();
+        }
+        delivered
     }
 
     fn push_input(&self, bytes: &[u8]) {
@@ -242,7 +246,8 @@ impl RuntimeStdinBridge {
     fn discard_buffered(&self) -> Vec<u8> {
         let mut guard = self.inner.lock().unwrap();
         guard.pending_read = false;
-        guard.interrupted = guard.raw_read_pending;
+        guard.interrupted = guard.pending_raw_read_size.is_some();
+        guard.pending_raw_read_size = None;
         let mut discarded: Vec<u8> = guard.sideband_input.drain(..).collect();
         discarded.extend(guard.input.drain(..));
         self.cvar.notify_all();
@@ -254,18 +259,19 @@ impl RuntimeStdinBridge {
             return Vec::new();
         }
         let mut guard = self.inner.lock().unwrap();
-        guard.raw_read_pending = true;
+        guard.pending_raw_read_size = Some(size);
+        self.cvar.notify_all();
         let mut wait_announced = false;
-        while guard.input.is_empty() && !guard.eof && !guard.interrupted {
+        while !Self::raw_read_ready(&guard, size) {
             if !wait_announced && stdin_pending_byte_count() == Some(0) {
                 ipc::emit_readline_start("");
                 wait_announced = true;
             }
             guard = self.cvar.wait(guard).unwrap();
         }
+        guard.pending_raw_read_size = None;
         if guard.interrupted {
             guard.interrupted = false;
-            guard.raw_read_pending = false;
             return Vec::new();
         }
         let Some(line_len) = guard
@@ -275,12 +281,10 @@ impl RuntimeStdinBridge {
             .map(|idx| idx.saturating_add(1))
             .or_else(|| (!guard.input.is_empty()).then_some(guard.input.len()))
         else {
-            guard.raw_read_pending = false;
             return Vec::new();
         };
         let take = line_len.min(size);
         let bytes: Vec<u8> = guard.input.drain(..take).collect();
-        guard.raw_read_pending = false;
         Self::emit_readline_input_bytes(&mut guard, &bytes);
         mark_request_input_delivered();
         bytes
@@ -288,6 +292,47 @@ impl RuntimeStdinBridge {
 
     fn has_pending_read(&self) -> bool {
         self.inner.lock().unwrap().pending_read
+    }
+
+    fn wait_for_stdin_byte_request(&self) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        loop {
+            if guard.eof || guard.writer.is_none() {
+                return false;
+            }
+            if Self::stdin_byte_needed(&guard) {
+                return true;
+            }
+            guard = self.cvar.wait(guard).unwrap();
+        }
+    }
+
+    fn stdin_byte_requested(&self) -> bool {
+        let guard = self.inner.lock().unwrap();
+        Self::stdin_byte_needed(&guard)
+    }
+
+    fn stdin_byte_needed(guard: &RuntimeStdinBridgeInner) -> bool {
+        if guard.eof || guard.interrupted {
+            return false;
+        }
+        if guard.pending_read {
+            return !Self::line_ready(guard);
+        }
+        guard
+            .pending_raw_read_size
+            .is_some_and(|size| !Self::raw_read_ready(guard, size))
+    }
+
+    fn line_ready(guard: &RuntimeStdinBridgeInner) -> bool {
+        guard.input.iter().any(|byte| *byte == b'\n') || (guard.eof && !guard.input.is_empty())
+    }
+
+    fn raw_read_ready(guard: &RuntimeStdinBridgeInner, size: usize) -> bool {
+        guard.interrupted
+            || guard.eof
+            || guard.input.len() >= size
+            || guard.input.iter().any(|byte| *byte == b'\n')
     }
 
     fn deliver_if_ready(guard: &mut RuntimeStdinBridgeInner) -> bool {
@@ -507,13 +552,38 @@ fn discard_pending_stdin() {
     let Some(bridge) = PYTHON_STDIN_BRIDGE.get() else {
         return;
     };
-    let discarded = bridge.discard_buffered();
+    let mut discarded = bridge.discard_buffered();
+    discarded.extend(drain_process_stdin_pipe());
+    discarded.extend(bridge.discard_buffered());
     if discarded.is_empty() {
         return;
     }
     let text =
         String::from_utf8(discarded).expect("discarded Python stdin must be valid UTF-8 text");
     ipc::emit_readline_discard(&text);
+}
+
+#[cfg(target_family = "unix")]
+fn drain_process_stdin_pipe() -> Vec<u8> {
+    let mut discarded = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while let Some(available) = stdin_pending_byte_count() {
+        if available == 0 {
+            break;
+        }
+        let to_read = available.min(buffer.len());
+        let read = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), to_read) };
+        if read > 0 {
+            discarded.extend_from_slice(&buffer[..read as usize]);
+        } else if read < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            break;
+        }
+    }
+    discarded
 }
 
 #[cfg(target_family = "unix")]
@@ -721,19 +791,35 @@ fn start_process_stdin_reader(bridge: Arc<RuntimeStdinBridge>) -> Result<(), Str
             std::io::Error::last_os_error()
         ));
     }
-    let mut stdin = unsafe { File::from_raw_fd(fd) };
+    let stdin = unsafe { File::from_raw_fd(fd) };
     thread::Builder::new()
         .name("python-stdin-bridge".to_string())
         .spawn(move || {
-            let mut buffer = [0u8; 8192];
+            let stdin_fd = stdin.as_raw_fd();
             loop {
-                match stdin.read(&mut buffer) {
-                    Ok(0) => {
+                if !bridge.wait_for_stdin_byte_request() {
+                    break;
+                }
+                match wait_for_stdin_readable(stdin_fd) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
                         bridge.mark_eof();
                         break;
                     }
-                    Ok(n) => bridge.push_input(&buffer[..n]),
+                }
+                if !bridge.stdin_byte_requested() {
+                    continue;
+                }
+                match read_stdin_byte(stdin_fd) {
+                    Ok(Some(byte)) => bridge.push_input(&[byte]),
+                    Ok(None) => {
+                        bridge.mark_eof();
+                        break;
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) if stdin_read_would_block(&err) => continue,
                     Err(_) => {
                         bridge.mark_eof();
                         break;
@@ -743,6 +829,41 @@ fn start_process_stdin_reader(bridge: Arc<RuntimeStdinBridge>) -> Result<(), Str
         })
         .map(|_| ())
         .map_err(|err| format!("failed to spawn Python stdin bridge thread: {err}"))
+}
+
+#[cfg(target_family = "unix")]
+fn wait_for_stdin_readable(fd: libc::c_int) -> Result<bool, std::io::Error> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut poll_fd, 1, 10) };
+    if rc > 0 {
+        Ok((poll_fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
+    } else if rc == 0 {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn read_stdin_byte(fd: libc::c_int) -> Result<Option<u8>, std::io::Error> {
+    let mut byte = 0u8;
+    let rc = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+    if rc > 0 {
+        Ok(Some(byte))
+    } else if rc == 0 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn stdin_read_would_block(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK)
 }
 
 fn open_stdio_file(fd: libc::c_int, mode: &CStr) -> Result<*mut libc::FILE, String> {

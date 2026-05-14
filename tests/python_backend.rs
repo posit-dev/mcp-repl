@@ -984,6 +984,35 @@ print("RAW_AFTER_INTERRUPT", data)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_fd_level_stdin_ready_before_sys_stdin_read() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import select, sys
+ready = bool(select.select([sys.stdin], [], [], 0)[0])
+data = sys.stdin.readline()
+payload
+print("FD_READY_BEFORE_STDIN_READ", ready, data.strip())
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FD_READY_BEFORE_STDIN_READ True payload"),
+        "expected fd 0 to stay ready until sys.stdin consumed payload, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
