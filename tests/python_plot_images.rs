@@ -696,6 +696,50 @@ _mcp_repl_stdin_plot_test()"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_background_plot_after_request_completion_does_not_emit() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let input = format!(
+        r#"{}
+import threading, time
+plt.figure(314)
+plt.clf()
+def _mcp_repl_late_background_plot():
+    time.sleep(0.5)
+    plt.plot([1, 2, 3], [1, 4, 9])
+
+threading.Thread(target=_mcp_repl_late_background_plot, daemon=True).start()
+print("late background plot scheduled")"#,
+        python_plot_preamble()
+    );
+    let schedule_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    assert_ne!(
+        schedule_result.is_error,
+        Some(true),
+        "background plot setup reported an error: {}",
+        result_text(&schedule_result)
+    );
+    assert!(
+        result_text(&schedule_result).contains("late background plot scheduled"),
+        "expected setup response before background plot, got: {}",
+        result_text(&schedule_result)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let poll_result = session.write_stdin_raw_with("", Some(5.0)).await?;
+    session.cancel().await?;
+
+    assert_no_images(
+        &poll_result,
+        "background plot after completed Python request",
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

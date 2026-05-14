@@ -288,6 +288,11 @@ impl RuntimeStdinBridge {
         self.inner.lock().unwrap().pending_read
     }
 
+    fn has_buffered_input(&self) -> bool {
+        let guard = self.inner.lock().unwrap();
+        !guard.input.is_empty() || !guard.sideband_input.is_empty()
+    }
+
     fn wait_for_stdin_byte_request(&self) -> bool {
         let mut guard = self.inner.lock().unwrap();
         loop {
@@ -670,6 +675,14 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
     } else {
         None
     }
+}
+
+#[cfg(target_family = "unix")]
+fn protocol_request_input_exhausted() -> bool {
+    stdin_pending_byte_count() == Some(0)
+        && PYTHON_STDIN_BRIDGE
+            .get()
+            .is_none_or(|bridge| !bridge.has_buffered_input())
 }
 
 #[cfg(windows)]
@@ -1551,10 +1564,19 @@ fn handle_protocol_input_hook() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
+    let input_exhausted = protocol_request_input_exhausted();
     let prompt = {
         let mut guard = state.inner.lock().unwrap();
         if guard.shutdown {
             return;
+        }
+        if input_exhausted {
+            // Unix protocol-mode Python has no worker-local ActiveRequest. The
+            // server completes the request when the next prompt arrives after
+            // all request stdin is accounted, so clear the Python-side plot gate
+            // at that same boundary. If more payload bytes remain, keep it
+            // active so multi-line requests can still emit prompt-time plots.
+            guard.request_active = false;
         }
         let prompt = if guard.repl_readline_count == 0 {
             guard.python_primary_prompt.clone()
