@@ -1,112 +1,34 @@
-use std::io::Read;
+use std::io::BufRead;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-#[cfg(windows)]
-use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::backend::{Backend, backend_from_env};
-use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_worker_ready, set_global_ipc,
-};
+use crate::ipc::{ServerToWorkerIpcMessage, connect_from_env, emit_worker_ready, set_global_ipc};
 use crate::r_session::RSession;
 use crate::worker_protocol::WORKER_MODE_ARG;
 
 struct WorkerState {
-    busy: AtomicBool,
     shutting_down: AtomicBool,
-    #[cfg(windows)]
-    stdin_read_in_progress: AtomicBool,
-    #[cfg(windows)]
-    stdin_wait: Mutex<()>,
-    #[cfg(windows)]
-    stdin_wait_cvar: Condvar,
 }
 
 impl WorkerState {
-    fn try_mark_busy(&self) -> bool {
-        #[cfg(windows)]
-        {
-            let mut guard = self.stdin_wait.lock().unwrap();
-            while self.stdin_read_in_progress.load(Ordering::SeqCst) && !self.is_shutting_down() {
-                guard = self.stdin_wait_cvar.wait(guard).unwrap();
-            }
-            if self.is_shutting_down() {
-                return false;
-            }
-        }
-        self.busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    fn mark_idle(&self) {
-        #[cfg(windows)]
-        let _guard = self.stdin_wait.lock().unwrap();
-        self.busy.store(false, Ordering::SeqCst);
-        #[cfg(windows)]
-        self.stdin_wait_cvar.notify_all();
-    }
-
     fn begin_shutdown(&self) {
-        #[cfg(windows)]
-        let _guard = self.stdin_wait.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
-        #[cfg(windows)]
-        self.stdin_wait_cvar.notify_all();
     }
 
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
-    }
-
-    #[cfg(windows)]
-    fn wait_until_stdin_read_allowed(&self) -> bool {
-        let mut guard = self.stdin_wait.lock().unwrap();
-        while (self.busy.load(Ordering::SeqCst)
-            || self.stdin_read_in_progress.load(Ordering::SeqCst))
-            && !self.is_shutting_down()
-        {
-            guard = self.stdin_wait_cvar.wait(guard).unwrap();
-        }
-        if self.is_shutting_down() {
-            return false;
-        }
-        self.stdin_read_in_progress.store(true, Ordering::SeqCst);
-        true
-    }
-
-    #[cfg(windows)]
-    fn finish_stdin_read(&self) {
-        let _guard = self.stdin_wait.lock().unwrap();
-        self.stdin_read_in_progress.store(false, Ordering::SeqCst);
-        self.stdin_wait_cvar.notify_all();
     }
 }
 
 impl Default for WorkerState {
     fn default() -> Self {
         Self {
-            busy: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
-            #[cfg(windows)]
-            stdin_read_in_progress: AtomicBool::new(false),
-            #[cfg(windows)]
-            stdin_wait: Mutex::new(()),
-            #[cfg(windows)]
-            stdin_wait_cvar: Condvar::new(),
         }
     }
-}
-
-struct QueuedRequest {
-    text: String,
-}
-
-enum StdinReadCommand {
-    Read { byte_len: usize },
-    Shutdown,
 }
 
 pub fn is_worker_mode() -> bool {
@@ -125,25 +47,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_r_worker() -> Result<(), Box<dyn std::error::Error>> {
     crate::diagnostics::startup_log("worker: run begin");
     let state = Arc::new(WorkerState::default());
-    let (request_tx, request_rx) = mpsc::sync_channel(1);
-    let (stdin_tx, stdin_rx) = mpsc::channel();
-    init_ipc(state.clone(), stdin_tx.clone()).map_err(|err| {
+    init_ipc(state.clone()).map_err(|err| {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
     emit_worker_ready("r", true, Some("quit(\"no\")\n"));
-    let request_state = state.clone();
-    let _request_thread = thread::Builder::new()
-        .name("worker-requests".to_string())
-        .spawn(move || request_loop(request_rx, request_state))
-        .map_err(|err| format!("failed to spawn worker request thread: {err}"))?;
 
     let stdin_state = state.clone();
-    let stdin_requests = request_tx.clone();
     let _stdin_thread = thread::Builder::new()
         .name("worker-stdin".to_string())
         .spawn(move || {
-            if let Err(err) = stdin_loop(stdin_state, stdin_rx, stdin_requests) {
+            if let Err(err) = stdin_loop(stdin_state) {
                 eprintln!("worker stdin error: {err}");
             }
         })
@@ -168,10 +82,7 @@ fn wait_for_r_session() -> Result<&'static RSession, String> {
     }
 }
 
-fn init_ipc(
-    state: Arc<WorkerState>,
-    stdin_tx: mpsc::Sender<StdinReadCommand>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = connect_from_env(Duration::from_secs(2))?;
     set_global_ipc(conn.clone());
     if let Err(err) = thread::Builder::new()
@@ -181,15 +92,7 @@ fn init_ipc(
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::RequestStart) => {}
                     Some(ServerToWorkerIpcMessage::PythonRequestStart { .. }) => {}
-                    Some(ServerToWorkerIpcMessage::StdinWrite {
-                        byte_len,
-                        line_count: _,
-                        final_prompt: _,
-                    }) => {
-                        if stdin_tx.send(StdinReadCommand::Read { byte_len }).is_err() {
-                            std::process::exit(0);
-                        }
-                    }
+                    Some(ServerToWorkerIpcMessage::StdinWrite { .. }) => {}
                     Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         crate::r_session::clear_pending_input();
@@ -201,7 +104,6 @@ fn init_ipc(
                         state.begin_shutdown();
                         crate::r_session::clear_pending_input();
                         let _ = crate::r_session::request_shutdown();
-                        let _ = stdin_tx.send(StdinReadCommand::Shutdown);
                     }
                     None => {
                         // Without IPC, the worker cannot participate in turn accounting (prompt,
@@ -217,38 +119,23 @@ fn init_ipc(
     Ok(())
 }
 
-fn stdin_loop(
-    state: Arc<WorkerState>,
-    stdin_rx: mpsc::Receiver<StdinReadCommand>,
-    request_tx: mpsc::SyncSender<QueuedRequest>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn stdin_loop(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin);
-    for command in stdin_rx {
-        let StdinReadCommand::Read { byte_len } = command else {
-            break;
-        };
+    loop {
         if state.is_shutting_down() {
             break;
         }
 
-        let mut buffer = vec![0u8; byte_len];
-        #[cfg(windows)]
-        {
-            if !state.wait_until_stdin_read_allowed() {
-                break;
-            }
-        }
-        let read_result = reader.read_exact(&mut buffer);
-        #[cfg(windows)]
-        state.finish_stdin_read();
-        if let Err(err) = read_result {
+        let mut buffer = Vec::new();
+        let read_len = reader.read_until(b'\n', &mut buffer)?;
+        if read_len == 0 {
             state.begin_shutdown();
             if !crate::r_session::request_shutdown() {
                 crate::ipc::emit_session_end();
                 std::process::exit(0);
             }
-            return Err(err.into());
+            break;
         }
 
         if state.is_shutting_down() {
@@ -256,71 +143,9 @@ fn stdin_loop(
         }
 
         let text = String::from_utf8_lossy(&buffer).to_string();
-        handle_write_stdin(text, state.clone(), &request_tx);
+        let session = wait_for_r_session().map_err(std::io::Error::other)?;
+        session.enqueue_input(text).map_err(std::io::Error::other)?;
     }
 
     Ok(())
-}
-
-fn request_loop(rx: mpsc::Receiver<QueuedRequest>, state: Arc<WorkerState>) {
-    for request in rx {
-        let result = write_stdin_request(request.text);
-        if let Err(err) = result {
-            emit_stderr_message(&err.message);
-            emit_session_end();
-        }
-        state.mark_idle();
-    }
-}
-fn handle_write_stdin(
-    text: String,
-    state: Arc<WorkerState>,
-    request_tx: &mpsc::SyncSender<QueuedRequest>,
-) {
-    if state.is_shutting_down() {
-        return;
-    }
-
-    if !state.try_mark_busy() {
-        emit_stderr_message("worker is busy; request already running");
-        return;
-    }
-
-    if let Err(err) = request_tx.try_send(QueuedRequest { text }) {
-        state.mark_idle();
-        let message = match err {
-            mpsc::TrySendError::Full(_) => "worker is busy; request already running".to_string(),
-            mpsc::TrySendError::Disconnected(_) => {
-                "worker execution thread exited unexpectedly".to_string()
-            }
-        };
-        emit_stderr_message(&message);
-        emit_session_end();
-    }
-}
-
-struct WorkerExecError {
-    message: String,
-}
-
-impl WorkerExecError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-fn write_stdin_request(text: String) -> Result<(), WorkerExecError> {
-    let session = wait_for_r_session()
-        .map_err(|err| WorkerExecError::new(format!("failed to start R session: {err}")))?;
-    let reply_rx = session.send_request(text).map_err(WorkerExecError::new)?;
-    reply_rx
-        .recv()
-        .map(|_| ())
-        .map_err(|err| WorkerExecError::new(format!("R session reply error: {err}")))
-}
-
-fn emit_stderr_message(message: &str) {
-    crate::output_stream::write_stderr_bytes(message.as_bytes());
 }

@@ -632,6 +632,7 @@ impl ServerIpcConnection {
         Ok(())
     }
 
+    #[cfg_attr(target_family = "unix", allow(dead_code))]
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);

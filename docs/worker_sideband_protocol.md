@@ -126,16 +126,14 @@ invalid base64, and unknown message types are protocol errors.
 
 These frames remain for built-in workers that have not fully migrated on every
 platform. New protocol workers should not copy them for steady-state request
-handling. Built-in Unix Python still receives the legacy request-boundary
-frames, but stdin accounting comes from CPython readline events rather than a
-separate stdin bridge.
+handling. Built-in R no longer uses them. Built-in Unix Python still receives
+the legacy request-boundary frames, but stdin accounting comes from CPython
+readline events rather than a separate stdin bridge.
 
 `stdin_write`
 - `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
 - Legacy server-to-worker request metadata emitted before the server writes raw
   input payload bytes to stdin.
-- Built-in R still uses `byte_len` to make its worker-owned stdin reader consume
-  exactly one raw payload before handing it to embedded R.
 - Built-in Unix Python uses these fields only to install active request state
   before CPython's next readline callback consumes stdin.
 - Non-Unix Python may still use them for the pipe-backed compatibility path

@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 use crate::ipc;
@@ -34,11 +34,7 @@ use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
 
-#[derive(Debug)]
-pub struct RequestCompleted;
-
 pub struct RSession {
-    sender: mpsc::Sender<RRequest>,
     init: Arc<SessionInit>,
 }
 
@@ -50,40 +46,27 @@ impl RSession {
     }
 
     pub fn start_on_current_thread() -> Result<(), String> {
-        let (request_tx, request_rx) = mpsc::channel();
         let init = Arc::new(SessionInit::new());
-        let session = RSession {
-            sender: request_tx,
-            init: init.clone(),
-        };
+        let session = RSession { init: init.clone() };
         let session_set = SESSION.set(session);
         if session_set.is_err() {
             return Err("R session already initialized".to_string());
         }
-        run_session_on_current_thread(request_rx, init)
+        run_session_on_current_thread(init)
     }
 
     pub fn wait_until_ready(&self) -> Result<(), String> {
         self.init.wait_ready()
     }
 
-    pub fn send_request(&self, input: String) -> Result<mpsc::Receiver<RequestCompleted>, String> {
+    pub fn enqueue_input(&self, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let request = RRequest {
-            input,
-            reply: reply_tx,
-        };
-        self.sender
-            .send(request)
-            .map_err(|_| "R session is unavailable".to_string())?;
-        Ok(reply_rx)
+        let state = session_state();
+        let mut guard = state.inner.lock().unwrap();
+        queue_input(&mut guard.input_queue, &input);
+        state.cvar.notify_all();
+        Ok(())
     }
-}
-
-struct RRequest {
-    input: String,
-    reply: mpsc::Sender<RequestCompleted>,
 }
 
 #[derive(Debug)]
@@ -149,37 +132,15 @@ pub(crate) fn clear_pending_input() -> bool {
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
-    guard.input_queue.clear();
+    let discarded = drain_input_queue(&mut guard.input_queue);
+    drop(guard);
+    if !discarded.is_empty() {
+        ipc::emit_readline_discard(&discarded);
+    }
     had_pending
 }
 
-#[cfg(target_family = "windows")]
-pub(crate) fn complete_active_request_if_idle() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    if !guard.input_queue.is_empty() {
-        return false;
-    }
-    let prompt = guard
-        .last_prompt
-        .clone()
-        .unwrap_or_else(|| "> ".to_string());
-    let active = guard.active_request.take();
-    let had_active = active.is_some();
-    drop(guard);
-    if had_active {
-        ipc::emit_readline_start(&prompt);
-        complete_active_request(state, active, false);
-    }
-    had_active
-}
-
-fn run_session_on_current_thread(
-    requests: mpsc::Receiver<RRequest>,
-    init: Arc<SessionInit>,
-) -> Result<(), String> {
+fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     crate::diagnostics::startup_log("r-session: init begin");
     let state = Arc::new(SessionState::new());
     if SESSION_STATE.set(state.clone()).is_err() {
@@ -201,12 +162,6 @@ fn run_session_on_current_thread(
 
     init.mark_ready();
 
-    let request_state = state.clone();
-    thread::Builder::new()
-        .name("r-session-requests".to_string())
-        .spawn(move || handle_requests(requests, request_state))
-        .expect("failed to spawn request handler thread");
-
     unsafe {
         libr::run_Rmainloop();
     }
@@ -221,15 +176,10 @@ struct SessionState {
 
 struct SessionStateInner {
     input_queue: VecDeque<String>,
-    active_request: Option<ActiveRequest>,
+    plot_hashes: HashMap<String, u64>,
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
-}
-
-struct ActiveRequest {
-    reply: mpsc::Sender<RequestCompleted>,
-    plot_hashes: HashMap<String, u64>,
 }
 
 impl SessionState {
@@ -237,7 +187,7 @@ impl SessionState {
         Self {
             inner: Mutex::new(SessionStateInner {
                 input_queue: VecDeque::new(),
-                active_request: None,
+                plot_hashes: HashMap::new(),
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
@@ -245,30 +195,6 @@ impl SessionState {
             cvar: Condvar::new(),
         }
     }
-}
-
-fn handle_requests(requests: mpsc::Receiver<RRequest>, state: Arc<SessionState>) {
-    for request in requests {
-        let mut guard = state.inner.lock().unwrap();
-        while guard.active_request.is_some() {
-            guard = state.cvar.wait(guard).unwrap();
-        }
-        let is_eof = is_eof_input(&request.input);
-        guard.active_request = Some(ActiveRequest {
-            reply: request.reply,
-            plot_hashes: HashMap::new(),
-        });
-        if is_eof {
-            guard.shutdown = true;
-        } else {
-            queue_input(&mut guard.input_queue, &request.input);
-        }
-        state.cvar.notify_all();
-    }
-
-    let mut guard = state.inner.lock().unwrap();
-    guard.shutdown = true;
-    state.cvar.notify_all();
 }
 
 fn initialize_r() -> Result<(), String> {
@@ -680,12 +606,8 @@ fn queue_input(queue: &mut VecDeque<String>, input: &str) {
     if input.is_empty() {
         return;
     }
-    let normalized = input.replace("\r\n", "\n");
-    let mut lines: Vec<String> = normalized
-        .split_inclusive('\n')
-        .map(str::to_string)
-        .collect();
-    if !normalized.ends_with('\n') {
+    let mut lines: Vec<String> = input.split_inclusive('\n').map(str::to_string).collect();
+    if !input.ends_with('\n') {
         if let Some(last) = lines.last_mut() {
             last.push('\n');
         } else {
@@ -695,16 +617,25 @@ fn queue_input(queue: &mut VecDeque<String>, input: &str) {
     queue.extend(lines);
 }
 
-fn is_eof_input(input: &str) -> bool {
-    let trimmed = input.trim_matches(|ch| ch == '\n' || ch == '\r');
-    let mut saw_eot = false;
-    for ch in trimmed.chars() {
-        match ch {
-            '\u{4}' => saw_eot = true,
-            _ => return false,
-        }
+fn drain_input_queue(queue: &mut VecDeque<String>) -> String {
+    let mut drained = String::new();
+    while let Some(line) = queue.pop_front() {
+        drained.push_str(&line);
     }
-    saw_eot
+    drained
+}
+
+fn split_console_line(mut line: String, max: usize) -> (String, Option<String>) {
+    if line.len() <= max {
+        return (line, None);
+    }
+    let mut split = max;
+    while split > 0 && !line.is_char_boundary(split) {
+        split -= 1;
+    }
+    assert!(split > 0, "R console buffer is too small for UTF-8 input");
+    let tail = line.split_off(split);
+    (line, Some(tail))
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
@@ -918,15 +849,7 @@ fn decode_console_bytes_for_channel(_otype: c_int, bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
-fn complete_active_request(
-    state: &Arc<SessionState>,
-    active: Option<ActiveRequest>,
-    emit_session_end: bool,
-) {
-    if let Some(active) = active {
-        let _ = active.reply.send(RequestCompleted);
-        state.cvar.notify_all();
-    }
+fn complete_session_if_needed(emit_session_end: bool) {
     if emit_session_end {
         ipc::emit_session_end();
     }
@@ -961,17 +884,7 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_busy(which: c_int) {
-    #[cfg(target_family = "windows")]
-    {
-        if which == 0 {
-            let _ = complete_active_request_if_idle();
-        }
-    }
-
-    #[cfg(not(target_family = "windows"))]
-    {
-        let _ = which;
-    }
+    let _ = which;
 }
 
 #[unsafe(no_mangle)]
@@ -987,9 +900,8 @@ pub extern "C-unwind" fn r_suicide(buf: *const c_char) {
     let mut guard = state.inner.lock().unwrap();
     let should_emit = !guard.session_end_emitted;
     guard.session_end_emitted = true;
-    let active = guard.active_request.take();
     drop(guard);
-    complete_active_request(state, active, should_emit);
+    complete_session_if_needed(should_emit);
     panic!("{message}");
 }
 
@@ -1018,27 +930,27 @@ pub extern "C-unwind" fn r_read_console(
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
         .unwrap_or(false);
     let state = session_state();
+    ipc::emit_readline_start(prompt);
     let emit_idle_start;
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
-        emit_idle_start = guard.active_request.is_none() && guard.input_queue.is_empty();
-    }
-    if emit_idle_start {
-        ipc::emit_readline_start(prompt);
+        emit_idle_start = guard.input_queue.is_empty();
+        if emit_idle_start {
+            guard.plot_hashes.clear();
+        }
     }
 
     loop {
         let mut guard = state.inner.lock().unwrap();
 
         if is_save_prompt {
-            let active = guard.active_request.take();
             let should_emit = guard.shutdown && !guard.session_end_emitted;
             if guard.shutdown {
                 guard.session_end_emitted = true;
             }
             drop(guard);
-            complete_active_request(state, active, should_emit);
+            complete_session_if_needed(should_emit);
             if !buf.is_null() {
                 let response = b"n\n";
                 let max = (buflen as usize).saturating_sub(1);
@@ -1061,9 +973,8 @@ pub extern "C-unwind" fn r_read_console(
         if guard.shutdown {
             let should_emit = !guard.session_end_emitted;
             guard.session_end_emitted = true;
-            let active = guard.active_request.take();
             drop(guard);
-            complete_active_request(state, active, should_emit);
+            complete_session_if_needed(should_emit);
             if !buf.is_null() {
                 unsafe { *buf = 0 };
             }
@@ -1071,25 +982,21 @@ pub extern "C-unwind" fn r_read_console(
         }
 
         if let Some(line) = guard.input_queue.pop_front() {
-            let mut bytes = line.into_bytes();
-            if bytes.is_empty() || *bytes.last().unwrap() != b'\n' {
-                bytes.push(b'\n');
-            }
-
             let max = (buflen as usize).saturating_sub(1);
-            let (head, tail) = if bytes.len() > max {
-                bytes.split_at(max)
-            } else {
-                (bytes.as_slice(), &[][..])
-            };
-
-            if !tail.is_empty() {
-                let remainder = String::from_utf8_lossy(tail).to_string();
+            let (line_text, tail) = split_console_line(line, max);
+            if let Some(remainder) = tail {
                 guard.input_queue.push_front(remainder);
             }
             drop(guard);
 
-            let line_text = String::from_utf8_lossy(head).to_string();
+            let head = line_text.as_bytes();
+            if !buf.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
+                    *buf.add(head.len()) = 0;
+                }
+            }
+            ipc::emit_readline_input(&line_text);
             let mut echoed = String::with_capacity(prompt.len() + line_text.len());
             echoed.push_str(prompt);
             echoed.push_str(&line_text);
@@ -1098,21 +1005,7 @@ pub extern "C-unwind" fn r_read_console(
                 emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
 
-            if !buf.is_null() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
-                    *buf.add(head.len()) = 0;
-                }
-            }
-
             return 1;
-        }
-
-        if let Some(active) = guard.active_request.take() {
-            drop(guard);
-            ipc::emit_readline_start(prompt);
-            complete_active_request(state, Some(active), false);
-            continue;
         }
 
         guard = state.cvar.wait(guard).unwrap();
@@ -1130,19 +1023,16 @@ pub(crate) fn push_plot_image(
         .inner
         .lock()
         .map_err(|_| "session state lock poisoned".to_string())?;
-    let Some(active) = guard.active_request.as_mut() else {
-        return Ok(());
-    };
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     let hash = hasher.finish();
 
-    if active.plot_hashes.get(&plot_id) == Some(&hash) {
+    if guard.plot_hashes.get(&plot_id) == Some(&hash) {
         return Ok(());
     }
 
-    active.plot_hashes.insert(plot_id.clone(), hash);
+    guard.plot_hashes.insert(plot_id.clone(), hash);
     let mime_type = if mime_type.trim().is_empty() {
         "image/png".to_string()
     } else {
