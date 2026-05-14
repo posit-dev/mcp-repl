@@ -4,6 +4,10 @@ use common::TestResult;
 use rmcp::model::RawContent;
 use serde_json::json;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+
+static ZOD_WORKER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -37,23 +41,47 @@ fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
 }
 
 fn zod_worker_path() -> TestResult<PathBuf> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_zod-worker") {
-        return Ok(PathBuf::from(path));
+    match ZOD_WORKER_PATH.get_or_init(build_zod_worker) {
+        Ok(path) => Ok(path.clone()),
+        Err(err) => Err(err.clone().into()),
+    }
+}
+
+fn build_zod_worker() -> Result<PathBuf, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .arg("build")
+        .arg("--example")
+        .arg("zod-worker")
+        .arg("--manifest-path")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .output()
+        .map_err(|err| format!("failed to run cargo build --example zod-worker: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo build --example zod-worker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    let mut path = std::env::current_exe()?;
-    path.pop();
-    path.pop();
-    path.push(if cfg!(windows) {
+    let mut target_dir = std::env::current_exe()
+        .map_err(|err| format!("failed to resolve current test executable: {err}"))?;
+    target_dir.pop();
+    target_dir.pop();
+    let exe_name = if cfg!(windows) {
         "zod-worker.exe"
     } else {
         "zod-worker"
-    });
+    };
+    let path = target_dir.join("examples").join(exe_name);
     if path.exists() {
         return Ok(path);
     }
 
-    Err("unable to locate zod-worker test binary".into())
+    Err(format!(
+        "unable to locate zod-worker test example at {}",
+        path.display()
+    ))
 }
 
 async fn spawn_zod_server() -> TestResult<common::McpTestSession> {

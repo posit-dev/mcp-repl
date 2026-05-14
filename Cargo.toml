@@ -11,9 +11,9 @@
   name = "mcp-repl"
   path = "src/main.rs"
 
-[[bin]]
+[[example]]
   name = "zod-worker"
-  path = "src/bin/zod-worker.rs"
+  path = "tests/fixtures/zod-worker.rs"
 
 [dependencies]
   ctor = "0.6.3"
