@@ -262,8 +262,17 @@ impl RuntimeStdinBridge {
         let mut wait_announced = false;
         while !Self::raw_read_ready(&guard, size) {
             if !wait_announced && stdin_pending_byte_count() == Some(0) {
-                ipc::emit_readline_start("");
                 wait_announced = true;
+                drop(guard);
+                // A raw fd read with no buffered bytes completes the MCP request as a
+                // stdin wait, just like input(). Flush foreground plots, then close the
+                // plot gate so background matplotlib hooks cannot emit into a completed
+                // request while the Python thread waits with the GIL released.
+                emit_plots();
+                mark_stdin_wait_prompt_completed_request();
+                ipc::emit_readline_start("");
+                guard = self.inner.lock().unwrap();
+                continue;
             }
             guard = self.cvar.wait(guard).unwrap();
         }
