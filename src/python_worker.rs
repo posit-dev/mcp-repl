@@ -97,6 +97,10 @@ fn init_ipc(
         .spawn(move || {
             loop {
                 match conn.recv(None) {
+                    Some(ServerToWorkerIpcMessage::RequestStart) => {
+                        python_session::mark_request_started();
+                        emit_stdin_write_ack();
+                    }
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
                         line_count,

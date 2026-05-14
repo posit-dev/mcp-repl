@@ -630,6 +630,72 @@ answer = input('next? ')"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_plot_after_input_follow_up_resets_request_state() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let setup_input = format!(
+        "{}; plt.figure(190); plt.clf(); plt.plot([1, 2, 3]); plt.show()",
+        python_plot_preamble()
+    );
+    let setup_result = session
+        .write_stdin_raw_with(&setup_input, Some(30.0))
+        .await?;
+    assert_ne!(
+        setup_result.is_error,
+        Some(true),
+        "plot hook setup reported an error: {}",
+        result_text(&setup_result)
+    );
+
+    let input = format!(
+        r#"{}
+plt.figure(192)
+plt.clf()
+plt.plot([3, 2, 1])
+def _mcp_repl_stdin_plot_test():
+    plt.show()
+    answer = input('next? ')
+    plt.show()
+
+_mcp_repl_stdin_plot_test()"#,
+        python_plot_preamble()
+    );
+    let prompt_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let follow_up_result = session.write_stdin_raw_with("ready", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        prompt_result.is_error,
+        Some(true),
+        "plot-before-input request reported an error: {}",
+        result_text(&prompt_result)
+    );
+    assert_ne!(
+        follow_up_result.is_error,
+        Some(true),
+        "plot-after-input follow-up reported an error: {}",
+        result_text(&follow_up_result)
+    );
+    let prompt_images = extract_images(&prompt_result);
+    let follow_up_images = extract_images(&follow_up_result);
+    assert!(
+        !prompt_images.is_empty(),
+        "expected pre-input plot to emit image content; response text: {}",
+        result_text(&prompt_result)
+    );
+    assert!(
+        !follow_up_images.is_empty(),
+        "expected follow-up plot to emit image content as a new request; response text: {}",
+        result_text(&follow_up_result)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

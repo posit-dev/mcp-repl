@@ -335,7 +335,6 @@ fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(),
         .map_err(WorkerError::Io)
 }
 
-#[cfg(not(target_family = "unix"))]
 fn driver_wait_for_stdin_write_ack(
     ipc: &ServerIpcConnection,
     timeout: Duration,
@@ -874,11 +873,21 @@ impl BackendDriver for PythonBackendDriver {
     }
 }
 
-struct ProtocolBackendDriver;
+struct ProtocolBackendDriver {
+    announce_request_start: bool,
+}
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
-        Self
+        Self {
+            announce_request_start: false,
+        }
+    }
+
+    fn python() -> Self {
+        Self {
+            announce_request_start: true,
+        }
     }
 }
 
@@ -896,9 +905,18 @@ impl BackendDriver for ProtocolBackendDriver {
         _text: &str,
         payload: &[u8],
         ipc: &ServerIpcConnection,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<(), WorkerError> {
         ipc.begin_request_with_stdin(payload);
+        if self.announce_request_start {
+            // Built-in Unix Python reads request bytes through the worker stdin fd
+            // like a protocol worker, but its plot hooks still need a Python-side
+            // request boundary before follow-up stdin is consumed. Custom protocol
+            // workers do not receive this private bridge message.
+            ipc.send(ServerToWorkerIpcMessage::RequestStart)
+                .map_err(WorkerError::Io)?;
+            driver_wait_for_stdin_write_ack(ipc, timeout)?;
+        }
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -1298,7 +1316,7 @@ impl WorkerManager {
                 WorkerLaunch::Builtin(Backend::Python) => {
                     #[cfg(target_family = "unix")]
                     {
-                        Box::new(ProtocolBackendDriver::new())
+                        Box::new(ProtocolBackendDriver::python())
                     }
                     #[cfg(not(target_family = "unix"))]
                     {

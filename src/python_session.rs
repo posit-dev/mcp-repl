@@ -517,6 +517,14 @@ pub(crate) fn mark_stdin_write_complete() {
     }
 }
 
+pub(crate) fn mark_request_started() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.plot_reset_pending = true;
+}
+
 #[cfg(windows)]
 fn windows_continuation_prompt_write_should_complete(
     active: &ActiveRequest,

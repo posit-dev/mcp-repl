@@ -86,6 +86,7 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
+    RequestStart,
     StdinWrite {
         byte_len: usize,
         #[serde(default)]

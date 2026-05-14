@@ -179,6 +179,7 @@ fn init_ipc(
         .spawn(move || {
             loop {
                 match conn.recv(None) {
+                    Some(ServerToWorkerIpcMessage::RequestStart) => {}
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
                         line_count: _,
