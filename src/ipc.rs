@@ -791,6 +791,7 @@ impl ServerIpcConnection {
         }
     }
 
+    #[cfg_attr(target_family = "unix", allow(dead_code))]
     pub fn wait_for_stdin_write_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -1645,6 +1646,22 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
+pub fn emit_readline_input(text: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInput {
+            text: text.to_string(),
+        });
+    }
+}
+
+pub fn emit_readline_discard(text: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscard {
+            text: text.to_string(),
+        });
+    }
+}
+
 pub fn emit_readline_result(prompt: &str, line: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineResult {
@@ -1783,6 +1800,7 @@ fn account_active_stdin(
     Ok(())
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue

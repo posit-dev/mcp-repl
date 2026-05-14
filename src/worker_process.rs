@@ -329,11 +329,13 @@ fn driver_announce_stdin_write(
     .map_err(WorkerError::Io)
 }
 
+#[cfg(not(target_family = "unix"))]
 fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
         .map_err(WorkerError::Io)
 }
 
+#[cfg(not(target_family = "unix"))]
 fn driver_wait_for_stdin_write_ack(
     ipc: &ServerIpcConnection,
     timeout: Duration,
@@ -499,14 +501,17 @@ impl BackendDriver for RBackendDriver {
     }
 }
 
+#[cfg(not(target_family = "unix"))]
 struct PythonBackendDriver;
 
+#[cfg(not(target_family = "unix"))]
 impl PythonBackendDriver {
     fn new() -> Self {
         Self
     }
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_final_prompt_hint(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -532,6 +537,7 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     }
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_has_open_block_suite(text: &str) -> bool {
     let mut block_indents = Vec::new();
     let mut scan_state = PythonLineScanState::default();
@@ -558,6 +564,7 @@ fn python_has_open_block_suite(text: &str) -> bool {
     !block_indents.is_empty()
 }
 
+#[cfg(not(target_family = "unix"))]
 #[derive(Default)]
 struct PythonLineScanState {
     quote: Option<(char, bool)>,
@@ -565,12 +572,14 @@ struct PythonLineScanState {
     groups: Vec<char>,
 }
 
+#[cfg(not(target_family = "unix"))]
 impl PythonLineScanState {
     fn continuation_active(&self) -> bool {
         self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
     }
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_line_code_before_comment_with_state(
     line: &str,
     state: &mut PythonLineScanState,
@@ -637,12 +646,14 @@ fn python_line_code_before_comment_with_state(
     code
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_line_indent(line: &str) -> usize {
     line.chars()
         .take_while(|ch| matches!(ch, ' ' | '\t'))
         .count()
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_line_code_before_comment(line: &str) -> &str {
     let mut chars = line.char_indices().peekable();
     let mut quote: Option<(char, bool)> = None;
@@ -684,10 +695,12 @@ fn python_line_code_before_comment(line: &str) -> &str {
     line
 }
 
+#[cfg(not(target_family = "unix"))]
 fn python_requires_continuation(text: &str) -> bool {
     has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
 }
 
+#[cfg(not(target_family = "unix"))]
 fn final_line_continues_with_backslash(text: &str) -> bool {
     let Some(line) = text.lines().last() else {
         return false;
@@ -702,6 +715,7 @@ fn final_line_continues_with_backslash(text: &str) -> bool {
         == 1
 }
 
+#[cfg(not(target_family = "unix"))]
 fn has_unclosed_python_group_or_string(text: &str) -> bool {
     let mut stack = Vec::new();
     let mut chars = text.chars().peekable();
@@ -761,6 +775,7 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
     }
 }
 
+#[cfg(not(target_family = "unix"))]
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
     let mut clone = chars.clone();
     if clone.next() != Some(expected) || clone.next() != Some(expected) {
@@ -771,6 +786,7 @@ fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected:
     true
 }
 
+#[cfg(not(target_family = "unix"))]
 fn take_next_two_indexed(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     expected: char,
@@ -786,6 +802,7 @@ fn take_next_two_indexed(
     true
 }
 
+#[cfg(not(target_family = "unix"))]
 fn text_ends_with_blank_line(text: &str) -> bool {
     let Some(text) = strip_one_line_ending(text) else {
         return false;
@@ -793,12 +810,14 @@ fn text_ends_with_blank_line(text: &str) -> bool {
     text.ends_with('\n') || text.ends_with('\r')
 }
 
+#[cfg(not(target_family = "unix"))]
 fn strip_one_line_ending(text: &str) -> Option<&str> {
     text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .or_else(|| text.strip_suffix('\r'))
 }
 
+#[cfg(not(target_family = "unix"))]
 impl BackendDriver for PythonBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
         let mut payload = text.as_bytes().to_vec();
@@ -1276,7 +1295,16 @@ impl WorkerManager {
             output_timeline,
             driver: match worker_launch {
                 WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
-                WorkerLaunch::Builtin(Backend::Python) => Box::new(PythonBackendDriver::new()),
+                WorkerLaunch::Builtin(Backend::Python) => {
+                    #[cfg(target_family = "unix")]
+                    {
+                        Box::new(ProtocolBackendDriver::new())
+                    }
+                    #[cfg(not(target_family = "unix"))]
+                    {
+                        Box::new(PythonBackendDriver::new())
+                    }
+                }
                 WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
             },
             pending_request: false,
@@ -2284,14 +2312,8 @@ impl WorkerManager {
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }
-        if !timed_out && !session_end {
-            if !self.pager.is_active() {
-                reconcile_completion_prompt(&mut contents, resolved_prompt.clone(), self.backend);
-            } else if matches!(self.backend, Backend::Python)
-                && let Some(prompt_text) = resolved_prompt.as_deref()
-            {
-                strip_trailing_worker_stdout_prompt(&mut contents, prompt_text);
-            }
+        if !timed_out && !session_end && !self.pager.is_active() {
+            reconcile_completion_prompt(&mut contents, resolved_prompt.clone(), self.backend);
         }
 
         Ok(ReplyWithOffset {
@@ -2790,18 +2812,12 @@ impl WorkerManager {
                         fallback_input_transcript.as_deref(),
                     );
                 }
-                if !session_end {
-                    if !self.pager.is_active() {
-                        reconcile_completion_prompt(
-                            &mut contents,
-                            resolved_prompt.clone(),
-                            self.backend,
-                        );
-                    } else if matches!(self.backend, Backend::Python)
-                        && let Some(prompt_text) = resolved_prompt.as_deref()
-                    {
-                        strip_trailing_worker_stdout_prompt(&mut contents, prompt_text);
-                    }
+                if !session_end && !self.pager.is_active() {
+                    reconcile_completion_prompt(
+                        &mut contents,
+                        resolved_prompt.clone(),
+                        self.backend,
+                    );
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 Ok(ReplyWithOffset {
@@ -3293,18 +3309,12 @@ impl WorkerManager {
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
         self.remember_prompt(raw_prompt);
-        if !session_end {
-            if !timed_out {
-                reconcile_trailing_completion_prompt(
-                    &mut contents,
-                    resolved_prompt.clone(),
-                    self.backend,
-                );
-            } else if matches!(self.backend, Backend::Python)
-                && let Some(prompt_text) = resolved_prompt.as_deref()
-            {
-                strip_trailing_prompt(&mut contents, prompt_text);
-            }
+        if !session_end && !timed_out {
+            reconcile_trailing_completion_prompt(
+                &mut contents,
+                resolved_prompt.clone(),
+                self.backend,
+            );
         }
 
         let reply = WorkerReply::Output {
@@ -3409,10 +3419,6 @@ impl WorkerManager {
             let WorkerReply::Output { contents, .. } = &mut reply.reply;
             if !pager_active {
                 reconcile_polled_completion_prompt(contents, prompt, self.backend);
-            } else if matches!(self.backend, Backend::Python)
-                && let Some(prompt) = prompt.as_deref()
-            {
-                strip_trailing_prompt(contents, prompt);
             }
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end_with_options(
@@ -3484,18 +3490,12 @@ impl WorkerManager {
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }
-        if !session_end {
-            if !timed_out && !self.pager.is_active() {
-                reconcile_trailing_completion_prompt(
-                    &mut contents,
-                    resolved_prompt.clone(),
-                    self.backend,
-                );
-            } else if matches!(self.backend, Backend::Python)
-                && let Some(prompt_text) = resolved_prompt.as_deref()
-            {
-                strip_trailing_prompt(&mut contents, prompt_text);
-            }
+        if !session_end && !timed_out && !self.pager.is_active() {
+            reconcile_trailing_completion_prompt(
+                &mut contents,
+                resolved_prompt.clone(),
+                self.backend,
+            );
         }
 
         let reply = WorkerReply::Output {
@@ -5283,53 +5283,25 @@ fn append_prompt(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
 fn reconcile_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    backend: Backend,
+    _backend: Backend,
 ) {
-    match backend {
-        // R reports completion prompts as framed IPC facts. Prompt-shaped raw
-        // stdout can come from child processes and must stay visible.
-        Backend::R => append_prompt(contents, prompt),
-        Backend::Python => {
-            if let Some(prompt_text) = prompt.as_deref() {
-                strip_trailing_worker_stdout_prompt(contents, prompt_text);
-            }
-            append_prompt_if_missing(contents, prompt);
-        }
-    }
+    append_prompt(contents, prompt);
 }
 
 fn reconcile_trailing_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    backend: Backend,
+    _backend: Backend,
 ) {
-    match backend {
-        // R reports completion prompts as framed IPC facts. Prompt-shaped raw
-        // stdout can come from child processes and must stay visible.
-        Backend::R => append_prompt(contents, prompt),
-        Backend::Python => {
-            if let Some(prompt_text) = prompt.as_deref() {
-                strip_trailing_worker_stdout_prompt(contents, prompt_text);
-            }
-            append_prompt_if_missing(contents, prompt);
-        }
-    }
+    append_prompt(contents, prompt);
 }
 
 fn reconcile_polled_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    backend: Backend,
+    _backend: Backend,
 ) {
-    match backend {
-        Backend::R => {}
-        Backend::Python => {
-            if let Some(prompt_text) = prompt.as_deref() {
-                strip_trailing_worker_stdout_prompt(contents, prompt_text);
-            }
-            append_prompt_if_missing(contents, prompt);
-        }
-    }
+    append_prompt_if_missing(contents, prompt);
 }
 
 fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
@@ -5355,47 +5327,6 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
             text: prefix.to_string(),
             stream: *stream,
             origin: crate::worker_protocol::ContentOrigin::Worker,
-        };
-    }
-}
-
-fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
-    if prompt.is_empty() {
-        return;
-    }
-
-    let mut idx = contents.len();
-    while idx > 0 {
-        idx = idx.saturating_sub(1);
-        match &contents[idx] {
-            WorkerContent::ContentText {
-                origin: ContentOrigin::Server,
-                ..
-            } => continue,
-            WorkerContent::ContentText {
-                text,
-                stream: TextStream::Stdout,
-                origin: ContentOrigin::Worker,
-            } => {
-                let Some(prefix) = text.strip_suffix(prompt) else {
-                    return;
-                };
-                if prefix.is_empty() {
-                    contents.remove(idx);
-                } else {
-                    contents[idx] = WorkerContent::ContentText {
-                        text: prefix.to_string(),
-                        stream: TextStream::Stdout,
-                        origin: ContentOrigin::Worker,
-                    };
-                }
-                return;
-            }
-            WorkerContent::ContentText {
-                origin: ContentOrigin::Worker,
-                ..
-            }
-            | WorkerContent::ContentImage { .. } => return,
         };
     }
 }

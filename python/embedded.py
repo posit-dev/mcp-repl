@@ -567,6 +567,7 @@ def _mcp_repl_plot_capable():
 
 
 _original_excepthook = sys.excepthook
+_original_os_read = os.read
 
 
 def _mcp_repl_excepthook(exc_type, exc, traceback):
@@ -576,8 +577,15 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
     _original_excepthook(exc_type, exc, traceback)
 
 
+def _mcp_repl_os_read(fd, n):
+    if fd == 0:
+        return _mcp_repl.raw_stdin_read(n)
+    return _original_os_read(fd, n)
+
+
 builtins.input = _input
 pydoc.pager = _pydoc_plainpager
+os.read = _mcp_repl_os_read
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 sys.ps1 = _mcp_repl_suppressed_ps1

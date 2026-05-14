@@ -3143,6 +3143,35 @@ async fn python_prompt_shaped_stdout_before_stderr_stays_visible() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_trailing_prompt_shaped_stdout_stays_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys; _ = sys.stdout.write('PROMPT_STDOUT>>> '); sys.stdout.flush()",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_trailing_prompt_shaped_stdout_stays_visible remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        text.contains("PROMPT_STDOUT>>> >>> "),
+        "expected trailing prompt-shaped stdout and worker prompt to both remain visible, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

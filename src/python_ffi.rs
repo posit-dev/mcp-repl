@@ -100,9 +100,11 @@ pub struct PythonApi {
         unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     pub py_unicode_as_utf8_and_size:
         unsafe extern "C" fn(*mut PyObject, *mut PySsizeT) -> *const c_char,
+    py_bytes_from_string_and_size: unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     py_bytes_as_string_and_size:
         unsafe extern "C" fn(*mut PyObject, *mut *mut c_char, *mut PySsizeT) -> c_int,
     pub py_long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
+    py_long_as_long: unsafe extern "C" fn(*mut PyObject) -> c_long,
     pub py_bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_build_value: unsafe extern "C" fn(*const c_char, ...) -> *mut PyObject,
     pub py_mem_raw_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
@@ -166,10 +168,14 @@ impl PythonApi {
             py_unicode_as_utf8_and_size: unsafe {
                 load_symbol(&library, b"PyUnicode_AsUTF8AndSize\0")?
             },
+            py_bytes_from_string_and_size: unsafe {
+                load_symbol(&library, b"PyBytes_FromStringAndSize\0")?
+            },
             py_bytes_as_string_and_size: unsafe {
                 load_symbol(&library, b"PyBytes_AsStringAndSize\0")?
             },
             py_long_from_long: unsafe { load_symbol(&library, b"PyLong_FromLong\0")? },
+            py_long_as_long: unsafe { load_symbol(&library, b"PyLong_AsLong\0")? },
             py_bool_from_long: unsafe { load_symbol(&library, b"PyBool_FromLong\0")? },
             py_build_value: unsafe { load_symbol(&library, b"Py_BuildValue\0")? },
             py_mem_raw_malloc: unsafe { load_symbol(&library, b"PyMem_RawMalloc\0")? },
@@ -259,6 +265,16 @@ impl PythonApi {
         PyPtr::from_owned(ptr, "failed to allocate Python string")
     }
 
+    pub fn bytes(&self, value: &[u8]) -> Result<PyPtr, String> {
+        let ptr = unsafe {
+            (self.py_bytes_from_string_and_size)(
+                value.as_ptr().cast::<c_char>(),
+                value.len() as PySsizeT,
+            )
+        };
+        PyPtr::from_owned(ptr, "failed to allocate Python bytes")
+    }
+
     pub fn unicode_arg(&self, args: *mut PyObject, index: PySsizeT) -> Option<String> {
         let item = unsafe { (self.py_tuple_get_item)(args, index) };
         if item.is_null() {
@@ -290,6 +306,14 @@ impl PythonApi {
         }
         let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize) };
         Some(bytes.to_vec())
+    }
+
+    pub fn long_arg(&self, args: *mut PyObject, index: PySsizeT) -> Option<c_long> {
+        let item = unsafe { (self.py_tuple_get_item)(args, index) };
+        if item.is_null() {
+            return None;
+        }
+        Some(unsafe { (self.py_long_as_long)(item) })
     }
 
     pub fn tuple_size(&self, args: *mut PyObject) -> PySsizeT {
