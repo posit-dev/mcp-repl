@@ -740,6 +740,80 @@ print("late background plot scheduled")"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_background_plot_while_input_waits_does_not_emit() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+    let temp_dir = tempdir()?;
+    let signal_path = temp_dir.path().join("release-background-plot");
+    let done_path = temp_dir.path().join("background-plot-done");
+    let signal_path = signal_path
+        .to_str()
+        .ok_or("signal path must be UTF-8")?
+        .to_string();
+    let done_path = done_path
+        .to_str()
+        .ok_or("done path must be UTF-8")?
+        .to_string();
+    let signal_path_literal = serde_json::to_string(&signal_path)?;
+    let done_path_literal = serde_json::to_string(&done_path)?;
+
+    let input = format!(
+        r#"{}
+import os, threading, time
+signal_path = {signal_path_literal}
+done_path = {done_path_literal}
+def _mcp_repl_late_input_plot():
+    while not os.path.exists(signal_path):
+        time.sleep(0.02)
+    plt.figure(315)
+    plt.clf()
+    plt.plot([1, 2, 3], [1, 4, 9])
+    with open(done_path, "w") as done_file:
+        done_file.write("done")
+
+threading.Thread(target=_mcp_repl_late_input_plot, daemon=True).start()
+answer = input("next? ")"#,
+        python_plot_preamble()
+    );
+    let prompt_result = session.write_stdin_raw_with(&input, Some(1.0)).await?;
+    assert_ne!(
+        prompt_result.is_error,
+        Some(true),
+        "input-wait setup reported an error: {}",
+        result_text(&prompt_result)
+    );
+    assert!(
+        result_text(&prompt_result).contains("next? "),
+        "expected input prompt before background plot, got: {}",
+        result_text(&prompt_result)
+    );
+
+    std::fs::write(&signal_path, b"go")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&done_path).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background plot did not finish while input was waiting"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let answer_result = session.write_stdin_raw_with("0", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        answer_result.is_error,
+        Some(true),
+        "input follow-up reported an error: {}",
+        result_text(&answer_result)
+    );
+    assert_no_images(&prompt_result, "background plot before input wait");
+    assert_no_images(&answer_result, "background plot while input waited");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

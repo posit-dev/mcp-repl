@@ -598,11 +598,11 @@ def _maybe_emit_plots(force_figures=None, force_all=False):
     _emit_plots(force_figures=force_figures, force_all=force_all)
 
 
-def _emit_plots(force_figures=None, force_all=False):
+def _emit_plots(force_figures=None, force_all=False, record_only=False):
     global _plot_known_figures, _plot_hashes, _plot_emitted_this_request
     global _plot_emit_in_progress
 
-    if _mcp_repl.take_plot_reset_pending():
+    if not record_only and _mcp_repl.take_plot_reset_pending():
         with _plot_lock:
             _plot_emitted_this_request = {}
 
@@ -660,6 +660,10 @@ def _emit_plots(force_figures=None, force_all=False):
         digest = hashlib.sha256(data).hexdigest()
         force_current = force_all or fig_num in force_figures
         with _plot_lock:
+            if record_only:
+                _plot_hashes[fig_num] = digest
+                _plot_emitted_this_request.pop(fig_num, None)
+                continue
             emitted_this_request = _plot_emitted_this_request.get(fig_num) == digest
             if emitted_this_request:
                 continue
@@ -691,6 +695,10 @@ def _mcp_repl_begin_request():
 
 def _mcp_repl_emit_plots():
     _emit_plots()
+
+
+def _mcp_repl_record_background_plots():
+    _emit_plots(record_only=True)
 
 
 def _mcp_repl_flush_original_stdio():

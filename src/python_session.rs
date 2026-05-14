@@ -560,12 +560,25 @@ fn mark_request_started_with_generation(request_generation: Option<u64>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
+    let should_record_background_plots = {
+        let guard = state.inner.lock().unwrap();
+        !guard.request_active || guard.request_completed_at_stdin_wait
+    };
+    if should_record_background_plots {
+        // A stdin-wait prompt closes the MCP request while Python threads can
+        // still mutate matplotlib state. Snapshot those inactive plots before
+        // reopening the gate so a later stdin answer does not flush stale
+        // background figures into its reply. A later explicit plot/show in the
+        // new request still forces a fresh image.
+        record_background_plots();
+    }
     let mut guard = state.inner.lock().unwrap();
     if let Some(request_generation) = request_generation {
         guard.request_generation = request_generation;
     } else {
         guard.request_generation = guard.request_generation.wrapping_add(1);
     }
+    guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
     guard.plot_reset_pending = true;
 }
@@ -1443,6 +1456,7 @@ fn begin_tracked_request(
     let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.waiting_for_input = false;
     guard.request_generation = guard.request_generation.wrapping_add(1);
+    guard.request_completed_at_stdin_wait = false;
     guard.active_request = Some(ActiveRequest {
         reply,
         byte_len,
@@ -2011,6 +2025,11 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     #[cfg(target_family = "unix")]
     let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
     #[cfg(target_family = "unix")]
+    if !prompt_has_buffered_answer {
+        emit_plots();
+        mark_stdin_wait_prompt_completed_request();
+    }
+    #[cfg(target_family = "unix")]
     let prompt_delivered_immediately =
         request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
     #[cfg(target_family = "unix")]
@@ -2108,6 +2127,9 @@ fn plot_capable() -> bool {
 }
 
 fn emit_plots() {
+    if !request_active() {
+        return;
+    }
     let _gil = GilGuard::acquire();
     let api = PythonApi::global();
     let Ok(main) = api.import_module("__main__") else {
@@ -2124,6 +2146,29 @@ fn emit_plots() {
     } else {
         drop(PyPtr::from_owned(result, "plot emission result"));
     }
+}
+
+fn record_background_plots() {
+    let _gil = GilGuard::acquire();
+    let api = PythonApi::global();
+    let Ok(main) = api.import_module("__main__") else {
+        return;
+    };
+    let Ok(func) = api.get_attr_string(main.as_ptr(), "_mcp_repl_record_background_plots") else {
+        return;
+    };
+    let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
+    if let Ok(result) = PyPtr::from_owned(result, "Python background plot recording failed") {
+        drop(result);
+    }
+}
+
+fn request_active() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let guard = state.inner.lock().unwrap();
+    guard.request_active && !guard.request_completed_at_stdin_wait
 }
 
 fn flush_original_stdio() {
@@ -2165,6 +2210,7 @@ struct SessionStateInner {
     active_request: Option<ActiveRequest>,
     request_generation: u64,
     request_active: bool,
+    request_completed_at_stdin_wait: bool,
     current_prompt: Option<String>,
     current_readline_state: Option<PythonReadlineState>,
     python_primary_prompt: String,
@@ -2199,6 +2245,7 @@ impl SessionState {
                 active_request: None,
                 request_generation: 0,
                 request_active: false,
+                request_completed_at_stdin_wait: false,
                 current_prompt: None,
                 current_readline_state: None,
                 python_primary_prompt: ">>> ".to_string(),
@@ -2269,6 +2316,22 @@ fn emit_output_text(stream: TextStream, bytes: &[u8]) {
         },
         Err(err) => panic!("failed to send Python output over worker IPC: {err}"),
     }
+}
+
+#[cfg(target_family = "unix")]
+fn mark_stdin_wait_prompt_completed_request() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    // A Unix input()/sys.stdin.readline() prompt with no buffered answer is the
+    // response boundary for the current MCP request. The Python read then
+    // releases the GIL while it waits for a later request to supply stdin, so
+    // background Python threads can run. Clear the plot gate at this boundary
+    // to prevent those background updates from being attributed to the request
+    // that already completed.
+    guard.request_active = false;
+    guard.request_completed_at_stdin_wait = true;
 }
 
 unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
@@ -2464,10 +2527,7 @@ unsafe extern "C" fn py_has_request_active(
     _self: *mut PyObject,
     _args: *mut PyObject,
 ) -> *mut PyObject {
-    let Some(state) = SESSION_STATE.get() else {
-        return PythonApi::global().bool_result(false);
-    };
-    PythonApi::global().bool_result(state.inner.lock().unwrap().request_active)
+    PythonApi::global().bool_result(request_active())
 }
 
 unsafe extern "C" fn py_take_plot_reset_pending(
