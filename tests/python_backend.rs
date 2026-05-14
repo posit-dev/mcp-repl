@@ -875,6 +875,38 @@ print("RAW_FD", data)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_preserves_split_utf8_byte() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+first = os.read(0, 1); second = os.read(0, 1)
+é
+print("RAW_FD_SPLIT_UTF8", first, second)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err(format!("python raw fd split UTF-8 read remained busy: {text:?}").into());
+    }
+    assert!(
+        text.contains(r#"RAW_FD_SPLIT_UTF8 b'\xc3' b'\xa9'"#),
+        "expected split UTF-8 raw fd stdin bytes, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();

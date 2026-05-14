@@ -187,6 +187,7 @@ struct RuntimeStdinBridge {
 #[cfg(target_family = "unix")]
 struct RuntimeStdinBridgeInner {
     input: VecDeque<u8>,
+    sideband_input: Vec<u8>,
     pending_read: bool,
     eof: bool,
     interrupted: bool,
@@ -199,6 +200,7 @@ impl RuntimeStdinBridge {
         Self {
             inner: Mutex::new(RuntimeStdinBridgeInner {
                 input: VecDeque::new(),
+                sideband_input: Vec::new(),
                 pending_read: false,
                 eof: false,
                 interrupted: false,
@@ -239,7 +241,8 @@ impl RuntimeStdinBridge {
         let mut guard = self.inner.lock().unwrap();
         guard.pending_read = false;
         guard.interrupted = true;
-        let discarded = guard.input.drain(..).collect();
+        let mut discarded: Vec<u8> = guard.sideband_input.drain(..).collect();
+        discarded.extend(guard.input.drain(..));
         self.cvar.notify_all();
         discarded
     }
@@ -267,9 +270,7 @@ impl RuntimeStdinBridge {
         };
         let take = line_len.min(size);
         let bytes: Vec<u8> = guard.input.drain(..take).collect();
-        let text = String::from_utf8(bytes.clone())
-            .expect("raw Python stdin bytes must be valid UTF-8 text");
-        ipc::emit_readline_input(&text);
+        Self::emit_readline_input_bytes(&mut guard, &bytes);
         mark_request_input_delivered();
         bytes
     }
@@ -308,11 +309,37 @@ impl RuntimeStdinBridge {
         }
         guard.pending_read = false;
 
-        let text =
-            String::from_utf8(line).expect("server-written Python stdin must be valid UTF-8 text");
-        ipc::emit_readline_input(&text);
+        Self::emit_readline_input_bytes(guard, &line);
         mark_request_input_delivered();
         true
+    }
+
+    fn emit_readline_input_bytes(guard: &mut RuntimeStdinBridgeInner, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        guard.sideband_input.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&guard.sideband_input) {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        ipc::emit_readline_input(text);
+                    }
+                    guard.sideband_input.clear();
+                    return;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to == 0 {
+                        return;
+                    }
+                    let text = std::str::from_utf8(&guard.sideband_input[..valid_up_to])
+                        .expect("valid UTF-8 prefix should decode");
+                    ipc::emit_readline_input(text);
+                    guard.sideband_input.drain(..valid_up_to);
+                }
+            }
+        }
     }
 }
 
