@@ -4149,6 +4149,7 @@ async fn python_prompt_shaped_stdout_before_stderr_stays_visible() -> TestResult
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_trailing_prompt_shaped_stdout_stays_visible() -> TestResult<()> {
     let _guard = lock_test_mutex();
