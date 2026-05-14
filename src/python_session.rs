@@ -245,16 +245,15 @@ pub(crate) fn mark_stdin_write_complete() {
         let waiting_for_input = guard.waiting_for_input;
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
+            let continuation_write_complete =
+                windows_continuation_prompt_write_should_complete(active, current_readline_state);
             let should_complete = if active.repl_turn_finished {
                 request_repl_turn_should_complete(active)
             } else {
                 request_prompt_wait_should_complete(active, current_readline_state)
-                    || windows_continuation_prompt_write_should_complete(
-                        active,
-                        current_readline_state,
-                    )
+                    || continuation_write_complete
             };
-            if waiting_for_input && should_complete {
+            if (waiting_for_input || continuation_write_complete) && should_complete {
                 let fallback_prompt = if active.repl_turn_finished {
                     None
                 } else {
@@ -280,7 +279,7 @@ pub(crate) fn mark_stdin_write_complete() {
         // Python object flushes run from handle_input_hook on the Python thread.
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -469,7 +468,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    ipc::emit_backend_info(plot_capable());
+    ipc::emit_worker_ready("python", plot_capable(), Some("exit()\n"));
 
     let result = run_repl(&runtime);
     let finalize_result = finalize_python(api, thread_state);
@@ -1050,12 +1049,12 @@ fn handle_input_hook() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     } else if emit_idle {
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, false);
+        ipc::emit_readline_start(prompt);
     }
 }
 
@@ -1195,7 +1194,7 @@ fn finish_repl_turn_request() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt, true);
+        ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     }
 }

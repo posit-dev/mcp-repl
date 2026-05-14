@@ -101,6 +101,13 @@ pub enum ServerToWorkerIpcMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerToServerIpcMessage {
+    WorkerReady {
+        protocol: WorkerProtocol,
+        worker: WorkerIdentity,
+        capabilities: WorkerCapabilities,
+        #[serde(default)]
+        graceful_shutdown: Option<WorkerGracefulShutdown>,
+    },
     BackendInfo {
         #[serde(default)]
         supports_images: bool,
@@ -114,7 +121,12 @@ pub enum WorkerToServerIpcMessage {
     },
     ReadlineStart {
         prompt: String,
-        client_waiting: bool,
+    },
+    ReadlineInput {
+        text: String,
+    },
+    ReadlineDiscard {
+        text: String,
     },
     ReadlineResult {
         prompt: String,
@@ -127,15 +139,55 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    SessionEnd,
+    OutputImage {
+        image_id: String,
+        mime_type: String,
+        data_b64: String,
+        update: bool,
+    },
+    SessionEnd {
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        message_b64: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProtocol {
+    pub name: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCapabilities {
+    #[serde(default)]
+    pub images: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerGracefulShutdown {
+    pub stdin: String,
 }
 
 #[derive(Default)]
 struct ServerIpcInbox {
     queue: VecDeque<WorkerToServerIpcMessage>,
+    startup_message_seen: bool,
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
+    active_stdin: Option<VecDeque<u8>>,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
@@ -144,7 +196,9 @@ struct ServerIpcInbox {
     plot_source_image_ids: HashMap<String, String>,
     request_plot_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
+    protocol_error: Option<String>,
     session_end: bool,
+    session_end_final: bool,
     disconnected: bool,
 }
 
@@ -287,21 +341,48 @@ impl ServerIpcConnection {
                 }
                 let message = match serde_json::from_str::<WorkerToServerIpcMessage>(trimmed) {
                     Ok(message) => message,
-                    Err(_) => {
+                    Err(err) => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.disconnected = true;
+                        guard.protocol_error = Some(format!("invalid worker sideband JSON: {err}"));
                         reader_cvar.notify_all();
                         break;
                     }
                 };
+                {
+                    let mut guard = reader_inbox.lock().unwrap();
+                    if guard.session_end_final {
+                        guard.protocol_error =
+                            Some("worker sideband message after session_end".to_string());
+                        reader_cvar.notify_all();
+                        break;
+                    }
+                    if !guard.startup_message_seen {
+                        let startup_message = matches!(
+                            &message,
+                            WorkerToServerIpcMessage::BackendInfo { .. }
+                                | WorkerToServerIpcMessage::WorkerReady { .. }
+                                | WorkerToServerIpcMessage::SessionEnd { .. }
+                        );
+                        if !startup_message {
+                            guard.protocol_error = Some(
+                                "first worker sideband message must be worker_ready or backend_info"
+                                    .to_string(),
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        guard.startup_message_seen = true;
+                    }
+                }
                 match message {
-                    WorkerToServerIpcMessage::ReadlineStart {
-                        prompt,
-                        client_waiting,
-                    } => {
+                    WorkerToServerIpcMessage::ReadlineStart { prompt } => {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
-                        if client_waiting {
+                        let waiting_for_new_input = guard
+                            .active_stdin
+                            .as_ref()
+                            .is_none_or(|active_stdin| active_stdin.is_empty());
+                        if waiting_for_new_input {
                             guard.readline_unmatched_starts =
                                 guard.readline_unmatched_starts.saturating_add(1);
                             if guard.readline_unmatched_starts == 1 {
@@ -325,6 +406,27 @@ impl ServerIpcConnection {
                             handler(prompt_for_handler);
                         }
                     }
+                    WorkerToServerIpcMessage::ReadlineInput { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) = account_active_stdin(&mut guard, &text, "readline_input")
+                        {
+                            guard.protocol_error = Some(err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::ReadlineDiscard { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) =
+                            account_active_stdin(&mut guard, &text, "readline_discard")
+                        {
+                            guard.protocol_error = Some(err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
                     WorkerToServerIpcMessage::ReadlineResult { prompt, line } => {
                         let echo_event = IpcEchoEvent {
                             prompt: prompt.clone(),
@@ -346,10 +448,17 @@ impl ServerIpcConnection {
                             handler(echo_event);
                         }
                     }
-                    WorkerToServerIpcMessage::SessionEnd => {
+                    WorkerToServerIpcMessage::SessionEnd {
+                        reason,
+                        message_b64,
+                    } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.session_end = true;
-                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd);
+                        guard.session_end_final = true;
+                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
+                            reason,
+                            message_b64,
+                        });
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
@@ -366,7 +475,8 @@ impl ServerIpcConnection {
                                 Ok(bytes) => bytes,
                                 Err(_) => {
                                     let mut guard = reader_inbox.lock().unwrap();
-                                    guard.disconnected = true;
+                                    guard.protocol_error =
+                                        Some("invalid output_text base64".to_string());
                                     reader_cvar.notify_all();
                                     break;
                                 }
@@ -424,6 +534,54 @@ impl ServerIpcConnection {
                             reader_cvar.notify_all();
                         }
                     }
+                    WorkerToServerIpcMessage::OutputImage {
+                        image_id,
+                        mime_type,
+                        data_b64,
+                        update,
+                    } => {
+                        if base64::engine::general_purpose::STANDARD
+                            .decode(&data_b64)
+                            .is_err()
+                        {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard.protocol_error = Some("invalid output_image base64".to_string());
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        let (id, is_new, updates_previous_image, readline_results_seen) = {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            let (id, is_new, updates_previous_image) =
+                                assign_plot_image_id(&mut guard, Some(&image_id), update);
+                            (
+                                id,
+                                is_new,
+                                updates_previous_image,
+                                guard.readline_result_count as usize,
+                            )
+                        };
+                        if let Some(handler) = plot_handler.as_ref() {
+                            handler(IpcPlotImage {
+                                id,
+                                mime_type,
+                                data: data_b64,
+                                is_new,
+                                updates_previous_image,
+                                readline_results_seen,
+                            });
+                        } else {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            guard
+                                .queue
+                                .push_back(WorkerToServerIpcMessage::OutputImage {
+                                    image_id,
+                                    mime_type,
+                                    data_b64,
+                                    update,
+                                });
+                            reader_cvar.notify_all();
+                        }
+                    }
                     other => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.queue.push_back(other);
@@ -466,6 +624,16 @@ impl ServerIpcConnection {
         guard.protocol_warnings.clear();
     }
 
+    pub fn begin_request_with_stdin(&self, payload: &[u8]) {
+        let mut guard = self.inbox.lock().unwrap();
+        reset_after_completed_request(&mut guard);
+        drop_stdin_write_acks(&mut guard);
+        guard.active_stdin = Some(payload.iter().copied().collect());
+        guard.echo_events.clear();
+        guard.prompt_history.clear();
+        guard.protocol_warnings.clear();
+    }
+
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()
@@ -486,6 +654,11 @@ impl ServerIpcConnection {
         guard.protocol_warnings.drain(..).collect()
     }
 
+    pub fn take_protocol_error(&self) -> Option<String> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.protocol_error.take()
+    }
+
     pub fn wait_for_request_completion(
         &self,
         timeout: Duration,
@@ -495,6 +668,9 @@ impl ServerIpcConnection {
         let allow_completion_settle_after_deadline = !timeout.is_zero();
         let mut guard = self.inbox.lock().unwrap();
         loop {
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -524,6 +700,9 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
+                if let Some(message) = guard.protocol_error.take() {
+                    return Err(IpcWaitError::Protocol(message));
+                }
                 if take_session_end(&mut guard) {
                     return Err(IpcWaitError::SessionEnd);
                 }
@@ -547,6 +726,9 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -586,6 +768,9 @@ impl ServerIpcConnection {
                 let _ = take_session_end(&mut guard);
                 return Ok(info);
             }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -613,6 +798,9 @@ impl ServerIpcConnection {
             if take_stdin_write_ack(&mut guard) {
                 return Ok(());
             }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
             if take_session_end(&mut guard) {
                 return Err(IpcWaitError::SessionEnd);
             }
@@ -630,6 +818,9 @@ impl ServerIpcConnection {
             if timeout_res.timed_out() {
                 if take_stdin_write_ack(&mut guard) {
                     return Ok(());
+                }
+                if let Some(message) = guard.protocol_error.take() {
+                    return Err(IpcWaitError::Protocol(message));
                 }
                 return Err(IpcWaitError::Timeout);
             }
@@ -764,6 +955,7 @@ pub enum IpcWaitError {
     Timeout,
     SessionEnd,
     Disconnected,
+    Protocol(String),
 }
 
 pub struct IpcServer {
@@ -1445,11 +1637,10 @@ fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd) -> io::Res
     Ok(())
 }
 
-pub fn emit_readline_start(prompt: &str, client_waiting: bool) {
+pub fn emit_readline_start(prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.to_string(),
-            client_waiting,
         });
     }
 }
@@ -1479,9 +1670,28 @@ pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Opt
     }
 }
 
-pub fn emit_backend_info(supports_images: bool) {
+pub fn emit_worker_ready(
+    worker_name: &str,
+    supports_images: bool,
+    graceful_shutdown_stdin: Option<&str>,
+) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::BackendInfo { supports_images });
+        let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
+            protocol: WorkerProtocol {
+                name: "mcp-repl-worker".to_string(),
+                version: 1,
+            },
+            worker: WorkerIdentity {
+                name: worker_name.to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            capabilities: WorkerCapabilities {
+                images: supports_images,
+            },
+            graceful_shutdown: graceful_shutdown_stdin.map(|stdin| WorkerGracefulShutdown {
+                stdin: stdin.to_string(),
+            }),
+        });
     }
 }
 
@@ -1493,7 +1703,10 @@ pub fn emit_stdin_write_ack() {
 
 pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd);
+        let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
+            reason: None,
+            message_b64: None,
+        });
     }
 }
 
@@ -1519,6 +1732,7 @@ pub(crate) fn test_connection_pair_with_handlers(
         reader: Box::new(worker_read),
         writer: Box::new(worker_write),
     })?;
+    server.inbox.lock().unwrap().startup_message_seen = true;
     Ok((server, worker))
 }
 
@@ -1530,11 +1744,43 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue
         .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::SessionEnd))
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::SessionEnd { .. }))
     {
         guard.queue.remove(idx);
     }
     true
+}
+
+fn account_active_stdin(
+    guard: &mut ServerIpcInbox,
+    text: &str,
+    event_type: &str,
+) -> Result<(), String> {
+    let Some(active_stdin) = guard.active_stdin.as_mut() else {
+        if text.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("{event_type} reported input with no active turn"));
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() > active_stdin.len() {
+        return Err(format!(
+            "{event_type} reported {} bytes but only {} active stdin bytes remain",
+            bytes.len(),
+            active_stdin.len()
+        ));
+    }
+    for (idx, expected) in bytes.iter().enumerate() {
+        if active_stdin.get(idx) != Some(expected) {
+            return Err(format!(
+                "{event_type} text does not match active stdin at byte {idx}"
+            ));
+        }
+    }
+    for _ in bytes {
+        active_stdin.pop_front();
+    }
+    Ok(())
 }
 
 fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
@@ -1653,6 +1899,7 @@ fn assign_plot_image_id(
 }
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
+    guard.active_stdin = None;
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;
@@ -1666,10 +1913,13 @@ fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
 }
 
 fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
-    let idx = guard
-        .queue
-        .iter()
-        .position(|msg| matches!(msg, WorkerToServerIpcMessage::BackendInfo { .. }))?;
+    let idx = guard.queue.iter().position(|msg| {
+        matches!(
+            msg,
+            WorkerToServerIpcMessage::BackendInfo { .. }
+                | WorkerToServerIpcMessage::WorkerReady { .. }
+        )
+    })?;
     guard.queue.remove(idx)
 }
 
@@ -1682,7 +1932,7 @@ mod protocol_tests {
     use super::{
         IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
         OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
-        WorkerIpcConnection, WorkerToServerIpcMessage, test_connection_pair_with_handlers,
+        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -1778,6 +2028,22 @@ mod protocol_tests {
         }));
 
         assert!(parsed.is_err(), "output_text should require data_b64");
+    }
+
+    #[test]
+    fn readline_start_protocol_only_carries_prompt() {
+        let value = serde_json::to_value(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "zod> ".to_string(),
+        })
+        .expect("serialize readline_start");
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "readline_start",
+                "prompt": "zod> "
+            })
+        );
     }
 
     #[test]
@@ -1905,8 +2171,8 @@ mod protocol_tests {
         let result = server.wait_for_backend_info(Duration::from_millis(200));
 
         assert!(
-            matches!(result, Err(super::IpcWaitError::Disconnected)),
-            "invalid worker message should disconnect server IPC, got: {result:?}"
+            matches!(result, Err(super::IpcWaitError::Protocol(ref message)) if message.starts_with("invalid worker sideband JSON:")),
+            "invalid worker message should report a protocol error, got: {result:?}"
         );
     }
 
@@ -2046,28 +2312,15 @@ mod protocol_tests {
 
     #[test]
     fn plot_image_updates_reuse_current_server_image_id() {
-        let (server_read, worker_write) = std::io::pipe().expect("server pipe");
-        let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
         let images = Arc::new(Mutex::new(Vec::new()));
         let handler_images = images.clone();
-        let _server = ServerIpcConnection::new(
-            IpcTransport {
-                reader: Box::new(server_read),
-                writer: Box::new(server_write),
-            },
-            IpcHandlers {
-                on_plot_image: Some(Arc::new(move |image| {
-                    handler_images.lock().expect("image mutex").push(image);
-                })),
-                ..IpcHandlers::default()
-            },
-        )
-        .expect("server connection");
-        let worker = WorkerIpcConnection::new(IpcTransport {
-            reader: Box::new(worker_read),
-            writer: Box::new(worker_write),
+        let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+            on_plot_image: Some(Arc::new(move |image| {
+                handler_images.lock().expect("image mutex").push(image);
+            })),
+            ..IpcHandlers::default()
         })
-        .expect("worker connection");
+        .expect("ipc pair");
         let first = json!({
             "type": "plot_image",
             "mime_type": "image/png",
@@ -2109,28 +2362,15 @@ mod protocol_tests {
     #[test]
     fn plot_image_ids_do_not_repeat_across_server_connections() {
         fn next_connection_image_id() -> String {
-            let (server_read, worker_write) = std::io::pipe().expect("server pipe");
-            let (worker_read, server_write) = std::io::pipe().expect("worker pipe");
             let images = Arc::new(Mutex::new(Vec::new()));
             let handler_images = images.clone();
-            let _server = ServerIpcConnection::new(
-                IpcTransport {
-                    reader: Box::new(server_read),
-                    writer: Box::new(server_write),
-                },
-                IpcHandlers {
-                    on_plot_image: Some(Arc::new(move |image| {
-                        handler_images.lock().expect("image mutex").push(image);
-                    })),
-                    ..IpcHandlers::default()
-                },
-            )
-            .expect("server connection");
-            let worker = WorkerIpcConnection::new(IpcTransport {
-                reader: Box::new(worker_read),
-                writer: Box::new(worker_write),
+            let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+                on_plot_image: Some(Arc::new(move |image| {
+                    handler_images.lock().expect("image mutex").push(image);
+                })),
+                ..IpcHandlers::default()
             })
-            .expect("worker connection");
+            .expect("ipc pair");
             let image = json!({
                 "type": "plot_image",
                 "mime_type": "image/png",

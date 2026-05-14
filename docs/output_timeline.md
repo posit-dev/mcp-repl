@@ -69,8 +69,8 @@ only as a later presentation step.
 
 Echo matching must be driven by the sideband facts themselves:
 
-- `readline_start` supplies prompt text and whether the prompt is waiting for
-  new client input
+- `readline_start` supplies prompt text; the server derives whether it is
+  unsatisfied from active-turn stdin accounting
 - `readline_result` is emitted by the worker, but it describes the exact
   prompt text and input line that `readline` consumed and echoed
 - the server should match and collapse those exact sideband facts

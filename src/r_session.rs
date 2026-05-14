@@ -170,7 +170,7 @@ pub(crate) fn complete_active_request_if_idle() -> bool {
     let had_active = active.is_some();
     drop(guard);
     if had_active {
-        ipc::emit_readline_start(&prompt, true);
+        ipc::emit_readline_start(&prompt);
         complete_active_request(state, active, false);
     }
     had_active
@@ -1013,16 +1013,19 @@ pub extern "C-unwind" fn r_read_console(
         )
     };
     let prompt = prompt_text.as_deref().unwrap_or("");
-    ipc::emit_readline_start(prompt, false);
-    let mut client_waiting_start_emitted = false;
     let is_save_prompt = prompt_text
         .as_deref()
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
         .unwrap_or(false);
     let state = session_state();
+    let emit_idle_start;
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
+        emit_idle_start = guard.active_request.is_none() && guard.input_queue.is_empty();
+    }
+    if emit_idle_start {
+        ipc::emit_readline_start(prompt);
     }
 
     loop {
@@ -1105,13 +1108,9 @@ pub extern "C-unwind" fn r_read_console(
             return 1;
         }
 
-        if !client_waiting_start_emitted && guard.active_request.is_some() {
-            ipc::emit_readline_start(prompt, true);
-            client_waiting_start_emitted = true;
-        }
-
         if let Some(active) = guard.active_request.take() {
             drop(guard);
+            ipc::emit_readline_start(prompt);
             complete_active_request(state, Some(active), false);
             continue;
         }

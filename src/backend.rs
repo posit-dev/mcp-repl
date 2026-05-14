@@ -1,3 +1,8 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
 pub const INTERPRETER_ENV: &str = "MCP_REPL_INTERPRETER";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +21,97 @@ impl Backend {
             )),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkerLaunch {
+    Builtin(Backend),
+    Custom(CustomWorkerSpec),
+}
+
+impl WorkerLaunch {
+    pub fn builtin_backend(&self) -> Option<Backend> {
+        match self {
+            Self::Builtin(backend) => Some(*backend),
+            Self::Custom(_) => None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Builtin(Backend::R) => "r".to_string(),
+            Self::Builtin(Backend::Python) => "python".to_string(),
+            Self::Custom(spec) => format!("custom:{}", spec.executable.display()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomWorkerSpec {
+    pub executable: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_dir: CustomWorkerWorkingDir,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub stdin: CustomWorkerStdin,
+    pub sandbox: CustomWorkerSandbox,
+}
+
+impl CustomWorkerSpec {
+    pub fn from_json_file(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("failed to read worker spec {}: {err}", path.display()))?;
+        let spec: Self = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("failed to parse worker spec {}: {err}", path.display()))?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.executable.as_os_str().is_empty() {
+            return Err("worker spec executable must not be empty".to_string());
+        }
+        if matches!(
+            &self.working_dir,
+            CustomWorkerWorkingDir::Path { path } if path.as_os_str().is_empty()
+        ) {
+            return Err("worker spec working_dir path must not be empty".to_string());
+        }
+        match self.stdin {
+            CustomWorkerStdin::Pipe => {}
+        }
+        match self.sandbox {
+            CustomWorkerSandbox::Server => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum CustomWorkerWorkingDir {
+    Policy(CustomWorkerWorkingDirPolicy),
+    Path { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomWorkerWorkingDirPolicy {
+    Inherit,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomWorkerStdin {
+    Pipe,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomWorkerSandbox {
+    Server,
 }
 
 pub fn backend_from_env() -> Result<Option<Backend>, String> {

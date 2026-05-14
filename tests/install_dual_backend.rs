@@ -30,6 +30,55 @@ fn resolve_exe() -> TestResult<PathBuf> {
 }
 
 #[test]
+fn cargo_install_default_binary_surface_is_mcp_repl_only() -> TestResult<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .arg("metadata")
+        .arg("--no-deps")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metadata: JsonValue = serde_json::from_slice(&output.stdout)?;
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("expected metadata packages");
+    let package = packages
+        .iter()
+        .find(|package| package["name"].as_str() == Some("mcp-repl"))
+        .expect("expected mcp-repl package metadata");
+    let targets = package["targets"]
+        .as_array()
+        .expect("expected package targets");
+    let bin_names = targets
+        .iter()
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .expect("expected target kind array")
+                .iter()
+                .any(|kind| kind.as_str() == Some("bin"))
+        })
+        .map(|target| target["name"].as_str().expect("expected target name"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        bin_names,
+        vec!["mcp-repl"],
+        "cargo install should expose only the mcp-repl binary target"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

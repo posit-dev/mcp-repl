@@ -85,12 +85,27 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   should use a separate protocol step.
 
 `readline_start`
-- `{ "type": "readline_start", "prompt": <string>, "client_waiting": <bool> }`
+- `{ "type": "readline_start", "prompt": <string> }`
 - Emitted for readline prompts. The prompt string is required; use an empty
   string if the backend did not supply one.
-- `client_waiting` is true only when the backend knows the prompt is waiting for
-  new client input. Prompts that will immediately consume buffered input should
-  use false.
+- If active-turn stdin bytes remain unaccounted, the prompt is treated as
+  satisfied by already-written stdin and does not complete the request. If no
+  active-turn stdin bytes remain, the prompt is unsatisfied and may complete
+  the request.
+
+`readline_input`
+- `{ "type": "readline_input", "text": <string> }`
+- Emitted after the worker delivers active-turn stdin text to the
+  runtime-facing input layer.
+- The server encodes `text` as UTF-8 and removes those bytes from the active
+  stdin queue. A mismatch is a protocol error.
+
+`readline_discard`
+- `{ "type": "readline_discard", "text": <string> }`
+- Emitted after the worker discards active-turn stdin text during
+  interrupt/reset cleanup without delivering it to the runtime.
+- The server encodes `text` as UTF-8 and removes those bytes from the active
+  stdin queue. A mismatch is a protocol error.
 
 `readline_result`
 - `{ "type": "readline_result", "prompt": <string>, "line": <string> }`

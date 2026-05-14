@@ -939,8 +939,9 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
+    let first_sleep_secs = if cfg!(windows) { 0.6 } else { 0.2 };
     let first_input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.2); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep({first_sleep_secs}); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n')"
     );
     let first = session
         .write_stdin_raw_with(&first_input, Some(test_timeout_secs(0.05, 0.2)))
@@ -951,6 +952,10 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial under-threshold reply to time out, got: {first_text:?}"
+    );
     assert!(
         bundle_transcript_path(&first_text).is_none(),
         "did not expect the initial under-threshold timeout reply to spill, got: {first_text:?}"

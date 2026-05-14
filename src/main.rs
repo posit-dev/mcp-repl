@@ -31,7 +31,7 @@ mod worker_protocol;
 
 use std::path::PathBuf;
 
-use crate::backend::{Backend, backend_from_env};
+use crate::backend::{Backend, CustomWorkerSpec, WorkerLaunch, backend_from_env};
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::{
     SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
@@ -46,7 +46,7 @@ enum CliCommand {
 struct CliOptions {
     sandbox_plan: SandboxCliPlan,
     debug_repl: bool,
-    backend: Backend,
+    worker_launch: WorkerLaunch,
     debug_dir: Option<PathBuf>,
     oversized_output: OversizedOutputMode,
 }
@@ -90,25 +90,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         "server".to_string()
                     },
-                    backend: match options.backend {
-                        Backend::R => "r".to_string(),
-                        Backend::Python => "python".to_string(),
-                    },
+                    backend: options.worker_launch.label(),
                     debug_repl: options.debug_repl,
                     sandbox_state: None,
                 },
             )?;
             if options.debug_repl {
+                let WorkerLaunch::Builtin(backend) = options.worker_launch.clone() else {
+                    return Err("--debug-repl requires --interpreter, not --worker-spec".into());
+                };
                 crate::diagnostics::startup_log("main: debug repl mode");
-                return debug_repl::run(
-                    options.backend,
-                    options.sandbox_plan,
-                    options.oversized_output,
-                );
+                return debug_repl::run(backend, options.sandbox_plan, options.oversized_output);
             }
             crate::diagnostics::startup_log("main: server mode");
             server::run(
-                options.backend,
+                options.worker_launch,
                 options.sandbox_plan,
                 options.oversized_output,
             )
@@ -145,6 +141,8 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
+    let mut backend_seen = false;
+    let mut worker_spec = None;
     let mut oversized_output = OversizedOutputMode::Pager;
     let mut oversized_output_seen = false;
     while let Some(arg) = parser.next() {
@@ -248,6 +246,20 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
             "--debug-repl" => {
                 debug_repl = true;
             }
+            "--worker-spec" => {
+                let value = parser.next_value("--worker-spec")?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --worker-spec".into());
+                }
+                worker_spec = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--worker-spec=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --worker-spec".into());
+                }
+                worker_spec = Some(PathBuf::from(value));
+            }
             "--debug-dir" => {
                 let value = parser.next_value("--debug-dir")?;
                 if value.trim().is_empty() {
@@ -287,16 +299,28 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
                 oversized_output_seen = true;
             }
             _ => match parse_backend_arg(&arg, &mut parser)? {
-                Some(parsed_backend) => backend = Some(parsed_backend),
+                Some(parsed_backend) => {
+                    backend = Some(parsed_backend);
+                    backend_seen = true;
+                }
                 None => return Err(format!("unknown argument: {arg}").into()),
             },
         }
     }
 
+    let worker_launch = if let Some(path) = worker_spec {
+        if backend_seen {
+            return Err("--worker-spec cannot be combined with --interpreter".into());
+        }
+        WorkerLaunch::Custom(CustomWorkerSpec::from_json_file(&path)?)
+    } else {
+        WorkerLaunch::Builtin(backend.unwrap_or(Backend::R))
+    };
+
     Ok(CliCommand::RunServer(CliOptions {
         sandbox_plan: sandbox_args.plan,
         debug_repl,
-        backend: backend.unwrap_or(Backend::R),
+        worker_launch,
         debug_dir,
         oversized_output,
     }))
@@ -536,6 +560,24 @@ mod tests {
             panic!("expected server command");
         };
         assert_eq!(options.oversized_output, OversizedOutputMode::Files);
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_worker_spec_with_interpreter() {
+        let result = parse_cli_args_from(vec![
+            "--worker-spec".to_string(),
+            "/tmp/zod-worker.json".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ]);
+        let err = match result {
+            Ok(_) => panic!("worker spec and interpreter should conflict"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
