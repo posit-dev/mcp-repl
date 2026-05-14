@@ -245,16 +245,15 @@ pub(crate) fn mark_stdin_write_complete() {
         let waiting_for_input = guard.waiting_for_input;
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
+            let continuation_write_complete =
+                windows_continuation_prompt_write_should_complete(active, current_readline_state);
             let should_complete = if active.repl_turn_finished {
                 request_repl_turn_should_complete(active)
             } else {
                 request_prompt_wait_should_complete(active, current_readline_state)
-                    || windows_continuation_prompt_write_should_complete(
-                        active,
-                        current_readline_state,
-                    )
+                    || continuation_write_complete
             };
-            if waiting_for_input && should_complete {
+            if (waiting_for_input || continuation_write_complete) && should_complete {
                 let fallback_prompt = if active.repl_turn_finished {
                     None
                 } else {

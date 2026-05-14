@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::FromRawFd;
