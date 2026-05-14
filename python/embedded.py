@@ -10,6 +10,7 @@ import pydoc
 import sys
 import threading
 
+import _io
 import _mcp_repl
 
 os.environ.setdefault("MPLBACKEND", "agg")
@@ -586,9 +587,11 @@ def _mcp_repl_plot_capable():
 
 
 _original_excepthook = sys.excepthook
+_original_builtins_open = builtins.open
 _original_io_FileIO = io.FileIO
 _original_os_fdopen = os.fdopen
 _original_os_read = os.read
+_original_os_readv = getattr(os, "readv", None)
 _mcp_repl_raw_stdin_read_supported = os.name == "posix"
 # Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
 _mcp_repl_raw_stdin_stat = None
@@ -622,9 +625,7 @@ def _mcp_repl_is_raw_stdin_fd(fd):
 
 
 def _mcp_repl_stdin_read_mode(mode):
-    return isinstance(mode, str) and "r" in mode and not any(
-        flag in mode for flag in "wax+"
-    )
+    return isinstance(mode, str) and mode in ("r", "rt", "tr", "rb", "br")
 
 
 def _mcp_repl_close_owned_stdin_fd(fd, closefd):
@@ -640,6 +641,34 @@ def _mcp_repl_stdin_stream_for_mode(mode):
     if "b" in mode:
         return stream.buffer
     return stream
+
+
+def _mcp_repl_open(
+    file,
+    mode="r",
+    buffering=-1,
+    encoding=None,
+    errors=None,
+    newline=None,
+    closefd=True,
+    opener=None,
+):
+    try:
+        fd = operator.index(file)
+    except TypeError:
+        return _original_builtins_open(
+            file, mode, buffering, encoding, errors, newline, closefd, opener
+        )
+    if (
+        opener is None
+        and _mcp_repl_is_raw_stdin_fd(fd)
+        and _mcp_repl_stdin_read_mode(mode)
+    ):
+        _mcp_repl_close_owned_stdin_fd(fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(mode)
+    return _original_builtins_open(
+        file, mode, buffering, encoding, errors, newline, closefd, opener
+    )
 
 
 def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
@@ -666,6 +695,17 @@ def _mcp_repl_io_FileIO(file, mode="r", closefd=True, opener=None):
     return _original_io_FileIO(file, mode, closefd=closefd, opener=opener)
 
 
+def _mcp_repl_fill_readv_buffers(buffers, data):
+    offset = 0
+    for view in buffers:
+        if offset >= len(data):
+            break
+        count = min(view.nbytes, len(data) - offset)
+        view[:count] = data[offset : offset + count]
+        offset += count
+    return offset
+
+
 def _mcp_repl_os_read(fd, n):
     fd = operator.index(fd)
     if _mcp_repl_is_raw_stdin_fd(fd):
@@ -678,11 +718,40 @@ def _mcp_repl_os_read(fd, n):
     return _original_os_read(fd, n)
 
 
+def _mcp_repl_os_readv(fd, buffers):
+    fd = operator.index(fd)
+    if not _mcp_repl_is_raw_stdin_fd(fd):
+        return _original_os_readv(fd, buffers)
+    views = []
+    total = 0
+    for buffer in buffers:
+        view = memoryview(buffer)
+        if view.readonly:
+            raise TypeError("readv buffers must be writable")
+        view = view.cast("B")
+        views.append(view)
+        total += view.nbytes
+    if total > sys.maxsize:
+        raise OverflowError("Python int too large to convert to C ssize_t")
+    if total == 0:
+        return 0
+    return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
+
+
 builtins.input = _input
+# The worker keeps a real fd 0 so Unix readiness checks and fork+exec children
+# behave like a normal REPL. Python-level integer-fd reads of that same stdin
+# must still go through sideband so the server can account for consumed input.
+builtins.open = _mcp_repl_open
+io.open = _mcp_repl_open
 io.FileIO = _mcp_repl_io_FileIO
+_io.open = _mcp_repl_open
+_io.FileIO = _mcp_repl_io_FileIO
 pydoc.pager = _pydoc_plainpager
 os.fdopen = _mcp_repl_os_fdopen
 os.read = _mcp_repl_os_read
+if _original_os_readv is not None:
+    os.readv = _mcp_repl_os_readv
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 sys.ps1 = _mcp_repl_suppressed_ps1
