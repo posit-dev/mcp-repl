@@ -530,6 +530,10 @@ def _emit_plots(force_figures=None, force_all=False):
     fig_nums = sorted(fig_nums)
     new_known = set(fig_nums)
     force_figures = set() if force_figures is None else set(force_figures)
+    try:
+        current_fig_num = plt.gcf().number
+    except Exception:
+        current_fig_num = None
     with _plot_lock:
         prev_known = set(_plot_known_figures)
         for stale_num in set(_plot_hashes) - new_known:
@@ -562,6 +566,11 @@ def _emit_plots(force_figures=None, force_all=False):
         _mcp_repl_flush_original_stdio()
         _mcp_repl.emit_plot_image("image/png", encoded, not bool(is_new), str(fig_num))
 
+    if current_fig_num in new_known:
+        try:
+            plt.figure(current_fig_num)
+        except Exception:
+            pass
     with _plot_lock:
         _plot_known_figures = new_known
     _plot_emit_in_progress = False

@@ -516,6 +516,7 @@ pub(crate) fn mark_request_started() {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
+    guard.request_active = true;
     guard.plot_reset_pending = true;
 }
 
@@ -1686,9 +1687,16 @@ fn finish_repl_turn_request() {
         let primary_prompt = guard.python_primary_prompt.clone();
         let continuation_prompt = guard.python_continuation_prompt.clone();
         guard.interrupt_requested = false;
-        guard.request_active = false;
         if guard.active_request.is_some() {
             guard.waiting_for_input = true;
+        } else {
+            // Protocol-style Unix Python has no worker-local ActiveRequest; the
+            // server owns completion, so RequestStart keeps plot state active
+            // across all PyRun_InteractiveOne turns in one MCP request.
+            #[cfg(not(target_family = "unix"))]
+            {
+                guard.request_active = false;
+            }
         }
         if let Some(active) = guard.active_request.as_mut() {
             active.repl_turn_finished = true;
@@ -1704,6 +1712,7 @@ fn finish_repl_turn_request() {
                     &continuation_prompt,
                 ));
                 completed = guard.active_request.take();
+                guard.request_active = false;
             }
         }
     }
