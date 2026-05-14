@@ -1346,6 +1346,40 @@ finally:
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_instance_checks_include_regular_and_stdin_files() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import io, os, tempfile
+fd, path = tempfile.mkstemp()
+os.write(fd, b"x")
+os.close(fd)
+regular = open(path, "rb", buffering=0)
+stdin = io.FileIO(0, "rb", closefd=False)
+print("FILEIO_INSTANCE_CHECKS", isinstance(regular, io.FileIO), isinstance(stdin, io.FileIO))
+regular.close()
+stdin.close()
+os.unlink(path)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FILEIO_INSTANCE_CHECKS True True"),
+        "expected FileIO instance checks to include regular files and stdin wrappers, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_fileio_stdin_read_preserves_remaining_raw_bytes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

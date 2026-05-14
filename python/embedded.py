@@ -827,7 +827,15 @@ def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     return _original_os_fdopen(fd, mode, *args, **kwargs)
 
 
-class _McpReplFileIO(_original_io_FileIO):
+class _McpReplFileIOMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, (_original_io_FileIO, McpRawInputBuffer))
+
+    def __subclasscheck__(cls, subclass):
+        return issubclass(subclass, (_original_io_FileIO, McpRawInputBuffer))
+
+
+class _McpReplFileIO(_original_io_FileIO, metaclass=_McpReplFileIOMeta):
     def __new__(cls, file, mode="r", closefd=True, opener=None):
         try:
             fd = operator.index(file)
