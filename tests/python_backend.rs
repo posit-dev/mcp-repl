@@ -1063,6 +1063,40 @@ data = os.read(0, 100); print("RAW_FD_MULTILINE", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_from_dup_fd_uses_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+fd = os.dup(0)
+data = os.read(fd, 1); os.close(fd); print("RAW_FD_DUP", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected duplicated fd read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("Q", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"RAW_FD_DUP b'Q'"#),
+        "expected duplicated fd read to consume bridge stdin, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_raw_fd_stdin_read_after_interrupt_consumes_new_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

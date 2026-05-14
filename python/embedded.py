@@ -571,6 +571,13 @@ def _mcp_repl_plot_capable():
 _original_excepthook = sys.excepthook
 _original_os_read = os.read
 _mcp_repl_raw_stdin_read_supported = os.name == "posix"
+# Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
+_mcp_repl_raw_stdin_stat = None
+if _mcp_repl_raw_stdin_read_supported:
+    try:
+        _mcp_repl_raw_stdin_stat = os.fstat(0)
+    except OSError:
+        pass
 
 
 def _mcp_repl_excepthook(exc_type, exc, traceback):
@@ -580,9 +587,24 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
     _original_excepthook(exc_type, exc, traceback)
 
 
+def _mcp_repl_is_raw_stdin_fd(fd):
+    if not _mcp_repl_raw_stdin_read_supported:
+        return False
+    if _mcp_repl_raw_stdin_stat is None:
+        return fd == 0
+    try:
+        stat = os.fstat(fd)
+    except OSError:
+        return False
+    return (
+        stat.st_dev == _mcp_repl_raw_stdin_stat.st_dev
+        and stat.st_ino == _mcp_repl_raw_stdin_stat.st_ino
+    )
+
+
 def _mcp_repl_os_read(fd, n):
     fd = operator.index(fd)
-    if fd == 0 and _mcp_repl_raw_stdin_read_supported:
+    if _mcp_repl_is_raw_stdin_fd(fd):
         n = operator.index(n)
         if n > sys.maxsize or n < -sys.maxsize - 1:
             raise OverflowError("Python int too large to convert to C ssize_t")
