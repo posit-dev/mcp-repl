@@ -540,6 +540,8 @@ pub(crate) fn mark_stdin_write_complete() {
 
     if let Some(active) = completed {
         emit_plots();
+        #[cfg(not(target_family = "unix"))]
+        mark_stdin_wait_prompt_completed_request();
         // Python object flushes run from handle_input_hook on the Python thread.
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
@@ -1597,6 +1599,8 @@ fn handle_input_hook() {
             flush_original_stdio();
         } else if let Some(active) = completed {
             emit_plots();
+            #[cfg(not(target_family = "unix"))]
+            mark_stdin_wait_prompt_completed_request();
             flush_original_stdio();
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
@@ -2318,18 +2322,17 @@ fn emit_output_text(stream: TextStream, bytes: &[u8]) {
     }
 }
 
-#[cfg(target_family = "unix")]
 fn mark_stdin_wait_prompt_completed_request() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
-    // A Unix input()/sys.stdin.readline() prompt with no buffered answer is the
-    // response boundary for the current MCP request. The Python read then
-    // releases the GIL while it waits for a later request to supply stdin, so
-    // background Python threads can run. Clear the plot gate at this boundary
-    // to prevent those background updates from being attributed to the request
-    // that already completed.
+    // An input()/sys.stdin.readline() prompt with no buffered answer is the
+    // response boundary for the current MCP request. The Python read can then
+    // block while background Python threads keep running. Clear the plot gate at
+    // this boundary to prevent those background updates from being attributed to
+    // the request that already completed. On Unix this also happens before the
+    // prompt sideband is emitted because the server owns that completion path.
     guard.request_active = false;
     guard.request_completed_at_stdin_wait = true;
 }
