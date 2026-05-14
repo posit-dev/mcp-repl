@@ -570,6 +570,7 @@ def _mcp_repl_plot_capable():
 
 _original_excepthook = sys.excepthook
 _original_os_read = os.read
+_mcp_repl_raw_stdin_read_supported = os.name == "posix"
 
 
 def _mcp_repl_excepthook(exc_type, exc, traceback):
@@ -581,7 +582,7 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
 
 def _mcp_repl_os_read(fd, n):
     fd = operator.index(fd)
-    if fd == 0:
+    if fd == 0 and _mcp_repl_raw_stdin_read_supported:
         n = operator.index(n)
         if n > sys.maxsize or n < -sys.maxsize - 1:
             raise OverflowError("Python int too large to convert to C ssize_t")
