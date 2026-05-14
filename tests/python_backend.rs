@@ -1345,6 +1345,42 @@ first = stream.read(1); second = os.read(0, 1); print("FILEIO_RAW_SPLIT", first,
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_stdin_line_reads_use_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import io
+stream = io.FileIO(0, 'rb', closefd=False)
+first = stream.readline(); second = next(stream); stream.close(); print("FILEIO_LINES", first, second)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected FileIO line read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_with("one\ntwo\n", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FILEIO_LINES b'one\n' b'two\n'"#),
+        "expected FileIO line reads to consume bridge stdin, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_open_fd_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

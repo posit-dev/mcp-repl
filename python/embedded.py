@@ -365,9 +365,9 @@ class McpInputBuffer:
         pass
 
 
-class McpRawInputBuffer:
+class McpRawInputBuffer(io.RawIOBase):
     def __init__(self):
-        self.closed = False
+        super().__init__()
 
     def _check_open(self):
         if self.closed:
@@ -390,6 +390,40 @@ class McpRawInputBuffer:
     def readall(self):
         return self.read(-1)
 
+    def readline(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            chunk = self.read(1)
+            if chunk == b"":
+                break
+            chunks.append(chunk)
+            if chunk == b"\n":
+                break
+            if remaining > 0:
+                remaining -= 1
+        return b"".join(chunks)
+
+    def readlines(self, hint=-1):
+        self._check_open()
+        hint = self._normalize_size(hint)
+        lines = []
+        total = 0
+        while True:
+            line = self.readline()
+            if line == b"":
+                break
+            lines.append(line)
+            total += len(line)
+            if hint > 0 and total >= hint:
+                break
+        return lines
+
     def readinto(self, target):
         data = self.read(len(target))
         target[: len(data)] = data
@@ -409,16 +443,6 @@ class McpRawInputBuffer:
 
     def fileno(self):
         return 0
-
-    def close(self):
-        self.closed = True
-
-    def __enter__(self):
-        self._check_open()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.close()
 
     def flush(self):
         pass
