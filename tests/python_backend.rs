@@ -1414,6 +1414,74 @@ data = stream.read(1); stream.close(); print("OPEN_FD_STDIN", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_open_unbuffered_stdin_read_preserves_remaining_raw_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+stream = open(0, 'rb', buffering=0, closefd=False)
+first = stream.read(1); second = os.read(0, 1); print("OPEN_UNBUFFERED_RAW_SPLIT", first, second)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected unbuffered open raw split read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("AB", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"OPEN_UNBUFFERED_RAW_SPLIT b'A' b'B'"#),
+        "expected unbuffered open read to leave remaining bytes for os.read, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_fdopen_unbuffered_stdin_read_preserves_remaining_raw_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+stream = os.fdopen(os.dup(0), 'rb', 0)
+first = stream.read(1); second = os.read(0, 1); print("FDOPEN_UNBUFFERED_RAW_SPLIT", first, second)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected unbuffered fdopen raw split read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("CD", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FDOPEN_UNBUFFERED_RAW_SPLIT b'C' b'D'"#),
+        "expected unbuffered fdopen read to leave remaining bytes for os.read, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_readv_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

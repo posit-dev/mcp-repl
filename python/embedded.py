@@ -731,6 +731,15 @@ def _mcp_repl_stdin_read_mode(mode):
     return isinstance(mode, str) and mode in ("r", "rt", "tr", "rb", "br")
 
 
+def _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+    return (
+        isinstance(mode, str)
+        and "b" in mode
+        and _mcp_repl_stdin_read_mode(mode)
+        and operator.index(buffering) == 0
+    )
+
+
 def _mcp_repl_close_owned_stdin_fd(fd, closefd):
     if closefd and fd != 0:
         try:
@@ -747,6 +756,12 @@ def _mcp_repl_os_fdopen_closefd(args, kwargs):
     if len(args) >= 5:
         return args[4]
     return kwargs.get("closefd", True)
+
+
+def _mcp_repl_os_fdopen_buffering(args, kwargs):
+    if len(args) >= 1:
+        return args[0]
+    return kwargs.get("buffering", -1)
 
 
 def _mcp_repl_stdin_stream_for_mode(mode):
@@ -775,6 +790,8 @@ def _mcp_repl_open(
             and _mcp_repl_is_raw_stdin_path(file)
             and _mcp_repl_stdin_read_mode(mode)
         ):
+            if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+                return McpRawInputBuffer()
             return _mcp_repl_stdin_stream_for_mode(mode)
         return _original_builtins_open(
             file, mode, buffering, encoding, errors, newline, closefd, opener
@@ -785,6 +802,8 @@ def _mcp_repl_open(
         and _mcp_repl_stdin_read_mode(mode)
     ):
         _mcp_repl_close_owned_stdin_fd(fd, closefd)
+        if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+            return McpRawInputBuffer()
         return _mcp_repl_stdin_stream_for_mode(mode)
     return _original_builtins_open(
         file, mode, buffering, encoding, errors, newline, closefd, opener
@@ -793,9 +812,12 @@ def _mcp_repl_open(
 
 def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     fd = operator.index(fd)
+    buffering = _mcp_repl_os_fdopen_buffering(args, kwargs)
     closefd = _mcp_repl_os_fdopen_closefd(args, kwargs)
     if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
         _mcp_repl_close_owned_stdin_fd(fd, closefd)
+        if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+            return McpRawInputBuffer()
         return _mcp_repl_stdin_stream_for_mode(mode)
     return _original_os_fdopen(fd, mode, *args, **kwargs)
 
