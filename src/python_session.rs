@@ -1882,6 +1882,11 @@ enum CStdinLine {
 }
 
 fn read_c_stdin_line(prompt: &str) -> CStdinLine {
+    #[cfg(target_family = "unix")]
+    if ipc::worker_ipc_disabled_for_process() {
+        return fork_child_stdin_eof(prompt);
+    }
+
     let stdin = PYTHON_STDIN_FILE.load(Ordering::SeqCst);
     if stdin.is_null() {
         set_callback_error("Python stdio files are not initialized");
@@ -1932,7 +1937,28 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
 }
 
 #[cfg(target_family = "unix")]
+fn fork_child_stdin_eof(prompt: &str) -> CStdinLine {
+    // Fork children inherit fd 0/1/2, but mcp-repl sideband IPC is deliberately
+    // disabled in the at-fork child handler. Letting Python-level stdin wrappers
+    // use the parent RuntimeStdinBridge would deadlock because only the forking
+    // thread survives. Reading fd 0 directly would be closer to vanilla
+    // os.fork(), but the parent server could not observe those consumed bytes
+    // through sideband and request completion would become ambiguous. Treat
+    // mcp-repl-managed stdin as EOF in IPC-disabled children instead. Raw
+    // stdout/stderr still fall back to fd writes, and fork+exec children keep
+    // the inherited OS fds.
+    if !prompt.is_empty() {
+        emit_output_text(TextStream::Stdout, prompt.as_bytes());
+    }
+    CStdinLine::Eof
+}
+
+#[cfg(target_family = "unix")]
 fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
+    if ipc::worker_ipc_disabled_for_process() {
+        return Vec::new();
+    }
+
     let Some(bridge) = PYTHON_STDIN_BRIDGE.get() else {
         return Vec::new();
     };

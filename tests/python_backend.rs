@@ -1880,6 +1880,51 @@ exec("pid = os.fork()\nif pid == 0:\n    os._exit(0)\n_, status = os.waitpid(pid
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fork_child_mcp_stdin_returns_eof() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""import os
+pid = os.fork()
+if pid == 0:
+    try:
+        input("child> ")
+    except EOFError:
+        print("CHILD_STDIN_EOF", flush=True)
+        os._exit(0)
+    print("CHILD_STDIN_READ", flush=True)
+    os._exit(2)
+_, status = os.waitpid(pid, 0)
+print("FORK_STDIN_STATUS", status)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected fork child stdin EOF to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("CHILD_STDIN_EOF"),
+        "expected fork child mcp-repl stdin to return EOF, got: {text:?}"
+    );
+    assert!(
+        text.contains("FORK_STDIN_STATUS 0"),
+        "expected fork child to exit cleanly, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
