@@ -668,6 +668,7 @@ if _mcp_repl_raw_stdin_read_supported:
         _mcp_repl_raw_stdin_stat = os.fstat(0)
     except OSError:
         pass
+_mcp_repl_stdin_path_aliases = frozenset(("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 
 
 def _mcp_repl_excepthook(exc_type, exc, traceback):
@@ -690,6 +691,16 @@ def _mcp_repl_is_raw_stdin_fd(fd):
         stat.st_dev == _mcp_repl_raw_stdin_stat.st_dev
         and stat.st_ino == _mcp_repl_raw_stdin_stat.st_ino
     )
+
+
+def _mcp_repl_is_raw_stdin_path(file):
+    try:
+        path = os.fspath(file)
+    except TypeError:
+        return False
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    return os.path.normpath(path) in _mcp_repl_stdin_path_aliases
 
 
 def _mcp_repl_stdin_read_mode(mode):
@@ -734,6 +745,13 @@ def _mcp_repl_open(
     try:
         fd = operator.index(file)
     except TypeError:
+        if (
+            opener is None
+            and closefd
+            and _mcp_repl_is_raw_stdin_path(file)
+            and _mcp_repl_stdin_read_mode(mode)
+        ):
+            return _mcp_repl_stdin_stream_for_mode(mode)
         return _original_builtins_open(
             file, mode, buffering, encoding, errors, newline, closefd, opener
         )
@@ -763,6 +781,13 @@ class _McpReplFileIO(_original_io_FileIO):
         try:
             fd = operator.index(file)
         except TypeError:
+            if (
+                opener is None
+                and closefd
+                and _mcp_repl_is_raw_stdin_path(file)
+                and _mcp_repl_stdin_read_mode(mode)
+            ):
+                return McpRawInputBuffer()
             return super().__new__(cls)
         if (
             opener is None
@@ -823,7 +848,8 @@ def _mcp_repl_os_readv(fd, buffers):
 builtins.input = _input
 # The worker keeps a real fd 0 so Unix readiness checks and fork+exec children
 # behave like a normal REPL. Python-level integer-fd reads of that same stdin
-# must still go through sideband so the server can account for consumed input.
+# and path aliases to it must still go through sideband so the server can
+# account for consumed input.
 builtins.open = _mcp_repl_open
 io.open = _mcp_repl_open
 io.FileIO = _McpReplFileIO
@@ -838,6 +864,12 @@ sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 sys.ps1 = _mcp_repl_suppressed_ps1
 sys.ps2 = _mcp_repl_suppressed_ps2
-sys.stdin = McpInputStream()
+_mcp_repl_stdin = McpInputStream()
+sys.stdin = _mcp_repl_stdin
+# In vanilla Python, sys.__stdin__ preserves the startup stdin object. In this
+# embedded REPL the startup stdin is mcp-repl-managed, and leaving CPython's
+# original fd-backed object exposed would let user code bypass sideband input
+# accounting and keep requests busy after consuming bytes.
+sys.__stdin__ = _mcp_repl_stdin
 sys.stdout = McpOutputStream("stdout")
 sys.stderr = McpOutputStream("stderr")
