@@ -1034,6 +1034,54 @@ data = stream.read(1); stream.close(); print("DEV_STDIN", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_dev_stdin_after_dup2_reads_reassigned_fd() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"exec("""import os, tempfile
+saved_stdin = os.dup(0)
+tmp = tempfile.TemporaryFile()
+tmp.write(b"file")
+tmp.seek(0)
+try:
+    os.dup2(tmp.fileno(), 0)
+    stream = open("/dev/stdin", "rb", buffering=0)
+    data = stream.read(4)
+    stream.close()
+finally:
+    os.dup2(saved_stdin, 0)
+    os.close(saved_stdin)
+    tmp.close()
+print("DEV_STDIN_REASSIGNED", data)
+""")
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let mut text = result_text(&first);
+    if is_busy_response(&text) || text.contains("<<repl status: waiting for stdin>>") {
+        let follow_up = session.write_stdin_raw_with("tool", Some(5.0)).await?;
+        text.push_str(&result_text(&follow_up));
+    }
+    session.cancel().await?;
+
+    assert!(
+        text.contains(r#"DEV_STDIN_REASSIGNED b'file'"#),
+        "expected /dev/stdin after dup2 to read reassigned fd, got: {text:?}"
+    );
+    assert!(
+        !text.contains(r#"DEV_STDIN_REASSIGNED b'tool'"#),
+        "expected /dev/stdin after dup2 not to consume MCP stdin, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_raw_fd_stdin_read_completes_request() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

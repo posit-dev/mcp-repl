@@ -756,7 +756,11 @@ def _mcp_repl_is_raw_stdin_path(file):
         return False
     if isinstance(path, bytes):
         path = os.fsdecode(path)
-    return os.path.normpath(path) in _mcp_repl_stdin_path_aliases
+    if os.path.normpath(path) not in _mcp_repl_stdin_path_aliases:
+        return False
+    # These aliases resolve through the current fd 0. Keep routing them through
+    # the bridge only while fd 0 still names the original managed stdin.
+    return _mcp_repl_is_raw_stdin_fd(0)
 
 
 def _mcp_repl_stdin_read_mode(mode):
