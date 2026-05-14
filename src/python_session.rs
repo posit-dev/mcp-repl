@@ -565,25 +565,72 @@ fn discard_pending_stdin() {
 
 #[cfg(target_family = "unix")]
 fn drain_process_stdin_pipe() -> Vec<u8> {
+    let Some(_nonblocking) = NonBlockingFd::new(libc::STDIN_FILENO) else {
+        return Vec::new();
+    };
+
     let mut discarded = Vec::new();
     let mut buffer = [0u8; 8192];
-    while let Some(available) = stdin_pending_byte_count() {
-        if available == 0 {
-            break;
-        }
-        let to_read = available.min(buffer.len());
-        let read = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), to_read) };
+    loop {
+        let read =
+            unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
         if read > 0 {
             discarded.extend_from_slice(&buffer[..read as usize]);
-        } else if read < 0
-            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-        {
             continue;
-        } else {
+        }
+        if read == 0 {
             break;
         }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if stdin_read_would_block(&err) {
+            break;
+        }
+        break;
     }
     discarded
+}
+
+#[cfg(target_family = "unix")]
+struct NonBlockingFd {
+    fd: libc::c_int,
+    previous_flags: Option<libc::c_int>,
+}
+
+#[cfg(target_family = "unix")]
+impl NonBlockingFd {
+    fn new(fd: libc::c_int) -> Option<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return None;
+        }
+        if flags & libc::O_NONBLOCK != 0 {
+            return Some(Self {
+                fd,
+                previous_flags: None,
+            });
+        }
+
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return None;
+        }
+        Some(Self {
+            fd,
+            previous_flags: Some(flags),
+        })
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl Drop for NonBlockingFd {
+    fn drop(&mut self) {
+        if let Some(flags) = self.previous_flags {
+            let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, flags) };
+        }
+    }
 }
 
 #[cfg(target_family = "unix")]
