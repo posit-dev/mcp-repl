@@ -1555,6 +1555,46 @@ first = stream.read(1); second = os.read(0, 1); print("OPEN_UNBUFFERED_RAW_SPLIT
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_readwrite_binary_stdin_modes_use_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"exec("""import io, os
+opened = open(0, "rb+", buffering=0, closefd=False)
+fileio = io.FileIO(os.dup(0), "r+b")
+first = opened.read(1)
+second = fileio.read(1)
+opened.close()
+fileio.close()
+print("STDIN_READWRITE_MODES", first, second)
+""")
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+
+    let answer = session.write_stdin_raw_with("XY", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected read/write stdin modes to report stdin wait, got: {prompt_text:?}"
+    );
+    assert!(
+        answer_text.contains(r#"STDIN_READWRITE_MODES b'X' b'Y'"#),
+        "expected read/write stdin modes to consume bridge stdin, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_fdopen_unbuffered_stdin_read_preserves_remaining_raw_bytes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

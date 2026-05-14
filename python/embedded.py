@@ -760,7 +760,18 @@ def _mcp_repl_is_raw_stdin_path(file):
 
 
 def _mcp_repl_stdin_read_mode(mode):
-    return isinstance(mode, str) and mode in ("r", "rt", "tr", "rb", "br")
+    if not isinstance(mode, str):
+        return False
+    chars = set(mode)
+    if "r" not in chars or ("b" in chars and "t" in chars):
+        return False
+    if any(ch not in "rbt+" for ch in chars):
+        return False
+    if any(mode.count(ch) > 1 for ch in chars):
+        return False
+    # Readable '+' modes must use the bridge so fd-0 reads stay accounted. The bridge
+    # remains read-only; write attempts fail instead of mutating mcp-repl-managed stdin.
+    return True
 
 
 def _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
