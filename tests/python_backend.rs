@@ -1200,6 +1200,40 @@ finally:
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_stdin_read_preserves_remaining_raw_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import io, os
+stream = io.FileIO(0, 'rb', closefd=False)
+first = stream.read(1); second = os.read(0, 1); print("FILEIO_RAW_SPLIT", first, second)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected FileIO raw split read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("AB", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FILEIO_RAW_SPLIT b'A' b'B'"#),
+        "expected FileIO read to leave remaining bytes for os.read, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_open_fd_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

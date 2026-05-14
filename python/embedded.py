@@ -365,6 +365,65 @@ class McpInputBuffer:
         pass
 
 
+class McpRawInputBuffer:
+    def __init__(self):
+        self.closed = False
+
+    def _check_open(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+
+    def _normalize_size(self, size):
+        if size is None:
+            return -1
+        return operator.index(size)
+
+    def read(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+        if size < 0:
+            return McpInputStream().buffer.read(size)
+        return _mcp_repl.raw_stdin_read(size)
+
+    def readall(self):
+        return self.read(-1)
+
+    def readinto(self, target):
+        data = self.read(len(target))
+        target[: len(data)] = data
+        return len(data)
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def flush(self):
+        pass
+
+
 class McpOutputStream:
     encoding = "utf-8"
     errors = "replace"
@@ -701,7 +760,7 @@ class _McpReplFileIO(_original_io_FileIO):
             and _mcp_repl_stdin_read_mode(mode)
         ):
             _mcp_repl_close_owned_stdin_fd(fd, closefd)
-            return _mcp_repl_stdin_stream_for_mode("b")
+            return McpRawInputBuffer()
         return super().__new__(cls)
 
     def __init__(self, file, mode="r", closefd=True, opener=None):
