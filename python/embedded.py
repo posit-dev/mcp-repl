@@ -96,8 +96,10 @@ class McpInputStream:
     errors = "replace"
     newlines = None
 
-    def __init__(self):
+    def __init__(self, fileno=0, closefd=False):
         self._buffer = b""
+        self._fileno = fileno
+        self._closefd = closefd
         self.buffer = McpInputBuffer(self)
         self.closed = False
 
@@ -277,10 +279,16 @@ class McpInputStream:
         return False
 
     def fileno(self):
-        return 0
+        return self._fileno
 
     def close(self):
-        self.closed = True
+        if self.closed:
+            return
+        try:
+            if self._closefd and self._fileno != 0:
+                os.close(self._fileno)
+        finally:
+            self.closed = True
 
     def __enter__(self):
         self._check_open()
@@ -361,7 +369,7 @@ class McpInputBuffer:
         return False
 
     def fileno(self):
-        return 0
+        return self._text_stream.fileno()
 
     def close(self):
         self._text_stream.close()
@@ -371,8 +379,10 @@ class McpInputBuffer:
 
 
 class McpRawInputBuffer(io.RawIOBase):
-    def __init__(self):
+    def __init__(self, fileno=0, closefd=False):
         super().__init__()
+        self._fileno = fileno
+        self._closefd = closefd
 
     def _check_open(self):
         if self.closed:
@@ -447,7 +457,16 @@ class McpRawInputBuffer(io.RawIOBase):
         return False
 
     def fileno(self):
-        return 0
+        return self._fileno
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            if self._closefd and self._fileno != 0:
+                os.close(self._fileno)
+        finally:
+            super().close()
 
     def flush(self):
         pass
@@ -745,14 +764,6 @@ def _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
     )
 
 
-def _mcp_repl_close_owned_stdin_fd(fd, closefd):
-    if closefd and fd != 0:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
 def _mcp_repl_os_fdopen_closefd(args, kwargs):
     # os.fdopen forwards positional args to open(fd, mode, ...), where
     # closefd is the fifth argument after mode. Respecting that slot preserves
@@ -769,8 +780,8 @@ def _mcp_repl_os_fdopen_buffering(args, kwargs):
     return kwargs.get("buffering", -1)
 
 
-def _mcp_repl_stdin_stream_for_mode(mode):
-    stream = McpInputStream()
+def _mcp_repl_stdin_stream_for_mode(mode, fileno=0, closefd=False):
+    stream = McpInputStream(fileno, closefd)
     if "b" in mode:
         return stream.buffer
     return stream
@@ -806,10 +817,9 @@ def _mcp_repl_open(
         and _mcp_repl_is_raw_stdin_fd(fd)
         and _mcp_repl_stdin_read_mode(mode)
     ):
-        _mcp_repl_close_owned_stdin_fd(fd, closefd)
         if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
-            return McpRawInputBuffer()
-        return _mcp_repl_stdin_stream_for_mode(mode)
+            return McpRawInputBuffer(fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(mode, fd, closefd)
     return _original_builtins_open(
         file, mode, buffering, encoding, errors, newline, closefd, opener
     )
@@ -820,10 +830,9 @@ def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     buffering = _mcp_repl_os_fdopen_buffering(args, kwargs)
     closefd = _mcp_repl_os_fdopen_closefd(args, kwargs)
     if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
-        _mcp_repl_close_owned_stdin_fd(fd, closefd)
         if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
-            return McpRawInputBuffer()
-        return _mcp_repl_stdin_stream_for_mode(mode)
+            return McpRawInputBuffer(fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(mode, fd, closefd)
     return _original_os_fdopen(fd, mode, *args, **kwargs)
 
 
@@ -853,8 +862,7 @@ class _McpReplFileIO(_original_io_FileIO, metaclass=_McpReplFileIOMeta):
             and _mcp_repl_is_raw_stdin_fd(fd)
             and _mcp_repl_stdin_read_mode(mode)
         ):
-            _mcp_repl_close_owned_stdin_fd(fd, closefd)
-            return McpRawInputBuffer()
+            return McpRawInputBuffer(fd, closefd)
         return super().__new__(cls)
 
     def __init__(self, file, mode="r", closefd=True, opener=None):

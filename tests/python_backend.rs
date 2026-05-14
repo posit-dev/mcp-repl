@@ -1450,6 +1450,44 @@ first = stream.readline(); second = next(stream); stream.close(); print("FILEIO_
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_duplicated_stdin_wrappers_report_supplied_fileno() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import io, os
+fdopen_fd = os.dup(0)
+open_fd = os.dup(0)
+fileio_fd = os.dup(0)
+fdopen_stream = os.fdopen(fdopen_fd, "rb", closefd=False)
+open_stream = open(open_fd, "rb", closefd=False)
+fileio_stream = io.FileIO(fileio_fd, "rb", closefd=False)
+print("STDIN_WRAPPER_FILENOS", fdopen_stream.fileno() == fdopen_fd, open_stream.fileno() == open_fd, fileio_stream.fileno() == fileio_fd)
+fdopen_stream.close()
+open_stream.close()
+fileio_stream.close()
+os.close(fdopen_fd)
+os.close(open_fd)
+os.close(fileio_fd)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STDIN_WRAPPER_FILENOS True True True"),
+        "expected duplicated stdin wrappers to report supplied fds, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_open_fd_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
