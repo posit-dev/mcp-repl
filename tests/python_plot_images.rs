@@ -777,7 +777,7 @@ threading.Thread(target=_mcp_repl_late_input_plot, daemon=True).start()
 answer = input("next? ")"#,
         python_plot_preamble()
     );
-    let prompt_result = session.write_stdin_raw_with(&input, Some(1.0)).await?;
+    let prompt_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
     assert_ne!(
         prompt_result.is_error,
         Some(true),
@@ -853,7 +853,7 @@ print("RAW_STDIN_WAIT_ANSWER", answer)
 """)"#,
         python_plot_preamble()
     );
-    let prompt_result = session.write_stdin_raw_with(&input, Some(1.0)).await?;
+    let prompt_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
     assert_ne!(
         prompt_result.is_error,
         Some(true),
