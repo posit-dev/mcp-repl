@@ -874,21 +874,30 @@ impl BackendDriver for PythonBackendDriver {
 }
 
 struct ProtocolBackendDriver {
-    announce_request_start: bool,
+    #[cfg(target_family = "unix")]
+    python_request_generation: Option<u64>,
 }
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
         Self {
-            announce_request_start: false,
+            #[cfg(target_family = "unix")]
+            python_request_generation: None,
         }
     }
 
     #[cfg(target_family = "unix")]
     fn python() -> Self {
         Self {
-            announce_request_start: true,
+            python_request_generation: Some(0),
         }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn next_python_request_generation(&mut self) -> Option<u64> {
+        let generation = self.python_request_generation.as_mut()?;
+        *generation = generation.wrapping_add(1);
+        Some(*generation)
     }
 }
 
@@ -909,12 +918,17 @@ impl BackendDriver for ProtocolBackendDriver {
         timeout: Duration,
     ) -> Result<(), WorkerError> {
         ipc.begin_request_with_stdin(payload);
-        if self.announce_request_start {
+        #[cfg(not(target_family = "unix"))]
+        let _ = timeout;
+        #[cfg(target_family = "unix")]
+        if let Some(request_generation) = self.next_python_request_generation() {
             // Built-in Unix Python reads request bytes through the worker stdin fd
             // like a protocol worker, but its plot hooks still need a Python-side
-            // request boundary before follow-up stdin is consumed. Custom protocol
-            // workers do not receive this private bridge message.
-            ipc.send(ServerToWorkerIpcMessage::RequestStart)
+            // request boundary before follow-up stdin is consumed. The generation
+            // also lets a late interrupt avoid draining fd 0 after the next request
+            // has started. Custom protocol workers do not receive this private
+            // bridge message.
+            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart { request_generation })
                 .map_err(WorkerError::Io)?;
             driver_wait_for_stdin_write_ack(ipc, timeout)?;
         }
@@ -941,6 +955,14 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        if let Some(request_generation) = self.python_request_generation {
+            if let Some(ipc) = process.ipc.get() {
+                let _ = ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation });
+            }
+            return process.send_interrupt();
+        }
+
         driver_interrupt(process)
     }
 

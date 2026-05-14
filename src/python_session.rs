@@ -429,11 +429,42 @@ fn take_exit_requested() -> bool {
 }
 
 pub(crate) fn interrupt() {
+    interrupt_for_request_generation(None);
+}
+
+pub(crate) fn interrupt_request_generation(request_generation: u64) {
+    interrupt_for_request_generation(Some(request_generation));
+}
+
+fn interrupt_for_request_generation(request_generation: Option<u64>) {
+    if !interrupt_generation_is_current(request_generation) {
+        return;
+    }
     discard_pending_stdin();
     #[cfg(not(target_family = "unix"))]
     finish_active_request_at_next_read();
     mark_interrupt_requested();
     request_platform_interrupt();
+}
+
+fn interrupt_generation_is_current(request_generation: Option<u64>) -> bool {
+    let Some(request_generation) = request_generation else {
+        return true;
+    };
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let guard = state.inner.lock().unwrap();
+    // Unix Python receives SIGINT out-of-band from the server and an IPC
+    // interrupt message on a separate thread. SIGINT can bring Python back to a
+    // prompt before the IPC thread handles that message; if the next MCP
+    // request has already started, draining fd 0 here would discard the new
+    // request's stdin. Generated Python interrupts are therefore allowed to
+    // clean up only while their original request generation is still current.
+    // The tradeoff is that a very late interrupt stops cleaning old tail bytes
+    // once a later request is accepted; preserving the new request boundary is
+    // the stricter REPL contract.
+    guard.request_generation == request_generation
 }
 
 fn mark_interrupt_requested() {
@@ -518,10 +549,23 @@ pub(crate) fn mark_stdin_write_complete() {
 }
 
 pub(crate) fn mark_request_started() {
+    mark_request_started_with_generation(None);
+}
+
+pub(crate) fn mark_request_started_for_generation(request_generation: u64) {
+    mark_request_started_with_generation(Some(request_generation));
+}
+
+fn mark_request_started_with_generation(request_generation: Option<u64>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
+    if let Some(request_generation) = request_generation {
+        guard.request_generation = request_generation;
+    } else {
+        guard.request_generation = guard.request_generation.wrapping_add(1);
+    }
     guard.request_active = true;
     guard.plot_reset_pending = true;
 }
@@ -1398,6 +1442,7 @@ fn begin_tracked_request(
     let skip_next_hook = !guard.waiting_for_input;
     let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.waiting_for_input = false;
+    guard.request_generation = guard.request_generation.wrapping_add(1);
     guard.active_request = Some(ActiveRequest {
         reply,
         byte_len,
@@ -2118,6 +2163,7 @@ struct SessionState {
 
 struct SessionStateInner {
     active_request: Option<ActiveRequest>,
+    request_generation: u64,
     request_active: bool,
     current_prompt: Option<String>,
     current_readline_state: Option<PythonReadlineState>,
@@ -2151,6 +2197,7 @@ impl SessionState {
         Self {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
+                request_generation: 0,
                 request_active: false,
                 current_prompt: None,
                 current_readline_state: None,

@@ -87,6 +87,9 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
     RequestStart,
+    PythonRequestStart {
+        request_generation: u64,
+    },
     StdinWrite {
         byte_len: usize,
         #[serde(default)]
@@ -95,6 +98,9 @@ pub enum ServerToWorkerIpcMessage {
         final_prompt: Option<String>,
     },
     StdinWriteComplete,
+    PythonInterrupt {
+        request_generation: u64,
+    },
     Interrupt,
     SessionEnd,
 }
@@ -2116,6 +2122,44 @@ mod protocol_tests {
         assert!(
             parsed.is_err(),
             "stdin_write_ack should not deserialize as a server-to-worker message"
+        );
+    }
+
+    #[test]
+    fn python_request_generation_messages_are_server_to_worker_only() {
+        let request_start = serde_json::to_value(ServerToWorkerIpcMessage::PythonRequestStart {
+            request_generation: 7,
+        })
+        .expect("serialize python_request_start");
+        assert_eq!(
+            request_start,
+            json!({
+                "type": "python_request_start",
+                "request_generation": 7
+            })
+        );
+
+        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            matches!(
+                interrupt,
+                Ok(ServerToWorkerIpcMessage::PythonInterrupt {
+                    request_generation: 7
+                })
+            ),
+            "python_interrupt should carry the request generation"
+        );
+
+        let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            worker_to_server.is_err(),
+            "python_interrupt should not deserialize as a worker-to-server message"
         );
     }
 

@@ -180,6 +180,7 @@ fn init_ipc(
             loop {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::RequestStart) => {}
+                    Some(ServerToWorkerIpcMessage::PythonRequestStart { .. }) => {}
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
                         line_count: _,
@@ -191,6 +192,9 @@ fn init_ipc(
                     }
                     Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
+                        crate::r_session::clear_pending_input();
+                    }
+                    Some(ServerToWorkerIpcMessage::PythonInterrupt { .. }) => {
                         crate::r_session::clear_pending_input();
                     }
                     Some(ServerToWorkerIpcMessage::SessionEnd) => {
