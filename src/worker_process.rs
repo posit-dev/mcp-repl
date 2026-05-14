@@ -5322,24 +5322,65 @@ fn append_prompt(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
 fn reconcile_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    _backend: Backend,
+    backend: Backend,
 ) {
-    append_prompt(contents, prompt);
+    match backend {
+        Backend::Python => reconcile_python_completion_prompt(contents, prompt),
+        Backend::R => append_prompt(contents, prompt),
+    }
 }
 
 fn reconcile_trailing_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    _backend: Backend,
+    backend: Backend,
 ) {
-    append_prompt(contents, prompt);
+    match backend {
+        Backend::Python => reconcile_python_completion_prompt(contents, prompt),
+        Backend::R => append_prompt(contents, prompt),
+    }
 }
 
 fn reconcile_polled_completion_prompt(
     contents: &mut Vec<WorkerContent>,
     prompt: Option<String>,
-    _backend: Backend,
+    backend: Backend,
 ) {
+    match backend {
+        Backend::Python => reconcile_python_polled_completion_prompt(contents, prompt),
+        Backend::R => append_prompt_if_missing(contents, prompt),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn reconcile_python_completion_prompt(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
+    append_prompt(contents, prompt);
+}
+
+#[cfg(target_family = "unix")]
+fn reconcile_python_polled_completion_prompt(
+    contents: &mut Vec<WorkerContent>,
+    prompt: Option<String>,
+) {
+    append_prompt_if_missing(contents, prompt);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn reconcile_python_completion_prompt(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
+    if let Some(prompt_text) = prompt.as_deref() {
+        strip_trailing_worker_stdout_prompt(contents, prompt_text);
+    }
+    append_prompt_if_missing(contents, prompt);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn reconcile_python_polled_completion_prompt(
+    contents: &mut Vec<WorkerContent>,
+    prompt: Option<String>,
+) {
+    if let Some(prompt_text) = prompt.as_deref() {
+        strip_trailing_worker_stdout_prompt(contents, prompt_text);
+    }
     append_prompt_if_missing(contents, prompt);
 }
 
@@ -5366,6 +5407,48 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
             text: prefix.to_string(),
             stream: *stream,
             origin: crate::worker_protocol::ContentOrigin::Worker,
+        };
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
+    if prompt.is_empty() {
+        return;
+    }
+
+    let mut idx = contents.len();
+    while idx > 0 {
+        idx = idx.saturating_sub(1);
+        match &contents[idx] {
+            WorkerContent::ContentText {
+                origin: ContentOrigin::Server,
+                ..
+            } => continue,
+            WorkerContent::ContentText {
+                text,
+                stream: TextStream::Stdout,
+                origin: ContentOrigin::Worker,
+            } => {
+                let Some(prefix) = text.strip_suffix(prompt) else {
+                    return;
+                };
+                if prefix.is_empty() {
+                    contents.remove(idx);
+                } else {
+                    contents[idx] = WorkerContent::ContentText {
+                        text: prefix.to_string(),
+                        stream: TextStream::Stdout,
+                        origin: ContentOrigin::Worker,
+                    };
+                }
+                return;
+            }
+            WorkerContent::ContentText {
+                origin: ContentOrigin::Worker,
+                ..
+            }
+            | WorkerContent::ContentImage { .. } => return,
         };
     }
 }

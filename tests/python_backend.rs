@@ -635,6 +635,41 @@ async fn python_smoke() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "unix"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('p> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("p> ") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected input prompt, got: {text:?}"
+    );
+    assert_eq!(
+        text.matches("p> ").count(),
+        1,
+        "expected input prompt to appear once, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(not(unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
