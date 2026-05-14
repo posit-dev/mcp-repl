@@ -2128,6 +2128,37 @@ print("FORK_STDIN_STATUS", status)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_subprocess_does_not_inherit_mcp_stdin_fd() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import subprocess
+proc = subprocess.run(["/bin/cat"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print("SUBPROCESS_STDIN", proc.returncode)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected subprocess inherited stdin to fail fast, got: {text:?}"
+    );
+    assert!(
+        text.contains("SUBPROCESS_STDIN"),
+        "expected subprocess completion to be visible, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_quit_does_not_wait_for_detached_stdio_holders() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {

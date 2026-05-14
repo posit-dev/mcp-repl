@@ -5,7 +5,7 @@ use std::fs::File;
 #[cfg(target_family = "unix")]
 use std::io::Write;
 #[cfg(target_family = "unix")]
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
@@ -813,6 +813,14 @@ fn open_python_runtime() -> Result<PythonRuntime, String> {
 
 #[cfg(target_family = "unix")]
 fn open_python_runtime_with_stdin_bridge() -> Result<PythonRuntime, String> {
+    // Option A for worker children: the Python worker itself keeps fd 0 so the
+    // embedded REPL and Unix readiness checks can read request bytes normally,
+    // but fork+exec children must not inherit mcp-repl-managed stdin. If an exec
+    // child consumes fd 0 directly, the server cannot observe those bytes through
+    // sideband and active stdin accounting can hang the request. Close-on-exec
+    // keeps ordinary REPL execution compatible while making inherited-stdin
+    // subprocesses fail fast instead of stealing request input.
+    set_fd_close_on_exec(libc::STDIN_FILENO)?;
     let (runtime_reader, runtime_writer) =
         std::io::pipe().map_err(|err| format!("failed to create Python stdin pipe: {err}"))?;
     let runtime_read_fd = runtime_reader.into_raw_fd();
@@ -832,6 +840,24 @@ fn open_python_runtime_with_stdin_bridge() -> Result<PythonRuntime, String> {
 }
 
 #[cfg(target_family = "unix")]
+fn set_fd_close_on_exec(fd: RawFd) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(format!(
+            "failed to read fd {fd} close-on-exec flags: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "failed to set fd {fd} close-on-exec: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
 fn start_process_stdin_reader(bridge: Arc<RuntimeStdinBridge>) -> Result<(), String> {
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -840,6 +866,7 @@ fn start_process_stdin_reader(bridge: Arc<RuntimeStdinBridge>) -> Result<(), Str
             std::io::Error::last_os_error()
         ));
     }
+    set_fd_close_on_exec(fd)?;
     let stdin = unsafe { File::from_raw_fd(fd) };
     thread::Builder::new()
         .name("python-stdin-bridge".to_string())
