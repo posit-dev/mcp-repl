@@ -1852,10 +1852,12 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     #[cfg(target_family = "unix")]
     flush_original_stdio();
     #[cfg(target_family = "unix")]
+    let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
+    #[cfg(target_family = "unix")]
     let prompt_delivered_immediately =
         request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
     #[cfg(target_family = "unix")]
-    if prompt_delivered_immediately {
+    if !prompt.is_empty() && (prompt_delivered_immediately || prompt_has_buffered_answer) {
         emit_output_text(TextStream::Stdout, prompt.as_bytes());
     }
     #[cfg(not(target_family = "unix"))]

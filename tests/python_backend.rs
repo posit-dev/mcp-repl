@@ -3994,6 +3994,10 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
         text.contains("got hello"),
         "expected input() to consume buffered hello, got: {text:?}"
     );
+    assert!(
+        text.contains("p> "),
+        "expected buffered input() prompt to stay visible, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())
