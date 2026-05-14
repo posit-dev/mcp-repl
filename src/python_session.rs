@@ -326,7 +326,7 @@ impl RuntimeStdinBridge {
         guard.interrupted
             || guard.eof
             || guard.input.len() >= size
-            || (!guard.input.is_empty() && stdin_pending_byte_count() == Some(0))
+            || (guard.input.back() == Some(&b'\n') && stdin_pending_byte_count() == Some(0))
     }
 
     fn deliver_if_ready(guard: &mut RuntimeStdinBridgeInner) -> bool {

@@ -1097,6 +1097,74 @@ data = os.read(fd, 1); os.close(fd); print("RAW_FD_DUP", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fdopen_dup_stdin_read_uses_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+stream = os.fdopen(os.dup(0), 'rb')
+data = stream.read(1); stream.close(); print("FDOPEN_STDIN", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected fdopen stdin read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("F", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FDOPEN_STDIN b'F'"#),
+        "expected fdopen stdin read to consume bridge stdin, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_stdin_read_uses_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import io
+stream = io.FileIO(0, 'rb', closefd=False)
+data = stream.read(1); stream.close(); print("FILEIO_STDIN", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected FileIO stdin read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("I", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FILEIO_STDIN b'I'"#),
+        "expected FileIO stdin read to consume bridge stdin, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_raw_fd_stdin_read_after_interrupt_consumes_new_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

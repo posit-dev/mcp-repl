@@ -276,6 +276,13 @@ class McpInputStream:
     def close(self):
         self.closed = True
 
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
     def flush(self):
         pass
 
@@ -324,6 +331,16 @@ class McpInputBuffer:
 
     def readinto1(self, target):
         return self.readinto(target)
+
+    def close(self):
+        self._text_stream.close()
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     def readable(self):
         return True
@@ -569,6 +586,8 @@ def _mcp_repl_plot_capable():
 
 
 _original_excepthook = sys.excepthook
+_original_io_FileIO = io.FileIO
+_original_os_fdopen = os.fdopen
 _original_os_read = os.read
 _mcp_repl_raw_stdin_read_supported = os.name == "posix"
 # Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
@@ -602,6 +621,51 @@ def _mcp_repl_is_raw_stdin_fd(fd):
     )
 
 
+def _mcp_repl_stdin_read_mode(mode):
+    return isinstance(mode, str) and "r" in mode and not any(
+        flag in mode for flag in "wax+"
+    )
+
+
+def _mcp_repl_close_owned_stdin_fd(fd, closefd):
+    if closefd and fd != 0:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _mcp_repl_stdin_stream_for_mode(mode):
+    stream = McpInputStream()
+    if "b" in mode:
+        return stream.buffer
+    return stream
+
+
+def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
+    fd = operator.index(fd)
+    closefd = kwargs.get("closefd", True)
+    if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
+        _mcp_repl_close_owned_stdin_fd(fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(mode)
+    return _original_os_fdopen(fd, mode, *args, **kwargs)
+
+
+def _mcp_repl_io_FileIO(file, mode="r", closefd=True, opener=None):
+    try:
+        fd = operator.index(file)
+    except TypeError:
+        return _original_io_FileIO(file, mode, closefd=closefd, opener=opener)
+    if (
+        opener is None
+        and _mcp_repl_is_raw_stdin_fd(fd)
+        and _mcp_repl_stdin_read_mode(mode)
+    ):
+        _mcp_repl_close_owned_stdin_fd(fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode("b")
+    return _original_io_FileIO(file, mode, closefd=closefd, opener=opener)
+
+
 def _mcp_repl_os_read(fd, n):
     fd = operator.index(fd)
     if _mcp_repl_is_raw_stdin_fd(fd):
@@ -615,7 +679,9 @@ def _mcp_repl_os_read(fd, n):
 
 
 builtins.input = _input
+io.FileIO = _mcp_repl_io_FileIO
 pydoc.pager = _pydoc_plainpager
+os.fdopen = _mcp_repl_os_fdopen
 os.read = _mcp_repl_os_read
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
