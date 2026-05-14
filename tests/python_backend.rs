@@ -907,6 +907,39 @@ print("RAW_FD_SPLIT_UTF8", first, second)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_waits_for_follow_up_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 1); print("RAW_FD_WAIT", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected raw fd read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("Z", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"RAW_FD_WAIT b'Z'"#),
+        "expected follow-up input to satisfy raw fd read, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();

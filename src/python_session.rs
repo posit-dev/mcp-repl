@@ -252,7 +252,12 @@ impl RuntimeStdinBridge {
             return Vec::new();
         }
         let mut guard = self.inner.lock().unwrap();
+        let mut wait_announced = false;
         while guard.input.is_empty() && !guard.eof && !guard.interrupted {
+            if !wait_announced && stdin_pending_byte_count() == Some(0) {
+                ipc::emit_readline_start("");
+                wait_announced = true;
+            }
             guard = self.cvar.wait(guard).unwrap();
         }
         if guard.interrupted {
