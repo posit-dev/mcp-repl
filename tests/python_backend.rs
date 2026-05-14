@@ -1013,6 +1013,50 @@ print("FD_READY_BEFORE_STDIN_READ", ready, data.strip())
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_preserves_length_errors() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+for label, size in [("negative", -1), ("non_integer", "x"), ("overflow", 10**100)]:
+    try:
+        os.read(0, size)
+    except Exception as err:
+        print("RAW_FD_LENGTH_ERROR", label, type(err).__name__, str(err))
+
+print("RAW_FD_LENGTH_DONE")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("RAW_FD_LENGTH_ERROR negative OSError [Errno 22] Invalid argument"),
+        "expected negative raw fd read size to raise OSError, got: {text:?}"
+    );
+    assert!(
+        text.contains(
+            "RAW_FD_LENGTH_ERROR non_integer TypeError 'str' object cannot be interpreted as an integer"
+        ),
+        "expected non-integer raw fd read size to raise TypeError, got: {text:?}"
+    );
+    assert!(
+        text.contains(
+            "RAW_FD_LENGTH_ERROR overflow OverflowError Python int too large to convert to C ssize_t"
+        ),
+        "expected overflowing raw fd read size to raise OverflowError, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();

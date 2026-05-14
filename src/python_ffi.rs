@@ -109,6 +109,7 @@ pub struct PythonApi {
     pub py_build_value: unsafe extern "C" fn(*const c_char, ...) -> *mut PyObject,
     pub py_mem_raw_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
+    py_err_occurred: unsafe extern "C" fn() -> *mut PyObject,
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
@@ -180,6 +181,7 @@ impl PythonApi {
             py_build_value: unsafe { load_symbol(&library, b"Py_BuildValue\0")? },
             py_mem_raw_malloc: unsafe { load_symbol(&library, b"PyMem_RawMalloc\0")? },
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
+            py_err_occurred: unsafe { load_symbol(&library, b"PyErr_Occurred\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
@@ -313,7 +315,11 @@ impl PythonApi {
         if item.is_null() {
             return None;
         }
-        Some(unsafe { (self.py_long_as_long)(item) })
+        let value = unsafe { (self.py_long_as_long)(item) };
+        if value == -1 && unsafe { !(self.py_err_occurred)().is_null() } {
+            return None;
+        }
+        Some(value)
     }
 
     pub fn tuple_size(&self, args: *mut PyObject) -> PySsizeT {

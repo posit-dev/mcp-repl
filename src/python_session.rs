@@ -2208,7 +2208,10 @@ unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject
     let Some(size) = api.long_arg(args, 0) else {
         return ptr::null_mut();
     };
-    let size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+    let Ok(size) = usize::try_from(size) else {
+        set_callback_error("raw_stdin_read size must be non-negative");
+        return ptr::null_mut();
+    };
     let bytes = read_raw_stdin_bytes(size);
     match api.bytes(&bytes) {
         Ok(value) => value.into_raw(),

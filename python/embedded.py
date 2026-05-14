@@ -1,8 +1,10 @@
 import base64
 import builtins
+import errno
 import hashlib
 import importlib.util
 import io
+import operator
 import os
 import pydoc
 import sys
@@ -578,7 +580,13 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
 
 
 def _mcp_repl_os_read(fd, n):
+    fd = operator.index(fd)
     if fd == 0:
+        n = operator.index(n)
+        if n > sys.maxsize or n < -sys.maxsize - 1:
+            raise OverflowError("Python int too large to convert to C ssize_t")
+        if n < 0:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
         return _mcp_repl.raw_stdin_read(n)
     return _original_os_read(fd, n)
 
