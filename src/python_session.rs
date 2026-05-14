@@ -191,6 +191,7 @@ struct RuntimeStdinBridgeInner {
     sideband_input: Vec<u8>,
     pending_read: bool,
     pending_raw_read_size: Option<usize>,
+    reader_in_flight: bool,
     eof: bool,
     interrupted: bool,
     writer: Option<std::io::PipeWriter>,
@@ -205,6 +206,7 @@ impl RuntimeStdinBridge {
                 sideband_input: Vec::new(),
                 pending_read: false,
                 pending_raw_read_size: None,
+                reader_in_flight: false,
                 eof: false,
                 interrupted: false,
                 writer: Some(writer),
@@ -224,16 +226,6 @@ impl RuntimeStdinBridge {
         delivered
     }
 
-    fn push_input(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let mut guard = self.inner.lock().unwrap();
-        guard.input.extend(bytes.iter().copied());
-        let _ = Self::deliver_if_ready(&mut guard);
-        self.cvar.notify_all();
-    }
-
     fn mark_eof(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.eof = true;
@@ -249,6 +241,11 @@ impl RuntimeStdinBridge {
         guard.pending_read = false;
         guard.interrupted = guard.pending_raw_read_size.is_some();
         guard.pending_raw_read_size = None;
+        // The fd reader may have consumed the next byte without queueing it yet. Wait before
+        // draining fd 0 directly so interrupt-time discard reports bytes in input order.
+        while guard.reader_in_flight {
+            guard = self.cvar.wait(guard).unwrap();
+        }
         let mut discarded: Vec<u8> = guard.sideband_input.drain(..).collect();
         discarded.extend(guard.input.drain(..));
         self.cvar.notify_all();
@@ -307,9 +304,23 @@ impl RuntimeStdinBridge {
         }
     }
 
-    fn stdin_byte_requested(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        Self::stdin_byte_needed(&guard)
+    fn begin_stdin_byte_read(&self) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        if !Self::stdin_byte_needed(&guard) {
+            return false;
+        }
+        guard.reader_in_flight = true;
+        true
+    }
+
+    fn finish_stdin_byte_read(&self, byte: Option<u8>) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(byte) = byte {
+            guard.input.push_back(byte);
+            let _ = Self::deliver_if_ready(&mut guard);
+        }
+        guard.reader_in_flight = false;
+        self.cvar.notify_all();
     }
 
     fn stdin_byte_needed(guard: &RuntimeStdinBridgeInner) -> bool {
@@ -953,18 +964,26 @@ fn start_process_stdin_reader(bridge: Arc<RuntimeStdinBridge>) -> Result<(), Str
                         break;
                     }
                 }
-                if !bridge.stdin_byte_requested() {
+                if !bridge.begin_stdin_byte_read() {
                     continue;
                 }
                 match read_stdin_byte(stdin_fd) {
-                    Ok(Some(byte)) => bridge.push_input(&[byte]),
+                    Ok(Some(byte)) => bridge.finish_stdin_byte_read(Some(byte)),
                     Ok(None) => {
+                        bridge.finish_stdin_byte_read(None);
                         bridge.mark_eof();
                         break;
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) if stdin_read_would_block(&err) => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                        bridge.finish_stdin_byte_read(None);
+                        continue;
+                    }
+                    Err(err) if stdin_read_would_block(&err) => {
+                        bridge.finish_stdin_byte_read(None);
+                        continue;
+                    }
                     Err(_) => {
+                        bridge.finish_stdin_byte_read(None);
                         bridge.mark_eof();
                         break;
                     }
