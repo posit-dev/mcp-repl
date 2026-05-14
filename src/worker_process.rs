@@ -1183,6 +1183,7 @@ pub struct WorkerManager {
     pending_request_input: Option<String>,
     session_end_seen: bool,
     settled_pending_completion: Option<CompletionInfo>,
+    settled_pending_error: Option<WorkerError>,
     preserved_detached_prefix: PrefixCapture,
     reply_owned_prefix: PrefixCapture,
     next_live_prefix_belongs_to_reply: bool,
@@ -1283,6 +1284,7 @@ impl WorkerManager {
             pending_request_input: None,
             session_end_seen: false,
             settled_pending_completion: None,
+            settled_pending_error: None,
             preserved_detached_prefix: PrefixCapture::default(),
             reply_owned_prefix: PrefixCapture::default(),
             next_live_prefix_belongs_to_reply: false,
@@ -2015,6 +2017,9 @@ impl WorkerManager {
             session_end_seen: false,
         };
 
+        if let Some(err) = self.settled_pending_error.take() {
+            return Err(err);
+        }
         if self.pending_request {
             match self.wait_for_request_completion(timeout) {
                 Ok(info) => {
@@ -2168,6 +2173,9 @@ impl WorkerManager {
             session_end_seen: false,
         };
 
+        if let Some(err) = self.settled_pending_error.take() {
+            return Err(err);
+        }
         if self.pending_request {
             match self.wait_for_request_completion(timeout) {
                 Ok(info) => {
@@ -3833,6 +3841,7 @@ impl WorkerManager {
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
+            self.settled_pending_error = None;
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
@@ -3902,6 +3911,7 @@ impl WorkerManager {
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
+            self.settled_pending_error = None;
             self.last_detached_prefix_item_count = 0;
         }
         self.pager_prompt = None;
@@ -4344,6 +4354,9 @@ impl WorkerManager {
         if !self.pending_request {
             return;
         }
+        if self.settled_pending_error.is_some() {
+            return;
+        }
         let Some(ipc) = self.process.as_ref().and_then(|process| process.ipc.get()) else {
             return;
         };
@@ -4384,7 +4397,10 @@ impl WorkerManager {
             Err(IpcWaitError::SessionEnd) => {
                 self.settle_pending_session_end(&ipc);
             }
-            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected | IpcWaitError::Protocol(_)) => {
+            Err(IpcWaitError::Protocol(message)) => {
+                self.settled_pending_error = Some(WorkerError::Protocol(message));
+            }
+            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
                 let worker_exited = self
                     .process
                     .as_mut()
@@ -4412,6 +4428,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.settled_pending_completion = None;
+        self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 

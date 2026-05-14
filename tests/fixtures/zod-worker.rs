@@ -148,6 +148,12 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
+        sleep_for(parse_millis(millis)?, interrupted, false);
+        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
+        return Ok(());
+    }
+
     if let Some(millis) = command.strip_prefix("interruptible ") {
         sleep_for(parse_millis(millis)?, interrupted, true);
         return Ok(());

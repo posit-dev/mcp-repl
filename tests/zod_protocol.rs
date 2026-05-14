@@ -454,6 +454,46 @@ async fn zod_worker_invalid_output_base64_is_protocol_error() -> TestResult<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_protocol_error_after_timeout_is_reported_on_follow_up() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-output-after-sleep 80",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout busy status, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "after delayed protocol error",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("invalid output_text base64"),
+        "expected delayed protocol error on follow-up, got: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
