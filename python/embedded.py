@@ -13,6 +13,11 @@ import threading
 import _io
 import _mcp_repl
 
+try:
+    import posix as _mcp_repl_posix
+except ImportError:
+    _mcp_repl_posix = None
+
 os.environ.setdefault("MPLBACKEND", "agg")
 sys.argv = ["mcp-repl"]
 if "" not in sys.path:
@@ -906,6 +911,10 @@ os.fdopen = _mcp_repl_os_fdopen
 os.read = _mcp_repl_os_read
 if _original_os_readv is not None:
     os.readv = _mcp_repl_os_readv
+if _mcp_repl_posix is not None:
+    _mcp_repl_posix.read = _mcp_repl_os_read
+    if _original_os_readv is not None:
+        _mcp_repl_posix.readv = _mcp_repl_os_readv
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 sys.ps1 = _mcp_repl_suppressed_ps1
