@@ -940,6 +940,50 @@ data = os.read(0, 1); print("RAW_FD_WAIT", data)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_after_interrupt_consumes_new_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout = session
+        .write_stdin_raw_with("import time; time.sleep(30)", Some(0.2))
+        .await?;
+    let timeout_text = result_text(&timeout);
+    assert!(
+        is_busy_response(&timeout_text),
+        "expected sleep request to time out, got: {timeout_text:?}"
+    );
+
+    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 6)
+hello
+print("RAW_AFTER_INTERRUPT", data)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains(r#"RAW_AFTER_INTERRUPT b'hello\n'"#),
+        "expected raw fd read after interrupt to consume new stdin, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();

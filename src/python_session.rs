@@ -189,6 +189,7 @@ struct RuntimeStdinBridgeInner {
     input: VecDeque<u8>,
     sideband_input: Vec<u8>,
     pending_read: bool,
+    raw_read_pending: bool,
     eof: bool,
     interrupted: bool,
     writer: Option<std::io::PipeWriter>,
@@ -202,6 +203,7 @@ impl RuntimeStdinBridge {
                 input: VecDeque::new(),
                 sideband_input: Vec::new(),
                 pending_read: false,
+                raw_read_pending: false,
                 eof: false,
                 interrupted: false,
                 writer: Some(writer),
@@ -240,7 +242,7 @@ impl RuntimeStdinBridge {
     fn discard_buffered(&self) -> Vec<u8> {
         let mut guard = self.inner.lock().unwrap();
         guard.pending_read = false;
-        guard.interrupted = true;
+        guard.interrupted = guard.raw_read_pending;
         let mut discarded: Vec<u8> = guard.sideband_input.drain(..).collect();
         discarded.extend(guard.input.drain(..));
         self.cvar.notify_all();
@@ -252,6 +254,7 @@ impl RuntimeStdinBridge {
             return Vec::new();
         }
         let mut guard = self.inner.lock().unwrap();
+        guard.raw_read_pending = true;
         let mut wait_announced = false;
         while guard.input.is_empty() && !guard.eof && !guard.interrupted {
             if !wait_announced && stdin_pending_byte_count() == Some(0) {
@@ -262,6 +265,7 @@ impl RuntimeStdinBridge {
         }
         if guard.interrupted {
             guard.interrupted = false;
+            guard.raw_read_pending = false;
             return Vec::new();
         }
         let Some(line_len) = guard
@@ -271,10 +275,12 @@ impl RuntimeStdinBridge {
             .map(|idx| idx.saturating_add(1))
             .or_else(|| (!guard.input.is_empty()).then_some(guard.input.len()))
         else {
+            guard.raw_read_pending = false;
             return Vec::new();
         };
         let take = line_len.min(size);
         let bytes: Vec<u8> = guard.input.drain(..take).collect();
+        guard.raw_read_pending = false;
         Self::emit_readline_input_bytes(&mut guard, &bytes);
         mark_request_input_delivered();
         bytes
