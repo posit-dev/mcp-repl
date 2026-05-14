@@ -274,16 +274,10 @@ impl RuntimeStdinBridge {
             guard.interrupted = false;
             return Vec::new();
         }
-        let Some(line_len) = guard
-            .input
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|idx| idx.saturating_add(1))
-            .or_else(|| (!guard.input.is_empty()).then_some(guard.input.len()))
-        else {
+        if guard.input.is_empty() {
             return Vec::new();
-        };
-        let take = line_len.min(size);
+        }
+        let take = guard.input.len().min(size);
         let bytes: Vec<u8> = guard.input.drain(..take).collect();
         Self::emit_readline_input_bytes(&mut guard, &bytes);
         mark_request_input_delivered();
@@ -332,7 +326,7 @@ impl RuntimeStdinBridge {
         guard.interrupted
             || guard.eof
             || guard.input.len() >= size
-            || guard.input.iter().any(|byte| *byte == b'\n')
+            || (!guard.input.is_empty() && stdin_pending_byte_count() == Some(0))
     }
 
     fn deliver_if_ready(guard: &mut RuntimeStdinBridgeInner) -> bool {

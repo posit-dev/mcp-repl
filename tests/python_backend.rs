@@ -1030,6 +1030,39 @@ data = os.read(0, 1); print("RAW_FD_WAIT", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_raw_fd_stdin_read_consumes_multiline_follow_up_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 100); print("RAW_FD_MULTILINE", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected raw fd read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("abc\ndef", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"RAW_FD_MULTILINE b'abc\ndef\n'"#),
+        "expected follow-up raw fd read to consume all multiline input, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_raw_fd_stdin_read_after_interrupt_consumes_new_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1375,15 +1408,16 @@ async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> Tes
         filler.push('\n');
     }
     let input = format!(
-        "import os\nchunk = os.read(0, 1048576)\n{filler}print('RAW_LARGE_DONE', len(chunk))"
+        "import os\nchunk = os.read(0, {})\n{filler}print('RAW_LARGE_DONE', len(chunk))",
+        filler.len()
     );
     let result = session.write_stdin_raw_with(&input, Some(20.0)).await?;
     let text = result_text(&result);
     session.cancel().await?;
 
     assert!(
-        text.contains("RAW_LARGE_DONE"),
-        "expected large raw fd read request to complete after the full payload, got: {text:?}"
+        text.contains(&format!("RAW_LARGE_DONE {}", filler.len())),
+        "expected large raw fd read request to consume the full payload, got: {text:?}"
     );
     Ok(())
 }
