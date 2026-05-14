@@ -704,6 +704,16 @@ def _mcp_repl_close_owned_stdin_fd(fd, closefd):
             pass
 
 
+def _mcp_repl_os_fdopen_closefd(args, kwargs):
+    # os.fdopen forwards positional args to open(fd, mode, ...), where
+    # closefd is the fifth argument after mode. Respecting that slot preserves
+    # callers that intentionally keep a duplicated stdin fd usable after the
+    # bridge returns its own stdin wrapper.
+    if len(args) >= 5:
+        return args[4]
+    return kwargs.get("closefd", True)
+
+
 def _mcp_repl_stdin_stream_for_mode(mode):
     stream = McpInputStream()
     if "b" in mode:
@@ -741,7 +751,7 @@ def _mcp_repl_open(
 
 def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     fd = operator.index(fd)
-    closefd = kwargs.get("closefd", True)
+    closefd = _mcp_repl_os_fdopen_closefd(args, kwargs)
     if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
         _mcp_repl_close_owned_stdin_fd(fd, closefd)
         return _mcp_repl_stdin_stream_for_mode(mode)

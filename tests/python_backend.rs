@@ -1131,6 +1131,51 @@ data = stream.read(1); stream.close(); print("FDOPEN_STDIN", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fdopen_dup_stdin_honors_positional_closefd_false() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with(
+            r#"exec("""import os
+fd = os.dup(0)
+stream = os.fdopen(fd, 'rb', -1, None, None, None, False)
+data = stream.read(1)
+stream.close()
+try:
+    os.fstat(fd)
+    fd_still_open = True
+except OSError:
+    fd_still_open = False
+if fd_still_open:
+    os.close(fd)
+print("FDOPEN_POSITIONAL_CLOSEFD", data, fd_still_open)
+""")
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("<<repl status: waiting for stdin>>"),
+        "expected positional-closefd fdopen read to report stdin wait, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("P", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains(r#"FDOPEN_POSITIONAL_CLOSEFD b'P' True"#),
+        "expected positional closefd=False to keep duplicate stdin fd open, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_fileio_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
