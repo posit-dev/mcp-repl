@@ -1165,6 +1165,41 @@ data = stream.read(1); stream.close(); print("FILEIO_STDIN", data)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_remains_a_type_for_non_stdin_files() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""import _io, io, os, tempfile
+fd, path = tempfile.mkstemp()
+os.close(fd)
+try:
+    f = io.FileIO(path, "rb")
+    g = _io.FileIO(path, "rb")
+    print("FILEIO_TYPE", isinstance(f, io.FileIO), isinstance(g, _io.FileIO))
+    f.close(); g.close()
+finally:
+    os.unlink(path)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FILEIO_TYPE True True"),
+        "expected FileIO monkeypatch to preserve type semantics, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_open_fd_stdin_read_uses_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

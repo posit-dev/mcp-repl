@@ -680,19 +680,23 @@ def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     return _original_os_fdopen(fd, mode, *args, **kwargs)
 
 
-def _mcp_repl_io_FileIO(file, mode="r", closefd=True, opener=None):
-    try:
-        fd = operator.index(file)
-    except TypeError:
-        return _original_io_FileIO(file, mode, closefd=closefd, opener=opener)
-    if (
-        opener is None
-        and _mcp_repl_is_raw_stdin_fd(fd)
-        and _mcp_repl_stdin_read_mode(mode)
-    ):
-        _mcp_repl_close_owned_stdin_fd(fd, closefd)
-        return _mcp_repl_stdin_stream_for_mode("b")
-    return _original_io_FileIO(file, mode, closefd=closefd, opener=opener)
+class _McpReplFileIO(_original_io_FileIO):
+    def __new__(cls, file, mode="r", closefd=True, opener=None):
+        try:
+            fd = operator.index(file)
+        except TypeError:
+            return super().__new__(cls)
+        if (
+            opener is None
+            and _mcp_repl_is_raw_stdin_fd(fd)
+            and _mcp_repl_stdin_read_mode(mode)
+        ):
+            _mcp_repl_close_owned_stdin_fd(fd, closefd)
+            return _mcp_repl_stdin_stream_for_mode("b")
+        return super().__new__(cls)
+
+    def __init__(self, file, mode="r", closefd=True, opener=None):
+        super().__init__(file, mode, closefd=closefd, opener=opener)
 
 
 def _mcp_repl_fill_readv_buffers(buffers, data):
@@ -744,9 +748,9 @@ builtins.input = _input
 # must still go through sideband so the server can account for consumed input.
 builtins.open = _mcp_repl_open
 io.open = _mcp_repl_open
-io.FileIO = _mcp_repl_io_FileIO
+io.FileIO = _McpReplFileIO
 _io.open = _mcp_repl_open
-_io.FileIO = _mcp_repl_io_FileIO
+_io.FileIO = _McpReplFileIO
 pydoc.pager = _pydoc_plainpager
 os.fdopen = _mcp_repl_os_fdopen
 os.read = _mcp_repl_os_read
