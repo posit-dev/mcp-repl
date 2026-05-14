@@ -1,3 +1,4 @@
+#[cfg(target_family = "unix")]
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
@@ -698,12 +699,6 @@ fn discard_pending_stdin() {
 
 #[cfg(not(any(target_family = "unix", windows)))]
 fn discard_pending_stdin() {}
-
-#[cfg(not(target_family = "unix"))]
-fn request_runtime_stdin_line(prompt: &str) -> bool {
-    ipc::emit_readline_start(prompt);
-    false
-}
 
 #[cfg(windows)]
 fn drain_stdin_pipe() {
@@ -1423,6 +1418,7 @@ fn begin_tracked_request(
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
 fn mark_request_input_delivered() {
     let Some(state) = SESSION_STATE.get() else {
         return;

@@ -884,6 +884,7 @@ impl ProtocolBackendDriver {
         }
     }
 
+    #[cfg(target_family = "unix")]
     fn python() -> Self {
         Self {
             announce_request_start: true,

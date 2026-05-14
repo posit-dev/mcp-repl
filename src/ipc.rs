@@ -1647,6 +1647,7 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
+#[cfg(target_family = "unix")]
 pub fn emit_readline_input(text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInput {
@@ -1655,6 +1656,7 @@ pub fn emit_readline_input(text: &str) {
     }
 }
 
+#[cfg(target_family = "unix")]
 pub fn emit_readline_discard(text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscard {
