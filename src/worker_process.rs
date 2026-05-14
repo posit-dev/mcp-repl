@@ -4123,7 +4123,17 @@ impl WorkerManager {
             );
             return Err(err);
         }
-        self.seed_last_prompt_from_process(&process);
+        if let Err(err) = self.seed_last_prompt_from_process(&process) {
+            let _ = process.kill();
+            crate::event_log::log(
+                "worker_spawn_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "backend": format!("{:?}", self.backend),
+                }),
+            );
+            return Err(err);
+        }
         self.record_spawn();
         crate::event_log::log(
             "worker_spawn_end",
@@ -4201,7 +4211,17 @@ impl WorkerManager {
             );
             return Err(err);
         }
-        self.seed_last_prompt_from_process(&process);
+        if let Err(err) = self.seed_last_prompt_from_process(&process) {
+            let _ = process.kill();
+            crate::event_log::log(
+                "worker_spawn_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "backend": format!("{:?}", self.backend),
+                }),
+            );
+            return Err(err);
+        }
         self.record_spawn();
         crate::event_log::log(
             "worker_spawn_end",
@@ -4258,13 +4278,16 @@ impl WorkerManager {
         true
     }
 
-    fn seed_last_prompt_from_process(&mut self, process: &WorkerProcess) {
+    fn seed_last_prompt_from_process(
+        &mut self,
+        process: &WorkerProcess,
+    ) -> Result<(), WorkerError> {
         let Some(ipc) = process.ipc.get() else {
-            return;
+            return Ok(());
         };
         if let Some(raw_prompt) = ipc.try_take_prompt() {
             self.remember_prompt(Some(raw_prompt));
-            return;
+            return Ok(());
         }
         match ipc.wait_for_prompt(Duration::from_millis(200)) {
             Ok(prompt) => {
@@ -4272,13 +4295,10 @@ impl WorkerManager {
                     self.last_prompt = Some(prompt);
                 }
             }
-            Err(
-                IpcWaitError::Timeout
-                | IpcWaitError::SessionEnd
-                | IpcWaitError::Disconnected
-                | IpcWaitError::Protocol(_),
-            ) => {}
+            Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
+            Err(IpcWaitError::Timeout | IpcWaitError::SessionEnd | IpcWaitError::Disconnected) => {}
         }
+        Ok(())
     }
 
     fn record_spawn(&mut self) {

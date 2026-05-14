@@ -21,6 +21,7 @@ const IPC_WRITE_FD_ENV: &str = "MCP_REPL_IPC_WRITE_FD";
 const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
+const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 
 #[cfg(target_family = "unix")]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -48,6 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stdin: "exit\n".to_string(),
         }),
     })?;
+    if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
+        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
+    }
     writer.send(&WorkerToServer::ReadlineStart {
         prompt: "zod> ".to_string(),
     })?;

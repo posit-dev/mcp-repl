@@ -2,7 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -84,14 +84,20 @@ fn build_zod_worker() -> Result<PathBuf, String> {
     ))
 }
 
-async fn spawn_zod_server() -> TestResult<common::McpTestSession> {
+async fn spawn_zod_server_with_env(
+    env_vars: Vec<(&str, &str)>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
+    let env = env_vars
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+        .collect::<Map<String, Value>>();
     let spec = json!({
         "executable": zod_worker_path()?,
         "args": [],
         "working_dir": "inherit",
-        "env": {},
+        "env": env,
         "stdin": "pipe",
         "sandbox": "server"
     });
@@ -105,6 +111,10 @@ async fn spawn_zod_server() -> TestResult<common::McpTestSession> {
         "files".to_string(),
     ])
     .await
+}
+
+async fn spawn_zod_server() -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_env(Vec::new()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -447,6 +457,30 @@ async fn zod_worker_invalid_output_base64_is_protocol_error() -> TestResult<()> 
     assert!(
         text.contains("invalid output_text base64"),
         "expected invalid base64 protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_startup_protocol_error_after_ready_is_reported() -> TestResult<()> {
+    let session =
+        spawn_zod_server_with_env(vec![("MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR", "1")]).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "after bad startup",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid output_text base64"),
+        "expected startup protocol error to be reported, got: {text:?}"
     );
 
     session.cancel().await?;
