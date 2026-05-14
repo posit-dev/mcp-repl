@@ -1324,6 +1324,10 @@ fn begin_tracked_request(
         repl_turn_finished: false,
         started_after_continuation_prompt,
     });
+    #[cfg(not(target_family = "unix"))]
+    {
+        guard.request_active = true;
+    }
     guard.plot_reset_pending = true;
     state.cvar.notify_all();
     Ok(())

@@ -66,6 +66,44 @@ fn require_python() -> bool {
     }
 }
 
+#[cfg(not(unix))]
+fn python_plotting_available() -> bool {
+    if !common::python_available() {
+        eprintln!("python not available; skipping");
+        return false;
+    }
+    let python = common::python_program().unwrap_or("python3");
+    std::process::Command::new(python)
+        .args([
+            "-c",
+            "import matplotlib; matplotlib.use('agg', force=True); import matplotlib.pyplot as plt",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn python_plot_tests_enabled() -> bool {
+    if std::env::var_os("MCP_REPL_PYTHON_PLOT_TESTS").is_none() {
+        eprintln!("python plot tests disabled; set MCP_REPL_PYTHON_PLOT_TESTS=1 to enable");
+        return false;
+    }
+    python_plotting_available()
+}
+
+#[cfg(not(unix))]
+fn image_count(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, RawContent::Image(_)))
+        .count()
+}
+
 fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
         || text.contains("worker io error: Permission denied")
@@ -592,6 +630,56 @@ async fn python_smoke() -> TestResult<()> {
         return Ok(());
     }
     assert!(text.contains("2"), "expected 2, got: {text:?}");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            r#"import matplotlib
+matplotlib.use("agg", force=True)
+import matplotlib.pyplot as plt
+print("plot ready")
+"#,
+            Some(30.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        setup_text.contains("plot ready"),
+        "expected matplotlib setup to finish, got: {setup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import time
+plt.figure(919)
+plt.clf()
+plt.plot([1, 2, 3], [3, 2, 1])
+plt.show()
+time.sleep(10)
+"#,
+            Some(0.5),
+        )
+        .await?;
+    assert_eq!(
+        image_count(&result),
+        1,
+        "expected plot hook to emit before timeout, got text: {:?}",
+        result_text(&result)
+    );
 
     session.cancel().await?;
     Ok(())
