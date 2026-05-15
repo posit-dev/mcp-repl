@@ -1673,6 +1673,80 @@ first = stream.read(1); second = os.read(0, 1); print("OPEN_UNBUFFERED_RAW_SPLIT
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_open_stdin_rejects_binary_text_options() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""import os
+for label, factory in [
+    ("open", lambda: open(0, "rb", encoding="utf-8", closefd=False)),
+    ("fdopen", lambda: os.fdopen(0, "rb", encoding="utf-8", closefd=False)),
+]:
+    try:
+        stream = factory()
+    except ValueError as exc:
+        print("STDIN_BINARY_TEXT_OPTION", label, type(exc).__name__)
+    else:
+        stream.close()
+        print("STDIN_BINARY_TEXT_OPTION", label, "missing")
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STDIN_BINARY_TEXT_OPTION open ValueError"),
+        "expected open(0, 'rb', encoding=...) to raise ValueError, got: {text:?}"
+    );
+    assert!(
+        text.contains("STDIN_BINARY_TEXT_OPTION fdopen ValueError"),
+        "expected os.fdopen(0, 'rb', encoding=...) to raise ValueError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("missing"),
+        "expected binary text options not to be ignored, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_open_stdin_honors_text_encoding_options() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""stream = open(0, "r", encoding="ascii", errors="replace", closefd=False)
+line = stream.readline()
+print("STDIN_TEXT_OPTIONS", repr(line))
+""")
+é
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains(r#"STDIN_TEXT_OPTIONS '?\n'"#),
+        "expected open(0, text options) to honor encoding/errors, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_readwrite_binary_stdin_modes_use_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

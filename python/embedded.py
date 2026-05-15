@@ -1,5 +1,6 @@
 import base64
 import builtins
+import codecs
 import errno
 import hashlib
 import importlib.util
@@ -122,10 +123,15 @@ class McpInputStream:
     errors = "replace"
     newlines = None
 
-    def __init__(self, fileno=0, closefd=False):
+    def __init__(self, fileno=0, closefd=False, encoding=None, errors=None, newline=None):
         self._buffer = b""
         self._fileno = fileno
         self._closefd = closefd
+        if encoding is not None:
+            self.encoding = encoding
+        if errors is not None:
+            self.errors = errors
+        self._newline = newline
         self.buffer = McpInputBuffer(self)
         self.closed = False
 
@@ -142,7 +148,7 @@ class McpInputStream:
         line = _mcp_repl.readline(prompt)
         if line is None:
             return None
-        return line.encode(self.encoding)
+        return line.encode(self.encoding, self.errors)
 
     def _emit_prompt(self, prompt):
         if prompt:
@@ -815,24 +821,69 @@ def _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
     )
 
 
+def _mcp_repl_validate_stdin_open_options(
+    mode, buffering, encoding=None, errors=None, newline=None
+):
+    if "b" in mode:
+        if encoding is not None:
+            raise ValueError("binary mode doesn't take an encoding argument")
+        if errors is not None:
+            raise ValueError("binary mode doesn't take an errors argument")
+        if newline is not None:
+            raise ValueError("binary mode doesn't take a newline argument")
+        return
+
+    if operator.index(buffering) == 0:
+        raise ValueError("can't have unbuffered text I/O")
+    if encoding is not None:
+        codecs.lookup(encoding)
+    if newline not in (None, "", "\n", "\r", "\r\n"):
+        raise ValueError(f"illegal newline value: {newline}")
+
+
+def _mcp_repl_os_fdopen_arg(args, kwargs, index, name, default=None):
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(name, default)
+
+
 def _mcp_repl_os_fdopen_closefd(args, kwargs):
     # os.fdopen forwards positional args to open(fd, mode, ...), where
     # closefd is the fifth argument after mode. Respecting that slot preserves
     # callers that intentionally keep a duplicated stdin fd usable after the
     # bridge returns its own stdin wrapper.
-    if len(args) >= 5:
-        return args[4]
-    return kwargs.get("closefd", True)
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 4, "closefd", True)
 
 
 def _mcp_repl_os_fdopen_buffering(args, kwargs):
-    if len(args) >= 1:
-        return args[0]
-    return kwargs.get("buffering", -1)
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 0, "buffering", -1)
 
 
-def _mcp_repl_stdin_stream_for_mode(mode, fileno=0, closefd=False):
-    stream = McpInputStream(fileno, closefd)
+def _mcp_repl_os_fdopen_encoding(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 1, "encoding")
+
+
+def _mcp_repl_os_fdopen_errors(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 2, "errors")
+
+
+def _mcp_repl_os_fdopen_newline(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 3, "newline")
+
+
+def _mcp_repl_stdin_stream_for_mode(
+    mode,
+    buffering=-1,
+    encoding=None,
+    errors=None,
+    newline=None,
+    fileno=0,
+    closefd=False,
+):
+    _mcp_repl_validate_stdin_open_options(mode, buffering, encoding, errors, newline)
+    if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+        return McpRawInputBuffer(fileno, closefd)
+    stream = McpInputStream(fileno, closefd, encoding, errors, newline)
     if "b" in mode:
         return stream.buffer
     return stream
@@ -857,9 +908,9 @@ def _mcp_repl_open(
             and _mcp_repl_is_raw_stdin_path(file)
             and _mcp_repl_stdin_read_mode(mode)
         ):
-            if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
-                return McpRawInputBuffer()
-            return _mcp_repl_stdin_stream_for_mode(mode)
+            return _mcp_repl_stdin_stream_for_mode(
+                mode, buffering, encoding, errors, newline
+            )
         return _original_builtins_open(
             file, mode, buffering, encoding, errors, newline, closefd, opener
         )
@@ -868,9 +919,9 @@ def _mcp_repl_open(
         and _mcp_repl_is_raw_stdin_fd(fd)
         and _mcp_repl_stdin_read_mode(mode)
     ):
-        if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
-            return McpRawInputBuffer(fd, closefd)
-        return _mcp_repl_stdin_stream_for_mode(mode, fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(
+            mode, buffering, encoding, errors, newline, fd, closefd
+        )
     return _original_builtins_open(
         file, mode, buffering, encoding, errors, newline, closefd, opener
     )
@@ -879,11 +930,14 @@ def _mcp_repl_open(
 def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
     fd = operator.index(fd)
     buffering = _mcp_repl_os_fdopen_buffering(args, kwargs)
+    encoding = _mcp_repl_os_fdopen_encoding(args, kwargs)
+    errors = _mcp_repl_os_fdopen_errors(args, kwargs)
+    newline = _mcp_repl_os_fdopen_newline(args, kwargs)
     closefd = _mcp_repl_os_fdopen_closefd(args, kwargs)
     if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
-        if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
-            return McpRawInputBuffer(fd, closefd)
-        return _mcp_repl_stdin_stream_for_mode(mode, fd, closefd)
+        return _mcp_repl_stdin_stream_for_mode(
+            mode, buffering, encoding, errors, newline, fd, closefd
+        )
     return _original_os_fdopen(fd, mode, *args, **kwargs)
 
 
