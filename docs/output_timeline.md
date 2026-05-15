@@ -11,6 +11,9 @@ The worker emits different kinds of information on different channels:
 - Raw stdout/stderr bytes still capture unowned output from child processes,
   direct file-descriptor writes, or runtime/native code that bypasses the
   worker-owned output callbacks.
+- PTY-backed workers expose raw terminal output through the PTY master, which
+  may merge stdout/stderr identity and apply terminal behavior such as CRLF
+  translation, echo, and width-dependent formatting.
 - Sideband IPC carries structural events such as `readline_start`,
   `readline_result`, `plot_image`, and `session_end`.
 
@@ -81,6 +84,8 @@ That matching is only opportunistic:
 
 - raw stdout/stderr remains authoritative for text that did not arrive through
   `output_text`
+- raw PTY output is authoritative for the bytes seen on the terminal stream,
+  but it is not authoritative for separate stdout/stderr stream identity
 - forked children, spawned subprocesses, or other writers may interleave with
   or corrupt what would otherwise have been a clean echoed line
 - if exact sideband-to-stdout matching fails or becomes ambiguous, the server
@@ -109,6 +114,8 @@ resolution, not in the wire protocol.
 ## What the timeline must preserve
 
 - Worker text must remain in the order observed on its stdout/stderr pipes.
+- For PTY-backed workers, worker text from the PTY master must remain in the
+  order observed on that terminal stream.
 - Sideband `readline_result` events define the order in which input lines were
   consumed.
 - Sideband `plot_image` events define when plot updates happened relative to

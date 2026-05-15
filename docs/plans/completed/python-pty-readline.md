@@ -9,7 +9,7 @@ continuation state, or emulate Python stdin semantics.
 
 ## Summary
 
-- Move the embedded Python worker toward PTY-backed C stdin/stdout so CPython
+- Move the embedded Python worker to PTY-backed C stdin/stdout on Unix so CPython
   takes the `PyOS_ReadlineFunctionPointer` path for supported interactive input.
 - Keep sideband IPC separate from PTY traffic, with the server continuing to
   write normalized request bytes to worker stdin, consume sideband facts, capture
@@ -24,27 +24,27 @@ continuation state, or emulate Python stdin semantics.
 
 ## Status
 
-- State: active
+- State: completed
 - Last updated: 2026-05-15
-- Current phase: phase 7 pending
-- Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: phase 6, "Remove obsolete Python stdin bridge and direct-fd shims"
+- Current phase: complete
+- Driving initiative: move embedded Python to PTY-backed CPython readline
+- Final slice: current-state documentation and PTY output contract
 
 ## Current Direction
 
 - Treat PTY use as a launch-time worker transport decision, not a steady-state
   sideband protocol feature.
-- Add an explicit pipe-vs-PTY launch abstraction before changing Python behavior.
-- Prove PTY transport independently with sideband kept on a separate IPC channel.
-- Run embedded Python with C stdin and C stdout attached to a PTY so CPython sees
-  TTY streams and calls `PyOS_ReadlineFunctionPointer`.
+- Keep the explicit pipe-vs-PTY launch abstraction.
+- Keep PTY transport independent from sideband IPC.
+- Run embedded Unix Python with C stdin, stdout, and stderr attached to a PTY so
+  CPython sees TTY streams and calls `PyOS_ReadlineFunctionPointer`.
 - Keep the PTY launch implementation platform-specific where sandbox launch
   semantics require it: Unix can allocate the PTY before sandbox exec, while
   Windows sandbox mode must attach ConPTY to the restricted child itself.
 - Make the readline callback the supported stdin accounting point for Python
   interactive input, `input()`, and debugger command loops.
-- Remove or sharply reduce the broad Python stdin bridge after the readline path
-  covers the supported public behavior.
+- Leave CPython's fd-backed stdin surface intact on the Unix PTY path instead of
+  installing broad Python-level direct-fd stdin shims.
 
 This path is preferred because it lets CPython own Python syntax and interactive
 control flow while keeping the server's request handling interpreter-neutral.
@@ -89,19 +89,19 @@ route.
 
 ## Phase Status
 
-- Phase 0: completed - create this plan and record the design boundary (#190).
-- Phase 1: completed - add a launch-time worker stdin transport abstraction (#191).
+- Phase 0: completed - create this plan and record the design boundary.
+- Phase 1: completed - add a launch-time worker stdin transport abstraction.
 - Phase 2: completed - prove PTY worker transport while keeping sideband separate
-  (#192).
+  from visible PTY output.
 - Phase 3: completed - run embedded Python on PTY-backed C stdin/stdout and prove
-  CPython takes the readline path (#193).
-- Phase 4: pending - make `PyOS_ReadlineFunctionPointer` the Python stdin
-  accounting point (#194).
-- Phase 5: completed - harden interrupt and reset cleanup for PTY readline (#195).
+  CPython takes the readline path.
+- Phase 4: completed - make `PyOS_ReadlineFunctionPointer` the Python stdin
+  accounting point.
+- Phase 5: completed - harden interrupt and reset cleanup for PTY readline.
 - Phase 6: completed - remove obsolete Python stdin bridge and direct-fd shims
-  (#196).
-- Phase 7: pending - update current-state docs and snapshots for the final PTY
-  contract (#197).
+  from the Unix PTY path.
+- Phase 7: completed - update current-state docs for the final Unix PTY
+  contract and output tradeoffs.
 
 ## Locked Decisions
 
@@ -119,24 +119,23 @@ route.
 - Broad Python-level stdin interception is rejected as the long-term design.
   Keep only compatibility code that is justified by public behavior tests.
 
-## Open Questions
+## Remaining Follow-Up
 
-- How should tests prove that CPython uses `PyOS_ReadlineFunctionPointer` without
-  relying on private helper behavior?
-- Does PTY mode require bounded input-delivery coordination with open ordering
-  work in #149?
-- What terminal size and echo settings should be fixed for deterministic tests?
-- What is the Windows PTY interrupt path: write Ctrl-C through ConPTY input,
-  use console control events for the restricted child, or keep a Python-side
-  interrupt notification for the blocked readline case?
+- Non-Unix Python still has a pipe-backed compatibility path. A future Windows
+  ConPTY slice should decide whether to write Ctrl-C through ConPTY input, use
+  console control events for the restricted child, or keep a Python-side
+  interrupt notification for the blocked readline case.
+- If future ordering work needs stricter input-delivery coordination, it should
+  preserve the current boundary: sideband facts describe observed runtime events;
+  the server must not parse Python prompts from visible PTY output.
 
-## Next Safe Slice
+## Completion Notes
 
-- Work phase 7 next: update current-state docs and snapshots for the final PTY
-  contract.
-- Keep sideband IPC separate from PTY traffic. Direct fd stdin consumers are not
-  first-class request-completion behavior unless a later public contract adds
-  that support.
+- The current repository contract is documented in `docs/architecture.md`,
+  `docs/worker_sideband_protocol.md`, `docs/output_timeline.md`, and
+  `docs/testing.md`.
+- Direct fd stdin consumers are not first-class request-completion behavior
+  unless a later public contract adds that support.
 
 ## Drain Loop Note
 
@@ -160,7 +159,7 @@ route.
 
 ## Decision Log
 
-- 2026-05-15: Started the active plan for epic #189 so later slices can follow a
+- 2026-05-15: Started the active plan so later slices can follow a
   single PTY/readline design boundary.
 - 2026-05-15: Chose PTY-backed C stdin/stdout as the route to CPython's readline
   path because `PyOS_InputHook` alone does not account for actual line reads.

@@ -9,7 +9,7 @@ text to worker stdin, appending exactly one trailing `\n` to non-empty input
 that does not already end in `\n`. The worker owns runtime stdin placement and
 reports stdin accounting facts back on sideband.
 
-## Transport
+## Sideband Transport
 
 - Unix: worker inherits two file descriptors through environment variables:
   - `MCP_REPL_IPC_READ_FD`
@@ -19,6 +19,17 @@ reports stdin accounting facts back on sideband.
   - `MCP_REPL_IPC_PIPE_TO_WORKER`
   - `MCP_REPL_IPC_PIPE_FROM_WORKER`
 - Messages are serialized as UTF-8 JSON, one message per line.
+
+## Runtime Stdin Transport
+
+Runtime stdin transport is a launch-time worker setting, not a sideband
+negotiation. A worker may use ordinary pipes or a PTY for its C stdio, but the
+server still writes accepted request bytes to worker stdin and relies on
+sideband events for prompt, input, discard, output, and session facts.
+
+Built-in Unix Python uses PTY-backed C stdin/stdout/stderr so CPython calls
+`PyOS_ReadlineFunctionPointer`. The Python callback emits readline accounting
+facts from that CPython path. Sideband IPC stays separate from the PTY.
 
 ## Direction: server -> worker
 
@@ -114,8 +125,10 @@ invalid base64, and unknown message types are protocol errors.
 ## Transitional Compatibility Frames
 
 These frames remain for built-in workers that have not fully migrated on every
-platform. New protocol workers, Zod, and Unix Python should not use them for
-steady-state request handling.
+platform. New protocol workers should not copy them for steady-state request
+handling. Built-in Unix Python still receives the legacy request-boundary
+frames, but stdin accounting comes from CPython readline events rather than a
+separate stdin bridge.
 
 `stdin_write`
 - `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
@@ -123,8 +136,10 @@ steady-state request handling.
   input payload bytes to stdin.
 - Built-in R still uses `byte_len` to make its worker-owned stdin reader consume
   exactly one raw payload before handing it to embedded R.
-- Non-Unix Python may still use `line_count` and `final_prompt` until it is
-  migrated to the protocol-worker stdin accounting model.
+- Built-in Unix Python uses these fields only to install active request state
+  before CPython's next readline callback consumes stdin.
+- Non-Unix Python may still use them for the pipe-backed compatibility path
+  until it is migrated to the same readline accounting model.
 
 `stdin_write_complete`
 - `{ "type": "stdin_write_complete" }`
@@ -141,7 +156,8 @@ steady-state request handling.
 - `{ "type": "stdin_write_ack" }`
 - Legacy worker-to-server request-boundary acknowledgement.
 - This only acknowledges request-boundary state. It is not an acknowledgement
-  for stdout/stderr, plot images, or request completion.
+  for stdout/stderr, PTY output, plot images, prompt completion, or request
+  completion.
 
 `python_interrupt_ack`
 - `{ "type": "python_interrupt_ack" }`
@@ -176,6 +192,11 @@ steady-state request handling.
 - Raw stdout/stderr capture remains active for unowned output, such as child
   processes or direct file-descriptor writes. Raw capture must not drive
   completion, prompt detection, echo suppression, or interrupt routing.
+- For PTY-backed workers, raw visible output may arrive from one terminal stream
+  with terminal behavior such as CRLF translation, echo, terminal-width effects,
+  and merged stdout/stderr identity. Worker-owned `output_text` frames preserve
+  their declared stream; raw PTY output does not promise pipe-style stream
+  fidelity.
 - The server infers request completion when explicit worker sideband facts show
   that the worker is waiting for the next input or that the session ended.
 - On timeout, a request may remain pending; later empty polls can observe worker
