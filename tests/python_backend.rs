@@ -3422,7 +3422,11 @@ async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestRe
         return Ok(());
     };
     let marker_dir = tempdir()?;
+    let release_path = marker_dir.path().join("detached-idle-release");
     let marker_path = marker_dir.path().join("detached-idle-written");
+    let release = release_path
+        .to_str()
+        .ok_or("detached idle release path must be valid utf-8")?;
     let marker = marker_path
         .to_str()
         .ok_or("detached idle marker path must be valid utf-8")?;
@@ -3432,19 +3436,22 @@ async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestRe
             format!(
                 r#"import subprocess, sys
 script = """import pathlib, sys, time
-time.sleep(0.3)
+release = pathlib.Path(sys.argv[1])
+while not release.exists():
+    time.sleep(0.01)
 for i in range(160):
     sys.stdout.write("IDLE_%03d " % i + ("x" * 80) + "\\n")
 sys.stdout.flush()
-pathlib.Path(sys.argv[1]).write_text("done")
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", script, {marker_arg}],
+    [sys.executable, "-c", script, {release_arg}, {marker_arg}],
     stdin=subprocess.DEVNULL,
     close_fds=False,
 )
 print("parent ready")
 "#,
+                release_arg = serde_json::to_string(release)?,
                 marker_arg = serde_json::to_string(marker)?
             ),
             Some(5.0),
@@ -3461,6 +3468,7 @@ print("parent ready")
         "expected detached-idle setup reply, got: {setup_text:?}"
     );
 
+    fs::write(&release_path, "go")?;
     wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
@@ -3664,7 +3672,11 @@ async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request()
         return Ok(());
     };
     let marker_dir = tempdir()?;
+    let release_path = marker_dir.path().join("detached-incomplete-release");
     let marker_path = marker_dir.path().join("detached-incomplete-written");
+    let release = release_path
+        .to_str()
+        .ok_or("detached incomplete release path must be valid utf-8")?;
     let marker = marker_path
         .to_str()
         .ok_or("detached incomplete marker path must be valid utf-8")?;
@@ -3674,19 +3686,22 @@ async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request()
             format!(
                 r#"import subprocess, sys
 script = """import os, pathlib, sys, time
-time.sleep(0.3)
+release = pathlib.Path(sys.argv[1])
+while not release.exists():
+    time.sleep(0.01)
 for i in range(160):
     os.write(sys.stdout.fileno(), ("IDLE_%03d " % i + ("x" * 80) + "\\n").encode())
 os.write(sys.stdout.fileno(), bytes([0xC3]))
-pathlib.Path(sys.argv[1]).write_text("done")
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", script, {marker_arg}],
+    [sys.executable, "-c", script, {release_arg}, {marker_arg}],
     stdin=subprocess.DEVNULL,
     close_fds=False,
 )
 print("parent ready")
 "#,
+                release_arg = serde_json::to_string(release)?,
                 marker_arg = serde_json::to_string(marker)?
             ),
             Some(5.0),
@@ -3703,6 +3718,7 @@ print("parent ready")
         "expected detached-incomplete setup reply, got: {setup_text:?}"
     );
 
+    fs::write(&release_path, "go")?;
     wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with(
