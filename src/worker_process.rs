@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::backend::{
     Backend, CustomWorkerSpec, CustomWorkerWorkingDir, CustomWorkerWorkingDirPolicy, WorkerLaunch,
+    WorkerStdinTransport,
 };
 #[cfg(target_family = "windows")]
 use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
@@ -1210,6 +1211,7 @@ pub(crate) fn split_write_stdin_control_prefix(
 }
 
 fn worker_context_event_payload(
+    worker_launch: &WorkerLaunch,
     backend: Backend,
     sandbox_state: &SandboxState,
 ) -> serde_json::Value {
@@ -1217,6 +1219,8 @@ fn worker_context_event_payload(
         .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
     serde_json::json!({
         "backend": format!("{backend:?}"),
+        "worker_launch": worker_launch.label(),
+        "stdin_transport": worker_launch.stdin_transport().as_str(),
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
@@ -1316,7 +1320,7 @@ impl WorkerManager {
             );
         } else {
             crate::event_log::log_lazy("worker_manager_created", || {
-                worker_context_event_payload(backend, &sandbox_state)
+                worker_context_event_payload(&worker_launch, backend, &sandbox_state)
             });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
@@ -4139,7 +4143,7 @@ impl WorkerManager {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state)
+            worker_context_event_payload(&self.worker_launch, self.backend, &self.sandbox_state)
         });
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
@@ -4227,7 +4231,7 @@ impl WorkerManager {
         crate::sandbox::prepare_session_temp_dir(&self.sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log_lazy("worker_spawn_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state)
+            worker_context_event_payload(&self.worker_launch, self.backend, &self.sandbox_state)
         });
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
@@ -4389,7 +4393,7 @@ impl WorkerManager {
         }
 
         crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
-            worker_context_event_payload(self.backend, &self.sandbox_state)
+            worker_context_event_payload(&self.worker_launch, self.backend, &self.sandbox_state)
         });
         let prepared = crate::windows_sandbox::prepare_sandbox_launch(
             &self.sandbox_state.sandbox_policy,
@@ -5620,6 +5624,12 @@ struct SpawnedWorker {
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
 
+struct SpawnedWorkerStdio {
+    stdin_tx: mpsc::Sender<StdinCommand>,
+    stdout_reader: Option<OutputReader>,
+    stderr_reader: Option<OutputReader>,
+}
+
 struct WorkerSpawnContext<'a> {
     oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
@@ -5891,11 +5901,8 @@ impl WorkerProcess {
                 Ok(())
             });
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        let child_result = spawn_command_with_transport(&mut command, stdin_transport);
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -5903,6 +5910,7 @@ impl WorkerProcess {
                 libc::close(client_fds.write_fd);
             }
         }
+        let mut child = child_result?;
         if let Some(status) = child.try_wait()? {
             maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
@@ -5910,15 +5918,11 @@ impl WorkerProcess {
             )));
         }
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-        let stdin_tx = spawn_stdin_writer(stdin);
-        let stdout_reader =
-            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
-        let stderr_reader =
-            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone())?;
+        let SpawnedWorkerStdio {
+            stdin_tx,
+            stdout_reader,
+            stderr_reader,
+        } = attach_spawned_worker_stdio(&mut child, stdin_transport, live_output.clone())?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -6011,11 +6015,8 @@ impl WorkerProcess {
                 Ok(())
             });
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let stdin_transport = spec.stdin.transport();
+        let child_result = spawn_command_with_transport(&mut command, stdin_transport);
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6023,6 +6024,7 @@ impl WorkerProcess {
                 libc::close(client_fds.write_fd);
             }
         }
+        let mut child = child_result?;
         if let Some(status) = child.try_wait()? {
             maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
@@ -6030,15 +6032,11 @@ impl WorkerProcess {
             )));
         }
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-        let stdin_tx = spawn_stdin_writer(stdin);
-        let stdout_reader =
-            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
-        let stderr_reader =
-            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone())?;
+        let SpawnedWorkerStdio {
+            stdin_tx,
+            stdout_reader,
+            stderr_reader,
+        } = attach_spawned_worker_stdio(&mut child, stdin_transport, live_output.clone())?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -6774,6 +6772,50 @@ where
         handle,
         stop_requested,
     }))
+}
+
+fn spawn_command_with_transport(
+    command: &mut Command,
+    stdin_transport: WorkerStdinTransport,
+) -> Result<Child, WorkerError> {
+    match stdin_transport {
+        WorkerStdinTransport::Pipe => Ok(command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?),
+        WorkerStdinTransport::Pty => Err(WorkerError::Protocol(
+            "PTY worker stdin transport is not implemented".to_string(),
+        )),
+    }
+}
+
+fn attach_spawned_worker_stdio(
+    child: &mut Child,
+    stdin_transport: WorkerStdinTransport,
+    live_output: LiveOutputCapture,
+) -> Result<SpawnedWorkerStdio, WorkerError> {
+    match stdin_transport {
+        WorkerStdinTransport::Pipe => {
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
+            let stdin_tx = spawn_stdin_writer(stdin);
+            let stdout_reader =
+                spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone())?;
+            let stderr_reader =
+                spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output)?;
+            Ok(SpawnedWorkerStdio {
+                stdin_tx,
+                stdout_reader,
+                stderr_reader,
+            })
+        }
+        WorkerStdinTransport::Pty => Err(WorkerError::Protocol(
+            "PTY worker stdin transport is not implemented".to_string(),
+        )),
+    }
 }
 
 fn spawn_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>

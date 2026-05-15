@@ -3,6 +3,7 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use serde_json::{Map, Value, json};
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -87,6 +88,13 @@ fn build_zod_worker() -> Result<PathBuf, String> {
 async fn spawn_zod_server_with_env(
     env_vars: Vec<(&str, &str)>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_env_and_extra_args(env_vars, Vec::new()).await
+}
+
+async fn spawn_zod_server_with_env_and_extra_args(
+    env_vars: Vec<(&str, &str)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let env = env_vars
@@ -102,19 +110,37 @@ async fn spawn_zod_server_with_env(
         "sandbox": "server"
     });
     std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
-    common::spawn_server_with_args(vec![
+    let mut args = vec![
         "--worker-spec".to_string(),
         spec_path.display().to_string(),
         "--sandbox".to_string(),
         "danger-full-access".to_string(),
         "--oversized-output".to_string(),
         "files".to_string(),
-    ])
-    .await
+    ];
+    args.extend(extra_args);
+    common::spawn_server_with_args(args).await
 }
 
 async fn spawn_zod_server() -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_env(Vec::new()).await
+}
+
+fn latest_debug_events(debug_dir: &std::path::Path) -> TestResult<Vec<Value>> {
+    let mut sessions = fs::read_dir(debug_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    let session_dir = sessions
+        .last()
+        .cloned()
+        .ok_or_else(|| "missing debug session directory".to_string())?;
+    let log_text = fs::read_to_string(session_dir.join("events.jsonl"))?;
+    Ok(log_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -140,6 +166,43 @@ async fn zod_worker_echoes_input_and_returns_worker_prompt() -> TestResult<()> {
         text.contains("zod> "),
         "expected worker-supplied prompt in response, got: {text:?}"
     );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_pipe_launch_records_transport_and_starts_sideband() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_server_with_env_and_extra_args(
+        Vec::new(),
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "transport check",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("zod> "),
+        "expected worker_ready sideband startup to seed the worker prompt, got: {text:?}"
+    );
+
+    let events = latest_debug_events(&debug_dir)?;
+    let spawn_begin = events
+        .iter()
+        .find(|entry| entry["event"] == "worker_spawn_begin")
+        .ok_or_else(|| "missing worker_spawn_begin event".to_string())?;
+    assert_eq!(spawn_begin["payload"]["stdin_transport"], "pipe");
 
     session.cancel().await?;
     Ok(())

@@ -26,9 +26,9 @@ continuation state, or emulate Python stdin semantics.
 
 - State: active
 - Last updated: 2026-05-15
-- Current phase: phase 1 pending
+- Current phase: phase 2 pending
 - Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: #190, "Plan Python PTY readline redesign"
+- Last completed slice: #191, "Add launch-time worker stdin transport abstraction"
 
 ## Current Direction
 
@@ -38,6 +38,9 @@ continuation state, or emulate Python stdin semantics.
 - Prove PTY transport independently with sideband kept on a separate IPC channel.
 - Run embedded Python with C stdin and C stdout attached to a PTY so CPython sees
   TTY streams and calls `PyOS_ReadlineFunctionPointer`.
+- Keep the PTY launch implementation platform-specific where sandbox launch
+  semantics require it: Unix can allocate the PTY before sandbox exec, while
+  Windows sandbox mode must attach ConPTY to the restricted child itself.
 - Make the readline callback the supported stdin accounting point for Python
   interactive input, `input()`, and debugger command loops.
 - Remove or sharply reduce the broad Python stdin bridge after the readline path
@@ -58,10 +61,36 @@ control flow while keeping the server's request handling interpreter-neutral.
   public contract explicitly adds that support.
 - Current pipe behavior may remain for R, fixtures, and non-PTY workers.
 
+## Platform Launch Design
+
+Unix and macOS/Linux sandboxed workers should allocate the PTY in the server
+before the sandbox wrapper applies restrictions, then spawn the wrapper or
+worker with the PTY slave as C stdin/stdout/stderr. Sideband file descriptors
+must stay separate from the PTY and must survive exec. `portable-pty` can be
+used for PTY allocation/master I/O where it fits, but its Unix
+`SlavePty::spawn_command` path should not be used directly unless sideband file
+descriptor preservation is handled, because that path closes extra file
+descriptors before exec.
+
+Windows sandboxed workers need a different shape. The outer server should still
+spawn the Windows sandbox wrapper through ordinary pipes, but the wrapper should
+create ConPTY after ACL/restricted-token setup and launch the restricted worker
+directly into that ConPTY with `CreateProcessAsUserW` plus extended startup
+attributes. The wrapper then forwards server stdin to the ConPTY input pipe and
+ConPTY output to wrapper stdout. Sideband named pipes remain separate from
+ConPTY traffic. PTY mode may merge stdout/stderr on Windows.
+
+`portable-pty` is not the right Windows sandbox launch boundary as-is because
+its ConPTY spawn path owns `CreateProcessW`; it does not apply this repo's
+restricted token, launch ACL state, prepared capability SID, or job lifetime
+setup. A local Windows ConPTY launch adapter, or an upstreamable extension that
+allows the sandbox wrapper to provide the process creation step, is the intended
+route.
+
 ## Phase Status
 
 - Phase 0: completed - create this plan and record the design boundary (#190).
-- Phase 1: pending - add a launch-time worker stdin transport abstraction (#191).
+- Phase 1: completed - add a launch-time worker stdin transport abstraction (#191).
 - Phase 2: pending - prove PTY worker transport while keeping sideband separate
   (#192).
 - Phase 3: pending - run embedded Python on PTY-backed C stdin/stdout and prove
@@ -104,15 +133,15 @@ control flow while keeping the server's request handling interpreter-neutral.
   #168, or can terminal flushing plus public stale-input tests cover the
   contract?
 - What terminal size and echo settings should be fixed for deterministic tests?
-- What, if any, Windows support belongs in this initiative?
+- What is the Windows PTY interrupt path: write Ctrl-C through ConPTY input,
+  use console control events for the restricted child, or keep a Python-side
+  interrupt notification for the blocked readline case?
 
 ## Next Safe Slice
 
-- Work #191 next: add a narrow launch-time stdin transport model that preserves
-  existing pipe behavior by default and keeps Python on the current path until
-  PTY transport is proven.
-- Public or launch-facing tests should prove the default pipe launch path remains
-  unchanged before any Python PTY behavior changes.
+- Work #192 next: prove PTY worker transport while keeping sideband separate.
+- Public or launch-facing tests should compare pipe and PTY launch behavior
+  before any built-in Python PTY behavior changes.
 
 ## Drain Loop Note
 
@@ -130,7 +159,7 @@ control flow while keeping the server's request handling interpreter-neutral.
 - Stop and ask before sending sideband facts over the PTY.
 - Stop and ask before treating direct fd stdin as first-class supported behavior.
 - Stop and update this plan if PTY setup cannot satisfy CPython's TTY
-  assumptions on the supported Unix path.
+  assumptions on the supported Unix or Windows sandbox paths.
 - Stop and update this plan if a later slice needs to change the public reply
   shape or sideband event contract.
 
@@ -144,3 +173,8 @@ control flow while keeping the server's request handling interpreter-neutral.
   plots, session termination, and future output facts remain structured.
 - 2026-05-15: Rejected Jupyter cell mode and broad Python-level stdin
   interception because the supported surface is Python's own interactive REPL.
+- 2026-05-15: Chose a platform-specific PTY launch boundary for Windows
+  sandbox support: ConPTY must be attached to the restricted child from inside
+  the sandbox wrapper, not merely to the outer wrapper process.
+- 2026-05-15: Added an explicit launch-time stdin transport model. Built-in R,
+  built-in Python, and the current protocol fixture launch through pipe stdin.
