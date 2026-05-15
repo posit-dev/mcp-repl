@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_stdin_write_ack,
-    set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_python_interrupt_ack, emit_session_end,
+    emit_stdin_write_ack, set_global_ipc,
 };
 use crate::python_session::{self, PythonSession};
 
@@ -97,6 +97,14 @@ fn init_ipc(
         .spawn(move || {
             loop {
                 match conn.recv(None) {
+                    Some(ServerToWorkerIpcMessage::RequestStart) => {
+                        python_session::mark_request_started();
+                        emit_stdin_write_ack();
+                    }
+                    Some(ServerToWorkerIpcMessage::PythonRequestStart { request_generation }) => {
+                        python_session::mark_request_started_for_generation(request_generation);
+                        emit_stdin_write_ack();
+                    }
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
                         line_count,
@@ -115,6 +123,10 @@ fn init_ipc(
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();
+                    }
+                    Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
+                        python_session::interrupt_request_generation(request_generation);
+                        emit_python_interrupt_ack();
                     }
                     Some(ServerToWorkerIpcMessage::SessionEnd) => {
                         state.begin_shutdown();

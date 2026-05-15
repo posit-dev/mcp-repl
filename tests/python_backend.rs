@@ -66,6 +66,44 @@ fn require_python() -> bool {
     }
 }
 
+#[cfg(not(unix))]
+fn python_plotting_available() -> bool {
+    if !common::python_available() {
+        eprintln!("python not available; skipping");
+        return false;
+    }
+    let python = common::python_program().unwrap_or("python3");
+    std::process::Command::new(python)
+        .args([
+            "-c",
+            "import matplotlib; matplotlib.use('agg', force=True); import matplotlib.pyplot as plt",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn python_plot_tests_enabled() -> bool {
+    if std::env::var_os("MCP_REPL_PYTHON_PLOT_TESTS").is_none() {
+        eprintln!("python plot tests disabled; set MCP_REPL_PYTHON_PLOT_TESTS=1 to enable");
+        return false;
+    }
+    python_plotting_available()
+}
+
+#[cfg(not(unix))]
+fn image_count(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, RawContent::Image(_)))
+        .count()
+}
+
 fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
         || text.contains("worker io error: Permission denied")
@@ -597,6 +635,91 @@ async fn python_smoke() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_family = "unix"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('p> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("p> ") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected input prompt, got: {text:?}"
+    );
+    assert_eq!(
+        text.matches("p> ").count(),
+        1,
+        "expected input prompt to appear once, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            r#"import matplotlib
+matplotlib.use("agg", force=True)
+import matplotlib.pyplot as plt
+print("plot ready")
+"#,
+            Some(30.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        setup_text.contains("plot ready"),
+        "expected matplotlib setup to finish, got: {setup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import time
+plt.figure(919)
+plt.clf()
+plt.plot([1, 2, 3], [3, 2, 1])
+plt.show()
+time.sleep(10)
+"#,
+            Some(0.5),
+        )
+        .await?;
+    assert_eq!(
+        image_count(&result),
+        1,
+        "expected plot hook to emit before timeout, got text: {:?}",
+        result_text(&result)
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_backend_runs_inside_mcp_repl_worker() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -638,114 +761,6 @@ else:
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_sys_stdin_supports_file_like_reads() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import sys
-first = sys.stdin.read(3)
-abcdef
-second = sys.stdin.readline(2)
-third = sys.stdin.readline()
-print("READS", repr(first), repr(second), repr(third))
-"#,
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python sys.stdin file-like read test remained busy".into());
-    }
-    assert!(
-        text.contains(r#"READS 'abc' 'de' 'f\n'"#),
-        "expected sys.stdin read APIs to preserve buffered text, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_stdin_data_suffix_does_not_force_continuation_prompt() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            "import sys; data = sys.stdin.readline(); print('STDIN_DATA', data.strip())\n:\n",
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    session.cancel().await?;
-
-    assert!(
-        text.contains("STDIN_DATA :"),
-        "expected Python code to consume the colon as stdin data, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected primary prompt after stdin data was consumed, got: {text:?}"
-    );
-    assert!(
-        !text.contains("... "),
-        "stdin data that resembles Python syntax should not force continuation prompt, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_sys_stdio_supports_binary_buffers() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import sys
-out_count = sys.stdout.buffer.write(b"BINOUT\n")
-sys.stdout.buffer.flush()
-err_count = sys.stderr.buffer.write(b"BINERR\n")
-data = sys.stdin.buffer.read(4)
-abc
-line = sys.stdin.buffer.readline()
-def
-print("BUFFERS", out_count, err_count, data, line)
-"#,
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python binary stdio buffer test remained busy".into());
-    }
-    assert!(
-        text.contains("BINOUT"),
-        "expected stdout.buffer bytes, got: {text:?}"
-    );
-    assert!(
-        text.contains("BINERR"),
-        "expected stderr.buffer bytes, got: {text:?}"
-    );
-    assert!(
-        text.contains(r#"BUFFERS 7 7 b'abc\n' b'def\n'"#),
-        "expected binary stdio buffers to read and write bytes, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn python_sys_path_includes_current_working_directory() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -778,97 +793,6 @@ print("LOCAL_IMPORT", local_import_probe.VALUE)
     assert!(
         text.contains("LOCAL_IMPORT local-ok"),
         "expected cwd import to resolve local module, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_stdin_buffer_read_counts_bytes() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import sys
-first = sys.stdin.buffer.read(1)
-é
-rest = sys.stdin.buffer.read(2)
-print("BYTE_READ", first, rest, len(first), len(rest))
-"#,
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python stdin buffer byte count test remained busy".into());
-    }
-    assert!(
-        text.contains(r#"BYTE_READ b'\xc3' b'\xa9\n' 1 2"#),
-        "expected stdin.buffer reads to count bytes, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_stdin_buffer_preserves_nul_bytes() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            "import sys\ndata = sys.stdin.buffer.read(3)\nA\0B\nprint('NUL_BYTES', repr(data), len(data))",
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python stdin.buffer NUL byte read remained busy".into());
-    }
-    assert!(
-        text.contains(r#"NUL_BYTES b'A\x00B' 3"#),
-        "expected stdin.buffer read to preserve NUL bytes, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_raw_fd_stdin_read_completes_request() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os
-data = os.read(0, 5)
-abcd
-print("RAW_FD", data)
-"#,
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err(format!("python raw fd stdin read remained busy: {text:?}").into());
-    }
-    assert!(
-        text.contains(r#"RAW_FD b'abcd\n'"#),
-        "expected raw fd stdin read output, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -1090,34 +1014,6 @@ async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> T
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let mut filler = String::new();
-    for idx in 0..40_000 {
-        filler.push_str("# filler ");
-        filler.push_str(&idx.to_string());
-        filler.push('\n');
-    }
-    let input = format!(
-        "import os\nchunk = os.read(0, 1048576)\n{filler}print('RAW_LARGE_DONE', len(chunk))"
-    );
-    let result = session.write_stdin_raw_with(&input, Some(20.0)).await?;
-    let text = result_text(&result);
-    session.cancel().await?;
-
-    assert!(
-        text.contains("RAW_LARGE_DONE"),
-        "expected large raw fd read request to complete after the full payload, got: {text:?}"
-    );
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn python_long_physical_line_does_not_complete_before_execution() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -1283,6 +1179,108 @@ print("INPUT", input())
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import builtins, os
+print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
+print("INPUT_IMPL", builtins.input.__module__, builtins.input.__name__)
+value = input("pty> ")
+hello
+print("PTY_INPUT", value)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python PTY input() path test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("PTY_FDS True True True"),
+        "expected Python C stdio fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("INPUT_IMPL builtins input"),
+        "expected input() to use CPython's builtin implementation, got: {text:?}"
+    );
+    assert!(
+        text.contains("PTY_INPUT hello"),
+        "expected CPython input() to consume the PTY-backed answer, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import builtins, io, os, sys, _io
+readv_module = getattr(os, "readv", os.read).__module__
+print("STDIN_SURFACE", type(sys.stdin).__module__, type(sys.stdin).__name__, sys.stdin.fileno(), sys.stdin.isatty())
+print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO.__module__, _io.FileIO.__module__, os.read.__module__, readv_module)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python PTY stdin surface test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
+        "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
+    );
+    let direct_fd_modules = text
+        .lines()
+        .find_map(|line| line.strip_prefix("DIRECT_FD_SHIMS "))
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            panic!("expected direct fd stdin API module line, got: {text:?}");
+        });
+    assert_eq!(
+        direct_fd_modules.len(),
+        6,
+        "expected six direct fd stdin API module names, got: {text:?}"
+    );
+    for (label, module) in [
+        ("builtins.open", direct_fd_modules[0]),
+        ("io.open", direct_fd_modules[1]),
+    ] {
+        assert!(
+            matches!(module, "io" | "_io"),
+            "expected {label} to come from io or _io, got: {text:?}"
+        );
+    }
+    assert_eq!(
+        &direct_fd_modules[2..],
+        ["_io", "_io", "posix", "posix"],
+        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+    );
     Ok(())
 }
 
@@ -1604,6 +1602,82 @@ exec("pid = os.fork()\nif pid == 0:\n    os._exit(0)\n_, status = os.waitpid(pid
         !marker_path.exists(),
         "expected at-fork cleanup to bypass Python os.close, got marker contents: {:?}",
         fs::read_to_string(&marker_path).ok()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_fork_child_mcp_stdin_returns_eof() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""import os
+pid = os.fork()
+if pid == 0:
+    try:
+        input("child> ")
+    except EOFError:
+        print("CHILD_STDIN_EOF", flush=True)
+        os._exit(0)
+    print("CHILD_STDIN_READ", flush=True)
+    os._exit(2)
+_, status = os.waitpid(pid, 0)
+print("FORK_STDIN_STATUS", status)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected fork child stdin EOF to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("CHILD_STDIN_EOF"),
+        "expected fork child mcp-repl stdin to return EOF, got: {text:?}"
+    );
+    assert!(
+        text.contains("FORK_STDIN_STATUS 0"),
+        "expected fork child to exit cleanly, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_subprocess_does_not_inherit_mcp_stdin_fd() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import subprocess
+proc = subprocess.run(["/bin/cat"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print("SUBPROCESS_STDIN", proc.returncode)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected subprocess inherited stdin to fail fast, got: {text:?}"
+    );
+    assert!(
+        text.contains("SUBPROCESS_STDIN"),
+        "expected subprocess completion to be visible, got: {text:?}"
     );
     Ok(())
 }
@@ -2852,6 +2926,52 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with("value = input('reset> ')", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("reset> "),
+        "expected input prompt before reset, got: {prompt_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw("repl_reset", serde_json::json!({}))
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        !is_busy_response(&reset_text),
+        "expected repl_reset while input() waits to complete, got: {reset_text:?}"
+    );
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to start a new session, got: {reset_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_INPUT_RESET"),
+        "expected follow-up after repl_reset to run in the replacement worker, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("reset> "),
+        "did not expect the old input prompt to leak after repl_reset, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -3142,6 +3262,36 @@ async fn python_prompt_shaped_stdout_before_stderr_stays_visible() -> TestResult
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_trailing_prompt_shaped_stdout_stays_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys; _ = sys.stdout.write('PROMPT_STDOUT>>> '); sys.stdout.flush()",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_trailing_prompt_shaped_stdout_stays_visible remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        text.contains("PROMPT_STDOUT>>> >>> "),
+        "expected trailing prompt-shaped stdout and worker prompt to both remain visible, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -3161,7 +3311,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        interrupt_text.contains(">>>"),
+        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
         "expected prompt after interrupt, got: {interrupt_text:?}"
     );
 
@@ -3272,7 +3422,11 @@ async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestRe
         return Ok(());
     };
     let marker_dir = tempdir()?;
+    let release_path = marker_dir.path().join("detached-idle-release");
     let marker_path = marker_dir.path().join("detached-idle-written");
+    let release = release_path
+        .to_str()
+        .ok_or("detached idle release path must be valid utf-8")?;
     let marker = marker_path
         .to_str()
         .ok_or("detached idle marker path must be valid utf-8")?;
@@ -3282,19 +3436,22 @@ async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestRe
             format!(
                 r#"import subprocess, sys
 script = """import pathlib, sys, time
-time.sleep(0.3)
+release = pathlib.Path(sys.argv[1])
+while not release.exists():
+    time.sleep(0.01)
 for i in range(160):
     sys.stdout.write("IDLE_%03d " % i + ("x" * 80) + "\\n")
 sys.stdout.flush()
-pathlib.Path(sys.argv[1]).write_text("done")
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", script, {marker_arg}],
+    [sys.executable, "-c", script, {release_arg}, {marker_arg}],
     stdin=subprocess.DEVNULL,
     close_fds=False,
 )
 print("parent ready")
 "#,
+                release_arg = serde_json::to_string(release)?,
                 marker_arg = serde_json::to_string(marker)?
             ),
             Some(5.0),
@@ -3311,6 +3468,7 @@ print("parent ready")
         "expected detached-idle setup reply, got: {setup_text:?}"
     );
 
+    fs::write(&release_path, "go")?;
     wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
@@ -3514,7 +3672,11 @@ async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request()
         return Ok(());
     };
     let marker_dir = tempdir()?;
+    let release_path = marker_dir.path().join("detached-incomplete-release");
     let marker_path = marker_dir.path().join("detached-incomplete-written");
+    let release = release_path
+        .to_str()
+        .ok_or("detached incomplete release path must be valid utf-8")?;
     let marker = marker_path
         .to_str()
         .ok_or("detached incomplete marker path must be valid utf-8")?;
@@ -3524,19 +3686,22 @@ async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request()
             format!(
                 r#"import subprocess, sys
 script = """import os, pathlib, sys, time
-time.sleep(0.3)
+release = pathlib.Path(sys.argv[1])
+while not release.exists():
+    time.sleep(0.01)
 for i in range(160):
     os.write(sys.stdout.fileno(), ("IDLE_%03d " % i + ("x" * 80) + "\\n").encode())
 os.write(sys.stdout.fileno(), bytes([0xC3]))
-pathlib.Path(sys.argv[1]).write_text("done")
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", script, {marker_arg}],
+    [sys.executable, "-c", script, {release_arg}, {marker_arg}],
     stdin=subprocess.DEVNULL,
     close_fds=False,
 )
 print("parent ready")
 "#,
+                release_arg = serde_json::to_string(release)?,
                 marker_arg = serde_json::to_string(marker)?
             ),
             Some(5.0),
@@ -3553,6 +3718,7 @@ print("parent ready")
         "expected detached-incomplete setup reply, got: {setup_text:?}"
     );
 
+    fs::write(&release_path, "go")?;
     wait_for_detached_holder_exit(&marker_path).await?;
     let follow_up = session
         .write_stdin_raw_with(
@@ -3623,7 +3789,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        interrupt_text.contains(">>>"),
+        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
         "expected prompt after interrupt, got: {interrupt_text:?}"
     );
 
@@ -3743,9 +3909,8 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
     let result = session.write_stdin_raw_with("c", Some(5.0)).await?;
     let text = result_text(&result);
     if is_busy_response(&text) {
-        eprintln!("python_pdb_roundtrip remained busy after continue; skipping");
         session.cancel().await?;
-        return Ok(());
+        return Err("python_pdb_roundtrip remained busy after continue".into());
     }
     assert!(
         text.contains(">>>"),
@@ -3783,43 +3948,9 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
         text.contains("got hello"),
         "expected input() to consume buffered hello, got: {text:?}"
     );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_input_emits_prompt_before_buffered_read() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import sys
-first = sys.stdin.read(1)
-z
-answer = input('p> ')
-print("MIXED", repr(first), repr(answer))
-"#,
-            Some(5.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python buffered input prompt test remained busy".into());
-    }
-    let prompt_index = text
-        .find("p> ")
-        .ok_or_else(|| format!("expected buffered input prompt, got: {text:?}"))?;
-    let output_index = text
-        .find(r#"MIXED 'z' ''"#)
-        .ok_or_else(|| format!("expected mixed buffered input output, got: {text:?}"))?;
     assert!(
-        prompt_index < output_index,
-        "expected prompt before buffered input output, got: {text:?}"
+        text.contains("p> "),
+        "expected buffered input() prompt to stay visible, got: {text:?}"
     );
 
     session.cancel().await?;

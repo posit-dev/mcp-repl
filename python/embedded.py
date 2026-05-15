@@ -1,16 +1,28 @@
 import base64
 import builtins
+import codecs
+import errno
 import hashlib
 import importlib.util
 import io
+import operator
 import os
 import pydoc
 import sys
 import threading
 
+import _io
 import _mcp_repl
 
+try:
+    import posix as _mcp_repl_posix
+except ImportError:
+    _mcp_repl_posix = None
+
 os.environ.setdefault("MPLBACKEND", "agg")
+# pdb's pyrepl path reads the terminal fd directly; keep debugger input on
+# CPython input()/PyOS_Readline so sideband stdin accounting stays single-owner.
+os.environ.setdefault("PYTHON_BASIC_REPL", "1")
 sys.argv = ["mcp-repl"]
 if "" not in sys.path:
     sys.path.insert(0, "")
@@ -28,6 +40,33 @@ _plot_show = None
 _plot_emitted_this_request = {}
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
+_mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
+
+
+def _mcp_repl_readinto_type_name(target):
+    if target is None:
+        return "None"
+    return type(target).__name__
+
+
+def _mcp_repl_readinto_byte_view(target):
+    type_name = _mcp_repl_readinto_type_name(target)
+    try:
+        view = memoryview(target)
+    except TypeError:
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        ) from None
+    if view.readonly:
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        )
+    try:
+        return view.cast("B")
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        ) from None
 
 
 class _McpSuppressedPrompt:
@@ -56,8 +95,9 @@ def _mcp_repl_capture_prompts():
     if ps2 is not _mcp_repl_suppressed_ps2:
         _mcp_repl_ps2 = str(ps2)
     _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
-    sys.ps1 = _mcp_repl_suppressed_ps1
-    sys.ps2 = _mcp_repl_suppressed_ps2
+    if not _mcp_repl_c_stdio_tty:
+        sys.ps1 = _mcp_repl_suppressed_ps1
+        sys.ps2 = _mcp_repl_suppressed_ps2
 
 
 def _input(prompt=""):
@@ -88,8 +128,15 @@ class McpInputStream:
     errors = "replace"
     newlines = None
 
-    def __init__(self):
+    def __init__(self, fileno=0, closefd=False, encoding=None, errors=None, newline=None):
         self._buffer = b""
+        self._fileno = fileno
+        self._closefd = closefd
+        if encoding is not None:
+            self.encoding = encoding
+        if errors is not None:
+            self.errors = errors
+        self._newline = newline
         self.buffer = McpInputBuffer(self)
         self.closed = False
 
@@ -106,7 +153,7 @@ class McpInputStream:
         line = _mcp_repl.readline(prompt)
         if line is None:
             return None
-        return line.encode(self.encoding)
+        return line.encode(self.encoding, self.errors)
 
     def _emit_prompt(self, prompt):
         if prompt:
@@ -269,10 +316,23 @@ class McpInputStream:
         return False
 
     def fileno(self):
-        return 0
+        return self._fileno
 
     def close(self):
-        self.closed = True
+        if self.closed:
+            return
+        try:
+            if self._closefd and self._fileno != 0:
+                os.close(self._fileno)
+        finally:
+            self.closed = True
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     def flush(self):
         pass
@@ -313,8 +373,9 @@ class McpInputBuffer:
         return lines
 
     def readinto(self, target):
-        data = self.read(len(target))
-        target[: len(data)] = data
+        view = _mcp_repl_readinto_byte_view(target)
+        data = self.read(view.nbytes)
+        view[: len(data)] = data
         return len(data)
 
     def read1(self, size=-1):
@@ -322,6 +383,16 @@ class McpInputBuffer:
 
     def readinto1(self, target):
         return self.readinto(target)
+
+    def close(self):
+        self._text_stream.close()
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     def readable(self):
         return True
@@ -336,10 +407,105 @@ class McpInputBuffer:
         return False
 
     def fileno(self):
-        return 0
+        return self._text_stream.fileno()
 
     def close(self):
         self._text_stream.close()
+
+    def flush(self):
+        pass
+
+
+class McpRawInputBuffer(io.RawIOBase):
+    def __init__(self, fileno=0, closefd=False):
+        super().__init__()
+        self._fileno = fileno
+        self._closefd = closefd
+
+    def _check_open(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+
+    def _normalize_size(self, size):
+        if size is None:
+            return -1
+        return operator.index(size)
+
+    def read(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+        if size < 0:
+            return McpInputStream().buffer.read(size)
+        return _mcp_repl.raw_stdin_read(size)
+
+    def readall(self):
+        return self.read(-1)
+
+    def readline(self, size=-1):
+        self._check_open()
+        size = self._normalize_size(size)
+        if size == 0:
+            return b""
+
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            chunk = self.read(1)
+            if chunk == b"":
+                break
+            chunks.append(chunk)
+            if chunk == b"\n":
+                break
+            if remaining > 0:
+                remaining -= 1
+        return b"".join(chunks)
+
+    def readlines(self, hint=-1):
+        self._check_open()
+        hint = self._normalize_size(hint)
+        lines = []
+        total = 0
+        while True:
+            line = self.readline()
+            if line == b"":
+                break
+            lines.append(line)
+            total += len(line)
+            if hint > 0 and total >= hint:
+                break
+        return lines
+
+    def readinto(self, target):
+        view = _mcp_repl_readinto_byte_view(target)
+        data = self.read(view.nbytes)
+        view[: len(data)] = data
+        return len(data)
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._fileno
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            if self._closefd and self._fileno != 0:
+                os.close(self._fileno)
+        finally:
+            super().close()
 
     def flush(self):
         pass
@@ -471,11 +637,11 @@ def _maybe_emit_plots(force_figures=None, force_all=False):
     _emit_plots(force_figures=force_figures, force_all=force_all)
 
 
-def _emit_plots(force_figures=None, force_all=False):
+def _emit_plots(force_figures=None, force_all=False, record_only=False):
     global _plot_known_figures, _plot_hashes, _plot_emitted_this_request
     global _plot_emit_in_progress
 
-    if _mcp_repl.take_plot_reset_pending():
+    if not record_only and _mcp_repl.take_plot_reset_pending():
         with _plot_lock:
             _plot_emitted_this_request = {}
 
@@ -510,6 +676,10 @@ def _emit_plots(force_figures=None, force_all=False):
     fig_nums = sorted(fig_nums)
     new_known = set(fig_nums)
     force_figures = set() if force_figures is None else set(force_figures)
+    try:
+        current_fig_num = plt.gcf().number
+    except Exception:
+        current_fig_num = None
     with _plot_lock:
         prev_known = set(_plot_known_figures)
         for stale_num in set(_plot_hashes) - new_known:
@@ -529,6 +699,10 @@ def _emit_plots(force_figures=None, force_all=False):
         digest = hashlib.sha256(data).hexdigest()
         force_current = force_all or fig_num in force_figures
         with _plot_lock:
+            if record_only:
+                _plot_hashes[fig_num] = digest
+                _plot_emitted_this_request.pop(fig_num, None)
+                continue
             emitted_this_request = _plot_emitted_this_request.get(fig_num) == digest
             if emitted_this_request:
                 continue
@@ -542,6 +716,11 @@ def _emit_plots(force_figures=None, force_all=False):
         _mcp_repl_flush_original_stdio()
         _mcp_repl.emit_plot_image("image/png", encoded, not bool(is_new), str(fig_num))
 
+    if current_fig_num in new_known:
+        try:
+            plt.figure(current_fig_num)
+        except Exception:
+            pass
     with _plot_lock:
         _plot_known_figures = new_known
     _plot_emit_in_progress = False
@@ -557,6 +736,10 @@ def _mcp_repl_emit_plots():
     _emit_plots()
 
 
+def _mcp_repl_record_background_plots():
+    _emit_plots(record_only=True)
+
+
 def _mcp_repl_flush_original_stdio():
     sys.__stdout__.flush()
     sys.__stderr__.flush()
@@ -567,6 +750,21 @@ def _mcp_repl_plot_capable():
 
 
 _original_excepthook = sys.excepthook
+_original_builtins_import = builtins.__import__
+_original_builtins_open = builtins.open
+_original_io_FileIO = io.FileIO
+_original_os_fdopen = os.fdopen
+_original_os_read = os.read
+_original_os_readv = getattr(os, "readv", None)
+_mcp_repl_raw_stdin_read_supported = os.name == "posix"
+# Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
+_mcp_repl_raw_stdin_stat = None
+if _mcp_repl_raw_stdin_read_supported:
+    try:
+        _mcp_repl_raw_stdin_stat = os.fstat(0)
+    except OSError:
+        pass
+_mcp_repl_stdin_path_aliases = frozenset(("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 
 
 def _mcp_repl_excepthook(exc_type, exc, traceback):
@@ -576,12 +774,290 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
     _original_excepthook(exc_type, exc, traceback)
 
 
-builtins.input = _input
+def _mcp_repl_import(name, globals=None, locals=None, fromlist=(), level=0):
+    module = _original_builtins_import(name, globals, locals, fromlist, level)
+    if name.partition(".")[0] == "readline":
+        _mcp_repl.restore_readline_function()
+    return module
+
+
+def _mcp_repl_is_raw_stdin_fd(fd):
+    if not _mcp_repl_raw_stdin_read_supported:
+        return False
+    if _mcp_repl_raw_stdin_stat is None:
+        return fd == 0
+    try:
+        stat = os.fstat(fd)
+    except OSError:
+        return False
+    return (
+        stat.st_dev == _mcp_repl_raw_stdin_stat.st_dev
+        and stat.st_ino == _mcp_repl_raw_stdin_stat.st_ino
+    )
+
+
+def _mcp_repl_is_raw_stdin_path(file):
+    try:
+        path = os.fspath(file)
+    except TypeError:
+        return False
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    if os.path.normpath(path) not in _mcp_repl_stdin_path_aliases:
+        return False
+    # These aliases resolve through the current fd 0. Keep routing them through
+    # the bridge only while fd 0 still names the original managed stdin.
+    return _mcp_repl_is_raw_stdin_fd(0)
+
+
+def _mcp_repl_stdin_read_mode(mode):
+    if not isinstance(mode, str):
+        return False
+    chars = set(mode)
+    if "r" not in chars or ("b" in chars and "t" in chars):
+        return False
+    if any(ch not in "rbt+" for ch in chars):
+        return False
+    if any(mode.count(ch) > 1 for ch in chars):
+        return False
+    # Readable '+' modes must use the bridge so fd-0 reads stay accounted. The bridge
+    # remains read-only; write attempts fail instead of mutating mcp-repl-managed stdin.
+    return True
+
+
+def _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+    return (
+        isinstance(mode, str)
+        and "b" in mode
+        and _mcp_repl_stdin_read_mode(mode)
+        and operator.index(buffering) == 0
+    )
+
+
+def _mcp_repl_validate_stdin_open_options(
+    mode, buffering, encoding=None, errors=None, newline=None
+):
+    if "b" in mode:
+        if encoding is not None:
+            raise ValueError("binary mode doesn't take an encoding argument")
+        if errors is not None:
+            raise ValueError("binary mode doesn't take an errors argument")
+        if newline is not None:
+            raise ValueError("binary mode doesn't take a newline argument")
+        return
+
+    if operator.index(buffering) == 0:
+        raise ValueError("can't have unbuffered text I/O")
+    if encoding is not None:
+        codecs.lookup(encoding)
+    if newline not in (None, "", "\n", "\r", "\r\n"):
+        raise ValueError(f"illegal newline value: {newline}")
+
+
+def _mcp_repl_os_fdopen_arg(args, kwargs, index, name, default=None):
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(name, default)
+
+
+def _mcp_repl_os_fdopen_closefd(args, kwargs):
+    # os.fdopen forwards positional args to open(fd, mode, ...), where
+    # closefd is the fifth argument after mode. Respecting that slot preserves
+    # callers that intentionally keep a duplicated stdin fd usable after the
+    # bridge returns its own stdin wrapper.
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 4, "closefd", True)
+
+
+def _mcp_repl_os_fdopen_buffering(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 0, "buffering", -1)
+
+
+def _mcp_repl_os_fdopen_encoding(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 1, "encoding")
+
+
+def _mcp_repl_os_fdopen_errors(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 2, "errors")
+
+
+def _mcp_repl_os_fdopen_newline(args, kwargs):
+    return _mcp_repl_os_fdopen_arg(args, kwargs, 3, "newline")
+
+
+def _mcp_repl_stdin_stream_for_mode(
+    mode,
+    buffering=-1,
+    encoding=None,
+    errors=None,
+    newline=None,
+    fileno=0,
+    closefd=False,
+):
+    _mcp_repl_validate_stdin_open_options(mode, buffering, encoding, errors, newline)
+    if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
+        return McpRawInputBuffer(fileno, closefd)
+    stream = McpInputStream(fileno, closefd, encoding, errors, newline)
+    if "b" in mode:
+        return stream.buffer
+    return stream
+
+
+def _mcp_repl_open(
+    file,
+    mode="r",
+    buffering=-1,
+    encoding=None,
+    errors=None,
+    newline=None,
+    closefd=True,
+    opener=None,
+):
+    try:
+        fd = operator.index(file)
+    except TypeError:
+        if (
+            opener is None
+            and closefd
+            and _mcp_repl_is_raw_stdin_path(file)
+            and _mcp_repl_stdin_read_mode(mode)
+        ):
+            return _mcp_repl_stdin_stream_for_mode(
+                mode, buffering, encoding, errors, newline
+            )
+        return _original_builtins_open(
+            file, mode, buffering, encoding, errors, newline, closefd, opener
+        )
+    if (
+        opener is None
+        and _mcp_repl_is_raw_stdin_fd(fd)
+        and _mcp_repl_stdin_read_mode(mode)
+    ):
+        return _mcp_repl_stdin_stream_for_mode(
+            mode, buffering, encoding, errors, newline, fd, closefd
+        )
+    return _original_builtins_open(
+        file, mode, buffering, encoding, errors, newline, closefd, opener
+    )
+
+
+def _mcp_repl_os_fdopen(fd, mode="r", *args, **kwargs):
+    fd = operator.index(fd)
+    buffering = _mcp_repl_os_fdopen_buffering(args, kwargs)
+    encoding = _mcp_repl_os_fdopen_encoding(args, kwargs)
+    errors = _mcp_repl_os_fdopen_errors(args, kwargs)
+    newline = _mcp_repl_os_fdopen_newline(args, kwargs)
+    closefd = _mcp_repl_os_fdopen_closefd(args, kwargs)
+    if _mcp_repl_is_raw_stdin_fd(fd) and _mcp_repl_stdin_read_mode(mode):
+        return _mcp_repl_stdin_stream_for_mode(
+            mode, buffering, encoding, errors, newline, fd, closefd
+        )
+    return _original_os_fdopen(fd, mode, *args, **kwargs)
+
+
+class _McpReplFileIOMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, (_original_io_FileIO, McpRawInputBuffer))
+
+    def __subclasscheck__(cls, subclass):
+        return issubclass(subclass, (_original_io_FileIO, McpRawInputBuffer))
+
+
+class _McpReplFileIO(_original_io_FileIO, metaclass=_McpReplFileIOMeta):
+    def __new__(cls, file, mode="r", closefd=True, opener=None):
+        try:
+            fd = operator.index(file)
+        except TypeError:
+            if (
+                opener is None
+                and closefd
+                and _mcp_repl_is_raw_stdin_path(file)
+                and _mcp_repl_stdin_read_mode(mode)
+            ):
+                return McpRawInputBuffer()
+            return super().__new__(cls)
+        if (
+            opener is None
+            and _mcp_repl_is_raw_stdin_fd(fd)
+            and _mcp_repl_stdin_read_mode(mode)
+        ):
+            return McpRawInputBuffer(fd, closefd)
+        return super().__new__(cls)
+
+    def __init__(self, file, mode="r", closefd=True, opener=None):
+        super().__init__(file, mode, closefd=closefd, opener=opener)
+
+
+def _mcp_repl_fill_readv_buffers(buffers, data):
+    offset = 0
+    for view in buffers:
+        if offset >= len(data):
+            break
+        count = min(view.nbytes, len(data) - offset)
+        view[:count] = data[offset : offset + count]
+        offset += count
+    return offset
+
+
+def _mcp_repl_os_read(fd, n):
+    fd = operator.index(fd)
+    if _mcp_repl_is_raw_stdin_fd(fd):
+        n = operator.index(n)
+        if n > sys.maxsize or n < -sys.maxsize - 1:
+            raise OverflowError("Python int too large to convert to C ssize_t")
+        if n < 0:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+        return _mcp_repl.raw_stdin_read(n)
+    return _original_os_read(fd, n)
+
+
+def _mcp_repl_os_readv(fd, buffers):
+    fd = operator.index(fd)
+    if not _mcp_repl_is_raw_stdin_fd(fd):
+        return _original_os_readv(fd, buffers)
+    views = []
+    total = 0
+    for buffer in buffers:
+        view = memoryview(buffer)
+        if view.readonly:
+            raise TypeError("readv buffers must be writable")
+        view = view.cast("B")
+        views.append(view)
+        total += view.nbytes
+    if total > sys.maxsize:
+        raise OverflowError("Python int too large to convert to C ssize_t")
+    if total == 0:
+        return 0
+    return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
+
+
+builtins.__import__ = _mcp_repl_import
 pydoc.pager = _pydoc_plainpager
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
-sys.ps1 = _mcp_repl_suppressed_ps1
-sys.ps2 = _mcp_repl_suppressed_ps2
-sys.stdin = McpInputStream()
+if _mcp_repl_c_stdio_tty:
+    sys.ps1 = _mcp_repl_ps1
+    sys.ps2 = _mcp_repl_ps2
+else:
+    builtins.input = _input
+    builtins.open = _mcp_repl_open
+    io.open = _mcp_repl_open
+    io.FileIO = _McpReplFileIO
+    _io.open = _mcp_repl_open
+    _io.FileIO = _McpReplFileIO
+    os.fdopen = _mcp_repl_os_fdopen
+    os.read = _mcp_repl_os_read
+    if _original_os_readv is not None:
+        os.readv = _mcp_repl_os_readv
+    if _mcp_repl_posix is not None:
+        _mcp_repl_posix.read = _mcp_repl_os_read
+        if _original_os_readv is not None:
+            _mcp_repl_posix.readv = _mcp_repl_os_readv
+    sys.ps1 = _mcp_repl_suppressed_ps1
+    sys.ps2 = _mcp_repl_suppressed_ps2
+    _mcp_repl_stdin = McpInputStream()
+    sys.stdin = _mcp_repl_stdin
+    # In the non-PTY fallback, leaving CPython's original fd-backed object
+    # exposed would let user code bypass sideband input accounting.
+    sys.__stdin__ = _mcp_repl_stdin
 sys.stdout = McpOutputStream("stdout")
 sys.stderr = McpOutputStream("stderr")

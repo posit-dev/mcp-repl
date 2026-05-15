@@ -37,11 +37,36 @@ impl WorkerLaunch {
         }
     }
 
+    pub fn stdin_transport(&self) -> WorkerStdinTransport {
+        match self {
+            Self::Builtin(Backend::Python) if cfg!(target_family = "unix") => {
+                WorkerStdinTransport::Pty
+            }
+            Self::Builtin(_) => WorkerStdinTransport::Pipe,
+            Self::Custom(spec) => spec.stdin.transport(),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Builtin(Backend::R) => "r".to_string(),
             Self::Builtin(Backend::Python) => "python".to_string(),
             Self::Custom(spec) => format!("custom:{}", spec.executable.display()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStdinTransport {
+    Pipe,
+    Pty,
+}
+
+impl WorkerStdinTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pipe => "pipe",
+            Self::Pty => "pty",
         }
     }
 }
@@ -79,9 +104,6 @@ impl CustomWorkerSpec {
         ) {
             return Err("worker spec working_dir path must not be empty".to_string());
         }
-        match self.stdin {
-            CustomWorkerStdin::Pipe => {}
-        }
         match self.sandbox {
             CustomWorkerSandbox::Server => {}
         }
@@ -106,6 +128,16 @@ pub enum CustomWorkerWorkingDirPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum CustomWorkerStdin {
     Pipe,
+    Pty,
+}
+
+impl CustomWorkerStdin {
+    pub fn transport(self) -> WorkerStdinTransport {
+        match self {
+            Self::Pipe => WorkerStdinTransport::Pipe,
+            Self::Pty => WorkerStdinTransport::Pty,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -158,5 +190,23 @@ mod tests {
         unsafe {
             std::env::remove_var(INTERPRETER_ENV);
         }
+    }
+
+    #[test]
+    fn builtin_worker_launches_default_to_pipe_stdin_transport() {
+        assert_eq!(
+            WorkerLaunch::Builtin(Backend::R).stdin_transport(),
+            WorkerStdinTransport::Pipe
+        );
+        #[cfg(not(target_family = "unix"))]
+        assert_eq!(
+            WorkerLaunch::Builtin(Backend::Python).stdin_transport(),
+            WorkerStdinTransport::Pipe
+        );
+        #[cfg(target_family = "unix")]
+        assert_eq!(
+            WorkerLaunch::Builtin(Backend::Python).stdin_transport(),
+            WorkerStdinTransport::Pty
+        );
     }
 }

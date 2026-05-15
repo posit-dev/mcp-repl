@@ -6,9 +6,10 @@ This file is the entrypoint for deciding how to verify a change.
 ## Core Test Surface
 
 - `tests/repl_surface.rs`: basic `repl` and `repl_reset` behavior.
-- `tests/repl_surface.rs` and `tests/python_backend.rs`: IPC ownership coverage. Only the main worker may own sideband fds; user-spawned children must not. `tests/python_backend.rs` also covers detached-idle oversized-output behavior through the public `repl` API.
+- `tests/repl_surface.rs` and `tests/python_backend.rs`: IPC ownership coverage. Only the main worker may own sideband fds; user-spawned children must not. `tests/python_backend.rs` also covers detached-idle oversized-output behavior, Unix Python PTY-backed C stdio, CPython `input()` through the readline path, and the absence of direct-fd stdin shims through the public `repl` API.
 - `tests/server_smoke.rs`: end-to-end MCP session smoke coverage.
 - `tests/write_stdin_behavior.rs`: timeout polling, oversized text replies, and transcript-file behavior through the public `repl` API.
+- `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
 - `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
 - `tests/plot_images.rs` and `tests/python_plot_images.rs`: plot/image behavior through the public tool surface.
 - `tests/codex_approvals_tui.rs` and `tests/claude_integration.rs`: client integration coverage.

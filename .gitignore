@@ -6,3 +6,5 @@ mcp-repl-startup.log
 .venv
 /eval
 .agents
+tools/drain-*
+prompts/*

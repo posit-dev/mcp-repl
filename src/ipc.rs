@@ -86,6 +86,10 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
+    RequestStart,
+    PythonRequestStart {
+        request_generation: u64,
+    },
     StdinWrite {
         byte_len: usize,
         #[serde(default)]
@@ -94,6 +98,9 @@ pub enum ServerToWorkerIpcMessage {
         final_prompt: Option<String>,
     },
     StdinWriteComplete,
+    PythonInterrupt {
+        request_generation: u64,
+    },
     Interrupt,
     SessionEnd,
 }
@@ -113,6 +120,7 @@ pub enum WorkerToServerIpcMessage {
         supports_images: bool,
     },
     StdinWriteAck,
+    PythonInterruptAck,
     OutputText {
         stream: TextStream,
         data_b64: String,
@@ -196,10 +204,15 @@ struct ServerIpcInbox {
     plot_source_image_ids: HashMap<String, String>,
     request_plot_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
-    protocol_error: Option<String>,
+    protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
     session_end_final: bool,
     disconnected: bool,
+}
+
+struct LatchedProtocolError {
+    message: String,
+    observed_at: Instant,
 }
 
 #[derive(Default)]
@@ -343,7 +356,10 @@ impl ServerIpcConnection {
                     Ok(message) => message,
                     Err(err) => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.protocol_error = Some(format!("invalid worker sideband JSON: {err}"));
+                        latch_protocol_error(
+                            &mut guard,
+                            format!("invalid worker sideband JSON: {err}"),
+                        );
                         reader_cvar.notify_all();
                         break;
                     }
@@ -351,8 +367,10 @@ impl ServerIpcConnection {
                 {
                     let mut guard = reader_inbox.lock().unwrap();
                     if guard.session_end_final {
-                        guard.protocol_error =
-                            Some("worker sideband message after session_end".to_string());
+                        latch_protocol_error(
+                            &mut guard,
+                            "worker sideband message after session_end",
+                        );
                         reader_cvar.notify_all();
                         break;
                     }
@@ -364,9 +382,9 @@ impl ServerIpcConnection {
                                 | WorkerToServerIpcMessage::SessionEnd { .. }
                         );
                         if !startup_message {
-                            guard.protocol_error = Some(
-                                "first worker sideband message must be worker_ready or backend_info"
-                                    .to_string(),
+                            latch_protocol_error(
+                                &mut guard,
+                                "first worker sideband message must be worker_ready or backend_info",
                             );
                             reader_cvar.notify_all();
                             break;
@@ -410,7 +428,7 @@ impl ServerIpcConnection {
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) = account_active_stdin(&mut guard, &text, "readline_input")
                         {
-                            guard.protocol_error = Some(err);
+                            latch_protocol_error(&mut guard, err);
                             reader_cvar.notify_all();
                             break;
                         }
@@ -421,7 +439,7 @@ impl ServerIpcConnection {
                         if let Err(err) =
                             account_active_stdin(&mut guard, &text, "readline_discard")
                         {
-                            guard.protocol_error = Some(err);
+                            latch_protocol_error(&mut guard, err);
                             reader_cvar.notify_all();
                             break;
                         }
@@ -475,8 +493,7 @@ impl ServerIpcConnection {
                                 Ok(bytes) => bytes,
                                 Err(_) => {
                                     let mut guard = reader_inbox.lock().unwrap();
-                                    guard.protocol_error =
-                                        Some("invalid output_text base64".to_string());
+                                    latch_protocol_error(&mut guard, "invalid output_text base64");
                                     reader_cvar.notify_all();
                                     break;
                                 }
@@ -545,7 +562,7 @@ impl ServerIpcConnection {
                             .is_err()
                         {
                             let mut guard = reader_inbox.lock().unwrap();
-                            guard.protocol_error = Some("invalid output_image base64".to_string());
+                            latch_protocol_error(&mut guard, "invalid output_image base64");
                             reader_cvar.notify_all();
                             break;
                         }
@@ -619,6 +636,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         drop_stdin_write_acks(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -628,6 +646,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         drop_stdin_write_acks(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.active_stdin = Some(payload.iter().copied().collect());
         guard.echo_events.clear();
         guard.prompt_history.clear();
@@ -656,7 +675,7 @@ impl ServerIpcConnection {
 
     pub fn take_protocol_error(&self) -> Option<String> {
         let mut guard = self.inbox.lock().unwrap();
-        guard.protocol_error.take()
+        take_latched_protocol_error(&mut guard)
     }
 
     pub fn wait_for_request_completion(
@@ -668,7 +687,10 @@ impl ServerIpcConnection {
         let allow_completion_settle_after_deadline = !timeout.is_zero();
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if let Some(message) = guard.protocol_error.take() {
+            if take_request_completion_before_latched_protocol_error(&mut guard, stable_wait) {
+                return Ok(());
+            }
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
                 return Err(IpcWaitError::Protocol(message));
             }
             if take_session_end(&mut guard) {
@@ -700,7 +722,10 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if let Some(message) = guard.protocol_error.take() {
+                if take_request_completion_before_latched_protocol_error(&mut guard, stable_wait) {
+                    return Ok(());
+                }
+                if let Some(message) = take_latched_protocol_error(&mut guard) {
                     return Err(IpcWaitError::Protocol(message));
                 }
                 if take_session_end(&mut guard) {
@@ -726,7 +751,7 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if let Some(message) = guard.protocol_error.take() {
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
                 return Err(IpcWaitError::Protocol(message));
             }
             if take_session_end(&mut guard) {
@@ -768,7 +793,7 @@ impl ServerIpcConnection {
                 let _ = take_session_end(&mut guard);
                 return Ok(info);
             }
-            if let Some(message) = guard.protocol_error.take() {
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
                 return Err(IpcWaitError::Protocol(message));
             }
             if take_session_end(&mut guard) {
@@ -791,6 +816,7 @@ impl ServerIpcConnection {
         }
     }
 
+    #[cfg_attr(target_family = "unix", allow(dead_code))]
     pub fn wait_for_stdin_write_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -798,7 +824,7 @@ impl ServerIpcConnection {
             if take_stdin_write_ack(&mut guard) {
                 return Ok(());
             }
-            if let Some(message) = guard.protocol_error.take() {
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
                 return Err(IpcWaitError::Protocol(message));
             }
             if take_session_end(&mut guard) {
@@ -819,7 +845,44 @@ impl ServerIpcConnection {
                 if take_stdin_write_ack(&mut guard) {
                     return Ok(());
                 }
-                if let Some(message) = guard.protocol_error.take() {
+                if let Some(message) = take_latched_protocol_error(&mut guard) {
+                    return Err(IpcWaitError::Protocol(message));
+                }
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    #[cfg_attr(not(target_family = "unix"), allow(dead_code))]
+    pub fn wait_for_python_interrupt_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if take_python_interrupt_ack(&mut guard) {
+                return Ok(());
+            }
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                if take_python_interrupt_ack(&mut guard) {
+                    return Ok(());
+                }
+                if let Some(message) = take_latched_protocol_error(&mut guard) {
                     return Err(IpcWaitError::Protocol(message));
                 }
                 return Err(IpcWaitError::Timeout);
@@ -1645,6 +1708,24 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
+#[cfg(target_family = "unix")]
+pub fn emit_readline_input(text: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInput {
+            text: text.to_string(),
+        });
+    }
+}
+
+#[cfg(target_family = "unix")]
+pub fn emit_readline_discard(text: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscard {
+            text: text.to_string(),
+        });
+    }
+}
+
 pub fn emit_readline_result(prompt: &str, line: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineResult {
@@ -1698,6 +1779,12 @@ pub fn emit_worker_ready(
 pub fn emit_stdin_write_ack() {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::StdinWriteAck);
+    }
+}
+
+pub fn emit_python_interrupt_ack() {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::PythonInterruptAck);
     }
 }
 
@@ -1783,11 +1870,26 @@ fn account_active_stdin(
     Ok(())
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue
         .iter()
         .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+    {
+        guard.queue.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg_attr(not(target_family = "unix"), allow(dead_code))]
+fn take_python_interrupt_ack(guard: &mut ServerIpcInbox) -> bool {
+    if let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck))
     {
         guard.queue.remove(idx);
         true
@@ -1802,11 +1904,55 @@ fn drop_stdin_write_acks(guard: &mut ServerIpcInbox) {
         .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinWriteAck));
 }
 
+fn drop_python_interrupt_acks(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck));
+}
+
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
     let Some(since) = guard.readline_unmatched_since else {
         return false;
     };
     guard.readline_unmatched_starts > 0 && since.elapsed() >= stable_wait
+}
+
+fn latch_protocol_error(guard: &mut ServerIpcInbox, message: impl Into<String>) {
+    guard.protocol_error = Some(LatchedProtocolError {
+        message: message.into(),
+        observed_at: Instant::now(),
+    });
+}
+
+fn take_latched_protocol_error(guard: &mut ServerIpcInbox) -> Option<String> {
+    guard.protocol_error.take().map(|error| error.message)
+}
+
+fn take_request_completion_before_latched_protocol_error(
+    guard: &mut ServerIpcInbox,
+    stable_wait: Duration,
+) -> bool {
+    if !request_completion_precedes_latched_protocol_error(guard, stable_wait) {
+        return false;
+    }
+    reset_request_progress(guard);
+    true
+}
+
+fn request_completion_precedes_latched_protocol_error(
+    guard: &ServerIpcInbox,
+    stable_wait: Duration,
+) -> bool {
+    let Some(error) = guard.protocol_error.as_ref() else {
+        return false;
+    };
+    let Some(since) = guard.readline_unmatched_since else {
+        return false;
+    };
+    let Some(stable_at) = since.checked_add(stable_wait) else {
+        return false;
+    };
+    guard.readline_unmatched_starts > 0 && stable_at <= error.observed_at
 }
 
 fn take_request_completion(guard: &mut ServerIpcInbox, stable_wait: Duration) -> bool {
@@ -2099,6 +2245,44 @@ mod protocol_tests {
     }
 
     #[test]
+    fn python_request_generation_messages_are_server_to_worker_only() {
+        let request_start = serde_json::to_value(ServerToWorkerIpcMessage::PythonRequestStart {
+            request_generation: 7,
+        })
+        .expect("serialize python_request_start");
+        assert_eq!(
+            request_start,
+            json!({
+                "type": "python_request_start",
+                "request_generation": 7
+            })
+        );
+
+        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            matches!(
+                interrupt,
+                Ok(ServerToWorkerIpcMessage::PythonInterrupt {
+                    request_generation: 7
+                })
+            ),
+            "python_interrupt should carry the request generation"
+        );
+
+        let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            worker_to_server.is_err(),
+            "python_interrupt should not deserialize as a worker-to-server message"
+        );
+    }
+
+    #[test]
     fn begin_request_drops_stale_stdin_write_acks() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
@@ -2174,6 +2358,48 @@ mod protocol_tests {
             matches!(result, Err(super::IpcWaitError::Protocol(ref message)) if message.starts_with("invalid worker sideband JSON:")),
             "invalid worker message should report a protocol error, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn request_completion_keeps_protocol_error_latched_after_stable_prompt() {
+        let stable_wait = Duration::from_millis(20);
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        server.begin_request_with_stdin(b"done\n");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineInput {
+                text: "done\n".to_string(),
+            })
+            .expect("send readline_input");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "zod> ".to_string(),
+                line: "done\n".to_string(),
+            })
+            .expect("send readline_result");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: "zod> ".to_string(),
+            })
+            .expect("send readline_start");
+        thread::sleep(stable_wait + Duration::from_millis(5));
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: "***".to_string(),
+                is_continuation: false,
+            })
+            .expect("send invalid output_text");
+        thread::sleep(Duration::from_millis(5));
+
+        let completion = server.wait_for_request_completion(Duration::from_secs(1), stable_wait);
+        assert!(
+            completion.is_ok(),
+            "stable request completion should win over later idle protocol error, got: {completion:?}"
+        );
+        let latched = server.take_protocol_error();
+        assert_eq!(latched.as_deref(), Some("invalid output_text base64"));
     }
 
     #[test]

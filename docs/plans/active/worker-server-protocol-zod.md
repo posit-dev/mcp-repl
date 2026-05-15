@@ -662,6 +662,10 @@ ordered on the worker-to-server sideband stream. The server must not
 assume that writing the `interrupt` message means the worker has already
 processed it; later `readline_input`, `readline_discard`,
 `readline_start`, and `session_end` events determine recovery.
+Built-in Unix Python currently has a private `python_interrupt` /
+`python_interrupt_ack` cleanup handshake so it can drain PTY input before
+SIGINT; that acknowledgement is transitional and not part of the generic
+worker protocol.
 
 ## Timeout and Polling
 
@@ -826,7 +830,8 @@ Required migration work:
 - Keep worker stdin as the only user-input transport from server to
   worker.
 - Remove `stdin_write`, `stdin_write_complete`, byte counts, line
-  counts, and `stdin_write_ack`.
+  counts, `stdin_write_ack`, and the private Python interrupt
+  acknowledgement.
 - Remove IPC-carried request ids and request payloads.
 - Replace server-inferred completion from prompt parsing with
   unsatisfied worker-emitted `readline_start`.

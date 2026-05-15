@@ -1,97 +1,81 @@
 # Worker Sideband Protocol (JSON Lines)
 
-This document describes the minimal sideband protocol between the server and a
-worker process. The channel is a JSON-lines stream (one JSON object per line)
+This document describes the sideband protocol between the server and a worker
+process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
-## Transport
+User input is not carried on sideband. The server writes decoded MCP `repl()`
+text to worker stdin, appending exactly one trailing `\n` to non-empty input
+that does not already end in `\n`. The worker owns runtime stdin placement and
+reports stdin accounting facts back on sideband.
 
-- Availability:
-  - Unix: worker inherits two file descriptors via environment variables:
-    - `MCP_REPL_IPC_READ_FD`
-    - `MCP_REPL_IPC_WRITE_FD`
-  - Windows: worker connects to two server-created named pipes via environment
-    variables:
-    - `MCP_REPL_IPC_PIPE_TO_WORKER`
-    - `MCP_REPL_IPC_PIPE_FROM_WORKER`
+## Sideband Transport
+
+- Unix: worker inherits two file descriptors through environment variables:
+  - `MCP_REPL_IPC_READ_FD`
+  - `MCP_REPL_IPC_WRITE_FD`
+- Windows: worker connects to two server-created named pipes through
+  environment variables:
+  - `MCP_REPL_IPC_PIPE_TO_WORKER`
+  - `MCP_REPL_IPC_PIPE_FROM_WORKER`
 - Messages are serialized as UTF-8 JSON, one message per line.
+
+## Runtime Stdin Transport
+
+Runtime stdin transport is a launch-time worker setting, not a sideband
+negotiation. A worker may use ordinary pipes or a PTY for its C stdio, but the
+server still writes accepted request bytes to worker stdin and relies on
+sideband events for prompt, input, discard, output, and session facts.
+
+Built-in Unix Python uses PTY-backed C stdin/stdout/stderr so CPython calls
+`PyOS_ReadlineFunctionPointer`. The Python callback emits readline accounting
+facts from that CPython path. Sideband IPC stays separate from the PTY.
 
 ## Direction: server -> worker
 
-`stdin_write`
-- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
-- Emitted before the server writes the raw input payload bytes to stdin.
-- The payload itself is not carried on IPC and stdin contains no protocol
-  header.
-- R worker mode uses `byte_len` to make its worker-owned stdin reader consume
-  exactly one raw payload before handing it to embedded R.
-- Python worker mode lets CPython own stdin. It ignores `byte_len` after request
-  acceptance and uses `line_count` to know how many CPython readline calls
-  belong to the active request.
-- `line_count` is optional for older senders and defaults to `0`.
-- `final_prompt` is optional and is currently sent by the Python backend driver.
-  It is a best-effort fallback prompt hint for the request payload, used only
-  while the worker is still waiting for the current request to finish.
-
-`stdin_write_complete`
-- `{ "type": "stdin_write_complete" }`
-- Emitted after the server has written the raw input payload bytes to stdin.
-- Python worker mode uses this frame to distinguish "no more bytes will arrive
-  for this request" from "stdin may still be draining", so it can finish a
-  request only after both CPython readline progress and payload write completion
-  agree.
-- R worker mode currently ignores this frame because the R stdin reader owns
-  exact payload consumption through `byte_len`.
-
 `interrupt`
 - `{ "type": "interrupt" }`
-- Sent when the server issues an interrupt to an existing worker process.
-- Interrupt routing must not depend on prompt text. Prompt strings are visible
-  output data, not control metadata; for example, a user-code prompt may look
-  like a primary REPL prompt or may be empty.
-- For R, worker-side handlers clear any pending queued input.
-- For Python, the worker invokes CPython's interrupt API and discards pending
-  stdin bytes from the current request before normal completion signaling
-  resumes.
+- Sent when the server is about to issue an OS interrupt to an existing worker
+  process or process group.
+- This is for worker-owned bookkeeping only. It does not carry user input and
+  does not replace the OS interrupt.
+- The worker may emit `readline_discard` for exact active-turn stdin bytes it
+  discarded before delivering them to the runtime.
 
 `session_end`
 - `{ "type": "session_end" }`
-- Sent when the server is ending the current session (for example
-  restart/shutdown).
+- Sent when the server is ending the current session, for example during reset
+  or shutdown.
 - Worker treats this as shutdown intent and stops consuming further stdin
   payloads.
 
 ## Direction: worker -> server
 
-Worker-to-server messages are strict: unknown fields are protocol errors.
+Worker-to-server messages are strict: unknown fields, invalid enum values,
+invalid base64, and unknown message types are protocol errors.
 
-`backend_info`
-- `{ "type": "backend_info", "supports_images": <bool> }`
-- Sent once on startup after the sideband connection is established.
-- This is startup metadata. It may describe narrow worker capabilities, but it
-  must not turn steady-state server request handling into language-specific
-  policy.
-
-`stdin_write_ack`
-- `{ "type": "stdin_write_ack" }`
-- Sent after a worker has processed `stdin_write` and installed request metadata
-  for the upcoming raw stdin bytes.
-- Currently emitted by Python worker mode. R worker mode does not emit it
-  because the server does not need an acceptance barrier before writing the raw
-  payload to R's worker-owned stdin reader.
-- This only acknowledges request-boundary state. It is not an acknowledgement
-  for stdout/stderr, plot images, or request completion.
-- `stdin_write_ack` is not an output-drain barrier. A future output-drain gate
-  should use a separate protocol step.
+`worker_ready`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 1 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> }, "graceful_shutdown": { "stdin": <string> } }`
+- Must be the first worker-to-server message for protocol workers.
+- The server rejects unsupported protocol names or versions before sending user
+  input.
+- `worker.name` is diagnostic metadata. Server request handling must not branch
+  on it.
+- `graceful_shutdown` is optional. If present, the server may write that exact
+  stdin text only when server-owned shutdown/reset rules decide a graceful
+  stdin request is appropriate.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string> }`
-- Emitted for readline prompts. The prompt string is required; use an empty
-  string if the backend did not supply one.
-- If active-turn stdin bytes remain unaccounted, the prompt is treated as
-  satisfied by already-written stdin and does not complete the request. If no
-  active-turn stdin bytes remain, the prompt is unsatisfied and may complete
-  the request.
+- Emitted when the runtime enters a line-read operation, before reading bytes
+  for that operation.
+- The prompt string is required; use an empty string if the runtime supplied no
+  prompt.
+- If active-turn stdin bytes remain unaccounted, the prompt is satisfied by
+  already-written stdin and does not complete the request. If no active-turn
+  stdin bytes remain, the prompt is unsatisfied and may complete the request.
+- Prompt rendering is derived from this structured event, not from raw
+  stdout/stderr parsing.
 
 `readline_input`
 - `{ "type": "readline_input", "text": <string> }`
@@ -106,22 +90,16 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
   interrupt/reset cleanup without delivering it to the runtime.
 - The server encodes `text` as UTF-8 and removes those bytes from the active
   stdin queue. A mismatch is a protocol error.
-
-`readline_result`
-- `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
-- Emitted after a line is read. Includes the prompt and the line that was
-  consumed.
-- The server can reconstruct echoed readline bytes as `prompt + line` for
-  conservative echo suppression of raw pipe output.
+- Workers must emit this only for exact bytes they can identify. Bytes flushed
+  from terminal state without being observed are not reportable.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
-- Carries worker-owned text bytes on the ordered IPC stream. The payload is
-  base64 so workers can preserve bytes without depending on JSON string
+- Carries worker-owned output bytes on the ordered sideband stream. The payload
+  is base64 so workers can preserve bytes without depending on JSON string
   encoding.
-- R uses this for R-owned console output and prompts. Python uses this for
-  Python-level `sys.stdout` and `sys.stderr` after installing embedded stream
-  objects.
+- Prompt-looking bytes are ordinary output unless the worker reports them in
+  `readline_start.prompt`.
 - `is_continuation` marks bounded transport chunks that continue the same
   worker-owned output write. It defaults to `false`.
 - Workers send output-critical frames synchronously: each JSON line is written,
@@ -131,42 +109,98 @@ Worker-to-server messages are strict: unknown fields are protocol errors.
 - Forked child processes with sideband IPC intentionally disabled are outside
   this worker-owned path and may continue to use inherited raw output streams.
 
+`output_image`
+- `{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }`
+- Carries worker-owned image bytes on the ordered sideband stream.
+- `image_id` is worker-local source identity for update grouping. The server
+  owns MCP response image IDs.
+
+`session_end`
+- `{ "type": "session_end", "reason": <string>, "message_b64": <base64, optional> }`
+- Indicates the worker session is terminating.
+- `reason` is required for protocol workers. Recognized values are `shutdown`,
+  `reset`, `runtime_exit`, `crash`, and `protocol_error`.
+- After this event, the worker must not emit more output.
+
+## Transitional Compatibility Frames
+
+These frames remain for built-in workers that have not fully migrated on every
+platform. New protocol workers should not copy them for steady-state request
+handling. Built-in Unix Python still receives the legacy request-boundary
+frames, but stdin accounting comes from CPython readline events rather than a
+separate stdin bridge.
+
+`stdin_write`
+- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
+- Legacy server-to-worker request metadata emitted before the server writes raw
+  input payload bytes to stdin.
+- Built-in R still uses `byte_len` to make its worker-owned stdin reader consume
+  exactly one raw payload before handing it to embedded R.
+- Built-in Unix Python uses these fields only to install active request state
+  before CPython's next readline callback consumes stdin.
+- Non-Unix Python may still use them for the pipe-backed compatibility path
+  until it is migrated to the same readline accounting model.
+
+`stdin_write_complete`
+- `{ "type": "stdin_write_complete" }`
+- Legacy server-to-worker marker emitted after the server has written the raw
+  input payload bytes to stdin.
+
+`backend_info`
+- `{ "type": "backend_info", "supports_images": <bool> }`
+- Legacy startup metadata accepted from older built-in workers.
+- It may describe narrow worker capabilities, but it must not turn steady-state
+  server request handling into language-specific policy.
+
+`stdin_write_ack`
+- `{ "type": "stdin_write_ack" }`
+- Legacy worker-to-server request-boundary acknowledgement.
+- This only acknowledges request-boundary state. It is not an acknowledgement
+  for stdout/stderr, PTY output, plot images, prompt completion, or request
+  completion.
+
+`python_interrupt_ack`
+- `{ "type": "python_interrupt_ack" }`
+- Transitional worker-to-server acknowledgement used only by built-in Unix
+  Python after it has processed its private `python_interrupt` cleanup message.
+- It means the worker has attempted exact discard accounting and terminal input
+  flushing before the server delivers SIGINT. It is not a generic protocol
+  interrupt acknowledgement.
+
+`readline_result`
+- `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
+- Legacy echo metadata emitted after a line is read.
+- The server may use it for conservative echo suppression of raw pipe output,
+  but completion is driven by `readline_start`, `readline_input`,
+  `readline_discard`, and `session_end`.
+
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
-- Image payload for plot updates.
+- Legacy image payload used by built-in plot emitters.
 - `source` is optional worker-local plot source identity, such as a graphics
   device or figure slot. It is not a response image ID; the server owns response
-  image IDs and uses `source` only to keep distinct plot sources from collapsing
-  into one response image.
+  image IDs and uses `source` only to keep distinct plot sources from
+  collapsing into one response image.
 - There is no plot-image acknowledgement message.
 - Workers must not delay stdout/stderr output waiting for sideband responses.
 - If an update is the first image event for a new server request, the server
   treats it as a new response image and includes a server notice that it updates
   the previously sent image.
 
-`session_end`
-- `{ "type": "session_end" }`
-- Indicates the worker session is terminating.
-
 ## Notes
 
 - Raw stdout/stderr capture remains active for unowned output, such as child
-  processes or direct file-descriptor writes.
-- The server infers request completion when prompt/readline sideband facts show
-  that the worker is waiting for the next input.
-- To reduce IPC-vs-output capture races, the server applies a short
-  post-completion settle window so output reader threads can drain final bytes
-  before snapshotting output.
-- A future pre-input drain gate may let the server hold back the next stdin
-  payload while it drains raw stdout/stderr from the previous boundary for a
-  small bounded budget, for example about 200 ms with a hard stop. Child output
-  that arrives after that boundary belongs to the next response. This would be a
-  request-boundary coordination step, not a per-output acknowledgement.
-- On timeout, a request may remain pending; later polls can observe the inferred
-  completion state and finish the request.
-- Backend-specific execution rules should be implemented by the worker. Server
-  branching on backend is reserved for interpreter selection, launch setup, tool
-  description selection, or narrow capabilities reported at startup.
-- Control-only interrupts are still server-owned routing decisions: if a worker
+  processes or direct file-descriptor writes. Raw capture must not drive
+  completion, prompt detection, echo suppression, or interrupt routing.
+- For PTY-backed workers, raw visible output may arrive from one terminal stream
+  with terminal behavior such as CRLF translation, echo, terminal-width effects,
+  and merged stdout/stderr identity. Worker-owned `output_text` frames preserve
+  their declared stream; raw PTY output does not promise pipe-style stream
+  fidelity.
+- The server infers request completion when explicit worker sideband facts show
+  that the worker is waiting for the next input or that the session ended.
+- On timeout, a request may remain pending; later empty polls can observe worker
+  events and finish the request.
+- Control-only interrupts are server-owned routing decisions: if a worker
   process already exists, the server forwards the interrupt to it; if no worker
   exists, the server must not spawn one only to interrupt nothing.

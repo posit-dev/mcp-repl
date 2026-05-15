@@ -100,16 +100,20 @@ pub struct PythonApi {
         unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     pub py_unicode_as_utf8_and_size:
         unsafe extern "C" fn(*mut PyObject, *mut PySsizeT) -> *const c_char,
+    py_bytes_from_string_and_size: unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     py_bytes_as_string_and_size:
         unsafe extern "C" fn(*mut PyObject, *mut *mut c_char, *mut PySsizeT) -> c_int,
     pub py_long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
+    py_long_as_long: unsafe extern "C" fn(*mut PyObject) -> c_long,
     pub py_bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
     pub py_build_value: unsafe extern "C" fn(*const c_char, ...) -> *mut PyObject,
     pub py_mem_raw_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
+    py_err_occurred: unsafe extern "C" fn() -> *mut PyObject,
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
+    pub py_err_set_interrupt: unsafe extern "C" fn(),
 }
 
 static PYTHON_API: OnceLock<PythonApi> = OnceLock::new();
@@ -166,17 +170,23 @@ impl PythonApi {
             py_unicode_as_utf8_and_size: unsafe {
                 load_symbol(&library, b"PyUnicode_AsUTF8AndSize\0")?
             },
+            py_bytes_from_string_and_size: unsafe {
+                load_symbol(&library, b"PyBytes_FromStringAndSize\0")?
+            },
             py_bytes_as_string_and_size: unsafe {
                 load_symbol(&library, b"PyBytes_AsStringAndSize\0")?
             },
             py_long_from_long: unsafe { load_symbol(&library, b"PyLong_FromLong\0")? },
+            py_long_as_long: unsafe { load_symbol(&library, b"PyLong_AsLong\0")? },
             py_bool_from_long: unsafe { load_symbol(&library, b"PyBool_FromLong\0")? },
             py_build_value: unsafe { load_symbol(&library, b"Py_BuildValue\0")? },
             py_mem_raw_malloc: unsafe { load_symbol(&library, b"PyMem_RawMalloc\0")? },
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
+            py_err_occurred: unsafe { load_symbol(&library, b"PyErr_Occurred\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
+            py_err_set_interrupt: unsafe { load_symbol(&library, b"PyErr_SetInterrupt\0")? },
             _library: library,
         };
         Ok(api)
@@ -259,6 +269,16 @@ impl PythonApi {
         PyPtr::from_owned(ptr, "failed to allocate Python string")
     }
 
+    pub fn bytes(&self, value: &[u8]) -> Result<PyPtr, String> {
+        let ptr = unsafe {
+            (self.py_bytes_from_string_and_size)(
+                value.as_ptr().cast::<c_char>(),
+                value.len() as PySsizeT,
+            )
+        };
+        PyPtr::from_owned(ptr, "failed to allocate Python bytes")
+    }
+
     pub fn unicode_arg(&self, args: *mut PyObject, index: PySsizeT) -> Option<String> {
         let item = unsafe { (self.py_tuple_get_item)(args, index) };
         if item.is_null() {
@@ -292,6 +312,18 @@ impl PythonApi {
         Some(bytes.to_vec())
     }
 
+    pub fn long_arg(&self, args: *mut PyObject, index: PySsizeT) -> Option<c_long> {
+        let item = unsafe { (self.py_tuple_get_item)(args, index) };
+        if item.is_null() {
+            return None;
+        }
+        let value = unsafe { (self.py_long_as_long)(item) };
+        if value == -1 && unsafe { !(self.py_err_occurred)().is_null() } {
+            return None;
+        }
+        Some(value)
+    }
+
     pub fn tuple_size(&self, args: *mut PyObject) -> PySsizeT {
         unsafe { (self.py_tuple_size)(args) }
     }
@@ -312,6 +344,10 @@ impl PythonApi {
         let message =
             CString::new(message).expect("internal Python error message must not contain NUL");
         unsafe { (self.py_err_set_string)(exception, message.as_ptr()) };
+    }
+
+    pub fn set_interrupt(&self) {
+        unsafe { (self.py_err_set_interrupt)() };
     }
 
     pub fn install_input_hook(&self, callback: PyOsInputHookCallback) -> Result<(), String> {
