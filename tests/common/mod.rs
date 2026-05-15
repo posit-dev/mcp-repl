@@ -1459,29 +1459,21 @@ pub fn python_available() -> bool {
     python_program().is_some()
 }
 
-pub(crate) fn python_program_with_checker(
-    mut ok: impl FnMut(&str) -> bool,
-) -> Option<&'static str> {
-    if ok("python3") {
-        return Some("python3");
-    }
-    if ok("python") {
-        return Some("python");
-    }
-    None
-}
-
 pub fn python_program() -> Option<&'static str> {
-    python_program_with_checker(|program| {
-        std::process::Command::new(program)
+    for program in ["python3", "python"] {
+        let ok = std::process::Command::new(program)
             .args(["-c", "import sys; sys.exit(0)"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
-            .unwrap_or(false)
-    })
+            .unwrap_or(false);
+        if ok {
+            return Some(program);
+        }
+    }
+    None
 }
 
 pub async fn spawn_server_with_args_env_and_pager_page_chars(

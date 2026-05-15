@@ -4,15 +4,6 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 
-#[test]
-fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
-    let text = "worker protocol error: ipc disconnected while waiting for request completion";
-    assert!(
-        !common::backend_unavailable(text),
-        "request-completion IPC disconnects should fail tests instead of skipping them"
-    );
-}
-
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sends_input_to_r_console_snapshot() -> TestResult<()> {

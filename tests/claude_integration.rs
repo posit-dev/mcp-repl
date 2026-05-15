@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const SNAPSHOT_NAME: &str = "claude_live_integration";
 const INSTALL_SNAPSHOT_NAME: &str = "claude_live_install_integration";
+const CLIENT_INTEGRATION_ENV: &str = "MCP_REPL_RUN_CLIENT_INTEGRATIONS";
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLAUDE_MODEL: &str = "haiku";
 const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
@@ -111,7 +112,6 @@ fn claude_live_integration() -> TestResult<()> {
 #[test]
 fn claude_live_install_integration() -> TestResult<()> {
     if !claude_available() {
-        eprintln!("claude not found on PATH; skipping");
         return Ok(());
     }
 
@@ -136,7 +136,6 @@ fn claude_live_install_integration() -> TestResult<()> {
 
 fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
     if !claude_available() {
-        eprintln!("claude not found on PATH; skipping");
         return Ok(None);
     }
 
@@ -202,14 +201,23 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
 }
 
 fn claude_available() -> bool {
-    Command::new("claude")
+    if env::var(CLIENT_INTEGRATION_ENV).as_deref() != Ok("1") {
+        eprintln!("{CLIENT_INTEGRATION_ENV}=1 is not set; skipping Claude integration test");
+        return false;
+    }
+
+    let available = Command::new("claude")
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !available {
+        eprintln!("claude not found on PATH; skipping");
+    }
+    available
 }
 
 fn resolve_mcp_repl_path() -> TestResult<PathBuf> {

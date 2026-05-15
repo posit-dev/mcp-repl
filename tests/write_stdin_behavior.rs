@@ -15,15 +15,8 @@ fn test_mutex() -> &'static Mutex<()> {
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
-fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 fn lock_test_mutex() -> MutexGuard<'static, ()> {
-    lock_mutex(test_mutex())
+    test_mutex().lock().expect("test mutex poisoned")
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -1991,15 +1984,4 @@ async fn output_bundle_is_cleaned_up_when_server_exits() -> TestResult<()> {
     wait_for_path_to_disappear(&transcript_path).await?;
 
     Ok(())
-}
-
-#[test]
-fn lock_mutex_handles_poisoned_mutex() {
-    let mutex = Mutex::new(());
-    let _ = std::panic::catch_unwind(|| {
-        let _guard = mutex.lock().expect("lock");
-        panic!("poison mutex");
-    });
-
-    let _guard = lock_mutex(&mutex);
 }

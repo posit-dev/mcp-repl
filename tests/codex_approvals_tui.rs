@@ -38,6 +38,7 @@ mod unix_impl {
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
+    const CLIENT_INTEGRATION_ENV: &str = "MCP_REPL_RUN_CLIENT_INTEGRATIONS";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
@@ -71,7 +72,6 @@ mod unix_impl {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_exec_wire_sandbox_state_meta() -> TestResult<String> {
         if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
@@ -145,7 +145,6 @@ mod unix_impl {
 
     pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
             return Ok(());
         }
         if !loopback_bind_available().await {
@@ -212,7 +211,6 @@ mod unix_impl {
         mode: ExecSnapshotMode,
     ) -> TestResult<String> {
         if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
@@ -286,7 +284,6 @@ mod unix_impl {
             return Ok(());
         }
         if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
             return Ok(());
         }
         if !common::sandbox_exec_available() {
@@ -447,10 +444,19 @@ mod unix_impl {
     }
 
     fn codex_available() -> bool {
-        std::process::Command::new("codex")
+        if std::env::var(CLIENT_INTEGRATION_ENV).as_deref() != Ok("1") {
+            eprintln!("{CLIENT_INTEGRATION_ENV}=1 is not set; skipping Codex integration test");
+            return false;
+        }
+
+        let available = std::process::Command::new("codex")
             .arg("--version")
             .output()
-            .is_ok()
+            .is_ok();
+        if !available {
+            eprintln!("codex not found on PATH; skipping");
+        }
+        available
     }
 
     fn create_isolated_codex_env_with_config(

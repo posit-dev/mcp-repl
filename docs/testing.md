@@ -3,6 +3,13 @@
 `mcp-repl` is validated primarily through public API tests and transcript-style snapshots.
 This file is the entrypoint for deciding how to verify a change.
 
+## Policy
+
+- Default tests should launch the built `mcp-repl` binary and exercise it through the MCP tool surface.
+- Prefer compact transcript or JSON snapshots over verbose bespoke assertions.
+- Keep internal Rust unit tests only when they communicate intent that is not reachable through the public API.
+- Client integration tests are opt-in and do not run as part of default cargo test. Set `MCP_REPL_RUN_CLIENT_INTEGRATIONS=1` when explicitly validating Codex or Claude client behavior.
+
 ## Core Test Surface
 
 - `tests/repl_surface.rs`: basic `repl` and `repl_reset` behavior.
@@ -12,7 +19,7 @@ This file is the entrypoint for deciding how to verify a change.
 - `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
 - `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
 - `tests/plot_images.rs` and `tests/python_plot_images.rs`: plot/image behavior through the public tool surface.
-- `tests/codex_approvals_tui.rs` and `tests/claude_integration.rs`: client integration coverage.
+- `tests/codex_approvals_tui.rs` and `tests/claude_integration.rs`: opt-in client integration coverage.
 - `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.
 
 ## Snapshot Workflow

@@ -68,6 +68,23 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn client_integrations_are_opt_in() {
+    let root = repo_root();
+    let testing = read(&root.join("docs/testing.md"));
+    assert_contains_wrapped_text(
+        &testing,
+        "Client integration tests are opt-in and do not run as part of default cargo test.",
+        "docs/testing.md",
+    );
+
+    let workflow = read(&root.join(".github/workflows/ci.yml"));
+    assert!(
+        workflow.contains("MCP_REPL_RUN_CLIENT_INTEGRATIONS: \"1\""),
+        "real client integration CI steps should explicitly opt in"
+    );
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_plot_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
