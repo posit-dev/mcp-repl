@@ -2173,6 +2173,9 @@ impl WorkerManager {
             InputFallback::default()
         };
         let fallback_input_transcript = fallback_input.transcript.clone();
+        if !timed_out && consumed_completion {
+            self.wait_for_late_files_output_after_settled_completion(timeout);
+        }
 
         let FormattedPendingOutput {
             mut contents,
@@ -3062,6 +3065,30 @@ impl WorkerManager {
         }
         let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(total);
         self.settle_output_until_stable(total, stable_needed);
+    }
+
+    fn wait_for_late_files_output_after_settled_completion(&self, budget: Duration) {
+        if self.pending_output_tape.has_pending() {
+            return;
+        }
+        let total = budget.min(OUTPUT_READER_TIMEOUT_SETTLE_MAX);
+        if total.is_zero() {
+            return;
+        }
+
+        let poll = Duration::from_millis(5);
+        let start = std::time::Instant::now();
+        while start.elapsed() < total {
+            let remaining = total.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(poll.min(remaining));
+            if self.pending_output_tape.has_pending() {
+                self.settle_output_after_completion(total.saturating_sub(start.elapsed()));
+                return;
+            }
+        }
     }
 
     fn settle_output_after_timeout(&self) {
@@ -8212,6 +8239,55 @@ mod tests {
         assert!(
             manager.settled_pending_completion.is_none(),
             "expected the settled completion to be consumed by the interrupt follow-up"
+        );
+    }
+
+    #[test]
+    fn files_empty_poll_waits_for_late_stdout_after_settled_completion() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some("> ".to_string()),
+            prompt_variants: Some(vec!["> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let tape = manager.pending_output_tape.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tape.append_stdout_bytes(b"[1] 2\n");
+        });
+
+        let reply = manager
+            .write_stdin_files(
+                String::new(),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                WriteStdinOptions::default(),
+            )
+            .expect("empty poll reply");
+
+        writer.join().expect("late stdout writer");
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+        assert!(
+            text.contains("[1] 2\n"),
+            "expected the empty poll to wait for late settled stdout, got: {text:?}"
+        );
+        assert!(
+            !text.contains("<<repl status: idle>>"),
+            "did not expect an idle marker before late settled stdout, got: {text:?}"
         );
     }
 

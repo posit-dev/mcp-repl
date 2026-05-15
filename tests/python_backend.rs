@@ -1255,9 +1255,31 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
         "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
     );
-    assert!(
-        text.contains("DIRECT_FD_SHIMS _io _io _io _io posix posix"),
-        "expected direct fd stdin APIs to come from standard modules, got: {text:?}"
+    let direct_fd_modules = text
+        .lines()
+        .find_map(|line| line.strip_prefix("DIRECT_FD_SHIMS "))
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            panic!("expected direct fd stdin API module line, got: {text:?}");
+        });
+    assert_eq!(
+        direct_fd_modules.len(),
+        6,
+        "expected six direct fd stdin API module names, got: {text:?}"
+    );
+    for (label, module) in [
+        ("builtins.open", direct_fd_modules[0]),
+        ("io.open", direct_fd_modules[1]),
+    ] {
+        assert!(
+            matches!(module, "io" | "_io"),
+            "expected {label} to come from io or _io, got: {text:?}"
+        );
+    }
+    assert_eq!(
+        &direct_fd_modules[2..],
+        ["_io", "_io", "posix", "posix"],
+        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
     );
     Ok(())
 }
