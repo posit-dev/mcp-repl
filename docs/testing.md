@@ -8,7 +8,7 @@ This file is the entrypoint for deciding how to verify a change.
 - Default tests should launch the built `mcp-repl` binary and exercise it through the MCP tool surface.
 - Prefer compact transcript or JSON snapshots over verbose bespoke assertions.
 - Keep internal Rust unit tests only when they communicate intent that is not reachable through the public API.
-- Client integration tests are opt-in and do not run as part of default cargo test. Set `MCP_REPL_RUN_CLIENT_INTEGRATIONS=1` when explicitly validating Codex or Claude client behavior.
+- Client integration tests are ignored by default. Run the specific test target with `-- --ignored` when explicitly validating Codex or Claude client behavior.
 
 ## Core Test Surface
 

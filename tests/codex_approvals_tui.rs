@@ -38,7 +38,6 @@ mod unix_impl {
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
-    const CLIENT_INTEGRATION_ENV: &str = "MCP_REPL_RUN_CLIENT_INTEGRATIONS";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
@@ -72,6 +71,7 @@ mod unix_impl {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_exec_wire_sandbox_state_meta() -> TestResult<String> {
         if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
@@ -145,6 +145,7 @@ mod unix_impl {
 
     pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
             return Ok(());
         }
         if !loopback_bind_available().await {
@@ -211,6 +212,7 @@ mod unix_impl {
         mode: ExecSnapshotMode,
     ) -> TestResult<String> {
         if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
@@ -284,6 +286,7 @@ mod unix_impl {
             return Ok(());
         }
         if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
             return Ok(());
         }
         if !common::sandbox_exec_available() {
@@ -444,19 +447,10 @@ mod unix_impl {
     }
 
     fn codex_available() -> bool {
-        if std::env::var(CLIENT_INTEGRATION_ENV).as_deref() != Ok("1") {
-            eprintln!("{CLIENT_INTEGRATION_ENV}=1 is not set; skipping Codex integration test");
-            return false;
-        }
-
-        let available = std::process::Command::new("codex")
+        std::process::Command::new("codex")
             .arg("--version")
             .output()
-            .is_ok();
-        if !available {
-            eprintln!("codex not found on PATH; skipping");
-        }
-        available
+            .is_ok()
     }
 
     fn create_isolated_codex_env_with_config(
@@ -2595,6 +2589,7 @@ mod linux {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2605,6 +2600,7 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2615,6 +2611,7 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
         if snapshot.is_empty() {
@@ -2625,11 +2622,13 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2645,6 +2644,7 @@ mod macos {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2655,6 +2655,7 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_initial_sandbox_state_plain() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state_plain().await?;
         if snapshot.is_empty() {
@@ -2665,6 +2666,7 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_wire_sandbox_state_meta() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_wire_sandbox_state_meta().await?;
         if snapshot.is_empty() {
@@ -2675,11 +2677,13 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2695,6 +2699,7 @@ mod windows {
     use super::TestResult;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn codex_exec_initial_sandbox_state() -> TestResult<()> {
         let snapshot = super::unix_impl::run_codex_exec_initial_sandbox_state().await?;
         if snapshot.is_empty() {
@@ -2704,6 +2709,7 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a real Codex CLI session"]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
     }

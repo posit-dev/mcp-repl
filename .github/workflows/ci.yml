@@ -112,15 +112,11 @@ jobs:
 
       - name: cargo test (real codex integrations)
         if: matrix.os != 'windows-2022'
-        env:
-          MCP_REPL_RUN_CLIENT_INTEGRATIONS: "1"
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
 
       - name: cargo test (real codex integrations, windows serial)
         if: matrix.os == 'windows-2022'
-        env:
-          MCP_REPL_RUN_CLIENT_INTEGRATIONS: "1"
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        run: cargo test -j 1 --test codex_approvals_tui -- --ignored --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check
