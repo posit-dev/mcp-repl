@@ -1709,7 +1709,6 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
-#[cfg(target_family = "unix")]
 pub fn emit_readline_input(text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInput {
@@ -1718,7 +1717,6 @@ pub fn emit_readline_input(text: &str) {
     }
 }
 
-#[cfg(target_family = "unix")]
 pub fn emit_readline_discard(text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscard {
@@ -2079,7 +2077,8 @@ mod protocol_tests {
     use super::{
         IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
         OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
-        WorkerToServerIpcMessage, test_connection_pair_with_handlers,
+        WorkerToServerIpcMessage, emit_readline_discard, emit_readline_input,
+        test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -2140,6 +2139,12 @@ mod protocol_tests {
             parsed.is_err(),
             "plot_image should reject old worker-owned image fields"
         );
+    }
+
+    #[test]
+    fn readline_accounting_emitters_are_platform_neutral_noops_without_global_ipc() {
+        emit_readline_input("answer\n");
+        emit_readline_discard("queued\n");
     }
 
     #[test]
