@@ -3931,11 +3931,6 @@ async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResul
         session.cancel().await?;
         return Ok(());
     }
-    if interrupt_text.contains("[repl] session ended") || interrupt_text.is_empty() {
-        eprintln!("PTY idle prompt interrupt cleanup is not hardened in this slice; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     if !interrupt_text.contains("KeyboardInterrupt") {
         session.cancel().await?;
         return Err(format!(
@@ -4090,11 +4085,6 @@ async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> 
         session.cancel().await?;
         return Ok(());
     }
-    if interrupt_text.contains("SHOULD_NOT_RUN") {
-        eprintln!("PTY continuation interrupt cleanup is not hardened in this slice; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     assert!(
         !is_busy_response(&interrupt_text),
         "expected continuation prompt interrupt to complete, got: {interrupt_text:?}"
@@ -4206,6 +4196,52 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
     assert!(
         answer_text.contains("EMPTY_INPUT_VALUE answer"),
         "expected answer to be consumed by input(), got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with("value = input('reset> ')", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("reset> "),
+        "expected input prompt before reset, got: {prompt_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw("repl_reset", serde_json::json!({}))
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        !is_busy_response(&reset_text),
+        "expected repl_reset while input() waits to complete, got: {reset_text:?}"
+    );
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to start a new session, got: {reset_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_INPUT_RESET"),
+        "expected follow-up after repl_reset to run in the replacement worker, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("reset> "),
+        "did not expect the old input prompt to leak after repl_reset, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4549,13 +4585,8 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
-    if is_busy_response(&interrupt_text) {
-        eprintln!("PTY timeout-tail interrupt cleanup is not hardened in this slice; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     assert!(
-        interrupt_text.contains(">>>"),
+        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
         "expected prompt after interrupt, got: {interrupt_text:?}"
     );
 
@@ -5016,13 +5047,8 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
 
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
-    if is_busy_response(&interrupt_text) {
-        eprintln!("PTY timeout-tail interrupt cleanup is not hardened in this slice; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     assert!(
-        interrupt_text.contains(">>>"),
+        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
         "expected prompt after interrupt, got: {interrupt_text:?}"
     );
 

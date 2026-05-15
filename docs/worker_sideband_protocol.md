@@ -79,6 +79,8 @@ invalid base64, and unknown message types are protocol errors.
   interrupt/reset cleanup without delivering it to the runtime.
 - The server encodes `text` as UTF-8 and removes those bytes from the active
   stdin queue. A mismatch is a protocol error.
+- Workers must emit this only for exact bytes they can identify. Bytes flushed
+  from terminal state without being observed are not reportable.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
@@ -140,6 +142,14 @@ steady-state request handling.
 - Legacy worker-to-server request-boundary acknowledgement.
 - This only acknowledges request-boundary state. It is not an acknowledgement
   for stdout/stderr, plot images, or request completion.
+
+`python_interrupt_ack`
+- `{ "type": "python_interrupt_ack" }`
+- Transitional worker-to-server acknowledgement used only by built-in Unix
+  Python after it has processed its private `python_interrupt` cleanup message.
+- It means the worker has attempted exact discard accounting and terminal input
+  flushing before the server delivers SIGINT. It is not a generic protocol
+  interrupt acknowledgement.
 
 `readline_result`
 - `{ "type": "readline_result", "prompt": <string>, "line": <string> }`

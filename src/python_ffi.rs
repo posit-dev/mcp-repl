@@ -113,6 +113,7 @@ pub struct PythonApi {
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
+    pub py_err_set_interrupt: unsafe extern "C" fn(),
 }
 
 static PYTHON_API: OnceLock<PythonApi> = OnceLock::new();
@@ -185,6 +186,7 @@ impl PythonApi {
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
+            py_err_set_interrupt: unsafe { load_symbol(&library, b"PyErr_SetInterrupt\0")? },
             _library: library,
         };
         Ok(api)
@@ -342,6 +344,10 @@ impl PythonApi {
         let message =
             CString::new(message).expect("internal Python error message must not contain NUL");
         unsafe { (self.py_err_set_string)(exception, message.as_ptr()) };
+    }
+
+    pub fn set_interrupt(&self) {
+        unsafe { (self.py_err_set_interrupt)() };
     }
 
     pub fn install_input_hook(&self, callback: PyOsInputHookCallback) -> Result<(), String> {

@@ -488,8 +488,6 @@ fn interrupt_for_request_generation(request_generation: Option<u64>) {
     if !interrupt_generation_is_current(request_generation) {
         return;
     }
-    #[cfg(target_family = "unix")]
-    flush_terminal_input();
     discard_pending_stdin();
     #[cfg(target_family = "unix")]
     flush_terminal_input();
@@ -658,6 +656,7 @@ fn mark_request_started_with_generation(request_generation: Option<u64>) {
     } else {
         guard.request_generation = guard.request_generation.wrapping_add(1);
     }
+    guard.interrupt_requested = false;
     guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
     guard.plot_reset_pending = true;
@@ -2023,15 +2022,19 @@ unsafe extern "C" fn mcp_repl_readline(
     #[cfg(not(target_family = "unix"))]
     handle_input_hook();
 
-    let bytes = read_stdio_line_bytes(stdin);
-    note_cpython_readline_bytes_read(&bytes);
+    let read = read_stdio_line_bytes(stdin);
+    if read.interrupted {
+        #[cfg(target_family = "unix")]
+        flush_terminal_input();
+    }
+    note_cpython_readline_bytes_read(&read.bytes);
     clear_current_readline_prompt();
-    if take_interrupt_requested() {
-        set_callback_error("Python input interrupted");
+    if read.interrupted || take_interrupt_requested() {
+        PythonApi::global().set_interrupt();
         return ptr::null_mut();
     }
 
-    allocate_readline_result(&bytes)
+    allocate_readline_result(&read.bytes)
 }
 
 fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
@@ -2076,22 +2079,33 @@ fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     note_stdin_line_read(bytes);
 }
 
-fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> Vec<u8> {
+struct StdioLineRead {
+    bytes: Vec<u8>,
+    interrupted: bool,
+}
+
+fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
     let mut bytes = Vec::new();
     loop {
         let ch = unsafe { libc::fgetc(stdin) };
         if ch == libc::EOF {
-            break;
+            let interrupted = unsafe { libc::ferror(stdin) != 0 };
+            if interrupted {
+                unsafe { libc::clearerr(stdin) };
+            }
+            return StdioLineRead { bytes, interrupted };
         }
         bytes.push(ch as u8);
         if ch == b'\n' as i32 {
-            break;
+            return StdioLineRead {
+                bytes,
+                interrupted: false,
+            };
         }
     }
-    bytes
 }
 
-fn read_stdio_line_bytes_allowing_python_threads(stdin: *mut libc::FILE) -> Vec<u8> {
+fn read_stdio_line_bytes_allowing_python_threads(stdin: *mut libc::FILE) -> StdioLineRead {
     // _mcp_repl.readline is called from Python with the GIL held. Release it
     // while stdin blocks so the IPC completion path can flush prompt-time plots.
     let _allow_threads = PythonThreadsAllowed::new();
@@ -2241,17 +2255,21 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         handle_input_hook();
         emit_output_text(TextStream::Stdout, prompt.as_bytes());
     }
-    let bytes = read_stdio_line_bytes_allowing_python_threads(stdin);
-    note_stdin_line_read(&bytes);
+    let read = read_stdio_line_bytes_allowing_python_threads(stdin);
+    if read.interrupted {
+        #[cfg(target_family = "unix")]
+        flush_terminal_input();
+    }
+    note_stdin_line_read(&read.bytes);
     clear_current_readline_prompt();
-    if take_interrupt_requested() {
-        set_callback_error("Python input interrupted");
+    if read.interrupted || take_interrupt_requested() {
+        PythonApi::global().set_interrupt();
         return CStdinLine::Error;
     }
-    if bytes.is_empty() {
+    if read.bytes.is_empty() {
         CStdinLine::Eof
     } else {
-        CStdinLine::Line(String::from_utf8_lossy(&bytes).to_string())
+        CStdinLine::Line(String::from_utf8_lossy(&read.bytes).to_string())
     }
 }
 

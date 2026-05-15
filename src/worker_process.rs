@@ -356,6 +356,24 @@ fn driver_wait_for_stdin_write_ack(
     }
 }
 
+#[cfg(target_family = "unix")]
+fn driver_wait_for_python_interrupt_ack(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_python_interrupt_ack(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before cleaning up interrupt".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before worker cleaned up interrupt".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
 fn driver_wait_for_completion(
     timeout: Duration,
@@ -972,7 +990,9 @@ impl BackendDriver for ProtocolBackendDriver {
         #[cfg(target_family = "unix")]
         if let Some(request_generation) = self.python_request_generation {
             if let Some(ipc) = process.ipc.get() {
-                let _ = ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation });
+                ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
+                    .map_err(WorkerError::Io)?;
+                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
             }
             return process.send_interrupt();
         }
@@ -1015,6 +1035,8 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_family = "unix")]
+const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);

@@ -120,6 +120,7 @@ pub enum WorkerToServerIpcMessage {
         supports_images: bool,
     },
     StdinWriteAck,
+    PythonInterruptAck,
     OutputText {
         stream: TextStream,
         data_b64: String,
@@ -626,6 +627,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         drop_stdin_write_acks(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -635,6 +637,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         drop_stdin_write_acks(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.active_stdin = Some(payload.iter().copied().collect());
         guard.echo_events.clear();
         guard.prompt_history.clear();
@@ -825,6 +828,43 @@ impl ServerIpcConnection {
             guard = next_guard;
             if timeout_res.timed_out() {
                 if take_stdin_write_ack(&mut guard) {
+                    return Ok(());
+                }
+                if let Some(message) = guard.protocol_error.take() {
+                    return Err(IpcWaitError::Protocol(message));
+                }
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    #[cfg_attr(target_family = "unix", allow(dead_code))]
+    pub fn wait_for_python_interrupt_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if take_python_interrupt_ack(&mut guard) {
+                return Ok(());
+            }
+            if let Some(message) = guard.protocol_error.take() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                if take_python_interrupt_ack(&mut guard) {
                     return Ok(());
                 }
                 if let Some(message) = guard.protocol_error.take() {
@@ -1727,6 +1767,12 @@ pub fn emit_stdin_write_ack() {
     }
 }
 
+pub fn emit_python_interrupt_ack() {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::PythonInterruptAck);
+    }
+}
+
 pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
@@ -1823,10 +1869,30 @@ fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     }
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
+fn take_python_interrupt_ack(guard: &mut ServerIpcInbox) -> bool {
+    if let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck))
+    {
+        guard.queue.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
 fn drop_stdin_write_acks(guard: &mut ServerIpcInbox) {
     guard
         .queue
         .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::StdinWriteAck));
+}
+
+fn drop_python_interrupt_acks(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck));
 }
 
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {

@@ -26,9 +26,9 @@ continuation state, or emulate Python stdin semantics.
 
 - State: active
 - Last updated: 2026-05-15
-- Current phase: phase 4 pending
+- Current phase: phase 6 pending
 - Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: #193, "Run embedded Python on PTY-backed C stdin and stdout"
+- Last completed slice: phase 5, "Harden interrupt and reset cleanup for PTY readline"
 
 ## Current Direction
 
@@ -97,7 +97,7 @@ route.
   CPython takes the readline path (#193).
 - Phase 4: pending - make `PyOS_ReadlineFunctionPointer` the Python stdin
   accounting point (#194).
-- Phase 5: pending - harden interrupt and reset cleanup for PTY readline (#195).
+- Phase 5: completed - harden interrupt and reset cleanup for PTY readline (#195).
 - Phase 6: pending - remove obsolete Python stdin bridge and direct-fd shims
   (#196).
 - Phase 7: pending - update current-state docs and snapshots for the final PTY
@@ -123,13 +123,8 @@ route.
 
 - How should tests prove that CPython uses `PyOS_ReadlineFunctionPointer` without
   relying on private helper behavior?
-- Which `readline_discard` facts can be accounted for exactly when bytes are
-  queued in the terminal driver during interrupt or reset cleanup?
 - Does PTY mode require bounded input-delivery coordination with open ordering
   work in #149?
-- Does interrupt cleanup need a protocol acknowledgement decision related to
-  #168, or can terminal flushing plus public stale-input tests cover the
-  contract?
 - What terminal size and echo settings should be fixed for deterministic tests?
 - What is the Windows PTY interrupt path: write Ctrl-C through ConPTY input,
   use console control events for the restricted child, or keep a Python-side
@@ -137,10 +132,9 @@ route.
 
 ## Next Safe Slice
 
-- Work #194 next: make `PyOS_ReadlineFunctionPointer` the Python stdin
-  accounting point.
-- Keep sideband IPC separate from PTY traffic, and do not remove the old Python
-  stdin bridge until the readline callback path covers the public behavior.
+- Work #196 next: remove obsolete Python stdin bridge and direct-fd shims.
+- Keep sideband IPC separate from PTY traffic. Do not treat direct fd stdin as
+  first-class behavior unless a later public contract adds it.
 
 ## Drain Loop Note
 
@@ -185,3 +179,11 @@ route.
   stdin/stdout/stderr, disabled terminal echo for Python determinism, and kept
   the Python-level stdin bridge installed for compatibility while CPython owns
   `builtins.input`.
+- 2026-05-15: Hardened built-in Unix Python interrupt cleanup by having the
+  worker process its private interrupt cleanup message before the server sends
+  SIGINT. The worker drains exact queued active-turn bytes and emits
+  `readline_discard` before flushing terminal input for unknown leftovers.
+  Bytes flushed from terminal state without being observed remain unreported.
+- 2026-05-15: `repl_reset` while Python is blocked in readline now replaces the
+  worker cleanly; stale prompt/input state from the old PTY-backed worker does
+  not carry into the replacement session.
