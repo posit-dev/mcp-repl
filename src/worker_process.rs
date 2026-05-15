@@ -312,6 +312,7 @@ impl RBackendDriver {
     }
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
     if let Some(message) = ipc.take_protocol_error() {
@@ -320,6 +321,7 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), W
     Ok(())
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn driver_announce_stdin_write(
     byte_len: usize,
     line_count: usize,
@@ -401,6 +403,7 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn driver_refresh_backend_info(
     ipc: ServerIpcConnection,
     timeout: Duration,
@@ -471,18 +474,25 @@ fn driver_refresh_worker_ready(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        text.as_bytes().to_vec()
+        let mut payload = text.as_bytes().to_vec();
+        if !payload.is_empty() && !payload.ends_with(b"\n") {
+            payload.push(b'\n');
+        }
+        payload
     }
 
     fn on_input_start(
         &mut self,
-        text: &str,
+        _text: &str,
         payload: &[u8],
         ipc: &ServerIpcConnection,
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_on_input_start(text, ipc)?;
-        driver_announce_stdin_write(payload.len(), 0, None, ipc)
+        ipc.begin_request_with_stdin(payload);
+        if let Some(message) = ipc.take_protocol_error() {
+            return Err(WorkerError::Protocol(message));
+        }
+        Ok(())
     }
 
     fn should_settle_output_after_timeout(
@@ -518,7 +528,7 @@ impl BackendDriver for RBackendDriver {
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_backend_info(ipc, timeout, true)
+        driver_refresh_worker_ready(ipc, timeout)
     }
 }
 
