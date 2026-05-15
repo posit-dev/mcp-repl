@@ -49,6 +49,13 @@ continuation state, or emulate Python stdin semantics.
 This path is preferred because it lets CPython own Python syntax and interactive
 control flow while keeping the server's request handling interpreter-neutral.
 
+## Diff Size Note
+
+This branch can look like a large addition because it keeps transitional
+pipe-backed and non-Unix compatibility scaffolding while adding the Unix PTY
+path. After Windows ConPTY support lands, the previous broad stdin interception
+and protocol compatibility code should be deleted instead of carried forward.
+
 ## Long-Term Direction
 
 - Python and R should share the same server/worker boundary shape: stdin carries
