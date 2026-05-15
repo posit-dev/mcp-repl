@@ -547,6 +547,8 @@ pub(crate) fn mark_stdin_write_complete() {
     if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
         bridge.mark_stdin_write_complete();
     }
+    #[cfg(target_family = "unix")]
+    let protocol_input_exhausted = protocol_request_input_exhausted();
 
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -560,6 +562,15 @@ pub(crate) fn mark_stdin_write_complete() {
         let primary_prompt = guard.python_primary_prompt.clone();
         let continuation_prompt = guard.python_continuation_prompt.clone();
         let waiting_for_input = guard.waiting_for_input;
+        #[cfg(target_family = "unix")]
+        if protocol_input_exhausted && guard.active_request.is_none() && waiting_for_input {
+            // Unix protocol-mode Python can reach the next prompt before the IPC
+            // thread observes StdinWriteComplete. In that case the prompt hook
+            // deliberately left the plot gate open because stdin was not yet
+            // accounted; close it here once the explicit write-complete signal
+            // proves the already-emitted prompt is the request boundary.
+            guard.request_active = false;
+        }
         if let Some(active) = guard.active_request.as_mut() {
             active.stdin_write_complete = true;
             let continuation_write_complete =
