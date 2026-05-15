@@ -527,7 +527,7 @@ async fn zod_worker_idle_protocol_error_is_latched_for_next_request() -> TestRes
         .call_tool_raw(
             "repl",
             json!({
-                "input": "bad-output-while-idle 250",
+                "input": "timeline after-readline-start delay-ms 250 raw-output-text-invalid-base64",
                 "timeout_ms": 10_000
             }),
         )

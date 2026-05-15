@@ -22,6 +22,8 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
+const INVALID_OUTPUT_TEXT_BASE64: &str =
+    r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 
 #[cfg(target_family = "unix")]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -50,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     })?;
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
-        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
     writer.send(&WorkerToServer::ReadlineStart {
         prompt: "zod> ".to_string(),
@@ -60,14 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
     let mut next_prompt = "zod> ".to_string();
+    let mut timeline = Timeline::default();
     loop {
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
-            writer.send(&WorkerToServer::SessionEnd {
-                reason: "shutdown".to_string(),
-                message_b64: None,
-            })?;
+            send_session_end(&writer, &mut timeline, "shutdown")?;
             return Ok(());
         }
 
@@ -80,25 +80,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.send(&WorkerToServer::ReadlineInput {
             text: reported_input,
         })?;
+        timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
-            writer.send(&WorkerToServer::SessionEnd {
-                reason: "runtime_exit".to_string(),
-                message_b64: None,
-            })?;
+            send_session_end(&writer, &mut timeline, "runtime_exit")?;
             return Ok(());
         }
         if command == "bad-output-after-session-end" {
-            writer.send(&WorkerToServer::SessionEnd {
-                reason: "runtime_exit".to_string(),
-                message_b64: None,
-            })?;
+            send_session_end(&writer, &mut timeline, "runtime_exit")?;
             writer.output_text("stdout", b"late output\n")?;
             return Ok(());
         }
-        run_command(&writer, &interrupted, command, &line, &mut next_prompt)?;
-        writer.send(&WorkerToServer::ReadlineStart {
-            prompt: std::mem::replace(&mut next_prompt, "zod> ".to_string()),
-        })?;
+        timeline.run(LifecyclePoint::BeforeCommand, &writer)?;
+        run_command(
+            &writer,
+            &interrupted,
+            command,
+            &line,
+            &mut next_prompt,
+            &mut timeline,
+        )?;
+        timeline.run(LifecyclePoint::AfterCommand, &writer)?;
+        send_readline_start(
+            &writer,
+            &mut timeline,
+            std::mem::replace(&mut next_prompt, "zod> ".to_string()),
+        )?;
     }
 }
 
@@ -108,6 +114,7 @@ fn run_command(
     command: &str,
     raw_line: &str,
     next_prompt: &mut String,
+    timeline: &mut Timeline,
 ) -> io::Result<()> {
     if let Some(prompt) = command.strip_prefix("wait ") {
         *next_prompt = prompt.to_string();
@@ -143,19 +150,22 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-while-idle ") {
-        let delayed_writer = writer.clone();
-        let millis = parse_millis(millis)?;
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(millis));
-            let _ = delayed_writer
-                .send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#);
-        });
+        schedule_invalid_output_text_base64(
+            timeline,
+            LifecyclePoint::AfterReadlineStart,
+            Duration::from_millis(parse_millis(millis)?),
+        );
+        return Ok(());
+    }
+
+    if let Some(spec) = command.strip_prefix("timeline ") {
+        schedule_timeline_command(timeline, spec)?;
         return Ok(());
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
         sleep_for(parse_millis(millis)?, interrupted, false);
-        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
     }
 
@@ -182,11 +192,173 @@ fn run_command(
     }
 
     if command == "bad-output-base64" {
-        writer.send_raw_json(r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#)?;
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
     }
 
     writer.output_text("stdout", raw_line.as_bytes())
+}
+
+fn send_readline_start(
+    writer: &IpcWriter,
+    timeline: &mut Timeline,
+    prompt: String,
+) -> io::Result<()> {
+    timeline.run(LifecyclePoint::BeforeReadlineStart, writer)?;
+    writer.send(&WorkerToServer::ReadlineStart { prompt })?;
+    timeline.run(LifecyclePoint::AfterReadlineStart, writer)
+}
+
+fn send_session_end(writer: &IpcWriter, timeline: &mut Timeline, reason: &str) -> io::Result<()> {
+    timeline.run(LifecyclePoint::BeforeSessionEnd, writer)?;
+    writer.send(&WorkerToServer::SessionEnd {
+        reason: reason.to_string(),
+        message_b64: None,
+    })?;
+    timeline.run(LifecyclePoint::AfterSessionEnd, writer)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LifecyclePoint {
+    AfterReadlineInput,
+    BeforeCommand,
+    AfterCommand,
+    BeforeReadlineStart,
+    AfterReadlineStart,
+    BeforeSessionEnd,
+    AfterSessionEnd,
+}
+
+#[derive(Default)]
+struct Timeline {
+    entries: Vec<TimelineEntry>,
+}
+
+impl Timeline {
+    fn schedule(&mut self, point: LifecyclePoint, delay: Duration, action: TimelineAction) {
+        self.entries.push(TimelineEntry {
+            point,
+            delay,
+            action,
+        });
+    }
+
+    fn run(&mut self, point: LifecyclePoint, writer: &IpcWriter) -> io::Result<()> {
+        let mut idx = 0;
+        while idx < self.entries.len() {
+            if self.entries[idx].point == point {
+                let entry = self.entries.remove(idx);
+                entry.run(writer)?;
+            } else {
+                idx += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TimelineEntry {
+    point: LifecyclePoint,
+    delay: Duration,
+    action: TimelineAction,
+}
+
+impl TimelineEntry {
+    fn run(self, writer: &IpcWriter) -> io::Result<()> {
+        if self.delay.is_zero() {
+            return self.action.run(writer);
+        }
+
+        let writer = writer.clone();
+        thread::spawn(move || {
+            thread::sleep(self.delay);
+            let _ = self.action.run(&writer);
+        });
+        Ok(())
+    }
+}
+
+enum TimelineAction {
+    RawSideband(String),
+}
+
+impl TimelineAction {
+    fn run(self, writer: &IpcWriter) -> io::Result<()> {
+        let TimelineAction::RawSideband(payload) = self;
+        writer.send_raw_json(&payload)
+    }
+}
+
+fn schedule_timeline_command(timeline: &mut Timeline, spec: &str) -> io::Result<()> {
+    let mut parts = spec.split_whitespace();
+    let point = parse_lifecycle_point(parts.next())?;
+    expect_timeline_token(parts.next(), "delay-ms")?;
+    let delay = Duration::from_millis(parse_millis_token(parts.next(), "delay-ms value")?);
+    let action = parse_timeline_action(parts.next())?;
+    if parts.next().is_some() {
+        return Err(invalid_timeline("unexpected trailing timeline tokens"));
+    }
+    timeline.schedule(point, delay, action);
+    Ok(())
+}
+
+fn schedule_invalid_output_text_base64(
+    timeline: &mut Timeline,
+    point: LifecyclePoint,
+    delay: Duration,
+) {
+    timeline.schedule(
+        point,
+        delay,
+        TimelineAction::RawSideband(INVALID_OUTPUT_TEXT_BASE64.to_string()),
+    );
+}
+
+fn parse_lifecycle_point(raw: Option<&str>) -> io::Result<LifecyclePoint> {
+    match raw {
+        Some("after-readline-input") => Ok(LifecyclePoint::AfterReadlineInput),
+        Some("before-command") => Ok(LifecyclePoint::BeforeCommand),
+        Some("after-command") => Ok(LifecyclePoint::AfterCommand),
+        Some("before-readline-start") => Ok(LifecyclePoint::BeforeReadlineStart),
+        Some("after-readline-start") => Ok(LifecyclePoint::AfterReadlineStart),
+        Some("before-session-end") => Ok(LifecyclePoint::BeforeSessionEnd),
+        Some("after-session-end") => Ok(LifecyclePoint::AfterSessionEnd),
+        Some(other) => Err(invalid_timeline(&format!(
+            "unknown lifecycle point {other:?}"
+        ))),
+        None => Err(invalid_timeline("missing lifecycle point")),
+    }
+}
+
+fn parse_timeline_action(raw: Option<&str>) -> io::Result<TimelineAction> {
+    match raw {
+        Some("raw-output-text-invalid-base64") => Ok(TimelineAction::RawSideband(
+            INVALID_OUTPUT_TEXT_BASE64.to_string(),
+        )),
+        Some(other) => Err(invalid_timeline(&format!(
+            "unknown timeline action {other:?}"
+        ))),
+        None => Err(invalid_timeline("missing timeline action")),
+    }
+}
+
+fn expect_timeline_token(raw: Option<&str>, expected: &str) -> io::Result<()> {
+    match raw {
+        Some(value) if value == expected => Ok(()),
+        Some(other) => Err(invalid_timeline(&format!(
+            "expected {expected:?}, got {other:?}"
+        ))),
+        None => Err(invalid_timeline(&format!("missing {expected:?}"))),
+    }
+}
+
+fn parse_millis_token(raw: Option<&str>, name: &str) -> io::Result<u64> {
+    raw.ok_or_else(|| invalid_timeline(&format!("missing {name}")))
+        .and_then(parse_millis)
+}
+
+fn invalid_timeline(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 fn parse_millis(raw: &str) -> io::Result<u64> {
