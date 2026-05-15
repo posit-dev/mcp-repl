@@ -329,7 +329,6 @@ fn driver_announce_stdin_write(
     .map_err(WorkerError::Io)
 }
 
-#[cfg(not(target_family = "unix"))]
 fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
         .map_err(WorkerError::Io)
@@ -935,6 +934,16 @@ impl BackendDriver for ProtocolBackendDriver {
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
+        Ok(())
+    }
+
+    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        if self.python_request_generation.is_some() {
+            driver_announce_stdin_write_complete(ipc)?;
+        }
+        #[cfg(not(target_family = "unix"))]
+        let _ = ipc;
         Ok(())
     }
 

@@ -2116,17 +2116,15 @@ async fn python_large_raw_fd_read_does_not_complete_before_full_payload() -> Tes
         return Ok(());
     };
 
-    let mut filler = String::new();
-    for idx in 0..40_000 {
-        filler.push_str("# filler ");
-        filler.push_str(&idx.to_string());
-        filler.push('\n');
+    let mut filler = String::with_capacity(2_000_000);
+    for _ in 0..1_000_000 {
+        filler.push_str("#\n");
     }
     let input = format!(
         "import os\nchunk = os.read(0, {})\n{filler}print('RAW_LARGE_DONE', len(chunk))",
         filler.len()
     );
-    let result = session.write_stdin_raw_with(&input, Some(20.0)).await?;
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
     let text = result_text(&result);
     session.cancel().await?;
 

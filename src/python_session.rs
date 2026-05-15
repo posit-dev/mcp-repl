@@ -192,6 +192,7 @@ struct RuntimeStdinBridgeInner {
     pending_read: bool,
     pending_raw_read_size: Option<usize>,
     reader_in_flight: bool,
+    stdin_write_complete: bool,
     eof: bool,
     interrupted: bool,
     writer: Option<std::io::PipeWriter>,
@@ -207,6 +208,7 @@ impl RuntimeStdinBridge {
                 pending_read: false,
                 pending_raw_read_size: None,
                 reader_in_flight: false,
+                stdin_write_complete: false,
                 eof: false,
                 interrupted: false,
                 writer: Some(writer),
@@ -224,6 +226,18 @@ impl RuntimeStdinBridge {
             self.cvar.notify_all();
         }
         delivered
+    }
+
+    fn start_request(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.stdin_write_complete = false;
+        self.cvar.notify_all();
+    }
+
+    fn mark_stdin_write_complete(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.stdin_write_complete = true;
+        self.cvar.notify_all();
     }
 
     fn mark_eof(&self) {
@@ -261,7 +275,7 @@ impl RuntimeStdinBridge {
         self.cvar.notify_all();
         let mut wait_announced = false;
         while !Self::raw_read_ready(&guard, size) {
-            if !wait_announced && stdin_pending_byte_count() == Some(0) {
+            if !wait_announced && Self::request_input_drained(&guard) {
                 wait_announced = true;
                 drop(guard);
                 // A raw fd read with no buffered bytes completes the MCP request as a
@@ -297,9 +311,11 @@ impl RuntimeStdinBridge {
         self.inner.lock().unwrap().pending_read
     }
 
-    fn has_buffered_input(&self) -> bool {
+    fn request_input_exhausted(&self) -> bool {
         let guard = self.inner.lock().unwrap();
-        !guard.input.is_empty() || !guard.sideband_input.is_empty()
+        Self::request_input_drained(&guard)
+            && guard.input.is_empty()
+            && guard.sideband_input.is_empty()
     }
 
     fn wait_for_stdin_byte_request(&self) -> bool {
@@ -354,7 +370,17 @@ impl RuntimeStdinBridge {
         guard.interrupted
             || guard.eof
             || guard.input.len() >= size
-            || (guard.input.back() == Some(&b'\n') && stdin_pending_byte_count() == Some(0))
+            || (guard.input.back() == Some(&b'\n') && Self::request_input_drained(guard))
+    }
+
+    fn request_input_drained(guard: &RuntimeStdinBridgeInner) -> bool {
+        // The server writes the MCP payload to fd 0 asynchronously. FIONREAD == 0
+        // can be only a transient pipe state while that write is still in progress,
+        // so newline only means "end of this request's raw stdin" after the
+        // server has sent StdinWriteComplete. Subprocesses still do not inherit
+        // this managed stdin; this only preserves the parent REPL's own request
+        // boundary while the write thread and bridge reader race.
+        guard.stdin_write_complete && stdin_pending_byte_count() == Some(0)
     }
 
     fn deliver_if_ready(guard: &mut RuntimeStdinBridgeInner) -> bool {
@@ -517,6 +543,11 @@ fn take_interrupt_requested() -> bool {
 }
 
 pub(crate) fn mark_stdin_write_complete() {
+    #[cfg(target_family = "unix")]
+    if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
+        bridge.mark_stdin_write_complete();
+    }
+
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
@@ -581,6 +612,11 @@ pub(crate) fn mark_request_started_for_generation(request_generation: u64) {
 }
 
 fn mark_request_started_with_generation(request_generation: Option<u64>) {
+    #[cfg(target_family = "unix")]
+    if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
+        bridge.start_request();
+    }
+
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
@@ -761,10 +797,10 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    stdin_pending_byte_count() == Some(0)
-        && PYTHON_STDIN_BRIDGE
-            .get()
-            .is_none_or(|bridge| !bridge.has_buffered_input())
+    PYTHON_STDIN_BRIDGE.get().map_or_else(
+        || stdin_pending_byte_count() == Some(0),
+        |bridge| bridge.request_input_exhausted(),
+    )
 }
 
 #[cfg(windows)]
