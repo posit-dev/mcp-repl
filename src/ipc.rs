@@ -838,7 +838,7 @@ impl ServerIpcConnection {
         }
     }
 
-    #[cfg_attr(target_family = "unix", allow(dead_code))]
+    #[cfg_attr(not(target_family = "unix"), allow(dead_code))]
     pub fn wait_for_python_interrupt_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -1869,7 +1869,7 @@ fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
     }
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(not(target_family = "unix"), allow(dead_code))]
 fn take_python_interrupt_ack(guard: &mut ServerIpcInbox) -> bool {
     if let Some(idx) = guard
         .queue

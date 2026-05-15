@@ -1670,7 +1670,7 @@ fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
         if ch == libc::EOF {
             let interrupted = unsafe { libc::ferror(stdin) != 0 };
             if interrupted {
-                unsafe { libc::clearerr(stdin) };
+                unsafe { clear_stdio_error(stdin) };
             }
             return StdioLineRead { bytes, interrupted };
         }
@@ -1682,6 +1682,20 @@ fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
             };
         }
     }
+}
+
+#[cfg(not(windows))]
+unsafe fn clear_stdio_error(stdin: *mut libc::FILE) {
+    unsafe { libc::clearerr(stdin) };
+}
+
+#[cfg(windows)]
+unsafe fn clear_stdio_error(stdin: *mut libc::FILE) {
+    unsafe extern "C" {
+        fn clearerr(stream: *mut libc::FILE);
+    }
+
+    unsafe { clearerr(stdin) };
 }
 
 fn read_stdio_line_bytes_allowing_python_threads(stdin: *mut libc::FILE) -> StdioLineRead {
