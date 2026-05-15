@@ -26,9 +26,9 @@ continuation state, or emulate Python stdin semantics.
 
 - State: active
 - Last updated: 2026-05-15
-- Current phase: phase 3 pending
+- Current phase: phase 4 pending
 - Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: #192, "Prove PTY worker transport with sideband kept separate"
+- Last completed slice: #193, "Run embedded Python on PTY-backed C stdin and stdout"
 
 ## Current Direction
 
@@ -93,7 +93,7 @@ route.
 - Phase 1: completed - add a launch-time worker stdin transport abstraction (#191).
 - Phase 2: completed - prove PTY worker transport while keeping sideband separate
   (#192).
-- Phase 3: pending - run embedded Python on PTY-backed C stdin/stdout and prove
+- Phase 3: completed - run embedded Python on PTY-backed C stdin/stdout and prove
   CPython takes the readline path (#193).
 - Phase 4: pending - make `PyOS_ReadlineFunctionPointer` the Python stdin
   accounting point (#194).
@@ -137,8 +137,8 @@ route.
 
 ## Next Safe Slice
 
-- Work #193 next: run embedded Python on PTY-backed C stdin/stdout and prove
-  CPython takes the readline path.
+- Work #194 next: make `PyOS_ReadlineFunctionPointer` the Python stdin
+  accounting point.
 - Keep sideband IPC separate from PTY traffic, and do not remove the old Python
   stdin bridge until the readline callback path covers the public behavior.
 
@@ -181,3 +181,7 @@ route.
   on separate inherited file descriptors. The fixture test covers PTY echo,
   CRLF output conversion, visible PTY output capture, and sideband prompt
   completion before switching Python to PTY.
+- 2026-05-15: Switched built-in Unix Python launch to PTY-backed C
+  stdin/stdout/stderr, disabled terminal echo for Python determinism, and kept
+  the Python-level stdin bridge installed for compatibility while CPython owns
+  `builtins.input`.

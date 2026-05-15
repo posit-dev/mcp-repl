@@ -5913,7 +5913,11 @@ impl WorkerProcess {
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
-        let child_result = spawn_command_with_transport(&mut command, stdin_transport);
+        let child_result = spawn_command_with_transport(
+            &mut command,
+            stdin_transport,
+            !matches!(backend, Backend::Python),
+        );
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6032,7 +6036,7 @@ impl WorkerProcess {
         let stdin_transport = spec.stdin.transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
-        let child_result = spawn_command_with_transport(&mut command, stdin_transport);
+        let child_result = spawn_command_with_transport(&mut command, stdin_transport, true);
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6803,6 +6807,7 @@ where
 fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
+    pty_echo: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
@@ -6817,12 +6822,15 @@ fn spawn_command_with_transport(
                 pty_stdio: None,
             })
         }
-        WorkerStdinTransport::Pty => spawn_command_with_pty(command),
+        WorkerStdinTransport::Pty => spawn_command_with_pty(command, pty_echo),
     }
 }
 
 #[cfg(target_family = "unix")]
-fn spawn_command_with_pty(command: &mut Command) -> Result<SpawnedCommand, WorkerError> {
+fn spawn_command_with_pty(
+    command: &mut Command,
+    echo: bool,
+) -> Result<SpawnedCommand, WorkerError> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -6838,6 +6846,7 @@ fn spawn_command_with_pty(command: &mut Command) -> Result<SpawnedCommand, Worke
         .ok_or_else(|| WorkerError::Protocol("worker PTY has no slave path".to_string()))?;
 
     let stdin = open_pty_slave_stdio(&slave_path)?;
+    configure_pty_slave_echo(stdin.as_raw_fd(), echo)?;
     let stdout = open_pty_slave_stdio(&slave_path)?;
     let stderr = open_pty_slave_stdio(&slave_path)?;
     command
@@ -6879,7 +6888,10 @@ fn spawn_command_with_pty(command: &mut Command) -> Result<SpawnedCommand, Worke
 }
 
 #[cfg(not(target_family = "unix"))]
-fn spawn_command_with_pty(_command: &mut Command) -> Result<SpawnedCommand, WorkerError> {
+fn spawn_command_with_pty(
+    _command: &mut Command,
+    _echo: bool,
+) -> Result<SpawnedCommand, WorkerError> {
     Err(WorkerError::Protocol(
         "PTY worker stdin transport is not supported on this platform".to_string(),
     ))
@@ -6892,6 +6904,26 @@ fn open_pty_slave_stdio(path: &Path) -> Result<File, WorkerError> {
         .write(true)
         .open(path)
         .map_err(WorkerError::Io)
+}
+
+#[cfg(target_family = "unix")]
+fn configure_pty_slave_echo(fd: libc::c_int, enabled: bool) -> Result<(), WorkerError> {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    let mut termios = unsafe { termios.assume_init() };
+    if enabled {
+        termios.c_lflag |= libc::ECHO;
+    } else {
+        termios.c_lflag &= !libc::ECHO;
+    }
+    let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+    if rc != 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn attach_spawned_worker_stdio(

@@ -488,11 +488,20 @@ fn interrupt_for_request_generation(request_generation: Option<u64>) {
     if !interrupt_generation_is_current(request_generation) {
         return;
     }
+    #[cfg(target_family = "unix")]
+    flush_terminal_input();
     discard_pending_stdin();
+    #[cfg(target_family = "unix")]
+    flush_terminal_input();
     #[cfg(not(target_family = "unix"))]
     finish_active_request_at_next_read();
     mark_interrupt_requested();
     request_platform_interrupt();
+}
+
+#[cfg(target_family = "unix")]
+fn flush_terminal_input() {
+    let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
 }
 
 fn interrupt_generation_is_current(request_generation: Option<u64>) -> bool {
@@ -686,12 +695,15 @@ fn finish_active_request_at_next_read() {
 
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
-    let Some(bridge) = PYTHON_STDIN_BRIDGE.get() else {
-        return;
-    };
-    let mut discarded = bridge.discard_buffered();
-    discarded.extend(drain_process_stdin_pipe());
-    discarded.extend(bridge.discard_buffered());
+    let mut discarded = Vec::new();
+    if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
+        discarded.extend(bridge.discard_buffered());
+        discarded.extend(drain_process_stdin_pipe());
+        discarded.extend(bridge.discard_buffered());
+    } else {
+        discarded.extend(PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap().drain(..));
+        discarded.extend(drain_process_stdin_pipe());
+    }
     if discarded.is_empty() {
         return;
     }
@@ -772,13 +784,11 @@ impl Drop for NonBlockingFd {
 
 #[cfg(target_family = "unix")]
 fn request_runtime_stdin_line(prompt: &str) -> bool {
-    if runtime_stdin_read_in_progress() {
-        return false;
-    }
     if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
         return bridge.request_read(prompt);
     }
-    false
+    ipc::emit_readline_start(prompt);
+    true
 }
 
 #[cfg(target_family = "unix")]
@@ -934,7 +944,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 fn open_python_runtime() -> Result<PythonRuntime, String> {
     #[cfg(target_family = "unix")]
     {
-        open_python_runtime_with_stdin_bridge()
+        open_python_runtime_with_pty_stdio()
     }
 
     #[cfg(not(target_family = "unix"))]
@@ -949,6 +959,58 @@ fn open_python_runtime() -> Result<PythonRuntime, String> {
 }
 
 #[cfg(target_family = "unix")]
+fn open_python_runtime_with_pty_stdio() -> Result<PythonRuntime, String> {
+    ensure_python_pty_stdio()?;
+    set_fd_close_on_exec(libc::STDIN_FILENO)?;
+
+    let runtime_read_fd = duplicate_stdio_fd(libc::STDIN_FILENO)?;
+    set_fd_close_on_exec(runtime_read_fd)?;
+    let stdin = open_stdio_fd(runtime_read_fd, c"r")?;
+    set_stdio_unbuffered(stdin, runtime_read_fd)?;
+    PYTHON_RUNTIME_STDIN_FD.store(runtime_read_fd, Ordering::SeqCst);
+    install_python_level_stdin_bridge()?;
+    Ok(PythonRuntime { stdin })
+}
+
+#[cfg(target_family = "unix")]
+fn ensure_python_pty_stdio() -> Result<(), String> {
+    let missing = [
+        (libc::STDIN_FILENO, "stdin"),
+        (libc::STDOUT_FILENO, "stdout"),
+        (libc::STDERR_FILENO, "stderr"),
+    ]
+    .into_iter()
+    .filter_map(|(fd, label)| (!stdio_fd_is_tty(fd)).then_some(label))
+    .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Python PTY stdin transport requires TTY-backed C stdio; non-TTY fds: {}",
+        missing.join(", ")
+    ))
+}
+
+#[cfg(target_family = "unix")]
+fn stdio_fd_is_tty(fd: libc::c_int) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+#[cfg(target_family = "unix")]
+fn duplicate_stdio_fd(fd: libc::c_int) -> Result<RawFd, String> {
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        Err(format!(
+            "failed to duplicate worker fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(duplicated)
+    }
+}
+
+#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg(target_family = "unix")]
 fn open_python_runtime_with_stdin_bridge() -> Result<PythonRuntime, String> {
     // Option A for worker children: the Python worker itself keeps fd 0 so the
     // embedded REPL and Unix readiness checks can read request bytes normally,
@@ -958,13 +1020,21 @@ fn open_python_runtime_with_stdin_bridge() -> Result<PythonRuntime, String> {
     // keeps ordinary REPL execution compatible while making inherited-stdin
     // subprocesses fail fast instead of stealing request input.
     set_fd_close_on_exec(libc::STDIN_FILENO)?;
+    let stdin = install_python_level_stdin_bridge()?;
+    Ok(PythonRuntime { stdin })
+}
+
+#[cfg(target_family = "unix")]
+fn install_python_level_stdin_bridge() -> Result<*mut libc::FILE, String> {
     let (runtime_reader, runtime_writer) =
         std::io::pipe().map_err(|err| format!("failed to create Python stdin pipe: {err}"))?;
     let runtime_read_fd = runtime_reader.into_raw_fd();
-    PYTHON_RUNTIME_STDIN_FD.store(runtime_read_fd, Ordering::SeqCst);
     let stdin = open_stdio_fd(runtime_read_fd, c"r")?;
     set_stdio_unbuffered(stdin, runtime_read_fd)?;
     let stdout = open_stdio_file(1, c"w")?;
+    if PYTHON_RUNTIME_STDIN_FD.load(Ordering::SeqCst) < 0 {
+        PYTHON_RUNTIME_STDIN_FD.store(runtime_read_fd, Ordering::SeqCst);
+    }
     PYTHON_STDIN_FILE.store(stdin, Ordering::SeqCst);
     PYTHON_STDOUT_FILE.store(stdout, Ordering::SeqCst);
 
@@ -973,7 +1043,7 @@ fn open_python_runtime_with_stdin_bridge() -> Result<PythonRuntime, String> {
         return Err("Python stdin bridge already initialized".to_string());
     }
     start_process_stdin_reader(bridge)?;
-    Ok(PythonRuntime { stdin })
+    Ok(stdin)
 }
 
 #[cfg(target_family = "unix")]
@@ -1933,20 +2003,38 @@ unsafe extern "C" fn mcp_repl_readline(
             .to_string_lossy()
             .into_owned()
     };
+    #[cfg(target_family = "unix")]
+    if ipc::worker_ipc_disabled_for_process() {
+        return allocate_readline_result(&[]);
+    }
     set_current_repl_readline_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
-    request_runtime_stdin_line(&prompt_text);
+    let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
+    #[cfg(target_family = "unix")]
+    let prompt_matches_repl = prompt_matches_python_repl_prompt(&prompt_text);
+    #[cfg(target_family = "unix")]
+    flush_original_stdio();
+    #[cfg(target_family = "unix")]
+    request_cpython_readline_stdin_line(&prompt_text);
+    #[cfg(target_family = "unix")]
+    if prompt_has_buffered_answer && !prompt_text.is_empty() && !prompt_matches_repl {
+        emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
+    }
     #[cfg(not(target_family = "unix"))]
     handle_input_hook();
 
     let bytes = read_stdio_line_bytes(stdin);
-    note_stdin_line_read(&bytes);
+    note_cpython_readline_bytes_read(&bytes);
     clear_current_readline_prompt();
     if take_interrupt_requested() {
         set_callback_error("Python input interrupted");
         return ptr::null_mut();
     }
 
+    allocate_readline_result(&bytes)
+}
+
+fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
     let api = PythonApi::global();
     let result = unsafe { (api.py_mem_raw_malloc)(bytes.len().saturating_add(1)) }.cast::<c_char>();
     if result.is_null() {
@@ -1957,6 +2045,35 @@ unsafe extern "C" fn mcp_repl_readline(
         *result.add(bytes.len()) = 0;
     }
     result
+}
+
+#[cfg(target_family = "unix")]
+fn request_cpython_readline_stdin_line(prompt: &str) {
+    ipc::emit_readline_start(prompt);
+}
+
+#[cfg(target_family = "unix")]
+fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let guard = state.inner.lock().unwrap();
+    prompt == guard.python_primary_prompt || prompt == guard.python_continuation_prompt
+}
+
+#[cfg(target_family = "unix")]
+fn note_cpython_readline_bytes_read(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    emit_readline_input_bytes(bytes);
+    mark_request_input_delivered();
+    note_active_stdin_line_read(bytes);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn note_cpython_readline_bytes_read(bytes: &[u8]) {
+    note_stdin_line_read(bytes);
 }
 
 fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> Vec<u8> {
@@ -2160,11 +2277,13 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
         return Vec::new();
     }
 
-    let Some(bridge) = PYTHON_STDIN_BRIDGE.get() else {
-        return Vec::new();
-    };
     let _allow_threads = PythonThreadsAllowed::new();
-    bridge.read_raw_stdin(size)
+    if let Some(bridge) = PYTHON_STDIN_BRIDGE.get() {
+        return bridge.read_raw_stdin(size);
+    }
+    let bytes = read_fd_bytes(libc::STDIN_FILENO, size);
+    note_stdin_bytes_read(&bytes);
+    bytes
 }
 
 #[cfg(not(target_family = "unix"))]
@@ -2173,7 +2292,42 @@ fn read_raw_stdin_bytes(_size: usize) -> Vec<u8> {
 }
 
 #[cfg(target_family = "unix")]
-fn note_stdin_line_read(bytes: &[u8]) {
+fn read_fd_bytes(fd: libc::c_int, size: usize) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut bytes = vec![0u8; size];
+    loop {
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read > 0 {
+            bytes.truncate(read as usize);
+            return bytes;
+        }
+        if read == 0 {
+            return Vec::new();
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Vec::new();
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn note_stdin_bytes_read(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if PYTHON_STDIN_BRIDGE.get().is_none() {
+        emit_readline_input_bytes(bytes);
+        mark_request_input_delivered();
+    }
+    note_active_stdin_line_read(bytes);
+}
+
+#[cfg(target_family = "unix")]
+fn note_active_stdin_line_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -2183,6 +2337,41 @@ fn note_stdin_line_read(bytes: &[u8]) {
     let mut guard = state.inner.lock().unwrap();
     if let Some(active) = guard.active_request.as_mut() {
         active.consumed_lines = active.consumed_lines.saturating_add(1);
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn note_stdin_line_read(bytes: &[u8]) {
+    note_stdin_bytes_read(bytes);
+}
+
+#[cfg(target_family = "unix")]
+fn emit_readline_input_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
+    pending.extend_from_slice(bytes);
+    loop {
+        match std::str::from_utf8(&pending) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    ipc::emit_readline_input(text);
+                }
+                pending.clear();
+                return;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to == 0 {
+                    return;
+                }
+                let text = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("valid UTF-8 prefix should decode");
+                ipc::emit_readline_input(text);
+                pending.drain(..valid_up_to);
+            }
+        }
     }
 }
 
@@ -2640,6 +2829,8 @@ static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut(
 static PYTHON_STDIN_BRIDGE: OnceLock<Arc<RuntimeStdinBridge>> = OnceLock::new();
 #[cfg(target_family = "unix")]
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(target_family = "unix")]
+static PYTHON_DIRECT_STDIN_SIDEBAND_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests {

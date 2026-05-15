@@ -37,6 +37,7 @@ _plot_show = None
 _plot_emitted_this_request = {}
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
+_mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -91,8 +92,9 @@ def _mcp_repl_capture_prompts():
     if ps2 is not _mcp_repl_suppressed_ps2:
         _mcp_repl_ps2 = str(ps2)
     _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
-    sys.ps1 = _mcp_repl_suppressed_ps1
-    sys.ps2 = _mcp_repl_suppressed_ps2
+    if not _mcp_repl_c_stdio_tty:
+        sys.ps1 = _mcp_repl_suppressed_ps1
+        sys.ps2 = _mcp_repl_suppressed_ps2
 
 
 def _input(prompt=""):
@@ -1017,7 +1019,8 @@ def _mcp_repl_os_readv(fd, buffers):
     return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
 
 
-builtins.input = _input
+if not _mcp_repl_c_stdio_tty:
+    builtins.input = _input
 # The worker keeps a real fd 0 so Unix readiness checks and fork+exec children
 # behave like a normal REPL. Python-level integer-fd reads of that same stdin
 # and path aliases to it must still go through sideband so the server can
@@ -1038,8 +1041,12 @@ if _mcp_repl_posix is not None:
         _mcp_repl_posix.readv = _mcp_repl_os_readv
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
-sys.ps1 = _mcp_repl_suppressed_ps1
-sys.ps2 = _mcp_repl_suppressed_ps2
+if _mcp_repl_c_stdio_tty:
+    sys.ps1 = _mcp_repl_ps1
+    sys.ps2 = _mcp_repl_ps2
+else:
+    sys.ps1 = _mcp_repl_suppressed_ps1
+    sys.ps2 = _mcp_repl_suppressed_ps2
 _mcp_repl_stdin = McpInputStream()
 sys.stdin = _mcp_repl_stdin
 # In vanilla Python, sys.__stdin__ preserves the startup stdin object. In this
