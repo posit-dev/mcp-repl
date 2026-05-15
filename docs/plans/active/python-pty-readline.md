@@ -26,9 +26,9 @@ continuation state, or emulate Python stdin semantics.
 
 - State: active
 - Last updated: 2026-05-15
-- Current phase: phase 6 pending
+- Current phase: phase 7 pending
 - Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: phase 5, "Harden interrupt and reset cleanup for PTY readline"
+- Last completed slice: phase 6, "Remove obsolete Python stdin bridge and direct-fd shims"
 
 ## Current Direction
 
@@ -98,7 +98,7 @@ route.
 - Phase 4: pending - make `PyOS_ReadlineFunctionPointer` the Python stdin
   accounting point (#194).
 - Phase 5: completed - harden interrupt and reset cleanup for PTY readline (#195).
-- Phase 6: pending - remove obsolete Python stdin bridge and direct-fd shims
+- Phase 6: completed - remove obsolete Python stdin bridge and direct-fd shims
   (#196).
 - Phase 7: pending - update current-state docs and snapshots for the final PTY
   contract (#197).
@@ -132,9 +132,11 @@ route.
 
 ## Next Safe Slice
 
-- Work #196 next: remove obsolete Python stdin bridge and direct-fd shims.
-- Keep sideband IPC separate from PTY traffic. Do not treat direct fd stdin as
-  first-class behavior unless a later public contract adds it.
+- Work phase 7 next: update current-state docs and snapshots for the final PTY
+  contract.
+- Keep sideband IPC separate from PTY traffic. Direct fd stdin consumers are not
+  first-class request-completion behavior unless a later public contract adds
+  that support.
 
 ## Drain Loop Note
 
@@ -187,3 +189,8 @@ route.
 - 2026-05-15: `repl_reset` while Python is blocked in readline now replaces the
   worker cleanly; stale prompt/input state from the old PTY-backed worker does
   not carry into the replacement session.
+- 2026-05-15: Removed the Unix Python stdin bridge thread from the PTY runtime
+  path and stopped installing Python-level direct-fd stdin shims there. The
+  supported PTY path leaves CPython's `sys.stdin`, `open`, `os.read`,
+  `os.readv`, and `io.FileIO` surfaces intact; request-completion accounting
+  remains tied to `PyOS_ReadlineFunctionPointer`.

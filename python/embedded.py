@@ -1030,41 +1030,34 @@ def _mcp_repl_os_readv(fd, buffers):
     return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
 
 
-if not _mcp_repl_c_stdio_tty:
-    builtins.input = _input
-# The worker keeps a real fd 0 so Unix readiness checks and fork+exec children
-# behave like a normal REPL. Python-level integer-fd reads of that same stdin
-# and path aliases to it must still go through sideband so the server can
-# account for consumed input.
 builtins.__import__ = _mcp_repl_import
-builtins.open = _mcp_repl_open
-io.open = _mcp_repl_open
-io.FileIO = _McpReplFileIO
-_io.open = _mcp_repl_open
-_io.FileIO = _McpReplFileIO
 pydoc.pager = _pydoc_plainpager
-os.fdopen = _mcp_repl_os_fdopen
-os.read = _mcp_repl_os_read
-if _original_os_readv is not None:
-    os.readv = _mcp_repl_os_readv
-if _mcp_repl_posix is not None:
-    _mcp_repl_posix.read = _mcp_repl_os_read
-    if _original_os_readv is not None:
-        _mcp_repl_posix.readv = _mcp_repl_os_readv
 sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 if _mcp_repl_c_stdio_tty:
     sys.ps1 = _mcp_repl_ps1
     sys.ps2 = _mcp_repl_ps2
 else:
+    builtins.input = _input
+    builtins.open = _mcp_repl_open
+    io.open = _mcp_repl_open
+    io.FileIO = _McpReplFileIO
+    _io.open = _mcp_repl_open
+    _io.FileIO = _McpReplFileIO
+    os.fdopen = _mcp_repl_os_fdopen
+    os.read = _mcp_repl_os_read
+    if _original_os_readv is not None:
+        os.readv = _mcp_repl_os_readv
+    if _mcp_repl_posix is not None:
+        _mcp_repl_posix.read = _mcp_repl_os_read
+        if _original_os_readv is not None:
+            _mcp_repl_posix.readv = _mcp_repl_os_readv
     sys.ps1 = _mcp_repl_suppressed_ps1
     sys.ps2 = _mcp_repl_suppressed_ps2
-_mcp_repl_stdin = McpInputStream()
-sys.stdin = _mcp_repl_stdin
-# In vanilla Python, sys.__stdin__ preserves the startup stdin object. In this
-# embedded REPL the startup stdin is mcp-repl-managed, and leaving CPython's
-# original fd-backed object exposed would let user code bypass sideband input
-# accounting and keep requests busy after consuming bytes.
-sys.__stdin__ = _mcp_repl_stdin
+    _mcp_repl_stdin = McpInputStream()
+    sys.stdin = _mcp_repl_stdin
+    # In the non-PTY fallback, leaving CPython's original fd-backed object
+    # exposed would let user code bypass sideband input accounting.
+    sys.__stdin__ = _mcp_repl_stdin
 sys.stdout = McpOutputStream("stdout")
 sys.stderr = McpOutputStream("stderr")
