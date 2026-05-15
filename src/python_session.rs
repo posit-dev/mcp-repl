@@ -2146,10 +2146,11 @@ fn set_current_repl_readline_prompt(prompt: &str) {
         .as_ref()
         .is_some_and(|active| active.started_after_continuation_prompt);
     let readline_state = if prompt == guard.python_continuation_prompt
-        || guard.repl_readline_count > 0
         || (prompt.is_empty() && started_after_continuation_prompt)
     {
         PythonReadlineState::Continuation
+    } else if guard.repl_readline_count > 0 {
+        PythonReadlineState::ClientInput
     } else {
         PythonReadlineState::Primary
     };
@@ -2623,6 +2624,10 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
             function: py_raw_stdin_read,
         },
         ModuleMethod {
+            name: "restore_readline_function",
+            function: py_restore_readline_function,
+        },
+        ModuleMethod {
             name: "request_exit",
             function: py_request_exit,
         },
@@ -2731,6 +2736,22 @@ unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject
         Ok(value) => value.into_raw(),
         Err(_) => ptr::null_mut(),
     }
+}
+
+unsafe extern "C" fn py_restore_readline_function(
+    _self: *mut PyObject,
+    args: *mut PyObject,
+) -> *mut PyObject {
+    let api = PythonApi::global();
+    if api.tuple_size(args) != 0 {
+        set_callback_error("restore_readline_function expects no arguments");
+        return ptr::null_mut();
+    }
+    if let Err(err) = api.install_readline_function(mcp_repl_readline) {
+        set_callback_error(&err);
+        return ptr::null_mut();
+    }
+    api.none()
 }
 
 unsafe extern "C" fn py_request_exit(_self: *mut PyObject, args: *mut PyObject) -> *mut PyObject {

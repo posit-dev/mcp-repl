@@ -20,6 +20,9 @@ except ImportError:
     _mcp_repl_posix = None
 
 os.environ.setdefault("MPLBACKEND", "agg")
+# pdb's pyrepl path reads the terminal fd directly; keep debugger input on
+# CPython input()/PyOS_Readline so sideband stdin accounting stays single-owner.
+os.environ.setdefault("PYTHON_BASIC_REPL", "1")
 sys.argv = ["mcp-repl"]
 if "" not in sys.path:
     sys.path.insert(0, "")
@@ -747,6 +750,7 @@ def _mcp_repl_plot_capable():
 
 
 _original_excepthook = sys.excepthook
+_original_builtins_import = builtins.__import__
 _original_builtins_open = builtins.open
 _original_io_FileIO = io.FileIO
 _original_os_fdopen = os.fdopen
@@ -768,6 +772,13 @@ def _mcp_repl_excepthook(exc_type, exc, traceback):
         _mcp_repl.request_exit()
         return
     _original_excepthook(exc_type, exc, traceback)
+
+
+def _mcp_repl_import(name, globals=None, locals=None, fromlist=(), level=0):
+    module = _original_builtins_import(name, globals, locals, fromlist, level)
+    if name.partition(".")[0] == "readline":
+        _mcp_repl.restore_readline_function()
+    return module
 
 
 def _mcp_repl_is_raw_stdin_fd(fd):
@@ -1025,6 +1036,7 @@ if not _mcp_repl_c_stdio_tty:
 # behave like a normal REPL. Python-level integer-fd reads of that same stdin
 # and path aliases to it must still go through sideband so the server can
 # account for consumed input.
+builtins.__import__ = _mcp_repl_import
 builtins.open = _mcp_repl_open
 io.open = _mcp_repl_open
 io.FileIO = _McpReplFileIO

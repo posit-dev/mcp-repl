@@ -5142,9 +5142,8 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
     let result = session.write_stdin_raw_with("c", Some(5.0)).await?;
     let text = result_text(&result);
     if is_busy_response(&text) {
-        eprintln!("python_pdb_roundtrip remained busy after continue; skipping");
         session.cancel().await?;
-        return Ok(());
+        return Err("python_pdb_roundtrip remained busy after continue".into());
     }
     assert!(
         text.contains(">>>"),
