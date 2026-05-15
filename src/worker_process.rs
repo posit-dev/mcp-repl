@@ -2,6 +2,8 @@
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_family = "unix")]
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -54,7 +56,9 @@ use crate::worker_protocol::{
 };
 
 #[cfg(target_family = "unix")]
-use std::os::unix::io::AsRawFd;
+use portable_pty::{PtySize, native_pty_system};
+#[cfg(target_family = "unix")]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
@@ -5630,6 +5634,18 @@ struct SpawnedWorkerStdio {
     stderr_reader: Option<OutputReader>,
 }
 
+struct SpawnedCommand {
+    child: Child,
+    #[cfg(target_family = "unix")]
+    pty_stdio: Option<SpawnedPtyStdio>,
+}
+
+#[cfg(target_family = "unix")]
+struct SpawnedPtyStdio {
+    reader: File,
+    writer: Box<dyn Write + Send>,
+}
+
 struct WorkerSpawnContext<'a> {
     oversized_output: OversizedOutputMode,
     pending_output_tape: PendingOutputTape,
@@ -5894,14 +5910,9 @@ impl WorkerProcess {
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
-        #[cfg(target_family = "unix")]
-        unsafe {
-            command.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        #[cfg(target_family = "unix")]
+        configure_command_process_group(&mut command, stdin_transport);
         let child_result = spawn_command_with_transport(&mut command, stdin_transport);
         #[cfg(target_family = "unix")]
         {
@@ -5910,7 +5921,11 @@ impl WorkerProcess {
                 libc::close(client_fds.write_fd);
             }
         }
-        let mut child = child_result?;
+        let SpawnedCommand {
+            mut child,
+            #[cfg(target_family = "unix")]
+            pty_stdio,
+        } = child_result?;
         if let Some(status) = child.try_wait()? {
             maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
@@ -5922,7 +5937,13 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
-        } = attach_spawned_worker_stdio(&mut child, stdin_transport, live_output.clone())?;
+        } = attach_spawned_worker_stdio(
+            &mut child,
+            stdin_transport,
+            #[cfg(target_family = "unix")]
+            pty_stdio,
+            live_output.clone(),
+        )?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -6008,14 +6029,9 @@ impl WorkerProcess {
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
-        #[cfg(target_family = "unix")]
-        unsafe {
-            command.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
         let stdin_transport = spec.stdin.transport();
+        #[cfg(target_family = "unix")]
+        configure_command_process_group(&mut command, stdin_transport);
         let child_result = spawn_command_with_transport(&mut command, stdin_transport);
         #[cfg(target_family = "unix")]
         {
@@ -6024,7 +6040,11 @@ impl WorkerProcess {
                 libc::close(client_fds.write_fd);
             }
         }
-        let mut child = child_result?;
+        let SpawnedCommand {
+            mut child,
+            #[cfg(target_family = "unix")]
+            pty_stdio,
+        } = child_result?;
         if let Some(status) = child.try_wait()? {
             maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
@@ -6036,7 +6056,13 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
-        } = attach_spawned_worker_stdio(&mut child, stdin_transport, live_output.clone())?;
+        } = attach_spawned_worker_stdio(
+            &mut child,
+            stdin_transport,
+            #[cfg(target_family = "unix")]
+            pty_stdio,
+            live_output.clone(),
+        )?;
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -6777,26 +6803,107 @@ where
 fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
-) -> Result<Child, WorkerError> {
+) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
-        WorkerStdinTransport::Pipe => Ok(command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?),
-        WorkerStdinTransport::Pty => Err(WorkerError::Protocol(
-            "PTY worker stdin transport is not implemented".to_string(),
-        )),
+        WorkerStdinTransport::Pipe => {
+            let child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            Ok(SpawnedCommand {
+                child,
+                #[cfg(target_family = "unix")]
+                pty_stdio: None,
+            })
+        }
+        WorkerStdinTransport::Pty => spawn_command_with_pty(command),
     }
+}
+
+#[cfg(target_family = "unix")]
+fn spawn_command_with_pty(command: &mut Command) -> Result<SpawnedCommand, WorkerError> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| WorkerError::Protocol(format!("failed to open worker PTY: {err}")))?;
+    let slave_path = pair
+        .master
+        .tty_name()
+        .ok_or_else(|| WorkerError::Protocol("worker PTY has no slave path".to_string()))?;
+
+    let stdin = open_pty_slave_stdio(&slave_path)?;
+    let stdout = open_pty_slave_stdio(&slave_path)?;
+    let stderr = open_pty_slave_stdio(&slave_path)?;
+    command
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[allow(clippy::cast_lossless)]
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|err| WorkerError::Protocol(format!("failed to open worker PTY writer: {err}")))?;
+    let master_fd = pair
+        .master
+        .as_raw_fd()
+        .ok_or_else(|| WorkerError::Protocol("worker PTY master has no fd".to_string()))?;
+    let reader_fd = unsafe { libc::dup(master_fd) };
+    if reader_fd == -1 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    let reader = unsafe { File::from_raw_fd(reader_fd) };
+    let child = command.spawn()?;
+
+    Ok(SpawnedCommand {
+        child,
+        pty_stdio: Some(SpawnedPtyStdio { reader, writer }),
+    })
+}
+
+#[cfg(not(target_family = "unix"))]
+fn spawn_command_with_pty(_command: &mut Command) -> Result<SpawnedCommand, WorkerError> {
+    Err(WorkerError::Protocol(
+        "PTY worker stdin transport is not supported on this platform".to_string(),
+    ))
+}
+
+#[cfg(target_family = "unix")]
+fn open_pty_slave_stdio(path: &Path) -> Result<File, WorkerError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(WorkerError::Io)
 }
 
 fn attach_spawned_worker_stdio(
     child: &mut Child,
     stdin_transport: WorkerStdinTransport,
+    #[cfg(target_family = "unix")] pty_stdio: Option<SpawnedPtyStdio>,
     live_output: LiveOutputCapture,
 ) -> Result<SpawnedWorkerStdio, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
+            #[cfg(target_family = "unix")]
+            let _ = pty_stdio;
             let stdin = child
                 .stdin
                 .take()
@@ -6812,9 +6919,30 @@ fn attach_spawned_worker_stdio(
                 stderr_reader,
             })
         }
-        WorkerStdinTransport::Pty => Err(WorkerError::Protocol(
-            "PTY worker stdin transport is not implemented".to_string(),
-        )),
+        WorkerStdinTransport::Pty => {
+            #[cfg(target_family = "unix")]
+            {
+                let pty_stdio = pty_stdio.ok_or_else(|| {
+                    WorkerError::Protocol("worker PTY stdio unavailable".to_string())
+                })?;
+                let stdin_tx = spawn_stdin_writer(pty_stdio.writer);
+                let stdout_reader =
+                    spawn_output_reader(Some(pty_stdio.reader), TextStream::Stdout, live_output)?;
+                Ok(SpawnedWorkerStdio {
+                    stdin_tx,
+                    stdout_reader,
+                    stderr_reader: None,
+                })
+            }
+            #[cfg(not(target_family = "unix"))]
+            {
+                let _ = child;
+                let _ = live_output;
+                Err(WorkerError::Protocol(
+                    "PTY worker stdin transport is not supported on this platform".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -6913,6 +7041,19 @@ fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
     // The Windows child is the sandbox wrapper. Let it exit naturally so it can
     // roll back temporary ACL state before process teardown.
     Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn configure_command_process_group(command: &mut Command, stdin_transport: WorkerStdinTransport) {
+    if !matches!(stdin_transport, WorkerStdinTransport::Pipe) {
+        return;
+    }
+    unsafe {
+        command.pre_exec(|| {
+            let _ = libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_family = "unix")]

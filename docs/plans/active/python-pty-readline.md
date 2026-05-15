@@ -26,9 +26,9 @@ continuation state, or emulate Python stdin semantics.
 
 - State: active
 - Last updated: 2026-05-15
-- Current phase: phase 2 pending
+- Current phase: phase 3 pending
 - Driving epic: #189, "Move embedded Python to PTY-backed CPython readline"
-- Last completed slice: #191, "Add launch-time worker stdin transport abstraction"
+- Last completed slice: #192, "Prove PTY worker transport with sideband kept separate"
 
 ## Current Direction
 
@@ -91,7 +91,7 @@ route.
 
 - Phase 0: completed - create this plan and record the design boundary (#190).
 - Phase 1: completed - add a launch-time worker stdin transport abstraction (#191).
-- Phase 2: pending - prove PTY worker transport while keeping sideband separate
+- Phase 2: completed - prove PTY worker transport while keeping sideband separate
   (#192).
 - Phase 3: pending - run embedded Python on PTY-backed C stdin/stdout and prove
   CPython takes the readline path (#193).
@@ -121,8 +121,6 @@ route.
 
 ## Open Questions
 
-- What is the smallest launch abstraction that keeps pipe workers unchanged while
-  making PTY setup explicit and fail-fast?
 - How should tests prove that CPython uses `PyOS_ReadlineFunctionPointer` without
   relying on private helper behavior?
 - Which `readline_discard` facts can be accounted for exactly when bytes are
@@ -139,9 +137,10 @@ route.
 
 ## Next Safe Slice
 
-- Work #192 next: prove PTY worker transport while keeping sideband separate.
-- Public or launch-facing tests should compare pipe and PTY launch behavior
-  before any built-in Python PTY behavior changes.
+- Work #193 next: run embedded Python on PTY-backed C stdin/stdout and prove
+  CPython takes the readline path.
+- Keep sideband IPC separate from PTY traffic, and do not remove the old Python
+  stdin bridge until the readline callback path covers the public behavior.
 
 ## Drain Loop Note
 
@@ -178,3 +177,7 @@ route.
   the sandbox wrapper, not merely to the outer wrapper process.
 - 2026-05-15: Added an explicit launch-time stdin transport model. Built-in R,
   built-in Python, and the current protocol fixture launch through pipe stdin.
+- 2026-05-15: Proved Unix custom-worker PTY launch with sideband IPC preserved
+  on separate inherited file descriptors. The fixture test covers PTY echo,
+  CRLF output conversion, visible PTY output capture, and sideband prompt
+  completion before switching Python to PTY.
