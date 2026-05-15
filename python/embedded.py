@@ -38,6 +38,32 @@ _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 
 
+def _mcp_repl_readinto_type_name(target):
+    if target is None:
+        return "None"
+    return type(target).__name__
+
+
+def _mcp_repl_readinto_byte_view(target):
+    type_name = _mcp_repl_readinto_type_name(target)
+    try:
+        view = memoryview(target)
+    except TypeError:
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        ) from None
+    if view.readonly:
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        )
+    try:
+        return view.cast("B")
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"readinto() argument 1 must be read-write bytes-like object, not {type_name}"
+        ) from None
+
+
 class _McpSuppressedPrompt:
     def __init__(self, prompt_name):
         self._prompt_name = prompt_name
@@ -336,8 +362,9 @@ class McpInputBuffer:
         return lines
 
     def readinto(self, target):
-        data = self.read(len(target))
-        target[: len(data)] = data
+        view = _mcp_repl_readinto_byte_view(target)
+        data = self.read(view.nbytes)
+        view[: len(data)] = data
         return len(data)
 
     def read1(self, size=-1):
@@ -440,8 +467,9 @@ class McpRawInputBuffer(io.RawIOBase):
         return lines
 
     def readinto(self, target):
-        data = self.read(len(target))
-        target[: len(data)] = data
+        view = _mcp_repl_readinto_byte_view(target)
+        data = self.read(view.nbytes)
+        view[: len(data)] = data
         return len(data)
 
     def readable(self):

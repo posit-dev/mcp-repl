@@ -1498,6 +1498,76 @@ first = stream.readline(); second = next(stream); stream.close(); print("FILEIO_
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fileio_readinto_validates_target_before_consuming_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""import io
+stream = io.FileIO(0, 'rb', closefd=False)
+try:
+    stream.readinto(bytes(1))
+except TypeError as exc:
+    print("READINTO_TARGET_ERROR", type(exc).__name__)
+buf = bytearray(1)
+n = stream.readinto(buf)
+print("READINTO_TARGET_AFTER", n, bytes(buf))
+""")
+Z
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("READINTO_TARGET_ERROR TypeError"),
+        "expected read-only readinto target to raise before stdin read, got: {text:?}"
+    );
+    assert!(
+        text.contains(r#"READINTO_TARGET_AFTER 1 b'Z'"#),
+        "expected stdin byte to remain available after readinto target error, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_open_unbuffered_readinto_uses_memoryview_nbytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""stream = open(0, 'rb', buffering=0, closefd=False)
+buf = bytearray(4)
+view = memoryview(buf).cast('H')
+n = stream.readinto(view)
+print("READINTO_TYPED_VIEW", n, bytes(buf))
+""")
+abcd
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains(r#"READINTO_TYPED_VIEW 4 b'abcd'"#),
+        "expected readinto typed memoryview to use byte capacity, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_duplicated_stdin_wrappers_report_supplied_fileno() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
