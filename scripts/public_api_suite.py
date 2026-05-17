@@ -705,10 +705,23 @@ class SuiteCase:
     server_env: tuple[tuple[str, str], ...] = ()
 
 
+def r_suite_case(
+    run: Callable[[McpStdioClient], None],
+    *,
+    server_args: tuple[str, ...] = (),
+    server_env: tuple[tuple[str, str], ...] = (),
+) -> SuiteCase:
+    return SuiteCase(
+        run,
+        server_args=("--interpreter", "r", *server_args),
+        server_env=server_env,
+    )
+
+
 CASES: dict[str, SuiteCase] = {
-    "r-console-basic": SuiteCase(r_console_basic),
-    "r-interrupt-restart-prefixes": SuiteCase(r_interrupt_restart_prefixes),
-    "r-output-bundle-files": SuiteCase(
+    "r-console-basic": r_suite_case(r_console_basic),
+    "r-interrupt-restart-prefixes": r_suite_case(r_interrupt_restart_prefixes),
+    "r-output-bundle-files": r_suite_case(
         r_output_bundle_files,
         server_args=("--oversized-output", "files"),
         server_env=(
@@ -717,7 +730,7 @@ CASES: dict[str, SuiteCase] = {
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
         ),
     ),
-    "r-output-bundle-size-limit": SuiteCase(
+    "r-output-bundle-size-limit": r_suite_case(
         r_output_bundle_size_limit,
         server_args=("--oversized-output", "files"),
         server_env=(
@@ -726,13 +739,13 @@ CASES: dict[str, SuiteCase] = {
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "1048576"),
         ),
     ),
-    "r-pager-command-smoke": SuiteCase(
+    "r-pager-command-smoke": r_suite_case(
         r_pager_command_smoke,
         server_args=("--oversized-output", "pager"),
         server_env=(("MCP_REPL_PAGER_PAGE_CHARS", "80"),),
     ),
-    "r-reset-clears-state": SuiteCase(r_reset_clears_state),
-    "r-timeout-busy-recovers": SuiteCase(r_timeout_busy_recovers),
+    "r-reset-clears-state": r_suite_case(r_reset_clears_state),
+    "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
 }
 
 
