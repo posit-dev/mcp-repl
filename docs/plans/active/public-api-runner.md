@@ -35,7 +35,6 @@
 
 ## Open Questions
 
-- Which existing integration file should provide the next migrated scenario.
 - Whether CI should run the Python suite as a separate required step or as part of a broader fast test profile.
 
 ## Next Safe Slice
@@ -51,3 +50,4 @@
 
 - 2026-05-17: Chose a narrow first slice with one R `repl` smoke case to prove the runner can initialize the real binary and call public tools before moving more complex scenarios.
 - 2026-05-17: Added an R timeout/busy/recovery case to the external runner and removed the matching Rust snapshot smoke test.
+- 2026-05-17: Added an R `repl_reset` state-clearing case to the external runner and removed the duplicate Rust public surface test.

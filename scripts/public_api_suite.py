@@ -327,8 +327,38 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     require_r_result_two(recovered_text, "recovery repl")
 
 
+def r_reset_clears_state(client: McpStdioClient) -> None:
+    set_var = client.call_tool(
+        "repl",
+        {
+            "input": "x <- 1\n",
+            "timeout_ms": 30000,
+        },
+    )
+    set_var_text = require_success(set_var, "set variable repl")
+    if "<<repl status: busy" in set_var_text:
+        raise SuiteFailure(f"expected set variable response, got: {set_var_text!r}")
+
+    reset = client.call_tool("repl_reset", {})
+    require_success(reset, "repl_reset")
+
+    after_reset = client.call_tool(
+        "repl",
+        {
+            "input": "print(exists(\"x\"))\n",
+            "timeout_ms": 30000,
+        },
+    )
+    after_reset_text = require_success(after_reset, "after reset repl")
+    if "<<repl status: busy" in after_reset_text:
+        raise SuiteFailure(f"expected after-reset response, got: {after_reset_text!r}")
+    if "FALSE" not in after_reset_text:
+        raise SuiteFailure(f"expected reset state, got: {after_reset_text!r}")
+
+
 CASES: dict[str, Callable[[McpStdioClient], None]] = {
     "r-console-basic": r_console_basic,
+    "r-reset-clears-state": r_reset_clears_state,
     "r-timeout-busy-recovers": r_timeout_busy_recovers,
 }
 

@@ -500,63 +500,6 @@ async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_reset_clears_state() -> TestResult<()> {
-    let _guard = lock_test_mutex().await;
-    let session = common::spawn_server().await?;
-
-    let set_var = session
-        .call_tool_raw(
-            session.repl_tool_name(),
-            json!({
-                "input": "x <- 1\n",
-                "timeout_ms": 10_000
-            }),
-        )
-        .await?;
-    let set_var_text = result_text(&set_var);
-    if backend_unavailable(&set_var_text) {
-        eprintln!("repl_surface backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if busy_response(&set_var_text) {
-        eprintln!("repl_surface worker remained busy; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    let _ = session.call_tool_raw("repl_reset", json!({})).await?;
-
-    let after_reset = session
-        .call_tool_raw(
-            session.repl_tool_name(),
-            json!({
-                "input": "print(exists(\"x\"))\n",
-                "timeout_ms": 10_000
-            }),
-        )
-        .await?;
-    let after_reset_text = result_text(&after_reset);
-    if backend_unavailable(&after_reset_text) {
-        eprintln!("repl_surface backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if busy_response(&after_reset_text) {
-        eprintln!("repl_surface worker remained busy after reset; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        after_reset_text.contains("FALSE"),
-        "expected reset state, got: {after_reset_text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
