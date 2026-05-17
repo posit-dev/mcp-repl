@@ -8,6 +8,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -295,6 +296,65 @@ def require_success_when_not_busy(
     return wait_until_not_busy(client, context)
 
 
+def disclosed_path(text: str, suffix: str) -> Path | None:
+    end = text.find(suffix)
+    if end == -1:
+        return None
+    end += len(suffix)
+    start = 0
+    for index in range(end - 1, -1, -1):
+        ch = text[index]
+        if ch.isspace() or ch in "\"'[(":
+            start = index + 1
+            break
+    return Path(text[start:end])
+
+
+def bundle_transcript_path(text: str) -> Path | None:
+    return disclosed_path(text, "transcript.txt")
+
+
+def r_string_literal(value: str) -> str:
+    return json.dumps(value.replace("\\", "/"))
+
+
+def r_large_text_input(label: str, lines: int = 80, width: int = 120) -> str:
+    prefix = r_string_literal(f"{label}%03d %s\n")
+    return (
+        f"big <- paste(rep({r_string_literal(label)}, {width}), collapse = ''); "
+        f"for (i in 1:{lines}) cat(sprintf({prefix}, i, big))"
+    )
+
+
+def repl_text(
+    client: McpStdioClient,
+    input_text: str,
+    timeout_ms: int,
+    context: str,
+) -> str:
+    result = client.call_tool(
+        "repl",
+        {
+            "input": input_text,
+            "timeout_ms": timeout_ms,
+        },
+    )
+    return require_success_when_not_busy(client, result, context)
+
+
+def require_transcript_path(text: str, context: str) -> Path:
+    transcript_path = bundle_transcript_path(text)
+    if transcript_path is None:
+        raise SuiteFailure(f"{context} expected transcript.txt path, got: {text!r}")
+    return transcript_path
+
+
+def require_text_file(path: Path, context: str) -> str:
+    if not path.is_file():
+        raise SuiteFailure(f"{context} expected file to exist: {path}")
+    return path.read_text(encoding="utf-8")
+
+
 def wait_for_interrupt_ready(client: McpStdioClient, text: str, context: str) -> str:
     deadline = time.monotonic() + 20.0
     last_text = text
@@ -473,6 +533,125 @@ tryCatch(
         )
 
 
+def r_output_bundle_files(client: McpStdioClient) -> None:
+    oversized_text = repl_text(
+        client,
+        r_large_text_input("x"),
+        30000,
+        "output bundle text repl",
+    )
+    transcript_path = require_transcript_path(
+        oversized_text,
+        "output bundle text repl",
+    )
+    transcript = require_text_file(transcript_path, "output bundle text transcript")
+    if "x080" not in transcript:
+        raise SuiteFailure(
+            f"expected transcript bundle to contain full worker text, got: {transcript!r}"
+        )
+    bundle_dir = transcript_path.parent
+    if (bundle_dir / "events.log").exists():
+        raise SuiteFailure("did not expect events.log for text-only output bundle")
+    if (bundle_dir / "images").exists():
+        raise SuiteFailure("did not expect images dir for text-only output bundle")
+
+    bundle_paths: list[Path] = []
+    for label in ["a", "b", "c"]:
+        text = repl_text(
+            client,
+            r_large_text_input(label),
+            30000,
+            f"output bundle pruning repl {label}",
+        )
+        bundle_paths.append(
+            require_transcript_path(text, f"output bundle pruning repl {label}")
+        )
+
+    if bundle_paths[0].exists():
+        raise SuiteFailure(
+            f"expected oldest inactive bundle to be pruned: {bundle_paths[0]}"
+        )
+    if not bundle_paths[1].exists() or not bundle_paths[2].exists():
+        raise SuiteFailure(f"expected newest bundles to remain: {bundle_paths!r}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        gate = Path(temp_dir) / "release"
+        input_text = f"""
+cat("TIMEOUT_START\\n")
+flush.console()
+while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)
+big <- paste(rep("t", 120), collapse = "")
+cat("TIMEOUT_BIG_START\\n")
+for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
+cat("TIMEOUT_BIG_END\\n")
+"""
+        first = client.call_tool(
+            "repl",
+            {
+                "input": input_text,
+                "timeout_ms": 1000,
+            },
+        )
+        first_text = require_success(first, "output bundle timeout setup repl")
+        if not is_busy_response(first_text):
+            raise SuiteFailure(f"expected timeout setup to remain busy, got: {first_text!r}")
+        if bundle_transcript_path(first_text) is not None:
+            raise SuiteFailure(
+                f"did not expect timeout setup to disclose a bundle, got: {first_text!r}"
+            )
+
+        gate.write_text("ready", encoding="utf-8")
+        settled = repl_text(
+            client,
+            "",
+            10000,
+            "output bundle timeout poll repl",
+        )
+        timeout_transcript_path = require_transcript_path(
+            settled,
+            "output bundle timeout poll repl",
+        )
+        timeout_transcript = require_text_file(
+            timeout_transcript_path,
+            "output bundle timeout transcript",
+        )
+        if "TIMEOUT_START" not in timeout_transcript:
+            raise SuiteFailure(
+                "expected timeout transcript to backfill earlier worker text, "
+                f"got: {timeout_transcript!r}"
+            )
+        if "TIMEOUT_BIG_END" not in timeout_transcript:
+            raise SuiteFailure(
+                f"expected timeout transcript to include later worker text, got: {timeout_transcript!r}"
+            )
+        if "<<repl status: busy" in timeout_transcript:
+            raise SuiteFailure(
+                f"did not expect timeout marker in transcript, got: {timeout_transcript!r}"
+            )
+
+
+def r_output_bundle_size_limit(client: McpStdioClient) -> None:
+    text = repl_text(
+        client,
+        r_large_text_input("z", lines=120),
+        30000,
+        "output bundle size limit repl",
+    )
+    transcript_path = require_transcript_path(text, "output bundle size limit repl")
+    transcript = require_text_file(
+        transcript_path,
+        "output bundle size limit transcript",
+    )
+    if "later content omitted" not in text:
+        raise SuiteFailure(f"expected inline omission notice after cap, got: {text!r}")
+    if (transcript_path.parent / "events.log").exists():
+        raise SuiteFailure("did not expect events.log for text-only capped bundle")
+    if "z120" in transcript:
+        raise SuiteFailure(
+            f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"
+        )
+
+
 def r_pager_command_smoke(client: McpStdioClient) -> None:
     initial = client.call_tool(
         "repl",
@@ -529,6 +708,24 @@ class SuiteCase:
 CASES: dict[str, SuiteCase] = {
     "r-console-basic": SuiteCase(r_console_basic),
     "r-interrupt-restart-prefixes": SuiteCase(r_interrupt_restart_prefixes),
+    "r-output-bundle-files": SuiteCase(
+        r_output_bundle_files,
+        server_args=("--oversized-output", "files"),
+        server_env=(
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "2"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "1048576"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
+        ),
+    ),
+    "r-output-bundle-size-limit": SuiteCase(
+        r_output_bundle_size_limit,
+        server_args=("--oversized-output", "files"),
+        server_env=(
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "20"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "2048"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "1048576"),
+        ),
+    ),
     "r-pager-command-smoke": SuiteCase(
         r_pager_command_smoke,
         server_args=("--oversized-output", "pager"),
