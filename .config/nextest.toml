@@ -9,5 +9,5 @@ failure-output = "final"
 repl-integration = { max-threads = 1 }
 
 [[profile.ci.overrides]]
-filter = 'binary(=interrupt) or binary(=manage_session_behavior) or binary(=pager_flags) or binary(=python_backend) or binary(=r_manuals) or binary(=r_protocol) or binary(=r_vignettes) or binary(=repl_surface) or binary(=sandbox_state_updates) or binary(=write_stdin_batch) or binary(=write_stdin_behavior) or binary(=write_stdin_edge_cases)'
+filter = 'binary(=interrupt) or binary(=manage_session_behavior) or binary(=python_backend) or binary(=r_protocol) or binary(=repl_surface) or binary(=sandbox_state_updates) or binary(=write_stdin_batch) or binary(=write_stdin_behavior) or binary(=write_stdin_edge_cases)'
 test-group = "repl-integration"

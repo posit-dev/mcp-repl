@@ -206,6 +206,7 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
     let root = repo_root();
     let workflow = read(&root.join(".github/workflows/ci.yml"));
     let nextest_config = read(&root.join(".config/nextest.toml"));
+    let testing_docs = read(&root.join("docs/testing.md"));
 
     for required in [
         "taiki-e/install-action@nextest",
@@ -251,14 +252,11 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
         );
     }
 
-    for required_binary in [
+    for serialized_binary in [
         "binary(=interrupt)",
         "binary(=manage_session_behavior)",
-        "binary(=pager_flags)",
         "binary(=python_backend)",
-        "binary(=r_manuals)",
         "binary(=r_protocol)",
-        "binary(=r_vignettes)",
         "binary(=repl_surface)",
         "binary(=sandbox_state_updates)",
         "binary(=write_stdin_batch)",
@@ -266,10 +264,27 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
         "binary(=write_stdin_edge_cases)",
     ] {
         assert!(
-            nextest_config.contains(required_binary),
-            "missing {required_binary} in .config/nextest.toml"
+            nextest_config.contains(serialized_binary),
+            "missing {serialized_binary} in .config/nextest.toml"
         );
     }
+
+    for routine_binary in [
+        "binary(=pager_flags)",
+        "binary(=r_manuals)",
+        "binary(=r_vignettes)",
+    ] {
+        assert!(
+            !nextest_config.contains(routine_binary),
+            "did not expect {routine_binary} in the serial nextest group"
+        );
+    }
+
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "The profile keeps only the remaining timing-sensitive Rust REPL residue in a serial `repl-integration` test group.",
+        "docs/testing.md",
+    );
 }
 
 #[test]

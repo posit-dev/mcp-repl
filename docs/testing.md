@@ -60,10 +60,10 @@ treats that as user configuration rather than a repository profile key.
 
 The CI workflow uses this nextest profile for the ordinary Rust suite after
 `cargo clippy`, with `--show-progress none` on the command line. The profile
-keeps REPL integration binaries that depend on timing-sensitive server/worker
-transitions in a serial `repl-integration` test group. Windows keeps the
-ordinary suite fully serial with `--build-jobs 1` and `--test-threads 1`. The
-real Codex client integration step remains a separate serial
+keeps only the remaining timing-sensitive Rust REPL residue in a serial
+`repl-integration` test group. Windows keeps the ordinary suite fully serial
+with `--build-jobs 1` and `--test-threads 1`. The real Codex client integration
+step remains a separate serial
 `cargo test -j 1 --test codex_approvals_tui -- --test-threads=1` run after the
 Codex CLI is installed.
 
