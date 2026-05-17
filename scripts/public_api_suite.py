@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,11 +44,13 @@ class McpStdioClient:
         self,
         binary: Path,
         server_args: Sequence[str],
+        server_env: Sequence[tuple[str, str]],
         timeout_seconds: float,
     ) -> None:
         assert timeout_seconds > 0
         self.binary = binary
         self.server_args = list(server_args)
+        self.server_env = dict(server_env)
         self.timeout_seconds = timeout_seconds
         self.next_request_id = 1
         self.stderr_lines: list[str] = []
@@ -69,6 +72,7 @@ class McpStdioClient:
             "MCP_REPL_UPDATE_PLOT_IMAGES",
         ]:
             env.pop(key, None)
+        env.update(self.server_env)
 
         command = [str(self.binary), *self.server_args]
         self.process = subprocess.Popen(
@@ -249,7 +253,7 @@ def require_r_result_two(text: str, context: str) -> None:
         raise SuiteFailure(f"{context} expected R console result 2, got: {text!r}")
 
 
-def wait_until_not_busy(client: McpStdioClient, context: str) -> None:
+def wait_until_not_busy(client: McpStdioClient, context: str) -> str:
     deadline = time.monotonic() + 5.0
     last_text = ""
     while time.monotonic() < deadline:
@@ -262,8 +266,19 @@ def wait_until_not_busy(client: McpStdioClient, context: str) -> None:
         )
         last_text = require_success(result, context)
         if "<<repl status: busy" not in last_text:
-            return
+            return last_text
     raise SuiteFailure(f"{context} remained busy after polling: {last_text!r}")
+
+
+def require_success_when_not_busy(
+    client: McpStdioClient,
+    result: dict[str, Any],
+    context: str,
+) -> str:
+    text = require_success(result, context)
+    if "<<repl status: busy" not in text:
+        return text
+    return wait_until_not_busy(client, context)
 
 
 def r_console_basic(client: McpStdioClient) -> None:
@@ -356,10 +371,68 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
         raise SuiteFailure(f"expected reset state, got: {after_reset_text!r}")
 
 
-CASES: dict[str, Callable[[McpStdioClient], None]] = {
-    "r-console-basic": r_console_basic,
-    "r-reset-clears-state": r_reset_clears_state,
-    "r-timeout-busy-recovers": r_timeout_busy_recovers,
+def r_pager_command_smoke(client: McpStdioClient) -> None:
+    initial = client.call_tool(
+        "repl",
+        {
+            "input": "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))\n",
+            "timeout_ms": 120000,
+        },
+    )
+    initial_text = require_success_when_not_busy(client, initial, "pager initial repl")
+    if "L0001" not in initial_text:
+        raise SuiteFailure(f"expected first pager page, got: {initial_text!r}")
+    if "--More--" not in initial_text:
+        raise SuiteFailure(f"expected pager footer, got: {initial_text!r}")
+
+    next_page = client.call_tool(
+        "repl",
+        {
+            "input": ":next",
+            "timeout_ms": 60000,
+        },
+    )
+    next_text = require_success_when_not_busy(client, next_page, "pager next repl")
+    if not any(needle in next_text for needle in ["L0002", "L0003", "L0010", "L0014"]):
+        raise SuiteFailure(f"expected next pager page, got: {next_text!r}")
+
+    search = client.call_tool(
+        "repl",
+        {
+            "input": ":/L0031",
+            "timeout_ms": 60000,
+        },
+    )
+    search_text = require_success_when_not_busy(client, search, "pager search repl")
+    if "L0031" not in search_text and "next match" not in search_text:
+        raise SuiteFailure(f"expected pager search guidance/output, got: {search_text!r}")
+
+    quit_result = client.call_tool(
+        "repl",
+        {
+            "input": ":q",
+            "timeout_ms": 60000,
+        },
+    )
+    require_success_when_not_busy(client, quit_result, "pager quit repl")
+
+
+@dataclass(frozen=True)
+class SuiteCase:
+    run: Callable[[McpStdioClient], None]
+    server_args: tuple[str, ...] = ()
+    server_env: tuple[tuple[str, str], ...] = ()
+
+
+CASES: dict[str, SuiteCase] = {
+    "r-console-basic": SuiteCase(r_console_basic),
+    "r-pager-command-smoke": SuiteCase(
+        r_pager_command_smoke,
+        server_args=("--oversized-output", "pager"),
+        server_env=(("MCP_REPL_PAGER_PAGE_CHARS", "80"),),
+    ),
+    "r-reset-clears-state": SuiteCase(r_reset_clears_state),
+    "r-timeout-busy-recovers": SuiteCase(r_timeout_busy_recovers),
 }
 
 
@@ -402,13 +475,15 @@ def main(argv: Sequence[str]) -> int:
     selected = args.case or sorted(CASES)
     failures = 0
     for case_name in selected:
+        case = CASES[case_name]
         try:
             with McpStdioClient(
                 args.binary,
-                ["--sandbox", args.sandbox],
+                ["--sandbox", args.sandbox, *case.server_args],
+                case.server_env,
                 args.timeout,
             ) as client:
-                CASES[case_name](client)
+                case.run(client)
         except SuiteFailure as exc:
             failures += 1
             print(f"not ok {case_name}: {exc}", file=sys.stderr)
