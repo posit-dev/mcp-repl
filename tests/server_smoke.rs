@@ -3,6 +3,31 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time;
+
+fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.pop();
+    let mut candidate_path = path;
+    candidate_path.push("mcp-repl");
+    if cfg!(windows) {
+        candidate_path.set_extension("exe");
+    }
+    if candidate_path.exists() {
+        return Ok(candidate_path);
+    }
+
+    Err("unable to locate mcp-repl test binary".into())
+}
 
 #[test]
 fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
@@ -11,6 +36,33 @@ fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
         !common::backend_unavailable(text),
         "request-completion IPC disconnects should fail tests instead of skipping them"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_server_startup_stderr_omits_routine_notice() -> TestResult<()> {
+    let exe = resolve_mcp_repl_path()?;
+    let output = time::timeout(
+        Duration::from_secs(15),
+        Command::new(exe)
+            .args(["--interpreter", "python", "--sandbox", "danger-full-access"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "server startup timed out")??;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("starting mcp-repl server"),
+        "routine startup notice should not be written to stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.trim().is_empty(),
+        "closed-stdin startup failure should still write diagnostic stderr"
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]

@@ -785,7 +785,6 @@ pub async fn run(
     sandbox_plan: SandboxCliPlan,
     oversized_output: OversizedOutputMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("starting mcp-repl server");
     let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
     crate::event_log::log(
         "server_run_begin",
