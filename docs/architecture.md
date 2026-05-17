@@ -63,7 +63,15 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Validation harnesses
 
-- `tests/` is the primary public validation surface. The tests exercise tool behavior, snapshots, sandboxing, and client integrations through the exposed MCP interface.
+- `scripts/public_api_suite.py` starts an already-built `mcp-repl` binary and
+  exercises public MCP tools over stdio. It covers representative real-binary
+  behavior that should not depend on Rust internals.
+- `tests/` contains the Rust public API, snapshot, sandbox, backend, install,
+  protocol-worker, and client-integration suites. Most tests exercise behavior
+  through the exposed MCP interface using the shared harness in `tests/common/`.
+- `.config/nextest.toml` defines the quiet local Rust suite, a CI-filtered
+  variant that skips local client integrations, and the serial
+  `repl-integration` group for the remaining timing-sensitive REPL binaries.
 
 ## Design Constraints
 

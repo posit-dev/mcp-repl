@@ -41,9 +41,15 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
+        "cargo nextest run --show-progress none",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
     }
+
+    assert!(
+        !agents.contains("cargo nextest run --profile ci --show-progress none"),
+        "AGENTS.md should use the local default nextest profile, not the CI filter"
+    );
 }
 
 #[test]
@@ -154,8 +160,6 @@ fn ci_workflow_defines_dev_release_contract() {
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
         "mcp-repl-x86_64-pc-windows-msvc.zip",
-        "npm install -g @openai/codex",
-        "npm config get prefix",
         "SHA256SUMS.txt",
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
@@ -188,6 +192,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "CODEX_VERSION:",
         "openai/codex-action",
         "secrets.OPENAI_API_KEY",
+        "npm install -g @openai/codex",
+        "npm config get prefix",
         "codex-x86_64-unknown-linux-musl.tar.gz",
         "codex-aarch64-apple-darwin.tar.gz",
         "codex-x86_64-pc-windows-msvc.exe.zip",
@@ -202,11 +208,13 @@ fn ci_workflow_defines_dev_release_contract() {
 }
 
 #[test]
-fn ci_uses_quiet_nextest_profile_for_routine_suite() {
+fn nextest_profiles_keep_local_clients_and_filter_ci() {
     let root = repo_root();
     let workflow = read(&root.join(".github/workflows/ci.yml"));
     let nextest_config = read(&root.join(".config/nextest.toml"));
     let testing_docs = read(&root.join("docs/testing.md"));
+    let codex_integration = read(&root.join("tests/codex_approvals_tui.rs"));
+    let claude_integration = read(&root.join("tests/claude_integration.rs"));
 
     for required in [
         "taiki-e/install-action@nextest",
@@ -214,9 +222,6 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
         "run: cargo nextest run --profile ci --show-progress none",
         "name: cargo nextest (quiet, windows serial)",
         "run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1",
-        "name: cargo test (real codex integrations)",
-        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
-        "name: cargo test (real codex integrations, windows serial)",
     ] {
         assert!(
             workflow.contains(required),
@@ -227,17 +232,23 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
     for forbidden in [
         "name: cargo test\n        if: matrix.os != 'windows-2022'\n        run: cargo test",
         "name: cargo test (windows serial)\n        if: matrix.os == 'windows-2022'\n        run: cargo test -j 1 -- --test-threads=1",
+        "name: Install Codex CLI",
+        "name: Install Codex CLI (windows)",
+        "name: cargo test (real codex integrations)",
+        "name: cargo test (real codex integrations, windows serial)",
     ] {
         assert!(
             !workflow.contains(forbidden),
-            "did not expect routine cargo test command in .github/workflows/ci.yml"
+            "did not expect {forbidden} in .github/workflows/ci.yml"
         );
     }
 
     for required in [
+        "[profile.default]",
         "[profile.ci]",
         "[test-groups]",
         "repl-integration = { max-threads = 1 }",
+        "[[profile.default.overrides]]",
         "[[profile.ci.overrides]]",
         "test-group = \"repl-integration\"",
         "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
@@ -251,6 +262,11 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
             "missing {required} in .config/nextest.toml"
         );
     }
+    assert_eq!(
+        nextest_config.matches("default-filter = ").count(),
+        1,
+        "only the CI profile should filter out real client integrations"
+    );
 
     for serialized_binary in [
         "binary(=interrupt)",
@@ -282,8 +298,31 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
 
     assert_contains_wrapped_text(
         &testing_docs,
-        "The profile keeps only the remaining timing-sensitive Rust REPL residue in a serial `repl-integration` test group.",
+        "The default local profile includes real client integration binaries.",
         "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "The CI profile adds a default filter that excludes `codex_approvals_tui` and `claude_integration` because CI is not authenticated with model providers.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Both profiles keep only the remaining timing-sensitive Rust REPL residue in a serial `repl-integration` test group.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Codex uses the Spark model (`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.",
+        "docs/testing.md",
+    );
+    assert!(
+        codex_integration.contains(r#"const CODEX_MODEL: &str = "gpt-5.3-codex-spark";"#),
+        "Codex integration should use the Spark model"
+    );
+    assert!(
+        claude_integration.contains(r#"const CLAUDE_MODEL: &str = "haiku";"#),
+        "Claude integration should use the fastest/cheapest model"
     );
 }
 

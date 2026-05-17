@@ -5,15 +5,14 @@ This file is the entrypoint for deciding how to verify a change.
 
 ## Core Test Surface
 
-- `tests/repl_surface.rs`: basic `repl` behavior and Rust-only public surface contracts.
-- `scripts/public_api_suite.py`: external public API checks, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing against an already-built `mcp-repl` binary over MCP stdio.
-- `tests/repl_surface.rs` and `tests/python_backend.rs`: IPC ownership coverage. Only the main worker may own sideband fds; user-spawned children must not. `tests/python_backend.rs` also covers detached-idle oversized-output behavior, Unix Python PTY-backed C stdio, CPython `input()` through the readline path, and the absence of direct-fd stdin shims through the public `repl` API.
-- `tests/server_smoke.rs`: end-to-end MCP session smoke coverage.
-- `tests/write_stdin_behavior.rs`: timeout polling, oversized text replies, and transcript-file behavior through the public `repl` API.
+- `scripts/public_api_suite.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing.
+- `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
+- `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`/`repl_reset` behavior, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
+- `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
+- `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, PTY-backed Python readline behavior, and image output.
 - `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
 - `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
-- `tests/plot_images.rs` and `tests/python_plot_images.rs`: plot/image behavior through the public tool surface.
-- `tests/codex_approvals_tui.rs` and `tests/claude_integration.rs`: client integration coverage.
+- `tests/install_*.rs`, `tests/codex_approvals_tui.rs`, and `tests/claude_integration.rs`: install-path and real client integration coverage.
 - `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.
 
 ## Snapshot Workflow
@@ -35,8 +34,8 @@ python3 scripts/public_api_suite.py --binary target/debug/mcp-repl
 ```
 
 The runner starts the real server over MCP stdio and calls public tools only. It
-uses `--sandbox danger-full-access` by default so the first slice stays focused
-on client protocol behavior rather than sandbox policy.
+uses `--sandbox danger-full-access` by default so the suite stays focused on
+client protocol behavior rather than sandbox policy.
 
 Use `--case <name>` to run one public API case while iterating.
 
@@ -45,31 +44,47 @@ using the debug binary built for each matrix target.
 
 ## Fast Quiet Rust Suite
 
-Use this while iterating on ordinary Rust tests:
+Use this while iterating on ordinary Rust tests locally:
 
 ```sh
-cargo nextest run --profile ci --show-progress none
+cargo nextest run --show-progress none
 ```
 
-The checked-in `.config/nextest.toml` profile keeps passing-test output quiet
-and shows failure output in the final report. It also excludes the real client
-integration binaries from the ordinary suite so local client installs do not
-change what the fast path covers. The `--show-progress none` flag hides progress
-output so successful runs stay compact in local terminals and CI logs; nextest
-treats that as user configuration rather than a repository profile key.
+The checked-in `.config/nextest.toml` default profile keeps passing-test output
+quiet and shows failure output in the final report. The default local profile
+includes real client integration binaries. Use this when Codex and Claude are
+installed and authenticated locally.
 
-The CI workflow uses this nextest profile for the ordinary Rust suite after
-`cargo clippy`, with `--show-progress none` on the command line. The profile
-keeps only the remaining timing-sensitive Rust REPL residue in a serial
-`repl-integration` test group. Windows keeps the ordinary suite fully serial
-with `--build-jobs 1` and `--test-threads 1`. The real Codex client integration
-step remains a separate serial
-`cargo test -j 1 --test codex_approvals_tui -- --test-threads=1` run after the
-Codex CLI is installed.
+The `--show-progress none` flag hides progress output so successful runs stay
+compact in local terminals and CI logs; nextest treats that as user
+configuration rather than a repository profile key.
+
+The CI workflow uses the CI nextest profile for the ordinary Rust suite after
+`cargo clippy`, with `--profile ci --show-progress none` on the command line.
+The CI profile adds a default filter that excludes `codex_approvals_tui` and
+`claude_integration` because CI is not authenticated with model providers.
+Both profiles keep only the remaining timing-sensitive Rust REPL residue in a
+serial `repl-integration` test group. Windows keeps the ordinary suite fully
+serial with `--build-jobs 1` and `--test-threads 1`.
 
 This nextest path is the preferred fast local loop, but it does not replace the
-full compatibility path. Before replying after code changes, still run the full
-required checks below, including `cargo test`.
+real-binary suite or the full compatibility path. Before replying after code
+changes, still run the full required checks below, including `cargo test`.
+
+## Real Client Integrations
+
+Local full verification includes the Codex and Claude integration binaries when
+those clients are installed and authenticated. Codex uses the Spark model
+(`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.
+
+To run only those integrations:
+
+```sh
+cargo nextest run --show-progress none --test codex_approvals_tui --test claude_integration
+```
+
+CI does not run these binaries because provider authentication is unavailable
+there.
 
 ## Full Verification Before Replying
 
@@ -77,9 +92,18 @@ If you modify code, run:
 
 - `cargo check`
 - `cargo build`
+- `python3 scripts/public_api_suite.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run --show-progress none`
 - `cargo test`
 - `cargo +nightly fmt`
+
+For docs-only changes, run the narrow validation that covers the edited docs.
+For agent-facing docs, that is usually:
+
+```sh
+cargo test --test docs_contracts
+```
 
 ## Debug-Then-Validate Loop
 

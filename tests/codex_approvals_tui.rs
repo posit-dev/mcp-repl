@@ -37,6 +37,7 @@ mod unix_impl {
     const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
+    const CODEX_MODEL: &str = "gpt-5.3-codex-spark";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
@@ -1010,6 +1011,7 @@ mod unix_impl {
         let openai_base_url = toml_escape(openai_base_url);
         format!(
             r#"model_provider = "mock-openai"
+model = "{CODEX_MODEL}"
 disable_paste_burst = true
 project_doc_max_bytes = 0
 
@@ -1057,6 +1059,7 @@ trust_level = "trusted"
         let openai_base_url = toml_escape(openai_base_url);
         format!(
             r#"model_provider = "mock-openai"
+model = "{CODEX_MODEL}"
 disable_paste_burst = true
 project_doc_max_bytes = 0
 
@@ -1094,6 +1097,7 @@ trust_level = "trusted"
         let openai_base_url = toml_escape(openai_base_url);
         format!(
             r#"model_provider = "mock-openai"
+model = "{CODEX_MODEL}"
 disable_paste_burst = true
 project_doc_max_bytes = 0
 
@@ -2283,8 +2287,8 @@ tryCatch({
     fn models_response() -> String {
         serde_json::json!({
             "models": [{
-                "slug": "gpt-5.1-codex-mini",
-                "display_name": "gpt-5.1-codex-mini",
+                "slug": CODEX_MODEL,
+                "display_name": CODEX_MODEL,
                 "description": "mock model",
                 "default_reasoning_level": "low",
                 "supported_reasoning_levels": [{"effort": "low", "description": "low"}],

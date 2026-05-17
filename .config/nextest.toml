@@ -1,3 +1,9 @@
+[profile.default]
+status-level = "fail"
+final-status-level = "fail"
+success-output = "never"
+failure-output = "final"
+
 [profile.ci]
 default-filter = "not binary(=codex_approvals_tui) and not binary(=claude_integration)"
 status-level = "fail"
@@ -7,6 +13,10 @@ failure-output = "final"
 
 [test-groups]
 repl-integration = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(=interrupt) or binary(=manage_session_behavior) or binary(=python_backend) or binary(=r_protocol) or binary(=repl_surface) or binary(=sandbox_state_updates) or binary(=write_stdin_batch) or binary(=write_stdin_behavior) or binary(=write_stdin_edge_cases)'
+test-group = "repl-integration"
 
 [[profile.ci.overrides]]
 filter = 'binary(=interrupt) or binary(=manage_session_behavior) or binary(=python_backend) or binary(=r_protocol) or binary(=repl_surface) or binary(=sandbox_state_updates) or binary(=write_stdin_batch) or binary(=write_stdin_behavior) or binary(=write_stdin_edge_cases)'

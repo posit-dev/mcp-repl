@@ -101,35 +101,6 @@ jobs:
         if: matrix.os == 'windows-2022'
         run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1
 
-      - name: Install Codex CLI
-        if: matrix.os != 'windows-2022'
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install -g @openai/codex
-          npm_bin="$(npm config get prefix)/bin"
-          echo "$npm_bin" >> "$GITHUB_PATH"
-          export PATH="$npm_bin:$PATH"
-          codex --version
-
-      - name: Install Codex CLI (windows)
-        if: matrix.os == 'windows-2022'
-        shell: pwsh
-        run: |
-          npm install -g @openai/codex
-          $npmPrefix = npm config get prefix
-          Add-Content -Path $env:GITHUB_PATH -Value $npmPrefix
-          $env:PATH = "$npmPrefix;$env:PATH"
-          & (Join-Path $npmPrefix "codex.cmd") --version
-
-      - name: cargo test (real codex integrations)
-        if: matrix.os != 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
-
-      - name: cargo test (real codex integrations, windows serial)
-        if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
-
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check
 

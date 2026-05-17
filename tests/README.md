@@ -8,7 +8,6 @@ This crate uses `insta` snapshots for MCP tool-call transcripts.
   - `cargo insta review` (or `cargo insta accept` / `cargo insta reject` for non-interactive runs)
 - CI-style check: `cargo insta test --check --unreferenced=reject`
 - For format/metadata migrations: `cargo insta test --force-update-snapshots --accept`
-- Bulk rewrite fallback: `INSTA_UPDATE=always cargo test`
 - Review accepted changes with `git diff tests/snapshots`.
 - Transcript snapshots live alongside the JSON snapshots with `@transcript` suffixes.
 - Do not manually delete `tests/snapshots/*.snap.new`; use `cargo insta reject`.
