@@ -25,6 +25,22 @@ const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
 const TOOL_INPUT: &str = "cat(\"CLAUDE_MCP_OK\\n\")";
 const FINAL_RESULT: &str = "DONE";
 const CLAUDE_PROMPT: &str = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CLAUDE_MCP_OK\\n\") Then answer with exactly DONE, with no punctuation or extra text.\n";
+const HOST_CLI_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "USER",
+    "LOGNAME",
+    "USERNAME",
+    "SHELL",
+    "SSH_AUTH_SOCK",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
 
 #[derive(Debug)]
 struct StagedClaudeEnv {
@@ -110,13 +126,16 @@ fn claude_live_integration() -> TestResult<()> {
 
 #[test]
 fn claude_live_install_integration() -> TestResult<()> {
-    if !claude_available() {
-        eprintln!("claude not found on PATH; skipping");
+    if !claude_client_ready(INSTALL_SNAPSHOT_NAME) {
         return Ok(());
     }
 
     let mcp_repl = resolve_mcp_repl_path()?;
     let Some(staged) = stage_claude_install_env(&mcp_repl)? else {
+        print_skip_banner(
+            INSTALL_SNAPSHOT_NAME,
+            "Claude is not authenticated or no supported auth staging is available",
+        );
         return Ok(());
     };
 
@@ -135,13 +154,16 @@ fn claude_live_install_integration() -> TestResult<()> {
 }
 
 fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
-    if !claude_available() {
-        eprintln!("claude not found on PATH; skipping");
+    if !claude_client_ready(SNAPSHOT_NAME) {
         return Ok(None);
     }
 
     let mcp_repl = resolve_mcp_repl_path()?;
     let Some(staged) = stage_claude_env(&mcp_repl)? else {
+        print_skip_banner(
+            SNAPSHOT_NAME,
+            "Claude is not authenticated or no supported auth staging is available",
+        );
         return Ok(None);
     };
 
@@ -151,12 +173,7 @@ fn run_claude_integration_snapshot() -> TestResult<Option<ClaudeSnapshot>> {
 fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
     let mut cmd = Command::new("claude");
     cmd.env_clear();
-    if let Some(path) = env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
-    if let Some(tmpdir) = env::var_os("TMPDIR") {
-        cmd.env("TMPDIR", tmpdir);
-    }
+    set_host_cli_env(&mut cmd);
     cmd.env("HOME", &staged.runtime_home);
     for (key, value) in &staged.child_env {
         cmd.env(key, value);
@@ -201,15 +218,36 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
         .ok_or_else(|| "Claude snapshot unexpectedly missing".into())
 }
 
-fn claude_available() -> bool {
-    Command::new("claude")
+fn print_skip_banner(test_name: &str, reason: &str) {
+    let _ = std::io::stderr()
+        .write_all(format!("=== SKIP {test_name}: {reason}; skipping ===\n").as_bytes());
+}
+
+fn claude_client_ready(test_name: &str) -> bool {
+    match Command::new("claude")
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            print_skip_banner(
+                test_name,
+                &format!("claude --version exited with status {status}"),
+            );
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            print_skip_banner(test_name, "claude not found on PATH");
+            false
+        }
+        Err(err) => {
+            print_skip_banner(test_name, &format!("failed to launch claude: {err}"));
+            false
+        }
+    }
 }
 
 fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
@@ -403,12 +441,7 @@ fn stage_claude_install_env(mcp_repl: &Path) -> TestResult<Option<StagedClaudeEn
 fn install_claude_config(mcp_repl: &Path, home: &Path) -> TestResult<()> {
     let mut cmd = Command::new(mcp_repl);
     cmd.env_clear();
-    if let Some(path) = env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
-    if let Some(tmpdir) = env::var_os("TMPDIR") {
-        cmd.env("TMPDIR", tmpdir);
-    }
+    set_host_cli_env(&mut cmd);
     cmd.env("HOME", home);
     cmd.arg("install");
     cmd.arg("--client");
@@ -467,19 +500,13 @@ fn resolve_claude_runtime(temp_home: &Path) -> TestResult<Option<ClaudeRuntime>>
         }));
     }
 
-    eprintln!("no supported Claude auth staging available; skipping");
     Ok(None)
 }
 
 fn claude_subscription_available() -> TestResult<bool> {
     let mut cmd = Command::new("claude");
     cmd.env_clear();
-    if let Some(path) = env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
-    if let Some(tmpdir) = env::var_os("TMPDIR") {
-        cmd.env("TMPDIR", tmpdir);
-    }
+    set_host_cli_env(&mut cmd);
     cmd.env("HOME", host_home_dir()?);
     cmd.arg("auth");
     cmd.arg("status");
@@ -499,19 +526,21 @@ fn claude_auth_status_supports_first_party_subscription(output: &Output) -> bool
 
     let stdout = match String::from_utf8(output.stdout.clone()) {
         Ok(stdout) => stdout,
-        Err(err) => {
-            eprintln!("claude auth status stdout was not valid UTF-8; skipping: {err}");
-            return false;
-        }
+        Err(_) => return false,
     };
     let status: ClaudeAuthStatus = match serde_json::from_str(stdout.trim()) {
         Ok(status) => status,
-        Err(err) => {
-            eprintln!("failed to parse claude auth status JSON; skipping: {err}");
-            return false;
-        }
+        Err(_) => return false,
     };
     status.logged_in && status.api_provider == "firstParty"
+}
+
+fn set_host_cli_env(cmd: &mut Command) {
+    for key in HOST_CLI_ENV_KEYS {
+        if let Some(value) = env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
 }
 
 #[cfg(unix)]

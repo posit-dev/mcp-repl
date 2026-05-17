@@ -15,6 +15,10 @@ failure-output = "final"
 repl-integration = { max-threads = 1 }
 
 [[profile.default.overrides]]
+filter = 'binary(=codex_approvals_tui) or binary(=claude_integration)'
+success-output = "immediate"
+
+[[profile.default.overrides]]
 filter = 'binary(=interrupt) or binary(=manage_session_behavior) or binary(=python_backend) or binary(=r_protocol) or binary(=repl_surface) or binary(=sandbox_state_updates) or binary(=write_stdin_batch) or binary(=write_stdin_behavior) or binary(=write_stdin_edge_cases)'
 test-group = "repl-integration"
 

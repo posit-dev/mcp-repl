@@ -250,6 +250,7 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
         "repl-integration = { max-threads = 1 }",
         "[[profile.default.overrides]]",
         "[[profile.ci.overrides]]",
+        "success-output = \"immediate\"",
         "test-group = \"repl-integration\"",
         "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
         "status-level = \"fail\"",
@@ -314,6 +315,11 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     assert_contains_wrapped_text(
         &testing_docs,
         "Codex uses the Spark model (`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "If either client is unavailable or unauthenticated, the matching integration test prints a skip banner with the reason.",
         "docs/testing.md",
     );
     assert!(

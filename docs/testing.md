@@ -76,6 +76,8 @@ changes, still run the full required checks below, including `cargo test`.
 Local full verification includes the Codex and Claude integration binaries when
 those clients are installed and authenticated. Codex uses the Spark model
 (`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.
+If either client is unavailable or unauthenticated, the matching integration
+test prints a skip banner with the reason.
 
 To run only those integrations:
 

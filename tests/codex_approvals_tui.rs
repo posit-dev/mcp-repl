@@ -11,11 +11,8 @@ mod unix_impl {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::Value;
     use std::collections::BTreeMap;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::io::ErrorKind;
-    use std::io::Read;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::SocketAddr;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::process::CommandExt;
@@ -71,16 +68,16 @@ mod unix_impl {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_exec_wire_sandbox_state_meta() -> TestResult<String> {
-        if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
+        const TEST_NAME: &str = "codex_exec_wire_sandbox_state_meta";
+        if !codex_client_ready(TEST_NAME) {
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
-            eprintln!("loopback TCP bind unavailable; skipping");
+            print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(String::new());
         }
         let Some(python_program) = common::python_program() else {
-            eprintln!("python not found on PATH; skipping");
+            print_skip_banner(TEST_NAME, "python not found on PATH");
             return Ok(String::new());
         };
         let _guard = codex_exec_test_mutex().lock().await;
@@ -113,7 +110,10 @@ mod unix_impl {
             .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
         let outputs = mock_server.function_call_outputs().await;
         if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
-            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            print_skip_banner(
+                TEST_NAME,
+                "codex exec sandbox/backend unavailable in this environment",
+            );
             return Ok(String::new());
         }
         if !output.status.success() {
@@ -145,12 +145,12 @@ mod unix_impl {
     }
 
     pub(super) async fn run_install_then_codex_exec_uses_generated_config() -> TestResult<()> {
-        if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
+        const TEST_NAME: &str = "install_then_codex_exec_uses_generated_config";
+        if !codex_client_ready(TEST_NAME) {
             return Ok(());
         }
         if !loopback_bind_available().await {
-            eprintln!("loopback TCP bind unavailable; skipping");
+            print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(());
         }
         let _guard = codex_exec_test_mutex().lock().await;
@@ -181,7 +181,10 @@ mod unix_impl {
             .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
         let outputs = mock_server.function_call_outputs().await;
         if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
-            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            print_skip_banner(
+                TEST_NAME,
+                "codex exec sandbox/backend unavailable in this environment",
+            );
             return Ok(());
         }
         if !output.status.success() {
@@ -212,12 +215,12 @@ mod unix_impl {
     async fn run_codex_exec_initial_sandbox_state_for_mode(
         mode: ExecSnapshotMode,
     ) -> TestResult<String> {
-        if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
+        const TEST_NAME: &str = "codex_exec_initial_sandbox_state";
+        if !codex_client_ready(TEST_NAME) {
             return Ok(String::new());
         }
         if !loopback_bind_available().await {
-            eprintln!("loopback TCP bind unavailable; skipping");
+            print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(String::new());
         }
         let _guard = codex_exec_test_mutex().lock().await;
@@ -247,7 +250,10 @@ mod unix_impl {
             .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
         let outputs = mock_server.function_call_outputs().await;
         if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
-            eprintln!("codex exec sandbox/backend unavailable in this environment; skipping");
+            print_skip_banner(
+                TEST_NAME,
+                "codex exec sandbox/backend unavailable in this environment",
+            );
             return Ok(String::new());
         }
         if !output.status.success() {
@@ -280,22 +286,20 @@ mod unix_impl {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
+        const TEST_NAME: &str = "codex_tui_full_access_sandbox_update";
         if !full_access_test_enabled() {
-            eprintln!(
-                "{FULL_ACCESS_TEST_ENV} is not set; skipping full-access Codex TUI integration test"
-            );
+            print_skip_banner(TEST_NAME, &format!("{FULL_ACCESS_TEST_ENV} is not set"));
             return Ok(());
         }
-        if !codex_available() {
-            eprintln!("codex not found on PATH; skipping");
+        if !codex_client_ready(TEST_NAME) {
             return Ok(());
         }
         if !common::sandbox_exec_available() {
-            eprintln!("sandbox-exec unavailable; skipping");
+            print_skip_banner(TEST_NAME, "sandbox-exec unavailable");
             return Ok(());
         }
         if !loopback_bind_available().await {
-            eprintln!("loopback TCP bind unavailable; skipping");
+            print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(());
         }
 
@@ -447,11 +451,74 @@ mod unix_impl {
         codex_exec_backend_unavailable(&combined)
     }
 
-    fn codex_available() -> bool {
-        std::process::Command::new("codex")
+    fn print_skip_banner(test_name: &str, reason: &str) {
+        let _ = std::io::stderr()
+            .write_all(format!("=== SKIP {test_name}: {reason}; skipping ===\n").as_bytes());
+    }
+
+    fn codex_client_ready(test_name: &str) -> bool {
+        match std::process::Command::new("codex")
             .arg("--version")
-            .output()
-            .is_ok()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                print_skip_banner(
+                    test_name,
+                    &format!("codex --version exited with status {status}"),
+                );
+                return false;
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                print_skip_banner(test_name, "codex not found on PATH");
+                return false;
+            }
+            Err(err) => {
+                print_skip_banner(test_name, &format!("failed to launch codex: {err}"));
+                return false;
+            }
+        }
+
+        let output = std::process::Command::new("codex")
+            .arg("login")
+            .arg("status")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                print_skip_banner(test_name, "codex not found on PATH");
+                return false;
+            }
+            Err(err) => {
+                print_skip_banner(
+                    test_name,
+                    &format!("failed to run codex login status: {err}"),
+                );
+                return false;
+            }
+        };
+
+        if codex_login_status_indicates_authenticated(&output) {
+            return true;
+        }
+
+        print_skip_banner(test_name, "codex is not authenticated; run `codex login`");
+        false
+    }
+
+    fn codex_login_status_indicates_authenticated(output: &std::process::Output) -> bool {
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        stdout.contains("Logged in using ") || stderr.contains("Logged in using ")
     }
 
     fn create_isolated_codex_env_with_config(
