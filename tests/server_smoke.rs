@@ -41,30 +41,6 @@ async fn sends_input_to_r_console_snapshot() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sends_input_to_r_console_smoke() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
-    let first = session.write_stdin_raw_with("1+1", Some(30.0)).await?;
-    let result = common::wait_until_ready_with_input_retry(
-        &mut session,
-        "1+1",
-        first,
-        5.0,
-        std::time::Duration::from_millis(100),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
-    let text = common::result_text(&result);
-    if common::backend_unavailable(&text) {
-        eprintln!("server_smoke backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    session.cancel().await?;
-    assert!(text.contains("2"), "expected 2 in output, got: {text:?}");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn retries_input_after_rejected_busy_response() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
