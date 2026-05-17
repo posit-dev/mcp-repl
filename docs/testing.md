@@ -43,6 +43,32 @@ Use `--case <name>` to run one public API case while iterating.
 CI runs this suite after `cargo build` in the main cross-platform workflow,
 using the debug binary built for each matrix target.
 
+## Fast Quiet Rust Suite
+
+Use this while iterating on ordinary Rust tests:
+
+```sh
+cargo nextest run --profile ci --show-progress none
+```
+
+The checked-in `.config/nextest.toml` profile keeps passing-test output quiet
+and shows failure output in the final report. It also excludes the real client
+integration binaries from the ordinary suite so local client installs do not
+change what the fast path covers. The `--show-progress none` flag hides progress
+output so successful runs stay compact in local terminals and CI logs; nextest
+treats that as user configuration rather than a repository profile key.
+
+The CI workflow uses this nextest profile for the ordinary Rust suite after
+`cargo clippy`, with `--show-progress none` on the command line. Windows keeps
+that ordinary suite serial with `--build-jobs 1` and `--test-threads 1`. The
+real Codex client integration step remains a separate serial
+`cargo test -j 1 --test codex_approvals_tui -- --test-threads=1` run after the
+Codex CLI is installed.
+
+This nextest path is the preferred fast local loop, but it does not replace the
+full compatibility path. Before replying after code changes, still run the full
+required checks below, including `cargo test`.
+
 ## Full Verification Before Replying
 
 If you modify code, run:

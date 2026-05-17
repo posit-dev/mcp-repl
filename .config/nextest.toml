@@ -1,0 +1,6 @@
+[profile.ci]
+default-filter = "not binary(=codex_approvals_tui) and not binary(=claude_integration)"
+status-level = "fail"
+final-status-level = "fail"
+success-output = "never"
+failure-output = "final"

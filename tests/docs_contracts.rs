@@ -202,6 +202,53 @@ fn ci_workflow_defines_dev_release_contract() {
 }
 
 #[test]
+fn ci_uses_quiet_nextest_profile_for_routine_suite() {
+    let root = repo_root();
+    let workflow = read(&root.join(".github/workflows/ci.yml"));
+    let nextest_config = read(&root.join(".config/nextest.toml"));
+
+    for required in [
+        "taiki-e/install-action@nextest",
+        "name: cargo nextest (quiet)",
+        "run: cargo nextest run --profile ci --show-progress none",
+        "name: cargo nextest (quiet, windows serial)",
+        "run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1",
+        "name: cargo test (real codex integrations)",
+        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
+        "name: cargo test (real codex integrations, windows serial)",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/ci.yml"
+        );
+    }
+
+    for forbidden in [
+        "name: cargo test\n        if: matrix.os != 'windows-2022'\n        run: cargo test",
+        "name: cargo test (windows serial)\n        if: matrix.os == 'windows-2022'\n        run: cargo test -j 1 -- --test-threads=1",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "did not expect routine cargo test command in .github/workflows/ci.yml"
+        );
+    }
+
+    for required in [
+        "[profile.ci]",
+        "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
+        "status-level = \"fail\"",
+        "final-status-level = \"fail\"",
+        "success-output = \"never\"",
+        "failure-output = \"final\"",
+    ] {
+        assert!(
+            nextest_config.contains(required),
+            "missing {required} in .config/nextest.toml"
+        );
+    }
+}
+
+#[test]
 fn release_backfill_workflow_defines_manual_tag_publish_contract() {
     let workflow = read(&repo_root().join(".github/workflows/release-backfill.yml"));
 
