@@ -63,7 +63,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Validation harnesses
 
-- `scripts/public_api_suite.py` starts an already-built `mcp-repl` binary and
+- `tests/run_integration_tests.py` starts an already-built `mcp-repl` binary and
   exercises public MCP tools over stdio. It covers representative real-binary
   behavior that should not depend on Rust internals.
 - `tests/` contains the Rust public API, snapshot, sandbox, backend, install,

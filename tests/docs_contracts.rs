@@ -42,6 +42,7 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
         "cargo nextest run --show-progress none",
+        "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
     }
@@ -49,6 +50,10 @@ fn agents_is_short_and_points_to_main_docs() {
     assert!(
         !agents.contains("cargo nextest run --profile ci --show-progress none"),
         "AGENTS.md should use the local default nextest profile, not the CI filter"
+    );
+    assert!(
+        !agents.contains("scripts/public_api_suite.py"),
+        "AGENTS.md should use tests/run_integration_tests.py"
     );
 }
 
@@ -167,6 +172,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "github.event_name == 'pull_request'",
         "github.event_name == 'push' && github.ref == 'refs/heads/main'",
         "github.event_name == 'push' && github.ref_type == 'tag'",
+        "run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
+        "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
         "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
@@ -199,6 +206,7 @@ fn ci_workflow_defines_dev_release_contract() {
         "codex-x86_64-pc-windows-msvc.exe.zip",
         "https://github.com/openai/codex/releases/latest/download/",
         "Expand-Archive",
+        "scripts/public_api_suite.py",
     ] {
         assert!(
             !workflow.contains(forbidden),

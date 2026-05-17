@@ -5,8 +5,8 @@ from pathlib import Path
 
 
 def load_module():
-    script_path = Path(__file__).with_name("public_api_suite.py")
-    spec = importlib.util.spec_from_file_location("public_api_suite", script_path)
+    script_path = Path(__file__).with_name("run_integration_tests.py")
+    spec = importlib.util.spec_from_file_location("run_integration_tests", script_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -14,7 +14,7 @@ def load_module():
     return module
 
 
-class PublicApiSuiteCaseTests(unittest.TestCase):
+class RunIntegrationTestsCaseTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
 

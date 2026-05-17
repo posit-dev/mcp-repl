@@ -5,7 +5,7 @@ This file is the entrypoint for deciding how to verify a change.
 
 ## Core Test Surface
 
-- `scripts/public_api_suite.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing.
+- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing.
 - `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
 - `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`/`repl_reset` behavior, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
@@ -30,7 +30,7 @@ Build the binary first, then run the Python suite:
 
 ```sh
 cargo build
-python3 scripts/public_api_suite.py --binary target/debug/mcp-repl
+python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 ```
 
 The runner starts the real server over MCP stdio and calls public tools only. It
@@ -94,7 +94,7 @@ If you modify code, run:
 
 - `cargo check`
 - `cargo build`
-- `python3 scripts/public_api_suite.py --binary target/debug/mcp-repl`
+- `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo nextest run --show-progress none`
 - `cargo test`

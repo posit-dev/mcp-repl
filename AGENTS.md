@@ -7,7 +7,7 @@ Keep this file short. It is a table of contents, not the full manual.
 - If you modified code, run all required checks before replying:
   - `cargo check`
   - `cargo build`
-  - `python3 scripts/public_api_suite.py --binary target/debug/mcp-repl`
+  - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
   - `cargo nextest run --show-progress none`
   - `cargo test`
