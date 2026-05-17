@@ -291,8 +291,8 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     timed_out = client.call_tool(
         "repl",
         {
-            "input": "Sys.sleep(2)\n",
-            "timeout_ms": 500,
+            "input": "Sys.sleep(1)\n",
+            "timeout_ms": 300,
         },
     )
     timed_out_text = require_success(timed_out, "timeout repl")
@@ -303,7 +303,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
         "repl",
         {
             "input": "1+1\n",
-            "timeout_ms": 500,
+            "timeout_ms": 300,
         },
     )
     busy_text = require_success(busy_follow_up, "busy follow-up repl")
