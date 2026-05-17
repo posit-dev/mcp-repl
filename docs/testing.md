@@ -6,7 +6,7 @@ This file is the entrypoint for deciding how to verify a change.
 ## Core Test Surface
 
 - `tests/repl_surface.rs`: basic `repl` behavior and Rust-only public surface contracts.
-- `scripts/public_api_suite.py`: external public API checks, including basic R `repl`, pager command handling, timeout/busy recovery, and `repl_reset` state clearing against an already-built `mcp-repl` binary over MCP stdio.
+- `scripts/public_api_suite.py`: external public API checks, including basic R `repl`, pager command handling, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing against an already-built `mcp-repl` binary over MCP stdio.
 - `tests/repl_surface.rs` and `tests/python_backend.rs`: IPC ownership coverage. Only the main worker may own sideband fds; user-spawned children must not. `tests/python_backend.rs` also covers detached-idle oversized-output behavior, Unix Python PTY-backed C stdio, CPython `input()` through the readline path, and the absence of direct-fd stdin shims through the public `repl` API.
 - `tests/server_smoke.rs`: end-to-end MCP session smoke coverage.
 - `tests/write_stdin_behavior.rs`: timeout polling, oversized text replies, and transcript-file behavior through the public `repl` API.

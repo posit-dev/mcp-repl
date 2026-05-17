@@ -53,3 +53,4 @@
 - 2026-05-17: Added an R timeout/busy/recovery case to the external runner and removed the matching Rust snapshot smoke test.
 - 2026-05-17: Added an R `repl_reset` state-clearing case to the external runner and removed the duplicate Rust public surface test.
 - 2026-05-17: Added the external public API suite to the cross-platform CI workflow as a separate post-build step.
+- 2026-05-17: Added an R interrupt/restart-prefix scenario with explicit interrupt readiness polling and removed duplicate Rust prefix tests.

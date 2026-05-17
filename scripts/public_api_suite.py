@@ -253,8 +253,22 @@ def require_r_result_two(text: str, context: str) -> None:
         raise SuiteFailure(f"{context} expected R console result 2, got: {text!r}")
 
 
-def wait_until_not_busy(client: McpStdioClient, context: str) -> str:
-    deadline = time.monotonic() + 5.0
+def is_busy_response(text: str) -> bool:
+    return (
+        "<<repl status: busy" in text
+        or "worker is busy" in text
+        or "request already running" in text
+        or "input discarded while worker busy" in text
+    )
+
+
+def wait_until_not_busy(
+    client: McpStdioClient,
+    context: str,
+    deadline_seconds: float = 5.0,
+) -> str:
+    assert deadline_seconds > 0
+    deadline = time.monotonic() + deadline_seconds
     last_text = ""
     while time.monotonic() < deadline:
         result = client.call_tool(
@@ -265,7 +279,7 @@ def wait_until_not_busy(client: McpStdioClient, context: str) -> str:
             },
         )
         last_text = require_success(result, context)
-        if "<<repl status: busy" not in last_text:
+        if not is_busy_response(last_text):
             return last_text
     raise SuiteFailure(f"{context} remained busy after polling: {last_text!r}")
 
@@ -276,9 +290,30 @@ def require_success_when_not_busy(
     context: str,
 ) -> str:
     text = require_success(result, context)
-    if "<<repl status: busy" not in text:
+    if not is_busy_response(text):
         return text
     return wait_until_not_busy(client, context)
+
+
+def wait_for_interrupt_ready(client: McpStdioClient, text: str, context: str) -> str:
+    deadline = time.monotonic() + 20.0
+    last_text = text
+    while time.monotonic() < deadline:
+        if "INTERRUPT_READY" in last_text:
+            return last_text
+        if not is_busy_response(last_text):
+            raise SuiteFailure(
+                f"{context} finished before interrupt readiness marker: {last_text!r}"
+            )
+        result = client.call_tool(
+            "repl",
+            {
+                "input": "",
+                "timeout_ms": 500,
+            },
+        )
+        last_text = require_success(result, context)
+    raise SuiteFailure(f"{context} did not reach interrupt readiness: {last_text!r}")
 
 
 def r_console_basic(client: McpStdioClient) -> None:
@@ -371,6 +406,73 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
         raise SuiteFailure(f"expected reset state, got: {after_reset_text!r}")
 
 
+def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
+    set_var = client.call_tool(
+        "repl",
+        {
+            "input": "x <- 1\n",
+            "timeout_ms": 30000,
+        },
+    )
+    require_success_when_not_busy(client, set_var, "set variable before restart")
+
+    restarted = client.call_tool(
+        "repl",
+        {
+            "input": "\u0004print(exists(\"x\"))\n",
+            "timeout_ms": 30000,
+        },
+    )
+    restarted_text = require_success_when_not_busy(
+        client,
+        restarted,
+        "restart prefix repl",
+    )
+    if "FALSE" not in restarted_text:
+        raise SuiteFailure(f"expected restart prefix to clear state, got: {restarted_text!r}")
+
+    long_running = r"""
+cat("INTERRUPT_READY\n")
+flush.console()
+tryCatch(
+  {
+    repeat Sys.sleep(0.5)
+  },
+  interrupt = function(e) cat("interrupt received\n")
+)
+"""
+    timed_out = client.call_tool(
+        "repl",
+        {
+            "input": long_running,
+            "timeout_ms": 300,
+        },
+    )
+    timed_out_text = require_success(timed_out, "interrupt setup repl")
+    wait_for_interrupt_ready(client, timed_out_text, "interrupt setup repl")
+
+    interrupted = client.call_tool(
+        "repl",
+        {
+            "input": "\u0003cat(\"AFTER_INTERRUPT\\n\")",
+            "timeout_ms": 5000,
+        },
+    )
+    interrupted_text = require_success_when_not_busy(
+        client,
+        interrupted,
+        "interrupt prefix repl",
+    )
+    if "interrupt received" not in interrupted_text:
+        raise SuiteFailure(
+            f"expected interrupt handler output, got: {interrupted_text!r}"
+        )
+    if "AFTER_INTERRUPT" not in interrupted_text:
+        raise SuiteFailure(
+            f"expected remaining input after interrupt, got: {interrupted_text!r}"
+        )
+
+
 def r_pager_command_smoke(client: McpStdioClient) -> None:
     initial = client.call_tool(
         "repl",
@@ -426,6 +528,7 @@ class SuiteCase:
 
 CASES: dict[str, SuiteCase] = {
     "r-console-basic": SuiteCase(r_console_basic),
+    "r-interrupt-restart-prefixes": SuiteCase(r_interrupt_restart_prefixes),
     "r-pager-command-smoke": SuiteCase(
         r_pager_command_smoke,
         server_args=("--oversized-output", "pager"),
