@@ -235,6 +235,10 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
 
     for required in [
         "[profile.ci]",
+        "[test-groups]",
+        "repl-integration = { max-threads = 1 }",
+        "[[profile.ci.overrides]]",
+        "test-group = \"repl-integration\"",
         "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
         "status-level = \"fail\"",
         "final-status-level = \"fail\"",
@@ -244,6 +248,26 @@ fn ci_uses_quiet_nextest_profile_for_routine_suite() {
         assert!(
             nextest_config.contains(required),
             "missing {required} in .config/nextest.toml"
+        );
+    }
+
+    for required_binary in [
+        "binary(=interrupt)",
+        "binary(=manage_session_behavior)",
+        "binary(=pager_flags)",
+        "binary(=python_backend)",
+        "binary(=r_manuals)",
+        "binary(=r_protocol)",
+        "binary(=r_vignettes)",
+        "binary(=repl_surface)",
+        "binary(=sandbox_state_updates)",
+        "binary(=write_stdin_batch)",
+        "binary(=write_stdin_behavior)",
+        "binary(=write_stdin_edge_cases)",
+    ] {
+        assert!(
+            nextest_config.contains(required_binary),
+            "missing {required_binary} in .config/nextest.toml"
         );
     }
 }
