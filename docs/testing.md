@@ -40,6 +40,9 @@ on client protocol behavior rather than sandbox policy.
 
 Use `--case <name>` to run one public API case while iterating.
 
+CI runs this suite after `cargo build` in the main cross-platform workflow,
+using the debug binary built for each matrix target.
+
 ## Full Verification Before Replying
 
 If you modify code, run:

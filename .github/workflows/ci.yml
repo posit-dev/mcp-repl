@@ -78,6 +78,15 @@ jobs:
       - name: cargo build
         run: cargo build
 
+      - name: Python public API suite
+        if: matrix.os != 'windows-2022'
+        run: python3 scripts/public_api_suite.py --binary target/debug/mcp-repl
+
+      - name: Python public API suite (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: python scripts/public_api_suite.py --binary target/debug/mcp-repl.exe
+
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 

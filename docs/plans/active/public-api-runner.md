@@ -26,20 +26,21 @@
 
 - Phase 0: completed - add the runner shell and first R console smoke case.
 - Phase 1: completed - migrate another small real-client scenario with timeout or busy-worker behavior.
-- Phase 2: pending - decide how the external suite should run in CI.
+- Phase 2: completed - run the external suite in CI after the debug binary is built.
 
 ## Locked Decisions
 
 - The external suite must accept a prebuilt binary path instead of building the binary itself.
 - The runner should call MCP tools over stdio and avoid internal Rust helpers.
+- CI runs the external suite as its own step after `cargo build` on each matrix target.
 
 ## Open Questions
 
-- Whether CI should run the Python suite as a separate required step or as part of a broader fast test profile.
+- Which additional public scenarios should migrate into the external suite before the parent migration is complete.
 
 ## Next Safe Slice
 
-- Decide whether the external suite should run in CI now, or migrate one more small real-client scenario before making it required.
+- Migrate the next representative public scenario only if it can replace or reduce matching Rust integration coverage in the same change.
 
 ## Stop Conditions
 
@@ -51,3 +52,4 @@
 - 2026-05-17: Chose a narrow first slice with one R `repl` smoke case to prove the runner can initialize the real binary and call public tools before moving more complex scenarios.
 - 2026-05-17: Added an R timeout/busy/recovery case to the external runner and removed the matching Rust snapshot smoke test.
 - 2026-05-17: Added an R `repl_reset` state-clearing case to the external runner and removed the duplicate Rust public surface test.
+- 2026-05-17: Added the external public API suite to the cross-platform CI workflow as a separate post-build step.
