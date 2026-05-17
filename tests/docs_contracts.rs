@@ -246,12 +246,8 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     for required in [
         "[profile.default]",
         "[profile.ci]",
-        "[test-groups]",
-        "repl-integration = { max-threads = 1 }",
         "[[profile.default.overrides]]",
-        "[[profile.ci.overrides]]",
         "success-output = \"immediate\"",
-        "test-group = \"repl-integration\"",
         "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
         "status-level = \"fail\"",
         "final-status-level = \"fail\"",
@@ -268,34 +264,18 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
         1,
         "only the CI profile should filter out real client integrations"
     );
-
-    for serialized_binary in [
-        "binary(=interrupt)",
-        "binary(=manage_session_behavior)",
-        "binary(=python_backend)",
-        "binary(=r_protocol)",
-        "binary(=repl_surface)",
-        "binary(=sandbox_state_updates)",
-        "binary(=write_stdin_batch)",
-        "binary(=write_stdin_behavior)",
-        "binary(=write_stdin_edge_cases)",
-    ] {
+    for forbidden in ["[test-groups]", "test-group =", "repl-integration"] {
         assert!(
-            nextest_config.contains(serialized_binary),
-            "missing {serialized_binary} in .config/nextest.toml"
+            !nextest_config.contains(forbidden),
+            "did not expect stale serial nextest configuration {forbidden}"
         );
     }
 
-    for routine_binary in [
-        "binary(=pager_flags)",
-        "binary(=r_manuals)",
-        "binary(=r_vignettes)",
-    ] {
-        assert!(
-            !nextest_config.contains(routine_binary),
-            "did not expect {routine_binary} in the serial nextest group"
-        );
-    }
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "The local and CI nextest profiles use normal nextest scheduling. CI differs only by filtering out real client integrations.",
+        "docs/testing.md",
+    );
 
     assert_contains_wrapped_text(
         &testing_docs,
@@ -305,11 +285,6 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     assert_contains_wrapped_text(
         &testing_docs,
         "The CI profile adds a default filter that excludes `codex_approvals_tui` and `claude_integration` because CI is not authenticated with model providers.",
-        "docs/testing.md",
-    );
-    assert_contains_wrapped_text(
-        &testing_docs,
-        "Both profiles keep only the remaining timing-sensitive Rust REPL residue in a serial `repl-integration` test group.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(

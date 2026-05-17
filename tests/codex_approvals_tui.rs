@@ -1732,7 +1732,11 @@ tryCatch({
                         if path_matches(path, &["x-codex-turn-metadata"])
                             && matches!(
                                 normalized_key.as_str(),
-                                "thread_id" | "thread_source" | "model" | "reasoning_effort"
+                                "thread_id"
+                                    | "thread_source"
+                                    | "model"
+                                    | "reasoning_effort"
+                                    | "workspaces"
                             )
                         {
                             continue;
@@ -1842,7 +1846,12 @@ tryCatch({
                 "turn_id": "turn-1",
                 "sandbox": "seatbelt",
                 "model": "gpt-5.5",
-                "reasoning_effort": "medium"
+                "reasoning_effort": "medium",
+                "workspaces": {
+                    "/tmp/workspace": {
+                        "has_changes": false
+                    }
+                }
             }
         });
 

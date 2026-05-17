@@ -55,4 +55,4 @@
 - 2026-05-17: Added the external public API suite to the cross-platform CI workflow as a separate post-build step.
 - 2026-05-17: Added an R interrupt/restart-prefix scenario with explicit interrupt readiness polling and removed duplicate Rust prefix tests.
 - 2026-05-17: Added files-mode output-bundle scenarios for text bundles, pruning, timeout backfill, and size-cap omission, then removed duplicate broad Rust integration coverage.
-- 2026-05-17: Narrowed the nextest `repl-integration` group to remaining timing-sensitive Rust residue after the pager, interrupt/restart-prefix, and broad files-mode bundle migrations.
+- 2026-05-17: Removed the obsolete nextest `repl-integration` serial group after verifying the remaining Rust REPL binaries pass under normal nextest scheduling.

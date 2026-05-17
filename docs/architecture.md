@@ -69,9 +69,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `tests/` contains the Rust public API, snapshot, sandbox, backend, install,
   protocol-worker, and client-integration suites. Most tests exercise behavior
   through the exposed MCP interface using the shared harness in `tests/common/`.
-- `.config/nextest.toml` defines the quiet local Rust suite, a CI-filtered
-  variant that skips local client integrations, and the serial
-  `repl-integration` group for the remaining timing-sensitive REPL binaries.
+- `.config/nextest.toml` defines the quiet local Rust suite and a CI-filtered
+  variant that skips local client integrations. The tests should not depend on
+  special local scheduling.
 
 ## Design Constraints
 

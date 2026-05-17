@@ -63,9 +63,9 @@ The CI workflow uses the CI nextest profile for the ordinary Rust suite after
 `cargo clippy`, with `--profile ci --show-progress none` on the command line.
 The CI profile adds a default filter that excludes `codex_approvals_tui` and
 `claude_integration` because CI is not authenticated with model providers.
-Both profiles keep only the remaining timing-sensitive Rust REPL residue in a
-serial `repl-integration` test group. Windows keeps the ordinary suite fully
-serial with `--build-jobs 1` and `--test-threads 1`.
+The local and CI nextest profiles use normal nextest scheduling. CI differs
+only by filtering out real client integrations. Windows keeps the ordinary
+suite fully serial with `--build-jobs 1` and `--test-threads 1`.
 
 This nextest path is the preferred fast local loop, but it does not replace the
 real-binary suite or the full compatibility path. Before replying after code
