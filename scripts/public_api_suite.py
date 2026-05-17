@@ -237,6 +237,35 @@ def result_text(result: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def require_success(result: dict[str, Any], context: str) -> str:
+    text = result_text(result)
+    if result.get("isError") is True:
+        raise SuiteFailure(f"{context} returned isError=true: {text!r}")
+    return text
+
+
+def require_r_result_two(text: str, context: str) -> None:
+    if re.search(r"(?m)(^|\s)2(\s|$)", text) is None:
+        raise SuiteFailure(f"{context} expected R console result 2, got: {text!r}")
+
+
+def wait_until_not_busy(client: McpStdioClient, context: str) -> None:
+    deadline = time.monotonic() + 5.0
+    last_text = ""
+    while time.monotonic() < deadline:
+        result = client.call_tool(
+            "repl",
+            {
+                "input": "",
+                "timeout_ms": 500,
+            },
+        )
+        last_text = require_success(result, context)
+        if "<<repl status: busy" not in last_text:
+            return
+    raise SuiteFailure(f"{context} remained busy after polling: {last_text!r}")
+
+
 def r_console_basic(client: McpStdioClient) -> None:
     result = client.call_tool(
         "repl",
@@ -245,15 +274,62 @@ def r_console_basic(client: McpStdioClient) -> None:
             "timeout_ms": 30000,
         },
     )
-    if result.get("isError") is True:
-        raise SuiteFailure(f"repl returned isError=true: {result_text(result)!r}")
-    text = result_text(result)
-    if re.search(r"(?m)(^|\s)2(\s|$)", text) is None:
-        raise SuiteFailure(f"expected R console result 2, got: {text!r}")
+    text = require_success(result, "repl")
+    require_r_result_two(text, "repl")
+
+
+def r_timeout_busy_recovers(client: McpStdioClient) -> None:
+    warmup = client.call_tool(
+        "repl",
+        {
+            "input": "1+1\n",
+            "timeout_ms": 30000,
+        },
+    )
+    require_r_result_two(require_success(warmup, "warmup repl"), "warmup repl")
+
+    timed_out = client.call_tool(
+        "repl",
+        {
+            "input": "Sys.sleep(2)\n",
+            "timeout_ms": 500,
+        },
+    )
+    timed_out_text = require_success(timed_out, "timeout repl")
+    if "<<repl status: busy" not in timed_out_text:
+        raise SuiteFailure(f"expected timeout busy marker, got: {timed_out_text!r}")
+
+    busy_follow_up = client.call_tool(
+        "repl",
+        {
+            "input": "1+1\n",
+            "timeout_ms": 500,
+        },
+    )
+    busy_text = require_success(busy_follow_up, "busy follow-up repl")
+    if "<<repl status: busy" not in busy_text:
+        raise SuiteFailure(f"expected busy follow-up marker, got: {busy_text!r}")
+    if "input discarded while worker busy" not in busy_text:
+        raise SuiteFailure(f"expected busy input discard notice, got: {busy_text!r}")
+
+    wait_until_not_busy(client, "timeout poll repl")
+
+    recovered = client.call_tool(
+        "repl",
+        {
+            "input": "1+1\n",
+            "timeout_ms": 5000,
+        },
+    )
+    recovered_text = require_success(recovered, "recovery repl")
+    if "<<repl status: busy" in recovered_text:
+        raise SuiteFailure(f"expected recovery response, got: {recovered_text!r}")
+    require_r_result_two(recovered_text, "recovery repl")
 
 
 CASES: dict[str, Callable[[McpStdioClient], None]] = {
     "r-console-basic": r_console_basic,
+    "r-timeout-busy-recovers": r_timeout_busy_recovers,
 }
 
 

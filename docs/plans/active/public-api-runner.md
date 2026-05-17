@@ -13,9 +13,9 @@
 
 ## Current Direction
 
-- Start with a minimal Python runner that speaks MCP directly with newline-delimited JSON-RPC.
-- Keep the first slice focused on one R console smoke case and terse runner output.
-- Use `--sandbox danger-full-access` by default for the external suite so the first cases test client protocol behavior, not sandbox policy.
+- Grow the minimal Python runner with small, real-client scenarios that speak MCP directly with newline-delimited JSON-RPC.
+- Keep each migrated case focused enough that matching Rust integration coverage can be removed or reduced in the same change.
+- Use `--sandbox danger-full-access` by default for the external suite so the early cases test client protocol behavior, not sandbox policy.
 
 ## Long-Term Direction
 
@@ -25,7 +25,7 @@
 ## Phase Status
 
 - Phase 0: completed - add the runner shell and first R console smoke case.
-- Phase 1: pending - migrate another small real-client scenario with timeout or busy-worker behavior.
+- Phase 1: completed - migrate another small real-client scenario with timeout or busy-worker behavior.
 - Phase 2: pending - decide how the external suite should run in CI.
 
 ## Locked Decisions
@@ -40,7 +40,7 @@
 
 ## Next Safe Slice
 
-- Add one timeout or busy-worker scenario to the Python runner, then remove or reduce the matching Rust public smoke coverage.
+- Decide whether the external suite should run in CI now, or migrate one more small real-client scenario before making it required.
 
 ## Stop Conditions
 
@@ -50,3 +50,4 @@
 ## Decision Log
 
 - 2026-05-17: Chose a narrow first slice with one R `repl` smoke case to prove the runner can initialize the real binary and call public tools before moving more complex scenarios.
+- 2026-05-17: Added an R timeout/busy/recovery case to the external runner and removed the matching Rust snapshot smoke test.

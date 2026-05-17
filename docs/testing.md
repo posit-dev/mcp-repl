@@ -38,6 +38,8 @@ The runner starts the real server over MCP stdio and calls public tools only. It
 uses `--sandbox danger-full-access` by default so the first slice stays focused
 on client protocol behavior rather than sandbox policy.
 
+Use `--case <name>` to run one public API case while iterating.
+
 ## Full Verification Before Replying
 
 If you modify code, run:

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(not(windows))]
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 #[cfg(not(windows))]
 fn test_mutex() -> &'static Mutex<()> {
@@ -123,27 +123,6 @@ async fn write_stdin_accepts_multiple_calls() -> TestResult<()> {
         .await?;
 
     assert_snapshot_or_skip("write_stdin_accepts_multiple_calls", &snapshot)
-}
-
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
-
-    snapshot
-        .files_session(
-            "timeout_list",
-            mcp_session!(|session| {
-                session.write_stdin_with("Sys.sleep(5)", Some(2.0)).await;
-                session.write_stdin_with("1+1", Some(1.0)).await;
-                sleep(Duration::from_secs(4)).await;
-                session.write_stdin_with("1+1", Some(10.0)).await;
-                Ok(())
-            }),
-        )
-        .await?;
-
-    assert_snapshot_or_skip("write_stdin_timeout_then_busy_then_recovers", &snapshot)
 }
 
 #[cfg(not(windows))]
