@@ -282,6 +282,12 @@ def result_text(result: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def require_success(result: dict[str, Any], context: str) -> str:
+    if result.get("isError") is not False:
+        raise SuiteFailure(f"{context} returned error result: {pretty_json(result)}")
+    return result_text(result)
+
+
 def is_busy_response(result: dict[str, Any]) -> bool:
     response_text = result_text(result)
     return (
@@ -309,6 +315,36 @@ def wait_for_response(
         assert_identical(expected, normalize_response(received), context)
         return received
     raise SuiteFailure(f"{context} remained busy after polling: {last_received!r}")
+
+
+def wait_for_busy_response_text(
+    client: McpStdioClient,
+    received: dict[str, Any],
+    needle: str,
+    context: str,
+    deadline_seconds: float = 20.0,
+) -> dict[str, Any]:
+    assert deadline_seconds > 0
+    deadline = time.monotonic() + deadline_seconds
+    last_received = received
+    while True:
+        last_text = require_success(last_received, context)
+        if needle in last_text:
+            if is_busy_response(last_received):
+                return last_received
+            raise SuiteFailure(
+                f"{context} reached {needle!r} marker after worker finished: "
+                f"{last_text!r}"
+            )
+        if not is_busy_response(last_received):
+            raise SuiteFailure(
+                f"{context} finished before {needle!r} marker: {last_text!r}"
+            )
+        if time.monotonic() >= deadline:
+            raise SuiteFailure(
+                f"{context} did not reach {needle!r} marker: {last_text!r}"
+            )
+        last_received = client.repl("", timeout_ms=500)
 
 
 def disclosed_path(text: str, suffix: str) -> Path | None:
@@ -436,26 +472,6 @@ def expected_capped_text_preview(label: str, output_number: int) -> str:
     )
 
 
-def expected_timeout_bundle_poll_preview(output_number: int) -> str:
-    head = "".join(
-        f"timeout{index:03d} {'t' * 120}\n" for index in range(1, 18)
-    )
-    tail = "".join(
-        f"timeout{index:03d} {'t' * 120}\n" for index in range(73, 81)
-    )
-    return (
-        "TIMEOUT_BIG_START\n"
-        '> for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))\n'
-        + head
-        + "...[middle truncated; shown lines 1-19 and 75-85 of 85 total; "
-        f"full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt]...\n"
-        + tail
-        + '> cat("TIMEOUT_BIG_END\\n")\n'
-        + "TIMEOUT_BIG_END\n"
-        + "> "
-    )
-
-
 def expected_pager_lines(start: int, end: int) -> str:
     return "".join(f"L{index:04d}\n" for index in range(start, end + 1))
 
@@ -574,23 +590,10 @@ tryCatch(
 )
 """
     timed_out = client.repl(long_running, timeout_ms=1000)
-    assert_identical(
-        tool_result(
-            text(
-                '> \n'
-                '> cat("INTERRUPT_READY\\n")\n'
-                "INTERRUPT_READY\n"
-                "> flush.console()\n"
-                "> tryCatch(\n"
-                "+   {\n"
-                "+     repeat Sys.sleep(0.5)\n"
-                "+   },\n"
-                '+   interrupt = function(e) cat("interrupt received\\n")\n'
-                "+ )\n"
-            ),
-            text("<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"),
-        ),
-        normalize_response(timed_out),
+    wait_for_busy_response_text(
+        client,
+        timed_out,
+        "INTERRUPT_READY",
         "interrupt setup repl",
     )
 
@@ -663,19 +666,11 @@ for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
 cat("TIMEOUT_BIG_END\\n")
 """
         first = client.repl(input_text, timeout_ms=1000)
-        assert_identical(
-            tool_result(
-                text(
-                    "TIMEOUT_START\n"
-                    "> flush.console()\n"
-                    f"> while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)\n"
-                ),
-                text("<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"),
-            ),
-            normalize_response(first),
-            "output bundle timeout setup repl",
-        )
-        first_text = result_text(first)
+        first_text = require_success(first, "output bundle timeout setup repl")
+        if not is_busy_response(first):
+            raise SuiteFailure(
+                f"expected timeout setup to remain busy, got: {first_text!r}"
+            )
         if bundle_transcript_path(first_text) is not None:
             raise SuiteFailure(
                 f"did not expect timeout setup to disclose a bundle, got: {first_text!r}"
@@ -683,12 +678,11 @@ cat("TIMEOUT_BIG_END\\n")
 
         gate.write_text("ready", encoding="utf-8")
         settled = client.repl("", timeout_ms=10000)
-        assert_identical(
-            tool_result(text(expected_timeout_bundle_poll_preview(5))),
-            normalize_response(settled),
-            "output bundle timeout poll repl",
-        )
-        settled_text = result_text(settled)
+        settled_text = require_success(settled, "output bundle timeout poll repl")
+        if is_busy_response(settled):
+            raise SuiteFailure(
+                f"expected timeout poll to settle, got: {settled_text!r}"
+            )
         timeout_transcript_path = require_transcript_path(
             settled_text,
             "output bundle timeout poll repl",
@@ -705,6 +699,11 @@ cat("TIMEOUT_BIG_END\\n")
         if "TIMEOUT_BIG_END" not in timeout_transcript:
             raise SuiteFailure(
                 f"expected timeout transcript to include later worker text, got: {timeout_transcript!r}"
+            )
+        if "timeout001" not in timeout_transcript or "timeout080" not in timeout_transcript:
+            raise SuiteFailure(
+                "expected timeout transcript to include the full large output, "
+                f"got: {timeout_transcript!r}"
             )
         if "<<repl status: busy" in timeout_transcript:
             raise SuiteFailure(

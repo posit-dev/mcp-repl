@@ -43,6 +43,58 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
             },
         )
 
+    def test_wait_for_busy_response_text_polls_until_marker(self):
+        initial = self.module.tool_result(
+            self.module.text(
+                "setup started\n"
+                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"
+            )
+        )
+        ready = self.module.tool_result(
+            self.module.text(
+                "INTERRUPT_READY\n"
+                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"
+            )
+        )
+
+        test_case = self
+
+        class FakeClient:
+            def repl(self, input_text, *, timeout_ms=None):
+                test_case.assertEqual(input_text, "")
+                test_case.assertEqual(timeout_ms, 500)
+                return ready
+
+        received = self.module.wait_for_busy_response_text(
+            FakeClient(),
+            initial,
+            "INTERRUPT_READY",
+            "interrupt setup repl",
+            deadline_seconds=1.0,
+        )
+
+        self.assertIs(received, ready)
+
+    def test_wait_for_busy_response_text_fails_if_worker_finishes_before_marker(self):
+        finished = self.module.tool_result(self.module.text("> "))
+
+        with self.assertRaisesRegex(
+            self.module.SuiteFailure,
+            "finished before .* marker",
+        ):
+            self.module.wait_for_busy_response_text(
+                FakeClientWithoutResponses(),
+                finished,
+                "INTERRUPT_READY",
+                "interrupt setup repl",
+                deadline_seconds=1.0,
+            )
+
+
+class FakeClientWithoutResponses:
+    def repl(self, input_text, *, timeout_ms=None):
+        raise AssertionError("unexpected poll")
+
 
 if __name__ == "__main__":
     unittest.main()
