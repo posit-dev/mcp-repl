@@ -28,6 +28,8 @@ fn assert_contains_wrapped_text(document: &str, required: &str, source: &str) {
 #[test]
 fn agents_is_short_and_points_to_main_docs() {
     let agents = read(&repo_root().join("AGENTS.md"));
+    let testing_docs = read(&repo_root().join("docs/testing.md"));
+    let tests_readme = read(&repo_root().join("tests/README.md"));
     assert!(
         agents.lines().count() <= 120,
         "AGENTS.md should stay at 120 lines or less"
@@ -41,9 +43,10 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
-        "python3 tests/run_rust_tests.py --clippy",
-        "python3 tests/run_rust_tests.py --profile default",
+        "cargo nextest run --show-progress none",
         "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
+        "cargo insta test --check",
+        "MCP_REPL_CODEX_BACKEND=mock",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
     }
@@ -53,9 +56,27 @@ fn agents_is_short_and_points_to_main_docs() {
         "AGENTS.md should use the local default nextest profile, not the CI filter"
     );
     assert!(
+        !agents.contains("tests/run_rust_tests.py"),
+        "AGENTS.md should not use the transitional explicit Rust test wrapper"
+    );
+    assert!(
         !agents.contains("scripts/public_api_suite.py"),
         "AGENTS.md should use tests/run_integration_tests.py"
     );
+    for (source, text) in [
+        ("AGENTS.md", agents.as_str()),
+        ("docs/testing.md", testing_docs.as_str()),
+        ("tests/README.md", tests_readme.as_str()),
+    ] {
+        assert!(
+            text.contains("cargo insta test --check"),
+            "missing runnable cargo-insta check in {source}"
+        );
+        assert!(
+            !text.contains("cargo insta test --check --unreferenced=reject"),
+            "general cargo-insta check should not reject valid platform-specific snapshots in {source}"
+        );
+    }
 }
 
 #[test]
@@ -175,6 +196,10 @@ fn ci_workflow_defines_dev_release_contract() {
         "github.event_name == 'push' && github.ref_type == 'tag'",
         "run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
         "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
+        "npm install -g @openai/codex",
+        "npm config get prefix",
+        "name: cargo test (real codex integrations)",
+        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
         "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
@@ -200,8 +225,6 @@ fn ci_workflow_defines_dev_release_contract() {
         "CODEX_VERSION:",
         "openai/codex-action",
         "secrets.OPENAI_API_KEY",
-        "npm install -g @openai/codex",
-        "npm config get prefix",
         "codex-x86_64-unknown-linux-musl.tar.gz",
         "codex-aarch64-apple-darwin.tar.gz",
         "codex-x86_64-pc-windows-msvc.exe.zip",
@@ -217,7 +240,7 @@ fn ci_workflow_defines_dev_release_contract() {
 }
 
 #[test]
-fn nextest_profiles_keep_local_clients_and_filter_ci() {
+fn ci_runs_codex_integration_with_mock_backend() {
     let root = repo_root();
     let workflow = read(&root.join(".github/workflows/ci.yml"));
     let nextest_config = read(&root.join(".config/nextest.toml"));
@@ -228,9 +251,15 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     for required in [
         "taiki-e/install-action@nextest",
         "name: cargo nextest (quiet)",
-        "run: python3 tests/run_rust_tests.py --profile ci",
+        "run: cargo nextest run --profile ci --show-progress none",
         "name: cargo nextest (quiet, windows serial)",
-        "run: python tests/run_rust_tests.py --profile ci --build-jobs 1 --test-threads 1",
+        "run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1",
+        "name: Install Codex CLI",
+        "name: Install Codex CLI (windows)",
+        "npm install -g @openai/codex",
+        "name: cargo test (real codex integrations)",
+        "name: cargo test (real codex integrations, windows serial)",
+        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
     ] {
         assert!(
             workflow.contains(required),
@@ -241,10 +270,7 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     for forbidden in [
         "name: cargo test\n        if: matrix.os != 'windows-2022'\n        run: cargo test",
         "name: cargo test (windows serial)\n        if: matrix.os == 'windows-2022'\n        run: cargo test -j 1 -- --test-threads=1",
-        "name: Install Codex CLI",
-        "name: Install Codex CLI (windows)",
-        "name: cargo test (real codex integrations)",
-        "name: cargo test (real codex integrations, windows serial)",
+        "tests/run_rust_tests.py",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -273,12 +299,10 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
         1,
         "only the CI profile should filter out real client integrations"
     );
-    for forbidden in ["repl-integration"] {
-        assert!(
-            !nextest_config.contains(forbidden),
-            "did not expect stale serial nextest configuration {forbidden}"
-        );
-    }
+    assert!(
+        !nextest_config.contains("repl-integration"),
+        "did not expect stale serial nextest configuration repl-integration"
+    );
     for required in [
         "[test-groups]",
         "interrupt-integration = { max-threads = 1 }",
@@ -293,7 +317,7 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
 
     assert_contains_wrapped_text(
         &testing_docs,
-        "The Rust integration runner uses nextest and opts the interrupt binary into a one-at-a-time group because those tests coordinate through process-local fixtures.",
+        "It opts the interrupt binary into a one-at-a-time group because those tests coordinate through process-local fixtures.",
         "docs/testing.md",
     );
 
@@ -304,7 +328,7 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "The CI profile and wrapper exclude `codex_approvals_tui` and `claude_integration` because CI is not authenticated with model providers.",
+        "The CI profile excludes real client integration binaries from the ordinary Rust suite. CI installs Codex and runs `codex_approvals_tui` separately against a mocked model provider.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(
@@ -314,12 +338,64 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "If either client is unavailable or unauthenticated, the matching integration test prints a skip banner with the reason.",
+        "The Codex CI integration does not require OpenAI authentication because the test config points Codex at a local mock provider.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "By default, the Codex integration uses `MCP_REPL_CODEX_BACKEND=auto`: it checks whether Codex is logged in, checks whether `gpt-5.3-codex-spark` is available, and uses that live backend when both checks pass. Otherwise it uses the mocked provider.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Set `MCP_REPL_CODEX_BACKEND=live` or `MCP_REPL_CODEX_BACKEND=mock` to force one path.",
+        "docs/testing.md",
+    );
+    assert!(
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1"),
+        "docs/testing.md should show the forced mock Codex backend check"
+    );
+    assert!(
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1"),
+        "docs/testing.md should show the forced live Codex backend check"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI runs the Codex integration binary; Claude integration remains local because provider authentication is unavailable in CI.",
+        "docs/testing.md",
+    );
+    assert!(
+        !testing_docs.contains(
+            "CI does not run these binaries because provider authentication is unavailable"
+        ),
+        "docs/testing.md should not claim CI skips the Codex integration binary"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "If a required client binary is unavailable, the matching integration test prints a skip banner with the reason. Codex backend selection prints a `CODEX` banner showing whether the test selected live Spark or the mocked provider.",
         "docs/testing.md",
     );
     assert!(
         codex_integration.contains(r#"const CODEX_MODEL: &str = "gpt-5.3-codex-spark";"#),
         "Codex integration should use the Spark model"
+    );
+    assert!(
+        codex_integration.contains("requires_openai_auth = false"),
+        "Codex integration should use the mocked provider without OpenAI auth"
+    );
+    assert!(
+        codex_integration.contains("MCP_REPL_CODEX_BACKEND"),
+        "Codex integration should expose an env var to force live or mock backend selection"
+    );
+    assert!(
+        codex_integration.contains("codex")
+            && codex_integration.contains("login")
+            && codex_integration.contains("status"),
+        "Codex auto backend selection should probe login status"
+    );
+    assert!(
+        codex_integration.contains("debug") && codex_integration.contains("models"),
+        "Codex auto backend selection should inspect available models"
     );
     assert!(
         claude_integration.contains(r#"const CLAUDE_MODEL: &str = "haiku";"#),
@@ -328,61 +404,28 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
 }
 
 #[test]
-fn cargo_test_default_is_small_and_integration_targets_are_explicit() {
+fn cargo_test_default_discovers_existing_rust_tests() {
     let root = repo_root();
     let manifest = read(&root.join("Cargo.toml"));
-    let runner = read(&root.join("tests/run_rust_tests.py"));
     let testing_docs = read(&root.join("docs/testing.md"));
 
     assert!(
-        manifest.contains("autotests") && manifest.contains("false"),
-        "Cargo.toml should keep integration tests out of default cargo test"
-    );
-    assert!(
-        manifest
-            .contains("[[bin]]\n  name = \"mcp-repl\"\n  path = \"src/main.rs\"\n  test = false"),
-        "Cargo.toml should keep bin unit tests out of default cargo test"
-    );
-    assert!(
-        runner.contains("\"--bin\"") && runner.contains("\"mcp-repl\""),
-        "tests/run_rust_tests.py should run bin unit tests explicitly"
+        !manifest.contains("autotests"),
+        "Cargo.toml should not opt Rust integration tests out of default cargo test"
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "Plain `cargo test` is intentionally a small default Cargo compatibility check. It does not run the repository's binary unit tests or integration test targets.",
+        "Plain `cargo test` remains the full Cargo compatibility path. It must continue to discover the binary unit tests and Rust integration targets.",
         "docs/testing.md",
     );
-
-    let mut integration_targets = Vec::new();
-    for entry in fs::read_dir(root.join("tests")).expect("tests dir exists") {
-        let path = entry.expect("test entry").path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .expect("test filename is utf-8");
-        integration_targets.push(name.to_string());
-    }
-    integration_targets.sort();
-
-    for name in &integration_targets {
-        let target_block =
-            format!("[[test]]\nname = \"{name}\"\npath = \"tests/{name}.rs\"\ntest = false");
-        assert!(
-            manifest.contains(&target_block),
-            "Cargo.toml should explicitly opt {name} out of default cargo test"
-        );
-        assert!(
-            runner.contains(&format!("\"{name}\"")),
-            "tests/run_rust_tests.py should include {name}"
-        );
-    }
-
     assert!(
-        runner.contains("LIVE_CLIENT_TARGETS"),
-        "runner should make live-client filtering explicit"
+        !manifest.contains("test = false"),
+        "Cargo.toml should not disable Cargo test discovery for existing targets"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Do not opt Rust test targets out of Cargo discovery in anticipation of a future Python migration; migrate a scenario only when the Rust coverage is deleted or reduced in the same change that adds equivalent external coverage.",
+        "docs/testing.md",
     );
 }
 

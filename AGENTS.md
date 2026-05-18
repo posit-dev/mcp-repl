@@ -9,12 +9,13 @@ Keep this file short. It is a table of contents, not the full manual.
   - `cargo build`
   - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `python3 tests/run_rust_tests.py --clippy`
-  - `python3 tests/run_rust_tests.py --profile default`
+  - `cargo nextest run --show-progress none`
   - `cargo test`
   - `cargo +nightly fmt`
 - For docs-only changes, run the narrow docs validation that covers the edited
   files, usually `cargo test --test docs_contracts`.
+- When changing Codex backend selection or CI real-client wiring, also run:
+  - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1`
 - Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 
@@ -67,7 +68,10 @@ Keep this file short. It is a table of contents, not the full manual.
   - `cargo insta test`
   - `cargo insta pending-snapshots`
   - `cargo insta review` or `cargo insta accept` / `cargo insta reject`
-- CI-style validation: `cargo insta test --check --unreferenced=reject`
+- CI-style validation: `cargo insta test --check`
+- Do not add `--unreferenced=reject` to the general snapshot check; this
+  repository keeps valid platform-specific snapshots that are unreferenced on
+  other platforms.
 - For broad intentional snapshot migrations: `cargo insta test --force-update-snapshots --accept`
 - Do not delete `tests/snapshots/*.snap.new` manually. Use `cargo insta reject`.
 

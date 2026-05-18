@@ -16,6 +16,7 @@
 - Grow the minimal Python runner with small, real-client scenarios that speak MCP directly with newline-delimited JSON-RPC.
 - Keep each migrated case focused enough that matching Rust integration coverage can be removed or reduced in the same change.
 - Use `--sandbox danger-full-access` by default for the external suite so the early cases test client protocol behavior, not sandbox policy.
+- Keep existing Rust tests discoverable by `cargo test` until their scenario is migrated or removed in the same change that adds equivalent Python coverage.
 
 ## Long-Term Direction
 
@@ -33,6 +34,7 @@
 - The external suite must accept a prebuilt binary path instead of building the binary itself.
 - The runner should call MCP tools over stdio and avoid internal Rust helpers.
 - CI runs the external suite as its own step after `cargo build` on each matrix target.
+- Do not opt Rust test targets out of Cargo discovery in anticipation of future migration work.
 
 ## Open Questions
 
@@ -56,3 +58,4 @@
 - 2026-05-17: Added an R interrupt/restart-prefix scenario with explicit interrupt readiness polling and removed duplicate Rust prefix tests.
 - 2026-05-17: Added files-mode output-bundle scenarios for text bundles, pruning, timeout backfill, and size-cap omission, then removed duplicate broad Rust integration coverage.
 - 2026-05-17: Removed the obsolete nextest `repl-integration` serial group after verifying the remaining Rust REPL binaries pass under normal nextest scheduling.
+- 2026-05-18: Reaffirmed that unmigrated Rust scenarios must remain discoverable by `cargo test`; migrations should replace Rust coverage with equivalent Python coverage in the same change, not disable tests ahead of time.

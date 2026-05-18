@@ -6,7 +6,10 @@ This crate uses `insta` snapshots for MCP tool-call transcripts.
   - `cargo insta test`
   - `cargo insta pending-snapshots`
   - `cargo insta review` (or `cargo insta accept` / `cargo insta reject` for non-interactive runs)
-- CI-style check: `cargo insta test --check --unreferenced=reject`
+- CI-style check: `cargo insta test --check`
+- Do not add `--unreferenced=reject` to the general snapshot check; this
+  repository keeps valid platform-specific snapshots that are unreferenced on
+  other platforms.
 - For format/metadata migrations: `cargo insta test --force-update-snapshots --accept`
 - Review accepted changes with `git diff tests/snapshots`.
 - Transcript snapshots live alongside the JSON snapshots with `@transcript` suffixes.

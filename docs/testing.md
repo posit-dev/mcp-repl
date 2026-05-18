@@ -22,6 +22,10 @@ This file is the entrypoint for deciding how to verify a change.
   - `cargo insta test`
   - `cargo insta pending-snapshots`
   - `cargo insta review` or `cargo insta accept` / `cargo insta reject`
+- CI-style validation: `cargo insta test --check`
+- Do not add `--unreferenced=reject` to the general snapshot check; this
+  repository keeps valid platform-specific snapshots that are unreferenced on
+  other platforms.
 - Do not delete `tests/snapshots/*.snap.new` manually. Use `cargo insta reject`.
 
 ## External Public API Suite
@@ -47,58 +51,73 @@ using the debug binary built for each matrix target.
 Use this while iterating on ordinary Rust tests locally:
 
 ```sh
-python3 tests/run_rust_tests.py --profile default
+cargo nextest run --show-progress none
 ```
 
-The Rust integration runner uses nextest and opts the interrupt binary into a
-one-at-a-time group because those tests coordinate through process-local
-fixtures. The checked-in `.config/nextest.toml` default profile keeps
-passing-test output quiet and shows failure output in the final report. The
-default local profile includes real client integration binaries. Use this when
-Codex and Claude are installed and authenticated locally.
+The checked-in `.config/nextest.toml` default profile keeps passing-test output
+quiet and shows failure output in the final report. It opts the interrupt
+binary into a one-at-a-time group because those tests coordinate through
+process-local fixtures. The default local profile includes real client
+integration binaries. Use this when Codex and Claude are installed and
+authenticated locally.
 
 The `--show-progress none` flag hides progress output so successful runs stay
 compact in local terminals and CI logs; nextest treats that as user
-configuration rather than a repository profile key. The wrapper passes that
-flag to nextest, along with explicit `--test <target>` entries for integration
-targets opted out of default Cargo discovery.
+configuration rather than a repository profile key.
 
 The CI workflow uses the CI nextest profile for the ordinary Rust suite after
-`cargo clippy`, through `python3 tests/run_rust_tests.py --profile ci`. The CI
-profile and wrapper exclude `codex_approvals_tui` and `claude_integration`
-because CI is not authenticated with model providers. Windows keeps the
-ordinary suite fully serial with `--build-jobs 1` and `--test-threads 1`.
+`cargo clippy`, with `--profile ci --show-progress none` on the command line.
+The CI profile excludes real client integration binaries from the ordinary Rust
+suite. CI installs Codex and runs `codex_approvals_tui` separately against a
+mocked model provider. Windows keeps the ordinary suite fully serial with
+`--build-jobs 1` and `--test-threads 1`.
 
-Plain `cargo test` is intentionally a small default Cargo compatibility check.
-It does not run the repository's binary unit tests or integration test targets.
-Those targets are listed explicitly in `Cargo.toml` with `test = false` and run
-through `tests/run_rust_tests.py` instead. Before replying after code changes,
-still run the full required checks below, including both the explicit Rust test
-runner and `cargo test`.
-
-Because those integration targets are also outside Cargo's default target set,
-lint them explicitly with:
-
-```sh
-python3 tests/run_rust_tests.py --clippy
-```
+Plain `cargo test` remains the full Cargo compatibility path. It must continue
+to discover the binary unit tests and Rust integration targets. Do not opt Rust
+test targets out of Cargo discovery in anticipation of a future Python
+migration; migrate a scenario only when the Rust coverage is deleted or reduced
+in the same change that adds equivalent external coverage.
 
 ## Real Client Integrations
 
+CI installs Codex and runs the Codex integration binary. The Codex CI
+integration does not require OpenAI authentication because the test config
+points Codex at a local mock provider.
+
+By default, the Codex integration uses `MCP_REPL_CODEX_BACKEND=auto`: it checks
+whether Codex is logged in, checks whether `gpt-5.3-codex-spark` is available,
+and uses that live backend when both checks pass. Otherwise it uses the mocked
+provider. Set `MCP_REPL_CODEX_BACKEND=live` or `MCP_REPL_CODEX_BACKEND=mock`
+to force one path.
+
+When changing Codex backend selection or CI real-client wiring, run the forced
+mock path explicitly:
+
+```sh
+MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1
+```
+
+To validate the authenticated live path directly on a machine with Spark access:
+
+```sh
+MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1
+```
+
 Local full verification includes the Codex and Claude integration binaries when
-those clients are installed and authenticated. Codex uses the Spark model
+those clients are installed. Codex uses the Spark model
 (`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.
-If either client is unavailable or unauthenticated, the matching integration
-test prints a skip banner with the reason.
+If a required client binary is unavailable, the matching integration test prints
+a skip banner with the reason. Codex backend selection prints a `CODEX` banner
+showing whether the test selected live Spark or the mocked provider.
 
 To run only those integrations:
 
 ```sh
-python3 tests/run_rust_tests.py --profile default --target codex_approvals_tui --target claude_integration
+cargo nextest run --show-progress none --test codex_approvals_tui --test claude_integration
 ```
 
-CI does not run these binaries because provider authentication is unavailable
-there.
+CI runs the Codex integration binary; Claude integration remains local because
+provider authentication is unavailable in CI.
 
 ## Full Verification Before Replying
 
@@ -108,8 +127,7 @@ If you modify code, run:
 - `cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `python3 tests/run_rust_tests.py --clippy`
-- `python3 tests/run_rust_tests.py --profile default`
+- `cargo nextest run --show-progress none`
 - `cargo test`
 - `cargo +nightly fmt`
 

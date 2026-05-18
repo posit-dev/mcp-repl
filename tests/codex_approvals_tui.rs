@@ -35,6 +35,10 @@ mod unix_impl {
     const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const CODEX_MODEL: &str = "gpt-5.3-codex-spark";
+    const CODEX_BACKEND_ENV: &str = "MCP_REPL_CODEX_BACKEND";
+    const LIVE_TOOL_INPUT: &str = "cat(\"CODEX_LIVE_MCP_OK\\n\")\n";
+    const MOCK_TOOL_INPUT: &str = "cat(\"CODEX_MOCK_MCP_OK\\n\")\n";
+    const LIVE_FINAL_MARKER: &str = "CODEX_LIVE_DONE";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
@@ -55,6 +59,18 @@ mod unix_impl {
     enum ExecSnapshotMode {
         Json,
         Plain,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CodexBackendMode {
+        Auto,
+        Live,
+        Mock,
+    }
+
+    enum CodexBackendChoice {
+        Live { auth_json: PathBuf },
+        Mock { reason: String },
     }
 
     pub(super) async fn run_codex_exec_initial_sandbox_state() -> TestResult<String> {
@@ -97,7 +113,7 @@ mod unix_impl {
 
         let cmd = codex_exec_command(
             &env,
-            &mock_server.base_url(),
+            Some(&mock_server.base_url()),
             &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
             sandbox_mode,
             None,
@@ -168,7 +184,7 @@ mod unix_impl {
 
         let cmd = codex_exec_command(
             &env,
-            &mock_server.base_url(),
+            Some(&mock_server.base_url()),
             INSTALL_SCRIPTED_TOOL_CALL_MARKER,
             sandbox_mode,
             Some("--json"),
@@ -212,6 +228,23 @@ mod unix_impl {
         Ok(())
     }
 
+    pub(super) async fn run_codex_exec_auto_backend_smoke() -> TestResult<()> {
+        const TEST_NAME: &str = "codex_exec_auto_backend_smoke";
+        if !codex_client_ready(TEST_NAME) {
+            return Ok(());
+        }
+
+        let choice = select_codex_backend(TEST_NAME)?;
+        match choice {
+            CodexBackendChoice::Live { auth_json } => {
+                run_codex_exec_live_spark_smoke(TEST_NAME, &auth_json).await
+            }
+            CodexBackendChoice::Mock { reason } => {
+                run_codex_exec_mock_backend_smoke(TEST_NAME, &reason).await
+            }
+        }
+    }
+
     async fn run_codex_exec_initial_sandbox_state_for_mode(
         mode: ExecSnapshotMode,
     ) -> TestResult<String> {
@@ -234,7 +267,7 @@ mod unix_impl {
 
         let cmd = codex_exec_command(
             &env,
-            &mock_server.base_url(),
+            Some(&mock_server.base_url()),
             &format!("{WORKSPACE_WRITE_MARKER}: run the sandbox write test"),
             sandbox_mode,
             match mode {
@@ -282,6 +315,112 @@ mod unix_impl {
         }
 
         render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
+    }
+
+    async fn run_codex_exec_mock_backend_smoke(test_name: &str, reason: &str) -> TestResult<()> {
+        if !loopback_bind_available().await {
+            print_skip_banner(test_name, "loopback TCP bind unavailable");
+            return Ok(());
+        }
+        print_backend_banner(test_name, &format!("using mock provider ({reason})"));
+        let _guard = codex_exec_test_mutex().lock().await;
+
+        let tool_args = tool_args_for_code(MOCK_TOOL_INPUT.trim_end());
+        let mock_server =
+            MockResponsesServer::start_with_first_user_turn_tool_call(tool_name(), tool_args)
+                .await?;
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_codex_env(&mcp_repl, &mock_server.base_url())?;
+        let cmd = codex_exec_command(
+            &env,
+            Some(&mock_server.base_url()),
+            "Use the mcp__r__repl tool exactly once, then finish.",
+            codex_exec_sandbox_mode(),
+            Some("--json"),
+        );
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        let outputs = mock_server.function_call_outputs().await;
+        if codex_exec_environment_unavailable(&stdout, &stderr, &outputs) {
+            print_skip_banner(
+                test_name,
+                "codex exec sandbox/backend unavailable in this environment",
+            );
+            return Ok(());
+        }
+        if !output.status.success() {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "codex exec mock-backend smoke failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+
+        assert_exec_output_contains_tool_call(&stdout, "r", "repl", MOCK_TOOL_INPUT)?;
+        if !outputs.iter().any(|out| out.contains("CODEX_MOCK_MCP_OK")) {
+            let request_paths = mock_server.request_paths().await;
+            let last_request = mock_server.last_request().await;
+            return Err(format!(
+                "expected mock Codex backend to receive R tool output\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\noutputs: {outputs:?}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn run_codex_exec_live_spark_smoke(test_name: &str, auth_json: &Path) -> TestResult<()> {
+        print_backend_banner(
+            test_name,
+            &format!("using live Codex backend with {CODEX_MODEL}"),
+        );
+        let _guard = codex_exec_test_mutex().lock().await;
+
+        let mcp_repl = resolve_mcp_repl_path()?;
+        let env = create_isolated_live_codex_env(&mcp_repl, auth_json)?;
+        let prompt = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CODEX_LIVE_MCP_OK\\n\") Then answer with exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
+        let cmd = codex_exec_command(
+            &env,
+            None,
+            prompt,
+            codex_exec_sandbox_mode(),
+            Some("--json"),
+        );
+
+        let output = run_command_with_timeout(cmd, Duration::from_secs(120))?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|err| format!("codex exec stderr was not valid UTF-8: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "codex exec live Spark smoke failed with status {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                status = output.status
+            )
+            .into());
+        }
+        if assert_exec_output_contains_tool_call(&stdout, "r", "repl", LIVE_TOOL_INPUT).is_err() {
+            assert_exec_output_contains_tool_call(
+                &stdout,
+                "r",
+                "repl",
+                LIVE_TOOL_INPUT.trim_end(),
+            )?;
+        }
+        assert!(
+            stdout.contains("CODEX_LIVE_MCP_OK"),
+            "expected live Codex output to include R tool result marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(LIVE_FINAL_MARKER),
+            "expected live Codex final answer marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        Ok(())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -456,6 +595,11 @@ mod unix_impl {
             .write_all(format!("=== SKIP {test_name}: {reason}; skipping ===\n").as_bytes());
     }
 
+    fn print_backend_banner(test_name: &str, message: &str) {
+        let _ = std::io::stderr()
+            .write_all(format!("=== CODEX {test_name}: {message} ===\n").as_bytes());
+    }
+
     fn codex_client_ready(test_name: &str) -> bool {
         match std::process::Command::new("codex")
             .arg("--version")
@@ -482,47 +626,159 @@ mod unix_impl {
             }
         }
 
+        true
+    }
+
+    fn select_codex_backend(test_name: &str) -> TestResult<CodexBackendChoice> {
+        match codex_backend_mode()? {
+            CodexBackendMode::Mock => Ok(CodexBackendChoice::Mock {
+                reason: format!("{CODEX_BACKEND_ENV}=mock"),
+            }),
+            CodexBackendMode::Live => match live_codex_spark_auth()? {
+                Ok(auth_json) => Ok(CodexBackendChoice::Live { auth_json }),
+                Err(reason) => Err(format!(
+                    "{CODEX_BACKEND_ENV}=live requested, but live Codex Spark is unavailable: {reason}"
+                )
+                .into()),
+            },
+            CodexBackendMode::Auto => match live_codex_spark_auth()? {
+                Ok(auth_json) => Ok(CodexBackendChoice::Live { auth_json }),
+                Err(reason) => {
+                    print_backend_banner(test_name, &format!("live backend unavailable: {reason}"));
+                    Ok(CodexBackendChoice::Mock { reason })
+                }
+            },
+        }
+    }
+
+    fn codex_backend_mode() -> TestResult<CodexBackendMode> {
+        let Some(value) = std::env::var_os(CODEX_BACKEND_ENV) else {
+            return Ok(CodexBackendMode::Auto);
+        };
+        let value = value.to_string_lossy();
+        match value.as_ref() {
+            "" | "auto" => Ok(CodexBackendMode::Auto),
+            "live" => Ok(CodexBackendMode::Live),
+            "mock" => Ok(CodexBackendMode::Mock),
+            other => Err(format!(
+                "unsupported {CODEX_BACKEND_ENV}={other:?}; expected auto, live, or mock"
+            )
+            .into()),
+        }
+    }
+
+    fn live_codex_spark_auth() -> TestResult<Result<PathBuf, String>> {
+        if let Err(reason) = codex_logged_in() {
+            return Ok(Err(reason));
+        }
+        if let Err(reason) = codex_model_available(CODEX_MODEL)? {
+            return Ok(Err(reason));
+        }
+        let Some(codex_home) = host_codex_home() else {
+            return Ok(Err("unable to locate host Codex home".to_string()));
+        };
+        let auth_json = codex_home.join("auth.json");
+        if !auth_json.is_file() {
+            return Ok(Err(format!(
+                "host Codex auth file is unavailable at {}; the isolated live test cannot reuse auth",
+                auth_json.display()
+            )));
+        }
+        Ok(Ok(auth_json))
+    }
+
+    fn codex_logged_in() -> Result<(), String> {
         let output = std::process::Command::new("codex")
             .arg("login")
             .arg("status")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                print_skip_banner(test_name, "codex not found on PATH");
-                return false;
-            }
-            Err(err) => {
-                print_skip_banner(
-                    test_name,
-                    &format!("failed to run codex login status: {err}"),
-                );
-                return false;
-            }
-        };
-
-        if codex_login_status_indicates_authenticated(&output) {
-            return true;
+            .output()
+            .map_err(|err| format!("failed to run codex login status: {err}"))?;
+        let status_text = command_output_summary(&output);
+        if output.status.success() && status_text.contains("Logged in using") {
+            Ok(())
+        } else {
+            Err(format!("codex is not logged in ({status_text})"))
         }
-
-        print_skip_banner(test_name, "codex is not authenticated; run `codex login`");
-        false
     }
 
-    fn codex_login_status_indicates_authenticated(output: &std::process::Output) -> bool {
+    fn codex_model_available(model: &str) -> TestResult<Result<(), String>> {
+        let output = std::process::Command::new("codex")
+            .arg("debug")
+            .arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
         if !output.status.success() {
-            return false;
+            return Ok(Err(format!(
+                "codex debug models failed ({})",
+                command_output_summary(&output)
+            )));
         }
+        let catalog: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|err| format!("failed to parse codex debug models JSON: {err}"))?;
+        let has_model = catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|entry| entry.get("slug").and_then(Value::as_str) == Some(model))
+            });
+        if has_model {
+            Ok(Ok(()))
+        } else {
+            Ok(Err(format!(
+                "{model} is not available in codex debug models"
+            )))
+        }
+    }
+
+    fn command_output_summary(output: &std::process::Output) -> String {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        stdout.contains("Logged in using ") || stderr.contains("Logged in using ")
+        let mut text = String::new();
+        if !stdout.trim().is_empty() {
+            text.push_str(stdout.trim());
+        }
+        if !stderr.trim().is_empty() {
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push_str(stderr.trim());
+        }
+        if text.is_empty() {
+            format!("status {}", output.status)
+        } else {
+            format!("status {}; {text}", output.status)
+        }
+    }
+
+    fn host_codex_home() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("CODEX_HOME") {
+            return Some(PathBuf::from(path));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(PathBuf::from(home).join(".codex"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile).join(".codex"));
+        }
+        None
     }
 
     fn create_isolated_codex_env_with_config(
         build_config: impl FnOnce(&Path) -> String,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config_and_auth(build_config, None)
+    }
+
+    fn create_isolated_codex_env_with_config_and_auth(
+        build_config: impl FnOnce(&Path) -> String,
+        auth_json: Option<&Path>,
     ) -> TestResult<IsolatedCodexEnv> {
         let temp_dir = tempfile::tempdir()?;
         let workspace = temp_dir.path().join("workspace");
@@ -546,6 +802,14 @@ mod unix_impl {
 
         let config = build_config(&workspace);
         std::fs::write(codex_home.join("config.toml"), config)?;
+        if let Some(auth_json) = auth_json {
+            std::fs::copy(auth_json, codex_home.join("auth.json")).map_err(|err| {
+                format!(
+                    "failed to copy host Codex auth file {} into isolated Codex home: {err}",
+                    auth_json.display()
+                )
+            })?;
+        }
 
         Ok(IsolatedCodexEnv {
             _temp_dir: temp_dir,
@@ -562,6 +826,16 @@ mod unix_impl {
         create_isolated_codex_env_with_config(|workspace| {
             codex_config(mcp_repl, workspace, openai_base_url)
         })
+    }
+
+    fn create_isolated_live_codex_env(
+        mcp_repl: &Path,
+        auth_json: &Path,
+    ) -> TestResult<IsolatedCodexEnv> {
+        create_isolated_codex_env_with_config_and_auth(
+            |workspace| live_codex_config(mcp_repl, workspace),
+            Some(auth_json),
+        )
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -607,14 +881,16 @@ mod unix_impl {
 
     fn codex_exec_command(
         env: &IsolatedCodexEnv,
-        base_url: &str,
+        base_url: Option<&str>,
         prompt: &str,
         sandbox_mode: &str,
         mode_flag: Option<&str>,
     ) -> std::process::Command {
         let mut cmd = std::process::Command::new("codex");
         cmd.env("CODEX_HOME", env.codex_home.display().to_string());
-        cmd.env("CODEX_OSS_BASE_URL", base_url);
+        if let Some(base_url) = base_url {
+            cmd.env("CODEX_OSS_BASE_URL", base_url);
+        }
         cmd.env("MCP_REPL_DEBUG_DIR", env.debug_dir.display().to_string());
         cmd.env("TERM", "xterm-256color");
         cmd.env("LANG", "C");
@@ -1088,6 +1364,36 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[notice]
+hide_full_access_warning = true
+
+[tui]
+alternate_screen = "never"
+animations = false
+
+[features]
+steer = true
+remote_models = true
+responses_websockets = false
+
+[mcp_servers.r]
+command = "{mcp_repl}"
+args = ["--sandbox", "inherit"]
+env_vars = ["MCP_REPL_DEBUG_DIR"]
+[projects."{repo_root}"]
+trust_level = "trusted"
+"#,
+        )
+    }
+
+    fn live_codex_config(mcp_repl: &Path, repo_root: &Path) -> String {
+        let mcp_repl = toml_escape(&mcp_repl.display().to_string());
+        let repo_root = toml_escape(&repo_root.display().to_string());
+        format!(
+            r#"model = "{CODEX_MODEL}"
+disable_paste_burst = true
+project_doc_max_bytes = 0
 
 [notice]
 hide_full_access_warning = true
@@ -2704,6 +3010,11 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_auto_backend_smoke() -> TestResult<()> {
+        super::unix_impl::run_codex_exec_auto_backend_smoke().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2754,6 +3065,11 @@ mod macos {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_auto_backend_smoke() -> TestResult<()> {
+        super::unix_impl::run_codex_exec_auto_backend_smoke().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
         super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
@@ -2780,5 +3096,10 @@ mod windows {
     #[tokio::test(flavor = "multi_thread")]
     async fn install_then_codex_exec_uses_generated_config() -> TestResult<()> {
         super::unix_impl::run_install_then_codex_exec_uses_generated_config().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_exec_auto_backend_smoke() -> TestResult<()> {
+        super::unix_impl::run_codex_exec_auto_backend_smoke().await
     }
 }
