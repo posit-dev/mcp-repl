@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from textwrap import dedent
 
 
 def load_module():
@@ -46,14 +47,20 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(
             self.module.text(
-                "setup started\n"
-                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"
+                dedent(
+                    """\
+                    setup started
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"""
+                )
             )
         )
         ready = self.module.tool_result(
             self.module.text(
-                "INTERRUPT_READY\n"
-                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"
+                dedent(
+                    """\
+                    INTERRUPT_READY
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"""
+                )
             )
         )
 
@@ -93,8 +100,11 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
     def test_r_interrupt_restart_prefixes_polls_after_transient_busy_interrupt(self):
         initial_busy = self.module.tool_result(
             self.module.text(
-                "INTERRUPT_READY\n"
-                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"
+                dedent(
+                    """\
+                    INTERRUPT_READY
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"""
+                )
             )
         )
         interrupt_busy = self.module.tool_result(

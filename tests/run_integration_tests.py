@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 
@@ -584,16 +585,18 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
         "restart prefix repl",
     )
 
-    long_running = r"""
-cat("INTERRUPT_READY\n")
-flush.console()
-tryCatch(
-  {
-    repeat Sys.sleep(0.5)
-  },
-  interrupt = function(e) cat("interrupt received\n")
-)
-"""
+    long_running = dedent(
+        r"""
+        cat("INTERRUPT_READY\n")
+        flush.console()
+        tryCatch(
+          {
+            repeat Sys.sleep(0.5)
+          },
+          interrupt = function(e) cat("interrupt received\n")
+        )
+        """
+    )
     timed_out = client.repl(long_running, timeout_ms=1000)
     wait_for_busy_response_text(
         client,
@@ -670,15 +673,17 @@ def r_output_bundle_files(client: McpStdioClient) -> None:
 
     with tempfile.TemporaryDirectory() as temp_dir:
         gate = Path(temp_dir) / "release"
-        input_text = f"""
-cat("TIMEOUT_START\\n")
-flush.console()
-while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)
-big <- paste(rep("t", 120), collapse = "")
-cat("TIMEOUT_BIG_START\\n")
-for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
-cat("TIMEOUT_BIG_END\\n")
-"""
+        input_text = dedent(
+            f"""
+            cat("TIMEOUT_START\\n")
+            flush.console()
+            while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)
+            big <- paste(rep("t", 120), collapse = "")
+            cat("TIMEOUT_BIG_START\\n")
+            for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
+            cat("TIMEOUT_BIG_END\\n")
+            """
+        )
         first = client.repl(input_text, timeout_ms=1000)
         first_text = require_success(first, "output bundle timeout setup repl")
         if not is_busy_response(first):
