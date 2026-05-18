@@ -615,6 +615,62 @@ fn uv_cache_dir() -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+const RETICULATE_KERAS_JAX_PROBE: &str = r#"
+if (!requireNamespace("reticulate", quietly = TRUE)) {
+  cat("[repl] reticulate not installed\n")
+} else if (!requireNamespace("keras3", quietly = TRUE)) {
+  cat("[repl] keras3 not installed\n")
+} else {
+  library(keras3)
+  ok <- TRUE
+  msg <- NULL
+  tryCatch({
+    use_backend("jax")
+    reticulate::import("jax")
+    cat("[repl] keras-reticulate-ok\n")
+  }, error = function(e) {
+    ok <<- FALSE
+    msg <<- conditionMessage(e)
+  })
+  if (!ok) {
+    cat("[repl] keras-reticulate-error:", msg, "\n", sep = "")
+  }
+}
+"#;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepopulate_reticulate_keras_jax_cache() -> TestResult<bool> {
+    let output = match Command::new("Rscript")
+        .args(["-e", RETICULATE_KERAS_JAX_PROBE])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("sandbox_reticulate_keras_backend Rscript unavailable ({err}); skipping");
+            return Ok(false);
+        }
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if text.contains("[repl] keras-reticulate-ok") {
+        return Ok(true);
+    }
+    if text.contains("[repl] reticulate not installed")
+        || text.contains("[repl] keras3 not installed")
+        || text.contains("[repl] keras-reticulate-error:")
+    {
+        eprintln!(
+            "sandbox_reticulate_keras_backend host cache warm-up unavailable; skipping:\n{text}"
+        );
+        return Ok(false);
+    }
+    Err(format!("reticulate/keras host cache warm-up did not report a known result: {text}").into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_workspace_writes() -> TestResult<()> {
     assert!(sandbox_available(), "sandbox-exec unavailable");
@@ -843,6 +899,10 @@ async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
     assert!(sandbox_available(), "sandbox-exec unavailable");
+    if !prepopulate_reticulate_keras_jax_cache()? {
+        return Ok(());
+    }
+
     let mut writable_roots = Vec::new();
     if let Some(root) = reticulate_cache_dir() {
         writable_roots.push(root);
@@ -856,31 +916,9 @@ async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
     ))
     .await?;
 
-    let code = r#"
-if (!requireNamespace("reticulate", quietly = TRUE)) {
-  cat("[repl] reticulate not installed\n")
-} else if (!requireNamespace("keras3", quietly = TRUE)) {
-  cat("[repl] keras3 not installed\n")
-} else {
-  library(reticulate)
-  library(keras3)
-  ok <- TRUE
-  msg <- NULL
-  tryCatch({
-    use_backend("jax")
-    import("sys")
-    cat("[repl] keras-reticulate-ok\n")
-  }, error = function(e) {
-    ok <<- FALSE
-    msg <<- conditionMessage(e)
-  })
-  if (!ok) {
-    cat("[repl] keras-reticulate-error:", msg, "\n", sep = "")
-  }
-}
-"#;
-
-    let result = session.write_stdin_raw_with(code, Some(180.0)).await?;
+    let result = session
+        .write_stdin_raw_with(RETICULATE_KERAS_JAX_PROBE, Some(180.0))
+        .await?;
     let text = collect_text(&result);
     if skip_backend_unavailable("sandbox_reticulate_keras_backend", &text) {
         session.cancel().await?;
