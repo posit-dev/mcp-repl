@@ -2,32 +2,35 @@
 
 ## Summary
 
-- Move public MCP behavior checks toward an external Python runner that starts a built `mcp-repl` binary over stdio.
-- Keep Rust tests for unit contracts, snapshot normalization, platform-specific mechanics, and behavior that is not yet covered externally.
+- Move public MCP behavior checks, including sandbox-visible real-binary behavior, toward an external Python runner that starts a built `mcp-repl` binary over stdio.
+- Keep Rust tests for unit contracts, snapshot normalization, protocol-worker conformance, platform-specific mechanics, and behavior that is not yet covered externally.
 
 ## Status
 
 - State: active
-- Last updated: 2026-05-17
+- Last updated: 2026-05-18
 - Current phase: implementation
 
 ## Current Direction
 
 - Grow the minimal Python runner with small, real-client scenarios that speak MCP directly with newline-delimited JSON-RPC.
+- Treat sandboxing as product behavior for the external suite. The test runner process is outside the sandbox, but each case starts a built `mcp-repl` binary with an explicit sandbox state and verifies the worker is launched inside that policy through public MCP calls.
+- Reintroduce sandbox coverage in the Python runner now, starting with the default `workspace-write` behavior and then adding read-only or full-access contrasts where they prove public behavior.
 - Keep each migrated case focused enough that matching Rust integration coverage can be removed or reduced in the same change.
-- Use `--sandbox danger-full-access` by default for the external suite so the early cases test client protocol behavior, not sandbox policy.
+- Use `danger-full-access` only for individual external cases whose purpose is unrelated to sandboxing and where disabling sandbox enforcement does not hide the product behavior under test.
 - Keep existing Rust tests discoverable by `cargo test` until their scenario is migrated or removed in the same change that adds equivalent Python coverage.
 
 ## Long-Term Direction
 
-- Migrate representative public API integration scenarios out of Rust when the Python runner covers the same real-binary behavior.
-- Keep sandbox-policy tests, protocol-worker conformance tests, and Rust-only contract tests in Rust unless there is a clearer public external scenario.
+- Migrate representative public API integration scenarios out of Rust when the Python runner covers the same real-binary behavior, including sandbox behavior that is observable through public MCP tool calls.
+- Keep protocol-worker conformance tests, Rust-only contract tests, and deeply platform-specific sandbox launch mechanics in Rust unless there is a clearer public external scenario for the same contract.
 
 ## Phase Status
 
 - Phase 0: completed - add the runner shell and first R console smoke case.
 - Phase 1: completed - migrate another small real-client scenario with timeout or busy-worker behavior.
 - Phase 2: completed - run the external suite in CI after the debug binary is built.
+- Phase 3: pending - reintroduce sandbox scenarios in the Python runner and continue migrating duplicate real-binary Rust integration coverage case by case.
 
 ## Locked Decisions
 
@@ -38,11 +41,13 @@
 
 ## Open Questions
 
+- Which sandbox scenarios have public external equivalents and which should remain Rust-only launch or platform-mechanics coverage.
 - Which additional public scenarios should migrate into the external suite before the parent migration is complete.
 
 ## Next Safe Slice
 
-- Migrate the next representative public scenario only if it can replace or reduce matching Rust integration coverage in the same change.
+- Add a Python-runner sandbox case that starts the binary under `workspace-write`, proves an in-workspace write succeeds, and proves an out-of-policy write is blocked through the public `repl` tool.
+- In the same or next small slice, migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
 
 ## Stop Conditions
 
@@ -59,3 +64,4 @@
 - 2026-05-17: Added files-mode output-bundle scenarios for text bundles, pruning, timeout backfill, and size-cap omission, then removed duplicate broad Rust integration coverage.
 - 2026-05-17: Removed obsolete serial scheduling after verifying the remaining Rust REPL binaries pass under normal Cargo test scheduling.
 - 2026-05-18: Reaffirmed that unmigrated Rust scenarios must remain discoverable by `cargo test`; migrations should replace Rust coverage with equivalent Python coverage in the same change, not disable tests ahead of time.
+- 2026-05-18: Clarified that the external runner itself is not sandboxed, but the spawned `mcp-repl` binary still owns the sandbox contract; the next slice should restore sandbox coverage in the Python runner starting with `workspace-write`.
