@@ -93,6 +93,12 @@ fn r_path_literal(path: &Path) -> TestResult<String> {
     Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
 }
 
+fn workspace_tempdir() -> TestResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix("mcp-repl-write-stdin-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))?)
+}
+
 async fn wait_until_path_exists(path: &Path, label: &str) -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -746,7 +752,7 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
 async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
-    let temp = tempdir()?;
+    let temp = workspace_tempdir()?;
     let start_gate_path = temp.path().join("start-ready");
     let done_path = temp.path().join("small-done");
     let start_gate_literal = r_path_literal(&start_gate_path)?;
@@ -968,7 +974,7 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
 async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
-    let temp = tempdir()?;
+    let temp = workspace_tempdir()?;
     let start_gate_path = temp.path().join("start-ready");
     let mid_ready_path = temp.path().join("mid-ready");
     let tail_gate_path = temp.path().join("tail-ready");
@@ -1527,7 +1533,7 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
-    let temp = tempdir()?;
+    let temp = workspace_tempdir()?;
     let start_gate_path = temp.path().join("start-ready");
     let done_path = temp.path().join("pager-done");
     let start_gate_literal = r_path_literal(&start_gate_path)?;
@@ -1601,7 +1607,7 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
 async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
-    let temp = tempdir()?;
+    let temp = workspace_tempdir()?;
     let start_gate_path = temp.path().join("start-ready");
     let mid_ready_path = temp.path().join("mid-ready");
     let tail_gate_path = temp.path().join("tail-ready");
