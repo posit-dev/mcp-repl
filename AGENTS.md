@@ -7,19 +7,26 @@ Keep this file short. It is a table of contents, not the full manual.
 - If you modified code, run all required checks before replying:
   - `cargo check`
   - `cargo build`
+  - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo test`
+  - `cargo test --quiet`
   - `cargo +nightly fmt`
+- For docs-only changes, run the narrow docs validation that covers the edited
+  files, usually `cargo test --test docs_contracts`.
+- When changing Codex backend selection or CI real-client wiring, also run:
+  - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1`
 - Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 
 ## Start Here
 
 - `docs/index.md`: source-of-truth map for repository docs.
-- `docs/architecture.md`: subsystem map for the binary, worker, sandbox, and eval surfaces.
+- `docs/architecture.md`: subsystem map for the CLI, server, worker, sandbox, output, and validation surfaces.
 - `docs/testing.md`: public verification surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and stdio tracing.
 - `docs/sandbox.md`: sandbox modes and writable-root policy.
+- `docs/output_timeline.md`: visible output ordering across sideband and raw streams.
+- `docs/worker_sideband_protocol.md`: current server/worker IPC contract.
 - `docs/plans/AGENTS.md`: when to create checked-in execution plans.
 
 ## Glossary
@@ -41,8 +48,8 @@ Keep this file short. It is a table of contents, not the full manual.
 - Sandbox metadata: Codex per-tool-call `_meta["codex/sandbox-state-meta"]` used by `--sandbox inherit` to choose the effective worker sandbox for that call.
 - Writable root: An absolute path that a `workspace-write` worker may write, subject to forced read-only subpaths like `.git`, `.codex`, and `.agents`.
 - Session temp directory: The server-allocated per-session temp path exposed to the worker as `TMPDIR` and `MCP_REPL_R_SESSION_TMPDIR`.
-- Sideband IPC: The JSON-lines server/worker pipe for structural facts such as `readline_start`, `readline_result`, `plot_image`, `request_end`, and `session_end`.
-- stdout/stderr pipes: The normal process output streams captured by the server. They are the authoritative visible text source; sideband only helps interpret them.
+- Sideband IPC: The JSON-lines server/worker pipe for structural facts such as `readline_start`, `readline_input`, `readline_discard`, `output_text`, `plot_image`, and `session_end`.
+- Raw output capture: The stdout/stderr pipes or PTY stream captured by the server for unowned visible text. Sideband carries worker-owned text and structural facts.
 - Output timeline: The server-side reconstruction of visible output order from captured stdout/stderr plus sideband facts.
 - Server-owned: State, files, or notices created and retained by the main server process, not by the runtime or the worker. Use this for output bundles, response finalization, debug logs, and server temp roots.
 - Worker-originated text: Text that came from the worker REPL or worker child processes and can be written to `transcript.txt`.
@@ -60,7 +67,10 @@ Keep this file short. It is a table of contents, not the full manual.
   - `cargo insta test`
   - `cargo insta pending-snapshots`
   - `cargo insta review` or `cargo insta accept` / `cargo insta reject`
-- CI-style validation: `cargo insta test --check --unreferenced=reject`
+- CI-style validation: `cargo insta test --check`
+- Do not add `--unreferenced=reject` to the general snapshot check; this
+  repository keeps valid platform-specific snapshots that are unreferenced on
+  other platforms.
 - For broad intentional snapshot migrations: `cargo insta test --force-update-snapshots --accept`
 - Do not delete `tests/snapshots/*.snap.new` manually. Use `cargo insta reject`.
 

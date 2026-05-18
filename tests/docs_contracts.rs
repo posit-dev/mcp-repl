@@ -28,6 +28,8 @@ fn assert_contains_wrapped_text(document: &str, required: &str, source: &str) {
 #[test]
 fn agents_is_short_and_points_to_main_docs() {
     let agents = read(&repo_root().join("AGENTS.md"));
+    let testing_docs = read(&repo_root().join("docs/testing.md"));
+    let tests_readme = read(&repo_root().join("tests/README.md"));
     assert!(
         agents.lines().count() <= 120,
         "AGENTS.md should stay at 120 lines or less"
@@ -41,8 +43,39 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
+        "cargo test --quiet",
+        "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
+        "cargo insta test --check",
+        "MCP_REPL_CODEX_BACKEND=mock",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
+    }
+
+    assert!(
+        !agents.contains("cargo nextest"),
+        "AGENTS.md should use cargo test as the Rust test runner"
+    );
+    assert!(
+        !agents.contains("tests/run_rust_tests.py"),
+        "AGENTS.md should not use the transitional explicit Rust test wrapper"
+    );
+    assert!(
+        !agents.contains("scripts/public_api_suite.py"),
+        "AGENTS.md should use tests/run_integration_tests.py"
+    );
+    for (source, text) in [
+        ("AGENTS.md", agents.as_str()),
+        ("docs/testing.md", testing_docs.as_str()),
+        ("tests/README.md", tests_readme.as_str()),
+    ] {
+        assert!(
+            text.contains("cargo insta test --check"),
+            "missing runnable cargo-insta check in {source}"
+        );
+        assert!(
+            !text.contains("cargo insta test --check --unreferenced=reject"),
+            "general cargo-insta check should not reject valid platform-specific snapshots in {source}"
+        );
     }
 }
 
@@ -154,8 +187,6 @@ fn ci_workflow_defines_dev_release_contract() {
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
         "mcp-repl-x86_64-pc-windows-msvc.zip",
-        "npm install -g @openai/codex",
-        "npm config get prefix",
         "SHA256SUMS.txt",
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
@@ -163,6 +194,15 @@ fn ci_workflow_defines_dev_release_contract() {
         "github.event_name == 'pull_request'",
         "github.event_name == 'push' && github.ref == 'refs/heads/main'",
         "github.event_name == 'push' && github.ref_type == 'tag'",
+        "run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
+        "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
+        "npm install -g @openai/codex",
+        "npm config get prefix",
+        "name: cargo test",
+        "run: cargo test --quiet",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "MCP_REPL_CODEX_BACKEND: mock",
         "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
@@ -193,12 +233,173 @@ fn ci_workflow_defines_dev_release_contract() {
         "codex-x86_64-pc-windows-msvc.exe.zip",
         "https://github.com/openai/codex/releases/latest/download/",
         "Expand-Archive",
+        "scripts/public_api_suite.py",
+        "cargo-nextest",
+        "taiki-e/install-action@nextest",
+        "cargo nextest",
+        "profile ci",
+        ".config/nextest.toml",
     ] {
         assert!(
             !workflow.contains(forbidden),
             "did not expect {forbidden} in .github/workflows/ci.yml"
         );
     }
+}
+
+#[test]
+fn ci_runs_codex_integration_with_mock_backend() {
+    let root = repo_root();
+    let workflow = read(&root.join(".github/workflows/ci.yml"));
+    let testing_docs = read(&root.join("docs/testing.md"));
+    let codex_integration = read(&root.join("tests/codex_integration.rs"));
+    let claude_integration = read(&root.join("tests/claude_integration.rs"));
+
+    for required in [
+        "name: Install Codex CLI",
+        "name: Install Codex CLI (windows)",
+        "npm install -g @openai/codex",
+        "name: cargo test",
+        "run: cargo test --quiet",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "MCP_REPL_CODEX_BACKEND: mock",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/ci.yml"
+        );
+    }
+
+    for forbidden in [
+        "taiki-e/install-action@nextest",
+        "cargo nextest",
+        "name: cargo test (real codex integrations)",
+        "run: cargo test -j 1 --test codex_integration -- --test-threads=1",
+        "tests/run_rust_tests.py",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "did not expect {forbidden} in .github/workflows/ci.yml"
+        );
+    }
+
+    assert!(
+        !root.join(".config/nextest.toml").exists(),
+        "the repo should use cargo test directly rather than nextest config"
+    );
+
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "The Rust suite uses plain `cargo test` as its single runner.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI passes Cargo's `--quiet` flag to keep successful logs compact.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI installs Codex before `cargo test` and sets `MCP_REPL_CODEX_BACKEND=mock`, so the Codex integration target runs through the mocked provider as part of the ordinary Rust suite.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Codex uses the Spark model (`gpt-5.3-codex-spark`) in its isolated test config. Claude uses `haiku`.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "The Codex CI integration does not require OpenAI authentication because the test config points Codex at a local mock provider.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "By default, the Codex integration uses `MCP_REPL_CODEX_BACKEND=auto`: it checks whether Codex is logged in, checks whether `gpt-5.3-codex-spark` is available, and uses that live backend when both checks pass. Otherwise it uses the mocked provider.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Set `MCP_REPL_CODEX_BACKEND=live` or `MCP_REPL_CODEX_BACKEND=mock` to force one path.",
+        "docs/testing.md",
+    );
+    assert!(
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1"),
+        "docs/testing.md should show the forced mock Codex backend check"
+    );
+    assert!(
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1"),
+        "docs/testing.md should show the forced live Codex backend check"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI runs the Codex integration target as part of `cargo test`; Claude integration remains local because provider authentication is unavailable in CI.",
+        "docs/testing.md",
+    );
+    assert!(
+        !testing_docs.contains(
+            "CI does not run these binaries because provider authentication is unavailable"
+        ),
+        "docs/testing.md should not claim CI skips the Codex integration binary"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "If a required client binary is unavailable, the matching integration test prints a skip banner with the reason. Codex backend selection prints a `CODEX` banner showing whether the test selected live Spark or the mocked provider.",
+        "docs/testing.md",
+    );
+    assert!(
+        codex_integration.contains(r#"const CODEX_MODEL: &str = "gpt-5.3-codex-spark";"#),
+        "Codex integration should use the Spark model"
+    );
+    assert!(
+        codex_integration.contains("requires_openai_auth = false"),
+        "Codex integration should use the mocked provider without OpenAI auth"
+    );
+    assert!(
+        codex_integration.contains("MCP_REPL_CODEX_BACKEND"),
+        "Codex integration should expose an env var to force live or mock backend selection"
+    );
+    assert!(
+        codex_integration.contains("codex")
+            && codex_integration.contains("login")
+            && codex_integration.contains("status"),
+        "Codex auto backend selection should probe login status"
+    );
+    assert!(
+        codex_integration.contains("debug") && codex_integration.contains("models"),
+        "Codex auto backend selection should inspect available models"
+    );
+    assert!(
+        claude_integration.contains(r#"const CLAUDE_MODEL: &str = "haiku";"#),
+        "Claude integration should use the fastest/cheapest model"
+    );
+}
+
+#[test]
+fn cargo_test_default_discovers_existing_rust_tests() {
+    let root = repo_root();
+    let manifest = read(&root.join("Cargo.toml"));
+    let testing_docs = read(&root.join("docs/testing.md"));
+
+    assert!(
+        !manifest.contains("autotests"),
+        "Cargo.toml should not opt Rust integration tests out of default cargo test"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Plain `cargo test` remains the full Cargo compatibility path. It must continue to discover the binary unit tests and Rust integration targets.",
+        "docs/testing.md",
+    );
+    assert!(
+        !manifest.contains("test = false"),
+        "Cargo.toml should not disable Cargo test discovery for existing targets"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Do not opt Rust test targets out of Cargo discovery in anticipation of a future Python migration; migrate a scenario only when the Rust coverage is deleted or reduced in the same change that adds equivalent external coverage.",
+        "docs/testing.md",
+    );
 }
 
 #[test]

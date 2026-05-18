@@ -63,7 +63,15 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Validation harnesses
 
-- `tests/` is the primary public validation surface. The tests exercise tool behavior, snapshots, sandboxing, and client integrations through the exposed MCP interface.
+- `tests/run_integration_tests.py` starts an already-built `mcp-repl` binary and
+  exercises public MCP tools over stdio. It covers representative real-binary
+  behavior that should not depend on Rust internals.
+- `tests/` contains the Rust public API, snapshot, sandbox, backend, install,
+  protocol-worker, and client-integration suites. Most tests exercise behavior
+  through the exposed MCP interface using the shared harness in `tests/common/`.
+- CI uses Cargo's standard Rust test runner after installing the real Codex CLI,
+  with the Codex backend forced to the mocked provider. The tests should not
+  depend on special local scheduling.
 
 ## Design Constraints
 

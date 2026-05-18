@@ -78,16 +78,17 @@ jobs:
       - name: cargo build
         run: cargo build
 
+      - name: Python public API suite
+        if: matrix.os != 'windows-2022'
+        run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
+
+      - name: Python public API suite (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe
+
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: cargo test
-        if: matrix.os != 'windows-2022'
-        run: cargo test
-
-      - name: cargo test (windows serial)
-        if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 -- --test-threads=1
 
       - name: Install Codex CLI
         if: matrix.os != 'windows-2022'
@@ -110,13 +111,17 @@ jobs:
           $env:PATH = "$npmPrefix;$env:PATH"
           & (Join-Path $npmPrefix "codex.cmd") --version
 
-      - name: cargo test (real codex integrations)
+      - name: cargo test
         if: matrix.os != 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        env:
+          MCP_REPL_CODEX_BACKEND: mock
+        run: cargo test --quiet
 
-      - name: cargo test (real codex integrations, windows serial)
+      - name: cargo test (windows serial)
         if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        env:
+          MCP_REPL_CODEX_BACKEND: mock
+        run: cargo test -j 1 --quiet -- --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

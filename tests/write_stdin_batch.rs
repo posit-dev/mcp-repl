@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(not(windows))]
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 #[cfg(not(windows))]
 fn test_mutex() -> &'static Mutex<()> {
@@ -127,27 +127,6 @@ async fn write_stdin_accepts_multiple_calls() -> TestResult<()> {
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
-
-    snapshot
-        .files_session(
-            "timeout_list",
-            mcp_session!(|session| {
-                session.write_stdin_with("Sys.sleep(5)", Some(2.0)).await;
-                session.write_stdin_with("1+1", Some(1.0)).await;
-                sleep(Duration::from_secs(4)).await;
-                session.write_stdin_with("1+1", Some(10.0)).await;
-                Ok(())
-            }),
-        )
-        .await?;
-
-    assert_snapshot_or_skip("write_stdin_timeout_then_busy_then_recovers", &snapshot)
-}
-
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server_with_files().await?;
@@ -156,8 +135,8 @@ async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestR
         .call_tool_raw(
             session.repl_tool_name(),
             json!({
-                "input": "plot(1:10)\nSys.sleep(2)\ncat('done\\n')\n",
-                "timeout_ms": 200
+                "input": "plot(1:10)\nSys.sleep(0.5)\ncat('done\\n')\n",
+                "timeout_ms": 100
             }),
         )
         .await?;
@@ -224,8 +203,8 @@ async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> 
 
     let first = session
         .write_stdin_raw_with(
-            "cat(\"start\\n\"); flush.console(); Sys.sleep(2); cat(\"end\\n\")",
-            Some(1.0),
+            "cat(\"start\\n\"); flush.console(); Sys.sleep(0.6); cat(\"end\\n\")",
+            Some(0.1),
         )
         .await?;
     let first_text = collect_text(&first);

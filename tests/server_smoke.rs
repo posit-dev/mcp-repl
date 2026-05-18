@@ -3,6 +3,31 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time;
+
+fn resolve_mcp_repl_path() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.pop();
+    let mut candidate_path = path;
+    candidate_path.push("mcp-repl");
+    if cfg!(windows) {
+        candidate_path.set_extension("exe");
+    }
+    if candidate_path.exists() {
+        return Ok(candidate_path);
+    }
+
+    Err("unable to locate mcp-repl test binary".into())
+}
 
 #[test]
 fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
@@ -11,6 +36,33 @@ fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
         !common::backend_unavailable(text),
         "request-completion IPC disconnects should fail tests instead of skipping them"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_server_startup_stderr_omits_routine_notice() -> TestResult<()> {
+    let exe = resolve_mcp_repl_path()?;
+    let output = time::timeout(
+        Duration::from_secs(15),
+        Command::new(exe)
+            .args(["--interpreter", "python", "--sandbox", "danger-full-access"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "server startup timed out")??;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("starting mcp-repl server"),
+        "routine startup notice should not be written to stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.trim().is_empty(),
+        "closed-stdin startup failure should still write diagnostic stderr"
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -37,30 +89,6 @@ async fn sends_input_to_r_console_snapshot() -> TestResult<()> {
     insta::with_settings!({ snapshot_suffix => "transcript" }, {
         insta::assert_snapshot!("sends_input_to_r_console", transcript);
     });
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sends_input_to_r_console_smoke() -> TestResult<()> {
-    let mut session = common::spawn_server().await?;
-    let first = session.write_stdin_raw_with("1+1", Some(30.0)).await?;
-    let result = common::wait_until_ready_with_input_retry(
-        &mut session,
-        "1+1",
-        first,
-        5.0,
-        std::time::Duration::from_millis(100),
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
-    let text = common::result_text(&result);
-    if common::backend_unavailable(&text) {
-        eprintln!("server_smoke backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    session.cancel().await?;
-    assert!(text.contains("2"), "expected 2 in output, got: {text:?}");
     Ok(())
 }
 

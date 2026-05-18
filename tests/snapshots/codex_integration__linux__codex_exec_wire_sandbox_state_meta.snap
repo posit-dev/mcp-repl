@@ -1,5 +1,6 @@
 ---
-source: tests/codex_approvals_tui.rs
+source: tests/codex_integration.rs
+assertion_line: 2490
 expression: snapshot
 ---
 {
@@ -30,11 +31,6 @@ expression: snapshot
           "x-codex-turn-metadata": {
             "session_id": "<SESSION_ID>",
             "turn_id": "<TURN_ID>",
-            "workspaces": {
-              "<WORKSPACE>": {
-                "has_changes": false
-              }
-            },
             "sandbox": "<SANDBOX_BACKEND>"
           },
           "codex/sandbox-state-meta": {
@@ -47,7 +43,7 @@ expression: snapshot
               "exclude_tmpdir_env_var": false,
               "exclude_slash_tmp": false
             },
-            "codexLinuxSandboxExe": null,
+            "codexLinuxSandboxExe": "<CODEX_LINUX_SANDBOX_EXE>",
             "sandboxCwd": "<WORKSPACE>",
             "useLegacyLandlock": false
           }

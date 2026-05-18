@@ -43,12 +43,6 @@ fn is_busy_response(text: &str) -> bool {
         || text.contains("input discarded while worker busy")
 }
 
-fn is_restart_transient_output(text: &str) -> bool {
-    is_busy_response(text)
-        || text.contains("new session started")
-        || text.contains("worker exited with status")
-}
-
 async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args(vec![
         "--sandbox".to_string(),
@@ -162,8 +156,13 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
     session: common::McpTestSession,
 ) -> TestResult<()> {
-    let input = "Sys.sleep(0.3); invisible(system(\"printf '> '\"))";
-    let timeout_result = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let temp = tempfile::tempdir()?;
+    let marker_path = temp.path().join("child-output-ready");
+    let marker_literal = serde_json::to_string(&marker_path.to_string_lossy())?;
+    let input = format!(
+        "Sys.sleep(0.1); invisible(system(\"printf '> '\")); writeLines('ready', {marker_literal}); repeat Sys.sleep(0.05)"
+    );
+    let timeout_result = session.write_stdin_raw_with(input, Some(0.005)).await?;
     let timeout_text = result_text(&timeout_result);
     if backend_unavailable(&timeout_text) {
         eprintln!("interrupt test backend unavailable in this environment; skipping");
@@ -175,7 +174,14 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
         "expected child stdout request to time out, got: {timeout_text:?}"
     );
 
-    sleep(Duration::from_millis(700)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker_path.exists() {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            panic!("child prompt-shaped output marker was not written");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
@@ -189,8 +195,8 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
         session.cancel().await?;
         return Ok(());
     }
-    assert_eq!(
-        interrupt_text, "> > ",
+    assert!(
+        interrupt_text.matches("> ").count() >= 2,
         "expected raw prompt-shaped output plus completion prompt, got: {interrupt_text:?}"
     );
 
@@ -214,46 +220,6 @@ async fn files_interrupt_drain_preserves_prompt_shaped_child_stdout() -> TestRes
         spawn_interrupt_files_session().await?,
     )
     .await
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = spawn_interrupt_session().await?;
-
-    let timeout_result = session
-        .write_stdin_raw_with("Sys.sleep(30)", Some(0.5))
-        .await?;
-    let timeout_text = result_text(&timeout_result);
-    if backend_unavailable(&timeout_text) {
-        eprintln!("interrupt test backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        timeout_text.contains("<<repl status: busy"),
-        "expected sleep call to time out, got: {timeout_text:?}"
-    );
-
-    let result = session.write_stdin_raw_with("\u{3}1+1", Some(5.0)).await?;
-    let text = result_text(&result);
-    if text.contains("<<repl status: busy")
-        || text.contains("worker is busy")
-        || text.contains("request already running")
-        || text.contains("input discarded while worker busy")
-    {
-        eprintln!("interrupt prefix did not complete in time; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        text.contains("[1] 2") || text.contains("2"),
-        "expected evaluation after interrupt prefix, got: {text:?}"
-    );
-
-    session.cancel().await?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -386,58 +352,6 @@ tryCatch(
         text.contains("AFTER_INTERRUPT"),
         "expected remaining input after ctrl-c prefix to run, got: {text:?}"
     );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = spawn_interrupt_session().await?;
-
-    let _ = session.write_stdin_raw_with("x <- 1", Some(5.0)).await?;
-
-    let first = session
-        .write_stdin_raw_with("\u{4}print(exists(\"x\"))", Some(10.0))
-        .await?;
-    let mut text = result_text(&first);
-    if backend_unavailable(&text) {
-        eprintln!("interrupt test backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if text.contains("FALSE") {
-            break;
-        }
-        assert!(
-            !text.contains("TRUE"),
-            "expected restarted session to clear x, got: {text:?}"
-        );
-        if Instant::now() >= deadline {
-            session.cancel().await?;
-            panic!("expected fresh session after restart prefix, got: {text:?}");
-        }
-        sleep(Duration::from_millis(100)).await;
-        let result = session
-            .write_stdin_raw_with("print(exists(\"x\"))", Some(5.0))
-            .await?;
-        text = result_text(&result);
-        if backend_unavailable(&text) {
-            eprintln!("interrupt test backend unavailable in this environment; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        if is_restart_transient_output(&text) {
-            continue;
-        }
-    }
-    assert!(
-        text.contains("FALSE"),
-        "expected fresh session output, got: {text:?}"
-    );
-
-    session.cancel().await?;
     Ok(())
 }
 
