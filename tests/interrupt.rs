@@ -162,7 +162,7 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
     let input = format!(
         "Sys.sleep(0.1); invisible(system(\"printf '> '\")); writeLines('ready', {marker_literal}); repeat Sys.sleep(0.05)"
     );
-    let timeout_result = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout_result = session.write_stdin_raw_with(input, Some(0.005)).await?;
     let timeout_text = result_text(&timeout_result);
     if backend_unavailable(&timeout_text) {
         eprintln!("interrupt test backend unavailable in this environment; skipping");
