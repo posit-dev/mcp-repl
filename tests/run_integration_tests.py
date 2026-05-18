@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import queue
-import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 
@@ -160,6 +161,15 @@ class McpStdioClient:
             raise McpProtocolError(f"tools/call returned non-object result: {response!r}")
         return result
 
+    def repl(self, input: str, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"input": input}
+        if timeout_ms is not None:
+            arguments["timeout_ms"] = timeout_ms
+        return self.call_tool("repl", arguments)
+
+    def repl_reset(self) -> dict[str, Any]:
+        return self.call_tool("repl_reset", {})
+
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -231,6 +241,37 @@ class McpStdioClient:
         return "server stderr:\n" + "\n".join(tail)
 
 
+def text(value: str) -> dict[str, Any]:
+    return {"type": "text", "text": value}
+
+
+def tool_result(*content: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
+    return {"content": list(content), "isError": is_error}
+
+
+def pretty_json(value: dict[str, Any]) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def assert_identical(
+    expected: dict[str, Any],
+    received: dict[str, Any],
+    context: str,
+) -> None:
+    if expected == received:
+        return
+    diff = "\n".join(
+        difflib.unified_diff(
+            pretty_json(expected).splitlines(),
+            pretty_json(received).splitlines(),
+            fromfile="expected",
+            tofile="received",
+            lineterm="",
+        )
+    )
+    raise SuiteFailure(f"{context} response mismatch:\n{diff}")
+
+
 def result_text(result: dict[str, Any]) -> str:
     content = result.get("content")
     if not isinstance(content, list):
@@ -243,57 +284,68 @@ def result_text(result: dict[str, Any]) -> str:
 
 
 def require_success(result: dict[str, Any], context: str) -> str:
-    text = result_text(result)
-    if result.get("isError") is True:
-        raise SuiteFailure(f"{context} returned isError=true: {text!r}")
-    return text
+    if result.get("isError") is not False:
+        raise SuiteFailure(f"{context} returned error result: {pretty_json(result)}")
+    return result_text(result)
 
 
-def require_r_result_two(text: str, context: str) -> None:
-    if re.search(r"(?m)(^|\s)2(\s|$)", text) is None:
-        raise SuiteFailure(f"{context} expected R console result 2, got: {text!r}")
-
-
-def is_busy_response(text: str) -> bool:
+def is_busy_response(result: dict[str, Any]) -> bool:
+    response_text = result_text(result)
     return (
-        "<<repl status: busy" in text
-        or "worker is busy" in text
-        or "request already running" in text
-        or "input discarded while worker busy" in text
+        "<<repl status: busy" in response_text
+        or "worker is busy" in response_text
+        or "request already running" in response_text
+        or "input discarded while worker busy" in response_text
     )
 
 
-def wait_until_not_busy(
+def wait_for_response(
     client: McpStdioClient,
+    expected: dict[str, Any],
     context: str,
     deadline_seconds: float = 5.0,
-) -> str:
+) -> dict[str, Any]:
     assert deadline_seconds > 0
     deadline = time.monotonic() + deadline_seconds
-    last_text = ""
+    last_received: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        result = client.call_tool(
-            "repl",
-            {
-                "input": "",
-                "timeout_ms": 500,
-            },
-        )
-        last_text = require_success(result, context)
-        if not is_busy_response(last_text):
-            return last_text
-    raise SuiteFailure(f"{context} remained busy after polling: {last_text!r}")
+        received = client.repl("", timeout_ms=500)
+        last_received = received
+        if is_busy_response(received):
+            continue
+        assert_identical(expected, normalize_response(received), context)
+        return received
+    raise SuiteFailure(f"{context} remained busy after polling: {last_received!r}")
 
 
-def require_success_when_not_busy(
+def wait_for_busy_response_text(
     client: McpStdioClient,
-    result: dict[str, Any],
+    received: dict[str, Any],
+    needle: str,
     context: str,
-) -> str:
-    text = require_success(result, context)
-    if not is_busy_response(text):
-        return text
-    return wait_until_not_busy(client, context)
+    deadline_seconds: float = 20.0,
+) -> dict[str, Any]:
+    assert deadline_seconds > 0
+    deadline = time.monotonic() + deadline_seconds
+    last_received = received
+    while True:
+        last_text = require_success(last_received, context)
+        if needle in last_text:
+            if is_busy_response(last_received):
+                return last_received
+            raise SuiteFailure(
+                f"{context} reached {needle!r} marker after worker finished: "
+                f"{last_text!r}"
+            )
+        if not is_busy_response(last_received):
+            raise SuiteFailure(
+                f"{context} finished before {needle!r} marker: {last_text!r}"
+            )
+        if time.monotonic() >= deadline:
+            raise SuiteFailure(
+                f"{context} did not reach {needle!r} marker: {last_text!r}"
+            )
+        last_received = client.repl("", timeout_ms=500)
 
 
 def disclosed_path(text: str, suffix: str) -> Path | None:
@@ -314,6 +366,75 @@ def bundle_transcript_path(text: str) -> Path | None:
     return disclosed_path(text, "transcript.txt")
 
 
+def normalize_busy_timeout_elapsed_ms(value: str) -> str:
+    marker = "elapsed_ms="
+    out: list[str] = []
+    index = 0
+    while True:
+        marker_index = value.find(marker, index)
+        if marker_index == -1:
+            out.append(value[index:])
+            return "".join(out)
+        out.append(value[index:marker_index])
+        out.append(marker)
+        digit_index = marker_index + len(marker)
+        while digit_index < len(value) and value[digit_index].isdigit():
+            digit_index += 1
+        if digit_index > marker_index + len(marker):
+            out.append("N")
+        index = digit_index
+
+
+def disclosed_path_strings(value: str, suffix: str) -> list[str]:
+    paths: list[str] = []
+    search_from = 0
+    while True:
+        end = value.find(suffix, search_from)
+        if end == -1:
+            return paths
+        end += len(suffix)
+        start = 0
+        for index in range(end - 1, -1, -1):
+            ch = value[index]
+            if ch.isspace() or ch in "\"'[(":
+                start = index + 1
+                break
+        paths.append(value[start:end])
+        search_from = end
+
+
+def normalize_output_bundle_path(path: str) -> str:
+    parts = path.replace("\\", "/").split("/")
+    output_dir = next(
+        (part for part in reversed(parts) if part.startswith("output-")),
+        "output-0001",
+    )
+    leaf = "events.log" if path.endswith("events.log") else "transcript.txt"
+    return f"<mcp-repl-output>/{output_dir}/{leaf}"
+
+
+def normalize_output_bundle_paths(value: str) -> str:
+    normalized = value
+    for suffix in ["transcript.txt", "events.log"]:
+        for path in disclosed_path_strings(value, suffix):
+            normalized = normalized.replace(path, normalize_output_bundle_path(path))
+    return normalized
+
+
+def normalize_text_value(value: str) -> str:
+    return normalize_output_bundle_paths(normalize_busy_timeout_elapsed_ms(value))
+
+
+def normalize_response(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: normalize_response(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize_response(item) for item in value]
+    if isinstance(value, str):
+        return normalize_text_value(value)
+    return value
+
+
 def r_string_literal(value: str) -> str:
     return json.dumps(value.replace("\\", "/"))
 
@@ -326,20 +447,34 @@ def r_large_text_input(label: str, lines: int = 80, width: int = 120) -> str:
     )
 
 
-def repl_text(
-    client: McpStdioClient,
-    input_text: str,
-    timeout_ms: int,
-    context: str,
-) -> str:
-    result = client.call_tool(
-        "repl",
-        {
-            "input": input_text,
-            "timeout_ms": timeout_ms,
-        },
+def repeated_text_line(label: str, index: int, width: int = 120) -> str:
+    return f"{label}{index:03d} {label * width}\n"
+
+
+def expected_large_text_preview(label: str, output_number: int) -> str:
+    head = "".join(repeated_text_line(label, index) for index in range(1, 19))
+    tail = "".join(repeated_text_line(label, index) for index in range(72, 81))
+    return (
+        head
+        + "...[middle truncated; shown lines 1-18 and 72-81 of 81 total; "
+        f"full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt]...\n"
+        + tail
+        + "> "
     )
-    return require_success_when_not_busy(client, result, context)
+
+
+def expected_capped_text_preview(label: str, output_number: int) -> str:
+    lines = "".join(repeated_text_line(label, index) for index in range(1, 17))
+    return (
+        lines
+        + f"{label}017 {label}\n"
+        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt; "
+        "later content omitted]..."
+    )
+
+
+def expected_pager_lines(start: int, end: int) -> str:
+    return "".join(f"L{index:04d}\n" for index in range(start, end + 1))
 
 
 def require_transcript_path(text: str, context: str) -> Path:
@@ -355,191 +490,150 @@ def require_text_file(path: Path, context: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def wait_for_interrupt_ready(client: McpStdioClient, text: str, context: str) -> str:
-    deadline = time.monotonic() + 20.0
-    last_text = text
-    while time.monotonic() < deadline:
-        if "INTERRUPT_READY" in last_text:
-            return last_text
-        if not is_busy_response(last_text):
-            raise SuiteFailure(
-                f"{context} finished before interrupt readiness marker: {last_text!r}"
-            )
-        result = client.call_tool(
-            "repl",
-            {
-                "input": "",
-                "timeout_ms": 500,
-            },
-        )
-        last_text = require_success(result, context)
-    raise SuiteFailure(f"{context} did not reach interrupt readiness: {last_text!r}")
-
-
 def r_console_basic(client: McpStdioClient) -> None:
-    result = client.call_tool(
-        "repl",
-        {
-            "input": "1+1\n",
-            "timeout_ms": 30000,
-        },
+    received = client.repl("1+1\n", timeout_ms=30000)
+
+    expected = tool_result(
+        text("[1] 2\n"),
+        text("> "),
     )
-    text = require_success(result, "repl")
-    require_r_result_two(text, "repl")
+
+    assert_identical(expected, received, "repl")
 
 
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
-    warmup = client.call_tool(
-        "repl",
-        {
-            "input": "1+1\n",
-            "timeout_ms": 30000,
-        },
+    warmup = client.repl("1+1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("[1] 2\n"), text("> ")),
+        warmup,
+        "warmup repl",
     )
-    require_r_result_two(require_success(warmup, "warmup repl"), "warmup repl")
 
-    timed_out = client.call_tool(
-        "repl",
-        {
-            "input": "Sys.sleep(1)\n",
-            "timeout_ms": 300,
-        },
+    timed_out = client.repl("Sys.sleep(5)\n", timeout_ms=300)
+    assert_identical(
+        tool_result(
+            text("<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>")
+        ),
+        normalize_response(timed_out),
+        "timeout repl",
     )
-    timed_out_text = require_success(timed_out, "timeout repl")
-    if "<<repl status: busy" not in timed_out_text:
-        raise SuiteFailure(f"expected timeout busy marker, got: {timed_out_text!r}")
 
-    busy_follow_up = client.call_tool(
-        "repl",
-        {
-            "input": "1+1\n",
-            "timeout_ms": 300,
-        },
+    busy_follow_up = client.repl("1+1\n", timeout_ms=300)
+    assert_identical(
+        tool_result(
+            text("<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"),
+            text("[repl] input discarded while worker busy"),
+        ),
+        normalize_response(busy_follow_up),
+        "busy follow-up repl",
     )
-    busy_text = require_success(busy_follow_up, "busy follow-up repl")
-    if "<<repl status: busy" not in busy_text:
-        raise SuiteFailure(f"expected busy follow-up marker, got: {busy_text!r}")
-    if "input discarded while worker busy" not in busy_text:
-        raise SuiteFailure(f"expected busy input discard notice, got: {busy_text!r}")
 
-    wait_until_not_busy(client, "timeout poll repl")
-
-    recovered = client.call_tool(
-        "repl",
-        {
-            "input": "1+1\n",
-            "timeout_ms": 5000,
-        },
+    wait_for_response(
+        client,
+        tool_result(text("> ")),
+        "timeout poll repl",
+        deadline_seconds=10.0,
     )
-    recovered_text = require_success(recovered, "recovery repl")
-    if "<<repl status: busy" in recovered_text:
-        raise SuiteFailure(f"expected recovery response, got: {recovered_text!r}")
-    require_r_result_two(recovered_text, "recovery repl")
+
+    recovered = client.repl("1+1\n", timeout_ms=5000)
+    assert_identical(
+        tool_result(text("[1] 2\n"), text("> ")),
+        recovered,
+        "recovery repl",
+    )
 
 
 def r_reset_clears_state(client: McpStdioClient) -> None:
-    set_var = client.call_tool(
-        "repl",
-        {
-            "input": "x <- 1\n",
-            "timeout_ms": 30000,
-        },
+    set_var = client.repl("x <- 1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("> ")),
+        set_var,
+        "set variable repl",
     )
-    set_var_text = require_success(set_var, "set variable repl")
-    if "<<repl status: busy" in set_var_text:
-        raise SuiteFailure(f"expected set variable response, got: {set_var_text!r}")
 
-    reset = client.call_tool("repl_reset", {})
-    require_success(reset, "repl_reset")
-
-    after_reset = client.call_tool(
-        "repl",
-        {
-            "input": "print(exists(\"x\"))\n",
-            "timeout_ms": 30000,
-        },
+    reset = client.repl_reset()
+    assert_identical(
+        tool_result(text("[repl] new session started")),
+        reset,
+        "repl_reset",
     )
-    after_reset_text = require_success(after_reset, "after reset repl")
-    if "<<repl status: busy" in after_reset_text:
-        raise SuiteFailure(f"expected after-reset response, got: {after_reset_text!r}")
-    if "FALSE" not in after_reset_text:
-        raise SuiteFailure(f"expected reset state, got: {after_reset_text!r}")
+
+    after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
+    assert_identical(
+        tool_result(text("[1] FALSE\n"), text("> ")),
+        after_reset,
+        "after reset repl",
+    )
 
 
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
-    set_var = client.call_tool(
-        "repl",
-        {
-            "input": "x <- 1\n",
-            "timeout_ms": 30000,
-        },
+    set_var = client.repl("x <- 1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("> ")),
+        set_var,
+        "set variable before restart",
     )
-    require_success_when_not_busy(client, set_var, "set variable before restart")
 
-    restarted = client.call_tool(
-        "repl",
-        {
-            "input": "\u0004print(exists(\"x\"))\n",
-            "timeout_ms": 30000,
-        },
-    )
-    restarted_text = require_success_when_not_busy(
-        client,
+    restarted = client.repl('\u0004print(exists("x"))\n', timeout_ms=30000)
+    assert_identical(
+        tool_result(
+            text("[repl] new session started\n"),
+            text("[1] FALSE\n"),
+            text("> "),
+        ),
         restarted,
         "restart prefix repl",
     )
-    if "FALSE" not in restarted_text:
-        raise SuiteFailure(f"expected restart prefix to clear state, got: {restarted_text!r}")
 
-    long_running = r"""
-cat("INTERRUPT_READY\n")
-flush.console()
-tryCatch(
-  {
-    repeat Sys.sleep(0.5)
-  },
-  interrupt = function(e) cat("interrupt received\n")
-)
-"""
-    timed_out = client.call_tool(
-        "repl",
-        {
-            "input": long_running,
-            "timeout_ms": 300,
-        },
-    )
-    timed_out_text = require_success(timed_out, "interrupt setup repl")
-    wait_for_interrupt_ready(client, timed_out_text, "interrupt setup repl")
-
-    interrupted = client.call_tool(
-        "repl",
-        {
-            "input": "\u0003cat(\"AFTER_INTERRUPT\\n\")",
-            "timeout_ms": 5000,
-        },
-    )
-    interrupted_text = require_success_when_not_busy(
-        client,
-        interrupted,
-        "interrupt prefix repl",
-    )
-    if "interrupt received" not in interrupted_text:
-        raise SuiteFailure(
-            f"expected interrupt handler output, got: {interrupted_text!r}"
+    long_running = dedent(
+        r"""
+        cat("INTERRUPT_READY\n")
+        flush.console()
+        tryCatch(
+          {
+            repeat Sys.sleep(0.5)
+          },
+          interrupt = function(e) cat("interrupt received\n")
         )
-    if "AFTER_INTERRUPT" not in interrupted_text:
-        raise SuiteFailure(
-            f"expected remaining input after interrupt, got: {interrupted_text!r}"
+        """
+    )
+    timed_out = client.repl(long_running, timeout_ms=1000)
+    wait_for_busy_response_text(
+        client,
+        timed_out,
+        "INTERRUPT_READY",
+        "interrupt setup repl",
+    )
+
+    expected_interrupted = tool_result(
+        text("interrupt received\n"),
+        text("AFTER_INTERRUPT\n"),
+        text("> "),
+    )
+    interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
+    if is_busy_response(interrupted):
+        wait_for_response(
+            client,
+            expected_interrupted,
+            "interrupt prefix repl",
+            deadline_seconds=10.0,
+        )
+    else:
+        assert_identical(
+            expected_interrupted,
+            interrupted,
+            "interrupt prefix repl",
         )
 
 
 def r_output_bundle_files(client: McpStdioClient) -> None:
-    oversized_text = repl_text(
-        client,
-        r_large_text_input("x"),
-        30000,
+    oversized = client.repl(r_large_text_input("x"), timeout_ms=30000)
+    assert_identical(
+        tool_result(text(expected_large_text_preview("x", 1))),
+        normalize_response(oversized),
         "output bundle text repl",
     )
+    oversized_text = result_text(oversized)
     transcript_path = require_transcript_path(
         oversized_text,
         "output bundle text repl",
@@ -556,15 +650,18 @@ def r_output_bundle_files(client: McpStdioClient) -> None:
         raise SuiteFailure("did not expect images dir for text-only output bundle")
 
     bundle_paths: list[Path] = []
-    for label in ["a", "b", "c"]:
-        text = repl_text(
-            client,
-            r_large_text_input(label),
-            30000,
+    for output_number, label in enumerate(["a", "b", "c"], start=2):
+        received = client.repl(r_large_text_input(label), timeout_ms=30000)
+        assert_identical(
+            tool_result(text(expected_large_text_preview(label, output_number))),
+            normalize_response(received),
             f"output bundle pruning repl {label}",
         )
         bundle_paths.append(
-            require_transcript_path(text, f"output bundle pruning repl {label}")
+            require_transcript_path(
+                result_text(received),
+                f"output bundle pruning repl {label}",
+            )
         )
 
     if bundle_paths[0].exists():
@@ -576,39 +673,37 @@ def r_output_bundle_files(client: McpStdioClient) -> None:
 
     with tempfile.TemporaryDirectory() as temp_dir:
         gate = Path(temp_dir) / "release"
-        input_text = f"""
-cat("TIMEOUT_START\\n")
-flush.console()
-while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)
-big <- paste(rep("t", 120), collapse = "")
-cat("TIMEOUT_BIG_START\\n")
-for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
-cat("TIMEOUT_BIG_END\\n")
-"""
-        first = client.call_tool(
-            "repl",
-            {
-                "input": input_text,
-                "timeout_ms": 1000,
-            },
+        input_text = dedent(
+            f"""
+            cat("TIMEOUT_START\\n")
+            flush.console()
+            while (!file.exists({r_string_literal(str(gate))})) Sys.sleep(0.05)
+            big <- paste(rep("t", 120), collapse = "")
+            cat("TIMEOUT_BIG_START\\n")
+            for (i in 1:80) cat(sprintf("timeout%03d %s\\n", i, big))
+            cat("TIMEOUT_BIG_END\\n")
+            """
         )
+        first = client.repl(input_text, timeout_ms=1000)
         first_text = require_success(first, "output bundle timeout setup repl")
-        if not is_busy_response(first_text):
-            raise SuiteFailure(f"expected timeout setup to remain busy, got: {first_text!r}")
+        if not is_busy_response(first):
+            raise SuiteFailure(
+                f"expected timeout setup to remain busy, got: {first_text!r}"
+            )
         if bundle_transcript_path(first_text) is not None:
             raise SuiteFailure(
                 f"did not expect timeout setup to disclose a bundle, got: {first_text!r}"
             )
 
         gate.write_text("ready", encoding="utf-8")
-        settled = repl_text(
-            client,
-            "",
-            10000,
-            "output bundle timeout poll repl",
-        )
+        settled = client.repl("", timeout_ms=10000)
+        settled_text = require_success(settled, "output bundle timeout poll repl")
+        if is_busy_response(settled):
+            raise SuiteFailure(
+                f"expected timeout poll to settle, got: {settled_text!r}"
+            )
         timeout_transcript_path = require_transcript_path(
-            settled,
+            settled_text,
             "output bundle timeout poll repl",
         )
         timeout_transcript = require_text_file(
@@ -624,6 +719,11 @@ cat("TIMEOUT_BIG_END\\n")
             raise SuiteFailure(
                 f"expected timeout transcript to include later worker text, got: {timeout_transcript!r}"
             )
+        if "timeout001" not in timeout_transcript or "timeout080" not in timeout_transcript:
+            raise SuiteFailure(
+                "expected timeout transcript to include the full large output, "
+                f"got: {timeout_transcript!r}"
+            )
         if "<<repl status: busy" in timeout_transcript:
             raise SuiteFailure(
                 f"did not expect timeout marker in transcript, got: {timeout_transcript!r}"
@@ -631,19 +731,21 @@ cat("TIMEOUT_BIG_END\\n")
 
 
 def r_output_bundle_size_limit(client: McpStdioClient) -> None:
-    text = repl_text(
-        client,
-        r_large_text_input("z", lines=120),
-        30000,
+    received = client.repl(r_large_text_input("z", lines=120), timeout_ms=30000)
+    assert_identical(
+        tool_result(text(expected_capped_text_preview("z", 1))),
+        normalize_response(received),
         "output bundle size limit repl",
     )
-    transcript_path = require_transcript_path(text, "output bundle size limit repl")
+    received_text = result_text(received)
+    transcript_path = require_transcript_path(
+        received_text,
+        "output bundle size limit repl",
+    )
     transcript = require_text_file(
         transcript_path,
         "output bundle size limit transcript",
     )
-    if "later content omitted" not in text:
-        raise SuiteFailure(f"expected inline omission notice after cap, got: {text!r}")
     if (transcript_path.parent / "events.log").exists():
         raise SuiteFailure("did not expect events.log for text-only capped bundle")
     if "z120" in transcript:
@@ -653,49 +755,49 @@ def r_output_bundle_size_limit(client: McpStdioClient) -> None:
 
 
 def r_pager_command_smoke(client: McpStdioClient) -> None:
-    initial = client.call_tool(
-        "repl",
-        {
-            "input": "for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))\n",
-            "timeout_ms": 120000,
-        },
+    initial = client.repl(
+        'for (i in 1:80) cat(sprintf("L%04d\\n", i))\n',
+        timeout_ms=120000,
     )
-    initial_text = require_success_when_not_busy(client, initial, "pager initial repl")
-    if "L0001" not in initial_text:
-        raise SuiteFailure(f"expected first pager page, got: {initial_text!r}")
-    if "--More--" not in initial_text:
-        raise SuiteFailure(f"expected pager footer, got: {initial_text!r}")
+    assert_identical(
+        tool_result(
+            text(expected_pager_lines(1, 13)),
+            text("--More-- (6p, 16.2%, @0..78/480)"),
+        ),
+        initial,
+        "pager initial repl",
+    )
 
-    next_page = client.call_tool(
-        "repl",
-        {
-            "input": ":next",
-            "timeout_ms": 60000,
-        },
+    next_page = client.repl(":next", timeout_ms=60000)
+    assert_identical(
+        tool_result(
+            text(expected_pager_lines(14, 26)),
+            text("--More-- (5p, 32.5%, @78..156/480)"),
+        ),
+        next_page,
+        "pager next repl",
     )
-    next_text = require_success_when_not_busy(client, next_page, "pager next repl")
-    if not any(needle in next_text for needle in ["L0002", "L0003", "L0010", "L0014"]):
-        raise SuiteFailure(f"expected next pager page, got: {next_text!r}")
 
-    search = client.call_tool(
-        "repl",
-        {
-            "input": ":/L0031",
-            "timeout_ms": 60000,
-        },
+    search = client.repl(":/L0031", timeout_ms=60000)
+    assert_identical(
+        tool_result(
+            text("[pager] search for `L0031` @180"),
+            text("[match] L0031\n"),
+            text("--More-- (4p, 37.5%, @180/480)"),
+        ),
+        search,
+        "pager search repl",
     )
-    search_text = require_success_when_not_busy(client, search, "pager search repl")
-    if "L0031" not in search_text and "next match" not in search_text:
-        raise SuiteFailure(f"expected pager search guidance/output, got: {search_text!r}")
 
-    quit_result = client.call_tool(
-        "repl",
-        {
-            "input": ":q",
-            "timeout_ms": 60000,
-        },
+    quit_result = client.repl(":q", timeout_ms=60000)
+    assert_identical(
+        tool_result(
+            text("(END, 37.5%, @180/480)"),
+            text("> "),
+        ),
+        quit_result,
+        "pager quit repl",
     )
-    require_success_when_not_busy(client, quit_result, "pager quit repl")
 
 
 @dataclass(frozen=True)

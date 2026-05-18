@@ -5,7 +5,7 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 use tokio::time::{Duration, Instant, sleep};
@@ -87,6 +87,28 @@ async fn wait_for_path_to_disappear(path: &std::path::Path) -> TestResult<()> {
         sleep(Duration::from_millis(50)).await;
     }
     Err(format!("path still exists after shutdown: {}", path.display()).into())
+}
+
+fn r_path_literal(path: &Path) -> TestResult<String> {
+    Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
+}
+
+fn workspace_tempdir() -> TestResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix("mcp-repl-write-stdin-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))?)
+}
+
+async fn wait_until_path_exists(path: &Path, label: &str) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    Err(format!("timed out waiting for {label}: {}", path.display()).into())
 }
 
 async fn wait_until_not_busy(
@@ -730,10 +752,14 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
 async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let done_path = temp.path().join("small-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
 
-    let first_sleep_secs = if cfg!(windows) { 0.6 } else { 0.1 };
     let first_input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep({first_sleep_secs}); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); writeLines('done', {done_literal})"
     );
     let first = session
         .write_stdin_raw_with(&first_input, Some(test_timeout_secs(0.05, 0.2)))
@@ -753,14 +779,8 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
         "did not expect the initial under-threshold timeout reply to spill, got: {first_text:?}"
     );
 
-    sleep(Duration::from_millis(if cfg!(windows) {
-        700
-    } else if cfg!(target_os = "macos") {
-        220
-    } else {
-        180
-    }))
-    .await;
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&done_path, "small output marker").await?;
     let follow_up_input = format!(
         "fresh <- paste(rep('f', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('FRESH_START\\n'); cat(fresh); cat('\\nFRESH_END\\n')"
     );
@@ -954,8 +974,19 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
 async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let mid_ready_path = temp.path().join("mid-ready");
+    let tail_gate_path = temp.path().join("tail-ready");
+    let tail_done_path = temp.path().join("tail-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let mid_ready_literal = r_path_literal(&mid_ready_path)?;
+    let tail_gate_literal = r_path_literal(&tail_gate_path)?;
+    let tail_done_literal = r_path_literal(&tail_done_path)?;
 
-    let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.25); cat('tail\\n')";
+    let input = format!(
+        "big <- paste(rep('y', 120), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('start\\n'); flush.console(); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); writeLines('ready', {mid_ready_literal}); while (!file.exists({tail_gate_literal})) Sys.sleep(0.01); cat('tail\\n'); flush.console(); writeLines('done', {tail_done_literal})"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -963,8 +994,13 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated request to time out, got: {first_text:?}"
+    );
 
-    sleep(test_delay_ms(160, 260)).await;
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&mid_ready_path, "mid output marker").await?;
     let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
@@ -979,6 +1015,8 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         }
     };
 
+    fs::write(&tail_gate_path, b"ready")?;
+    wait_until_path_exists(&tail_done_path, "tail output marker").await?;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<repl status: busy") {
@@ -1093,10 +1131,22 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
 async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
+    let gate_temp = workspace_tempdir()?;
+    let start_gate_path = gate_temp.path().join("start-ready");
+    let done_path = gate_temp.path().join("bundle-failure-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
     let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
-    let input = "big <- paste(rep('z', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
+    let input = format!(
+        "big <- paste(rep('z', 120), collapse = ''); \
+         cat('start\\n'); flush.console(); \
+         while (!file.exists({start_gate_literal})) Sys.sleep(0.02); \
+         for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); \
+         flush.console(); cat('end\\n'); flush.console(); \
+         writeLines('done', {done_literal})"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1107,7 +1157,8 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 
     fs::remove_dir_all(temp.path())?;
 
-    sleep(test_delay_ms(160, 600)).await;
+    fs::write(&start_gate_path, b"go")?;
+    wait_until_path_exists(&done_path, "bundle failure output marker").await?;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
 
@@ -1140,12 +1191,21 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
+    let gate_temp = workspace_tempdir()?;
+    let start_gate_path = gate_temp.path().join("start-ready");
+    let done_path = gate_temp.path().join("hidden-bundle-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
     let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let first = session
         .write_stdin_raw_with(
-            "cat('start\\n'); flush.console(); Sys.sleep(0.1); cat('end\\n')",
+            format!(
+                "cat('start\\n'); flush.console(); \
+                 while (!file.exists({start_gate_literal})) Sys.sleep(0.02); \
+                 cat('end\\n'); flush.console(); writeLines('done', {done_literal})"
+            ),
             Some(0.05),
         )
         .await?;
@@ -1165,7 +1225,8 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
         "did not expect a hidden timeout bundle directory before disclosure"
     );
 
-    sleep(test_delay_ms(160, 600)).await;
+    fs::write(&start_gate_path, b"go")?;
+    wait_until_path_exists(&done_path, "hidden bundle output marker").await?;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<repl status: busy") {
@@ -1495,9 +1556,17 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let done_path = temp.path().join("pager-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
 
+    let first_input = format!(
+        "while (!file.exists({start_gate_literal})) Sys.sleep(0.01); print(1+1); flush.console(); writeLines('done', {done_literal})"
+    );
     let first = session
-        .write_stdin_raw_with("Sys.sleep(0.1); 1+1", Some(0.05))
+        .write_stdin_raw_with(&first_input, Some(0.05))
         .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1505,8 +1574,13 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated pager request to time out, got: {first_text:?}"
+    );
 
-    sleep(test_delay_ms(160, 700)).await;
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&done_path, "pager output marker").await?;
     let mut follow_up = session.write_stdin_raw_with("3+3", Some(2.0)).await?;
     let mut follow_up_text = String::new();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1545,7 +1619,7 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
         "expected the fresh pager follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("Sys.sleep(0.1); 1+1"),
+        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
         "did not expect the timed-out request echo to leak into the next pager reply, got: {follow_up_text:?}"
     );
 
@@ -1556,8 +1630,19 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
 async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let mid_ready_path = temp.path().join("mid-ready");
+    let tail_gate_path = temp.path().join("tail-ready");
+    let tail_done_path = temp.path().join("tail-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let mid_ready_literal = r_path_literal(&mid_ready_path)?;
+    let tail_gate_literal = r_path_literal(&tail_gate_path)?;
+    let tail_done_literal = r_path_literal(&tail_done_path)?;
 
-    let input = "big <- paste(rep('n', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.15); cat('tail\\n')";
+    let input = format!(
+        "big <- paste(rep('n', 120), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('start\\n'); flush.console(); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); writeLines('ready', {mid_ready_literal}); while (!file.exists({tail_gate_literal})) Sys.sleep(0.01); cat('tail\\n'); flush.console(); writeLines('done', {tail_done_literal})"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1565,8 +1650,13 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated request to time out, got: {first_text:?}"
+    );
 
-    sleep(test_delay_ms(160, 260)).await;
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&mid_ready_path, "mid output marker").await?;
     let spilled = session
         .write_stdin_raw_unterminated_with("", Some(0.1))
         .await?;
@@ -1583,7 +1673,9 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
         }
     };
     let transcript_before = fs::read_to_string(&transcript_path)?;
-    sleep(test_delay_ms(160, 260)).await;
+
+    fs::write(&tail_gate_path, b"ready")?;
+    wait_until_path_exists(&tail_done_path, "tail output marker").await?;
     let follow_up = session
         .write_stdin_raw_with("cat('NEW_TURN\\n')", Some(2.0))
         .await?;

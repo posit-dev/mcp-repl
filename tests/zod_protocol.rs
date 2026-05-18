@@ -527,7 +527,7 @@ async fn zod_worker_idle_protocol_error_is_latched_for_next_request() -> TestRes
         .call_tool_raw(
             "repl",
             json!({
-                "input": "timeline after-readline-start delay-ms 250 raw-output-text-invalid-base64",
+                "input": "timeline after-readline-start delay-ms 2000 raw-output-text-invalid-base64",
                 "timeout_ms": 10_000
             }),
         )
@@ -538,7 +538,7 @@ async fn zod_worker_idle_protocol_error_is_latched_for_next_request() -> TestRes
         "expected first request to finish before delayed protocol error, got: {first_text:?}"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
 
     let second = session
         .call_tool_raw(

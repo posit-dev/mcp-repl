@@ -336,10 +336,14 @@ async fn direct_stdout_fd_write_falls_back_to_raw_stream() -> TestResult<()> {
         "if (!file.exists('/dev/stdout')) { ",
         "cat('SKIP_DIRECT_FD\\n') ",
         "} else { ",
-        "con <- suppressWarnings(file('/dev/stdout', open = 'wb')); ",
+        "con <- tryCatch(suppressWarnings(file('/dev/stdout', open = 'wb')), error = function(e) NULL); ",
+        "if (is.null(con)) { ",
+        "cat('SKIP_DIRECT_FD\\n') ",
+        "} else { ",
         "writeBin(charToRaw('direct-fd\\n'), con); ",
         "flush(con); close(con); ",
         "cat('r-owned\\n') ",
+        "} ",
         "}",
     );
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;

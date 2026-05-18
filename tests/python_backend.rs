@@ -234,19 +234,26 @@ fn real_python_executable() -> TestResult<String> {
 async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox not available; skipping");
-        return Ok(());
-    }
     if std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_some() {
-        eprintln!("explicit Python executable set; skipping discovery test");
+        eprintln!("explicit Python executable set; skipping discovery sandbox coverage test");
         return Ok(());
     }
+    assert!(common::sandbox_exec_available(), "sandbox unavailable");
 
     let _guard = lock_test_mutex();
+    let real_python = real_python_executable()?;
     let workspace = tempdir()?;
-    let outside = tempdir()?;
-    let marker = outside.path().join("python-discovery-marker");
+    let empty_bin = workspace.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin)?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or("missing HOME/USERPROFILE for Python discovery sandbox marker")?;
+    let marker = home.join(format!(
+        ".mcp-repl-python-discovery-marker-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&marker);
     let marker_text = marker
         .to_str()
         .ok_or("marker path must be valid utf-8")?
@@ -256,7 +263,22 @@ async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
     let shim = venv_bin.join("python");
     fs::write(
         &shim,
-        "#!/bin/sh\nprintf probe > \"$MCP_REPL_TEST_PYTHON_PROBE_MARKER\"\nexit 1\n",
+        concat!(
+            "#!/bin/sh\n",
+            "exec \"$MCP_REPL_REAL_PYTHON\" - <<'PY'\n",
+            "import os\n",
+            "import sys\n",
+            "from pathlib import Path\n",
+            "\n",
+            "try:\n",
+            "    Path(os.environ['MCP_REPL_TEST_PYTHON_PROBE_MARKER']).write_text('probe')\n",
+            "except Exception as err:\n",
+            "    print(f'MCP_REPL_TEST_PYTHON_PROBE_WRITE_ERROR:{type(err).__name__}', file=sys.stderr)\n",
+            "else:\n",
+            "    print('MCP_REPL_TEST_PYTHON_PROBE_WRITE_OK', file=sys.stderr)\n",
+            "raise SystemExit(1)\n",
+            "PY\n",
+        ),
     )?;
     let mut permissions = fs::metadata(&shim)?.permissions();
     permissions.set_mode(0o755);
@@ -269,16 +291,26 @@ async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
             "--sandbox".to_string(),
             "read-only".to_string(),
         ],
-        vec![("MCP_REPL_TEST_PYTHON_PROBE_MARKER".to_string(), marker_text)],
+        vec![
+            ("PATH".to_string(), empty_bin.display().to_string()),
+            ("MCP_REPL_REAL_PYTHON".to_string(), real_python),
+            ("MCP_REPL_TEST_PYTHON_PROBE_MARKER".to_string(), marker_text),
+        ],
         Some(workspace.path().to_path_buf()),
     )
     .await?;
     let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
     let text = result_text(&result);
     session.cancel().await?;
+    let marker_exists = marker.exists();
+    let _ = fs::remove_file(&marker);
 
     assert!(
-        !marker.exists(),
+        text.contains("MCP_REPL_TEST_PYTHON_PROBE_WRITE_ERROR:"),
+        "expected Python discovery probe write failure in reply, got: {text:?}"
+    );
+    assert!(
+        !marker_exists,
         "Python discovery probe wrote outside the sandbox; reply was: {text:?}"
     );
     Ok(())

@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from textwrap import dedent
 
 
 def load_module():
@@ -27,6 +28,134 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 index = case.server_args.index("--interpreter")
                 self.assertLess(index + 1, len(case.server_args))
                 self.assertEqual(case.server_args[index + 1], "r")
+
+    def test_tool_result_builder_matches_mcp_response_shape(self):
+        self.assertEqual(
+            self.module.tool_result(
+                self.module.text("[1] 2\n"),
+                self.module.text("> "),
+            ),
+            {
+                "content": [
+                    {"type": "text", "text": "[1] 2\n"},
+                    {"type": "text", "text": "> "},
+                ],
+                "isError": False,
+            },
+        )
+
+    def test_wait_for_busy_response_text_polls_until_marker(self):
+        initial = self.module.tool_result(
+            self.module.text(
+                dedent(
+                    """\
+                    setup started
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"""
+                )
+            )
+        )
+        ready = self.module.tool_result(
+            self.module.text(
+                dedent(
+                    """\
+                    INTERRUPT_READY
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"""
+                )
+            )
+        )
+
+        test_case = self
+
+        class FakeClient:
+            def repl(self, input_text, *, timeout_ms=None):
+                test_case.assertEqual(input_text, "")
+                test_case.assertEqual(timeout_ms, 500)
+                return ready
+
+        received = self.module.wait_for_busy_response_text(
+            FakeClient(),
+            initial,
+            "INTERRUPT_READY",
+            "interrupt setup repl",
+            deadline_seconds=1.0,
+        )
+
+        self.assertIs(received, ready)
+
+    def test_wait_for_busy_response_text_fails_if_worker_finishes_before_marker(self):
+        finished = self.module.tool_result(self.module.text("> "))
+
+        with self.assertRaisesRegex(
+            self.module.SuiteFailure,
+            "finished before .* marker",
+        ):
+            self.module.wait_for_busy_response_text(
+                FakeClientWithoutResponses(),
+                finished,
+                "INTERRUPT_READY",
+                "interrupt setup repl",
+                deadline_seconds=1.0,
+            )
+
+    def test_r_interrupt_restart_prefixes_polls_after_transient_busy_interrupt(self):
+        initial_busy = self.module.tool_result(
+            self.module.text(
+                dedent(
+                    """\
+                    INTERRUPT_READY
+                    <<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"""
+                )
+            )
+        )
+        interrupt_busy = self.module.tool_result(
+            self.module.text(
+                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"
+            )
+        )
+        interrupted = self.module.tool_result(
+            self.module.text("interrupt received\n"),
+            self.module.text("AFTER_INTERRUPT\n"),
+            self.module.text("> "),
+        )
+        test_case = self
+        self_module = self.module
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = [
+                    ("x <- 1\n", 30000, self_module.tool_result(self_module.text("> "))),
+                    (
+                        '\u0004print(exists("x"))\n',
+                        30000,
+                        self_module.tool_result(
+                            self_module.text("[repl] new session started\n"),
+                            self_module.text("[1] FALSE\n"),
+                            self_module.text("> "),
+                        ),
+                    ),
+                    (None, 1000, initial_busy),
+                    ('\u0003cat("AFTER_INTERRUPT\\n")', 5000, interrupt_busy),
+                    ("", 500, interrupted),
+                ]
+
+            def repl(self, input_text, *, timeout_ms=None):
+                test_case.assertTrue(self.responses, "unexpected repl call")
+                expected_input, expected_timeout, result = self.responses.pop(0)
+                if expected_input is None:
+                    test_case.assertIn("INTERRUPT_READY", input_text)
+                else:
+                    test_case.assertEqual(expected_input, input_text)
+                test_case.assertEqual(expected_timeout, timeout_ms)
+                return result
+
+        client = FakeClient()
+        self.module.r_interrupt_restart_prefixes(client)
+        self.assertEqual([], client.responses)
+
+
+class FakeClientWithoutResponses:
+    def repl(self, input_text, *, timeout_ms=None):
+        raise AssertionError("unexpected poll")
 
 
 if __name__ == "__main__":

@@ -212,11 +212,13 @@ impl Drop for SuiteServerLockToken {
 pub fn sandbox_exec_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        if std::env::var_os("CODEX_SANDBOX").is_some() {
-            return false;
-        }
         std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", "(version 1)", "--", "/usr/bin/true"])
+            .args([
+                "-p",
+                "(version 1)(allow process-exec)(allow file-read*)",
+                "--",
+                "/usr/bin/true",
+            ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
