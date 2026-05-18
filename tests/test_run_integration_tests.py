@@ -28,6 +28,21 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 self.assertLess(index + 1, len(case.server_args))
                 self.assertEqual(case.server_args[index + 1], "r")
 
+    def test_tool_result_builder_matches_mcp_response_shape(self):
+        self.assertEqual(
+            self.module.tool_result(
+                self.module.text("[1] 2\n"),
+                self.module.text("> "),
+            ),
+            {
+                "content": [
+                    {"type": "text", "text": "[1] 2\n"},
+                    {"type": "text", "text": "> "},
+                ],
+                "isError": False,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
