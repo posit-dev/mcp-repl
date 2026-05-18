@@ -6,14 +6,236 @@
   description = "MCP server exposing a long-lived interactive REPL runtime (R or Python backend) over stdio."
   repository  = "https://github.com/posit-dev/mcp-repl"
   license     = "Apache-2.0"
+  autotests   = false
 
 [[bin]]
   name = "mcp-repl"
   path = "src/main.rs"
+  test = false
 
 [[example]]
   name = "zod-worker"
   path = "tests/fixtures/zod-worker.rs"
+
+[[test]]
+name = "claude_integration"
+path = "tests/claude_integration.rs"
+test = false
+
+[[test]]
+name = "codex_approvals_tui"
+path = "tests/codex_approvals_tui.rs"
+test = false
+
+[[test]]
+name = "debug_events_env"
+path = "tests/debug_events_env.rs"
+test = false
+
+[[test]]
+name = "debug_events_tool_calls"
+path = "tests/debug_events_tool_calls.rs"
+test = false
+
+[[test]]
+name = "debug_repl_prompt"
+path = "tests/debug_repl_prompt.rs"
+test = false
+
+[[test]]
+name = "docs_contracts"
+path = "tests/docs_contracts.rs"
+test = false
+
+[[test]]
+name = "install_dual_backend"
+path = "tests/install_dual_backend.rs"
+test = false
+
+[[test]]
+name = "install_shell_script"
+path = "tests/install_shell_script.rs"
+test = false
+
+[[test]]
+name = "interrupt"
+path = "tests/interrupt.rs"
+test = false
+
+[[test]]
+name = "manage_session_behavior"
+path = "tests/manage_session_behavior.rs"
+test = false
+
+[[test]]
+name = "mcp_transcripts"
+path = "tests/mcp_transcripts.rs"
+test = false
+
+[[test]]
+name = "oversized_output_cli"
+path = "tests/oversized_output_cli.rs"
+test = false
+
+[[test]]
+name = "pager"
+path = "tests/pager.rs"
+test = false
+
+[[test]]
+name = "pager_flags"
+path = "tests/pager_flags.rs"
+test = false
+
+[[test]]
+name = "pager_hits_seek"
+path = "tests/pager_hits_seek.rs"
+test = false
+
+[[test]]
+name = "pager_page_size"
+path = "tests/pager_page_size.rs"
+test = false
+
+[[test]]
+name = "pager_seek"
+path = "tests/pager_seek.rs"
+test = false
+
+[[test]]
+name = "pager_skip"
+path = "tests/pager_skip.rs"
+test = false
+
+[[test]]
+name = "pager_where"
+path = "tests/pager_where.rs"
+test = false
+
+[[test]]
+name = "plot_images"
+path = "tests/plot_images.rs"
+test = false
+
+[[test]]
+name = "python_backend"
+path = "tests/python_backend.rs"
+test = false
+
+[[test]]
+name = "python_help_snapshots"
+path = "tests/python_help_snapshots.rs"
+test = false
+
+[[test]]
+name = "python_plot_images"
+path = "tests/python_plot_images.rs"
+test = false
+
+[[test]]
+name = "python_program_selection"
+path = "tests/python_program_selection.rs"
+test = false
+
+[[test]]
+name = "r_console_encoding"
+path = "tests/r_console_encoding.rs"
+test = false
+
+[[test]]
+name = "r_file_show"
+path = "tests/r_file_show.rs"
+test = false
+
+[[test]]
+name = "r_help"
+path = "tests/r_help.rs"
+test = false
+
+[[test]]
+name = "r_manuals"
+path = "tests/r_manuals.rs"
+test = false
+
+[[test]]
+name = "r_protocol"
+path = "tests/r_protocol.rs"
+test = false
+
+[[test]]
+name = "r_startup"
+path = "tests/r_startup.rs"
+test = false
+
+[[test]]
+name = "r_vignettes"
+path = "tests/r_vignettes.rs"
+test = false
+
+[[test]]
+name = "refactor_coverage"
+path = "tests/refactor_coverage.rs"
+test = false
+
+[[test]]
+name = "repl_surface"
+path = "tests/repl_surface.rs"
+test = false
+
+[[test]]
+name = "reticulate_py_help"
+path = "tests/reticulate_py_help.rs"
+test = false
+
+[[test]]
+name = "sandbox"
+path = "tests/sandbox.rs"
+test = false
+
+[[test]]
+name = "sandbox_state_updates"
+path = "tests/sandbox_state_updates.rs"
+test = false
+
+[[test]]
+name = "server_smoke"
+path = "tests/server_smoke.rs"
+test = false
+
+[[test]]
+name = "session_endings"
+path = "tests/session_endings.rs"
+test = false
+
+[[test]]
+name = "windows_suite_server_lock"
+path = "tests/windows_suite_server_lock.rs"
+test = false
+
+[[test]]
+name = "worker_ipc_disconnect"
+path = "tests/worker_ipc_disconnect.rs"
+test = false
+
+[[test]]
+name = "write_stdin_batch"
+path = "tests/write_stdin_batch.rs"
+test = false
+
+[[test]]
+name = "write_stdin_behavior"
+path = "tests/write_stdin_behavior.rs"
+test = false
+
+[[test]]
+name = "write_stdin_edge_cases"
+path = "tests/write_stdin_edge_cases.rs"
+test = false
+
+[[test]]
+name = "zod_protocol"
+path = "tests/zod_protocol.rs"
+test = false
 
 [dependencies]
   ctor = "0.6.3"

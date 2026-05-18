@@ -41,7 +41,8 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
-        "cargo nextest run --show-progress none",
+        "python3 tests/run_rust_tests.py --clippy",
+        "python3 tests/run_rust_tests.py --profile default",
         "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
@@ -227,9 +228,9 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     for required in [
         "taiki-e/install-action@nextest",
         "name: cargo nextest (quiet)",
-        "run: cargo nextest run --profile ci --show-progress none",
+        "run: python3 tests/run_rust_tests.py --profile ci",
         "name: cargo nextest (quiet, windows serial)",
-        "run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1",
+        "run: python tests/run_rust_tests.py --profile ci --build-jobs 1 --test-threads 1",
     ] {
         assert!(
             workflow.contains(required),
@@ -272,16 +273,27 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
         1,
         "only the CI profile should filter out real client integrations"
     );
-    for forbidden in ["[test-groups]", "test-group =", "repl-integration"] {
+    for forbidden in ["repl-integration"] {
         assert!(
             !nextest_config.contains(forbidden),
             "did not expect stale serial nextest configuration {forbidden}"
         );
     }
+    for required in [
+        "[test-groups]",
+        "interrupt-integration = { max-threads = 1 }",
+        "filter = 'binary(=interrupt)'",
+        "test-group = \"interrupt-integration\"",
+    ] {
+        assert!(
+            nextest_config.contains(required),
+            "missing {required} in .config/nextest.toml"
+        );
+    }
 
     assert_contains_wrapped_text(
         &testing_docs,
-        "The local and CI nextest profiles use normal nextest scheduling. CI differs only by filtering out real client integrations.",
+        "The Rust integration runner uses nextest and opts the interrupt binary into a one-at-a-time group because those tests coordinate through process-local fixtures.",
         "docs/testing.md",
     );
 
@@ -292,7 +304,7 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "The CI profile adds a default filter that excludes `codex_approvals_tui` and `claude_integration` because CI is not authenticated with model providers.",
+        "The CI profile and wrapper exclude `codex_approvals_tui` and `claude_integration` because CI is not authenticated with model providers.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(
@@ -312,6 +324,65 @@ fn nextest_profiles_keep_local_clients_and_filter_ci() {
     assert!(
         claude_integration.contains(r#"const CLAUDE_MODEL: &str = "haiku";"#),
         "Claude integration should use the fastest/cheapest model"
+    );
+}
+
+#[test]
+fn cargo_test_default_is_small_and_integration_targets_are_explicit() {
+    let root = repo_root();
+    let manifest = read(&root.join("Cargo.toml"));
+    let runner = read(&root.join("tests/run_rust_tests.py"));
+    let testing_docs = read(&root.join("docs/testing.md"));
+
+    assert!(
+        manifest.contains("autotests") && manifest.contains("false"),
+        "Cargo.toml should keep integration tests out of default cargo test"
+    );
+    assert!(
+        manifest
+            .contains("[[bin]]\n  name = \"mcp-repl\"\n  path = \"src/main.rs\"\n  test = false"),
+        "Cargo.toml should keep bin unit tests out of default cargo test"
+    );
+    assert!(
+        runner.contains("\"--bin\"") && runner.contains("\"mcp-repl\""),
+        "tests/run_rust_tests.py should run bin unit tests explicitly"
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "Plain `cargo test` is intentionally a small default Cargo compatibility check. It does not run the repository's binary unit tests or integration test targets.",
+        "docs/testing.md",
+    );
+
+    let mut integration_targets = Vec::new();
+    for entry in fs::read_dir(root.join("tests")).expect("tests dir exists") {
+        let path = entry.expect("test entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("test filename is utf-8");
+        integration_targets.push(name.to_string());
+    }
+    integration_targets.sort();
+
+    for name in &integration_targets {
+        let target_block =
+            format!("[[test]]\nname = \"{name}\"\npath = \"tests/{name}.rs\"\ntest = false");
+        assert!(
+            manifest.contains(&target_block),
+            "Cargo.toml should explicitly opt {name} out of default cargo test"
+        );
+        assert!(
+            runner.contains(&format!("\"{name}\"")),
+            "tests/run_rust_tests.py should include {name}"
+        );
+    }
+
+    assert!(
+        runner.contains("LIVE_CLIENT_TARGETS"),
+        "runner should make live-client filtering explicit"
     );
 }
 

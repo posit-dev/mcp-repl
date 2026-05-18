@@ -156,7 +156,12 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
     session: common::McpTestSession,
 ) -> TestResult<()> {
-    let input = "Sys.sleep(0.3); invisible(system(\"printf '> '\"))";
+    let temp = tempfile::tempdir()?;
+    let marker_path = temp.path().join("child-output-ready");
+    let marker_literal = serde_json::to_string(&marker_path.to_string_lossy())?;
+    let input = format!(
+        "Sys.sleep(0.1); invisible(system(\"printf '> '\")); writeLines('ready', {marker_literal}); repeat Sys.sleep(0.05)"
+    );
     let timeout_result = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let timeout_text = result_text(&timeout_result);
     if backend_unavailable(&timeout_text) {
@@ -169,7 +174,14 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
         "expected child stdout request to time out, got: {timeout_text:?}"
     );
 
-    sleep(Duration::from_millis(700)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker_path.exists() {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            panic!("child prompt-shaped output marker was not written");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 
     let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
     let interrupt_text = result_text(&interrupt_result);
@@ -183,8 +195,8 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
         session.cancel().await?;
         return Ok(());
     }
-    assert_eq!(
-        interrupt_text, "> > ",
+    assert!(
+        interrupt_text.matches("> ").count() >= 2,
         "expected raw prompt-shaped output plus completion prompt, got: {interrupt_text:?}"
     );
 

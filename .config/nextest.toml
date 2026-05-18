@@ -11,6 +11,17 @@ final-status-level = "fail"
 success-output = "never"
 failure-output = "final"
 
+[test-groups]
+interrupt-integration = { max-threads = 1 }
+
 [[profile.default.overrides]]
 filter = 'binary(=codex_approvals_tui) or binary(=claude_integration)'
 success-output = "immediate"
+
+[[profile.default.overrides]]
+filter = 'binary(=interrupt)'
+test-group = "interrupt-integration"
+
+[[profile.ci.overrides]]
+filter = 'binary(=interrupt)'
+test-group = "interrupt-integration"

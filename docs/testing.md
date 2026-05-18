@@ -47,29 +47,41 @@ using the debug binary built for each matrix target.
 Use this while iterating on ordinary Rust tests locally:
 
 ```sh
-cargo nextest run --show-progress none
+python3 tests/run_rust_tests.py --profile default
 ```
 
-The checked-in `.config/nextest.toml` default profile keeps passing-test output
-quiet and shows failure output in the final report. The default local profile
-includes real client integration binaries. Use this when Codex and Claude are
-installed and authenticated locally.
+The Rust integration runner uses nextest and opts the interrupt binary into a
+one-at-a-time group because those tests coordinate through process-local
+fixtures. The checked-in `.config/nextest.toml` default profile keeps
+passing-test output quiet and shows failure output in the final report. The
+default local profile includes real client integration binaries. Use this when
+Codex and Claude are installed and authenticated locally.
 
 The `--show-progress none` flag hides progress output so successful runs stay
 compact in local terminals and CI logs; nextest treats that as user
-configuration rather than a repository profile key.
+configuration rather than a repository profile key. The wrapper passes that
+flag to nextest, along with explicit `--test <target>` entries for integration
+targets opted out of default Cargo discovery.
 
 The CI workflow uses the CI nextest profile for the ordinary Rust suite after
-`cargo clippy`, with `--profile ci --show-progress none` on the command line.
-The CI profile adds a default filter that excludes `codex_approvals_tui` and
-`claude_integration` because CI is not authenticated with model providers.
-The local and CI nextest profiles use normal nextest scheduling. CI differs
-only by filtering out real client integrations. Windows keeps the ordinary
-suite fully serial with `--build-jobs 1` and `--test-threads 1`.
+`cargo clippy`, through `python3 tests/run_rust_tests.py --profile ci`. The CI
+profile and wrapper exclude `codex_approvals_tui` and `claude_integration`
+because CI is not authenticated with model providers. Windows keeps the
+ordinary suite fully serial with `--build-jobs 1` and `--test-threads 1`.
 
-This nextest path is the preferred fast local loop, but it does not replace the
-real-binary suite or the full compatibility path. Before replying after code
-changes, still run the full required checks below, including `cargo test`.
+Plain `cargo test` is intentionally a small default Cargo compatibility check.
+It does not run the repository's binary unit tests or integration test targets.
+Those targets are listed explicitly in `Cargo.toml` with `test = false` and run
+through `tests/run_rust_tests.py` instead. Before replying after code changes,
+still run the full required checks below, including both the explicit Rust test
+runner and `cargo test`.
+
+Because those integration targets are also outside Cargo's default target set,
+lint them explicitly with:
+
+```sh
+python3 tests/run_rust_tests.py --clippy
+```
 
 ## Real Client Integrations
 
@@ -82,7 +94,7 @@ test prints a skip banner with the reason.
 To run only those integrations:
 
 ```sh
-cargo nextest run --show-progress none --test codex_approvals_tui --test claude_integration
+python3 tests/run_rust_tests.py --profile default --target codex_approvals_tui --target claude_integration
 ```
 
 CI does not run these binaries because provider authentication is unavailable
@@ -96,7 +108,8 @@ If you modify code, run:
 - `cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo nextest run --show-progress none`
+- `python3 tests/run_rust_tests.py --clippy`
+- `python3 tests/run_rust_tests.py --profile default`
 - `cargo test`
 - `cargo +nightly fmt`
 

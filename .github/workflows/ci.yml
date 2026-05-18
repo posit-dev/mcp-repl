@@ -93,13 +93,22 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: cargo clippy (explicit integration targets)
+        if: matrix.os != 'windows-2022'
+        run: python3 tests/run_rust_tests.py --clippy
+
+      - name: cargo clippy (explicit integration targets, windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: python tests/run_rust_tests.py --clippy
+
       - name: cargo nextest (quiet)
         if: matrix.os != 'windows-2022'
-        run: cargo nextest run --profile ci --show-progress none
+        run: python3 tests/run_rust_tests.py --profile ci
 
       - name: cargo nextest (quiet, windows serial)
         if: matrix.os == 'windows-2022'
-        run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1
+        run: python tests/run_rust_tests.py --profile ci --build-jobs 1 --test-threads 1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

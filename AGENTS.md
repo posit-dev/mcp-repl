@@ -9,7 +9,8 @@ Keep this file short. It is a table of contents, not the full manual.
   - `cargo build`
   - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo nextest run --show-progress none`
+  - `python3 tests/run_rust_tests.py --clippy`
+  - `python3 tests/run_rust_tests.py --profile default`
   - `cargo test`
   - `cargo +nightly fmt`
 - For docs-only changes, run the narrow docs validation that covers the edited
