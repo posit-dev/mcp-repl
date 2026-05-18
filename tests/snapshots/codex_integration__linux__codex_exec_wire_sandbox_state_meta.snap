@@ -31,11 +31,6 @@ expression: snapshot
           "x-codex-turn-metadata": {
             "session_id": "<SESSION_ID>",
             "turn_id": "<TURN_ID>",
-            "workspaces": {
-              "<WORKSPACE>": {
-                "has_changes": false
-              }
-            },
             "sandbox": "<SANDBOX_BACKEND>"
           },
           "codex/sandbox-state-meta": {

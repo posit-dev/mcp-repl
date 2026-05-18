@@ -803,7 +803,9 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
     let input = format!(
         "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.1); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(0.6); cat('TAIL\\n')"
     );
-    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.005, 0.05)))
+        .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -877,7 +879,9 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
     let input = format!(
         "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.1); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(0.6); cat('TAIL\\n')"
     );
-    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.005, 0.05)))
+        .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
