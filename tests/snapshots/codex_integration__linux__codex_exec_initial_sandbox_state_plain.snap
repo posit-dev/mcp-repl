@@ -1,6 +1,5 @@
 ---
-source: tests/codex_approvals_tui.rs
-assertion_line: 1710
+source: tests/codex_integration.rs
 expression: snapshot
 ---
 $ codex exec --sandbox workspace-write --skip-git-repo-check --cd <WORKSPACE> "SANDBOX_TEST_1: run the sandbox write test"

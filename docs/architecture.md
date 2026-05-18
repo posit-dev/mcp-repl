@@ -69,9 +69,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `tests/` contains the Rust public API, snapshot, sandbox, backend, install,
   protocol-worker, and client-integration suites. Most tests exercise behavior
   through the exposed MCP interface using the shared harness in `tests/common/`.
-- `.config/nextest.toml` defines the quiet local Rust suite and a CI-filtered
-  ordinary Rust suite. CI runs the Codex integration separately after installing
-  the real Codex CLI. The tests should not depend on special local scheduling.
+- CI uses Cargo's standard Rust test runner after installing the real Codex CLI,
+  with the Codex backend forced to the mocked provider. The tests should not
+  depend on special local scheduling.
 
 ## Design Constraints
 

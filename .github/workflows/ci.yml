@@ -48,9 +48,6 @@ jobs:
       - name: Install nightly rustfmt
         run: rustup toolchain install nightly --profile minimal --component rustfmt
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
 
@@ -93,14 +90,6 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: cargo nextest (quiet)
-        if: matrix.os != 'windows-2022'
-        run: cargo nextest run --profile ci --show-progress none
-
-      - name: cargo nextest (quiet, windows serial)
-        if: matrix.os == 'windows-2022'
-        run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1
-
       - name: Install Codex CLI
         if: matrix.os != 'windows-2022'
         shell: bash
@@ -122,13 +111,17 @@ jobs:
           $env:PATH = "$npmPrefix;$env:PATH"
           & (Join-Path $npmPrefix "codex.cmd") --version
 
-      - name: cargo test (real codex integrations)
+      - name: cargo test
         if: matrix.os != 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        env:
+          MCP_REPL_CODEX_BACKEND: mock
+        run: cargo test --quiet
 
-      - name: cargo test (real codex integrations, windows serial)
+      - name: cargo test (windows serial)
         if: matrix.os == 'windows-2022'
-        run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1
+        env:
+          MCP_REPL_CODEX_BACKEND: mock
+        run: cargo test -j 1 --quiet -- --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

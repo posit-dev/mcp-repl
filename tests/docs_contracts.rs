@@ -43,7 +43,7 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
         "scripts/diff_composition.py",
-        "cargo nextest run --show-progress none",
+        "cargo test --quiet",
         "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
         "cargo insta test --check",
         "MCP_REPL_CODEX_BACKEND=mock",
@@ -52,8 +52,8 @@ fn agents_is_short_and_points_to_main_docs() {
     }
 
     assert!(
-        !agents.contains("cargo nextest run --profile ci --show-progress none"),
-        "AGENTS.md should use the local default nextest profile, not the CI filter"
+        !agents.contains("cargo nextest"),
+        "AGENTS.md should use cargo test as the Rust test runner"
     );
     assert!(
         !agents.contains("tests/run_rust_tests.py"),
@@ -198,8 +198,11 @@ fn ci_workflow_defines_dev_release_contract() {
         "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
         "npm install -g @openai/codex",
         "npm config get prefix",
-        "name: cargo test (real codex integrations)",
-        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
+        "name: cargo test",
+        "run: cargo test --quiet",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "MCP_REPL_CODEX_BACKEND: mock",
         "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
@@ -231,6 +234,11 @@ fn ci_workflow_defines_dev_release_contract() {
         "https://github.com/openai/codex/releases/latest/download/",
         "Expand-Archive",
         "scripts/public_api_suite.py",
+        "cargo-nextest",
+        "taiki-e/install-action@nextest",
+        "cargo nextest",
+        "profile ci",
+        ".config/nextest.toml",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -243,23 +251,19 @@ fn ci_workflow_defines_dev_release_contract() {
 fn ci_runs_codex_integration_with_mock_backend() {
     let root = repo_root();
     let workflow = read(&root.join(".github/workflows/ci.yml"));
-    let nextest_config = read(&root.join(".config/nextest.toml"));
     let testing_docs = read(&root.join("docs/testing.md"));
-    let codex_integration = read(&root.join("tests/codex_approvals_tui.rs"));
+    let codex_integration = read(&root.join("tests/codex_integration.rs"));
     let claude_integration = read(&root.join("tests/claude_integration.rs"));
 
     for required in [
-        "taiki-e/install-action@nextest",
-        "name: cargo nextest (quiet)",
-        "run: cargo nextest run --profile ci --show-progress none",
-        "name: cargo nextest (quiet, windows serial)",
-        "run: cargo nextest run --profile ci --show-progress none --build-jobs 1 --test-threads 1",
         "name: Install Codex CLI",
         "name: Install Codex CLI (windows)",
         "npm install -g @openai/codex",
-        "name: cargo test (real codex integrations)",
-        "name: cargo test (real codex integrations, windows serial)",
-        "run: cargo test -j 1 --test codex_approvals_tui -- --test-threads=1",
+        "name: cargo test",
+        "run: cargo test --quiet",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "MCP_REPL_CODEX_BACKEND: mock",
     ] {
         assert!(
             workflow.contains(required),
@@ -268,8 +272,10 @@ fn ci_runs_codex_integration_with_mock_backend() {
     }
 
     for forbidden in [
-        "name: cargo test\n        if: matrix.os != 'windows-2022'\n        run: cargo test",
-        "name: cargo test (windows serial)\n        if: matrix.os == 'windows-2022'\n        run: cargo test -j 1 -- --test-threads=1",
+        "taiki-e/install-action@nextest",
+        "cargo nextest",
+        "name: cargo test (real codex integrations)",
+        "run: cargo test -j 1 --test codex_integration -- --test-threads=1",
         "tests/run_rust_tests.py",
     ] {
         assert!(
@@ -278,57 +284,24 @@ fn ci_runs_codex_integration_with_mock_backend() {
         );
     }
 
-    for required in [
-        "[profile.default]",
-        "[profile.ci]",
-        "[[profile.default.overrides]]",
-        "success-output = \"immediate\"",
-        "default-filter = \"not binary(=codex_approvals_tui) and not binary(=claude_integration)\"",
-        "status-level = \"fail\"",
-        "final-status-level = \"fail\"",
-        "success-output = \"never\"",
-        "failure-output = \"final\"",
-    ] {
-        assert!(
-            nextest_config.contains(required),
-            "missing {required} in .config/nextest.toml"
-        );
-    }
-    assert_eq!(
-        nextest_config.matches("default-filter = ").count(),
-        1,
-        "only the CI profile should filter out real client integrations"
-    );
     assert!(
-        !nextest_config.contains("repl-integration"),
-        "did not expect stale serial nextest configuration repl-integration"
-    );
-    for required in [
-        "[test-groups]",
-        "interrupt-integration = { max-threads = 1 }",
-        "filter = 'binary(=interrupt)'",
-        "test-group = \"interrupt-integration\"",
-    ] {
-        assert!(
-            nextest_config.contains(required),
-            "missing {required} in .config/nextest.toml"
-        );
-    }
-
-    assert_contains_wrapped_text(
-        &testing_docs,
-        "It opts the interrupt binary into a one-at-a-time group because those tests coordinate through process-local fixtures.",
-        "docs/testing.md",
+        !root.join(".config/nextest.toml").exists(),
+        "the repo should use cargo test directly rather than nextest config"
     );
 
     assert_contains_wrapped_text(
         &testing_docs,
-        "The default local profile includes real client integration binaries.",
+        "The Rust suite uses plain `cargo test` as its single runner.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "The CI profile excludes real client integration binaries from the ordinary Rust suite. CI installs Codex and runs `codex_approvals_tui` separately against a mocked model provider.",
+        "CI passes Cargo's `--quiet` flag to keep successful logs compact.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI installs Codex before `cargo test` and sets `MCP_REPL_CODEX_BACKEND=mock`, so the Codex integration target runs through the mocked provider as part of the ordinary Rust suite.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(
@@ -352,16 +325,16 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "docs/testing.md",
     );
     assert!(
-        testing_docs.contains("MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1"),
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1"),
         "docs/testing.md should show the forced mock Codex backend check"
     );
     assert!(
-        testing_docs.contains("MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1"),
+        testing_docs.contains("MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1"),
         "docs/testing.md should show the forced live Codex backend check"
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "CI runs the Codex integration binary; Claude integration remains local because provider authentication is unavailable in CI.",
+        "CI runs the Codex integration target as part of `cargo test`; Claude integration remains local because provider authentication is unavailable in CI.",
         "docs/testing.md",
     );
     assert!(

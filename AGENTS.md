@@ -9,13 +9,12 @@ Keep this file short. It is a table of contents, not the full manual.
   - `cargo build`
   - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo nextest run --show-progress none`
-  - `cargo test`
+  - `cargo test --quiet`
   - `cargo +nightly fmt`
 - For docs-only changes, run the narrow docs validation that covers the edited
   files, usually `cargo test --test docs_contracts`.
 - When changing Codex backend selection or CI real-client wiring, also run:
-  - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1`
+  - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1`
 - Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 

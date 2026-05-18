@@ -57,5 +57,5 @@
 - 2026-05-17: Added the external public API suite to the cross-platform CI workflow as a separate post-build step.
 - 2026-05-17: Added an R interrupt/restart-prefix scenario with explicit interrupt readiness polling and removed duplicate Rust prefix tests.
 - 2026-05-17: Added files-mode output-bundle scenarios for text bundles, pruning, timeout backfill, and size-cap omission, then removed duplicate broad Rust integration coverage.
-- 2026-05-17: Removed the obsolete nextest `repl-integration` serial group after verifying the remaining Rust REPL binaries pass under normal nextest scheduling.
+- 2026-05-17: Removed obsolete serial scheduling after verifying the remaining Rust REPL binaries pass under normal Cargo test scheduling.
 - 2026-05-18: Reaffirmed that unmigrated Rust scenarios must remain discoverable by `cargo test`; migrations should replace Rust coverage with equivalent Python coverage in the same change, not disable tests ahead of time.

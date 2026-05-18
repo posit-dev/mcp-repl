@@ -12,7 +12,7 @@ This file is the entrypoint for deciding how to verify a change.
 - `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, PTY-backed Python readline behavior, and image output.
 - `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
 - `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
-- `tests/install_*.rs`, `tests/codex_approvals_tui.rs`, and `tests/claude_integration.rs`: install-path and real client integration coverage.
+- `tests/install_*.rs`, `tests/codex_integration.rs`, and `tests/claude_integration.rs`: install-path and real client integration coverage.
 - `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.
 
 ## Snapshot Workflow
@@ -46,43 +46,37 @@ Use `--case <name>` to run one public API case while iterating.
 CI runs this suite after `cargo build` in the main cross-platform workflow,
 using the debug binary built for each matrix target.
 
-## Fast Quiet Rust Suite
+## Rust Suite
 
-Use this while iterating on ordinary Rust tests locally:
+Use Cargo's standard Rust test runner:
 
 ```sh
-cargo nextest run --show-progress none
+cargo test
 ```
 
-The checked-in `.config/nextest.toml` default profile keeps passing-test output
-quiet and shows failure output in the final report. It opts the interrupt
-binary into a one-at-a-time group because those tests coordinate through
-process-local fixtures. The default local profile includes real client
-integration binaries. Use this when Codex and Claude are installed and
-authenticated locally.
+The Rust suite uses plain `cargo test` as its single runner. Plain `cargo test`
+remains the full Cargo compatibility path. It must continue to discover the
+binary unit tests and Rust integration targets. CI passes Cargo's `--quiet`
+flag to keep successful logs compact.
 
-The `--show-progress none` flag hides progress output so successful runs stay
-compact in local terminals and CI logs; nextest treats that as user
-configuration rather than a repository profile key.
+```sh
+cargo test --quiet
+```
 
-The CI workflow uses the CI nextest profile for the ordinary Rust suite after
-`cargo clippy`, with `--profile ci --show-progress none` on the command line.
-The CI profile excludes real client integration binaries from the ordinary Rust
-suite. CI installs Codex and runs `codex_approvals_tui` separately against a
-mocked model provider. Windows keeps the ordinary suite fully serial with
-`--build-jobs 1` and `--test-threads 1`.
+CI installs Codex before `cargo test` and sets `MCP_REPL_CODEX_BACKEND=mock`,
+so the Codex integration target runs through the mocked provider as part of the
+ordinary Rust suite. Windows keeps the Rust suite fully serial with `-j 1` and
+`--test-threads=1`.
 
-Plain `cargo test` remains the full Cargo compatibility path. It must continue
-to discover the binary unit tests and Rust integration targets. Do not opt Rust
-test targets out of Cargo discovery in anticipation of a future Python
-migration; migrate a scenario only when the Rust coverage is deleted or reduced
-in the same change that adds equivalent external coverage.
+Do not opt Rust test targets out of Cargo discovery in anticipation of a future
+Python migration; migrate a scenario only when the Rust coverage is deleted or
+reduced in the same change that adds equivalent external coverage.
 
 ## Real Client Integrations
 
-CI installs Codex and runs the Codex integration binary. The Codex CI
-integration does not require OpenAI authentication because the test config
-points Codex at a local mock provider.
+CI installs Codex before the Rust suite. The Codex CI integration does not
+require OpenAI authentication because the test config points Codex at a local
+mock provider.
 
 By default, the Codex integration uses `MCP_REPL_CODEX_BACKEND=auto`: it checks
 whether Codex is logged in, checks whether `gpt-5.3-codex-spark` is available,
@@ -94,13 +88,13 @@ When changing Codex backend selection or CI real-client wiring, run the forced
 mock path explicitly:
 
 ```sh
-MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1
+MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1
 ```
 
 To validate the authenticated live path directly on a machine with Spark access:
 
 ```sh
-MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_approvals_tui codex_exec_auto_backend_smoke -- --test-threads=1
+MCP_REPL_CODEX_BACKEND=live cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1
 ```
 
 Local full verification includes the Codex and Claude integration binaries when
@@ -113,11 +107,11 @@ showing whether the test selected live Spark or the mocked provider.
 To run only those integrations:
 
 ```sh
-cargo nextest run --show-progress none --test codex_approvals_tui --test claude_integration
+cargo test --quiet --test codex_integration --test claude_integration
 ```
 
-CI runs the Codex integration binary; Claude integration remains local because
-provider authentication is unavailable in CI.
+CI runs the Codex integration target as part of `cargo test`; Claude integration
+remains local because provider authentication is unavailable in CI.
 
 ## Full Verification Before Replying
 
@@ -127,8 +121,7 @@ If you modify code, run:
 - `cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo nextest run --show-progress none`
-- `cargo test`
+- `cargo test --quiet`
 - `cargo +nightly fmt`
 
 For docs-only changes, run the narrow validation that covers the edited docs.
