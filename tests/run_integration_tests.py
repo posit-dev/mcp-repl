@@ -508,7 +508,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
         "warmup repl",
     )
 
-    timed_out = client.repl("Sys.sleep(1)\n", timeout_ms=300)
+    timed_out = client.repl("Sys.sleep(5)\n", timeout_ms=300)
     assert_identical(
         tool_result(
             text("<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>")
@@ -527,7 +527,12 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
         "busy follow-up repl",
     )
 
-    wait_for_response(client, tool_result(text("> ")), "timeout poll repl")
+    wait_for_response(
+        client,
+        tool_result(text("> ")),
+        "timeout poll repl",
+        deadline_seconds=10.0,
+    )
 
     recovered = client.repl("1+1\n", timeout_ms=5000)
     assert_identical(
