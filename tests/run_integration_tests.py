@@ -597,16 +597,25 @@ tryCatch(
         "interrupt setup repl",
     )
 
-    interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
-    assert_identical(
-        tool_result(
-            text("interrupt received\n"),
-            text("AFTER_INTERRUPT\n"),
-            text("> "),
-        ),
-        interrupted,
-        "interrupt prefix repl",
+    expected_interrupted = tool_result(
+        text("interrupt received\n"),
+        text("AFTER_INTERRUPT\n"),
+        text("> "),
     )
+    interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
+    if is_busy_response(interrupted):
+        wait_for_response(
+            client,
+            expected_interrupted,
+            "interrupt prefix repl",
+            deadline_seconds=10.0,
+        )
+    else:
+        assert_identical(
+            expected_interrupted,
+            interrupted,
+            "interrupt prefix repl",
+        )
 
 
 def r_output_bundle_files(client: McpStdioClient) -> None:

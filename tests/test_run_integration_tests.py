@@ -90,6 +90,58 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 deadline_seconds=1.0,
             )
 
+    def test_r_interrupt_restart_prefixes_polls_after_transient_busy_interrupt(self):
+        initial_busy = self.module.tool_result(
+            self.module.text(
+                "INTERRUPT_READY\n"
+                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=1>>"
+            )
+        )
+        interrupt_busy = self.module.tool_result(
+            self.module.text(
+                "<<repl status: busy, write_stdin timeout reached; elapsed_ms=2>>"
+            )
+        )
+        interrupted = self.module.tool_result(
+            self.module.text("interrupt received\n"),
+            self.module.text("AFTER_INTERRUPT\n"),
+            self.module.text("> "),
+        )
+        test_case = self
+        self_module = self.module
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = [
+                    ("x <- 1\n", 30000, self_module.tool_result(self_module.text("> "))),
+                    (
+                        '\u0004print(exists("x"))\n',
+                        30000,
+                        self_module.tool_result(
+                            self_module.text("[repl] new session started\n"),
+                            self_module.text("[1] FALSE\n"),
+                            self_module.text("> "),
+                        ),
+                    ),
+                    (None, 1000, initial_busy),
+                    ('\u0003cat("AFTER_INTERRUPT\\n")', 5000, interrupt_busy),
+                    ("", 500, interrupted),
+                ]
+
+            def repl(self, input_text, *, timeout_ms=None):
+                test_case.assertTrue(self.responses, "unexpected repl call")
+                expected_input, expected_timeout, result = self.responses.pop(0)
+                if expected_input is None:
+                    test_case.assertIn("INTERRUPT_READY", input_text)
+                else:
+                    test_case.assertEqual(expected_input, input_text)
+                test_case.assertEqual(expected_timeout, timeout_ms)
+                return result
+
+        client = FakeClient()
+        self.module.r_interrupt_restart_prefixes(client)
+        self.assertEqual([], client.responses)
+
 
 class FakeClientWithoutResponses:
     def repl(self, input_text, *, timeout_ms=None):
