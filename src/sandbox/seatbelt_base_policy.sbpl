@@ -22,6 +22,12 @@
   (require-all
     (path "/dev/null")
     (vnode-type CHARACTER-DEVICE)))
+; Allow runtimes and child processes to write directly to inherited stdout/stderr
+; through the standard device aliases.
+(allow file-read* file-write*
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (regex #"^/dev/fd/[12]$"))
 ; Allow uv's SystemConfiguration probe to touch /dev/dtracehelper on macOS.
 (allow file-write-data
   (require-all

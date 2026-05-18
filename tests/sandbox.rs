@@ -203,6 +203,12 @@ fn extract_prefixed_value_does_not_match_substrings() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_sandbox_probe_detects_available_sandbox_exec() {
+    assert!(common::sandbox_exec_available());
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn assert_tempdir_layout(info: &TempDirInfo, context: &str) {
     assert!(
@@ -595,12 +601,23 @@ fn reticulate_cache_dir() -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn uv_cache_dir() -> Option<PathBuf> {
+    let output = Command::new("uv").args(["cache", "dir"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(PathBuf::from(path))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_workspace_writes() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let repo_root = std::env::current_dir()?;
     let target = unique_path(&repo_root, "read-only");
     let session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
@@ -629,10 +646,7 @@ async fn sandbox_read_only_blocks_workspace_writes() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let repo_root = std::env::current_dir()?;
     let target = unique_path(&repo_root, "workspace-write");
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
@@ -657,10 +671,7 @@ async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(());
     };
@@ -719,10 +730,7 @@ async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> Te
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(());
     };
@@ -782,10 +790,7 @@ async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_full_access_allows_writes_outside_workspace() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let target = unique_path(&std::env::temp_dir(), "full-access");
     let session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
     let result = session
@@ -809,10 +814,7 @@ async fn sandbox_full_access_allows_writes_outside_workspace() -> TestResult<()>
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -840,12 +842,12 @@ async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let mut writable_roots = Vec::new();
     if let Some(root) = reticulate_cache_dir() {
+        writable_roots.push(root);
+    }
+    if let Some(root) = uv_cache_dir() {
         writable_roots.push(root);
     }
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
@@ -892,15 +894,6 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("requested data wasn't found in the cache")
-        || text.contains("Failed to download `")
-        || text.contains("Packages were unavailable because the network was disabled")
-    {
-        eprintln!("sandbox_reticulate_keras_backend offline cache unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
     assert!(
         !text.contains("[repl] keras-reticulate-error:"),
         "reticulate/keras sandbox run failed: {text}"
@@ -917,10 +910,7 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_blocks_network_access() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -948,10 +938,7 @@ async fn sandbox_workspace_write_blocks_network_access() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
     let Some(first) = fetch_tempdir_info(&mut session).await? else {
         eprintln!(
@@ -990,10 +977,7 @@ async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1044,10 +1028,7 @@ cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_network_access() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -1071,10 +1052,7 @@ async fn sandbox_workspace_write_allows_network_access() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -1098,10 +1076,7 @@ async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_allows_sysctl_used_by_quarto() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
 
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"
@@ -1119,7 +1094,10 @@ cat("SYSCTL_OIDFMT_STATUS=", status_oidfmt, "\n", sep = "")
         return Ok(());
     }
     assert!(
-        text.contains("SYSCTL_BRAND_STRING=Intel") || text.contains("SYSCTL_BRAND_STRING=Apple"),
+        text.lines().any(|line| {
+            line.starts_with("SYSCTL_BRAND_STRING=")
+                && (line.contains("Intel") || line.contains("Apple"))
+        }),
         "expected sysctl machdep.cpu.brand_string to contain Intel or Apple, got: {text}"
     );
     assert!(
@@ -1138,10 +1116,7 @@ cat("SYSCTL_OIDFMT_STATUS=", status_oidfmt, "\n", sep = "")
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_allows_parallel_detect_cores() -> TestResult<()> {
-    if !sandbox_available() {
-        eprintln!("sandbox-exec unavailable; skipping");
-        return Ok(());
-    }
+    assert!(sandbox_available(), "sandbox-exec unavailable");
 
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"

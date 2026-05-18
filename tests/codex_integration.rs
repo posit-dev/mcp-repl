@@ -40,9 +40,6 @@ mod unix_impl {
     const MOCK_TOOL_INPUT: &str = "cat(\"CODEX_MOCK_MCP_OK\\n\")\n";
     const LIVE_FINAL_MARKER: &str = "CODEX_LIVE_DONE";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
-
     fn codex_exec_test_mutex() -> &'static tokio::sync::Mutex<()> {
         static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -426,17 +423,10 @@ mod unix_impl {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
         const TEST_NAME: &str = "codex_tui_full_access_sandbox_update";
-        if !full_access_test_enabled() {
-            print_skip_banner(TEST_NAME, &format!("{FULL_ACCESS_TEST_ENV} is not set"));
-            return Ok(());
-        }
         if !codex_client_ready(TEST_NAME) {
             return Ok(());
         }
-        if !common::sandbox_exec_available() {
-            print_skip_banner(TEST_NAME, "sandbox-exec unavailable");
-            return Ok(());
-        }
+        assert!(common::sandbox_exec_available(), "sandbox-exec unavailable");
         if !loopback_bind_available().await {
             print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(());
@@ -459,15 +449,15 @@ mod unix_impl {
         driver.drain(Duration::from_millis(800));
         driver.ensure_running("after startup")?;
         driver.wait_for_warmup(Duration::from_secs(10))?;
-        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
         ))?;
         driver.wait_for_contains("WRITE_ERROR:", Duration::from_secs(20))?;
         driver.wait_for_contains("Tool call 1 completed", Duration::from_secs(20))?;
+        wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
-        driver.send_line("/approvals")?;
+        driver.send_line("/permissions")?;
         driver.wait_for_contains("Update Model Permissions", Duration::from_secs(15))?;
         driver.send("3")?;
         driver.wait_for_contains(
@@ -475,18 +465,17 @@ mod unix_impl {
             Duration::from_secs(15),
         )?;
 
+        driver.send_line(&format!(
+            "{FULL_ACCESS_MARKER}: probe write after full access"
+        ))?;
+        driver.wait_for_contains("WRITE_OK", Duration::from_secs(20))?;
+        driver.wait_for_contains("Tool call 2 completed", Duration::from_secs(20))?;
         wait_for_log_contains(
             &env.debug_dir,
             "danger-full-access",
             Duration::from_secs(20),
         )?;
         wait_for_log_contains(&env.debug_dir, "tool-call-meta", Duration::from_secs(20))?;
-
-        driver.send_line(&format!(
-            "{FULL_ACCESS_MARKER}: probe write after full access"
-        ))?;
-        driver.wait_for_contains("WRITE_OK", Duration::from_secs(20))?;
-        driver.wait_for_contains("Tool call 2 completed", Duration::from_secs(20))?;
         driver.kill()?;
 
         let outputs = mock_server.function_call_outputs().await;
@@ -536,11 +525,6 @@ mod unix_impl {
             "expected parse_error marker in mock request log, got: {last_request:?}"
         );
         Ok(())
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn full_access_test_enabled() -> bool {
-        std::env::var_os(FULL_ACCESS_TEST_ENV).is_some()
     }
 
     async fn loopback_bind_available() -> bool {
@@ -1513,7 +1497,11 @@ trust_level = "trusted"
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        let target = std::env::temp_dir().join(format!("mcp-repl-codex-probe-{nanos}.txt"));
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .ok_or_else(|| "missing HOME/USERPROFILE for outside-workspace probe".to_string())?;
+        let target = home.join(format!(".mcp-repl-codex-probe-{nanos}.txt"));
         let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
             .map_err(|err| format!("failed to encode target path: {err}"))?;
         Ok(r#"target <- __TARGET__

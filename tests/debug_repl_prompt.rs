@@ -12,11 +12,13 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[cfg(target_os = "macos")]
 fn sandbox_exec_available() -> bool {
     // Mirror tests/common/mod.rs: sandbox-exec may exist but be unusable (status 71).
-    if std::env::var_os("CODEX_SANDBOX").is_some() {
-        return false;
-    }
     Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", "(version 1)", "--", "/usr/bin/true"])
+        .args([
+            "-p",
+            "(version 1)(allow process-exec)(allow file-read*)",
+            "--",
+            "/usr/bin/true",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

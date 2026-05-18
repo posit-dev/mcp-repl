@@ -234,19 +234,23 @@ fn real_python_executable() -> TestResult<String> {
 async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if !common::sandbox_exec_available() {
-        eprintln!("sandbox not available; skipping");
-        return Ok(());
-    }
-    if std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_some() {
-        eprintln!("explicit Python executable set; skipping discovery test");
-        return Ok(());
-    }
+    assert!(common::sandbox_exec_available(), "sandbox unavailable");
+    assert!(
+        std::env::var_os("MCP_REPL_PYTHON_EXECUTABLE").is_none(),
+        "explicit Python executable disables discovery sandbox coverage"
+    );
 
     let _guard = lock_test_mutex();
     let workspace = tempdir()?;
-    let outside = tempdir()?;
-    let marker = outside.path().join("python-discovery-marker");
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or("missing HOME/USERPROFILE for Python discovery sandbox marker")?;
+    let marker = home.join(format!(
+        ".mcp-repl-python-discovery-marker-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&marker);
     let marker_text = marker
         .to_str()
         .ok_or("marker path must be valid utf-8")?
@@ -276,9 +280,11 @@ async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
     let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
     let text = result_text(&result);
     session.cancel().await?;
+    let marker_exists = marker.exists();
+    let _ = fs::remove_file(&marker);
 
     assert!(
-        !marker.exists(),
+        !marker_exists,
         "Python discovery probe wrote outside the sandbox; reply was: {text:?}"
     );
     Ok(())
