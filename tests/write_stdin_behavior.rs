@@ -1131,10 +1131,22 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
 async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
+    let gate_temp = workspace_tempdir()?;
+    let start_gate_path = gate_temp.path().join("start-ready");
+    let done_path = gate_temp.path().join("bundle-failure-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
     let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
-    let input = "big <- paste(rep('z', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
+    let input = format!(
+        "big <- paste(rep('z', 120), collapse = ''); \
+         cat('start\\n'); flush.console(); \
+         while (!file.exists({start_gate_literal})) Sys.sleep(0.02); \
+         for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); \
+         flush.console(); cat('end\\n'); flush.console(); \
+         writeLines('done', {done_literal})"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1145,7 +1157,8 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 
     fs::remove_dir_all(temp.path())?;
 
-    sleep(test_delay_ms(160, 600)).await;
+    fs::write(&start_gate_path, b"go")?;
+    wait_until_path_exists(&done_path, "bundle failure output marker").await?;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
 
@@ -1178,12 +1191,21 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
+    let gate_temp = workspace_tempdir()?;
+    let start_gate_path = gate_temp.path().join("start-ready");
+    let done_path = gate_temp.path().join("hidden-bundle-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
     let session =
         spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let first = session
         .write_stdin_raw_with(
-            "cat('start\\n'); flush.console(); Sys.sleep(0.1); cat('end\\n')",
+            format!(
+                "cat('start\\n'); flush.console(); \
+                 while (!file.exists({start_gate_literal})) Sys.sleep(0.02); \
+                 cat('end\\n'); flush.console(); writeLines('done', {done_literal})"
+            ),
             Some(0.05),
         )
         .await?;
@@ -1203,7 +1225,8 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
         "did not expect a hidden timeout bundle directory before disclosure"
     );
 
-    sleep(test_delay_ms(160, 600)).await;
+    fs::write(&start_gate_path, b"go")?;
+    wait_until_path_exists(&done_path, "hidden bundle output marker").await?;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<repl status: busy") {
