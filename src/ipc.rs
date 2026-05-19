@@ -461,6 +461,14 @@ impl ServerIpcConnection {
                         reason,
                         message_b64,
                     } => {
+                        if let Err(err) =
+                            validate_session_end(reason.as_deref(), message_b64.as_deref())
+                        {
+                            let mut guard = reader_inbox.lock().unwrap();
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.session_end = true;
                         guard.session_end_final = true;
@@ -1905,6 +1913,23 @@ fn latch_protocol_error(guard: &mut ServerIpcInbox, message: impl Into<String>) 
         message: message.into(),
         observed_at: Instant::now(),
     });
+}
+
+fn validate_session_end(reason: Option<&str>, message_b64: Option<&str>) -> Result<(), String> {
+    if let Some(reason) = reason {
+        match reason {
+            "shutdown" | "reset" | "runtime_exit" | "crash" | "protocol_error" => {}
+            other => return Err(format!("invalid session_end reason: {other}")),
+        }
+    }
+    if let Some(message_b64) = message_b64
+        && base64::engine::general_purpose::STANDARD
+            .decode(message_b64)
+            .is_err()
+    {
+        return Err("invalid session_end message_b64 base64".to_string());
+    }
+    Ok(())
 }
 
 fn take_latched_protocol_error(guard: &mut ServerIpcInbox) -> Option<String> {

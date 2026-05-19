@@ -743,6 +743,29 @@ async fn zod_worker_output_after_session_end_is_protocol_error() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_invalid_session_end_reason_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-session-end-reason",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid session_end reason"),
+        "expected invalid session_end reason protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_mixed_output_order() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 

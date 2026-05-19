@@ -26,6 +26,8 @@ const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const SHUTDOWN_LOG_ENV: &str = "MCP_REPL_ZOD_SHUTDOWN_LOG";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
+const INVALID_SESSION_END_REASON: &str =
+    r#"{"type":"session_end","reason":"not-a-recognized-reason"}"#;
 
 #[cfg(target_family = "unix")]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -214,6 +216,11 @@ fn run_command(
 
     if command == "bad-output-base64" {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
+        return Ok(());
+    }
+
+    if command == "bad-session-end-reason" {
+        writer.send_raw_json(INVALID_SESSION_END_REASON)?;
         return Ok(());
     }
 
