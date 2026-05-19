@@ -802,6 +802,53 @@ async fn zod_worker_invalid_session_end_reason_is_protocol_error() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_repl_reset_closes_active_stdin_without_shutdown_text() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let active = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-user-stdin",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let active_text = result_text(&active);
+    assert!(
+        active_text.contains("<<repl status: busy"),
+        "expected active stdin read to time out before reset, got: {active_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to respawn the Zod worker, got: {reset_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        !shutdown_log_text.contains("user-stdin:exit\n"),
+        "repl_reset must not send shutdown text to an active request, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("user-stdin:<eof>\n"),
+        "expected reset to close active stdin instead, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_repl_reset_can_exercise_slow_graceful_shutdown() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let shutdown_log = tempdir.path().join("shutdown.log");

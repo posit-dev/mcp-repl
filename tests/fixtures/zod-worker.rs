@@ -116,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &writer,
             &sideband_interrupted,
             &mut reader,
+            shutdown_log_path.as_deref(),
             command,
             &line,
             &mut command_state,
@@ -135,6 +136,7 @@ fn run_command(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     reader: &mut dyn BufRead,
+    shutdown_log_path: Option<&Path>,
     command: &str,
     raw_line: &str,
     state: &mut CommandState,
@@ -226,6 +228,20 @@ fn run_command(
     if let Some(millis) = command.strip_prefix("discard-on-interrupt ") {
         if sleep_for(parse_millis(millis)?, sideband_interrupted, true) {
             discard_buffered_stdin(reader, writer)?;
+        }
+        return Ok(());
+    }
+
+    if command == "read-user-stdin" {
+        let mut user_line = String::new();
+        let bytes = reader.read_line(&mut user_line)?;
+        if bytes == 0 {
+            append_shutdown_log(shutdown_log_path, "user-stdin:<eof>")?;
+        } else {
+            append_shutdown_log(
+                shutdown_log_path,
+                format!("user-stdin:{}", user_line.trim_end_matches(['\r', '\n'])).as_str(),
+            )?;
         }
         return Ok(());
     }
