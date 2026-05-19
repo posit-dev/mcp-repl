@@ -664,7 +664,9 @@ emits an unsatisfied `readline_start`, the server uses that explicit
 event to finalize the poll reply.
 
 A later non-empty `repl()` call after an unsatisfied `readline_start` is
-written to worker stdin after the same trailing-newline normalization.
+written to worker stdin after the same trailing-newline rule: if the input is
+non-empty and does not end in `\n`, append one `\n`. The server does not
+otherwise canonicalize supplied stdin bytes such as `\r\n` or bare `\r`.
 The worker/runtime decides whether those bytes answer an
 interpreter-level prompt, continue an incomplete expression, or start a
 new top-level evaluation.

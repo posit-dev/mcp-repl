@@ -475,7 +475,8 @@ fn driver_refresh_worker_ready(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
+        let normalized = normalize_input_newlines(text);
+        let mut payload = normalized.into_bytes();
         if !payload.is_empty() && !payload.ends_with(b"\n") {
             payload.push(b'\n');
         }
@@ -852,7 +853,8 @@ fn strip_one_line_ending(text: &str) -> Option<&str> {
 #[cfg(not(target_family = "unix"))]
 impl BackendDriver for PythonBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
+        let normalized = normalize_input_newlines(text);
+        let mut payload = normalized.into_bytes();
         if !payload.is_empty() && !payload.ends_with(b"\n") {
             payload.push(b'\n');
         }
@@ -2565,7 +2567,6 @@ impl WorkerManager {
         worker_timeout: Duration,
         server_timeout: Duration,
     ) -> Result<RequestState, WorkerError> {
-        let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt);

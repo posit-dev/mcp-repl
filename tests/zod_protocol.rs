@@ -343,6 +343,42 @@ async fn zod_worker_reset_requests_shutdown_by_closing_stdin_only() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_preserves_crlf_stdin_and_appended_newline() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "report-raw-line supplied crlf\r\nreport-raw-line trailing carriage\r",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("raw-line-debug: report-raw-line supplied crlf\\r\\n\n"),
+        "expected supplied CRLF bytes to reach Zod unchanged, got: {text:?}"
+    );
+    assert!(
+        text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\n"),
+        "expected server to append one newline after trailing carriage return, got: {text:?}"
+    );
+    assert!(
+        !text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\\n\n"),
+        "server must not append more than one newline, got: {text:?}"
+    );
+    assert!(
+        text.contains("zod> "),
+        "expected worker prompt after CRLF input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_prompt_shaped_stdout() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 

@@ -260,6 +260,12 @@ fn run_command(
         return Ok(());
     }
 
+    if command == "report-raw-line" || command.starts_with("report-raw-line ") {
+        let text = format!("raw-line-debug: {}\n", raw_line.escape_debug());
+        writer.output_text("stdout", text.as_bytes())?;
+        return Ok(());
+    }
+
     if command == "bad-output-base64" {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
