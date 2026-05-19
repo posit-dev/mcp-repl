@@ -475,7 +475,8 @@ fn driver_refresh_worker_ready(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
+        let normalized = normalize_input_newlines(text);
+        let mut payload = normalized.into_bytes();
         if !payload.is_empty() && !payload.ends_with(b"\n") {
             payload.push(b'\n');
         }
