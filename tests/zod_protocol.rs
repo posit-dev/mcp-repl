@@ -766,6 +766,116 @@ async fn zod_worker_invalid_session_end_reason_is_protocol_error() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_repl_reset_can_exercise_slow_graceful_shutdown() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let configured = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "slow-shutdown 25",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let configured_text = result_text(&configured);
+    assert!(
+        configured_text.contains("zod> "),
+        "expected Zod to accept slow shutdown hook, got: {configured_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to respawn after slow shutdown, got: {reset_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        shutdown_log_text.contains("stdin_eof\n"),
+        "expected repl_reset to close worker stdin, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        !shutdown_log_text.contains("user-stdin:exit\n"),
+        "reset must not send shutdown text to stdin, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:delay-ms:25\n"),
+        "expected Zod to record the slow shutdown hook, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:delay-complete\n"),
+        "expected Zod to complete the slow shutdown hook, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_can_hold_shutdown_open_for_escalation_tests() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let configured = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "hang-shutdown",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let configured_text = result_text(&configured);
+    assert!(
+        configured_text.contains("zod> "),
+        "expected Zod to accept hanging shutdown hook, got: {configured_text:?}"
+    );
+
+    let exiting = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "exit",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let exiting_text = result_text(&exiting);
+    assert!(
+        exiting_text.contains("<<repl status: busy"),
+        "expected hanging shutdown hook to leave exit pending, got: {exiting_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        shutdown_log_text.contains("user-stdin:exit\n"),
+        "expected Zod to receive exit before hanging, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:hang\n"),
+        "expected Zod to record the hanging shutdown hook, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_mixed_output_order() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 

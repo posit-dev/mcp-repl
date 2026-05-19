@@ -753,6 +753,10 @@ a small deterministic command language through stdin:
   poll behavior can be tested.
 - `interruptible <millis>` delays until either the timer finishes or an
   OS interrupt arrives.
+- `slow-shutdown <millis>` delays a later `exit` or EOF `session_end`
+  so reset and shutdown graceful-exit timing can be tested.
+- `hang-shutdown` accepts a later `exit` or EOF but never emits
+  `session_end`, so reset and shutdown OS escalation can be tested.
 - `image` emits a tiny deterministic PNG if Zod advertises image
   support.
 - `exit` emits `session_end`.

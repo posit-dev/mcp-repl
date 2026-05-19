@@ -69,7 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
-    let mut next_prompt = "zod> ".to_string();
+    let mut command_state = CommandState {
+        next_prompt: "zod> ".to_string(),
+        shutdown_mode: ShutdownMode::Normal,
+    };
     let mut timeline = Timeline::default();
     loop {
         line.clear();
@@ -81,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "stdin_eof"
             };
             append_shutdown_log(shutdown_log_path.as_deref(), shutdown_event)?;
+            apply_shutdown_mode(shutdown_log_path.as_deref(), command_state.shutdown_mode)?;
             send_session_end(&writer, &mut timeline, "shutdown")?;
             return Ok(());
         }
@@ -96,6 +100,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
+            append_shutdown_log(shutdown_log_path.as_deref(), "user-stdin:exit")?;
+            apply_shutdown_mode(shutdown_log_path.as_deref(), command_state.shutdown_mode)?;
             send_session_end(&writer, &mut timeline, "runtime_exit")?;
             return Ok(());
         }
@@ -111,14 +117,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut reader,
             command,
             &line,
-            &mut next_prompt,
+            &mut command_state,
             &mut timeline,
         )?;
         timeline.run(LifecyclePoint::AfterCommand, &writer)?;
         send_readline_start(
             &writer,
             &mut timeline,
-            std::mem::replace(&mut next_prompt, "zod> ".to_string()),
+            std::mem::replace(&mut command_state.next_prompt, "zod> ".to_string()),
         )?;
     }
 }
@@ -129,11 +135,11 @@ fn run_command(
     reader: &mut dyn BufRead,
     command: &str,
     raw_line: &str,
-    next_prompt: &mut String,
+    state: &mut CommandState,
     timeline: &mut Timeline,
 ) -> io::Result<()> {
     if let Some(prompt) = command.strip_prefix("wait ") {
-        *next_prompt = prompt.to_string();
+        state.next_prompt = prompt.to_string();
         return Ok(());
     }
 
@@ -190,6 +196,16 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("slow-shutdown ") {
+        state.shutdown_mode = ShutdownMode::Delay(Duration::from_millis(parse_millis(millis)?));
+        return Ok(());
+    }
+
+    if command == "hang-shutdown" {
+        state.shutdown_mode = ShutdownMode::Hang;
+        return Ok(());
+    }
+
     if let Some(millis) = command.strip_prefix("discard-on-interrupt ") {
         if sleep_for(parse_millis(millis)?, interrupted, true) {
             discard_buffered_stdin(reader, writer)?;
@@ -225,6 +241,35 @@ fn run_command(
     }
 
     writer.output_text("stdout", raw_line.as_bytes())
+}
+
+struct CommandState {
+    next_prompt: String,
+    shutdown_mode: ShutdownMode,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownMode {
+    Normal,
+    Delay(Duration),
+    Hang,
+}
+
+fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()> {
+    match mode {
+        ShutdownMode::Normal => Ok(()),
+        ShutdownMode::Delay(delay) => {
+            append_shutdown_log(path, &format!("shutdown:delay-ms:{}", delay.as_millis()))?;
+            thread::sleep(delay);
+            append_shutdown_log(path, "shutdown:delay-complete")
+        }
+        ShutdownMode::Hang => {
+            append_shutdown_log(path, "shutdown:hang")?;
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+    }
 }
 
 fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
