@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_prompt: "zod> ".to_string(),
         shutdown_mode: ShutdownMode::Normal,
         previous_line_empty: false,
+        shutdown_log_path: shutdown_log_path.clone(),
     };
     let mut timeline = Timeline::default();
     loop {
@@ -116,7 +117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &writer,
             &sideband_interrupted,
             &mut reader,
-            shutdown_log_path.as_deref(),
             command,
             &line,
             &mut command_state,
@@ -136,7 +136,6 @@ fn run_command(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     reader: &mut dyn BufRead,
-    shutdown_log_path: Option<&Path>,
     command: &str,
     raw_line: &str,
     state: &mut CommandState,
@@ -236,10 +235,10 @@ fn run_command(
         let mut user_line = String::new();
         let bytes = reader.read_line(&mut user_line)?;
         if bytes == 0 {
-            append_shutdown_log(shutdown_log_path, "user-stdin:<eof>")?;
+            append_shutdown_log(state.shutdown_log_path.as_deref(), "user-stdin:<eof>")?;
         } else {
             append_shutdown_log(
-                shutdown_log_path,
+                state.shutdown_log_path.as_deref(),
                 format!("user-stdin:{}", user_line.trim_end_matches(['\r', '\n'])).as_str(),
             )?;
         }
@@ -299,6 +298,7 @@ struct CommandState {
     next_prompt: String,
     shutdown_mode: ShutdownMode,
     previous_line_empty: bool,
+    shutdown_log_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
