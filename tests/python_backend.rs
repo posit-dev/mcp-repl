@@ -780,6 +780,10 @@ else:
         .await?;
     let text = result_text(&result);
     assert!(
+        !text.contains('\x1b'),
+        "did not expect terminal control sequences in a simple Python reply, got: {text:?}"
+    );
+    assert!(
         text.lines().any(|line| line.trim() == "mcp-repl"),
         "expected Python worker process image to be mcp-repl, got: {text:?}"
     );

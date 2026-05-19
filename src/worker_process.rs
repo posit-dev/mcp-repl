@@ -7324,6 +7324,86 @@ where
 }
 
 #[cfg(target_family = "windows")]
+#[derive(Default)]
+struct WindowsPtyOutputFilter {
+    state: WindowsPtyOutputFilterState,
+    pending: Vec<u8>,
+}
+
+#[cfg(target_family = "windows")]
+#[derive(Default)]
+enum WindowsPtyOutputFilterState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+}
+
+#[cfg(target_family = "windows")]
+impl WindowsPtyOutputFilter {
+    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match self.state {
+                WindowsPtyOutputFilterState::Ground => {
+                    if byte == 0x1b {
+                        self.pending.clear();
+                        self.pending.push(byte);
+                        self.state = WindowsPtyOutputFilterState::Escape;
+                    } else {
+                        output.push(byte);
+                    }
+                }
+                WindowsPtyOutputFilterState::Escape => {
+                    self.pending.push(byte);
+                    if byte == b'[' {
+                        self.state = WindowsPtyOutputFilterState::Csi;
+                    } else {
+                        output.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = WindowsPtyOutputFilterState::Ground;
+                    }
+                }
+                WindowsPtyOutputFilterState::Csi => {
+                    self.pending.push(byte);
+                    if is_csi_final_byte(byte) {
+                        if !is_conpty_screen_control_csi(&self.pending) {
+                            output.extend_from_slice(&self.pending);
+                        }
+                        self.pending.clear();
+                        self.state = WindowsPtyOutputFilterState::Ground;
+                    } else if self.pending.len() > 128 {
+                        output.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = WindowsPtyOutputFilterState::Ground;
+                    }
+                }
+            }
+        }
+        output
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn is_csi_final_byte(byte: u8) -> bool {
+    (0x40..=0x7e).contains(&byte)
+}
+
+#[cfg(target_family = "windows")]
+fn is_conpty_screen_control_csi(sequence: &[u8]) -> bool {
+    if !sequence.starts_with(b"\x1b[") {
+        return false;
+    }
+    match sequence.last().copied() {
+        Some(b'@' | b'A'..=b'K' | b'P' | b'S' | b'T' | b'X' | b'f' | b'r' | b's' | b'u') => true,
+        Some(b'h' | b'l') => sequence
+            .get(2..sequence.len().saturating_sub(1))
+            .is_some_and(|params| params.starts_with(b"?")),
+        _ => false,
+    }
+}
+
+#[cfg(target_family = "windows")]
 fn spawn_blocking_output_reader<R>(
     stream: Option<R>,
     output_stream: TextStream,
@@ -7339,10 +7419,16 @@ where
     let stop_requested = Arc::new(AtomicBool::new(false));
     let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let mut filter = WindowsPtyOutputFilter::default();
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => live_output.append_raw_text(&buffer[..n], output_stream),
+                Ok(n) => {
+                    let filtered = filter.filter(&buffer[..n]);
+                    if !filtered.is_empty() {
+                        live_output.append_raw_text(&filtered, output_stream);
+                    }
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -8131,6 +8217,25 @@ mod tests {
         let kills = TEST_UNIX_KILL_RECORDER
             .with(|recorder| recorder.borrow_mut().take().expect("recorded kills"));
         (result, kills)
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_output_filter_strips_split_conpty_cursor_sequences() {
+        let mut filter = WindowsPtyOutputFilter::default();
+        let mut output = filter.filter(b"\r\nmcp-repl\n\x1b[?25");
+        output.extend(filter.filter(b"l\x1b[15;1H\x1b[?25h>>> "));
+
+        assert_eq!(String::from_utf8(output).unwrap(), "\r\nmcp-repl\n>>> ");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_output_filter_preserves_sgr_sequences() {
+        let mut filter = WindowsPtyOutputFilter::default();
+        let output = filter.filter(b"\x1b[31mred\x1b[0m\n");
+
+        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[31mred\x1b[0m\n");
     }
 
     #[test]
