@@ -1972,6 +1972,38 @@ async fn python_multiline_block() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_crlf_multiline_block_executes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_unterminated_with(
+            "if True:\r\n    print('CRLF_BLOCK_OK')\r\n\r\n",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected CRLF multiline block to finish, got: {text:?}"
+    );
+    assert!(
+        text.contains("CRLF_BLOCK_OK"),
+        "expected CRLF multiline block output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("IndentationError"),
+        "CRLF multiline block injected a blank line before the body: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();

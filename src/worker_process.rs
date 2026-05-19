@@ -938,6 +938,13 @@ impl ProtocolBackendDriver {
 
 impl BackendDriver for ProtocolBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
+        #[cfg(target_family = "unix")]
+        let mut payload = if self.python_request_generation.is_some() {
+            normalize_input_newlines(text).into_bytes()
+        } else {
+            text.as_bytes().to_vec()
+        };
+        #[cfg(not(target_family = "unix"))]
         let mut payload = text.as_bytes().to_vec();
         if !payload.is_empty() && !payload.ends_with(b"\n") {
             payload.push(b'\n');
