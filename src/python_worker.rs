@@ -11,14 +11,10 @@ use crate::python_session::{self, PythonSession};
 
 struct WorkerState {
     busy: AtomicBool,
-    shutting_down: AtomicBool,
 }
 
 impl WorkerState {
     fn try_mark_busy(&self) -> bool {
-        if self.is_shutting_down() {
-            return false;
-        }
         self.busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -27,21 +23,12 @@ impl WorkerState {
     fn mark_idle(&self) {
         self.busy.store(false, Ordering::SeqCst);
     }
-
-    fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
-    }
-
-    fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
-    }
 }
 
 impl Default for WorkerState {
     fn default() -> Self {
         Self {
             busy: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
         }
     }
 }
@@ -128,10 +115,6 @@ fn init_ipc(
                         python_session::interrupt_request_generation(request_generation);
                         emit_python_interrupt_ack();
                     }
-                    Some(ServerToWorkerIpcMessage::SessionEnd) => {
-                        state.begin_shutdown();
-                        let _ = python_session::request_shutdown();
-                    }
                     None => {
                         std::process::exit(0);
                     }
@@ -163,10 +146,6 @@ fn handle_write_stdin(
     state: Arc<WorkerState>,
     request_tx: &mpsc::SyncSender<QueuedRequest>,
 ) {
-    if state.is_shutting_down() {
-        return;
-    }
-
     if !state.try_mark_busy() {
         emit_stderr_message("worker is busy; request already running");
         return;

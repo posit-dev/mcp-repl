@@ -102,7 +102,6 @@ pub enum ServerToWorkerIpcMessage {
         request_generation: u64,
     },
     Interrupt,
-    SessionEnd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,8 +111,6 @@ pub enum WorkerToServerIpcMessage {
         protocol: WorkerProtocol,
         worker: WorkerIdentity,
         capabilities: WorkerCapabilities,
-        #[serde(default)]
-        graceful_shutdown: Option<WorkerGracefulShutdown>,
     },
     BackendInfo {
         #[serde(default)]
@@ -180,12 +177,6 @@ pub struct WorkerIdentity {
 pub struct WorkerCapabilities {
     #[serde(default)]
     pub images: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerGracefulShutdown {
-    pub stdin: String,
 }
 
 #[derive(Default)]
@@ -1750,11 +1741,7 @@ pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Opt
     }
 }
 
-pub fn emit_worker_ready(
-    worker_name: &str,
-    supports_images: bool,
-    graceful_shutdown_stdin: Option<&str>,
-) {
+pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
             protocol: WorkerProtocol {
@@ -1768,9 +1755,6 @@ pub fn emit_worker_ready(
             capabilities: WorkerCapabilities {
                 images: supports_images,
             },
-            graceful_shutdown: graceful_shutdown_stdin.map(|stdin| WorkerGracefulShutdown {
-                stdin: stdin.to_string(),
-            }),
         });
     }
 }

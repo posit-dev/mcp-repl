@@ -238,6 +238,7 @@ const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const LINUX_BWRAP_FALLBACK_NOTICE: &str =
     "[repl] Linux bubblewrap sandbox unavailable; continuing without bwrap\n";
@@ -3670,7 +3671,7 @@ impl WorkerManager {
     pub fn shutdown(&mut self) {
         crate::event_log::log("worker_shutdown", serde_json::json!({}));
         if let Some(process) = self.process.take() {
-            let _ = process.kill();
+            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
@@ -6322,9 +6323,6 @@ impl WorkerProcess {
     }
 
     fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
-        if let Some(ipc) = self.ipc.get() {
-            let _ = ipc.send(ServerToWorkerIpcMessage::SessionEnd);
-        }
         let _ = self.close_stdin(Duration::from_millis(200));
 
         let start = std::time::Instant::now();

@@ -2931,9 +2931,30 @@ async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let tempdir = tempdir()?;
+    let marker_path = tempdir.path().join("reset-input-observation.txt");
+    let marker_literal = serde_json::to_string(
+        marker_path
+            .to_str()
+            .ok_or("reset input marker path must be valid utf-8")?,
+    )?;
 
     let prompt = session
-        .write_stdin_raw_with("value = input('reset> ')", Some(1.0))
+        .write_stdin_raw_with(
+            format!(
+                r#"import pathlib
+_marker = pathlib.Path({marker_literal})
+try:
+    _value = input('reset> ')
+except EOFError:
+    _marker.write_text('EOFError')
+else:
+    _marker.write_text('VALUE:' + _value)
+
+"#
+            ),
+            Some(1.0),
+        )
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
@@ -2952,6 +2973,15 @@ async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
     assert!(
         reset_text.contains("new session started"),
         "expected repl_reset to start a new session, got: {reset_text:?}"
+    );
+    let observed = fs::read_to_string(&marker_path)?;
+    assert!(
+        observed == "EOFError" || observed == "VALUE:",
+        "reset should expose EOF or an empty line to input(), got: {observed:?}"
+    );
+    assert!(
+        !observed.contains("exit()") && !observed.contains("quit("),
+        "reset must not send shutdown text consumed by input(), got: {observed:?}"
     );
 
     let follow_up = session

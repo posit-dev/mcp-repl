@@ -12,6 +12,8 @@ checked-in execution plans without relying on stale notes.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
 - `docs/worker_sideband_protocol.md`: server/worker IPC contract.
+- `docs/adr/0001-stdin-close-graceful-shutdown.md`: accepted decision that
+  graceful worker shutdown is requested only by closing worker stdin.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
 - `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
 
@@ -23,6 +25,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
+- `docs/adr/`: accepted architecture decision records.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 
 ## Exploratory Docs

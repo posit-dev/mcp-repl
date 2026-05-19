@@ -243,9 +243,6 @@ The first worker-to-server message must be:
   "worker": { "name": "zod", "version": "0.1.0" },
   "capabilities": {
     "images": false
-  },
-  "graceful_shutdown": {
-    "stdin": "quit()\n"
   }
 }
 ```
@@ -259,20 +256,9 @@ interpreter-specific steady-state code paths.
 The `worker.name` field is descriptive. It is useful for logs and
 diagnostics, but server request handling must not switch on it.
 
-`graceful_shutdown` is optional. If present, it contains the exact stdin text
-the server may write as a graceful shutdown/reset request when server-owned
-shutdown rules say a stdin request is appropriate. For example, R might ask for
-`quit("no")\n`.
-
 Handshake field notes:
 
 - `capabilities.images`: whether the worker emits `output_image` events.
-- `graceful_shutdown.stdin`: exact text the worker wants sent on stdin
-  when the server asks it to exit gracefully. This is not base64-encoded
-  because it is a small human-readable interpreter command. The worker
-  controls only this text; it does not control whether the command is
-  sent, when interrupts are sent, how long the server waits, or whether
-  OS termination follows.
 
 Raw stdout/stderr capture is not a negotiated capability. The server
 will always capture raw worker stdout/stderr as unowned fallback output,
@@ -520,18 +506,19 @@ delivering OS controls. If a worker exists, the server delivers the
 control. If no worker exists, the server must not spawn a worker solely
 to interrupt or shut down nothing.
 
-Workers cannot opt out of OS controls. The handshake may describe a
-graceful stdin request for shutdown/reset, but OS escalation is common
-across all workers and remains server-owned.
+Workers cannot opt out of OS controls. Graceful shutdown is a server-owned
+stdin close followed by a bounded wait; OS escalation is common across all
+workers and remains server-owned.
 
 For reset and shutdown, if the server considers the worker busy, it
 sends an interrupt first. This is not configurable by the worker. After
 the interrupt, the server waits for the normal bounded server-owned
 grace period for the worker to return to an unsatisfied `readline_start`
-or end the session. If the worker becomes idle and provided a
-`graceful_shutdown.stdin` command, the server may write that command to
-stdin. If the worker does not exit within the server-owned graceful
-shutdown timeout, the server escalates to OS termination.
+or end the session. The server then closes worker stdin and waits for
+natural exit. If the worker does not exit within the server-owned graceful
+shutdown timeout, the server escalates to OS termination. The server must not
+write interpreter shutdown code to stdin and must not use sideband shutdown
+commands to deliver graceful shutdown.
 
 ### Interrupt
 
@@ -586,11 +573,9 @@ Reset means end the current worker session and start a fresh one for the
 next tool call.
 
 If the worker is busy, the server interrupts first. If the worker is
-then known to be waiting at an unsatisfied `readline_start`, and the
-handshake provided a `graceful_shutdown.stdin` command, the server may
-write that command to stdin. If the worker does not exit within the
-server-owned timeout, the server escalates to OS termination. The worker
-controls only the graceful command text.
+then known to be waiting at an unsatisfied `readline_start`, the server closes
+worker stdin and waits for natural exit. If the worker does not exit within
+the server-owned timeout, the server escalates to OS termination.
 
 If a leading reset prefix has a non-empty tail, the server writes the
 tail only after reset has completed and the replacement worker has
@@ -806,11 +791,10 @@ surface with Zod as the worker:
 - Interrupt completion is driven by worker events, not prompt parsing.
 - Worker-owned stderr preserves ordering relative to stdout.
 - Raw stdout/stderr never affects prompt or completion state.
-- Reset interrupts first when the worker is busy, then uses graceful
-  stdin shutdown only after an unsatisfied `readline_start`, then
+- Reset interrupts first when the worker is busy, then closes worker stdin and
   escalates to OS termination if needed.
-- Shutdown follows the same interrupt-then-graceful-stdin-then-OS rule
-  and cannot be opted out of.
+- Shutdown follows the same interrupt-then-stdin-close-then-OS rule and cannot
+  be opted out of.
 - Protocol errors fail fast and do not leave the server in a shadow
   interpreter state.
 
