@@ -751,8 +751,10 @@ a small deterministic command language through stdin:
   bytes.
 - `sleep <millis>` delays the next unsatisfied prompt so timeout and
   poll behavior can be tested.
-- `interruptible <millis>` delays until either the timer finishes or an
-  OS interrupt arrives.
+- `interruptible <millis>` delays until either the timer finishes or a
+  sideband or OS interrupt arrives.
+- `interrupt-report <millis>` delays while recording sideband and OS
+  interrupt delivery as separate output facts.
 - `slow-shutdown <millis>` delays a later `exit` or EOF `session_end`
   so reset and shutdown graceful-exit timing can be tested.
 - `hang-shutdown` accepts a later `exit` or EOF but never emits

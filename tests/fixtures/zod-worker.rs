@@ -38,12 +38,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport = IpcTransport::connect_from_env()?;
     let writer = IpcWriter::new(transport.writer);
-    let interrupted = Arc::new(AtomicBool::new(false));
+    let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let control_session_end = Arc::new(AtomicBool::new(false));
     let shutdown_log_path = std::env::var_os(SHUTDOWN_LOG_ENV).map(PathBuf::from);
     start_control_reader(
         transport.reader,
-        interrupted.clone(),
+        sideband_interrupted.clone(),
         control_session_end.clone(),
         shutdown_log_path.clone(),
     );
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeline.run(LifecyclePoint::BeforeCommand, &writer)?;
         run_command(
             &writer,
-            &interrupted,
+            &sideband_interrupted,
             &mut reader,
             command,
             &line,
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_command(
     writer: &IpcWriter,
-    interrupted: &AtomicBool,
+    sideband_interrupted: &AtomicBool,
     reader: &mut dyn BufRead,
     command: &str,
     raw_line: &str,
@@ -151,7 +151,7 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("sleep ") {
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -159,7 +159,7 @@ fn run_command(
         let mut stdout = io::stdout().lock();
         stdout.write_all(b"zod> raw stdout\n")?;
         stdout.flush()?;
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -167,7 +167,7 @@ fn run_command(
         writer.send(&WorkerToServer::ReadlineStart {
             prompt: "buffered> ".to_string(),
         })?;
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -186,13 +186,28 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
     }
 
     if let Some(millis) = command.strip_prefix("interruptible ") {
-        sleep_for(parse_millis(millis)?, interrupted, true);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, true);
+        return Ok(());
+    }
+
+    if let Some(millis) = command.strip_prefix("interrupt-report ") {
+        let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
+        let text = format!(
+            "sideband interrupt: {}\nos interrupt: {}\n",
+            if report.sideband {
+                "observed"
+            } else {
+                "missing"
+            },
+            if report.os { "observed" } else { "missing" },
+        );
+        writer.output_text("stdout", text.as_bytes())?;
         return Ok(());
     }
 
@@ -207,7 +222,7 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("discard-on-interrupt ") {
-        if sleep_for(parse_millis(millis)?, interrupted, true) {
+        if sleep_for(parse_millis(millis)?, sideband_interrupted, true) {
             discard_buffered_stdin(reader, writer)?;
         }
         return Ok(());
@@ -478,6 +493,43 @@ fn sleep_for(millis: u64, interrupted: &AtomicBool, interruptible: bool) -> bool
     }
     false
 }
+
+struct InterruptReport {
+    sideband: bool,
+    os: bool,
+}
+
+fn observe_interrupts_for(millis: u64, sideband_interrupted: &AtomicBool) -> InterruptReport {
+    sideband_interrupted.store(false, Ordering::SeqCst);
+    clear_os_interrupted();
+
+    let deadline = Instant::now() + Duration::from_millis(millis);
+    let mut report = InterruptReport {
+        sideband: false,
+        os: false,
+    };
+    while Instant::now() < deadline {
+        report.sideband |= sideband_interrupted.swap(false, Ordering::SeqCst);
+        report.os |= os_interrupted().unwrap_or(false);
+        if report.sideband && (report.os || !os_interrupts_supported()) {
+            return report;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    report
+}
+
+fn os_interrupts_supported() -> bool {
+    cfg!(target_family = "unix")
+}
+
+#[cfg(target_family = "unix")]
+fn clear_os_interrupted() {
+    INTERRUPTED_BY_OS.store(false, Ordering::SeqCst);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn clear_os_interrupted() {}
 
 #[cfg(target_family = "unix")]
 fn os_interrupted() -> Option<bool> {
