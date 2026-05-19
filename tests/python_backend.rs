@@ -2579,7 +2579,9 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
         "expected input prompt, got: {text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) {
         eprintln!("input prompt interrupt stayed busy in this Python runtime; skipping");
@@ -2635,7 +2637,9 @@ async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<(
         "expected primary-shaped input prompt, got: {text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(1.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) || interrupt_text.contains("timed out") {
         eprintln!(
@@ -2681,7 +2685,9 @@ async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResul
         "expected custom primary prompt after setup, got: {setup_text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(1.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) || interrupt_text.contains("timed out") {
         eprintln!("idle custom prompt interrupt stayed busy in this Python runtime; skipping");
@@ -2742,7 +2748,9 @@ print("SIGINT_FINAL", sigint_count)
         "expected SIGINT handler loop to time out, got: {timeout_text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     assert!(
         !is_busy_response(&interrupt_text),
@@ -2835,7 +2843,9 @@ async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> 
         "expected continuation prompt before interrupt, got: {text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) {
         eprintln!("continuation prompt interrupt stayed busy in this Python runtime; skipping");
@@ -2892,7 +2902,9 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "did not expect a fabricated prompt for empty input, got: {prompt_text:?}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) {
         eprintln!("empty input prompt interrupt stayed busy in this Python runtime; skipping");
@@ -3370,7 +3382,9 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
-    let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
         !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
@@ -3449,7 +3463,11 @@ except KeyboardInterrupt:
     }
 
     let interrupt_deadline = interrupt_recovery_deadline();
-    text = result_text(&session.write_stdin_raw_with("\u{3}", Some(5.0)).await?);
+    text = result_text(
+        &session
+            .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+            .await?,
+    );
     while is_busy_response(&text) {
         if Instant::now() >= interrupt_deadline {
             session.cancel().await?;
@@ -3687,7 +3705,9 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
         return Ok(());
     }
 
-    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let restart_text = result_text(&restart);
     if is_busy_response(&restart_text) {
         eprintln!(
@@ -3848,7 +3868,9 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
-    let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
         !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),

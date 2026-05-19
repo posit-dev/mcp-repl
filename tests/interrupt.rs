@@ -107,7 +107,9 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
-    let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt_result);
     if backend_unavailable(&interrupt_text) {
         eprintln!("interrupt test backend unavailable in this environment; skipping");
@@ -183,7 +185,9 @@ async fn assert_interrupt_drain_preserves_prompt_shaped_child_stdout(
         sleep(Duration::from_millis(50)).await;
     }
 
-    let interrupt_result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let interrupt_result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
     let interrupt_text = result_text(&interrupt_result);
     if backend_unavailable(&interrupt_text) {
         eprintln!("interrupt test backend unavailable in this environment; skipping");

@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut command_state = CommandState {
         next_prompt: "zod> ".to_string(),
         shutdown_mode: ShutdownMode::Normal,
+        previous_line_empty: false,
     };
     let mut timeline = Timeline::default();
     loop {
@@ -121,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut timeline,
         )?;
         timeline.run(LifecyclePoint::AfterCommand, &writer)?;
+        command_state.previous_line_empty = command.is_empty();
         send_readline_start(
             &writer,
             &mut timeline,
@@ -245,6 +247,19 @@ fn run_command(
         return Ok(());
     }
 
+    if command == "report-leading-empty" {
+        let status = if state.previous_line_empty {
+            "observed"
+        } else {
+            "missing"
+        };
+        writer.output_text(
+            "stdout",
+            format!("previous empty line: {status}\n").as_bytes(),
+        )?;
+        return Ok(());
+    }
+
     if command == "bad-output-base64" {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
@@ -261,6 +276,7 @@ fn run_command(
 struct CommandState {
     next_prompt: String,
     shutdown_mode: ShutdownMode,
+    previous_line_empty: bool,
 }
 
 #[derive(Clone, Copy)]

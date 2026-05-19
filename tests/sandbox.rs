@@ -988,7 +988,9 @@ async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
     let marker_path = PathBuf::from(&first.tmpdir).join(SESSION_MARKER_FILE);
     let marker_path = marker_path.to_string_lossy().to_string();
 
-    session.write_stdin("\u{4}").await;
+    let _ = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let Some(after_restart) = fetch_tempdir_status(&mut session, &marker_path).await? else {
         eprintln!(
             "sandbox_tempdir_stable_across_restart backend unavailable in this environment; skipping"
@@ -1811,7 +1813,9 @@ cat("READ_BEFORE_MOVE=", paste(readLines(source, warn = FALSE), collapse = "|"),
 
     std::fs::rename(&source, &target)?;
 
-    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let restart_text = collect_text(&restart);
     if windows_sandbox_backend_unavailable(&restart_text) {
         eprintln!("windows restricted token setup unavailable; skipping");
@@ -1912,7 +1916,9 @@ cat("READ_BEFORE_MOVE=", paste(readLines(source, warn = FALSE), collapse = "|"),
 
     std::fs::rename(&source, &target)?;
 
-    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let restart_text = collect_text(&restart);
     if windows_sandbox_backend_unavailable(&restart_text) {
         eprintln!("windows restricted token setup unavailable; skipping");
@@ -2372,7 +2378,9 @@ cat("WRITE_OK=", file.exists(source), "\n", sep = "")
 
     std::fs::rename(&restored, &protected)?;
 
-    let first_restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let first_restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let first_restart_text = collect_text(&first_restart);
     if windows_sandbox_backend_unavailable(&first_restart_text) {
         eprintln!("windows restricted token setup unavailable; skipping");
@@ -2408,7 +2416,9 @@ tryCatch({{
 
     std::fs::rename(&protected, &restored)?;
 
-    let second_restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let second_restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let second_restart_text = collect_text(&second_restart);
     assert!(
         second_restart_text.contains("new session started"),

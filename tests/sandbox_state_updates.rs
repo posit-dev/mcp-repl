@@ -807,7 +807,7 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
     }
 
     let interrupt = session
-        .write_stdin_raw_with_meta(
+        .write_stdin_raw_unterminated_with_meta(
             "\u{3}",
             Some(2.0),
             Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
@@ -856,7 +856,9 @@ async fn sandbox_inherit_pending_bare_interrupt_ignores_missing_state_meta() -> 
         "expected interrupt setup request to time out, got: {timeout_text}"
     );
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(10.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
+        .await?;
     let interrupt_text = collect_text(&interrupt);
     session.cancel().await?;
 
@@ -1820,7 +1822,11 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_met
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let interrupt = session
-        .write_stdin_raw_with_meta("\u{3}", Some(2.0), Some(read_only_meta(scratch.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{3}",
+            Some(2.0),
+            Some(read_only_meta(scratch.path())),
+        )
         .await?;
     let interrupt_text = common::result_text(&interrupt);
     assert!(
@@ -1877,7 +1883,9 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_doe
     let _ = fs::remove_file(&startup_target);
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
-    let interrupt = session.write_stdin_raw_with("\u{3}", Some(2.0)).await?;
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(2.0))
+        .await?;
     let interrupt_text = common::result_text(&interrupt);
     assert!(
         !interrupt_text.contains(MISSING_INHERITED_STATE_MESSAGE),
@@ -2298,7 +2306,11 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
     tokio::time::sleep(test_delay_ms(260, 700)).await;
 
     let restart = session
-        .write_stdin_raw_with_meta("\u{4}", Some(1.0), Some(read_only_meta(scratch.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(1.0),
+            Some(read_only_meta(scratch.path())),
+        )
         .await?;
     let restart_text = common::result_text(&restart);
     assert!(
@@ -2364,7 +2376,11 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
     );
 
     let restart = session
-        .write_stdin_raw_with_meta("\u{4}", Some(10.0), Some(read_only_meta(scratch.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(10.0),
+            Some(read_only_meta(scratch.path())),
+        )
         .await?;
     let restart_text = common::result_text(&restart);
     session.cancel().await?;
@@ -2915,7 +2931,11 @@ async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> T
     )
     .await?;
     let result = session
-        .write_stdin_raw_with_meta("\u{4}", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
+            Some(workspace_write_meta(temp.path())),
+        )
         .await?;
     let text = collect_text(&result);
     assert!(
@@ -3083,7 +3103,11 @@ async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_
     );
 
     let interrupt = session
-        .write_stdin_raw_with_meta("\u{3}", Some(10.0), Some(read_only_meta(temp.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{3}",
+            Some(10.0),
+            Some(read_only_meta(temp.path())),
+        )
         .await?;
     let interrupt_text = collect_text(&interrupt);
     session.cancel().await?;
@@ -3137,7 +3161,11 @@ async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives
     );
 
     let interrupt = session
-        .write_stdin_raw_with_meta("\u{3}", Some(10.0), Some(read_only_meta(temp.path())))
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{3}",
+            Some(10.0),
+            Some(read_only_meta(temp.path())),
+        )
         .await?;
     let interrupt_text = collect_text(&interrupt);
     if interrupt_text.contains("<<repl status: busy") {
@@ -3302,7 +3330,9 @@ async fn sandbox_inherit_idle_ctrl_d_without_state_meta_does_not_restart() -> Te
         return Ok(());
     }
 
-    let restart_error = session.write_stdin_raw_with("\u{4}", Some(2.0)).await?;
+    let restart_error = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(2.0))
+        .await?;
     assert_eq!(
         restart_error.is_error,
         Some(true),
@@ -3351,7 +3381,7 @@ async fn sandbox_inherit_idle_ctrl_d_with_bad_meta_does_not_restart() -> TestRes
     }
 
     let restart_error = session
-        .write_stdin_raw_with_meta(
+        .write_stdin_raw_unterminated_with_meta(
             "\u{4}",
             Some(2.0),
             Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),

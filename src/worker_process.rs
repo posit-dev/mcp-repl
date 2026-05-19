@@ -1234,17 +1234,7 @@ pub(crate) fn split_write_stdin_control_prefix(
         _ => return None,
     };
 
-    let tail = &input[first.len_utf8()..];
-    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\n') {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\r') {
-        rest
-    } else {
-        tail
-    };
-    Some((action, tail))
+    Some((action, &input[first.len_utf8()..]))
 }
 
 fn worker_context_event_payload(
@@ -7603,11 +7593,11 @@ mod tests {
     }
 
     #[test]
-    fn control_prefix_strips_single_separator_newline() {
+    fn control_prefix_preserves_immediate_newline_tail() {
         let (action, remaining) =
             split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
         assert!(matches!(action, WriteStdinControlAction::Restart));
-        assert_eq!(remaining, "print(1)");
+        assert_eq!(remaining, "\nprint(1)");
     }
 
     #[test]

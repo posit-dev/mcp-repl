@@ -279,6 +279,21 @@ macro_rules! mcp_calls_inner {
         $crate::mcp_calls_inner!($session, $($rest)*);
     }};
 
+    ($session:ident, write_stdin_raw_unterminated($input:expr $(, timeout = $timeout:expr)? ); $($rest:tt)*) => {{
+        let mut args = serde_json::Map::new();
+        args.insert("input".to_string(), serde_json::Value::String($input.to_string()));
+        if let Some(timeout) = $crate::common::normalized_test_timeout($crate::mcp_timeout_opt!($($timeout)?)) {
+            args.insert(
+                "timeout_ms".to_string(),
+                serde_json::json!((timeout * 1000.0).round() as i64),
+            );
+        }
+        $session
+            .call_tool($session.repl_tool_name(), serde_json::Value::Object(args))
+            .await;
+        $crate::mcp_calls_inner!($session, $($rest)*);
+    }};
+
 }
 
 #[macro_export]
@@ -440,7 +455,7 @@ fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn normalized_test_timeout(timeout: Option<f64>) -> Option<f64> {
+pub(crate) fn normalized_test_timeout(timeout: Option<f64>) -> Option<f64> {
     #[cfg(windows)]
     {
         timeout.map(|value| value.min(WINDOWS_TEST_TIMEOUT_CAP_SECS))

@@ -964,6 +964,44 @@ async fn zod_worker_interrupt_tail_runs_after_recovery() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_control_prefix_preserves_immediate_newline_tail() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interruptible 1000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}\nreport-leading-empty",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("previous empty line: observed\n"),
+        "expected Zod to receive the immediate newline before the tail, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_reports_sideband_and_os_interrupt_facts() -> TestResult<()> {

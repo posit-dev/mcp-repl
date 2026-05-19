@@ -15,7 +15,7 @@ async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
             mcp_script! {
                 write_stdin("x <- 40 + 2", timeout = 10.0);
                 write_stdin("x", timeout = 10.0);
-                write_stdin("\u{4}");
+                write_stdin_raw_unterminated("\u{4}");
             },
         )
         .await?;
@@ -125,9 +125,9 @@ cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", 
             "tempdir_session",
             mcp_script! {
                 write_stdin(setup, timeout = 10.0);
-                write_stdin("\u{4}");
+                write_stdin_raw_unterminated("\u{4}");
                 write_stdin(after_restart, timeout = 10.0);
-                write_stdin("\u{4}");
+                write_stdin_raw_unterminated("\u{4}");
                 write_stdin(after_restart, timeout = 10.0);
             },
         )
@@ -166,7 +166,9 @@ async fn transcripts_smoke() -> TestResult<()> {
         return Ok(());
     }
 
-    let _ = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let _ = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     if !common::assert_eventually_contains(
         &mut session,
         "print(exists(\"x\"))",
