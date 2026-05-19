@@ -106,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_command(
             &writer,
             &interrupted,
+            &mut reader,
             command,
             &line,
             &mut next_prompt,
@@ -123,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_command(
     writer: &IpcWriter,
     interrupted: &AtomicBool,
+    reader: &mut dyn BufRead,
     command: &str,
     raw_line: &str,
     next_prompt: &mut String,
@@ -186,6 +188,13 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("discard-on-interrupt ") {
+        if sleep_for(parse_millis(millis)?, interrupted, true) {
+            discard_buffered_stdin(reader, writer)?;
+        }
+        return Ok(());
+    }
+
     if command == "image" {
         writer.send(&WorkerToServer::OutputImage {
             image_id: "zod-image".to_string(),
@@ -209,6 +218,21 @@ fn run_command(
     }
 
     writer.output_text("stdout", raw_line.as_bytes())
+}
+
+fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
+    let (text, len) = {
+        let buffer = reader.fill_buf()?;
+        let text = std::str::from_utf8(buffer)
+            .map_err(io::Error::other)?
+            .to_string();
+        (text, buffer.len())
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    reader.consume(len);
+    writer.send(&WorkerToServer::ReadlineDiscard { text })
 }
 
 fn send_readline_start(
@@ -390,16 +414,17 @@ fn parse_millis(raw: &str) -> io::Result<u64> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-fn sleep_for(millis: u64, interrupted: &AtomicBool, interruptible: bool) {
+fn sleep_for(millis: u64, interrupted: &AtomicBool, interruptible: bool) -> bool {
     let deadline = Instant::now() + Duration::from_millis(millis);
     while Instant::now() < deadline {
         if interruptible
             && (interrupted.swap(false, Ordering::SeqCst) || os_interrupted().unwrap_or(false))
         {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_millis(10));
     }
+    false
 }
 
 #[cfg(target_family = "unix")]
@@ -443,6 +468,9 @@ enum WorkerToServer {
         prompt: String,
     },
     ReadlineInput {
+        text: String,
+    },
+    ReadlineDiscard {
         text: String,
     },
     OutputText {

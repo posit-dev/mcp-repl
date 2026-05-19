@@ -830,3 +830,45 @@ async fn zod_worker_interrupt_tail_runs_after_recovery() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_discards_buffered_tail_before_follow_up() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "discard-on-interrupt 1000\nSHOULD_NOT_RUN",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}after discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("after discard\n"),
+        "expected follow-up tail to run after recovery, got: {text:?}"
+    );
+    assert!(
+        !text.contains("SHOULD_NOT_RUN"),
+        "expected buffered pre-interrupt tail to be discarded, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
