@@ -6,6 +6,7 @@ use common::TestResult;
 use rmcp::model::RawContent;
 use rmcp::service::ServiceError;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 fn test_mutex() -> &'static Mutex<()> {
@@ -108,7 +109,8 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
+#[cfg(windows)]
+async fn write_stdin_accepts_crlf_input_on_windows() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server().await?;
 

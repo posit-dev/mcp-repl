@@ -343,7 +343,7 @@ async fn zod_worker_reset_requests_shutdown_by_closing_stdin_only() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_preserves_crlf_stdin_and_appended_newline() -> TestResult<()> {
+async fn zod_worker_preserves_client_stdin_bytes_and_appended_newline() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
     let result = session
@@ -359,11 +359,11 @@ async fn zod_worker_preserves_crlf_stdin_and_appended_newline() -> TestResult<()
 
     assert!(
         text.contains("raw-line-debug: report-raw-line supplied crlf\\r\\n\n"),
-        "expected supplied CRLF bytes to reach Zod unchanged, got: {text:?}"
+        "expected client-supplied newline bytes to reach Zod unchanged, got: {text:?}"
     );
     assert!(
         text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\n"),
-        "expected server to append one newline after trailing carriage return, got: {text:?}"
+        "expected server to append one final newline after trailing carriage return, got: {text:?}"
     );
     assert!(
         !text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\\n\n"),
