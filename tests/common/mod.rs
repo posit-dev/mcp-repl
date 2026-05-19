@@ -686,7 +686,7 @@ impl McpTestSession {
     #[allow(dead_code)]
     pub async fn write_stdin_with(&mut self, input: impl Into<String>, timeout: Option<f64>) {
         let mut input = input.into();
-        if !input.ends_with('\n') {
+        if test_input_needs_trailing_newline(&input) {
             input.push('\n');
         }
         let timeout = normalized_test_timeout(timeout);
@@ -814,7 +814,7 @@ impl McpTestSession {
         meta: Option<Value>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
-        if !input.is_empty() && !input.ends_with('\n') {
+        if !input.is_empty() && test_input_needs_trailing_newline(&input) {
             input.push('\n');
         }
         let timeout = normalized_test_timeout(timeout);
@@ -887,6 +887,10 @@ impl McpTestSession {
         }
         Ok(())
     }
+}
+
+fn test_input_needs_trailing_newline(input: &str) -> bool {
+    !input.ends_with('\n') && !matches!(input, "\u{3}" | "\u{4}")
 }
 
 pub struct McpSnapshot {

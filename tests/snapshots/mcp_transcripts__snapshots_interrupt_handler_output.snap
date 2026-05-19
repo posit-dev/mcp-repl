@@ -28,7 +28,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0003\n",
+    "input": "\u0003",
     "timeout_ms": 5000
   }
 }

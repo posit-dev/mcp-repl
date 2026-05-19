@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_prompt: "zod> ".to_string(),
         shutdown_mode: ShutdownMode::Normal,
         previous_line_empty: false,
+        line_number: 0,
         shutdown_log_path: shutdown_log_path.clone(),
     };
     let mut timeline = Timeline::default();
@@ -90,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             send_session_end(&writer, &mut timeline, "shutdown")?;
             return Ok(());
         }
+        command_state.line_number += 1;
 
         let command = line.trim_end_matches(['\r', '\n']);
         let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
@@ -163,6 +165,15 @@ fn run_command(
         stdout.write_all(b"zod> raw stdout\n")?;
         stdout.flush()?;
         sleep_for(parse_millis(millis)?, sideband_interrupted, false);
+        return Ok(());
+    }
+
+    if command.starts_with("raw-line-escape") {
+        let escaped = escape_bytes(raw_line.as_bytes());
+        writer.output_text(
+            "stdout",
+            format!("raw-line[{}]={escaped}\n", state.line_number).as_bytes(),
+        )?;
         return Ok(());
     }
 
@@ -298,6 +309,7 @@ struct CommandState {
     next_prompt: String,
     shutdown_mode: ShutdownMode,
     previous_line_empty: bool,
+    line_number: u64,
     shutdown_log_path: Option<PathBuf>,
 }
 
@@ -338,6 +350,21 @@ fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::R
     }
     reader.consume(len);
     writer.send(&WorkerToServer::ReadlineDiscard { text })
+}
+
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::new();
+    for byte in bytes {
+        match byte {
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            b'\\' => escaped.push_str("\\\\"),
+            b' '..=b'~' => escaped.push(char::from(*byte)),
+            _ => escaped.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    escaped
 }
 
 fn send_readline_start(

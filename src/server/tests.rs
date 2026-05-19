@@ -195,6 +195,22 @@ fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
         super::response::timeout_bundle_reuse_for_input("\r\n"),
         super::response::TimeoutBundleReuse::FollowUpInput
     ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}"),
+        super::response::TimeoutBundleReuse::FullReply
+    ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}\r\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{4}"),
+        super::response::TimeoutBundleReuse::None
+    ));
 }
 
 #[test]

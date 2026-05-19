@@ -51,6 +51,8 @@ use crate::sandbox_cli::{
     resolve_effective_sandbox_state_with_defaults, sandbox_plan_requests_inherited_state,
     validate_sandbox_plan_with_defaults,
 };
+use crate::stdin_payload::prepare_worker_stdin_payload;
+pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
@@ -276,7 +278,14 @@ fn prechecked_follow_up_requires_meta_error() -> WorkerError {
 }
 
 trait BackendDriver: Send {
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8>;
+    fn prepare_input_text(&self, text: String) -> String {
+        text
+    }
+
+    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
+        prepare_worker_stdin_payload(text)
+    }
+
     fn on_input_start(
         &mut self,
         text: &str,
@@ -474,13 +483,8 @@ fn driver_refresh_worker_ready(
 }
 
 impl BackendDriver for RBackendDriver {
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let normalized = normalize_input_newlines(text);
-        let mut payload = normalized.into_bytes();
-        if !payload.is_empty() && !payload.ends_with(b"\n") {
-            payload.push(b'\n');
-        }
-        payload
+    fn prepare_input_text(&self, text: String) -> String {
+        normalize_input_newlines(&text)
     }
 
     fn on_input_start(
@@ -852,14 +856,6 @@ fn strip_one_line_ending(text: &str) -> Option<&str> {
 
 #[cfg(not(target_family = "unix"))]
 impl BackendDriver for PythonBackendDriver {
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
-        if !payload.is_empty() && !payload.ends_with(b"\n") {
-            payload.push(b'\n');
-        }
-        payload
-    }
-
     fn on_input_start(
         &mut self,
         text: &str,
@@ -936,14 +932,6 @@ impl ProtocolBackendDriver {
 }
 
 impl BackendDriver for ProtocolBackendDriver {
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
-        if !payload.is_empty() && !payload.ends_with(b"\n") {
-            payload.push(b'\n');
-        }
-        payload
-    }
-
     fn on_input_start(
         &mut self,
         _text: &str,
@@ -1198,12 +1186,6 @@ fn completion_info_from_ipc(
 
 const DEFERRED_SANDBOX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy)]
-pub(crate) enum WriteStdinControlAction {
-    Interrupt,
-    Restart,
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WriteStdinOptions {
     pub page_bytes_override: Option<u64>,
@@ -1223,19 +1205,6 @@ impl WriteStdinOptions {
             suppress_session_end_reset: false,
         }
     }
-}
-
-pub(crate) fn split_write_stdin_control_prefix(
-    input: &str,
-) -> Option<(WriteStdinControlAction, &str)> {
-    let first = input.chars().next()?;
-    let action = match first {
-        '\u{3}' => WriteStdinControlAction::Interrupt,
-        '\u{4}' => WriteStdinControlAction::Restart,
-        _ => return None,
-    };
-
-    Some((action, &input[first.len_utf8()..]))
 }
 
 fn worker_context_event_payload(
@@ -2566,6 +2535,7 @@ impl WorkerManager {
         worker_timeout: Duration,
         server_timeout: Duration,
     ) -> Result<RequestState, WorkerError> {
+        let text = self.driver.prepare_input_text(text);
         let started_at = std::time::Instant::now();
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt);
