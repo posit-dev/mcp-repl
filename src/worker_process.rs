@@ -3471,13 +3471,23 @@ impl WorkerManager {
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.maybe_emit_pending_server_notice();
+        let pre_shutdown_output = self
+            .process
+            .is_some()
+            .then(|| self.drain_sealed_formatted_output());
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
+            self.pending_output_tape.clear();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.maybe_emit_pending_server_notice();
 
-        let reply = self.build_session_reset_reply_files("new session started");
+        let reply = match pre_shutdown_output {
+            Some(output) => {
+                self.build_session_reset_reply_files_from_formatted("new session started", output)
+            }
+            None => self.build_session_reset_reply_files("new session started"),
+        };
         self.clear_preserved_prefixes();
         self.reset_output_state_files(true);
         self.note_respawn_during_write();
@@ -3644,14 +3654,32 @@ impl WorkerManager {
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.maybe_emit_pending_server_notice();
+        let pre_shutdown_end_offset = self
+            .process
+            .is_some()
+            .then(|| self.output.end_offset().unwrap_or(0));
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
+        let post_shutdown_end_offset = self.output.end_offset();
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.maybe_emit_pending_server_notice();
 
         let page_bytes = pager::resolve_page_bytes(None);
-        let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
+        let reply = match pre_shutdown_end_offset {
+            Some(end_offset) => {
+                let reply = self.build_session_reset_reply_pager_to_offset(
+                    page_bytes,
+                    "new session started",
+                    end_offset,
+                );
+                if let Some(end_offset) = post_shutdown_end_offset {
+                    self.output.advance_offset_to(end_offset);
+                }
+                reply
+            }
+            None => self.build_session_reset_reply_pager(page_bytes, "new session started"),
+        };
         self.clear_preserved_prefixes();
         self.reset_output_state_pager(true, false);
         self.note_respawn_during_write();
@@ -4577,10 +4605,19 @@ impl WorkerManager {
     }
 
     fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
+        let formatted = self.drain_sealed_formatted_output();
+        self.build_session_reset_reply_files_from_formatted(meta, formatted)
+    }
+
+    fn build_session_reset_reply_files_from_formatted(
+        &mut self,
+        meta: &str,
+        formatted: FormattedPendingOutput,
+    ) -> ReplyWithOffset {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_sealed_formatted_output();
+        } = formatted;
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
             _ => true,
@@ -4604,6 +4641,15 @@ impl WorkerManager {
 
     fn build_session_reset_reply_pager(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
         let end_offset = self.output.end_offset().unwrap_or(0);
+        self.build_session_reset_reply_pager_to_offset(page_bytes, meta, end_offset)
+    }
+
+    fn build_session_reset_reply_pager_to_offset(
+        &mut self,
+        page_bytes: u64,
+        meta: &str,
+        end_offset: u64,
+    ) -> ReplyWithOffset {
         let mut is_error = false;
 
         let SnapshotWithImages {
