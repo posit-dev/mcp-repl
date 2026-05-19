@@ -11,6 +11,7 @@ use rmcp::model::{
 use serde_json::Value;
 use tempfile::Builder;
 
+pub(crate) use crate::stdin_payload::{TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use crate::worker_process::WorkerError;
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
@@ -168,31 +169,6 @@ struct TimeoutReplyView<'a> {
     worker_text: &'a str,
     error_code: Option<WorkerErrorCode>,
     protected_bundle_id: Option<u64>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum TimeoutBundleReuse {
-    None,
-    FullReply,
-    FollowUpInput,
-}
-
-pub(crate) fn timeout_bundle_reuse_for_input(input: &str) -> TimeoutBundleReuse {
-    if input.is_empty() {
-        return TimeoutBundleReuse::FullReply;
-    }
-
-    let Some(first) = input.chars().next() else {
-        return TimeoutBundleReuse::FullReply;
-    };
-    let tail = &input[first.len_utf8()..];
-
-    match first {
-        '\u{3}' if tail.is_empty() => TimeoutBundleReuse::FullReply,
-        '\u{3}' => TimeoutBundleReuse::FollowUpInput,
-        '\u{4}' => TimeoutBundleReuse::None,
-        _ => TimeoutBundleReuse::FollowUpInput,
-    }
 }
 
 impl ResponseState {

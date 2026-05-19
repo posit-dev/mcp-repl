@@ -180,6 +180,70 @@ async fn zod_worker_echoes_input_and_returns_worker_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_raw_line_escape_preserves_stdin_bytes() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "raw-line-escape crlf\r\nraw-line-escape bare\rcoda",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("raw-line[1]=raw-line-escape crlf\\r\\n\n"),
+        "expected Zod to receive existing CRLF bytes, got: {text:?}"
+    );
+    assert!(
+        text.contains("raw-line[2]=raw-line-escape bare\\rcoda\\n\n"),
+        "expected Zod to receive bare CR plus one appended LF, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_restart_control_prefix_preserves_newline_tail() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{4}\nraw-line-escape after",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    let poll = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let combined_text = format!("{text}{}", result_text(&poll));
+
+    assert!(
+        combined_text
+            .contains("[repl] new session started\nraw-line[2]=raw-line-escape after\\n\n"),
+        "expected Ctrl-D tail to preserve the immediate newline before follow-up input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_pipe_launch_records_transport_and_starts_sideband() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let debug_dir = tempdir.path().join("debug");

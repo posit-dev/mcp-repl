@@ -1,0 +1,45 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteStdinControlAction {
+    Interrupt,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutBundleReuse {
+    None,
+    FullReply,
+    FollowUpInput,
+}
+
+pub(crate) fn prepare_worker_stdin_payload(input: &str) -> Vec<u8> {
+    let mut payload = input.as_bytes().to_vec();
+    if !payload.is_empty() && !payload.ends_with(b"\n") {
+        payload.push(b'\n');
+    }
+    payload
+}
+
+pub(crate) fn split_write_stdin_control_prefix(
+    input: &str,
+) -> Option<(WriteStdinControlAction, &str)> {
+    let first = input.chars().next()?;
+    let action = match first {
+        '\u{3}' => WriteStdinControlAction::Interrupt,
+        '\u{4}' => WriteStdinControlAction::Restart,
+        _ => return None,
+    };
+    Some((action, &input[first.len_utf8()..]))
+}
+
+pub(crate) fn timeout_bundle_reuse_for_input(input: &str) -> TimeoutBundleReuse {
+    if input.is_empty() {
+        return TimeoutBundleReuse::FullReply;
+    }
+
+    match split_write_stdin_control_prefix(input) {
+        Some((WriteStdinControlAction::Interrupt, "")) => TimeoutBundleReuse::FullReply,
+        Some((WriteStdinControlAction::Interrupt, _)) => TimeoutBundleReuse::FollowUpInput,
+        Some((WriteStdinControlAction::Restart, _)) => TimeoutBundleReuse::None,
+        None => TimeoutBundleReuse::FollowUpInput,
+    }
+}

@@ -23,6 +23,7 @@ mod r_session;
 mod sandbox;
 mod sandbox_cli;
 mod server;
+mod stdin_payload;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;
