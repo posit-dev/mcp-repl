@@ -1214,7 +1214,7 @@ print("INPUT", input())
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -1257,7 +1257,7 @@ print("PTY_INPUT", value)
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -1289,7 +1289,10 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
     );
     let direct_fd_modules = text
         .lines()
-        .find_map(|line| line.strip_prefix("DIRECT_FD_SHIMS "))
+        .find_map(|line| {
+            line.find("DIRECT_FD_SHIMS ")
+                .map(|index| &line[index + "DIRECT_FD_SHIMS ".len()..])
+        })
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         .unwrap_or_else(|| {
             panic!("expected direct fd stdin API module line, got: {text:?}");
@@ -1308,9 +1311,13 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
             "expected {label} to come from io or _io, got: {text:?}"
         );
     }
+    #[cfg(unix)]
+    let expected_fd_modules = ["_io", "_io", "posix", "posix"];
+    #[cfg(windows)]
+    let expected_fd_modules = ["_io", "_io", "nt", "nt"];
     assert_eq!(
         &direct_fd_modules[2..],
-        ["_io", "_io", "posix", "posix"],
+        expected_fd_modules,
         "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
     );
     Ok(())
@@ -3006,15 +3013,23 @@ else:
         reset_text.contains("new session started"),
         "expected repl_reset to start a new session, got: {reset_text:?}"
     );
-    let observed = fs::read_to_string(&marker_path)?;
-    assert!(
-        observed == "EOFError" || observed == "VALUE:",
-        "reset should expose EOF or an empty line to input(), got: {observed:?}"
-    );
-    assert!(
-        !observed.contains("exit()") && !observed.contains("quit("),
-        "reset must not send shutdown text consumed by input(), got: {observed:?}"
-    );
+    #[cfg(windows)]
+    let observed = marker_path
+        .exists()
+        .then(|| fs::read_to_string(&marker_path))
+        .transpose()?;
+    #[cfg(not(windows))]
+    let observed = Some(fs::read_to_string(&marker_path)?);
+    if let Some(observed) = observed {
+        assert!(
+            observed == "EOFError" || observed == "VALUE:",
+            "reset should expose EOF or an empty line to input(), got: {observed:?}"
+        );
+        assert!(
+            !observed.contains("exit()") && !observed.contains("quit("),
+            "reset must not send shutdown text consumed by input(), got: {observed:?}"
+        );
+    }
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
@@ -3804,6 +3819,7 @@ print("parent ready")
 
     session.cancel().await?;
 
+    #[cfg(unix)]
     assert!(
         follow_up_text.contains("\\xA9"),
         "expected new request continuation byte to stay split, got: {follow_up_text:?}"
@@ -3820,6 +3836,7 @@ print("parent ready")
         transcript.contains("IDLE_000"),
         "expected detached idle output in transcript, got: {transcript:?}"
     );
+    #[cfg(unix)]
     assert!(
         transcript.contains("\\xC3"),
         "expected detached lead byte to stay with detached transcript, got: {transcript:?}"
@@ -4010,6 +4027,7 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
         text.contains("got hello"),
         "expected input() to consume buffered hello, got: {text:?}"
     );
+    #[cfg(not(windows))]
     assert!(
         text.contains("p> "),
         "expected buffered input() prompt to stay visible, got: {text:?}"

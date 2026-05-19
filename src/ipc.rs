@@ -279,7 +279,9 @@ impl OutputCriticalIpcWriter {
             .writer
             .lock()
             .map_err(|_| io::Error::other("ipc writer mutex poisoned"))?;
-        write_ipc_message(&mut **writer, &message)
+        let result = write_ipc_message(&mut **writer, &message);
+        drop(writer);
+        result
     }
 }
 
@@ -623,7 +625,10 @@ impl ServerIpcConnection {
         Ok(())
     }
 
-    #[cfg_attr(target_family = "unix", allow(dead_code))]
+    #[cfg_attr(
+        any(target_family = "unix", target_family = "windows"),
+        allow(dead_code)
+    )]
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
@@ -1001,8 +1006,9 @@ impl WorkerIpcConnection {
 fn write_ipc_message<T: Serialize>(writer: &mut dyn Write, message: &T) -> io::Result<()> {
     let payload = serde_json::to_string(message).map_err(io::Error::other)?;
     writer.write_all(payload.as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.flush()
+    // IPC transports are unbuffered OS pipes. On Windows named pipes, flushing
+    // can wait for peer drainage, so a complete JSONL write is the sync point.
+    writer.write_all(b"\n")
 }
 
 #[derive(Debug)]
@@ -1105,7 +1111,7 @@ impl IpcServer {
         self,
         handle: IpcHandle,
         handlers: IpcHandlers,
-        child: &mut std::process::Child,
+        child_exited: impl FnMut() -> io::Result<bool>,
         max_wait: Duration,
     ) -> io::Result<()> {
         let Some(server_pipe_to_worker) = self.server_pipe_to_worker else {
@@ -1119,9 +1125,10 @@ impl IpcServer {
             ));
         };
         let start = Instant::now();
-        connect_named_pipe_with_process_retry(&server_pipe_to_worker, child, max_wait)?;
+        let child_exited = std::cell::RefCell::new(child_exited);
+        connect_named_pipe_with_process_retry(&server_pipe_to_worker, &child_exited, max_wait)?;
         let remaining = max_wait.saturating_sub(start.elapsed());
-        connect_named_pipe_with_process_retry(&server_pipe_from_worker, child, remaining)?;
+        connect_named_pipe_with_process_retry(&server_pipe_from_worker, &child_exited, remaining)?;
         let conn = ServerIpcConnection::new(
             IpcTransport {
                 reader: Box::new(server_pipe_from_worker),
@@ -1451,12 +1458,12 @@ fn join_connector_with_grace(connector: thread::JoinHandle<()>, max_wait: Durati
 #[cfg(target_family = "windows")]
 fn connect_named_pipe_with_process_retry(
     server_pipe: &File,
-    child: &mut std::process::Child,
+    child_exited: &std::cell::RefCell<impl FnMut() -> io::Result<bool>>,
     max_wait: Duration,
 ) -> io::Result<()> {
     connect_named_pipe_with_process_retry_impl(
         |timeout| connect_named_pipe(server_pipe, timeout),
-        || child.try_wait().map(|status| status.is_some()),
+        || child_exited.borrow_mut()(),
         max_wait,
     )
 }
