@@ -57,26 +57,50 @@ use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
+#[cfg(target_family = "windows")]
+use portable_pty::ExitStatus as WorkerExitStatus;
 #[cfg(target_family = "unix")]
 use portable_pty::{PtySize, native_pty_system};
+#[cfg(target_family = "windows")]
+use std::ffi::{OsStr, OsString};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_family = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 #[cfg(target_family = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+use windows_sys::Win32::System::Console::{
+    COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent,
+    HPCON,
+};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
+};
+
+#[cfg(not(target_family = "windows"))]
+type WorkerChild = Child;
+#[cfg(not(target_family = "windows"))]
+type WorkerExitStatus = std::process::ExitStatus;
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
@@ -322,7 +346,10 @@ impl RBackendDriver {
     }
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
     if let Some(message) = ipc.take_protocol_error() {
@@ -331,7 +358,10 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), W
     Ok(())
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_announce_stdin_write(
     byte_len: usize,
     line_count: usize,
@@ -368,7 +398,7 @@ fn driver_wait_for_stdin_write_ack(
     }
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 fn driver_wait_for_python_interrupt_ack(
     ipc: &ServerIpcConnection,
     timeout: Duration,
@@ -413,7 +443,10 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_refresh_backend_info(
     ipc: ServerIpcConnection,
     timeout: Duration,
@@ -538,17 +571,17 @@ impl BackendDriver for RBackendDriver {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 struct PythonBackendDriver;
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl PythonBackendDriver {
     fn new() -> Self {
         Self
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_final_prompt_hint(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -574,7 +607,7 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_has_open_block_suite(text: &str) -> bool {
     let mut block_indents = Vec::new();
     let mut scan_state = PythonLineScanState::default();
@@ -601,7 +634,7 @@ fn python_has_open_block_suite(text: &str) -> bool {
     !block_indents.is_empty()
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 #[derive(Default)]
 struct PythonLineScanState {
     quote: Option<(char, bool)>,
@@ -609,14 +642,14 @@ struct PythonLineScanState {
     groups: Vec<char>,
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl PythonLineScanState {
     fn continuation_active(&self) -> bool {
         self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_code_before_comment_with_state(
     line: &str,
     state: &mut PythonLineScanState,
@@ -683,14 +716,14 @@ fn python_line_code_before_comment_with_state(
     code
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_indent(line: &str) -> usize {
     line.chars()
         .take_while(|ch| matches!(ch, ' ' | '\t'))
         .count()
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_code_before_comment(line: &str) -> &str {
     let mut chars = line.char_indices().peekable();
     let mut quote: Option<(char, bool)> = None;
@@ -732,12 +765,12 @@ fn python_line_code_before_comment(line: &str) -> &str {
     line
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_requires_continuation(text: &str) -> bool {
     has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn final_line_continues_with_backslash(text: &str) -> bool {
     let Some(line) = text.lines().last() else {
         return false;
@@ -752,7 +785,7 @@ fn final_line_continues_with_backslash(text: &str) -> bool {
         == 1
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn has_unclosed_python_group_or_string(text: &str) -> bool {
     let mut stack = Vec::new();
     let mut chars = text.chars().peekable();
@@ -812,7 +845,7 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
     let mut clone = chars.clone();
     if clone.next() != Some(expected) || clone.next() != Some(expected) {
@@ -823,7 +856,7 @@ fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected:
     true
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_next_two_indexed(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     expected: char,
@@ -839,7 +872,7 @@ fn take_next_two_indexed(
     true
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn text_ends_with_blank_line(text: &str) -> bool {
     let Some(text) = strip_one_line_ending(text) else {
         return false;
@@ -847,14 +880,14 @@ fn text_ends_with_blank_line(text: &str) -> bool {
     text.ends_with('\n') || text.ends_with('\r')
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn strip_one_line_ending(text: &str) -> Option<&str> {
     text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .or_else(|| text.strip_suffix('\r'))
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl BackendDriver for PythonBackendDriver {
     fn on_input_start(
         &mut self,
@@ -904,26 +937,26 @@ impl BackendDriver for PythonBackendDriver {
 }
 
 struct ProtocolBackendDriver {
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     python_request_generation: Option<u64>,
 }
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
         Self {
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             python_request_generation: None,
         }
     }
 
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
         }
     }
 
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     fn next_python_request_generation(&mut self) -> Option<u64> {
         let generation = self.python_request_generation.as_mut()?;
         *generation = generation.wrapping_add(1);
@@ -940,11 +973,11 @@ impl BackendDriver for ProtocolBackendDriver {
         timeout: Duration,
     ) -> Result<(), WorkerError> {
         ipc.begin_request_with_stdin(payload);
-        #[cfg(not(target_family = "unix"))]
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         let _ = timeout;
-        #[cfg(target_family = "unix")]
+        #[cfg(any(target_family = "unix", target_family = "windows"))]
         if let Some(request_generation) = self.next_python_request_generation() {
-            // Built-in Unix Python reads request bytes through the worker stdin fd
+            // Built-in PTY-backed Python reads request bytes through worker stdin
             // like a protocol worker, but its plot hooks still need a Python-side
             // request boundary before follow-up stdin is consumed. The generation
             // also lets a late interrupt avoid draining fd 0 after the next request
@@ -961,11 +994,11 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
+        #[cfg(any(target_family = "unix", target_family = "windows"))]
         if self.python_request_generation.is_some() {
             driver_announce_stdin_write_complete(ipc)?;
         }
-        #[cfg(not(target_family = "unix"))]
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         let _ = ipc;
         Ok(())
     }
@@ -987,7 +1020,7 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
+        #[cfg(any(target_family = "unix", target_family = "windows"))]
         if let Some(request_generation) = self.python_request_generation {
             if let Some(ipc) = process.ipc.get() {
                 ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
@@ -1035,7 +1068,7 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
@@ -1347,11 +1380,11 @@ impl WorkerManager {
             driver: match worker_launch {
                 WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
                 WorkerLaunch::Builtin(Backend::Python) => {
-                    #[cfg(target_family = "unix")]
+                    #[cfg(any(target_family = "unix", target_family = "windows"))]
                     {
                         Box::new(ProtocolBackendDriver::python())
                     }
-                    #[cfg(not(target_family = "unix"))]
+                    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
                     {
                         Box::new(PythonBackendDriver::new())
                     }
@@ -3695,7 +3728,7 @@ impl WorkerManager {
     fn reset(&mut self) -> Result<(), WorkerError> {
         crate::event_log::log("worker_reset_begin", serde_json::json!({}));
         if let Some(process) = self.process.take() {
-            let _ = process.kill();
+            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
         }
         if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
@@ -3722,7 +3755,7 @@ impl WorkerManager {
             }),
         );
         if let Some(process) = self.process.take() {
-            let _ = process.kill();
+            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
         }
         if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
@@ -5656,14 +5689,16 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
 }
 
 struct WorkerProcess {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
+    #[cfg(target_family = "windows")]
+    _pty_conpty: Option<WindowsConPty>,
     expected_exit: bool,
-    exit_status: Option<std::process::ExitStatus>,
+    exit_status: Option<WorkerExitStatus>,
     #[cfg(target_family = "unix")]
     guardrail_stop: Arc<AtomicBool>,
     #[cfg(target_family = "unix")]
@@ -5685,11 +5720,13 @@ enum StdinCommand {
 }
 
 struct SpawnedWorker {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
+    #[cfg(target_family = "windows")]
+    pty_conpty: Option<WindowsConPty>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -5698,18 +5735,172 @@ struct SpawnedWorkerStdio {
     stdin_tx: mpsc::Sender<StdinCommand>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
+    #[cfg(target_family = "windows")]
+    pty_conpty: Option<WindowsConPty>,
 }
 
 struct SpawnedCommand {
-    child: Child,
-    #[cfg(target_family = "unix")]
+    child: WorkerChild,
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     pty_stdio: Option<SpawnedPtyStdio>,
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(target_family = "windows")]
+enum WorkerChild {
+    Process(Child),
+    Pty(WindowsPtyChild),
+}
+
+#[cfg(target_family = "windows")]
+impl WorkerChild {
+    fn from_process(child: Child) -> Self {
+        Self::Process(child)
+    }
+
+    fn from_pty(child: WindowsPtyChild) -> Self {
+        Self::Pty(child)
+    }
+
+    fn as_process_mut(&mut self) -> Option<&mut Child> {
+        match self {
+            Self::Process(child) => Some(child),
+            Self::Pty(_) => None,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<WorkerExitStatus>> {
+        match self {
+            Self::Process(child) => portable_pty::Child::try_wait(child),
+            Self::Pty(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<WorkerExitStatus> {
+        match self {
+            Self::Process(child) => portable_pty::Child::wait(child),
+            Self::Pty(child) => child.wait(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Process(child) => child.kill(),
+            Self::Pty(child) => child.kill(),
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Process(child) => Some(child.id()),
+            Self::Pty(child) => child.process_id(),
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+struct WindowsPtyChild {
+    process: HANDLE,
+    process_id: u32,
+}
+
+#[cfg(target_family = "windows")]
+unsafe impl Send for WindowsPtyChild {}
+
+#[cfg(target_family = "windows")]
+impl WindowsPtyChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<WorkerExitStatus>> {
+        let mut status = 0u32;
+        let ok = unsafe { GetExitCodeProcess(self.process, &mut status) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if status == windows_sys::Win32::Foundation::STILL_ACTIVE as u32 {
+            Ok(None)
+        } else {
+            Ok(Some(WorkerExitStatus::with_exit_code(status)))
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<WorkerExitStatus> {
+        loop {
+            match self.try_wait()? {
+                Some(status) => return Ok(status),
+                None => {
+                    let wait = unsafe { WaitForSingleObject(self.process, INFINITE) };
+                    if wait == WAIT_FAILED {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        let ok = unsafe { TerminateProcess(self.process, 1) };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            if self.try_wait()?.is_some() {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.process_id)
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl Drop for WindowsPtyChild {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.process);
+        }
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn worker_child_from_process(child: Child) -> WorkerChild {
+    child
+}
+
+#[cfg(target_family = "windows")]
+fn worker_child_from_process(child: Child) -> WorkerChild {
+    WorkerChild::from_process(child)
+}
+
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 struct SpawnedPtyStdio {
+    #[cfg(target_family = "unix")]
     reader: File,
+    #[cfg(target_family = "windows")]
+    reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
+    #[cfg(target_family = "windows")]
+    _conpty: WindowsConPty,
+}
+
+#[cfg(target_family = "windows")]
+struct WindowsConPty {
+    hpc: HPCON,
+    input_read: HANDLE,
+    output_write: HANDLE,
+}
+
+#[cfg(target_family = "windows")]
+unsafe impl Send for WindowsConPty {}
+
+#[cfg(target_family = "windows")]
+impl Drop for WindowsConPty {
+    fn drop(&mut self) {
+        unsafe {
+            ClosePseudoConsole(self.hpc);
+            CloseHandle(self.input_read);
+            CloseHandle(self.output_write);
+        }
+    }
 }
 
 struct WorkerSpawnContext<'a> {
@@ -5787,6 +5978,8 @@ impl WorkerProcess {
             session_tmpdir,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match &worker_launch {
@@ -5865,15 +6058,15 @@ impl WorkerProcess {
                 .connect(ipc.clone(), handlers)
                 .map_err(WorkerError::Io)?;
             #[cfg(target_family = "windows")]
-            handle_windows_ipc_connect_result(
-                ipc_server.connect(
+            {
+                let connect_result = ipc_server.connect(
                     ipc.clone(),
                     handlers,
-                    &mut child,
+                    || child.try_wait().map(|status| status.is_some()),
                     WINDOWS_IPC_CONNECT_MAX_WAIT,
-                ),
-                &mut child,
-            )?;
+                );
+                handle_windows_ipc_connect_result(connect_result, &mut child)?;
+            }
         }
 
         #[cfg(target_family = "unix")]
@@ -5887,6 +6080,8 @@ impl WorkerProcess {
             ipc,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            _pty_conpty: pty_conpty,
             expected_exit: false,
             exit_status: None,
             #[cfg(target_family = "unix")]
@@ -5956,6 +6151,31 @@ impl WorkerProcess {
                 python_executable,
             );
         }
+        #[cfg(target_family = "windows")]
+        let mut pty_command = {
+            let mut builder = WindowsPtyCommand::new(&prepared.program);
+            builder.args(&prepared.args);
+            for (key, value) in prepared.env.iter() {
+                builder.env(key, value);
+            }
+            builder.env(
+                crate::backend::INTERPRETER_ENV,
+                match backend {
+                    Backend::R => "r",
+                    Backend::Python => "python",
+                },
+            );
+            if matches!(backend, Backend::Python)
+                && let Some(python_executable) =
+                    std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
+            {
+                builder.env(
+                    crate::python_session::PYTHON_EXECUTABLE_ENV,
+                    python_executable,
+                );
+            }
+            builder
+        };
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -5971,11 +6191,15 @@ impl WorkerProcess {
         })?;
         #[cfg(target_family = "windows")]
         {
-            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
-            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
+            command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
+            pty_command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
+            pty_command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
+        #[cfg(target_family = "windows")]
+        apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
@@ -5983,6 +6207,8 @@ impl WorkerProcess {
             &mut command,
             stdin_transport,
             !matches!(backend, Backend::Python),
+            #[cfg(target_family = "windows")]
+            Some(pty_command),
         );
         #[cfg(target_family = "unix")]
         {
@@ -5993,11 +6219,11 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
-            maybe_report_sandbox_exec_failure(&prepared.program, status)?;
+            maybe_report_sandbox_exec_failure(&prepared.program, &status)?;
             return Err(WorkerError::Protocol(format!(
                 "worker process exited immediately with status {status}"
             )));
@@ -6007,10 +6233,12 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            pty_conpty,
         } = attach_spawned_worker_stdio(
             &mut child,
             stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -6028,6 +6256,8 @@ impl WorkerProcess {
             session_tmpdir,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -6079,6 +6309,21 @@ impl WorkerProcess {
                 command.current_dir(path);
             }
         }
+        #[cfg(target_family = "windows")]
+        let mut pty_command = {
+            let mut builder = WindowsPtyCommand::new(&prepared.program);
+            builder.args(&prepared.args);
+            for (key, value) in spec.env.iter() {
+                builder.env(key, value);
+            }
+            for (key, value) in prepared.env.iter() {
+                builder.env(key, value);
+            }
+            if let CustomWorkerWorkingDir::Path { path } = &spec.working_dir {
+                builder.cwd(path);
+            }
+            builder
+        };
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -6094,15 +6339,25 @@ impl WorkerProcess {
         })?;
         #[cfg(target_family = "windows")]
         {
-            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
-            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
+            command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
+            pty_command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
+            pty_command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
+        #[cfg(target_family = "windows")]
+        apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
         let stdin_transport = spec.stdin.transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
-        let child_result = spawn_command_with_transport(&mut command, stdin_transport, true);
+        let child_result = spawn_command_with_transport(
+            &mut command,
+            stdin_transport,
+            true,
+            #[cfg(target_family = "windows")]
+            Some(pty_command),
+        );
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6112,11 +6367,11 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
-            maybe_report_sandbox_exec_failure(&prepared.program, status)?;
+            maybe_report_sandbox_exec_failure(&prepared.program, &status)?;
             return Err(WorkerError::Protocol(format!(
                 "worker process exited immediately with status {status}"
             )));
@@ -6126,10 +6381,12 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            pty_conpty,
         } = attach_spawned_worker_stdio(
             &mut child,
             stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -6147,6 +6404,8 @@ impl WorkerProcess {
             session_tmpdir,
             stdout_reader,
             stderr_reader,
+            #[cfg(target_family = "windows")]
+            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -6209,7 +6468,12 @@ impl WorkerProcess {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
+        let Some(process_id) = self.child.process_id() else {
+            return Err(WorkerError::Protocol(
+                "worker process id unavailable for interrupt".to_string(),
+            ));
+        };
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
         if ok != 0 {
             return Ok(());
         }
@@ -6311,7 +6575,6 @@ impl WorkerProcess {
 
     fn is_running(&mut self) -> Result<bool, WorkerError> {
         if let Some(status) = self.child.try_wait()? {
-            self.exit_status = Some(status);
             let should_log = !status.success() && !self.expected_exit;
             if should_log {
                 #[cfg(target_family = "unix")]
@@ -6323,6 +6586,7 @@ impl WorkerProcess {
                 #[cfg(not(target_family = "unix"))]
                 eprintln!("worker exited with status {status}");
             }
+            self.exit_status = Some(status);
             return Ok(false);
         }
         Ok(true)
@@ -6415,6 +6679,10 @@ impl WorkerProcess {
         // sideband fds. Backend startup strips the bootstrap env vars, marks the fds
         // close-on-exec, and closes them again in forked children, so EOF should track the root
         // worker lifetime.
+        #[cfg(target_family = "windows")]
+        {
+            let _ = self._pty_conpty.take();
+        }
         if let Some(reader) = self.stdout_reader.take() {
             reader.stop_and_join("worker stdout reader thread panicked")?;
         }
@@ -6648,9 +6916,197 @@ fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBu
     }
 }
 
+#[cfg(target_family = "windows")]
+#[derive(Clone)]
+struct WindowsPtyCommand {
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(OsString, OsString)>,
+    cwd: Option<PathBuf>,
+}
+
+#[cfg(target_family = "windows")]
+impl WindowsPtyCommand {
+    fn new(program: &Path) -> Self {
+        Self {
+            program: program.to_path_buf(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        }
+    }
+
+    fn args(&mut self, args: &[String]) {
+        self.args.extend(args.iter().cloned());
+    }
+
+    fn env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.env
+            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+    }
+
+    fn cwd(&mut self, path: &Path) {
+        self.cwd = Some(path.to_path_buf());
+    }
+
+    fn command_line_wide(&self) -> Vec<u16> {
+        let mut command_line = Vec::new();
+        append_windows_quoted_arg(self.program.as_os_str(), &mut command_line);
+        for arg in &self.args {
+            command_line.push(' ' as u16);
+            append_windows_quoted_arg(OsStr::new(arg), &mut command_line);
+        }
+        command_line.push(0);
+        command_line
+    }
+
+    fn program_wide(&self) -> Vec<u16> {
+        let mut program = self.program.as_os_str().encode_wide().collect::<Vec<_>>();
+        program.push(0);
+        program
+    }
+
+    fn environment_block_wide(&self) -> Vec<u16> {
+        let mut entries = std::collections::BTreeMap::<String, (OsString, OsString)>::new();
+        for (key, value) in current_windows_environment() {
+            entries.insert(windows_env_key(&key), (key, value));
+        }
+        for (key, value) in &self.env {
+            entries.insert(windows_env_key(key), (key.clone(), value.clone()));
+        }
+
+        let mut block = Vec::new();
+        for (_normalized, (key, value)) in entries {
+            block.extend(key.encode_wide());
+            block.push('=' as u16);
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn cwd_wide(&self) -> Option<Vec<u16>> {
+        self.cwd.as_ref().map(|path| {
+            let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            wide.push(0);
+            wide
+        })
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn current_windows_environment() -> Vec<(OsString, OsString)> {
+    let block = unsafe { GetEnvironmentStringsW() };
+    if block.is_null() {
+        return std::env::vars_os().collect();
+    }
+
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let mut len = 0usize;
+        while unsafe { *block.add(offset + len) } != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            break;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(block.add(offset), len) };
+        if let Some(eq) = environment_entry_separator(slice) {
+            let key = OsString::from_wide(&slice[..eq]);
+            let value = OsString::from_wide(&slice[eq + 1..]);
+            entries.push((key, value));
+        }
+        offset += len + 1;
+    }
+    unsafe {
+        FreeEnvironmentStringsW(block);
+    }
+    entries
+}
+
+#[cfg(target_family = "windows")]
+fn environment_entry_separator(entry: &[u16]) -> Option<usize> {
+    let start = usize::from(entry.first() == Some(&('=' as u16)));
+    entry
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, ch)| (*ch == '=' as u16).then_some(index))
+}
+
+#[cfg(target_family = "windows")]
+fn windows_env_key(key: &OsStr) -> String {
+    key.to_string_lossy().to_ascii_lowercase()
+}
+
+#[cfg(target_family = "windows")]
+fn append_windows_quoted_arg(arg: &OsStr, command_line: &mut Vec<u16>) {
+    let wide = arg.encode_wide().collect::<Vec<_>>();
+    if !wide.is_empty()
+        && !wide.iter().any(|ch| {
+            *ch == b' ' as u16
+                || *ch == b'\t' as u16
+                || *ch == b'\n' as u16
+                || *ch == 0x0b
+                || *ch == b'"' as u16
+        })
+    {
+        command_line.extend(wide);
+        return;
+    }
+
+    command_line.push('"' as u16);
+    let mut index = 0;
+    while index < wide.len() {
+        let mut backslashes = 0;
+        while index < wide.len() && wide[index] == b'\\' as u16 {
+            index += 1;
+            backslashes += 1;
+        }
+
+        if index == wide.len() {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+            break;
+        }
+        if wide[index] == b'"' as u16 {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+        } else {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        }
+        command_line.push(wide[index]);
+        index += 1;
+    }
+    command_line.push('"' as u16);
+}
+
+#[cfg(target_family = "windows")]
+fn apply_debug_startup_env_to_pty(
+    command: &mut WindowsPtyCommand,
+    session_tmpdir: Option<&PathBuf>,
+) {
+    if let Some(debug_session_dir) =
+        crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        command.env(crate::debug_logs::DEBUG_SESSION_DIR_ENV, debug_session_dir);
+    }
+    if let Some(tmpdir) = session_tmpdir {
+        command.env(
+            crate::diagnostics::STARTUP_LOG_PATH_ENV,
+            tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
+        );
+    }
+}
+
 fn maybe_report_sandbox_exec_failure(
     _program: &Path,
-    _status: std::process::ExitStatus,
+    _status: &WorkerExitStatus,
 ) -> Result<(), WorkerError> {
     #[cfg(target_os = "macos")]
     {
@@ -6867,25 +7323,66 @@ where
     }))
 }
 
+#[cfg(target_family = "windows")]
+fn spawn_blocking_output_reader<R>(
+    stream: Option<R>,
+    output_stream: TextStream,
+    live_output: LiveOutputCapture,
+) -> Result<Option<OutputReader>, WorkerError>
+where
+    R: Read + Send + 'static,
+{
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let handle = thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => live_output.append_raw_text(&buffer[..n], output_stream),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    Ok(Some(OutputReader {
+        handle,
+        done_rx,
+        stop_requested,
+    }))
+}
+
 fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
     pty_echo: bool,
+    #[cfg(target_family = "windows")] pty_command: Option<WindowsPtyCommand>,
 ) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
+            #[cfg(target_family = "windows")]
+            let _ = pty_command;
             let child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
             Ok(SpawnedCommand {
-                child,
-                #[cfg(target_family = "unix")]
+                child: worker_child_from_process(child),
+                #[cfg(any(target_family = "unix", target_family = "windows"))]
                 pty_stdio: None,
             })
         }
-        WorkerStdinTransport::Pty => spawn_command_with_pty(command, pty_echo),
+        WorkerStdinTransport::Pty => spawn_command_with_pty(
+            command,
+            pty_echo,
+            #[cfg(target_family = "windows")]
+            pty_command,
+        ),
     }
 }
 
@@ -6893,6 +7390,7 @@ fn spawn_command_with_transport(
 fn spawn_command_with_pty(
     command: &mut Command,
     echo: bool,
+    #[cfg(target_family = "windows")] _pty_command: Option<WindowsPtyCommand>,
 ) -> Result<SpawnedCommand, WorkerError> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -6950,7 +7448,32 @@ fn spawn_command_with_pty(
     })
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(target_family = "windows")]
+fn spawn_command_with_pty(
+    _command: &mut Command,
+    _echo: bool,
+    pty_command: Option<WindowsPtyCommand>,
+) -> Result<SpawnedCommand, WorkerError> {
+    let pty_command = pty_command
+        .ok_or_else(|| WorkerError::Protocol("worker PTY command unavailable".to_string()))?;
+    let WindowsPtySpawn {
+        child,
+        reader,
+        writer,
+        conpty,
+    } = spawn_windows_pty_command(&pty_command)?;
+
+    Ok(SpawnedCommand {
+        child: WorkerChild::from_pty(child),
+        pty_stdio: Some(SpawnedPtyStdio {
+            reader,
+            writer,
+            _conpty: conpty,
+        }),
+    })
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn spawn_command_with_pty(
     _command: &mut Command,
     _echo: bool,
@@ -6989,16 +7512,185 @@ fn configure_pty_slave_echo(fd: libc::c_int, enabled: bool) -> Result<(), Worker
     Ok(())
 }
 
+#[cfg(target_family = "windows")]
+struct WindowsPtySpawn {
+    child: WindowsPtyChild,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    conpty: WindowsConPty,
+}
+
+#[cfg(target_family = "windows")]
+fn spawn_windows_pty_command(command: &WindowsPtyCommand) -> Result<WindowsPtySpawn, WorkerError> {
+    let (input_read, input_write) = create_windows_pipe("PTY input")?;
+    let (output_read, output_write) = create_windows_pipe("PTY output")?;
+    let mut hpc: HPCON = 0;
+    let hr = unsafe {
+        CreatePseudoConsole(
+            COORD { X: 4096, Y: 24 },
+            input_read,
+            output_write,
+            0,
+            &mut hpc,
+        )
+    };
+    if hr != 0 {
+        unsafe {
+            CloseHandle(input_read);
+            CloseHandle(input_write);
+            CloseHandle(output_read);
+            CloseHandle(output_write);
+        }
+        return Err(WorkerError::Protocol(format!(
+            "failed to create worker PTY: HRESULT {hr}"
+        )));
+    }
+
+    let conpty = WindowsConPty {
+        hpc,
+        input_read,
+        output_write,
+    };
+    let spawn_result = spawn_windows_pty_process(command, hpc);
+    match spawn_result {
+        Ok(child) => {
+            let reader = unsafe { std::fs::File::from_raw_handle(output_read as _) };
+            let writer = unsafe { std::fs::File::from_raw_handle(input_write as _) };
+            Ok(WindowsPtySpawn {
+                child,
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                conpty,
+            })
+        }
+        Err(err) => {
+            drop(conpty);
+            unsafe {
+                CloseHandle(input_write);
+                CloseHandle(output_read);
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn create_windows_pipe(label: &str) -> Result<(HANDLE, HANDLE), WorkerError> {
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    let ok = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+    if ok == 0 {
+        return Err(WorkerError::Io(std::io::Error::new(
+            std::io::Error::last_os_error().kind(),
+            format!(
+                "CreatePipe {label} failed: {}",
+                std::io::Error::last_os_error()
+            ),
+        )));
+    }
+    Ok((read, write))
+}
+
+#[cfg(target_family = "windows")]
+fn spawn_windows_pty_process(
+    command: &WindowsPtyCommand,
+    hpc: HPCON,
+) -> Result<WindowsPtyChild, WorkerError> {
+    let mut startup_info = STARTUPINFOEXW::default();
+    startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+
+    let mut attribute_list_size = 0usize;
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_list_size);
+    }
+    let mut attribute_list = vec![0u8; attribute_list_size];
+    let attribute_list_ptr = attribute_list.as_mut_ptr().cast();
+    let ok = unsafe {
+        InitializeProcThreadAttributeList(attribute_list_ptr, 1, 0, &mut attribute_list_size)
+    };
+    if ok == 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    startup_info.lpAttributeList = attribute_list_ptr;
+
+    let update_ok = unsafe {
+        UpdateProcThreadAttribute(
+            startup_info.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            hpc as *const std::ffi::c_void,
+            std::mem::size_of::<HPCON>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if update_ok == 0 {
+        unsafe {
+            DeleteProcThreadAttributeList(startup_info.lpAttributeList);
+        }
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+
+    let mut program = command.program_wide();
+    let mut command_line = command.command_line_wide();
+    let environment = command.environment_block_wide();
+    let cwd = command.cwd_wide();
+    let mut process_info = PROCESS_INFORMATION::default();
+    let ok = unsafe {
+        CreateProcessW(
+            program.as_mut_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            cwd.as_ref()
+                .map(|wide| wide.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            &startup_info.StartupInfo,
+            &mut process_info,
+        )
+    };
+    unsafe {
+        DeleteProcThreadAttributeList(startup_info.lpAttributeList);
+    }
+    if ok == 0 {
+        return Err(WorkerError::Protocol(format!(
+            "failed to spawn worker PTY child: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    unsafe {
+        CloseHandle(process_info.hThread);
+    }
+    Ok(WindowsPtyChild {
+        process: process_info.hProcess,
+        process_id: process_info.dwProcessId,
+    })
+}
+
 fn attach_spawned_worker_stdio(
-    child: &mut Child,
+    child: &mut WorkerChild,
     stdin_transport: WorkerStdinTransport,
-    #[cfg(target_family = "unix")] pty_stdio: Option<SpawnedPtyStdio>,
+    #[cfg(any(target_family = "unix", target_family = "windows"))] pty_stdio: Option<
+        SpawnedPtyStdio,
+    >,
     live_output: LiveOutputCapture,
 ) -> Result<SpawnedWorkerStdio, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             let _ = pty_stdio;
+            #[cfg(target_family = "windows")]
+            let child = child.as_process_mut().ok_or_else(|| {
+                WorkerError::Protocol("pipe worker process stdio unavailable".to_string())
+            })?;
             let stdin = child
                 .stdin
                 .take()
@@ -7012,6 +7704,8 @@ fn attach_spawned_worker_stdio(
                 stdin_tx,
                 stdout_reader,
                 stderr_reader,
+                #[cfg(target_family = "windows")]
+                pty_conpty: None,
             })
         }
         WorkerStdinTransport::Pty => {
@@ -7027,9 +7721,32 @@ fn attach_spawned_worker_stdio(
                     stdin_tx,
                     stdout_reader,
                     stderr_reader: None,
+                    #[cfg(target_family = "windows")]
+                    pty_conpty: None,
                 })
             }
-            #[cfg(not(target_family = "unix"))]
+            #[cfg(target_family = "windows")]
+            {
+                let _ = child;
+                let pty_stdio = pty_stdio.ok_or_else(|| {
+                    WorkerError::Protocol("worker PTY stdio unavailable".to_string())
+                })?;
+                let SpawnedPtyStdio {
+                    reader,
+                    writer,
+                    _conpty,
+                } = pty_stdio;
+                let stdin_tx = spawn_windows_pty_stdin_writer(writer);
+                let stdout_reader =
+                    spawn_blocking_output_reader(Some(reader), TextStream::Stdout, live_output)?;
+                Ok(SpawnedWorkerStdio {
+                    stdin_tx,
+                    stdout_reader,
+                    stderr_reader: None,
+                    pty_conpty: Some(_conpty),
+                })
+            }
+            #[cfg(not(any(target_family = "unix", target_family = "windows")))]
             {
                 let _ = child;
                 let _ = live_output;
@@ -7068,6 +7785,43 @@ where
     tx
 }
 
+#[cfg(target_family = "windows")]
+fn spawn_windows_pty_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>
+where
+    W: Write + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<StdinCommand>();
+    thread::spawn(move || {
+        let mut writer = std::io::BufWriter::new(stdin);
+        for command in rx {
+            match command {
+                StdinCommand::Write { payload, reply } => {
+                    let translated = windows_pty_input_payload(&payload);
+                    let result = writer
+                        .write_all(&translated)
+                        .and_then(|_| writer.flush())
+                        .map_err(WorkerError::Io);
+                    let _ = reply.send(result);
+                }
+                StdinCommand::Close { reply } => {
+                    let result = writer.flush().map_err(WorkerError::Io);
+                    let _ = reply.send(result);
+                    break;
+                }
+            }
+        }
+    });
+    tx
+}
+
+#[cfg(target_family = "windows")]
+fn windows_pty_input_payload(payload: &[u8]) -> Vec<u8> {
+    payload
+        .iter()
+        .map(|byte| if *byte == b'\n' { b'\r' } else { *byte })
+        .collect()
+}
+
 fn duration_to_millis(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     if millis > u64::MAX as u128 {
@@ -7099,13 +7853,19 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
 #[cfg(target_family = "windows")]
 fn handle_windows_ipc_connect_result(
     connect_result: Result<(), std::io::Error>,
-    child: &mut Child,
+    child: &mut WorkerChild,
 ) -> Result<(), WorkerError> {
     match connect_result {
         Ok(()) => Ok(()),
         // The child here is the sandbox wrapper process. Give it a short grace
         // period to unwind ACL changes before forcing termination/reap.
         Err(err) => {
+            if let Some(status) = child.try_wait()? {
+                return Err(WorkerError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("{err}; worker exited with status {status}"),
+                )));
+            }
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
             loop {
@@ -7132,7 +7892,7 @@ fn handle_windows_ipc_connect_result(
 }
 
 #[cfg(target_family = "windows")]
-fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
+fn request_soft_termination(_child: &mut WorkerChild) -> Result<(), WorkerError> {
     // The Windows child is the sandbox wrapper. Let it exit naturally so it can
     // roll back temporary ACL state before process teardown.
     Ok(())
@@ -7159,11 +7919,16 @@ fn set_command_arg0(command: &mut Command, arg0: &str) {
 #[cfg(not(target_family = "unix"))]
 fn set_command_arg0(_command: &mut Command, _arg0: &str) {}
 
-fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
+fn format_exit_status_message(status: &WorkerExitStatus) -> String {
     #[cfg(target_family = "unix")]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
         return format!("[repl] worker exited with signal {signal}");
     }
+    #[cfg(target_family = "windows")]
+    {
+        format!("[repl] worker exited with status {}", status.exit_code())
+    }
+    #[cfg(not(target_family = "windows"))]
     match status.code() {
         Some(code) => format!("[repl] worker exited with status {code}"),
         None => "[repl] worker exited with unknown status".to_string(),
@@ -7318,7 +8083,7 @@ mod tests {
     fn test_worker_process(child: Child) -> WorkerProcess {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         WorkerProcess {
-            child,
+            child: worker_child_from_process(child),
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
@@ -7338,12 +8103,13 @@ mod tests {
     fn test_worker_process(child: Child) -> WorkerProcess {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         WorkerProcess {
-            child,
+            child: worker_child_from_process(child),
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
             stdout_reader: None,
             stderr_reader: None,
+            _pty_conpty: None,
             expected_exit: false,
             exit_status: None,
         }
@@ -10096,10 +10862,11 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_ipc_connect_error_reaps_wrapper_process() {
-        let mut child = Command::new("powershell.exe")
+        let child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn test child process");
+        let mut child = worker_child_from_process(child);
 
         let result = handle_windows_ipc_connect_result(
             Err(std::io::Error::other("ipc connect failed")),
@@ -10125,10 +10892,11 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_soft_termination_does_not_kill_child() {
-        let mut child = Command::new("powershell.exe")
+        let child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn test child process");
+        let mut child = worker_child_from_process(child);
 
         request_soft_termination(&mut child).expect("soft terminate call should succeed");
 

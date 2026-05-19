@@ -1,6 +1,6 @@
 #[cfg(target_family = "unix")]
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let stdin = io::stdin();
+    let normalize_terminal_input = cfg!(windows) && stdin.is_terminal();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
     let mut command_state = CommandState {
@@ -96,6 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let command = line.trim_end_matches(['\r', '\n']);
         let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
             format!("{text}\n")
+        } else if normalize_terminal_input {
+            normalize_terminal_line_for_protocol(&line)
         } else {
             line.clone()
         };
@@ -365,6 +368,10 @@ fn escape_bytes(bytes: &[u8]) -> String {
         }
     }
     escaped
+}
+
+fn normalize_terminal_line_for_protocol(line: &str) -> String {
+    line.replace("\r\n", "\n")
 }
 
 fn send_readline_start(
@@ -740,8 +747,8 @@ impl IpcTransport {
         {
             let to_worker = std::env::var(IPC_PIPE_TO_WORKER_ENV).map_err(io::Error::other)?;
             let from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV).map_err(io::Error::other)?;
-            let reader = std::fs::OpenOptions::new().read(true).open(to_worker)?;
-            let writer = std::fs::OpenOptions::new().write(true).open(from_worker)?;
+            let reader = open_named_pipe_with_retry(&to_worker, NamedPipeAccess::Read)?;
+            let writer = open_named_pipe_with_retry(&from_worker, NamedPipeAccess::Write)?;
             Ok(Self {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
@@ -755,6 +762,48 @@ impl IpcTransport {
                 "zod-worker sideband transport is unsupported on this platform",
             ))
         }
+    }
+}
+
+#[cfg(target_family = "windows")]
+#[derive(Clone, Copy)]
+enum NamedPipeAccess {
+    Read,
+    Write,
+}
+
+#[cfg(target_family = "windows")]
+fn open_named_pipe_with_retry(path: &str, access: NamedPipeAccess) -> io::Result<std::fs::File> {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const IPC_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let deadline = Instant::now() + IPC_OPEN_TIMEOUT;
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        match access {
+            NamedPipeAccess::Read => {
+                options.read(true);
+            }
+            NamedPipeAccess::Write => {
+                options.write(true);
+            }
+        }
+        match options.open(path) {
+            Ok(file) => return Ok(file),
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

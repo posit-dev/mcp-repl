@@ -280,7 +280,7 @@ async fn zod_worker_pipe_launch_records_transport_and_starts_sideband() -> TestR
     Ok(())
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_pty_launch_keeps_sideband_separate_and_captures_visible_output()
 -> TestResult<()> {

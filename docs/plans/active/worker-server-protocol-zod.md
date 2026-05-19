@@ -647,7 +647,7 @@ ordered on the worker-to-server sideband stream. The server must not
 assume that writing the `interrupt` message means the worker has already
 processed it; later `readline_input`, `readline_discard`,
 `readline_start`, and `session_end` events determine recovery.
-Built-in Unix Python currently has a private `python_interrupt` /
+Built-in PTY-backed Python currently has a private `python_interrupt` /
 `python_interrupt_ack` cleanup handshake so it can drain PTY input before
 SIGINT; that acknowledgement is transitional and not part of the generic
 worker protocol.
