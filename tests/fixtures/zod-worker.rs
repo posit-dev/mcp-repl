@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::FromRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -22,6 +23,7 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
+const SHUTDOWN_LOG_ENV: &str = "MCP_REPL_ZOD_SHUTDOWN_LOG";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 
@@ -35,7 +37,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = IpcTransport::connect_from_env()?;
     let writer = IpcWriter::new(transport.writer);
     let interrupted = Arc::new(AtomicBool::new(false));
-    start_control_reader(transport.reader, interrupted.clone());
+    let control_session_end = Arc::new(AtomicBool::new(false));
+    let shutdown_log_path = std::env::var_os(SHUTDOWN_LOG_ENV).map(PathBuf::from);
+    start_control_reader(
+        transport.reader,
+        interrupted.clone(),
+        control_session_end.clone(),
+        shutdown_log_path.clone(),
+    );
 
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
@@ -47,9 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         capabilities: Capabilities { images: true },
-        graceful_shutdown: Some(GracefulShutdown {
-            stdin: "exit\n".to_string(),
-        }),
     })?;
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
@@ -67,6 +73,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
+            let shutdown_event = if control_session_end.load(Ordering::SeqCst) {
+                "sideband_shutdown"
+            } else {
+                "stdin_eof"
+            };
+            append_shutdown_log(shutdown_log_path.as_deref(), shutdown_event)?;
             send_session_end(&writer, &mut timeline, "shutdown")?;
             return Ok(());
         }
@@ -216,6 +228,17 @@ fn send_session_end(writer: &IpcWriter, timeline: &mut Timeline, reason: &str) -
         message_b64: None,
     })?;
     timeline.run(LifecyclePoint::AfterSessionEnd, writer)
+}
+
+fn append_shutdown_log(path: Option<&Path>, event: &str) -> io::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(format!("{event}\n").as_bytes())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,8 +438,6 @@ enum WorkerToServer {
         protocol: Protocol,
         worker: WorkerIdentity,
         capabilities: Capabilities,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        graceful_shutdown: Option<GracefulShutdown>,
     },
     ReadlineStart {
         prompt: String,
@@ -456,11 +477,6 @@ struct WorkerIdentity {
 #[derive(Serialize)]
 struct Capabilities {
     images: bool,
-}
-
-#[derive(Serialize)]
-struct GracefulShutdown {
-    stdin: String,
 }
 
 #[derive(Clone)]
@@ -553,7 +569,12 @@ fn env_fd(name: &str) -> io::Result<i32> {
         .map_err(io::Error::other)
 }
 
-fn start_control_reader(reader: Box<dyn Read + Send>, interrupted: Arc<AtomicBool>) {
+fn start_control_reader(
+    reader: Box<dyn Read + Send>,
+    interrupted: Arc<AtomicBool>,
+    control_session_end: Arc<AtomicBool>,
+    shutdown_log_path: Option<PathBuf>,
+) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -568,7 +589,12 @@ fn start_control_reader(reader: Box<dyn Read + Send>, interrupted: Arc<AtomicBoo
                 Ok(ServerToWorker::Interrupt) => {
                     interrupted.store(true, Ordering::SeqCst);
                 }
-                Ok(ServerToWorker::SessionEnd) => return,
+                Ok(ServerToWorker::SessionEnd) => {
+                    control_session_end.store(true, Ordering::SeqCst);
+                    let _ =
+                        append_shutdown_log(shutdown_log_path.as_deref(), "control_session_end");
+                    return;
+                }
                 Ok(ServerToWorker::Other) | Err(_) => {}
             }
         }

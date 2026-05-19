@@ -293,6 +293,56 @@ async fn zod_worker_preserves_existing_trailing_newline() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_reset_requests_shutdown_by_closing_stdin_only() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_text = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_text.as_str(),
+    )])
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "before reset",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("before reset\n"),
+        "expected Zod worker to start before reset, got: {first_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected reset to start a replacement session, got: {reset_text:?}"
+    );
+
+    session.cancel().await?;
+    let log = fs::read_to_string(&shutdown_log)?;
+    assert!(
+        log.contains("stdin_eof"),
+        "expected reset to close worker stdin, got log: {log:?}"
+    );
+    assert!(
+        !log.contains("control_session_end"),
+        "reset must not send a sideband shutdown command, got log: {log:?}"
+    );
+    assert!(
+        !log.contains("sideband_shutdown"),
+        "shutdown reason must come from stdin EOF, got log: {log:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_prompt_shaped_stdout() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 

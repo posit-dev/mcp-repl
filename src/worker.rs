@@ -47,11 +47,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_r_worker() -> Result<(), Box<dyn std::error::Error>> {
     crate::diagnostics::startup_log("worker: run begin");
     let state = Arc::new(WorkerState::default());
-    init_ipc(state.clone()).map_err(|err| {
+    init_ipc().map_err(|err| {
         eprintln!("worker ipc init error: {err}");
         err
     })?;
-    emit_worker_ready("r", true, Some("quit(\"no\")\n"));
+    emit_worker_ready("r", true);
 
     let stdin_state = state.clone();
     let _stdin_thread = thread::Builder::new()
@@ -82,7 +82,7 @@ fn wait_for_r_session() -> Result<&'static RSession, String> {
     }
 }
 
-fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
+fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
     let conn = connect_from_env(Duration::from_secs(2))?;
     set_global_ipc(conn.clone());
     if let Err(err) = thread::Builder::new()
@@ -99,11 +99,6 @@ fn init_ipc(state: Arc<WorkerState>) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Some(ServerToWorkerIpcMessage::PythonInterrupt { .. }) => {
                         crate::r_session::clear_pending_input();
-                    }
-                    Some(ServerToWorkerIpcMessage::SessionEnd) => {
-                        state.begin_shutdown();
-                        crate::r_session::clear_pending_input();
-                        let _ = crate::r_session::request_shutdown();
                     }
                     None => {
                         // Without IPC, the worker cannot participate in turn accounting (prompt,

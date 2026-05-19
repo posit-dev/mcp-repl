@@ -171,16 +171,6 @@ struct PythonRuntime {
     stdin: *mut libc::FILE,
 }
 
-pub fn request_shutdown() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    guard.shutdown = true;
-    state.cvar.notify_all();
-    true
-}
-
 fn request_exit() {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -631,7 +621,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    ipc::emit_worker_ready("python", plot_capable(), Some("exit()\n"));
+    ipc::emit_worker_ready("python", plot_capable());
 
     let result = run_repl(&runtime);
     let finalize_result = finalize_python(api, thread_state);

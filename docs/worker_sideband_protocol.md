@@ -26,6 +26,11 @@ Runtime stdin transport is a launch-time worker setting, not a sideband
 negotiation. A worker may use ordinary pipes or a PTY for its C stdio, but the
 server still writes accepted request bytes to worker stdin and relies on
 sideband events for prompt, input, discard, output, and session facts.
+For graceful reset and shutdown, the server closes the worker stdin transport
+and then waits for normal worker exit before escalating to OS termination.
+Workers must not advertise interpreter-specific shutdown text, and the server
+does not send shutdown code or a sideband shutdown command. See
+`docs/adr/0001-stdin-close-graceful-shutdown.md`.
 
 Built-in Unix Python uses PTY-backed C stdin/stdout/stderr so CPython calls
 `PyOS_ReadlineFunctionPointer`. The Python callback emits readline accounting
@@ -42,28 +47,18 @@ facts from that CPython path. Sideband IPC stays separate from the PTY.
 - The worker may emit `readline_discard` for exact active-turn stdin bytes it
   discarded before delivering them to the runtime.
 
-`session_end`
-- `{ "type": "session_end" }`
-- Sent when the server is ending the current session, for example during reset
-  or shutdown.
-- Worker treats this as shutdown intent and stops consuming further stdin
-  payloads.
-
 ## Direction: worker -> server
 
 Worker-to-server messages are strict: unknown fields, invalid enum values,
 invalid base64, and unknown message types are protocol errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 1 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> }, "graceful_shutdown": { "stdin": <string> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 1 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Must be the first worker-to-server message for protocol workers.
 - The server rejects unsupported protocol names or versions before sending user
   input.
 - `worker.name` is diagnostic metadata. Server request handling must not branch
   on it.
-- `graceful_shutdown` is optional. If present, the server may write that exact
-  stdin text only when server-owned shutdown/reset rules decide a graceful
-  stdin request is appropriate.
 
 `readline_start`
 - `{ "type": "readline_start", "prompt": <string> }`
