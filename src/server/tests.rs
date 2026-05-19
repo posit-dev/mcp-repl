@@ -197,6 +197,22 @@ fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
     ));
 }
 
+#[test]
+fn timeout_bundle_reuse_treats_newline_ctrl_c_as_follow_up_input() {
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}"),
+        super::response::TimeoutBundleReuse::FullReply
+    ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+    assert!(matches!(
+        super::response::timeout_bundle_reuse_for_input("\u{3}\r\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+}
+
 fn split_lines(text: &str) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();

@@ -25,6 +25,6 @@ snapshot.session("default", mcp_script! {
     write_stdin("x <- 1");
     write_stdin("x <- x + 2");
     write_stdin("x", timeout = 0.2);
-    write_stdin("\u{4}");
+    write_stdin_raw_unterminated("\u{4}");
 }).await?;
 ```

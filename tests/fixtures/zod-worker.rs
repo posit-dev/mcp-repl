@@ -26,6 +26,8 @@ const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const SHUTDOWN_LOG_ENV: &str = "MCP_REPL_ZOD_SHUTDOWN_LOG";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
+const INVALID_SESSION_END_REASON: &str =
+    r#"{"type":"session_end","reason":"not-a-recognized-reason"}"#;
 
 #[cfg(target_family = "unix")]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -36,12 +38,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport = IpcTransport::connect_from_env()?;
     let writer = IpcWriter::new(transport.writer);
-    let interrupted = Arc::new(AtomicBool::new(false));
+    let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let control_session_end = Arc::new(AtomicBool::new(false));
     let shutdown_log_path = std::env::var_os(SHUTDOWN_LOG_ENV).map(PathBuf::from);
     start_control_reader(
         transport.reader,
-        interrupted.clone(),
+        sideband_interrupted.clone(),
         control_session_end.clone(),
         shutdown_log_path.clone(),
     );
@@ -67,7 +69,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
-    let mut next_prompt = "zod> ".to_string();
+    let mut command_state = CommandState {
+        next_prompt: "zod> ".to_string(),
+        shutdown_mode: ShutdownMode::Normal,
+        previous_line_empty: false,
+        shutdown_log_path: shutdown_log_path.clone(),
+    };
     let mut timeline = Timeline::default();
     loop {
         line.clear();
@@ -79,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "stdin_eof"
             };
             append_shutdown_log(shutdown_log_path.as_deref(), shutdown_event)?;
+            apply_shutdown_mode(shutdown_log_path.as_deref(), command_state.shutdown_mode)?;
             send_session_end(&writer, &mut timeline, "shutdown")?;
             return Ok(());
         }
@@ -94,6 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
+            append_shutdown_log(shutdown_log_path.as_deref(), "user-stdin:exit")?;
+            apply_shutdown_mode(shutdown_log_path.as_deref(), command_state.shutdown_mode)?;
             send_session_end(&writer, &mut timeline, "runtime_exit")?;
             return Ok(());
         }
@@ -105,31 +115,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeline.run(LifecyclePoint::BeforeCommand, &writer)?;
         run_command(
             &writer,
-            &interrupted,
+            &sideband_interrupted,
+            &mut reader,
             command,
             &line,
-            &mut next_prompt,
+            &mut command_state,
             &mut timeline,
         )?;
         timeline.run(LifecyclePoint::AfterCommand, &writer)?;
+        command_state.previous_line_empty = command.is_empty();
         send_readline_start(
             &writer,
             &mut timeline,
-            std::mem::replace(&mut next_prompt, "zod> ".to_string()),
+            std::mem::replace(&mut command_state.next_prompt, "zod> ".to_string()),
         )?;
     }
 }
 
 fn run_command(
     writer: &IpcWriter,
-    interrupted: &AtomicBool,
+    sideband_interrupted: &AtomicBool,
+    reader: &mut dyn BufRead,
     command: &str,
     raw_line: &str,
-    next_prompt: &mut String,
+    state: &mut CommandState,
     timeline: &mut Timeline,
 ) -> io::Result<()> {
     if let Some(prompt) = command.strip_prefix("wait ") {
-        *next_prompt = prompt.to_string();
+        state.next_prompt = prompt.to_string();
         return Ok(());
     }
 
@@ -141,7 +154,7 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("sleep ") {
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -149,7 +162,7 @@ fn run_command(
         let mut stdout = io::stdout().lock();
         stdout.write_all(b"zod> raw stdout\n")?;
         stdout.flush()?;
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -157,7 +170,7 @@ fn run_command(
         writer.send(&WorkerToServer::ReadlineStart {
             prompt: "buffered> ".to_string(),
         })?;
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         return Ok(());
     }
 
@@ -176,13 +189,59 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
-        sleep_for(parse_millis(millis)?, interrupted, false);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
     }
 
     if let Some(millis) = command.strip_prefix("interruptible ") {
-        sleep_for(parse_millis(millis)?, interrupted, true);
+        sleep_for(parse_millis(millis)?, sideband_interrupted, true);
+        return Ok(());
+    }
+
+    if let Some(millis) = command.strip_prefix("interrupt-report ") {
+        let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
+        let text = format!(
+            "sideband interrupt: {}\nos interrupt: {}\n",
+            if report.sideband {
+                "observed"
+            } else {
+                "missing"
+            },
+            if report.os { "observed" } else { "missing" },
+        );
+        writer.output_text("stdout", text.as_bytes())?;
+        return Ok(());
+    }
+
+    if let Some(millis) = command.strip_prefix("slow-shutdown ") {
+        state.shutdown_mode = ShutdownMode::Delay(Duration::from_millis(parse_millis(millis)?));
+        return Ok(());
+    }
+
+    if command == "hang-shutdown" {
+        state.shutdown_mode = ShutdownMode::Hang;
+        return Ok(());
+    }
+
+    if let Some(millis) = command.strip_prefix("discard-on-interrupt ") {
+        if sleep_for(parse_millis(millis)?, sideband_interrupted, true) {
+            discard_buffered_stdin(reader, writer)?;
+        }
+        return Ok(());
+    }
+
+    if command == "read-user-stdin" {
+        let mut user_line = String::new();
+        let bytes = reader.read_line(&mut user_line)?;
+        if bytes == 0 {
+            append_shutdown_log(state.shutdown_log_path.as_deref(), "user-stdin:<eof>")?;
+        } else {
+            append_shutdown_log(
+                state.shutdown_log_path.as_deref(),
+                format!("user-stdin:{}", user_line.trim_end_matches(['\r', '\n'])).as_str(),
+            )?;
+        }
         return Ok(());
     }
 
@@ -203,12 +262,82 @@ fn run_command(
         return Ok(());
     }
 
+    if command == "report-leading-empty" {
+        let status = if state.previous_line_empty {
+            "observed"
+        } else {
+            "missing"
+        };
+        writer.output_text(
+            "stdout",
+            format!("previous empty line: {status}\n").as_bytes(),
+        )?;
+        return Ok(());
+    }
+
+    if command == "report-raw-line" || command.starts_with("report-raw-line ") {
+        let text = format!("raw-line-debug: {}\n", raw_line.escape_debug());
+        writer.output_text("stdout", text.as_bytes())?;
+        return Ok(());
+    }
+
     if command == "bad-output-base64" {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         return Ok(());
     }
 
+    if command == "bad-session-end-reason" {
+        writer.send_raw_json(INVALID_SESSION_END_REASON)?;
+        return Ok(());
+    }
+
     writer.output_text("stdout", raw_line.as_bytes())
+}
+
+struct CommandState {
+    next_prompt: String,
+    shutdown_mode: ShutdownMode,
+    previous_line_empty: bool,
+    shutdown_log_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownMode {
+    Normal,
+    Delay(Duration),
+    Hang,
+}
+
+fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()> {
+    match mode {
+        ShutdownMode::Normal => Ok(()),
+        ShutdownMode::Delay(delay) => {
+            append_shutdown_log(path, &format!("shutdown:delay-ms:{}", delay.as_millis()))?;
+            thread::sleep(delay);
+            append_shutdown_log(path, "shutdown:delay-complete")
+        }
+        ShutdownMode::Hang => {
+            append_shutdown_log(path, "shutdown:hang")?;
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
+    let (text, len) = {
+        let buffer = reader.fill_buf()?;
+        let text = std::str::from_utf8(buffer)
+            .map_err(io::Error::other)?
+            .to_string();
+        (text, buffer.len())
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    reader.consume(len);
+    writer.send(&WorkerToServer::ReadlineDiscard { text })
 }
 
 fn send_readline_start(
@@ -390,17 +519,55 @@ fn parse_millis(raw: &str) -> io::Result<u64> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-fn sleep_for(millis: u64, interrupted: &AtomicBool, interruptible: bool) {
+fn sleep_for(millis: u64, interrupted: &AtomicBool, interruptible: bool) -> bool {
     let deadline = Instant::now() + Duration::from_millis(millis);
     while Instant::now() < deadline {
         if interruptible
             && (interrupted.swap(false, Ordering::SeqCst) || os_interrupted().unwrap_or(false))
         {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_millis(10));
     }
+    false
 }
+
+struct InterruptReport {
+    sideband: bool,
+    os: bool,
+}
+
+fn observe_interrupts_for(millis: u64, sideband_interrupted: &AtomicBool) -> InterruptReport {
+    sideband_interrupted.store(false, Ordering::SeqCst);
+    clear_os_interrupted();
+
+    let deadline = Instant::now() + Duration::from_millis(millis);
+    let mut report = InterruptReport {
+        sideband: false,
+        os: false,
+    };
+    while Instant::now() < deadline {
+        report.sideband |= sideband_interrupted.swap(false, Ordering::SeqCst);
+        report.os |= os_interrupted().unwrap_or(false);
+        if report.sideband && (report.os || !os_interrupts_supported()) {
+            return report;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    report
+}
+
+fn os_interrupts_supported() -> bool {
+    cfg!(target_family = "unix")
+}
+
+#[cfg(target_family = "unix")]
+fn clear_os_interrupted() {
+    INTERRUPTED_BY_OS.store(false, Ordering::SeqCst);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn clear_os_interrupted() {}
 
 #[cfg(target_family = "unix")]
 fn os_interrupted() -> Option<bool> {
@@ -443,6 +610,9 @@ enum WorkerToServer {
         prompt: String,
     },
     ReadlineInput {
+        text: String,
+    },
+    ReadlineDiscard {
         text: String,
     },
     OutputText {

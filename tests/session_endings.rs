@@ -29,7 +29,7 @@ async fn snapshots_session_endings() -> TestResult<()> {
             "restart_timeout_zero",
             mcp_script! {
                 write_stdin("x <- 1", timeout = 10.0);
-                write_stdin("\u{4}", timeout = 0.0);
+                write_stdin_raw_unterminated("\u{4}", timeout = 0.0);
                 write_stdin("print(exists(\"x\"))", timeout = 10.0);
             },
         )
@@ -40,7 +40,7 @@ async fn snapshots_session_endings() -> TestResult<()> {
             "restart_timeout_thirty",
             mcp_script! {
                 write_stdin("x <- 1", timeout = 10.0);
-                write_stdin("\u{4}", timeout = 30.0);
+                write_stdin_raw_unterminated("\u{4}", timeout = 30.0);
                 write_stdin("print(exists(\"x\"))", timeout = 10.0);
             },
         )
@@ -50,7 +50,7 @@ async fn snapshots_session_endings() -> TestResult<()> {
         .session(
             "eof_input",
             mcp_script! {
-                write_stdin("\u{4}", timeout = 10.0);
+                write_stdin_raw_unterminated("\u{4}", timeout = 10.0);
                 write_stdin("1+1", timeout = 10.0);
             },
         )
@@ -106,7 +106,9 @@ async fn session_endings_smoke() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let _ = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
-    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     let restart_text = common::result_text(&restart);
     if common::backend_unavailable(&restart_text) {
         eprintln!("session_endings backend unavailable in this environment; skipping");

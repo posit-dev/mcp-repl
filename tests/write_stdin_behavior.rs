@@ -1517,18 +1517,29 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
 async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let start_path = temp.path().join("started");
+    let release_path = temp.path().join("release");
+    let start_literal = r_path_literal(&start_path)?;
+    let release_literal = r_path_literal(&release_path)?;
+    let input = format!(
+        "writeLines('started', {start_literal}); while (!file.exists({release_literal})) Sys.sleep(0.01); 1+1"
+    );
 
-    let first = session
-        .write_stdin_raw_with("Sys.sleep(0.1); 1+1", Some(0.05))
-        .await?;
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected gated request to time out before release, got: {first_text:?}"
+    );
 
-    sleep(test_delay_ms(160, 700)).await;
+    wait_until_path_exists(&start_path, "gated request start").await?;
+    fs::write(&release_path, "go")?;
     let follow_up = session
         .write_stdin_raw_unterminated_with("", Some(2.0))
         .await?;

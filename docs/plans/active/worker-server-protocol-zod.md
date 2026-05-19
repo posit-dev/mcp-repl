@@ -664,7 +664,9 @@ emits an unsatisfied `readline_start`, the server uses that explicit
 event to finalize the poll reply.
 
 A later non-empty `repl()` call after an unsatisfied `readline_start` is
-written to worker stdin after the same trailing-newline normalization.
+written to worker stdin after the same trailing-newline rule: if the input is
+non-empty and does not end in `\n`, append one `\n`. The server does not
+otherwise canonicalize supplied stdin bytes such as `\r\n` or bare `\r`.
 The worker/runtime decides whether those bytes answer an
 interpreter-level prompt, continue an incomplete expression, or start a
 new top-level evaluation.
@@ -751,8 +753,14 @@ a small deterministic command language through stdin:
   bytes.
 - `sleep <millis>` delays the next unsatisfied prompt so timeout and
   poll behavior can be tested.
-- `interruptible <millis>` delays until either the timer finishes or an
-  OS interrupt arrives.
+- `interruptible <millis>` delays until either the timer finishes or a
+  sideband or OS interrupt arrives.
+- `interrupt-report <millis>` delays while recording sideband and OS
+  interrupt delivery as separate output facts.
+- `slow-shutdown <millis>` delays a later `exit` or EOF `session_end`
+  so reset and shutdown graceful-exit timing can be tested.
+- `hang-shutdown` accepts a later `exit` or EOF but never emits
+  `session_end`, so reset and shutdown OS escalation can be tested.
 - `image` emits a tiny deterministic PNG if Zod advertises image
   support.
 - `exit` emits `session_end`.

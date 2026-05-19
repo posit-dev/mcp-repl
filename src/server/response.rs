@@ -186,15 +186,6 @@ pub(crate) fn timeout_bundle_reuse_for_input(input: &str) -> TimeoutBundleReuse 
         return TimeoutBundleReuse::FullReply;
     };
     let tail = &input[first.len_utf8()..];
-    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\n') {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\r') {
-        rest
-    } else {
-        tail
-    };
 
     match first {
         '\u{3}' if tail.is_empty() => TimeoutBundleReuse::FullReply,

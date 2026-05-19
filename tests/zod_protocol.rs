@@ -343,6 +343,42 @@ async fn zod_worker_reset_requests_shutdown_by_closing_stdin_only() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_preserves_client_stdin_bytes_and_appended_newline() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "report-raw-line supplied crlf\r\nreport-raw-line trailing carriage\r",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("raw-line-debug: report-raw-line supplied crlf\\r\\n\n"),
+        "expected client-supplied newline bytes to reach Zod unchanged, got: {text:?}"
+    );
+    assert!(
+        text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\n"),
+        "expected server to append one final newline after trailing carriage return, got: {text:?}"
+    );
+    assert!(
+        !text.contains("raw-line-debug: report-raw-line trailing carriage\\r\\n\\n\n"),
+        "server must not append more than one newline, got: {text:?}"
+    );
+    assert!(
+        text.contains("zod> "),
+        "expected worker prompt after CRLF input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_prompt_shaped_stdout() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
@@ -743,6 +779,186 @@ async fn zod_worker_output_after_session_end_is_protocol_error() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_invalid_session_end_reason_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-session-end-reason",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid session_end reason"),
+        "expected invalid session_end reason protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_repl_reset_closes_active_stdin_without_shutdown_text() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let active = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-user-stdin",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let active_text = result_text(&active);
+    assert!(
+        active_text.contains("<<repl status: busy"),
+        "expected active stdin read to time out before reset, got: {active_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to respawn the Zod worker, got: {reset_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        !shutdown_log_text.contains("user-stdin:exit\n"),
+        "repl_reset must not send shutdown text to an active request, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("user-stdin:<eof>\n"),
+        "expected reset to close active stdin instead, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_repl_reset_can_exercise_slow_graceful_shutdown() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let configured = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "slow-shutdown 25",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let configured_text = result_text(&configured);
+    assert!(
+        configured_text.contains("zod> "),
+        "expected Zod to accept slow shutdown hook, got: {configured_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected repl_reset to respawn after slow shutdown, got: {reset_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        shutdown_log_text.contains("stdin_eof\n"),
+        "expected repl_reset to close worker stdin, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        !shutdown_log_text.contains("user-stdin:exit\n"),
+        "reset must not send shutdown text to stdin, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:delay-ms:25\n"),
+        "expected Zod to record the slow shutdown hook, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:delay-complete\n"),
+        "expected Zod to complete the slow shutdown hook, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_can_hold_shutdown_open_for_escalation_tests() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let shutdown_log = tempdir.path().join("shutdown.log");
+    let shutdown_log_env = shutdown_log.display().to_string();
+    let session = spawn_zod_server_with_env(vec![(
+        "MCP_REPL_ZOD_SHUTDOWN_LOG",
+        shutdown_log_env.as_str(),
+    )])
+    .await?;
+
+    let configured = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "hang-shutdown",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let configured_text = result_text(&configured);
+    assert!(
+        configured_text.contains("zod> "),
+        "expected Zod to accept hanging shutdown hook, got: {configured_text:?}"
+    );
+
+    let exiting = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "exit",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let exiting_text = result_text(&exiting);
+    assert!(
+        exiting_text.contains("<<repl status: busy"),
+        "expected hanging shutdown hook to leave exit pending, got: {exiting_text:?}"
+    );
+
+    let shutdown_log_text = fs::read_to_string(&shutdown_log).unwrap_or_default();
+    assert!(
+        shutdown_log_text.contains("user-stdin:exit\n"),
+        "expected Zod to receive exit before hanging, got: {shutdown_log_text:?}"
+    );
+    assert!(
+        shutdown_log_text.contains("shutdown:hang\n"),
+        "expected Zod to record the hanging shutdown hook, got: {shutdown_log_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_mixed_output_order() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
@@ -825,6 +1041,133 @@ async fn zod_worker_interrupt_tail_runs_after_recovery() -> TestResult<()> {
     assert!(
         text.contains("tail after interrupt\n"),
         "expected interrupt tail to run after recovery, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_control_prefix_preserves_immediate_newline_tail() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interruptible 1000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}\nreport-leading-empty",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("previous empty line: observed\n"),
+        "expected Zod to receive the immediate newline before the tail, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_reports_sideband_and_os_interrupt_facts() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 1000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}tail after interrupt facts",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("sideband interrupt: observed\n"),
+        "expected Zod to report the sideband interrupt notification, got: {text:?}"
+    );
+    assert!(
+        text.contains("os interrupt: observed\n"),
+        "expected Zod to report the OS interrupt, got: {text:?}"
+    );
+    assert!(
+        text.contains("tail after interrupt facts\n"),
+        "expected interrupt tail to run after recovery, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_discards_buffered_tail_before_follow_up() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "discard-on-interrupt 1000\nSHOULD_NOT_RUN",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}after discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("after discard\n"),
+        "expected follow-up tail to run after recovery, got: {text:?}"
+    );
+    assert!(
+        !text.contains("SHOULD_NOT_RUN"),
+        "expected buffered pre-interrupt tail to be discarded, got: {text:?}"
     );
 
     session.cancel().await?;

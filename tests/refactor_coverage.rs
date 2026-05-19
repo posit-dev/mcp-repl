@@ -21,10 +21,10 @@ plot(1:5, type = "l")
 plot(5:1, type = "l")
 cat("plots_done\n")
 "#, timeout = 10.0);
-                write_stdin("\u{4}");
+                write_stdin_raw_unterminated("\u{4}");
                 write_stdin("1+1", timeout = 10.0);
                 write_stdin("Sys.sleep(5)", timeout = 0.2);
-                write_stdin("\u{3}", timeout = 5.0);
+                write_stdin_raw_unterminated("\u{3}", timeout = 5.0);
                 write_stdin("1+1", timeout = 10.0);
             },
         )
@@ -193,7 +193,9 @@ async fn restart_interrupt_plot_smoke() -> TestResult<()> {
         return Err(format!("expected plot command output marker, got: {text:?}").into());
     }
 
-    let _ = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let _ = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
     if !common::assert_eventually_contains(
         &mut session,
         "1+1",
@@ -213,7 +215,9 @@ async fn restart_interrupt_plot_smoke() -> TestResult<()> {
     let _ = session
         .write_stdin_raw_with("Sys.sleep(5)", Some(0.2))
         .await?;
-    let _ = session.write_stdin_raw_with("\u{3}", Some(10.0)).await?;
+    let _ = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
+        .await?;
     if !common::assert_eventually_contains(
         &mut session,
         "1+1",

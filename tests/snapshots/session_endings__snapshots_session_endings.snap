@@ -28,7 +28,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004\n",
+    "input": "\u0004",
     "timeout_ms": 0
   }
 }
@@ -94,7 +94,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004\n",
+    "input": "\u0004",
     "timeout_ms": 30000
   }
 }
@@ -140,7 +140,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004\n",
+    "input": "\u0004",
     "timeout_ms": 10000
   }
 }

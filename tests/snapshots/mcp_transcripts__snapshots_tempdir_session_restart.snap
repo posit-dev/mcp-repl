@@ -32,7 +32,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004\n"
+    "input": "\u0004"
   }
 }
 response:
@@ -75,7 +75,7 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004\n"
+    "input": "\u0004"
   }
 }
 response:

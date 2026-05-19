@@ -52,7 +52,9 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
     let session = spawn_manage_session().await?;
 
     let _ = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
-    let result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
+    let result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
 
     let text = result_text(&result);
     if backend_unavailable(&text) {
@@ -113,7 +115,9 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
         .write_stdin_raw_with("x <- 1; Sys.sleep(5)", Some(0.1))
         .await?;
 
-    let restart = session.write_stdin_raw_with("\u{4}", Some(5.0)).await?;
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(5.0))
+        .await?;
     let restart_text = result_text(&restart);
     if backend_unavailable(&restart_text) {
         eprintln!("restart test backend unavailable in this environment; skipping");

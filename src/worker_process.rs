@@ -475,7 +475,8 @@ fn driver_refresh_worker_ready(
 
 impl BackendDriver for RBackendDriver {
     fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let mut payload = text.as_bytes().to_vec();
+        let normalized = normalize_input_newlines(text);
+        let mut payload = normalized.into_bytes();
         if !payload.is_empty() && !payload.ends_with(b"\n") {
             payload.push(b'\n');
         }
@@ -1234,17 +1235,7 @@ pub(crate) fn split_write_stdin_control_prefix(
         _ => return None,
     };
 
-    let tail = &input[first.len_utf8()..];
-    let tail = if let Some(rest) = tail.strip_prefix("\r\n") {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\n') {
-        rest
-    } else if let Some(rest) = tail.strip_prefix('\r') {
-        rest
-    } else {
-        tail
-    };
-    Some((action, tail))
+    Some((action, &input[first.len_utf8()..]))
 }
 
 fn worker_context_event_payload(
@@ -2575,7 +2566,6 @@ impl WorkerManager {
         worker_timeout: Duration,
         server_timeout: Duration,
     ) -> Result<RequestState, WorkerError> {
-        let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt);
@@ -3480,13 +3470,23 @@ impl WorkerManager {
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.maybe_emit_pending_server_notice();
+        let pre_shutdown_output = self
+            .process
+            .is_some()
+            .then(|| self.drain_sealed_formatted_output());
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
+            self.pending_output_tape.clear();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.maybe_emit_pending_server_notice();
 
-        let reply = self.build_session_reset_reply_files("new session started");
+        let reply = match pre_shutdown_output {
+            Some(output) => {
+                self.build_session_reset_reply_files_from_formatted("new session started", output)
+            }
+            None => self.build_session_reset_reply_files("new session started"),
+        };
         self.clear_preserved_prefixes();
         self.reset_output_state_files(true);
         self.note_respawn_during_write();
@@ -3653,14 +3653,32 @@ impl WorkerManager {
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.maybe_emit_pending_server_notice();
+        let pre_shutdown_end_offset = self
+            .process
+            .is_some()
+            .then(|| self.output.end_offset().unwrap_or(0));
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
+        let post_shutdown_end_offset = self.output.end_offset();
         self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.maybe_emit_pending_server_notice();
 
         let page_bytes = pager::resolve_page_bytes(None);
-        let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
+        let reply = match pre_shutdown_end_offset {
+            Some(end_offset) => {
+                let reply = self.build_session_reset_reply_pager_to_offset(
+                    page_bytes,
+                    "new session started",
+                    end_offset,
+                );
+                if let Some(end_offset) = post_shutdown_end_offset {
+                    self.output.advance_offset_to(end_offset);
+                }
+                reply
+            }
+            None => self.build_session_reset_reply_pager(page_bytes, "new session started"),
+        };
         self.clear_preserved_prefixes();
         self.reset_output_state_pager(true, false);
         self.note_respawn_during_write();
@@ -4586,10 +4604,19 @@ impl WorkerManager {
     }
 
     fn build_session_reset_reply_files(&mut self, meta: &str) -> ReplyWithOffset {
+        let formatted = self.drain_sealed_formatted_output();
+        self.build_session_reset_reply_files_from_formatted(meta, formatted)
+    }
+
+    fn build_session_reset_reply_files_from_formatted(
+        &mut self,
+        meta: &str,
+        formatted: FormattedPendingOutput,
+    ) -> ReplyWithOffset {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_sealed_formatted_output();
+        } = formatted;
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
             _ => true,
@@ -4613,6 +4640,15 @@ impl WorkerManager {
 
     fn build_session_reset_reply_pager(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
         let end_offset = self.output.end_offset().unwrap_or(0);
+        self.build_session_reset_reply_pager_to_offset(page_bytes, meta, end_offset)
+    }
+
+    fn build_session_reset_reply_pager_to_offset(
+        &mut self,
+        page_bytes: u64,
+        meta: &str,
+        end_offset: u64,
+    ) -> ReplyWithOffset {
         let mut is_error = false;
 
         let SnapshotWithImages {
@@ -7603,11 +7639,11 @@ mod tests {
     }
 
     #[test]
-    fn control_prefix_strips_single_separator_newline() {
+    fn control_prefix_preserves_immediate_newline_tail() {
         let (action, remaining) =
             split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
         assert!(matches!(action, WriteStdinControlAction::Restart));
-        assert_eq!(remaining, "print(1)");
+        assert_eq!(remaining, "\nprint(1)");
     }
 
     #[test]
