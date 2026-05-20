@@ -200,7 +200,28 @@ fn home_scratch_dir(label: &str) -> TestResult<TempDir> {
 fn repo_scratch_dir(label: &str) -> TestResult<TempDir> {
     Ok(Builder::new()
         .prefix(&format!(".tmp-{label}-"))
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))?)
+        .tempdir_in(common::checkout_test_temp_parent("sandbox-state-updates")?)?)
+}
+
+#[test]
+fn repo_scratch_dir_uses_non_temp_checkout_scratch_parent() -> TestResult<()> {
+    let scratch = repo_scratch_dir("parent")?;
+    assert_ne!(
+        scratch.path().parent(),
+        Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "test scratch dirs must not be created directly in the repo root"
+    );
+    assert!(
+        scratch
+            .path()
+            .starts_with(common::checkout_test_temp_parent("sandbox-state-updates")?),
+        "sandbox cwd scratch dirs should stay under target/test-scratch"
+    );
+    assert!(
+        !scratch.path().starts_with(std::env::temp_dir()),
+        "sandbox cwd scratch dirs must stay outside OS temp so read-only sandbox tests can observe blocked cwd writes"
+    );
+    Ok(())
 }
 
 fn write_file_code(path: &Path) -> TestResult<String> {

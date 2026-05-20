@@ -7212,6 +7212,15 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    #[cfg(target_family = "unix")]
+    fn worker_process_test_temp_parent(label: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join("mcp-repl-test-scratch")
+            .join(label);
+        std::fs::create_dir_all(&root).expect("create worker process test temp parent");
+        root
+    }
+
     #[test]
     fn python_backend_prepares_windows_sandbox_launch() {
         assert!(
@@ -9829,7 +9838,7 @@ mod tests {
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let temp = tempfile::Builder::new()
             .prefix(".tmp-interrupt-tail-current-sandbox-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .tempdir_in(worker_process_test_temp_parent("worker-process"))
             .expect("tempdir");
         let sandbox_cwd = temp.path().to_path_buf();
         let plan = SandboxCliPlan {
