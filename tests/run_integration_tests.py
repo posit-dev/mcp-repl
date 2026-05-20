@@ -881,11 +881,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_binary_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if sys.platform == "win32" and path.suffix == "":
+        exe_path = path.with_name(f"{path.name}.exe")
+        if exe_path.is_file():
+            return exe_path
+    return path
+
+
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     if args.timeout <= 0:
         print("--timeout must be positive", file=sys.stderr)
         return 2
+    binary = resolve_binary_path(args.binary)
 
     selected = args.case or sorted(CASES)
     failures = 0
@@ -893,7 +904,7 @@ def main(argv: Sequence[str]) -> int:
         case = CASES[case_name]
         try:
             with McpStdioClient(
-                args.binary,
+                binary,
                 ["--sandbox", args.sandbox, *case.server_args],
                 case.server_env,
                 args.timeout,

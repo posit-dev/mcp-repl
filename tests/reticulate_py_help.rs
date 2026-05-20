@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::time::Duration;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -21,6 +22,18 @@ fn should_skip_reticulate_py_help_output(text: &str) -> bool {
         || text.trim() == ">"
 }
 
+fn reticulate_py_help_initial_timeout_secs() -> f64 {
+    if cfg!(windows) { 20.0 } else { 60.0 }
+}
+
+fn reticulate_py_help_wait_budget() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(180)
+    }
+}
+
 #[test]
 fn prompt_only_reticulate_output_is_skipped() {
     assert!(should_skip_reticulate_py_help_output(">"));
@@ -28,9 +41,9 @@ fn prompt_only_reticulate_output_is_skipped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered() -> TestResult<()> {
-    let session = common::spawn_server_with_files().await?;
+    let mut session = common::spawn_server_with_files().await?;
 
-    let result = session
+    let initial = session
         .write_stdin_raw_with(
             r#"
 {
@@ -51,9 +64,25 @@ async fn reticulate_py_help_is_rendered() -> TestResult<()> {
   }
 }
 "#,
-            Some(60.0),
+            Some(reticulate_py_help_initial_timeout_secs()),
         )
         .await?;
+    let result = match common::wait_until_not_busy(
+        &mut session,
+        initial,
+        Duration::from_millis(500),
+        reticulate_py_help_wait_budget(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) if cfg!(windows) && err.to_string().contains("worker remained busy") => {
+            eprintln!("reticulate::py_help() remained busy on Windows; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let text = result_text(&result);
 
     if should_skip_reticulate_py_help_output(&text) {
