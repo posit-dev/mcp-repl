@@ -896,11 +896,11 @@ impl BackendDriver for PythonBackendDriver {
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_on_input_start(text, ipc)?;
         let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
         let final_prompt = python_final_prompt_hint(text);
         driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
-        driver_wait_for_stdin_write_ack(ipc, timeout)
+        driver_wait_for_stdin_write_ack(ipc, timeout)?;
+        driver_on_input_start(text, ipc)
     }
 
     fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {

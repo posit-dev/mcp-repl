@@ -22,7 +22,8 @@ use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::Console::{
     ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FlushConsoleInputBuffer,
     GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD, KEY_EVENT,
-    ReadConsoleInputW, STD_INPUT_HANDLE, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
+    ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE, SetConsoleCP, SetConsoleMode,
+    SetConsoleOutputCP,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -1484,6 +1485,9 @@ fn request_prompt_wait_should_complete(
     }
     #[cfg(windows)]
     {
+        if !windows_stdin_is_console() {
+            return active.stdin_write_complete && active.consumed_lines >= active.line_count;
+        }
         prompt_can_complete_before_repl_turn(active, current_readline_state)
             && active.byte_len > 0
             && stdin_pending_byte_count() == Some(0)
@@ -1526,6 +1530,9 @@ fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
     }
     #[cfg(windows)]
     {
+        if !windows_stdin_is_console() {
+            return active.stdin_write_complete && active.consumed_lines >= active.line_count;
+        }
         active.line_count == 1 || (active.byte_len > 0 && stdin_pending_byte_count() == Some(0))
     }
     #[cfg(not(any(target_family = "unix", windows)))]
@@ -1579,6 +1586,15 @@ fn finish_repl_turn_request() {
         }
         if let Some(active) = guard.active_request.as_mut() {
             active.repl_turn_finished = true;
+            #[cfg(windows)]
+            if !windows_stdin_is_console() {
+                active.consumed_lines = active.consumed_lines.saturating_add(1);
+            }
+            #[cfg(windows)]
+            if windows_stdin_is_console() && active.line_count == 1 {
+                active.consumed_lines = active.consumed_lines.max(1);
+            }
+            #[cfg(not(windows))]
             if active.line_count == 1 {
                 active.consumed_lines = active.consumed_lines.max(1);
             }
@@ -1618,7 +1634,25 @@ fn stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(windows)]
 fn stdin_pending_byte_count() -> Option<usize> {
-    None
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    if windows_stdin_is_console() {
+        return None;
+    }
+    let mut available = 0u32;
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &mut available,
+            ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available as usize)
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
@@ -1663,7 +1697,7 @@ unsafe extern "C" fn mcp_repl_readline(
         #[cfg(any(target_family = "unix", windows))]
         flush_terminal_input();
     }
-    note_cpython_readline_bytes_read(&read.bytes);
+    note_cpython_readline_bytes_read(&prompt_text, &read.bytes);
     clear_current_readline_prompt();
     if read.interrupted || take_interrupt_requested() {
         PythonApi::global().set_interrupt();
@@ -1700,8 +1734,8 @@ fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
     prompt == guard.python_primary_prompt || prompt == guard.python_continuation_prompt
 }
 
-#[cfg(any(target_family = "unix", windows))]
-fn note_cpython_readline_bytes_read(bytes: &[u8]) {
+#[cfg(target_family = "unix")]
+fn note_cpython_readline_bytes_read(_prompt: &str, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -1710,8 +1744,22 @@ fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     note_active_stdin_line_read(bytes);
 }
 
+#[cfg(windows)]
+fn note_cpython_readline_bytes_read(prompt: &str, bytes: &[u8]) {
+    if windows_stdin_is_console() {
+        if bytes.is_empty() {
+            return;
+        }
+        emit_readline_input_bytes(bytes);
+        mark_request_input_delivered();
+        note_active_stdin_line_read(bytes);
+    } else {
+        note_windows_prompted_stdin_line_read(prompt, bytes);
+    }
+}
+
 #[cfg(not(any(target_family = "unix", windows)))]
-fn note_cpython_readline_bytes_read(bytes: &[u8]) {
+fn note_cpython_readline_bytes_read(_prompt: &str, bytes: &[u8]) {
     note_stdin_line_read(bytes);
 }
 
@@ -1721,6 +1769,11 @@ struct StdioLineRead {
 }
 
 fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
+    #[cfg(windows)]
+    if let Some(read) = read_windows_console_line_bytes() {
+        return read;
+    }
+
     let mut bytes = Vec::new();
     loop {
         let ch = unsafe { libc::fgetc(stdin) };
@@ -1906,9 +1959,13 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         emit_plots();
         mark_stdin_wait_prompt_completed_request();
     }
+    let sideband_prompt = prompt_for_sideband.to_str().unwrap_or("");
     #[cfg(any(target_family = "unix", windows))]
-    let prompt_delivered_immediately =
-        request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
+    let prompt_delivered_immediately = if cfg!(windows) && prompt_has_buffered_answer {
+        false
+    } else {
+        request_runtime_stdin_line(sideband_prompt)
+    };
     #[cfg(any(target_family = "unix", windows))]
     if !prompt.is_empty() && (prompt_delivered_immediately || prompt_has_buffered_answer) {
         emit_output_text(TextStream::Stdout, prompt.as_bytes());
@@ -1924,6 +1981,9 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         #[cfg(any(target_family = "unix", windows))]
         flush_terminal_input();
     }
+    #[cfg(windows)]
+    note_windows_prompted_stdin_line_read(sideband_prompt, &read.bytes);
+    #[cfg(not(windows))]
     note_stdin_line_read(&read.bytes);
     clear_current_readline_prompt();
     if read.interrupted || take_interrupt_requested() {
@@ -2006,6 +2066,90 @@ fn read_windows_stdin_bytes(size: usize) -> Vec<u8> {
 }
 
 #[cfg(windows)]
+fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
+    if !windows_stdin_is_console() {
+        return None;
+    }
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut units = Vec::new();
+    let mut buffer = [0u16; 256];
+    loop {
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadConsoleW(
+                handle,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut read,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let interrupted =
+                std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+            return Some(StdioLineRead {
+                bytes: String::from_utf16_lossy(&units).into_bytes(),
+                interrupted,
+            });
+        }
+        if read == 0 {
+            return Some(StdioLineRead {
+                bytes: String::from_utf16_lossy(&units).into_bytes(),
+                interrupted: false,
+            });
+        }
+        for unit in buffer.iter().take(read as usize).copied() {
+            match unit {
+                0x0d => {
+                    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+                    bytes.push(b'\n');
+                    return Some(StdioLineRead {
+                        bytes,
+                        interrupted: false,
+                    });
+                }
+                0x0a => {
+                    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+                    bytes.push(b'\n');
+                    return Some(StdioLineRead {
+                        bytes,
+                        interrupted: false,
+                    });
+                }
+                _ => units.push(unit),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_stdin_is_console() -> bool {
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut mode = 0;
+    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+}
+
+#[cfg(windows)]
+fn note_windows_prompted_stdin_line_read(_prompt: &str, bytes: &[u8]) {
+    if windows_stdin_is_console() {
+        note_stdin_line_read(bytes);
+        return;
+    }
+    let protocol_bytes = protocol_stdin_bytes(bytes);
+    if !protocol_bytes.is_empty() {
+        mark_request_input_delivered();
+        note_active_stdin_line_read(&protocol_bytes);
+    }
+}
+
+#[cfg(windows)]
 fn note_windows_raw_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -2017,7 +2161,9 @@ fn note_windows_raw_stdin_bytes_read(bytes: &[u8]) {
     if protocol_bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(&protocol_bytes);
+    if windows_stdin_is_console() {
+        emit_readline_input_bytes(&protocol_bytes);
+    }
     mark_request_input_delivered();
     note_active_stdin_line_read(&protocol_bytes);
 }

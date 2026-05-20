@@ -1492,7 +1492,7 @@ async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult
     .await?;
 
     let result = session
-        .write_stdin_raw_with("print('SANDBOX_PY_OK')", Some(10.0))
+        .write_stdin_raw_with("print('SANDBOX_A')\nprint('SANDBOX_B')", Some(10.0))
         .await?;
     let text = result_text(&result);
     if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
@@ -1508,8 +1508,77 @@ async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult
     session.cancel().await?;
 
     assert!(
-        text.contains("SANDBOX_PY_OK"),
-        "expected sandboxed Python request to execute, got: {text:?}"
+        text.contains("SANDBOX_A") && text.contains("SANDBOX_B"),
+        "expected sandboxed Python multiline request to execute, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = common::spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+    ])
+    .await?;
+
+    let result = session
+        .write_stdin_raw_with("print(input('p> '))\nhello", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
+        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows read-only sandbox input request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("p> ") && text.contains("hello"),
+        "expected sandboxed Python input() prompt and answer, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input reported input with no active turn"),
+        "sandboxed Python pipe fallback lost active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_pty_preserves_unicode_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let value = char::from_u32(0x00e9).expect("valid test char").to_string();
+    let code = format!("print('{value}')\nprint(input('u> '))\n{value}");
+    let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows Unicode PTY input request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.matches(&value).count() >= 2,
+        "expected Unicode source and input data to survive the PTY path, got: {text:?}"
+    );
+    assert!(
+        !text.contains("?"),
+        "Unicode input should not be replaced with '?', got: {text:?}"
     );
     Ok(())
 }
