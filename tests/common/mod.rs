@@ -36,6 +36,15 @@ const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 #[cfg(windows)]
 const WINDOWS_TEST_SERVER_MUTEX_NAME: &str = "Local\\mcp_repl_test_server_mutex";
 
+pub(crate) fn checkout_test_temp_parent(label: &str) -> TestResult<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-scratch")
+        .join(label);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
 #[cfg(windows)]
 struct WindowsSuiteServerMutexOwner {
     release_tx: std::sync::mpsc::Sender<()>,

@@ -96,7 +96,27 @@ fn r_path_literal(path: &Path) -> TestResult<String> {
 fn workspace_tempdir() -> TestResult<tempfile::TempDir> {
     Ok(tempfile::Builder::new()
         .prefix("mcp-repl-write-stdin-")
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))?)
+        .tempdir_in(common::checkout_test_temp_parent("write-stdin")?)?)
+}
+
+#[test]
+fn workspace_tempdir_uses_non_temp_checkout_scratch_parent() -> TestResult<()> {
+    let temp = workspace_tempdir()?;
+    assert_ne!(
+        temp.path().parent(),
+        Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "test scratch dirs must not be created directly in the repo root"
+    );
+    assert!(
+        temp.path()
+            .starts_with(common::checkout_test_temp_parent("write-stdin")?),
+        "workspace scratch dirs should stay under target/test-scratch"
+    );
+    assert!(
+        !temp.path().starts_with(std::env::temp_dir()),
+        "workspace scratch dirs must stay outside OS temp because some tests remove or override worker temp env"
+    );
+    Ok(())
 }
 
 async fn wait_until_path_exists(path: &Path, label: &str) -> TestResult<()> {
