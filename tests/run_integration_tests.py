@@ -41,6 +41,22 @@ def collect_stdout(stream: Any, sink: queue.Queue[bytes | None]) -> None:
     sink.put(None)
 
 
+def server_process_env(server_env: Sequence[tuple[str, str]]) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in [
+        "R_PROFILE_USER",
+        "R_PROFILE_SITE",
+        "R_ENVIRON",
+        "R_ENVIRON_USER",
+        "MCP_REPL_UPDATE_PLOT_IMAGES",
+    ]:
+        env.pop(key, None)
+    env["PAGER"] = "cat"
+    env["MANPAGER"] = "cat"
+    env.update(server_env)
+    return env
+
+
 class McpStdioClient:
     def __init__(
         self,
@@ -65,24 +81,13 @@ class McpStdioClient:
         if not self.binary.is_file():
             raise SuiteFailure(f"binary does not exist: {self.binary}")
 
-        env = os.environ.copy()
-        for key in [
-            "R_PROFILE_USER",
-            "R_PROFILE_SITE",
-            "R_ENVIRON",
-            "R_ENVIRON_USER",
-            "MCP_REPL_UPDATE_PLOT_IMAGES",
-        ]:
-            env.pop(key, None)
-        env.update(self.server_env)
-
         command = [str(self.binary), *self.server_args]
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=env,
+            env=server_process_env(tuple(self.server_env.items())),
         )
         assert self.process.stdout is not None
         assert self.process.stderr is not None
@@ -881,11 +886,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_binary_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if sys.platform == "win32" and path.suffix == "":
+        exe_path = path.with_name(f"{path.name}.exe")
+        if exe_path.is_file():
+            return exe_path
+    return path
+
+
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     if args.timeout <= 0:
         print("--timeout must be positive", file=sys.stderr)
         return 2
+    binary = resolve_binary_path(args.binary)
 
     selected = args.case or sorted(CASES)
     failures = 0
@@ -893,7 +909,7 @@ def main(argv: Sequence[str]) -> int:
         case = CASES[case_name]
         try:
             with McpStdioClient(
-                args.binary,
+                binary,
                 ["--sandbox", args.sandbox, *case.server_args],
                 case.server_env,
                 args.timeout,
