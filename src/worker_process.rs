@@ -1,4 +1,4 @@
-#[cfg(all(test, target_family = "unix"))]
+#[cfg(all(test, any(target_family = "unix", target_family = "windows")))]
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
@@ -107,6 +107,11 @@ thread_local! {
     static TEST_UNIX_KILL_RECORDER: RefCell<Option<Vec<(i32, i32)>>> = const { RefCell::new(None) };
 }
 
+#[cfg(all(test, target_family = "windows"))]
+thread_local! {
+    static TEST_WINDOWS_CTRL_EVENT_RECORDER: RefCell<Option<Vec<(u32, u32)>>> = const { RefCell::new(None) };
+}
+
 #[cfg(target_family = "unix")]
 fn raw_unix_kill(target: i32, signal: i32) -> i32 {
     #[cfg(test)]
@@ -121,6 +126,22 @@ fn raw_unix_kill(target: i32, signal: i32) -> i32 {
     }
 
     unsafe { libc::kill(target, signal) }
+}
+
+#[cfg(target_family = "windows")]
+fn raw_windows_generate_console_ctrl_event(ctrl_event: u32, process_group_id: u32) -> i32 {
+    #[cfg(test)]
+    if let Ok(Some(result)) = TEST_WINDOWS_CTRL_EVENT_RECORDER.try_with(|recorder| {
+        let mut recorder = recorder.borrow_mut();
+        recorder.as_mut().map(|calls| {
+            calls.push((ctrl_event, process_group_id));
+            1
+        })
+    }) {
+        return result;
+    }
+
+    unsafe { GenerateConsoleCtrlEvent(ctrl_event, process_group_id) }
 }
 
 #[derive(Debug, Clone)]
@@ -6512,14 +6533,18 @@ impl WorkerProcess {
         {
             self.send_signal(libc::SIGINT)
         }
-        #[cfg(not(target_family = "unix"))]
+        #[cfg(target_family = "windows")]
+        {
+            self.send_windows_ctrl_break()
+        }
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
             Ok(())
         }
     }
 
     #[cfg(target_family = "windows")]
-    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
@@ -6528,7 +6553,7 @@ impl WorkerProcess {
                 "worker process id unavailable for interrupt".to_string(),
             ));
         };
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
+        let ok = raw_windows_generate_console_ctrl_event(CTRL_BREAK_EVENT, process_id);
         if ok != 0 {
             return Ok(());
         }
@@ -6537,6 +6562,11 @@ impl WorkerProcess {
             Some(_) => Ok(()),
             None => Err(WorkerError::Io(std::io::Error::last_os_error())),
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        self.send_windows_ctrl_break()
     }
 
     #[cfg(not(target_family = "windows"))]
@@ -7817,7 +7847,7 @@ fn spawn_windows_pty_process(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            windows_pty_creation_flags(),
             environment.as_ptr().cast(),
             cwd.as_ref()
                 .map(|wide| wide.as_ptr())
@@ -7843,6 +7873,11 @@ fn spawn_windows_pty_process(
         process: process_info.hProcess,
         process_id: process_info.dwProcessId,
     })
+}
+
+#[cfg(target_family = "windows")]
+fn windows_pty_creation_flags() -> u32 {
+    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP
 }
 
 fn attach_spawned_worker_stdio(
@@ -8361,6 +8396,58 @@ mod tests {
         let kills = TEST_UNIX_KILL_RECORDER
             .with(|recorder| recorder.borrow_mut().take().expect("recorded kills"));
         (result, kills)
+    }
+
+    #[cfg(target_family = "windows")]
+    fn capture_recorded_windows_ctrl_events<F, R>(f: F) -> (R, Vec<(u32, u32)>)
+    where
+        F: FnOnce() -> R,
+    {
+        TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
+            assert!(
+                recorder.borrow().is_none(),
+                "did not expect nested Windows ctrl-event recorder"
+            );
+            *recorder.borrow_mut() = Some(Vec::new());
+        });
+        let result = f();
+        let events = TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
+            recorder
+                .borrow_mut()
+                .take()
+                .expect("recorded Windows ctrl events")
+        });
+        (result, events)
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_creation_flags_create_process_group_for_interrupts() {
+        assert!(
+            windows_pty_creation_flags() & CREATE_NEW_PROCESS_GROUP != 0,
+            "Windows PTY workers must be their own process group so Ctrl-Break can target them"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_generic_interrupt_sends_ctrl_break_to_worker_process_group() {
+        let child = sleeping_test_child();
+        let child_id = child.id();
+        let mut process = test_worker_process(child);
+        let (result, events) = capture_recorded_windows_ctrl_events(|| process.send_interrupt());
+
+        let _ = process.kill();
+
+        assert!(
+            result.is_ok(),
+            "expected Windows interrupt to succeed: {result:?}"
+        );
+        assert_eq!(
+            events,
+            vec![(CTRL_BREAK_EVENT, child_id)],
+            "expected Ctrl-Break to target the worker process group"
+        );
     }
 
     #[cfg(target_family = "windows")]
