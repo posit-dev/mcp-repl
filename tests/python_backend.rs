@@ -1250,9 +1250,13 @@ print("PTY_INPUT", value)
         text.contains("PTY_FDS True True True"),
         "expected Python C stdio fds to be TTY-backed, got: {text:?}"
     );
+    #[cfg(unix)]
+    let expected_input_impl = "INPUT_IMPL builtins input";
+    #[cfg(windows)]
+    let expected_input_impl = "INPUT_IMPL __main__ _input";
     assert!(
-        text.contains("INPUT_IMPL builtins input"),
-        "expected input() to use CPython's builtin implementation, got: {text:?}"
+        text.contains(expected_input_impl),
+        "expected input() to use the platform prompt-aware implementation, got: {text:?}"
     );
     assert!(
         text.contains("PTY_INPUT hello"),
@@ -1415,6 +1419,57 @@ async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
     assert!(
         !text.contains("readline_input text does not match active stdin"),
         "CRLF input desynchronized active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_fd0_replacement_bypasses_stdin_bridge() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import os, tempfile
+path = tempfile.mktemp()
+with open(path, "wb") as f:
+    _ = f.write(b"from-file")
+saved_fd = os.dup(0)
+file_fd = os.open(path, os.O_RDONLY)
+try:
+    os.dup2(file_fd, 0)
+    data = os.read(0, 9)
+finally:
+    os.dup2(saved_fd, 0)
+    os.close(saved_fd)
+    os.close(file_fd)
+    os.unlink(path)
+print("FD0_REPLACED", data.decode())
+print("AFTER_FD0_RESTORE")
+""")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows fd0 replacement test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FD0_REPLACED from-file"),
+        "expected os.read(0, ...) to read the replacement fd, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_FD0_RESTORE"),
+        "expected REPL input to continue after restoring fd 0, got: {text:?}"
     );
     Ok(())
 }
@@ -4145,7 +4200,6 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
         text.contains("got hello"),
         "expected input() to consume buffered hello, got: {text:?}"
     );
-    #[cfg(not(windows))]
     assert!(
         text.contains("p> "),
         "expected buffered input() prompt to stay visible, got: {text:?}"

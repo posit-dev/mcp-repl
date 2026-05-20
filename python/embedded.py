@@ -797,8 +797,6 @@ def _mcp_repl_import(name, globals=None, locals=None, fromlist=(), level=0):
 def _mcp_repl_is_raw_stdin_fd(fd):
     if not _mcp_repl_raw_stdin_read_supported:
         return False
-    if os.name == "nt" and fd == 0:
-        return True
     if _mcp_repl_raw_stdin_stat is None:
         return fd == 0
     try:
@@ -1071,6 +1069,7 @@ sys.excepthook = _mcp_repl_excepthook
 _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 if _mcp_repl_c_stdio_tty:
     if os.name == "nt":
+        builtins.input = _input
         _mcp_repl_install_direct_stdin_bridges()
         _mcp_repl_stdin = McpInputStream(tty=True)
         sys.stdin = _mcp_repl_stdin
