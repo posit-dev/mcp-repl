@@ -32,9 +32,12 @@ Workers must not advertise interpreter-specific shutdown text, and the server
 does not send shutdown code or a sideband shutdown command. See
 `docs/adr/0001-stdin-close-graceful-shutdown.md`.
 
-Built-in Unix Python uses PTY-backed C stdin/stdout/stderr so CPython calls
-`PyOS_ReadlineFunctionPointer`. The Python callback emits readline accounting
-facts from that CPython path. Sideband IPC stays separate from the PTY.
+Built-in Python uses PTY-backed C stdin/stdout/stderr where the platform launch
+supports it so CPython calls `PyOS_ReadlineFunctionPointer`. The Python callback
+emits readline accounting facts from that CPython path. Sideband IPC stays
+separate from the PTY. On Windows, sandboxed Python currently falls back to the
+pipe-backed compatibility path because the restricted wrapper must eventually
+own ConPTY process creation.
 
 ## Direction: server -> worker
 
@@ -121,18 +124,18 @@ invalid base64, and unknown message types are protocol errors.
 
 These frames remain for built-in workers that have not fully migrated on every
 platform. New protocol workers should not copy them for steady-state request
-handling. Built-in R no longer uses them. Built-in Unix Python still receives
-the legacy request-boundary frames, but stdin accounting comes from CPython
-readline events rather than a separate stdin bridge.
+handling. Built-in R no longer uses them. Built-in PTY-backed Python still
+receives the legacy request-boundary frames, but stdin accounting comes from
+CPython readline events rather than a separate stdin bridge.
 
 `stdin_write`
 - `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
 - Legacy server-to-worker request metadata emitted before the server writes raw
   input payload bytes to stdin.
-- Built-in Unix Python uses these fields only to install active request state
+- Built-in PTY-backed Python uses these fields only to install active request state
   before CPython's next readline callback consumes stdin.
-- Non-Unix Python may still use them for the pipe-backed compatibility path
-  until it is migrated to the same readline accounting model.
+- Pipe-backed Python may still use them for the compatibility path until it is
+  migrated to the same readline accounting model.
 
 `stdin_write_complete`
 - `{ "type": "stdin_write_complete" }`
@@ -154,7 +157,7 @@ readline events rather than a separate stdin bridge.
 
 `python_interrupt_ack`
 - `{ "type": "python_interrupt_ack" }`
-- Transitional worker-to-server acknowledgement used only by built-in Unix
+- Transitional worker-to-server acknowledgement used only by built-in PTY-backed
   Python after it has processed its private `python_interrupt` cleanup message.
 - It means the worker has attempted exact discard accounting and terminal input
   flushing before the server delivers SIGINT. It is not a generic protocol

@@ -1,18 +1,19 @@
 # Worker PTY Stdin Transport
 
-Status: implemented for Unix built-in Python and custom protocol-worker launch
-configuration. This note is retained as historical design context; the current
-contract is documented in `docs/architecture.md`,
-`docs/worker_sideband_protocol.md`, and `docs/output_timeline.md`.
+Status: implemented for Unix built-in Python, unsandboxed Windows built-in
+Python, and custom protocol-worker launch configuration. This note is retained
+as historical design context; the current contract is documented in
+`docs/architecture.md`, `docs/worker_sideband_protocol.md`, and
+`docs/output_timeline.md`.
 
 ## Use Case
 
 Some runtimes may need TTY-like stdin for their normal interactive
 hooks. For example, a Python embedding that relies on
 `PyOS_ReadlineFunctionPointer` may only use that hook when stdin is a
-TTY. The Unix Python worker now uses that PTY-backed path. R and default
-protocol workers continue to use pipe stdin unless their launch spec selects a
-PTY.
+TTY. The Unix Python worker and unsandboxed Windows Python worker now use that
+PTY-backed path. R and default protocol workers continue to use pipe stdin
+unless their launch spec selects a PTY.
 
 ## Boundary
 
@@ -54,5 +55,5 @@ steady-state request handling.
 
 The repository now has protocol-worker coverage for PTY launch with sideband IPC
 kept separate from visible PTY output, plus public Python backend tests proving
-that Unix Python gets TTY-backed C stdio and CPython `input()` consumes stdin
-through the readline path.
+that Unix and unsandboxed Windows Python get TTY-backed C stdio and CPython
+`input()` consumes stdin through the readline path.
