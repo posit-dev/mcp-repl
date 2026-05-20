@@ -1263,7 +1263,7 @@ print("PTY_INPUT", value)
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
+async fn python_pty_stdin_surface_matches_platform_accounting_path() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1287,9 +1287,13 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
 
     session.cancel().await?;
 
+    #[cfg(unix)]
+    let expected_stdin_surface = "STDIN_SURFACE _io TextIOWrapper 0 True";
+    #[cfg(windows)]
+    let expected_stdin_surface = "STDIN_SURFACE __main__ McpInputStream 0 True";
     assert!(
-        text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
-        "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
+        text.contains(expected_stdin_surface),
+        "expected sys.stdin to expose the platform PTY stdin surface, got: {text:?}"
     );
     let direct_fd_modules = text
         .lines()
@@ -1306,23 +1310,111 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         6,
         "expected six direct fd stdin API module names, got: {text:?}"
     );
-    for (label, module) in [
-        ("builtins.open", direct_fd_modules[0]),
-        ("io.open", direct_fd_modules[1]),
-    ] {
-        assert!(
-            matches!(module, "io" | "_io"),
-            "expected {label} to come from io or _io, got: {text:?}"
+    #[cfg(unix)]
+    {
+        for (label, module) in [
+            ("builtins.open", direct_fd_modules[0]),
+            ("io.open", direct_fd_modules[1]),
+        ] {
+            assert!(
+                matches!(module, "io" | "_io"),
+                "expected {label} to come from io or _io, got: {text:?}"
+            );
+        }
+        let expected_fd_modules = ["_io", "_io", "posix", "posix"];
+        assert_eq!(
+            &direct_fd_modules[2..],
+            expected_fd_modules,
+            "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
         );
     }
-    #[cfg(unix)]
-    let expected_fd_modules = ["_io", "_io", "posix", "posix"];
     #[cfg(windows)]
-    let expected_fd_modules = ["_io", "_io", "nt", "nt"];
-    assert_eq!(
-        &direct_fd_modules[2..],
-        expected_fd_modules,
-        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+    assert!(
+        direct_fd_modules.iter().all(|module| *module == "__main__"),
+        "expected Windows fd stdin APIs to use sideband-aware bridges, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_direct_stdin_reads_account_buffered_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os, sys
+line = sys.stdin.readline()
+buffered-line
+data = os.read(0, 9)
+raw-line
+print("READLINE", line.strip())
+print("OSREAD", data.decode().strip())
+print("AFTER_DIRECT_READS")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows direct stdin read accounting test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("READLINE buffered-line"),
+        "expected sys.stdin.readline() to consume buffered input, got: {text:?}"
+    );
+    assert!(
+        text.contains("OSREAD raw-line"),
+        "expected os.read(0, ...) to consume buffered input, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_DIRECT_READS"),
+        "expected follow-up REPL input after direct reads to execute, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input text does not match active stdin"),
+        "direct stdin reads desynchronized active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("print('A')\r\nprint('B')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows CRLF input test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("A"),
+        "expected first CRLF line to run, got: {text:?}"
+    );
+    assert!(
+        text.contains("B"),
+        "expected second CRLF line to run, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input text does not match active stdin"),
+        "CRLF input desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
 }

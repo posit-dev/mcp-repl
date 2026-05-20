@@ -965,6 +965,14 @@ impl ProtocolBackendDriver {
 }
 
 impl BackendDriver for ProtocolBackendDriver {
+    fn prepare_input_text(&self, text: String) -> String {
+        #[cfg(target_family = "windows")]
+        if self.python_request_generation.is_some() {
+            return normalize_input_newlines(&text);
+        }
+        text
+    }
+
     fn on_input_start(
         &mut self,
         _text: &str,
@@ -7337,6 +7345,8 @@ enum WindowsPtyOutputFilterState {
     Ground,
     Escape,
     Csi,
+    StringControl,
+    StringControlEscape,
 }
 
 #[cfg(target_family = "windows")]
@@ -7358,6 +7368,9 @@ impl WindowsPtyOutputFilter {
                     self.pending.push(byte);
                     if byte == b'[' {
                         self.state = WindowsPtyOutputFilterState::Csi;
+                    } else if is_ansi_string_control_start(byte) {
+                        self.pending.clear();
+                        self.state = WindowsPtyOutputFilterState::StringControl;
                     } else {
                         output.extend_from_slice(&self.pending);
                         self.pending.clear();
@@ -7378,10 +7391,29 @@ impl WindowsPtyOutputFilter {
                         self.state = WindowsPtyOutputFilterState::Ground;
                     }
                 }
+                WindowsPtyOutputFilterState::StringControl => {
+                    if byte == 0x07 {
+                        self.state = WindowsPtyOutputFilterState::Ground;
+                    } else if byte == 0x1b {
+                        self.state = WindowsPtyOutputFilterState::StringControlEscape;
+                    }
+                }
+                WindowsPtyOutputFilterState::StringControlEscape => {
+                    if byte == b'\\' || byte == 0x07 {
+                        self.state = WindowsPtyOutputFilterState::Ground;
+                    } else {
+                        self.state = WindowsPtyOutputFilterState::StringControl;
+                    }
+                }
             }
         }
         output
     }
+}
+
+#[cfg(target_family = "windows")]
+fn is_ansi_string_control_start(byte: u8) -> bool {
+    matches!(byte, b']' | b'P' | b'X' | b'^' | b'_')
 }
 
 #[cfg(target_family = "windows")]
@@ -7902,10 +7934,29 @@ where
 
 #[cfg(target_family = "windows")]
 fn windows_pty_input_payload(payload: &[u8]) -> Vec<u8> {
-    payload
-        .iter()
-        .map(|byte| if *byte == b'\n' { b'\r' } else { *byte })
-        .collect()
+    let mut translated = Vec::with_capacity(payload.len());
+    let mut index = 0;
+    while index < payload.len() {
+        match payload[index] {
+            b'\r' => {
+                translated.push(b'\r');
+                if payload.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            b'\n' => {
+                translated.push(b'\r');
+                index += 1;
+            }
+            byte => {
+                translated.push(byte);
+                index += 1;
+            }
+        }
+    }
+    translated
 }
 
 fn duration_to_millis(duration: Duration) -> u64 {
@@ -8236,6 +8287,22 @@ mod tests {
         let output = filter.filter(b"\x1b[31mred\x1b[0m\n");
 
         assert_eq!(String::from_utf8(output).unwrap(), "\x1b[31mred\x1b[0m\n");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_output_filter_strips_split_osc_sequences() {
+        let mut filter = WindowsPtyOutputFilter::default();
+        let mut output = filter.filter(b"\x1b]0;mcp");
+        output.extend(filter.filter(b"-repl\x07>>> "));
+
+        assert_eq!(String::from_utf8(output).unwrap(), ">>> ");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_input_payload_translates_crlf_as_one_enter() {
+        assert_eq!(windows_pty_input_payload(b"a\r\nb\nc\rd"), b"a\rb\rc\rd");
     }
 
     #[test]

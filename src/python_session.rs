@@ -1733,6 +1733,12 @@ fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
         }
         #[cfg(windows)]
         if ch == b'\r' as i32 {
+            let next = unsafe { libc::fgetc(stdin) };
+            if next != b'\n' as i32 && next != libc::EOF {
+                unsafe {
+                    libc::ungetc(next, stdin);
+                }
+            }
             bytes.push(b'\n');
             return StdioLineRead {
                 bytes,
@@ -1958,7 +1964,65 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
     bytes
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
+    let _allow_threads = PythonThreadsAllowed::new();
+    let bytes = read_windows_stdin_bytes(size);
+    note_windows_raw_stdin_bytes_read(&bytes);
+    protocol_stdin_bytes(&bytes)
+}
+
+#[cfg(windows)]
+fn read_windows_stdin_bytes(size: usize) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut bytes = vec![0u8; size.min(u32::MAX as usize)];
+    loop {
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                &mut read,
+                ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            bytes.truncate(read as usize);
+            return bytes;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Vec::new();
+    }
+}
+
+#[cfg(windows)]
+fn note_windows_raw_stdin_bytes_read(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut protocol_bytes = protocol_stdin_bytes(bytes);
+    if bytes.ends_with(b"\r") && !bytes.ends_with(b"\r\n") {
+        protocol_bytes.pop();
+    }
+    if protocol_bytes.is_empty() {
+        return;
+    }
+    emit_readline_input_bytes(&protocol_bytes);
+    mark_request_input_delivered();
+    note_active_stdin_line_read(&protocol_bytes);
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 fn read_raw_stdin_bytes(_size: usize) -> Vec<u8> {
     Vec::new()
 }

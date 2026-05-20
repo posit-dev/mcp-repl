@@ -18,6 +18,10 @@ try:
     import posix as _mcp_repl_posix
 except ImportError:
     _mcp_repl_posix = None
+try:
+    import nt as _mcp_repl_nt
+except ImportError:
+    _mcp_repl_nt = None
 
 os.environ.setdefault("MPLBACKEND", "agg")
 # pdb's pyrepl path reads the terminal fd directly; keep debugger input on
@@ -128,10 +132,19 @@ class McpInputStream:
     errors = "replace"
     newlines = None
 
-    def __init__(self, fileno=0, closefd=False, encoding=None, errors=None, newline=None):
+    def __init__(
+        self,
+        fileno=0,
+        closefd=False,
+        encoding=None,
+        errors=None,
+        newline=None,
+        tty=False,
+    ):
         self._buffer = b""
         self._fileno = fileno
         self._closefd = closefd
+        self._tty = tty
         if encoding is not None:
             self.encoding = encoding
         if errors is not None:
@@ -313,7 +326,7 @@ class McpInputStream:
         return False
 
     def isatty(self):
-        return False
+        return self._tty
 
     def fileno(self):
         return self._fileno
@@ -756,7 +769,7 @@ _original_io_FileIO = io.FileIO
 _original_os_fdopen = os.fdopen
 _original_os_read = os.read
 _original_os_readv = getattr(os, "readv", None)
-_mcp_repl_raw_stdin_read_supported = os.name == "posix"
+_mcp_repl_raw_stdin_read_supported = os.name in ("posix", "nt")
 # Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
 _mcp_repl_raw_stdin_stat = None
 if _mcp_repl_raw_stdin_read_supported:
@@ -784,6 +797,8 @@ def _mcp_repl_import(name, globals=None, locals=None, fromlist=(), level=0):
 def _mcp_repl_is_raw_stdin_fd(fd):
     if not _mcp_repl_raw_stdin_read_supported:
         return False
+    if os.name == "nt" and fd == 0:
+        return True
     if _mcp_repl_raw_stdin_stat is None:
         return fd == 0
     try:
@@ -896,7 +911,9 @@ def _mcp_repl_stdin_stream_for_mode(
     _mcp_repl_validate_stdin_open_options(mode, buffering, encoding, errors, newline)
     if _mcp_repl_unbuffered_binary_stdin_mode(mode, buffering):
         return McpRawInputBuffer(fileno, closefd)
-    stream = McpInputStream(fileno, closefd, encoding, errors, newline)
+    stream = McpInputStream(
+        fileno, closefd, encoding, errors, newline, _mcp_repl_c_stdio_tty
+    )
     if "b" in mode:
         return stream.buffer
     return stream
@@ -1030,15 +1047,7 @@ def _mcp_repl_os_readv(fd, buffers):
     return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
 
 
-builtins.__import__ = _mcp_repl_import
-pydoc.pager = _pydoc_plainpager
-sys.excepthook = _mcp_repl_excepthook
-_mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
-if _mcp_repl_c_stdio_tty:
-    sys.ps1 = _mcp_repl_ps1
-    sys.ps2 = _mcp_repl_ps2
-else:
-    builtins.input = _input
+def _mcp_repl_install_direct_stdin_bridges():
     builtins.open = _mcp_repl_open
     io.open = _mcp_repl_open
     io.FileIO = _McpReplFileIO
@@ -1052,6 +1061,25 @@ else:
         _mcp_repl_posix.read = _mcp_repl_os_read
         if _original_os_readv is not None:
             _mcp_repl_posix.readv = _mcp_repl_os_readv
+    if _mcp_repl_nt is not None:
+        _mcp_repl_nt.read = _mcp_repl_os_read
+
+
+builtins.__import__ = _mcp_repl_import
+pydoc.pager = _pydoc_plainpager
+sys.excepthook = _mcp_repl_excepthook
+_mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
+if _mcp_repl_c_stdio_tty:
+    if os.name == "nt":
+        _mcp_repl_install_direct_stdin_bridges()
+        _mcp_repl_stdin = McpInputStream(tty=True)
+        sys.stdin = _mcp_repl_stdin
+        sys.__stdin__ = _mcp_repl_stdin
+    sys.ps1 = _mcp_repl_ps1
+    sys.ps2 = _mcp_repl_ps2
+else:
+    builtins.input = _input
+    _mcp_repl_install_direct_stdin_bridges()
     sys.ps1 = _mcp_repl_suppressed_ps1
     sys.ps2 = _mcp_repl_suppressed_ps2
     _mcp_repl_stdin = McpInputStream()
