@@ -571,17 +571,17 @@ impl BackendDriver for RBackendDriver {
     }
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 struct PythonBackendDriver;
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 impl PythonBackendDriver {
     fn new() -> Self {
         Self
     }
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_final_prompt_hint(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -607,7 +607,7 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_has_open_block_suite(text: &str) -> bool {
     let mut block_indents = Vec::new();
     let mut scan_state = PythonLineScanState::default();
@@ -634,7 +634,7 @@ fn python_has_open_block_suite(text: &str) -> bool {
     !block_indents.is_empty()
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 #[derive(Default)]
 struct PythonLineScanState {
     quote: Option<(char, bool)>,
@@ -642,14 +642,14 @@ struct PythonLineScanState {
     groups: Vec<char>,
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 impl PythonLineScanState {
     fn continuation_active(&self) -> bool {
         self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
     }
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_line_code_before_comment_with_state(
     line: &str,
     state: &mut PythonLineScanState,
@@ -716,14 +716,14 @@ fn python_line_code_before_comment_with_state(
     code
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_line_indent(line: &str) -> usize {
     line.chars()
         .take_while(|ch| matches!(ch, ' ' | '\t'))
         .count()
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_line_code_before_comment(line: &str) -> &str {
     let mut chars = line.char_indices().peekable();
     let mut quote: Option<(char, bool)> = None;
@@ -765,12 +765,12 @@ fn python_line_code_before_comment(line: &str) -> &str {
     line
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn python_requires_continuation(text: &str) -> bool {
     has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn final_line_continues_with_backslash(text: &str) -> bool {
     let Some(line) = text.lines().last() else {
         return false;
@@ -785,7 +785,7 @@ fn final_line_continues_with_backslash(text: &str) -> bool {
         == 1
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn has_unclosed_python_group_or_string(text: &str) -> bool {
     let mut stack = Vec::new();
     let mut chars = text.chars().peekable();
@@ -845,7 +845,7 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
     }
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
     let mut clone = chars.clone();
     if clone.next() != Some(expected) || clone.next() != Some(expected) {
@@ -856,7 +856,7 @@ fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected:
     true
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn take_next_two_indexed(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     expected: char,
@@ -872,7 +872,7 @@ fn take_next_two_indexed(
     true
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn text_ends_with_blank_line(text: &str) -> bool {
     let Some(text) = strip_one_line_ending(text) else {
         return false;
@@ -880,14 +880,14 @@ fn text_ends_with_blank_line(text: &str) -> bool {
     text.ends_with('\n') || text.ends_with('\r')
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn strip_one_line_ending(text: &str) -> Option<&str> {
     text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .or_else(|| text.strip_suffix('\r'))
 }
 
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 impl BackendDriver for PythonBackendDriver {
     fn on_input_start(
         &mut self,
@@ -1258,7 +1258,7 @@ fn worker_context_event_payload(
     serde_json::json!({
         "backend": format!("{backend:?}"),
         "worker_launch": worker_launch.label(),
-        "stdin_transport": worker_launch.stdin_transport().as_str(),
+        "stdin_transport": worker_launch_stdin_transport(worker_launch, sandbox_state).as_str(),
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
@@ -1269,6 +1269,63 @@ fn worker_context_event_payload(
             "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,
         },
     })
+}
+
+fn worker_launch_stdin_transport(
+    worker_launch: &WorkerLaunch,
+    sandbox_state: &SandboxState,
+) -> WorkerStdinTransport {
+    let default_transport = worker_launch.stdin_transport();
+    #[cfg(target_family = "windows")]
+    {
+        if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
+            && sandbox_state.sandbox_policy.requires_sandbox()
+        {
+            return WorkerStdinTransport::Pipe;
+        }
+    }
+    default_transport
+}
+
+fn builtin_worker_stdin_transport(
+    backend: Backend,
+    sandbox_state: &SandboxState,
+) -> WorkerStdinTransport {
+    worker_launch_stdin_transport(&WorkerLaunch::Builtin(backend), sandbox_state)
+}
+
+fn backend_driver_for_launch(
+    worker_launch: &WorkerLaunch,
+    sandbox_state: &SandboxState,
+) -> Box<dyn BackendDriver> {
+    match worker_launch {
+        WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
+        WorkerLaunch::Builtin(Backend::Python) => python_backend_driver(sandbox_state),
+        WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
+    }
+}
+
+fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver> {
+    #[cfg(target_family = "unix")]
+    {
+        let _ = sandbox_state;
+        Box::new(ProtocolBackendDriver::python())
+    }
+    #[cfg(target_family = "windows")]
+    {
+        if builtin_worker_stdin_transport(Backend::Python, sandbox_state)
+            == WorkerStdinTransport::Pty
+        {
+            Box::new(ProtocolBackendDriver::python())
+        } else {
+            Box::new(PythonBackendDriver::new())
+        }
+    }
+    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+    {
+        let _ = sandbox_state;
+        Box::new(PythonBackendDriver::new())
+    }
 }
 
 pub struct WorkerManager {
@@ -1368,6 +1425,7 @@ impl WorkerManager {
             reset_last_reply_marker_offset();
             OutputTimeline::new(output_ring)
         };
+        let driver = backend_driver_for_launch(&worker_launch, &sandbox_state);
         Ok(Self {
             exe_path,
             worker_launch: worker_launch.clone(),
@@ -1385,20 +1443,7 @@ impl WorkerManager {
             output: OutputBuffer::default(),
             pager: Pager::default(),
             output_timeline,
-            driver: match worker_launch {
-                WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
-                WorkerLaunch::Builtin(Backend::Python) => {
-                    #[cfg(any(target_family = "unix", target_family = "windows"))]
-                    {
-                        Box::new(ProtocolBackendDriver::python())
-                    }
-                    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
-                    {
-                        Box::new(PythonBackendDriver::new())
-                    }
-                }
-                WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
-            },
+            driver,
             pending_request: false,
             pending_request_started_at: None,
             pending_request_input: None,
@@ -4241,6 +4286,7 @@ impl WorkerManager {
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
+        self.driver = backend_driver_for_launch(&self.worker_launch, &self.sandbox_state);
         let process = WorkerProcess::spawn(
             self.worker_launch.clone(),
             &self.exe_path,
@@ -4329,6 +4375,7 @@ impl WorkerManager {
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
+        self.driver = backend_driver_for_launch(&self.worker_launch, &self.sandbox_state);
         let process = WorkerProcess::spawn(
             self.worker_launch.clone(),
             &self.exe_path,
@@ -6208,7 +6255,7 @@ impl WorkerProcess {
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "windows")]
         apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
-        let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        let stdin_transport = builtin_worker_stdin_transport(backend, sandbox_state);
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
         let child_result = spawn_command_with_transport(
@@ -7336,6 +7383,7 @@ where
 struct WindowsPtyOutputFilter {
     state: WindowsPtyOutputFilterState,
     pending: Vec<u8>,
+    emitted_output: bool,
 }
 
 #[cfg(target_family = "windows")]
@@ -7362,6 +7410,7 @@ impl WindowsPtyOutputFilter {
                         self.state = WindowsPtyOutputFilterState::Escape;
                     } else {
                         output.push(byte);
+                        self.emitted_output = true;
                     }
                 }
                 WindowsPtyOutputFilterState::Escape => {
@@ -7373,6 +7422,7 @@ impl WindowsPtyOutputFilter {
                         self.state = WindowsPtyOutputFilterState::StringControl;
                     } else {
                         output.extend_from_slice(&self.pending);
+                        self.emitted_output = true;
                         self.pending.clear();
                         self.state = WindowsPtyOutputFilterState::Ground;
                     }
@@ -7380,13 +7430,17 @@ impl WindowsPtyOutputFilter {
                 WindowsPtyOutputFilterState::Csi => {
                     self.pending.push(byte);
                     if is_csi_final_byte(byte) {
-                        if !is_conpty_screen_control_csi(&self.pending) {
+                        if !is_conpty_screen_control_csi(&self.pending)
+                            && (self.emitted_output || !is_sgr_reset_csi(&self.pending))
+                        {
                             output.extend_from_slice(&self.pending);
+                            self.emitted_output = true;
                         }
                         self.pending.clear();
                         self.state = WindowsPtyOutputFilterState::Ground;
                     } else if self.pending.len() > 128 {
                         output.extend_from_slice(&self.pending);
+                        self.emitted_output = true;
                         self.pending.clear();
                         self.state = WindowsPtyOutputFilterState::Ground;
                     }
@@ -7409,6 +7463,11 @@ impl WindowsPtyOutputFilter {
         }
         output
     }
+}
+
+#[cfg(target_family = "windows")]
+fn is_sgr_reset_csi(sequence: &[u8]) -> bool {
+    matches!(sequence, b"\x1b[m" | b"\x1b[0m")
 }
 
 #[cfg(target_family = "windows")]
@@ -8131,6 +8190,47 @@ mod tests {
         );
     }
 
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandboxed_python_falls_back_to_pipe_stdin_transport() {
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            ..SandboxState::default()
+        };
+
+        assert_eq!(
+            builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
+            WorkerStdinTransport::Pipe
+        );
+        assert!(
+            matches!(
+                worker_context_event_payload(
+                    &WorkerLaunch::Builtin(Backend::Python),
+                    Backend::Python,
+                    &sandbox_state
+                )
+                .get("stdin_transport")
+                .and_then(serde_json::Value::as_str),
+                Some("pipe")
+            ),
+            "sandboxed Windows Python should report the effective pipe transport"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_unsandboxed_python_uses_pty_stdin_transport() {
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
+
+        assert_eq!(
+            builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
+            WorkerStdinTransport::Pty
+        );
+    }
+
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
@@ -8287,6 +8387,15 @@ mod tests {
         let output = filter.filter(b"\x1b[31mred\x1b[0m\n");
 
         assert_eq!(String::from_utf8(output).unwrap(), "\x1b[31mred\x1b[0m\n");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_output_filter_strips_initial_sgr_reset() {
+        let mut filter = WindowsPtyOutputFilter::default();
+        let output = filter.filter(b"\x1b[mx\n>>> ");
+
+        assert_eq!(String::from_utf8(output).unwrap(), "x\n>>> ");
     }
 
     #[cfg(target_family = "windows")]

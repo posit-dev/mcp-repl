@@ -110,6 +110,11 @@ fn python_backend_unavailable(text: &str) -> bool {
         || text.contains("failed to locate a shared libpython")
 }
 
+#[cfg(windows)]
+fn windows_sandbox_backend_unavailable(text: &str) -> bool {
+    text.contains("CreateRestrictedToken failed: 87")
+}
+
 fn is_busy_response(text: &str) -> bool {
     text.contains("<<repl status: busy")
         || text.contains("worker is busy")
@@ -1470,6 +1475,41 @@ print("AFTER_FD0_RESTORE")
     assert!(
         text.contains("AFTER_FD0_RESTORE"),
         "expected REPL input to continue after restoring fd 0, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = common::spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+    ])
+    .await?;
+
+    let result = session
+        .write_stdin_raw_with("print('SANDBOX_PY_OK')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
+        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows read-only sandbox request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SANDBOX_PY_OK"),
+        "expected sandboxed Python request to execute, got: {text:?}"
     );
     Ok(())
 }
