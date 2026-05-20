@@ -7019,12 +7019,6 @@ impl WindowsPtyCommand {
         command_line
     }
 
-    fn program_wide(&self) -> Vec<u16> {
-        let mut program = self.program.as_os_str().encode_wide().collect::<Vec<_>>();
-        program.push(0);
-        program
-    }
-
     fn environment_block_wide(&self) -> Vec<u16> {
         let mut entries = std::collections::BTreeMap::<String, (OsString, OsString)>::new();
         for (key, value) in current_windows_environment() {
@@ -7812,14 +7806,13 @@ fn spawn_windows_pty_process(
         return Err(WorkerError::Io(std::io::Error::last_os_error()));
     }
 
-    let mut program = command.program_wide();
     let mut command_line = command.command_line_wide();
     let environment = command.environment_block_wide();
     let cwd = command.cwd_wide();
     let mut process_info = PROCESS_INFORMATION::default();
     let ok = unsafe {
         CreateProcessW(
-            program.as_mut_ptr(),
+            std::ptr::null(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),

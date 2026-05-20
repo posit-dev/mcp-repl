@@ -223,6 +223,7 @@ fn flush_terminal_input() {
 
 #[cfg(windows)]
 fn flush_terminal_input() {
+    clear_windows_console_drop_next_lf();
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return;
@@ -2028,8 +2029,9 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
 fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
     let _allow_threads = PythonThreadsAllowed::new();
     let bytes = read_windows_stdin_bytes(size);
-    note_windows_raw_stdin_bytes_read(&bytes);
-    protocol_stdin_bytes(&bytes)
+    let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
+    note_windows_raw_stdin_bytes_read(&protocol_bytes);
+    protocol_bytes
 }
 
 #[cfg(windows)]
@@ -2102,9 +2104,16 @@ fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
                 interrupted: false,
             });
         }
-        for unit in buffer.iter().take(read as usize).copied() {
+        let read_len = read as usize;
+        for (idx, unit) in buffer.iter().take(read_len).copied().enumerate() {
+            if take_windows_console_drop_next_lf() && unit == 0x0a {
+                continue;
+            }
             match unit {
                 0x0d => {
+                    if buffer.get(idx + 1).copied() != Some(0x0a) {
+                        set_windows_console_drop_next_lf();
+                    }
                     let mut bytes = String::from_utf16_lossy(&units).into_bytes();
                     bytes.push(b'\n');
                     return Some(StdioLineRead {
@@ -2124,6 +2133,41 @@ fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_console_protocol_stdin_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if take_windows_console_drop_next_lf() && byte == b'\n' {
+            continue;
+        }
+        if byte == b'\r' {
+            normalized.push(b'\n');
+            set_windows_console_drop_next_lf();
+        } else {
+            normalized.push(byte);
+        }
+    }
+    normalized
+}
+
+#[cfg(windows)]
+fn take_windows_console_drop_next_lf() -> bool {
+    let mut guard = WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap();
+    let drop = *guard;
+    *guard = false;
+    drop
+}
+
+#[cfg(windows)]
+fn set_windows_console_drop_next_lf() {
+    *WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap() = true;
+}
+
+#[cfg(windows)]
+fn clear_windows_console_drop_next_lf() {
+    *WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap() = false;
 }
 
 #[cfg(windows)]
@@ -2154,18 +2198,11 @@ fn note_windows_raw_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let mut protocol_bytes = protocol_stdin_bytes(bytes);
-    if bytes.ends_with(b"\r") && !bytes.ends_with(b"\r\n") {
-        protocol_bytes.pop();
-    }
-    if protocol_bytes.is_empty() {
-        return;
-    }
     if windows_stdin_is_console() {
-        emit_readline_input_bytes(&protocol_bytes);
+        emit_readline_input_bytes(bytes);
     }
     mark_request_input_delivered();
-    note_active_stdin_line_read(&protocol_bytes);
+    note_active_stdin_line_read(bytes);
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
@@ -2754,6 +2791,8 @@ static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut(
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(any(target_family = "unix", windows))]
 static PYTHON_DIRECT_STDIN_SIDEBAND_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+#[cfg(windows)]
+static WINDOWS_CONSOLE_DROP_NEXT_LF: Mutex<bool> = Mutex::new(false);
 
 #[cfg(test)]
 mod tests {

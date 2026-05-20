@@ -328,6 +328,68 @@ async fn zod_worker_pty_launch_keeps_sideband_separate_and_captures_visible_outp
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_windows_pty_launch_uses_path_lookup() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let bin_dir = tempdir.path().join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let exe_name = "zod-worker.exe";
+    fs::copy(zod_worker_path()?, bin_dir.join(exe_name))?;
+
+    let spec_path = tempdir.path().join("zod-worker-path.json");
+    let spec = json!({
+        "executable": exe_name,
+        "args": [],
+        "working_dir": "inherit",
+        "env": {},
+        "stdin": "pty",
+        "sandbox": "server"
+    });
+    fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+
+    let mut path_entries = vec![bin_dir];
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&existing_path));
+    }
+    let path = std::env::join_paths(path_entries)?;
+    let session = common::spawn_server_with_args_env(
+        vec![
+            "--worker-spec".to_string(),
+            spec_path.display().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ],
+        vec![("PATH".to_string(), path.to_string_lossy().into_owned())],
+    )
+    .await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "hello from path",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("hello from path\r\n"),
+        "expected PATH-resolved PTY worker to receive input, got: {text:?}"
+    );
+    assert!(
+        text.contains("zod> "),
+        "expected PATH-resolved PTY worker prompt, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_existing_trailing_newline() -> TestResult<()> {
     let session = spawn_zod_server().await?;
