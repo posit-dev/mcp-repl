@@ -11,7 +11,7 @@ This file is the entrypoint for deciding how to verify a change.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
 - `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, PTY-backed Python readline behavior, and image output.
 - `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
-- `tests/sandbox.rs` and `tests/sandbox_state_updates.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
+- `tests/sandbox.rs` and `tests/sandbox_state_meta.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
 - `tests/install_*.rs`, `tests/codex_integration.rs`, and `tests/claude_integration.rs`: install-path and real client integration coverage.
 - `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.
 

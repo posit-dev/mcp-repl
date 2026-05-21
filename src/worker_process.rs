@@ -4549,6 +4549,8 @@ impl WorkerManager {
             serde_json::json!({
                 "status": "ok",
                 "capability_sid": prepared.capability_sid(),
+                "execution_backend": format!("{:?}", prepared.execution_backend()),
+                "network_identity": format!("{:?}", prepared.network_identity()),
             }),
         );
         self.windows_sandbox_launch = Some(prepared);

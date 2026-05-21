@@ -170,6 +170,17 @@ Optional `bwrap` stage:
   exposing a loadable runtime library.
 - managed domain allowlists are not enforced on Windows yet; configuring allowed
   or denied domains with enabled network access currently fails closed.
+- Codex `permissionProfile` metadata is preferred over legacy
+  `sandboxPolicy` when both are present. MCP REPL currently bridges only
+  `read-only` with restricted network, `workspace-write` with restricted
+  network, and explicit full access; richer split filesystem or network
+  profiles fail closed until the elevated Windows sandbox path enforces them
+  directly.
+- The intended Codex-style Windows identities are MCP REPL-specific:
+  `McpReplSandboxOffline` for restricted network and `McpReplSandboxOnline`
+  for explicit full-network launches. The current worker path still uses the
+  compatibility restricted-token wrapper while elevated setup and the command
+  runner are wired in.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
   - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.

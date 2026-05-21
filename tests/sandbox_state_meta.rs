@@ -134,6 +134,32 @@ fn read_only_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
 }
 
+fn read_only_permission_profile_meta(sandbox_cwd: &Path) -> Value {
+    json!({
+        SANDBOX_STATE_META_CAPABILITY: {
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": linux_sandbox_exe_value(false),
+        }
+    })
+}
+
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         json!({
@@ -2587,6 +2613,37 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
     assert!(
         !text.contains("WRITE_OK"),
         "did not expect read-only metadata to allow write in cwd, got: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_permission_profile_read_only_blocks_write_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-permission-profile-read-only")?;
+    let target = scratch.path().join("blocked.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(read_only_permission_profile_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected permissionProfile read-only metadata to block write in cwd, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "did not expect permissionProfile read-only metadata to allow write in cwd, got: {text}"
     );
     session.cancel().await?;
     Ok(())

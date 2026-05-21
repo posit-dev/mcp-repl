@@ -15,6 +15,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/adr/0001-stdin-close-graceful-shutdown.md`: accepted decision that
   graceful worker shutdown is requested only by closing worker stdin.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
+- `docs/plans/active/windows-codex-sandbox-alignment.md`: active plan for aligning Windows sandbox launch with Codex's elevated setup and command-runner direction.
 - `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
 
 ## Normative Docs

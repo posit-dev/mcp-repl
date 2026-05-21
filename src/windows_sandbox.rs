@@ -150,6 +150,50 @@ const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
 const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const WINDOWS_SANDBOX_BACKEND_ENV_KEY: &str = "MCP_REPL_WINDOWS_SANDBOX_BACKEND";
+const WINDOWS_SANDBOX_NETWORK_IDENTITY_ENV_KEY: &str = "MCP_REPL_WINDOWS_SANDBOX_NETWORK_IDENTITY";
+const WINDOWS_SANDBOX_TARGET_USER_ENV_KEY: &str = "MCP_REPL_WINDOWS_SANDBOX_TARGET_USER";
+const LEGACY_RESTRICTED_TOKEN_BACKEND: &str = "legacy-restricted-token";
+
+pub const MCP_REPL_WINDOWS_SANDBOX_OFFLINE_USER: &str = "McpReplSandboxOffline";
+pub const MCP_REPL_WINDOWS_SANDBOX_ONLINE_USER: &str = "McpReplSandboxOnline";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsSandboxExecutionBackend {
+    LegacyRestrictedToken,
+}
+
+impl WindowsSandboxExecutionBackend {
+    fn env_value(self) -> &'static str {
+        match self {
+            WindowsSandboxExecutionBackend::LegacyRestrictedToken => {
+                LEGACY_RESTRICTED_TOKEN_BACKEND
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsSandboxNetworkIdentity {
+    Offline,
+    Online,
+}
+
+impl WindowsSandboxNetworkIdentity {
+    fn env_value(self) -> &'static str {
+        match self {
+            WindowsSandboxNetworkIdentity::Offline => "offline",
+            WindowsSandboxNetworkIdentity::Online => "online",
+        }
+    }
+
+    fn target_user(self) -> &'static str {
+        match self {
+            WindowsSandboxNetworkIdentity::Offline => MCP_REPL_WINDOWS_SANDBOX_OFFLINE_USER,
+            WindowsSandboxNetworkIdentity::Online => MCP_REPL_WINDOWS_SANDBOX_ONLINE_USER,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -202,11 +246,21 @@ pub struct PreparedSandboxLaunch {
     sandbox_policy_cwd: PathBuf,
     session_temp_dir: PathBuf,
     capability_sid: String,
+    execution_backend: WindowsSandboxExecutionBackend,
+    network_identity: WindowsSandboxNetworkIdentity,
 }
 
 impl PreparedSandboxLaunch {
     pub fn capability_sid(&self) -> &str {
         &self.capability_sid
+    }
+
+    pub fn execution_backend(&self) -> WindowsSandboxExecutionBackend {
+        self.execution_backend
+    }
+
+    pub fn network_identity(&self) -> WindowsSandboxNetworkIdentity {
+        self.network_identity
     }
 
     pub fn matches(
@@ -319,6 +373,14 @@ impl Drop for PreparedLaunchLiveMarker {
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
+}
+
+fn windows_sandbox_network_identity(policy: &SandboxPolicy) -> WindowsSandboxNetworkIdentity {
+    if policy.has_full_network_access() {
+        WindowsSandboxNetworkIdentity::Online
+    } else {
+        WindowsSandboxNetworkIdentity::Offline
+    }
 }
 
 unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
@@ -734,6 +796,8 @@ fn build_prepared_sandbox_launch(
         sandbox_policy_cwd: canonicalize_or_identity(sandbox_policy_cwd),
         session_temp_dir: canonicalize_or_identity(session_temp_dir),
         capability_sid: capability_sid.to_string(),
+        execution_backend: WindowsSandboxExecutionBackend::LegacyRestrictedToken,
+        network_identity: windows_sandbox_network_identity(policy),
     }
 }
 
@@ -1423,6 +1487,20 @@ fn run_sandboxed_command_with_env_map(
 
     unsafe {
         crate::diagnostics::startup_log("windows-sandbox: begin");
+        let execution_backend = WindowsSandboxExecutionBackend::LegacyRestrictedToken;
+        let network_identity = windows_sandbox_network_identity(policy);
+        env_map.insert(
+            WINDOWS_SANDBOX_BACKEND_ENV_KEY.to_string(),
+            execution_backend.env_value().to_string(),
+        );
+        env_map.insert(
+            WINDOWS_SANDBOX_NETWORK_IDENTITY_ENV_KEY.to_string(),
+            network_identity.env_value().to_string(),
+        );
+        env_map.insert(
+            WINDOWS_SANDBOX_TARGET_USER_ENV_KEY.to_string(),
+            network_identity.target_user().to_string(),
+        );
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
         }
@@ -3651,6 +3729,52 @@ mod tests {
     }
 
     #[test]
+    fn restricted_network_maps_to_offline_identity() {
+        assert_eq!(
+            windows_sandbox_network_identity(&workspace_policy(Vec::new(), false, false)),
+            WindowsSandboxNetworkIdentity::Offline
+        );
+        assert_eq!(
+            WindowsSandboxNetworkIdentity::Offline.target_user(),
+            MCP_REPL_WINDOWS_SANDBOX_OFFLINE_USER
+        );
+    }
+
+    #[test]
+    fn enabled_network_maps_to_online_identity() {
+        assert_eq!(
+            windows_sandbox_network_identity(&workspace_policy(Vec::new(), true, false)),
+            WindowsSandboxNetworkIdentity::Online
+        );
+        assert_eq!(
+            WindowsSandboxNetworkIdentity::Online.target_user(),
+            MCP_REPL_WINDOWS_SANDBOX_ONLINE_USER
+        );
+    }
+
+    #[test]
+    fn prepared_launch_records_legacy_backend_and_network_identity() {
+        let tmp = prepared_launch_workspace_tempdir();
+        let session_tmp = prepared_launch_session_root_tempdir();
+        let policy = workspace_policy(Vec::new(), false, true);
+        let launch = build_prepared_sandbox_launch(
+            &policy,
+            tmp.path(),
+            session_tmp.path(),
+            "S-1-5-21-1-2-3-4",
+        );
+
+        assert_eq!(
+            launch.execution_backend(),
+            WindowsSandboxExecutionBackend::LegacyRestrictedToken
+        );
+        assert_eq!(
+            launch.network_identity(),
+            WindowsSandboxNetworkIdentity::Offline
+        );
+    }
+
+    #[test]
     fn apply_no_network_to_env_overrides_existing_values() {
         let mut env_map = HashMap::new();
         env_map.insert(
@@ -4288,12 +4412,12 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
         create_junction(&linked_root, &target_a);
         let policy = workspace_policy(vec![PathBuf::from("linked-root")], false, false);
-        let launch = PreparedSandboxLaunch {
-            policy: policy.clone(),
-            sandbox_policy_cwd: canonicalize_or_identity(&cwd),
-            session_temp_dir: canonicalize_or_identity(&session_temp_dir),
-            capability_sid: stable_cap_sid_string(&policy, &cwd),
-        };
+        let launch = build_prepared_sandbox_launch(
+            &policy,
+            &cwd,
+            &session_temp_dir,
+            &stable_cap_sid_string(&policy, &cwd),
+        );
         assert!(
             launch.matches(&policy, &cwd, &session_temp_dir),
             "launch should match before the relative writable root target changes"
