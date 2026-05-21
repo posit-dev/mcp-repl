@@ -1712,6 +1712,49 @@ async fn python_windows_pty_preserves_unicode_input() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_pty_buffered_input_then_plot_emits_image() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import matplotlib
+matplotlib.use("agg", force=True)
+import matplotlib.pyplot as plt
+value = input('plot-input> ')
+hello
+plt.figure(301); plt.clf(); plt.plot([1, 2, 3]); plt.show()
+print("BUFFERED_INPUT_VALUE", value)
+"#,
+            Some(30.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows buffered input plot request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("BUFFERED_INPUT_VALUE hello"),
+        "expected buffered input answer before plot, got: {text:?}"
+    );
+    assert!(
+        image_count(&result) > 0,
+        "expected plot after buffered input to emit an image, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();

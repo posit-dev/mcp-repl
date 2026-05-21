@@ -1308,10 +1308,16 @@ fn mark_request_input_delivered() {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
+    mark_request_input_delivered_locked(&mut guard);
+}
+
+#[cfg(any(target_family = "unix", windows))]
+fn mark_request_input_delivered_locked(guard: &mut SessionStateInner) {
     if !guard.request_active {
         guard.plot_reset_pending = true;
     }
     guard.request_active = true;
+    guard.request_completed_at_stdin_wait = false;
     guard.waiting_for_input = false;
 }
 
@@ -3037,6 +3043,24 @@ mod tests {
         assert_eq!(consumed_stdin_line_count(b"partial"), 0);
         assert_eq!(consumed_stdin_line_count(b"line\n"), 1);
         assert_eq!(consumed_stdin_line_count(b"first\nsecond\n"), 2);
+    }
+
+    #[cfg(any(target_family = "unix", windows))]
+    #[test]
+    fn delivered_input_reopens_request_after_stdin_wait_completion() {
+        let state = SessionState::new();
+        let mut guard = state.inner.lock().unwrap();
+        guard.request_active = false;
+        guard.request_completed_at_stdin_wait = true;
+        guard.plot_reset_pending = false;
+        guard.waiting_for_input = true;
+
+        mark_request_input_delivered_locked(&mut guard);
+
+        assert!(guard.request_active);
+        assert!(!guard.request_completed_at_stdin_wait);
+        assert!(guard.plot_reset_pending);
+        assert!(!guard.waiting_for_input);
     }
 
     #[cfg(windows)]
