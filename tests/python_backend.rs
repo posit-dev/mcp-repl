@@ -1449,6 +1449,50 @@ print("AFTER_SUBPROCESS_PIPE")
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_windows_os_read_dup_stdin_uses_bridge_accounting() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+fd = os.dup(0)
+data = os.read(fd, 9)
+dup-line
+os.close(fd)
+print("DUP_STDIN", data.decode().strip())
+print("AFTER_DUP_STDIN")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows duplicated stdin fd os.read request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("DUP_STDIN dup-line"),
+        "expected os.read() on duplicated stdin fd to consume buffered input, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_DUP_STDIN"),
+        "expected REPL input after duplicated stdin fd read to execute, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input text does not match active stdin"),
+        "duplicated stdin fd read desynchronized active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
