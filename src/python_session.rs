@@ -2270,7 +2270,8 @@ fn protocol_stdin_bytes(bytes: &[u8]) -> Vec<u8> {
 
 #[cfg(any(target_family = "unix", windows))]
 fn note_active_stdin_line_read(bytes: &[u8]) {
-    if bytes.is_empty() {
+    let consumed_lines = consumed_stdin_line_count(bytes);
+    if consumed_lines == 0 {
         return;
     }
     let Some(state) = SESSION_STATE.get() else {
@@ -2278,8 +2279,13 @@ fn note_active_stdin_line_read(bytes: &[u8]) {
     };
     let mut guard = state.inner.lock().unwrap();
     if let Some(active) = guard.active_request.as_mut() {
-        active.consumed_lines = active.consumed_lines.saturating_add(1);
+        active.consumed_lines = active.consumed_lines.saturating_add(consumed_lines);
     }
+}
+
+#[cfg(any(target_family = "unix", windows))]
+fn consumed_stdin_line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
 }
 
 #[cfg(any(target_family = "unix", windows))]
@@ -2995,5 +3001,13 @@ mod tests {
         let probe = runtime_probe_for(&python.to_string_lossy());
 
         assert_eq!(resolve_libpython_path(&probe), Some(dll));
+    }
+
+    #[cfg(any(target_family = "unix", windows))]
+    #[test]
+    fn active_stdin_accounting_counts_completed_lines() {
+        assert_eq!(consumed_stdin_line_count(b"partial"), 0);
+        assert_eq!(consumed_stdin_line_count(b"line\n"), 1);
+        assert_eq!(consumed_stdin_line_count(b"first\nsecond\n"), 2);
     }
 }

@@ -917,11 +917,11 @@ impl BackendDriver for PythonBackendDriver {
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
+        driver_on_input_start(text, ipc)?;
         let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
         let final_prompt = python_final_prompt_hint(text);
         driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
-        driver_wait_for_stdin_write_ack(ipc, timeout)?;
-        driver_on_input_start(text, ipc)
+        driver_wait_for_stdin_write_ack(ipc, timeout)
     }
 
     fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
@@ -960,6 +960,8 @@ impl BackendDriver for PythonBackendDriver {
 struct ProtocolBackendDriver {
     #[cfg(any(target_family = "unix", target_family = "windows"))]
     python_request_generation: Option<u64>,
+    #[cfg(target_family = "windows")]
+    normalize_input_newlines: bool,
 }
 
 impl ProtocolBackendDriver {
@@ -967,6 +969,8 @@ impl ProtocolBackendDriver {
         Self {
             #[cfg(any(target_family = "unix", target_family = "windows"))]
             python_request_generation: None,
+            #[cfg(target_family = "windows")]
+            normalize_input_newlines: false,
         }
     }
 
@@ -974,6 +978,16 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
+            #[cfg(target_family = "windows")]
+            normalize_input_newlines: true,
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn windows_pty() -> Self {
+        Self {
+            python_request_generation: None,
+            normalize_input_newlines: true,
         }
     }
 
@@ -988,7 +1002,7 @@ impl ProtocolBackendDriver {
 impl BackendDriver for ProtocolBackendDriver {
     fn prepare_input_text(&self, text: String) -> String {
         #[cfg(target_family = "windows")]
-        if self.python_request_generation.is_some() {
+        if self.normalize_input_newlines {
             return normalize_input_newlines(&text);
         }
         text
@@ -1322,8 +1336,17 @@ fn backend_driver_for_launch(
     match worker_launch {
         WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
         WorkerLaunch::Builtin(Backend::Python) => python_backend_driver(sandbox_state),
-        WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
+        WorkerLaunch::Custom(spec) => protocol_backend_driver(spec),
     }
+}
+
+fn protocol_backend_driver(spec: &CustomWorkerSpec) -> Box<dyn BackendDriver> {
+    #[cfg(target_family = "windows")]
+    if spec.stdin.transport() == WorkerStdinTransport::Pty {
+        return Box::new(ProtocolBackendDriver::windows_pty());
+    }
+    let _ = spec;
+    Box::new(ProtocolBackendDriver::new())
 }
 
 fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver> {
@@ -8259,6 +8282,51 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_family = "unix"))]
+    #[test]
+    fn python_pipe_driver_drops_stale_stdin_write_ack_before_waiting() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("seed ack");
+        server
+            .wait_for_stdin_write_ack(Duration::from_secs(1))
+            .expect("consume seed ack");
+        worker
+            .send(WorkerToServerIpcMessage::StdinWriteAck)
+            .expect("seed stale ack");
+        for _ in 0..100 {
+            if server.has_stdin_write_ack_for_test() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            server.has_stdin_write_ack_for_test(),
+            "expected stale ack to reach the server inbox before starting the next request"
+        );
+
+        let mut driver = PythonBackendDriver::new();
+        let result = driver.on_input_start(
+            "print(1)",
+            b"print(1)\n",
+            &server,
+            Duration::from_millis(20),
+        );
+
+        assert!(
+            matches!(result, Err(WorkerError::Timeout(_))),
+            "driver should drop stale acks before waiting for the new worker ack, got {result:?}"
+        );
+        assert!(
+            matches!(
+                worker.recv(Some(Duration::from_secs(1))),
+                Some(ServerToWorkerIpcMessage::StdinWrite { .. })
+            ),
+            "driver should still announce the new stdin write after resetting the request"
+        );
+    }
+
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
@@ -11101,6 +11169,26 @@ mod tests {
     #[test]
     fn normalize_input_newlines_canonicalizes_crlf_and_cr() {
         assert_eq!(normalize_input_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_custom_pty_driver_normalizes_input_newlines_for_accounting() {
+        let spec = CustomWorkerSpec {
+            executable: PathBuf::from("worker.exe"),
+            args: Vec::new(),
+            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
+            env: Default::default(),
+            stdin: crate::backend::CustomWorkerStdin::Pty,
+            sandbox: crate::backend::CustomWorkerSandbox::Server,
+        };
+
+        let driver = protocol_backend_driver(&spec);
+
+        assert_eq!(
+            driver.prepare_input_text("a\r\nb\rc\n".to_string()),
+            "a\nb\nc\n"
+        );
     }
 
     #[test]

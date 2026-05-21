@@ -658,6 +658,15 @@ impl ServerIpcConnection {
         guard.protocol_warnings.clear();
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_stdin_write_ack_for_test(&self) -> bool {
+        let guard = self.inbox.lock().unwrap();
+        guard
+            .queue
+            .iter()
+            .any(|message| matches!(message, WorkerToServerIpcMessage::StdinWriteAck))
+    }
+
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()

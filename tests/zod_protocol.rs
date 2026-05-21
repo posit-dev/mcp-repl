@@ -390,6 +390,40 @@ async fn zod_worker_windows_pty_launch_uses_path_lookup() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_windows_pty_crlf_input_uses_normalized_accounting() -> TestResult<()> {
+    let session =
+        spawn_zod_server_with_stdin_env_and_extra_args("pty", Vec::new(), Vec::new()).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "report-raw-line supplied crlf\r\nreport-leading-empty",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("raw-line-debug: report-raw-line supplied crlf"),
+        "expected Windows PTY worker to receive the first CRLF-terminated command, got: {text:?}"
+    );
+    assert!(
+        text.contains("previous empty line: missing\n"),
+        "expected the command after CRLF to run without a protocol mismatch, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input text does not match active stdin"),
+        "server accounting should normalize Windows PTY CRLF input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_preserves_existing_trailing_newline() -> TestResult<()> {
     let session = spawn_zod_server().await?;
