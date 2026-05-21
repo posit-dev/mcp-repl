@@ -78,6 +78,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_TIMEOUT,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Console::{
@@ -109,7 +110,13 @@ thread_local! {
 
 #[cfg(all(test, target_family = "windows"))]
 thread_local! {
-    static TEST_WINDOWS_CTRL_EVENT_RECORDER: RefCell<Option<Vec<(u32, u32)>>> = const { RefCell::new(None) };
+    static TEST_WINDOWS_CTRL_EVENT_RECORDER: RefCell<Option<TestWindowsCtrlEventRecorder>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_family = "windows"))]
+struct TestWindowsCtrlEventRecorder {
+    result: i32,
+    events: Vec<(u32, u32)>,
 }
 
 #[cfg(target_family = "unix")]
@@ -133,9 +140,9 @@ fn raw_windows_generate_console_ctrl_event(ctrl_event: u32, process_group_id: u3
     #[cfg(test)]
     if let Ok(Some(result)) = TEST_WINDOWS_CTRL_EVENT_RECORDER.try_with(|recorder| {
         let mut recorder = recorder.borrow_mut();
-        recorder.as_mut().map(|calls| {
-            calls.push((ctrl_event, process_group_id));
-            1
+        recorder.as_mut().map(|recorder| {
+            recorder.events.push((ctrl_event, process_group_id));
+            recorder.result
         })
     }) {
         return result;
@@ -1070,7 +1077,15 @@ impl BackendDriver for ProtocolBackendDriver {
                     .map_err(WorkerError::Io)?;
                 driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
             }
-            return process.send_interrupt();
+            #[cfg(target_family = "windows")]
+            {
+                let _ = process.send_interrupt();
+                return Ok(());
+            }
+            #[cfg(not(target_family = "windows"))]
+            {
+                return process.send_interrupt();
+            }
         }
 
         driver_interrupt(process)
@@ -5914,10 +5929,15 @@ impl WindowsPtyChild {
             return Err(std::io::Error::last_os_error());
         }
         if status == windows_sys::Win32::Foundation::STILL_ACTIVE as u32 {
-            Ok(None)
-        } else {
-            Ok(Some(WorkerExitStatus::with_exit_code(status)))
+            let wait = unsafe { WaitForSingleObject(self.process, 0) };
+            if wait == WAIT_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            if wait == WAIT_TIMEOUT {
+                return Ok(None);
+            }
         }
+        Ok(Some(WorkerExitStatus::with_exit_code(status)))
     }
 
     fn wait(&mut self) -> std::io::Result<WorkerExitStatus> {
@@ -8471,12 +8491,26 @@ mod tests {
     where
         F: FnOnce() -> R,
     {
+        capture_recorded_windows_ctrl_events_with_result(1, f)
+    }
+
+    #[cfg(target_family = "windows")]
+    fn capture_recorded_windows_ctrl_events_with_result<F, R>(
+        result: i32,
+        f: F,
+    ) -> (R, Vec<(u32, u32)>)
+    where
+        F: FnOnce() -> R,
+    {
         TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
             assert!(
                 recorder.borrow().is_none(),
                 "did not expect nested Windows ctrl-event recorder"
             );
-            *recorder.borrow_mut() = Some(Vec::new());
+            *recorder.borrow_mut() = Some(TestWindowsCtrlEventRecorder {
+                result,
+                events: Vec::new(),
+            });
         });
         let result = f();
         let events = TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
@@ -8484,6 +8518,7 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("recorded Windows ctrl events")
+                .events
         });
         (result, events)
     }
@@ -8515,6 +8550,29 @@ mod tests {
             events,
             vec![(CTRL_BREAK_EVENT, child_id)],
             "expected Ctrl-Break to target the worker process group"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_python_interrupt_ignores_ctrl_break_delivery_failure() {
+        let child = sleeping_test_child();
+        let child_id = child.id();
+        let mut process = test_worker_process(child);
+        let mut driver = ProtocolBackendDriver::python();
+        let (result, events) =
+            capture_recorded_windows_ctrl_events_with_result(0, || driver.interrupt(&mut process));
+
+        let _ = process.kill();
+
+        assert!(
+            result.is_ok(),
+            "Python sideband interrupt should not fail when Ctrl-Break delivery fails: {result:?}"
+        );
+        assert_eq!(
+            events,
+            vec![(CTRL_BREAK_EVENT, child_id)],
+            "expected best-effort Ctrl-Break attempt to still target the worker process group"
         );
     }
 
@@ -11357,6 +11415,27 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_child_treats_signaled_still_active_exit_code_as_exited() {
+        use std::os::windows::io::IntoRawHandle;
+
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "exit 259"])
+            .spawn()
+            .expect("spawn exit-code-259 child process");
+        let process_id = child.id();
+        let process = child.into_raw_handle() as HANDLE;
+        let mut child = WindowsPtyChild {
+            process,
+            process_id,
+        };
+
+        let status = child.wait().expect("wait for exit-code-259 child");
+
+        assert_eq!(status.exit_code(), 259);
     }
 
     #[cfg(target_family = "windows")]
