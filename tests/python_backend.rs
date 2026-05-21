@@ -1407,6 +1407,48 @@ print("AFTER_DIRECT_READS")
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_windows_os_read_subprocess_pipe_does_not_consume_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os, subprocess, sys
+proc = subprocess.Popen(
+    [sys.executable, "-c", "import sys; sys.stdout.write('PIPE_OK')"],
+    stdout=subprocess.PIPE,
+)
+data = os.read(proc.stdout.fileno(), 7)
+proc.wait()
+print("SUBPROCESS_PIPE", data.decode())
+print("AFTER_SUBPROCESS_PIPE")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows subprocess pipe os.read request remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SUBPROCESS_PIPE PIPE_OK"),
+        "expected os.read() on subprocess pipe to read pipe output, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_SUBPROCESS_PIPE"),
+        "expected REPL input after subprocess pipe read to execute, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

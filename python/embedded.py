@@ -770,7 +770,9 @@ _original_os_fdopen = os.fdopen
 _original_os_read = os.read
 _original_os_readv = getattr(os, "readv", None)
 _mcp_repl_raw_stdin_read_supported = os.name in ("posix", "nt")
-# Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
+# On POSIX, keep the original fd 0 identity so duplicated stdin fds still use
+# the bridge. On Windows, anonymous pipe stat identity is too weak to
+# distinguish unrelated pipes, so fd 0 itself is the bridge boundary.
 _mcp_repl_raw_stdin_stat = None
 if _mcp_repl_raw_stdin_read_supported:
     try:
@@ -797,6 +799,8 @@ def _mcp_repl_import(name, globals=None, locals=None, fromlist=(), level=0):
 def _mcp_repl_is_raw_stdin_fd(fd):
     if not _mcp_repl_raw_stdin_read_supported:
         return False
+    if os.name == "nt":
+        return fd == 0
     if _mcp_repl_raw_stdin_stat is None:
         return fd == 0
     try:
