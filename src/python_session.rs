@@ -208,8 +208,14 @@ fn interrupt_for_request_generation(request_generation: Option<u64>) {
         return;
     }
     discard_pending_stdin();
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     flush_terminal_input();
+    #[cfg(windows)]
+    if windows_stdin_is_console() {
+        flush_terminal_input();
+    } else {
+        finish_active_request_at_next_read();
+    }
     #[cfg(not(any(target_family = "unix", windows)))]
     finish_active_request_at_next_read();
     mark_interrupt_requested();
@@ -2029,9 +2035,14 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
 fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
     let _allow_threads = PythonThreadsAllowed::new();
     let bytes = read_windows_stdin_bytes(size);
-    let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
-    note_windows_raw_stdin_bytes_read(&protocol_bytes);
-    protocol_bytes
+    if windows_stdin_is_console() {
+        let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
+        note_windows_raw_stdin_bytes_read(&protocol_bytes);
+        protocol_bytes
+    } else {
+        note_windows_raw_stdin_bytes_read(&bytes);
+        bytes
+    }
 }
 
 #[cfg(windows)]

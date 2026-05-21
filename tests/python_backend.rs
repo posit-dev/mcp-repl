@@ -115,6 +115,17 @@ fn windows_sandbox_backend_unavailable(text: &str) -> bool {
     text.contains("CreateRestrictedToken failed: 87")
 }
 
+#[cfg(windows)]
+async fn start_windows_read_only_python_session() -> TestResult<common::McpTestSession> {
+    common::spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+    ])
+    .await
+}
+
 fn is_busy_response(text: &str) -> bool {
     text.contains("<<repl status: busy")
         || text.contains("worker is busy")
@@ -1525,13 +1536,7 @@ print("AFTER_FD0_RESTORE")
 #[tokio::test(flavor = "multi_thread")]
 async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = common::spawn_server_with_args(vec![
-        "--interpreter".to_string(),
-        "python".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
-    ])
-    .await?;
+    let session = start_windows_read_only_python_session().await?;
 
     let result = session
         .write_stdin_raw_with("print('SANDBOX_A')\nprint('SANDBOX_B')", Some(10.0))
@@ -1560,13 +1565,7 @@ async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult
 #[tokio::test(flavor = "multi_thread")]
 async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = common::spawn_server_with_args(vec![
-        "--interpreter".to_string(),
-        "python".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
-    ])
-    .await?;
+    let session = start_windows_read_only_python_session().await?;
 
     let result = session
         .write_stdin_raw_with("print(input('p> '))\nhello", Some(10.0))
@@ -1591,6 +1590,94 @@ async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResu
     assert!(
         !text.contains("readline_input reported input with no active turn"),
         "sandboxed Python pipe fallback lost active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_read_only_sandbox_preserves_raw_pipe_bytes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = start_windows_read_only_python_session().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            "import os\nparts = [os.read(0, 1) for _ in range(3)]\nab\r\nprint('RAW_PIPE_PARTS', parts)\nprint('AFTER_RAW_PIPE')",
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
+        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows read-only sandbox raw pipe read remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("RAW_PIPE_PARTS [b'a', b'b', b'\\r']"),
+        "expected os.read(0, ...) on pipe stdin to preserve CRLF bytes, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_RAW_PIPE"),
+        "expected REPL input after raw pipe read to execute, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_read_only_sandbox_interrupt_finishes_drained_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = start_windows_read_only_python_session().await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "import time\ntime.sleep(5)\nprint('SHOULD_NOT_RUN_AFTER_SANDBOX_INTERRUPT')",
+            Some(0.2),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if python_backend_unavailable(&first_text) || windows_sandbox_backend_unavailable(&first_text) {
+        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        is_busy_response(&first_text),
+        "expected sandboxed Python sleep request to time out before interrupt, got: {first_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    if is_busy_response(&interrupt_text) {
+        session.cancel().await?;
+        return Err(format!(
+            "sandboxed Python interrupt stayed busy after draining pipe stdin: {interrupt_text:?}"
+        )
+        .into());
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_SANDBOX_INTERRUPT')", Some(10.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_SANDBOX_INTERRUPT"),
+        "expected follow-up after sandboxed Python interrupt to run, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("SHOULD_NOT_RUN_AFTER_SANDBOX_INTERRUPT"),
+        "drained stdin tail should not execute after interrupt, got follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
