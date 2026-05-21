@@ -544,15 +544,32 @@ fn discard_pending_stdin() {
             libc::fflush(stdin);
         }
     }
-    let discarded = drain_console_input_text();
-    if !discarded.is_empty() {
-        ipc::emit_readline_discard(&discarded);
+    if let Some(mut discarded) = drain_direct_stdin_sideband_text() {
+        discarded.push_str(&drain_console_input_text());
+        if !discarded.is_empty() {
+            ipc::emit_readline_discard(&discarded);
+        }
+    } else {
+        // The pending direct-stdin bytes can be an incomplete UTF-8 scalar.
+        // Clear console input too, but do not emit replacement text that cannot
+        // match the server's active stdin byte queue.
+        let _ = drain_console_input_text();
     }
     drain_stdin_pipe();
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
 fn discard_pending_stdin() {}
+
+#[cfg(windows)]
+fn drain_direct_stdin_sideband_text() -> Option<String> {
+    let discarded = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect::<Vec<_>>();
+    String::from_utf8(discarded).ok()
+}
 
 #[cfg(windows)]
 fn drain_stdin_pipe() {
@@ -3020,5 +3037,56 @@ mod tests {
         assert_eq!(consumed_stdin_line_count(b"partial"), 0);
         assert_eq!(consumed_stdin_line_count(b"line\n"), 1);
         assert_eq!(consumed_stdin_line_count(b"first\nsecond\n"), 2);
+    }
+
+    #[cfg(windows)]
+    fn direct_stdin_sideband_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discard_drains_partial_direct_stdin_sideband_bytes() {
+        let _guard = direct_stdin_sideband_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        {
+            let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
+            pending.clear();
+            pending.push(0xc3);
+        }
+
+        assert_eq!(drain_direct_stdin_sideband_text(), None);
+        assert!(
+            PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discard_preserves_valid_direct_stdin_sideband_text() {
+        let _guard = direct_stdin_sideband_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        {
+            let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
+            pending.clear();
+            pending.extend_from_slice("line\n".as_bytes());
+        }
+
+        assert_eq!(
+            drain_direct_stdin_sideband_text(),
+            Some("line\n".to_string())
+        );
+        assert!(
+            PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
