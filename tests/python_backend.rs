@@ -1569,6 +1569,49 @@ print("AFTER_RAW_SMALL_READS")
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_windows_pty_raw_small_reads_skip_dropped_lf() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os
+parts = [os.read(0, 1) for _ in range(4)]
+ab
+c
+print("RAW_SPLIT_PARTS", parts)
+print("AFTER_RAW_SPLIT_READS")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows raw split-CRLF read test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains(r#"RAW_SPLIT_PARTS [b'a', b'b', b'\n', b'c']"#),
+        "expected raw reads to skip the dropped LF and continue reading, got: {text:?}"
+    );
+    assert!(
+        text.contains("AFTER_RAW_SPLIT_READS"),
+        "expected REPL input after split CRLF reads to execute, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input text does not match active stdin"),
+        "split CRLF raw reads desynchronized active stdin accounting: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_windows_fd0_replacement_bypasses_stdin_bridge() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

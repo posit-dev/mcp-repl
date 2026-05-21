@@ -2056,16 +2056,26 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
 
 #[cfg(windows)]
 fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
-    let _allow_threads = PythonThreadsAllowed::new();
-    let bytes = read_windows_stdin_bytes(size);
-    if windows_stdin_is_console() {
-        let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
-        note_windows_raw_stdin_bytes_read(&protocol_bytes);
-        protocol_bytes
-    } else {
-        note_windows_raw_stdin_bytes_read(&bytes);
-        bytes
+    if size == 0 {
+        return Vec::new();
     }
+    let _allow_threads = PythonThreadsAllowed::new();
+    if windows_stdin_is_console() {
+        loop {
+            let bytes = read_windows_stdin_bytes(size);
+            if bytes.is_empty() {
+                return bytes;
+            }
+            let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
+            if !protocol_bytes.is_empty() {
+                note_windows_raw_stdin_bytes_read(&protocol_bytes);
+                return protocol_bytes;
+            }
+        }
+    }
+    let bytes = read_windows_stdin_bytes(size);
+    note_windows_raw_stdin_bytes_read(&bytes);
+    bytes
 }
 
 #[cfg(windows)]
