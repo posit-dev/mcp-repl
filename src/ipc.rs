@@ -130,8 +130,14 @@ pub enum WorkerToServerIpcMessage {
     ReadlineInput {
         text: String,
     },
+    ReadlineInputBytes {
+        data_b64: String,
+    },
     ReadlineDiscard {
         text: String,
+    },
+    ReadlineDiscardBytes {
+        data_b64: String,
     },
     ReadlineResult {
         prompt: String,
@@ -419,7 +425,29 @@ impl ServerIpcConnection {
                     }
                     WorkerToServerIpcMessage::ReadlineInput { text } => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) = account_active_stdin(&mut guard, &text, "readline_input")
+                        if let Err(err) =
+                            account_active_stdin_text(&mut guard, &text, "readline_input")
+                        {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::ReadlineInputBytes { data_b64 } => {
+                        let bytes = match decode_sideband_base64(&data_b64, "readline_input_bytes")
+                        {
+                            Ok(bytes) => bytes,
+                            Err(err) => {
+                                let mut guard = reader_inbox.lock().unwrap();
+                                latch_protocol_error(&mut guard, err);
+                                reader_cvar.notify_all();
+                                break;
+                            }
+                        };
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) =
+                            account_active_stdin_bytes(&mut guard, &bytes, "readline_input_bytes")
                         {
                             latch_protocol_error(&mut guard, err);
                             reader_cvar.notify_all();
@@ -430,7 +458,28 @@ impl ServerIpcConnection {
                     WorkerToServerIpcMessage::ReadlineDiscard { text } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) =
-                            account_active_stdin(&mut guard, &text, "readline_discard")
+                            account_active_stdin_text(&mut guard, &text, "readline_discard")
+                        {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::ReadlineDiscardBytes { data_b64 } => {
+                        let bytes =
+                            match decode_sideband_base64(&data_b64, "readline_discard_bytes") {
+                                Ok(bytes) => bytes,
+                                Err(err) => {
+                                    let mut guard = reader_inbox.lock().unwrap();
+                                    latch_protocol_error(&mut guard, err);
+                                    reader_cvar.notify_all();
+                                    break;
+                                }
+                            };
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) =
+                            account_active_stdin_bytes(&mut guard, &bytes, "readline_discard_bytes")
                         {
                             latch_protocol_error(&mut guard, err);
                             reader_cvar.notify_all();
@@ -1732,10 +1781,26 @@ pub fn emit_readline_input(text: &str) {
     }
 }
 
+pub fn emit_readline_input_bytes(bytes: &[u8]) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+}
+
 pub fn emit_readline_discard(text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscard {
             text: text.to_string(),
+        });
+    }
+}
+
+pub fn emit_readline_discard_bytes(bytes: &[u8]) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscardBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
     }
 }
@@ -1845,18 +1910,34 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     true
 }
 
-fn account_active_stdin(
+fn account_active_stdin_text(
     guard: &mut ServerIpcInbox,
     text: &str,
     event_type: &str,
 ) -> Result<(), String> {
+    account_active_stdin_bytes_with_kind(guard, text.as_bytes(), event_type, "text")
+}
+
+fn account_active_stdin_bytes(
+    guard: &mut ServerIpcInbox,
+    bytes: &[u8],
+    event_type: &str,
+) -> Result<(), String> {
+    account_active_stdin_bytes_with_kind(guard, bytes, event_type, "bytes")
+}
+
+fn account_active_stdin_bytes_with_kind(
+    guard: &mut ServerIpcInbox,
+    bytes: &[u8],
+    event_type: &str,
+    value_kind: &str,
+) -> Result<(), String> {
     let Some(active_stdin) = guard.active_stdin.as_mut() else {
-        if text.is_empty() {
+        if bytes.is_empty() {
             return Ok(());
         }
         return Err(format!("{event_type} reported input with no active turn"));
     };
-    let bytes = text.as_bytes();
     if bytes.len() > active_stdin.len() {
         return Err(format!(
             "{event_type} reported {} bytes but only {} active stdin bytes remain",
@@ -1867,7 +1948,7 @@ fn account_active_stdin(
     for (idx, expected) in bytes.iter().enumerate() {
         if active_stdin.get(idx) != Some(expected) {
             return Err(format!(
-                "{event_type} text does not match active stdin at byte {idx}"
+                "{event_type} {value_kind} does not match active stdin at byte {idx}"
             ));
         }
     }
@@ -1875,6 +1956,12 @@ fn account_active_stdin(
         active_stdin.pop_front();
     }
     Ok(())
+}
+
+fn decode_sideband_base64(data_b64: &str, event_type: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|_| format!("invalid {event_type} base64"))
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -2102,8 +2189,8 @@ mod protocol_tests {
     use super::{
         IpcHandlers, IpcTransport, IpcWaitError, OUTPUT_TEXT_IPC_CHUNK_BYTES,
         OutputCriticalIpcWriter, ServerIpcConnection, ServerToWorkerIpcMessage,
-        WorkerToServerIpcMessage, emit_readline_discard, emit_readline_input,
-        test_connection_pair_with_handlers,
+        WorkerToServerIpcMessage, emit_readline_discard, emit_readline_discard_bytes,
+        emit_readline_input, emit_readline_input_bytes, test_connection_pair_with_handlers,
     };
     use crate::worker_protocol::TextStream;
     use base64::Engine as _;
@@ -2169,7 +2256,9 @@ mod protocol_tests {
     #[test]
     fn readline_accounting_emitters_are_platform_neutral_noops_without_global_ipc() {
         emit_readline_input("answer\n");
+        emit_readline_input_bytes(&[0xc3]);
         emit_readline_discard("queued\n");
+        emit_readline_discard_bytes(&[0xa9]);
     }
 
     #[test]
@@ -2431,6 +2520,43 @@ mod protocol_tests {
         );
         let latched = server.take_protocol_error();
         assert_eq!(latched.as_deref(), Some("invalid output_text base64"));
+    }
+
+    #[test]
+    fn request_completion_accounts_split_utf8_byte_frames() {
+        let stable_wait = Duration::from_millis(20);
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        server.begin_request_with_stdin("é\n".as_bytes());
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineInputBytes {
+                data_b64: base64::engine::general_purpose::STANDARD.encode([0xc3]),
+            })
+            .expect("send first byte");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineInputBytes {
+                data_b64: base64::engine::general_purpose::STANDARD.encode([0xa9]),
+            })
+            .expect("send second byte");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineInput {
+                text: "\n".to_string(),
+            })
+            .expect("send newline");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: ">>> ".to_string(),
+            })
+            .expect("send readline_start");
+        thread::sleep(stable_wait + Duration::from_millis(5));
+
+        let completion = server.wait_for_request_completion(Duration::from_secs(1), stable_wait);
+
+        assert!(
+            completion.is_ok(),
+            "split UTF-8 byte accounting should allow prompt completion, got: {completion:?}"
+        );
     }
 
     #[test]

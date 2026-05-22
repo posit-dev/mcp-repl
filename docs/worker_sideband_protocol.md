@@ -47,8 +47,9 @@ own ConPTY process creation.
   process or process group.
 - This is for worker-owned bookkeeping only. It does not carry user input and
   does not replace the OS interrupt.
-- The worker may emit `readline_discard` for exact active-turn stdin bytes it
-  discarded before delivering them to the runtime.
+- The worker may emit `readline_discard` or `readline_discard_bytes` for
+  exact active-turn stdin bytes it discarded before delivering them to the
+  runtime.
 
 ## Direction: worker -> server
 
@@ -69,9 +70,10 @@ invalid base64, and unknown message types are protocol errors.
   for that operation.
 - The prompt string is required; use an empty string if the runtime supplied no
   prompt.
-- If active-turn stdin bytes remain unaccounted, the prompt is satisfied by
-  already-written stdin and does not complete the request. If no active-turn
-  stdin bytes remain, the prompt is unsatisfied and may complete the request.
+- If active-turn stdin bytes remain unaccounted by input or discard events,
+  the prompt is satisfied by already-written stdin and does not complete the
+  request. If no active-turn stdin bytes remain, the prompt is unsatisfied and
+  may complete the request.
 - Prompt rendering is derived from this structured event, not from raw
   stdout/stderr parsing.
 
@@ -82,12 +84,30 @@ invalid base64, and unknown message types are protocol errors.
 - The server encodes `text` as UTF-8 and removes those bytes from the active
   stdin queue. A mismatch is a protocol error.
 
+`readline_input_bytes`
+- `{ "type": "readline_input_bytes", "data_b64": <base64> }`
+- Emitted after the worker delivers active-turn stdin bytes to the
+  runtime-facing input layer when an exact consumed byte range is not
+  representable as a complete UTF-8 string at that event boundary.
+- The server decodes `data_b64` and removes those bytes from the active stdin
+  queue. Invalid base64 or a byte mismatch is a protocol error.
+
 `readline_discard`
 - `{ "type": "readline_discard", "text": <string> }`
 - Emitted after the worker discards active-turn stdin text during
   interrupt/reset cleanup without delivering it to the runtime.
 - The server encodes `text` as UTF-8 and removes those bytes from the active
   stdin queue. A mismatch is a protocol error.
+- Workers must emit this only for exact bytes they can identify. Bytes flushed
+  from terminal state without being observed are not reportable.
+
+`readline_discard_bytes`
+- `{ "type": "readline_discard_bytes", "data_b64": <base64> }`
+- Emitted after the worker discards exact active-turn stdin bytes during
+  interrupt/reset cleanup when those bytes are not representable as a complete
+  UTF-8 string at that event boundary.
+- The server decodes `data_b64` and removes those bytes from the active stdin
+  queue. Invalid base64 or a byte mismatch is a protocol error.
 - Workers must emit this only for exact bytes they can identify. Bytes flushed
   from terminal state without being observed are not reportable.
 
@@ -168,7 +188,8 @@ CPython readline events rather than a separate stdin bridge.
 - Legacy echo metadata emitted after a line is read.
 - The server may use it for conservative echo suppression of raw pipe output,
   but completion is driven by `readline_start`, `readline_input`,
-  `readline_discard`, and `session_end`.
+  `readline_input_bytes`, `readline_discard`, `readline_discard_bytes`, and
+  `session_end`.
 
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`

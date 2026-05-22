@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::RawFd;
@@ -230,6 +232,7 @@ fn flush_terminal_input() {
 #[cfg(windows)]
 fn flush_terminal_input() {
     clear_windows_console_drop_next_lf();
+    clear_windows_console_stdin_buffer();
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return;
@@ -420,15 +423,7 @@ fn finish_active_request_at_next_read() {
 
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
-    let mut discarded = Vec::new();
-    discarded.extend(PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap().drain(..));
-    discarded.extend(drain_process_stdin_pipe());
-    if discarded.is_empty() {
-        return;
-    }
-    let text =
-        String::from_utf8(discarded).expect("discarded Python stdin must be valid UTF-8 text");
-    ipc::emit_readline_discard(&text);
+    emit_readline_discard_bytes(&drain_process_stdin_pipe());
 }
 
 #[cfg(target_family = "unix")]
@@ -529,11 +524,7 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-        .lock()
-        .unwrap()
-        .is_empty()
-        && stdin_pending_byte_count() == Some(0)
+    stdin_pending_byte_count() == Some(0)
 }
 
 #[cfg(windows)]
@@ -544,32 +535,12 @@ fn discard_pending_stdin() {
             libc::fflush(stdin);
         }
     }
-    if let Some(mut discarded) = drain_direct_stdin_sideband_text() {
-        discarded.push_str(&drain_console_input_text());
-        if !discarded.is_empty() {
-            ipc::emit_readline_discard(&discarded);
-        }
-    } else {
-        // The pending direct-stdin bytes can be an incomplete UTF-8 scalar.
-        // Clear console input too, but do not emit replacement text that cannot
-        // match the server's active stdin byte queue.
-        let _ = drain_console_input_text();
-    }
+    emit_readline_discard_bytes(&drain_console_input_bytes());
     drain_stdin_pipe();
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
 fn discard_pending_stdin() {}
-
-#[cfg(windows)]
-fn drain_direct_stdin_sideband_text() -> Option<String> {
-    let discarded = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-        .lock()
-        .unwrap()
-        .drain(..)
-        .collect::<Vec<_>>();
-    String::from_utf8(discarded).ok()
-}
 
 #[cfg(windows)]
 fn drain_stdin_pipe() {
@@ -1123,6 +1094,55 @@ fn initialize_python(
         api.install_input_hook(pyos_input_hook)?;
         Ok(thread_state)
     }
+}
+
+#[cfg(windows)]
+fn take_windows_console_stdin_bytes(max_len: usize) -> Vec<u8> {
+    let mut guard = WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap();
+    let take_len = max_len.min(guard.len());
+    (0..take_len).filter_map(|_| guard.pop_front()).collect()
+}
+
+#[cfg(windows)]
+fn take_windows_console_stdin_line_prefix() -> Vec<u8> {
+    let mut guard = WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap();
+    let mut bytes = Vec::new();
+    while let Some(byte) = guard.pop_front() {
+        bytes.push(byte);
+        if byte == b'\n' {
+            break;
+        }
+    }
+    bytes
+}
+
+#[cfg(windows)]
+fn push_windows_console_stdin_bytes(bytes: &[u8]) {
+    WINDOWS_CONSOLE_STDIN_BYTES
+        .lock()
+        .unwrap()
+        .extend(bytes.iter().copied());
+}
+
+#[cfg(windows)]
+fn drain_windows_console_stdin_buffer() -> Vec<u8> {
+    WINDOWS_CONSOLE_STDIN_BYTES
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect()
+}
+
+#[cfg(windows)]
+fn clear_windows_console_stdin_buffer() {
+    WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap().clear();
+}
+
+#[cfg(windows)]
+fn drain_console_input_bytes() -> Vec<u8> {
+    let mut bytes = drain_windows_console_stdin_buffer();
+    bytes.extend(drain_console_input_text().into_bytes());
+    bytes
 }
 
 #[cfg(windows)]
@@ -2061,20 +2081,34 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
     }
     let _allow_threads = PythonThreadsAllowed::new();
     if windows_stdin_is_console() {
-        loop {
-            let bytes = read_windows_stdin_bytes(size);
-            if bytes.is_empty() {
-                return bytes;
-            }
-            let protocol_bytes = windows_console_protocol_stdin_bytes(&bytes);
-            if !protocol_bytes.is_empty() {
-                note_windows_raw_stdin_bytes_read(&protocol_bytes);
-                return protocol_bytes;
-            }
-        }
+        let bytes = read_windows_console_stdin_bytes(size);
+        note_windows_raw_stdin_bytes_read(&bytes);
+        return bytes;
     }
     let bytes = read_windows_stdin_bytes(size);
     note_windows_raw_stdin_bytes_read(&bytes);
+    bytes
+}
+
+#[cfg(windows)]
+fn read_windows_console_stdin_bytes(size: usize) -> Vec<u8> {
+    let mut bytes = take_windows_console_stdin_bytes(size);
+    while bytes.len() < size {
+        let Some(read) = read_windows_console_line_bytes_uncached() else {
+            break;
+        };
+        if read.bytes.is_empty() {
+            break;
+        }
+        let interrupted = read.interrupted;
+        push_windows_console_stdin_bytes(&read.bytes);
+        bytes.extend(take_windows_console_stdin_bytes(
+            size.saturating_sub(bytes.len()),
+        ));
+        if interrupted {
+            break;
+        }
+    }
     bytes
 }
 
@@ -2116,6 +2150,23 @@ fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
     if !windows_stdin_is_console() {
         return None;
     }
+    let mut bytes = take_windows_console_stdin_line_prefix();
+    if bytes.last() == Some(&b'\n') {
+        return Some(StdioLineRead {
+            bytes,
+            interrupted: false,
+        });
+    }
+    let mut read = read_windows_console_line_bytes_uncached()?;
+    if !bytes.is_empty() {
+        bytes.append(&mut read.bytes);
+        read.bytes = bytes;
+    }
+    Some(read)
+}
+
+#[cfg(windows)]
+fn read_windows_console_line_bytes_uncached() -> Option<StdioLineRead> {
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return None;
@@ -2177,23 +2228,6 @@ fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn windows_console_protocol_stdin_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    for &byte in bytes {
-        if take_windows_console_drop_next_lf() && byte == b'\n' {
-            continue;
-        }
-        if byte == b'\r' {
-            normalized.push(b'\n');
-            set_windows_console_drop_next_lf();
-        } else {
-            normalized.push(byte);
-        }
-    }
-    normalized
 }
 
 #[cfg(windows)]
@@ -2342,26 +2376,54 @@ fn emit_readline_input_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
-    pending.extend_from_slice(bytes);
+    emit_readline_accounting_bytes(
+        bytes,
+        ipc::emit_readline_input,
+        ipc::emit_readline_input_bytes,
+    );
+}
+
+#[cfg(any(target_family = "unix", windows))]
+fn emit_readline_discard_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    emit_readline_accounting_bytes(
+        bytes,
+        ipc::emit_readline_discard,
+        ipc::emit_readline_discard_bytes,
+    );
+}
+
+#[cfg(any(target_family = "unix", windows))]
+fn emit_readline_accounting_bytes(
+    mut pending: &[u8],
+    emit_text: impl Fn(&str),
+    emit_bytes: impl Fn(&[u8]),
+) {
     loop {
-        match std::str::from_utf8(&pending) {
+        if pending.is_empty() {
+            return;
+        }
+        match std::str::from_utf8(pending) {
             Ok(text) => {
                 if !text.is_empty() {
-                    ipc::emit_readline_input(text);
+                    emit_text(text);
                 }
-                pending.clear();
                 return;
             }
             Err(err) => {
                 let valid_up_to = err.valid_up_to();
-                if valid_up_to == 0 {
-                    return;
+                if valid_up_to > 0 {
+                    let text = std::str::from_utf8(&pending[..valid_up_to])
+                        .expect("valid UTF-8 prefix should decode");
+                    emit_text(text);
+                    pending = &pending[valid_up_to..];
+                    continue;
                 }
-                let text = std::str::from_utf8(&pending[..valid_up_to])
-                    .expect("valid UTF-8 prefix should decode");
-                ipc::emit_readline_input(text);
-                pending.drain(..valid_up_to);
+                let invalid_len = err.error_len().unwrap_or(pending.len());
+                emit_bytes(&pending[..invalid_len]);
+                pending = &pending[invalid_len..];
             }
         }
     }
@@ -2839,10 +2901,10 @@ static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut()
 static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 #[cfg(target_family = "unix")]
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
-#[cfg(any(target_family = "unix", windows))]
-static PYTHON_DIRECT_STDIN_SIDEBAND_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 #[cfg(windows)]
 static WINDOWS_CONSOLE_DROP_NEXT_LF: Mutex<bool> = Mutex::new(false);
+#[cfg(windows)]
+static WINDOWS_CONSOLE_STDIN_BYTES: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 
 #[cfg(test)]
 mod tests {
@@ -3073,54 +3135,33 @@ mod tests {
         assert!(!guard.waiting_for_input);
     }
 
-    #[cfg(windows)]
-    fn direct_stdin_sideband_test_mutex() -> &'static Mutex<()> {
-        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    #[cfg(any(target_family = "unix", windows))]
+    #[test]
+    fn readline_accounting_bytes_emit_split_utf8_as_bytes() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        emit_readline_accounting_bytes(
+            b"\xc3",
+            |text| events.borrow_mut().push(format!("text:{text:?}")),
+            |bytes| events.borrow_mut().push(format!("bytes:{bytes:?}")),
+        );
+
+        assert_eq!(events.into_inner(), vec!["bytes:[195]"]);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_family = "unix", windows))]
     #[test]
-    fn windows_discard_drains_partial_direct_stdin_sideband_bytes() {
-        let _guard = direct_stdin_sideband_test_mutex()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        {
-            let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
-            pending.clear();
-            pending.push(0xc3);
-        }
+    fn readline_accounting_bytes_resume_after_invalid_byte() {
+        use std::cell::RefCell;
 
-        assert_eq!(drain_direct_stdin_sideband_text(), None);
-        assert!(
-            PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-                .lock()
-                .unwrap()
-                .is_empty()
+        let events = RefCell::new(Vec::new());
+        emit_readline_accounting_bytes(
+            b"\xa9\n",
+            |text| events.borrow_mut().push(format!("text:{text:?}")),
+            |bytes| events.borrow_mut().push(format!("bytes:{bytes:?}")),
         );
-    }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_discard_preserves_valid_direct_stdin_sideband_text() {
-        let _guard = direct_stdin_sideband_test_mutex()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        {
-            let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
-            pending.clear();
-            pending.extend_from_slice("line\n".as_bytes());
-        }
-
-        assert_eq!(
-            drain_direct_stdin_sideband_text(),
-            Some("line\n".to_string())
-        );
-        assert!(
-            PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(events.into_inner(), vec!["bytes:[169]", "text:\"\\n\""]);
     }
 }
