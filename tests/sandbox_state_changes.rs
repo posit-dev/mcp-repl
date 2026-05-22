@@ -2747,17 +2747,26 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
     }
+    let mut visible_text = text.clone();
+    for _ in 0..20 {
+        if visible_text.contains("WRITE_OK") || !text.contains("--More--") {
+            break;
+        }
+        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+        visible_text.push_str(&text);
+    }
     let file_text = std::fs::read_to_string(&target).ok();
     let _ = std::fs::remove_file(&target);
     session.cancel().await?;
 
     assert!(
-        text.contains("WRITE_OK"),
-        "expected pager ctrl-c tail to execute under the updated full-access sandbox, got: {text}"
+        visible_text.contains("WRITE_OK")
+            || file_text.as_deref().map(str::trim_end) == Some("allowed"),
+        "expected pager ctrl-c tail to execute under the updated full-access sandbox, got output: {visible_text}; file: {file_text:?}"
     );
     assert!(
-        !text.contains("WRITE_ERROR:"),
-        "did not expect pager ctrl-c tail to keep the previous sandbox permissions, got: {text}"
+        !visible_text.contains("WRITE_ERROR:"),
+        "did not expect pager ctrl-c tail to keep the previous sandbox permissions, got: {visible_text}"
     );
     assert_eq!(
         file_text.as_deref().map(str::trim_end),

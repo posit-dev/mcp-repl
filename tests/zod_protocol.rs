@@ -392,7 +392,7 @@ async fn zod_worker_windows_pty_launch_uses_path_lookup() -> TestResult<()> {
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_windows_pty_crlf_input_uses_normalized_accounting() -> TestResult<()> {
+async fn zod_worker_windows_pty_crlf_input_reports_wire_bytes_for_accounting() -> TestResult<()> {
     let session =
         spawn_zod_server_with_stdin_env_and_extra_args("pty", Vec::new(), Vec::new()).await?;
 
@@ -416,8 +416,8 @@ async fn zod_worker_windows_pty_crlf_input_uses_normalized_accounting() -> TestR
         "expected the command after CRLF to run without a protocol mismatch, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
-        "server accounting should normalize Windows PTY CRLF input, got: {text:?}"
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
+        "server accounting should use the bytes written to the Windows PTY, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -893,7 +893,7 @@ async fn zod_worker_protocol_error_after_timeout_is_reported_on_follow_up() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()> {
+async fn zod_worker_readline_input_bytes_mismatch_is_protocol_error() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
     let result = session
@@ -907,8 +907,8 @@ async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("readline_input text does not match active stdin"),
-        "expected readline_input accounting protocol error, got: {text:?}"
+        text.contains("readline_input_bytes bytes does not match active stdin"),
+        "expected readline_input_bytes accounting protocol error, got: {text:?}"
     );
 
     session.cancel().await?;

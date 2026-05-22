@@ -135,7 +135,7 @@ pub(crate) fn clear_pending_input() -> bool {
     let discarded = drain_input_queue(&mut guard.input_queue);
     drop(guard);
     if !discarded.is_empty() {
-        ipc::emit_readline_discard(&discarded);
+        ipc::emit_readline_discard_bytes(discarded.as_bytes());
     }
     had_pending
 }
@@ -989,18 +989,18 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let head = line_text.as_bytes();
+            let runtime_line = normalize_console_input_for_r(&line_text);
+            let head = runtime_line.as_bytes();
             if !buf.is_null() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
                     *buf.add(head.len()) = 0;
                 }
             }
-            ipc::emit_readline_input(&line_text);
-            let mut echoed = String::with_capacity(prompt.len() + line_text.len());
+            ipc::emit_readline_input_bytes(line_text.as_bytes());
+            let mut echoed = String::with_capacity(prompt.len() + runtime_line.len());
             echoed.push_str(prompt);
-            echoed.push_str(&line_text);
-            ipc::emit_readline_result(prompt, &line_text);
+            echoed.push_str(&runtime_line);
             if !echoed.is_empty() {
                 emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
@@ -1010,6 +1010,10 @@ pub extern "C-unwind" fn r_read_console(
 
         guard = state.cvar.wait(guard).unwrap();
     }
+}
+
+fn normalize_console_input_for_r(line: &str) -> String {
+    line.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub(crate) fn push_plot_image(
@@ -1039,7 +1043,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
+    ipc::emit_output_image(&plot_id, &mime_type, &data, !is_new);
 
     Ok(())
 }

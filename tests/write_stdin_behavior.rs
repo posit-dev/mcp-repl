@@ -303,7 +303,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
+async fn write_stdin_preserves_batch_output_with_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -316,14 +316,6 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         return Ok(());
     }
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
-    assert!(
-        !text.contains("> 1+"),
-        "did not expect echoed first line in trimmed reply, got: {text:?}"
-    );
-    assert!(
-        !text.contains("\n+ 1"),
-        "did not expect echoed continuation line in trimmed reply, got: {text:?}"
-    );
 
     let result = session
         .write_stdin_raw_with("echo_trim_x <- 1\necho_trim_x + 1", Some(30.0))
@@ -331,21 +323,16 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
-    assert!(
-        !text.contains("> echo_trim_x <- 1"),
-        "did not expect leading assignment echo in trimmed reply, got: {text:?}"
-    );
-    assert!(
-        !text.contains("> echo_trim_x + 1"),
-        "did not expect trailing expression echo when the whole prefix is safe to trim, got: {text:?}"
-    );
 
     let result = session
         .write_stdin_raw_with("echo_drop_x <- 1\necho_drop_y <- 2", Some(30.0))
         .await?;
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
-    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
+    assert!(
+        text.ends_with("> "),
+        "expected final prompt after assignment-only input, got: {text:?}"
+    );
 
     let result = session
         .write_stdin_raw_with("cat('A\\n')\n1+1", Some(30.0))
@@ -361,8 +348,8 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         "expected second expression result, got: {text:?}"
     );
     assert!(
-        !text.contains("> cat('A\\n')"),
-        "did not expect the leading echoed prefix to remain, got: {text:?}"
+        text.contains("> cat('A\\n')"),
+        "expected the leading echoed prefix to remain visible, got: {text:?}"
     );
     assert!(
         text.contains("> 1+1"),
@@ -426,7 +413,7 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
+async fn write_stdin_preserves_matched_readline_transcripts() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -449,8 +436,8 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
     let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
     let second_text = result_text(&second);
     assert!(
-        !second_text.contains("FIRST> alpha"),
-        "did not expect matched readline transcript in follow-up reply, got: {second_text:?}"
+        second_text.contains("FIRST> alpha"),
+        "expected matched readline transcript in follow-up reply, got: {second_text:?}"
     );
     assert!(
         second_text.contains("SECOND> "),
@@ -468,8 +455,8 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        !transcript.contains("SECOND> beta"),
-        "did not expect matched readline transcript in transcript.txt, got: {transcript:?}"
+        transcript.contains("SECOND> beta"),
+        "expected matched readline transcript in transcript.txt, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),
@@ -1100,8 +1087,8 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
     let spilled_before_delete =
         wait_until_file_contains_via_polls(&mut session, &transcript_path, "mid080").await?;
     assert!(
-        !spilled_before_delete.contains("tail"),
-        "did not expect tail before test releases the R-side gate, got: {spilled_before_delete:?}"
+        !spilled_before_delete.lines().any(|line| line == "tail"),
+        "did not expect tail output before test releases the R-side gate, got: {spilled_before_delete:?}"
     );
 
     fs::remove_file(&transcript_path)?;
@@ -1128,7 +1115,7 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         );
     }
     assert!(
-        recreated_transcript.contains("tail"),
+        recreated_transcript.lines().any(|line| line == "tail"),
         "expected later small poll output to recreate the deleted spill file, got: {recreated_transcript:?}"
     );
     assert!(
@@ -1136,7 +1123,8 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         "did not expect earlier spilled text to be replayed after transcript deletion, got: {recreated_transcript:?}"
     );
     assert!(
-        final_text.contains("tail") || final_text.contains("<<repl status: idle>>"),
+        final_text.lines().any(|line| line == "tail")
+            || final_text.contains("<<repl status: idle>>"),
         "expected later small poll to either return inline tail text or settle idle after recreating the spill file, got: {final_text:?}"
     );
     assert!(
@@ -1584,7 +1572,7 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
+async fn pager_follow_up_after_resolved_timeout_preserves_visible_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
     let temp = workspace_tempdir()?;
@@ -1650,8 +1638,8 @@ async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> 
         "expected the fresh pager follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
-        "did not expect the timed-out request echo to leak into the next pager reply, got: {follow_up_text:?}"
+        follow_up_text.contains("file.exists(") && follow_up_text.contains("print(1+1)"),
+        "expected the timed-out request echo to remain visible in the next pager reply, got: {follow_up_text:?}"
     );
 
     Ok(())

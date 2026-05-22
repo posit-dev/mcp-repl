@@ -727,7 +727,7 @@ def _emit_plots(force_figures=None, force_all=False, record_only=False):
         encoded = base64.b64encode(data).decode("ascii")
         is_new = fig_num not in prev_known
         _mcp_repl_flush_original_stdio()
-        _mcp_repl.emit_plot_image("image/png", encoded, not bool(is_new), str(fig_num))
+        _mcp_repl.emit_output_image("image/png", encoded, not bool(is_new), str(fig_num))
 
     if current_fig_num in new_known:
         try:

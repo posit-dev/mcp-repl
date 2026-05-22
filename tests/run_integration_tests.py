@@ -494,7 +494,7 @@ def r_console_basic(client: McpStdioClient) -> None:
     received = client.repl("1+1\n", timeout_ms=30000)
 
     expected = tool_result(
-        text("[1] 2\n"),
+        text("> 1+1\n[1] 2\n"),
         text("> "),
     )
 
@@ -504,7 +504,7 @@ def r_console_basic(client: McpStdioClient) -> None:
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("> 1+1\n[1] 2\n"), text("> ")),
         warmup,
         "warmup repl",
     )
@@ -546,7 +546,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
 def r_reset_clears_state(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("> ")),
+        tool_result(text("> x <- 1\n"), text("> ")),
         set_var,
         "set variable repl",
     )
@@ -560,7 +560,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] FALSE\n"), text("> ")),
+        tool_result(text('> print(exists("x"))\n[1] FALSE\n'), text("> ")),
         after_reset,
         "after reset repl",
     )
@@ -569,7 +569,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("> ")),
+        tool_result(text("> x <- 1\n"), text("> ")),
         set_var,
         "set variable before restart",
     )
@@ -578,7 +578,7 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     assert_identical(
         tool_result(
             text("[repl] new session started\n"),
-            text("[1] FALSE\n"),
+            text('> print(exists("x"))\n[1] FALSE\n'),
             text("> "),
         ),
         restarted,
@@ -761,8 +761,8 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     )
     assert_identical(
         tool_result(
-            text(expected_pager_lines(1, 13)),
-            text("--More-- (6p, 16.2%, @0..78/480)"),
+            text('> for (i in 1:80) cat(sprintf("L%04d\\n", i))\n' + expected_pager_lines(1, 5)),
+            text("--More-- (6p, 14.2%, @0..75/525)"),
         ),
         initial,
         "pager initial repl",
@@ -771,8 +771,8 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     next_page = client.repl(":next", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text(expected_pager_lines(14, 26)),
-            text("--More-- (5p, 32.5%, @78..156/480)"),
+            text(expected_pager_lines(6, 18)),
+            text("--More-- (5p, 29.1%, @75..153/525)"),
         ),
         next_page,
         "pager next repl",
@@ -781,9 +781,9 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     search = client.repl(":/L0031", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text("[pager] search for `L0031` @180"),
+            text("[pager] search for `L0031` @225"),
             text("[match] L0031\n"),
-            text("--More-- (4p, 37.5%, @180/480)"),
+            text("--More-- (4p, 42.8%, @225/525)"),
         ),
         search,
         "pager search repl",
@@ -792,7 +792,7 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     quit_result = client.repl(":q", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text("(END, 37.5%, @180/480)"),
+            text("(END, 42.8%, @225/525)"),
             text("> "),
         ),
         quit_result,

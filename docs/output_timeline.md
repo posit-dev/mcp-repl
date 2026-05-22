@@ -15,7 +15,8 @@ The worker emits different kinds of information on different channels:
   may merge stdout/stderr identity and apply terminal behavior such as CRLF
   translation, echo, and width-dependent formatting.
 - Sideband IPC carries structural events such as `readline_start`,
-  `readline_result`, `plot_image`, and `session_end`.
+  `readline_input_bytes`, `readline_discard_bytes`, `output_image`, and
+  `session_end`.
 
 Raw pipes and IPC do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
@@ -33,8 +34,8 @@ changes what must stay buffered between tool calls.
   reply.
 - Worker-owned `output_text` frames and raw stdout/stderr bytes are buffered as
   `TextFragment` events.
-- Sideband events are stored alongside text so later formatting can suppress
-  echoed input and respect request boundaries.
+- Sideband events are stored alongside text so later formatting can respect
+  image placement and request boundaries.
 - When a reply is sealed, `PendingOutputSnapshot::format_contents()` converts the
   tape into `WorkerContent`.
 
@@ -42,8 +43,8 @@ changes what must stay buffered between tool calls.
 
 - `src/output_capture.rs` stores text in the global output ring and stores image
   or server-status events at byte offsets within that ring.
-- `src/worker_process.rs` reads ranges from that ring, collapses echoed input,
-  and then asks `src/pager/` to page the resulting mixed text/image stream.
+- `src/worker_process.rs` reads ranges from that ring and then asks
+  `src/pager/` to page the resulting mixed text/image stream.
 
 ## Timeline vs completion
 
@@ -51,36 +52,36 @@ The important design split is not "files mode vs pager mode". It is:
 
 - timeline resolution: reconstruct the visible output order from text plus
   sideband facts
-- completion cleanup: once the server knows a request has finished, trim echoed
-  input, append protocol warnings, and restore the final prompt
+- completion cleanup: once the server knows a request has finished, append
+  protocol warnings, restore final prompt metadata, and apply any
+  sideband-driven presentation cleanup
 
 Timeline resolution must not depend on request completion. For example, the
-server does not need to wait for completion to know that a `plot_image` event
-belongs before a later `readline_result` echo. That ordering fact is already
-present in the mixed timeline.
+server does not need to wait for completion to know where an `output_image`
+event belongs relative to worker-owned `output_text`. That ordering fact is
+already present in the mixed timeline.
 
 Completion matters only for reply cleanup choices that are unsafe while a
 request is still in flight. In particular:
 
-- timed-out or otherwise non-final drains must preserve echoed input so the user
+- timed-out or otherwise non-final drains must preserve visible text so the user
   can still see what is running
-- completed replies may trim or drop echo-only content once the server knows the
-  request is settled
+- completed replies may add completion notices or restore final prompt metadata
+  once the server knows the request is settled
 
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
 
-Echo matching must be driven by the sideband facts themselves:
+Prompt and input accounting must be driven by sideband facts themselves:
 
 - `readline_start` supplies prompt text; the server derives whether it is
-  unsatisfied from active-turn stdin accounting
-- `readline_result` is emitted by the worker, but it describes the exact
-  prompt text and input line that `readline` consumed and echoed
-- the server should match and collapse those exact sideband facts
+  unsatisfied from active-turn stdin accounting.
+- `readline_input_bytes` and `readline_discard_bytes` report the exact
+  active-turn bytes consumed or discarded before worker-side normalization.
 - the server should not parse visible output looking for prompt shapes such as
-  `>`, `...`, or `Browse[n]>`
+  `>`, `...`, or `Browse[n]>`.
 
-That matching is only opportunistic:
+Visible text handling remains conservative:
 
 - raw stdout/stderr remains authoritative for text that did not arrive through
   `output_text`
@@ -88,14 +89,8 @@ That matching is only opportunistic:
   but it is not authoritative for separate stdout/stderr stream identity
 - forked children, spawned subprocesses, or other writers may interleave with
   or corrupt what would otherwise have been a clean echoed line
-- if exact sideband-to-stdout matching fails or becomes ambiguous, the server
-  should degrade softly to raw captured stdout/stderr for that region, without
-  eliding echo or inventing a cleaned-up transcript
-- sideband-first carryover is source-aware: the backend records whether a
-  `readline_result` echo should arrive as raw stdout or as `output_text`, and
-  carryover only trims later text from that same source. Prompt spelling only
-  decides whether a prompt shape is eligible for carryover; it does not decide
-  the source.
+- the server should degrade softly to raw captured stdout/stderr for ambiguous
+  regions, without eliding echo or inventing a cleaned-up transcript
 
 ## Ownership split
 
@@ -116,9 +111,11 @@ resolution, not in the wire protocol.
 - Worker text must remain in the order observed on its stdout/stderr pipes.
 - For PTY-backed workers, worker text from the PTY master must remain in the
   order observed on that terminal stream.
-- Sideband `readline_result` events define the order in which input lines were
-  consumed.
-- Sideband `plot_image` events define when plot updates happened relative to
+- Sideband `readline_input_bytes` events define the order in which active-turn
+  input bytes were consumed.
+- Sideband `readline_discard_bytes` events define the order in which
+  active-turn input bytes were discarded.
+- Sideband `output_image` events define when image updates happened relative to
   other sideband events.
 - Visible replies must preserve evaluation order when that order is represented
   by sideband facts. They must not invent a strict order between unframed
@@ -131,8 +128,7 @@ the same thing as "execution order in the backend".
 
 - `src/output_capture.rs`: pager-mode output ring and event storage.
 - `src/pending_output_tape.rs`: files-mode mixed event tape.
-- `src/worker_process.rs`: request completion, echo suppression, and reply
-  assembly.
+- `src/worker_process.rs`: request completion and reply assembly.
 - `src/ipc.rs`: sideband event intake and per-request IPC bookkeeping.
 - `docs/worker_sideband_protocol.md`: wire-level IPC contract.
 

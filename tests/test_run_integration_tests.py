@@ -134,13 +134,20 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.responses = [
-                    ("x <- 1\n", 30000, self_module.tool_result(self_module.text("> "))),
+                    (
+                        "x <- 1\n",
+                        30000,
+                        self_module.tool_result(
+                            self_module.text("> x <- 1\n"),
+                            self_module.text("> "),
+                        ),
+                    ),
                     (
                         '\u0004print(exists("x"))\n',
                         30000,
                         self_module.tool_result(
                             self_module.text("[repl] new session started\n"),
-                            self_module.text("[1] FALSE\n"),
+                            self_module.text('> print(exists("x"))\n[1] FALSE\n'),
                             self_module.text("> "),
                         ),
                     ),

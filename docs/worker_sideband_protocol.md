@@ -35,9 +35,10 @@ does not send shutdown code or a sideband shutdown command. See
 Built-in Python uses PTY-backed C stdin/stdout/stderr where the platform launch
 supports it so CPython calls `PyOS_ReadlineFunctionPointer`. The Python callback
 emits readline accounting facts from that CPython path. Sideband IPC stays
-separate from the PTY. On Windows, sandboxed Python currently falls back to the
-pipe-backed compatibility path because the restricted wrapper must eventually
-own ConPTY process creation.
+separate from the PTY. On Windows, sandboxed Python currently fails fast because
+the old pipe-backed compatibility path cannot satisfy byte-accurate sideband
+stdin accounting; the restricted wrapper must own ConPTY process creation before
+that mode can be restored.
 
 ## Direction: server -> worker
 
@@ -47,9 +48,8 @@ own ConPTY process creation.
   process or process group.
 - This is for worker-owned bookkeeping only. It does not carry user input and
   does not replace the OS interrupt.
-- The worker may emit `readline_discard` or `readline_discard_bytes` for
-  exact active-turn stdin bytes it discarded before delivering them to the
-  runtime.
+- The worker may emit `readline_discard_bytes` for exact active-turn stdin
+  bytes it discarded before delivering them to the runtime.
 
 ## Direction: worker -> server
 
@@ -77,35 +77,23 @@ invalid base64, and unknown message types are protocol errors.
 - Prompt rendering is derived from this structured event, not from raw
   stdout/stderr parsing.
 
-`readline_input`
-- `{ "type": "readline_input", "text": <string> }`
-- Emitted after the worker delivers active-turn stdin text to the
-  runtime-facing input layer.
-- The server encodes `text` as UTF-8 and removes those bytes from the active
-  stdin queue. A mismatch is a protocol error.
-
 `readline_input_bytes`
 - `{ "type": "readline_input_bytes", "data_b64": <base64> }`
 - Emitted after the worker delivers active-turn stdin bytes to the
-  runtime-facing input layer when an exact consumed byte range is not
-  representable as a complete UTF-8 string at that event boundary.
+  runtime-facing input layer.
+- `data_b64` must encode the exact bytes received from the server over the
+  worker stdin transport before any worker-side normalization or interpreter
+  adaptation. The worker may normalize the bytes it passes to the runtime, but
+  this accounting event reports the pre-normalized wire bytes.
 - The server decodes `data_b64` and removes those bytes from the active stdin
   queue. Invalid base64 or a byte mismatch is a protocol error.
-
-`readline_discard`
-- `{ "type": "readline_discard", "text": <string> }`
-- Emitted after the worker discards active-turn stdin text during
-  interrupt/reset cleanup without delivering it to the runtime.
-- The server encodes `text` as UTF-8 and removes those bytes from the active
-  stdin queue. A mismatch is a protocol error.
-- Workers must emit this only for exact bytes they can identify. Bytes flushed
-  from terminal state without being observed are not reportable.
 
 `readline_discard_bytes`
 - `{ "type": "readline_discard_bytes", "data_b64": <base64> }`
 - Emitted after the worker discards exact active-turn stdin bytes during
-  interrupt/reset cleanup when those bytes are not representable as a complete
-  UTF-8 string at that event boundary.
+  interrupt/reset cleanup without delivering them to the runtime.
+- `data_b64` must encode the exact bytes received from the server over the
+  worker stdin transport before any worker-side normalization.
 - The server decodes `data_b64` and removes those bytes from the active stdin
   queue. Invalid base64 or a byte mismatch is a protocol error.
 - Workers must emit this only for exact bytes they can identify. Bytes flushed
@@ -132,6 +120,8 @@ invalid base64, and unknown message types are protocol errors.
 - Carries worker-owned image bytes on the ordered sideband stream.
 - `image_id` is worker-local source identity for update grouping. The server
   owns MCP response image IDs.
+- There is no image acknowledgement message.
+- Workers must not delay stdout/stderr output waiting for sideband responses.
 
 `session_end`
 - `{ "type": "session_end", "reason": <string>, "message_b64": <base64, optional> }`
@@ -139,70 +129,6 @@ invalid base64, and unknown message types are protocol errors.
 - `reason` is required for protocol workers. Recognized values are `shutdown`,
   `reset`, `runtime_exit`, `crash`, and `protocol_error`.
 - After this event, the worker must not emit more output.
-
-## Transitional Compatibility Frames
-
-These frames remain for built-in workers that have not fully migrated on every
-platform. New protocol workers should not copy them for steady-state request
-handling. Built-in R no longer uses them. Built-in PTY-backed Python still
-receives the legacy request-boundary frames, but stdin accounting comes from
-CPython readline events rather than a separate stdin bridge.
-
-`stdin_write`
-- `{ "type": "stdin_write", "byte_len": <usize>, "line_count": <usize>, "final_prompt": <string, optional> }`
-- Legacy server-to-worker request metadata emitted before the server writes raw
-  input payload bytes to stdin.
-- Built-in PTY-backed Python uses these fields only to install active request state
-  before CPython's next readline callback consumes stdin.
-- Pipe-backed Python may still use them for the compatibility path until it is
-  migrated to the same readline accounting model.
-
-`stdin_write_complete`
-- `{ "type": "stdin_write_complete" }`
-- Legacy server-to-worker marker emitted after the server has written the raw
-  input payload bytes to stdin.
-
-`backend_info`
-- `{ "type": "backend_info", "supports_images": <bool> }`
-- Legacy startup metadata accepted from older built-in workers.
-- It may describe narrow worker capabilities, but it must not turn steady-state
-  server request handling into language-specific policy.
-
-`stdin_write_ack`
-- `{ "type": "stdin_write_ack" }`
-- Legacy worker-to-server request-boundary acknowledgement.
-- This only acknowledges request-boundary state. It is not an acknowledgement
-  for stdout/stderr, PTY output, plot images, prompt completion, or request
-  completion.
-
-`python_interrupt_ack`
-- `{ "type": "python_interrupt_ack" }`
-- Transitional worker-to-server acknowledgement used only by built-in PTY-backed
-  Python after it has processed its private `python_interrupt` cleanup message.
-- It means the worker has attempted exact discard accounting and terminal input
-  flushing before the server delivers SIGINT. It is not a generic protocol
-  interrupt acknowledgement.
-
-`readline_result`
-- `{ "type": "readline_result", "prompt": <string>, "line": <string> }`
-- Legacy echo metadata emitted after a line is read.
-- The server may use it for conservative echo suppression of raw pipe output,
-  but completion is driven by `readline_start`, `readline_input`,
-  `readline_input_bytes`, `readline_discard`, `readline_discard_bytes`, and
-  `session_end`.
-
-`plot_image`
-- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
-- Legacy image payload used by built-in plot emitters.
-- `source` is optional worker-local plot source identity, such as a graphics
-  device or figure slot. It is not a response image ID; the server owns response
-  image IDs and uses `source` only to keep distinct plot sources from
-  collapsing into one response image.
-- There is no plot-image acknowledgement message.
-- Workers must not delay stdout/stderr output waiting for sideband responses.
-- If an update is the first image event for a new server request, the server
-  treats it as a new response image and includes a server notice that it updates
-  the previously sent image.
 
 ## Notes
 

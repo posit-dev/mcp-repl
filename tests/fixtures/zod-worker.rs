@@ -1,6 +1,6 @@
 #[cfg(target_family = "unix")]
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let stdin = io::stdin();
-    let normalize_terminal_input = cfg!(windows) && stdin.is_terminal();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
     let mut command_state = CommandState {
@@ -96,14 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let command = line.trim_end_matches(['\r', '\n']);
         let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
-            format!("{text}\n")
-        } else if normalize_terminal_input {
-            normalize_terminal_line_for_protocol(&line)
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(b'\n');
+            bytes
         } else {
-            line.clone()
+            line.as_bytes().to_vec()
         };
-        writer.send(&WorkerToServer::ReadlineInput {
-            text: reported_input,
+        writer.send(&WorkerToServer::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(reported_input),
         })?;
         timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
@@ -341,18 +340,17 @@ fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()
 }
 
 fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
-    let (text, len) = {
+    let (bytes, len) = {
         let buffer = reader.fill_buf()?;
-        let text = std::str::from_utf8(buffer)
-            .map_err(io::Error::other)?
-            .to_string();
-        (text, buffer.len())
+        (buffer.to_vec(), buffer.len())
     };
     if len == 0 {
         return Ok(());
     }
     reader.consume(len);
-    writer.send(&WorkerToServer::ReadlineDiscard { text })
+    writer.send(&WorkerToServer::ReadlineDiscardBytes {
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 fn escape_bytes(bytes: &[u8]) -> String {
@@ -368,10 +366,6 @@ fn escape_bytes(bytes: &[u8]) -> String {
         }
     }
     escaped
-}
-
-fn normalize_terminal_line_for_protocol(line: &str) -> String {
-    line.replace("\r\n", "\n")
 }
 
 fn send_readline_start(
@@ -643,11 +637,11 @@ enum WorkerToServer {
     ReadlineStart {
         prompt: String,
     },
-    ReadlineInput {
-        text: String,
+    ReadlineInputBytes {
+        data_b64: String,
     },
-    ReadlineDiscard {
-        text: String,
+    ReadlineDiscardBytes {
+        data_b64: String,
     },
     OutputText {
         stream: String,

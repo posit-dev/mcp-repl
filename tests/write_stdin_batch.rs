@@ -321,7 +321,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
+async fn write_stdin_pages_huge_echo_only_inputs() -> TestResult<()> {
     let session = common::spawn_server().await?;
 
     let input = (1..=2_000)
@@ -341,19 +341,22 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        !text.contains("--More--"),
-        "did not expect pager activation for echo-only input, got: {text:?}"
+        text.contains("--More--"),
+        "expected pager activation for visible echo-only input, got: {text:?}"
     );
     assert!(
         !text.contains("echoed input elided"),
         "did not expect echo elision marker, got: {text:?}"
     );
-    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
+    assert!(
+        text.contains("x1 <- 1"),
+        "expected echoed input to remain visible, got: {text:?}"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
+async fn write_stdin_preserves_huge_leading_echo_prefix_and_later_echo() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 
     let mut input = String::new();
@@ -390,8 +393,8 @@ async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -
     );
     if let Some(spill_text) = spill_text {
         assert!(
-            !spill_text.contains("x500 <- 500"),
-            "did not expect the pure leading echo prefix in spill file, got: {spill_text:?}"
+            spill_text.contains("x500 <- 500"),
+            "expected the pure leading echo prefix in spill file, got: {spill_text:?}"
         );
         assert!(
             spill_text.contains("y500 <- 500"),
@@ -411,8 +414,8 @@ async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -
             "expected output from both cat() calls inline, got: {text:?}"
         );
         assert!(
-            !text.contains("x500 <- 500"),
-            "did not expect the pure leading echo prefix inline, got: {text:?}"
+            text.contains("x500 <- 500"),
+            "expected the pure leading echo prefix inline, got: {text:?}"
         );
         assert!(
             text.contains("y500 <- 500"),

@@ -6,7 +6,7 @@ This future work item covers the larger simplification goal behind the current o
 
 - keep the R worker thin and factual,
 - let it run the ordinary embedded REPL,
-- emit runtime facts such as `readline_start`, `readline_result`, and plot/image events over IPC,
+- emit runtime facts such as `readline_start`, byte-level input accounting, and image events over IPC,
 - move request-boundary interpretation and timeline reconstruction into the server.
 
 This is intentionally broader than the current branch milestone.

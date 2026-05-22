@@ -51,11 +51,10 @@ buckets:
   is documentation wiring, not request execution policy, and should move with
   `docs/futurework/composable-tool-descriptions.md`.
 - `src/worker_process.rs` selects a `BackendDriver` at `WorkerManager`
-  creation. The driver owns backend-specific request metadata such as Python
-  newline normalization, Python `line_count`, whether to wait for
-  `stdin_write_ack`, interrupt behavior, completion waiting, and backend-info
+  creation. The driver owns backend-specific adapter details such as Python
+  newline normalization, interrupt behavior, completion waiting, and worker
   startup tolerance. This is acceptable only as a server-side adapter until the
-  worker can advertise these narrow capabilities.
+  worker protocol can make these narrow capabilities generic.
 - `src/worker_process.rs` also branches at spawn time to configure R worker mode
   or Python worker mode in the same `mcp-repl` executable. Python launch setup
   additionally resolves the selected interpreter executable and loadable
@@ -88,12 +87,10 @@ semantics, not implementation language.
 
 Initial candidates:
 
-- `supports_images`: already present in `backend_info`; controls whether image
-  events are expected.
-- `stdin_write_ack`: whether the server must wait for worker acceptance after
-  `stdin_write` before writing raw stdin bytes.
-- `backend_info_startup_timeout`: whether startup may continue after a short
-  backend-info timeout.
+- `supports_images`: reported at worker startup; controls whether image events
+  are expected.
+- `worker_ready_startup_timeout`: whether startup may continue after a short
+  worker-ready timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional
   output-settle window before the server returns the timeout reply.
 

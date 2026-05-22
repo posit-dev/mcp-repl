@@ -32,15 +32,15 @@ The repository is organized around a few concrete subsystems rather than deep pa
   protocol-worker path use pipes; built-in Python uses PTY-backed C
   stdin/stdout/stderr where the platform launch supports it so CPython takes
   its normal interactive readline path. On Windows, sandboxed Python currently
-  falls back to pipe stdin until ConPTY can be attached inside the restricted
-  wrapper.
+  fails fast because the old pipe stdin compatibility path cannot satisfy the
+  byte sideband accounting contract; it can be restored once ConPTY can be
+  attached inside the restricted wrapper.
 - Both backends receive request payloads through worker stdin and use sideband
   IPC for structured facts. R owns stdin through a worker reader thread keyed by
   payload byte length. PTY-backed Python lets CPython own stdin through
   `PyOS_ReadlineFunctionPointer`; the callback reports `readline_start`,
-  `readline_input`, and `readline_discard` accounting facts. Its legacy
-  `stdin_write_ack` frames acknowledge request-boundary setup, not prompt
-  completion or output delivery.
+  `readline_input_bytes`, and `readline_discard_bytes` accounting facts using
+  the exact bytes received over worker stdin before interpreter normalization.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
 - Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On the Unix PTY path, Python leaves CPython's fd-backed stdin surface intact; Windows keeps sideband-aware direct-stdin bridges for the ConPTY path so CRLF and console reads remain accountably tied to active MCP input.

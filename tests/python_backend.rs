@@ -108,6 +108,7 @@ fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
         || text.contains("worker io error: Permission denied")
         || text.contains("failed to locate a shared libpython")
+        || text.contains("Windows sandboxed Python cannot satisfy strict sideband stdin accounting")
 }
 
 #[cfg(windows)]
@@ -1399,7 +1400,7 @@ print("AFTER_DIRECT_READS")
         "expected follow-up REPL input after direct reads to execute, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
         "direct stdin reads desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
@@ -1485,7 +1486,7 @@ print("AFTER_DUP_STDIN")
         "expected REPL input after duplicated stdin fd read to execute, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
         "duplicated stdin fd read desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
@@ -1519,7 +1520,7 @@ async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
         "expected second CRLF line to run, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
         "CRLF input desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
@@ -1561,7 +1562,7 @@ print("AFTER_RAW_SMALL_READS")
         "expected REPL input after split raw reads to execute, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
         "split raw-read CRLF desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
@@ -1604,7 +1605,7 @@ print("AFTER_RAW_SPLIT_READS")
         "expected REPL input after split CRLF reads to execute, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin"),
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
         "split CRLF raw reads desynchronized active stdin accounting: {text:?}"
     );
     Ok(())
@@ -1646,8 +1647,7 @@ print("AFTER_RAW_SPLIT_UTF8")
         "expected REPL input after split UTF-8 raw read to execute, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input text does not match active stdin")
-            && !text.contains("readline_input_bytes bytes does not match active stdin")
+        !text.contains("readline_input_bytes bytes does not match active stdin")
             && !text.contains("reported input with no active turn"),
         "split UTF-8 raw read desynchronized active stdin accounting: {text:?}"
     );
@@ -1761,7 +1761,7 @@ async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResu
         "expected sandboxed Python input() prompt and answer, got: {text:?}"
     );
     assert!(
-        !text.contains("readline_input reported input with no active turn"),
+        !text.contains("readline_input_bytes reported input with no active turn"),
         "sandboxed Python pipe fallback lost active stdin accounting: {text:?}"
     );
     Ok(())

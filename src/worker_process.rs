@@ -28,7 +28,7 @@ use crate::ipc::{
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
-use crate::ipc::{IpcHandlers, IpcPlotImage};
+use crate::ipc::{IpcHandlers, IpcOutputImage};
 #[cfg(test)]
 use crate::output_capture::OutputRange;
 use crate::output_capture::{
@@ -39,9 +39,7 @@ use crate::output_capture::{
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
-use crate::pending_output_tape::{
-    FormattedPendingOutput, PendingOutputTape, PendingSidebandKind, PendingTextSource,
-};
+use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate,
     prepare_worker_command_with_managed_network,
@@ -246,19 +244,16 @@ impl LiveOutputCapture {
         }
     }
 
-    fn append_image(&self, image: IpcPlotImage) {
+    fn append_image(&self, image: IpcOutputImage) {
         if image.updates_previous_image {
             self.output_timeline.append_text_event(
                 PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
                 false,
                 ContentOrigin::Server,
-                Some(image.readline_results_seen),
+                None,
             );
             if let Some(tape) = &self.pending_output_tape {
-                tape.append_stdout_status_event(
-                    PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
-                    image.readline_results_seen,
-                );
+                tape.append_stdout_status_event(PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(), 0);
             }
         }
         self.output_timeline.append_image(
@@ -266,16 +261,10 @@ impl LiveOutputCapture {
             image.mime_type.clone(),
             image.data.clone(),
             image.is_new,
-            image.readline_results_seen,
+            0,
         );
         if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(
-                image.id,
-                image.mime_type,
-                image.data,
-                image.is_new,
-                image.readline_results_seen,
-            );
+            tape.append_image(image.id, image.mime_type, image.data, image.is_new, 0);
         }
     }
 
@@ -338,6 +327,10 @@ trait BackendDriver: Send {
         prepare_worker_stdin_payload(text)
     }
 
+    fn prepare_stdin_write_payload(&self, payload: &[u8]) -> Vec<u8> {
+        payload.to_vec()
+    }
+
     fn on_input_start(
         &mut self,
         text: &str,
@@ -359,7 +352,7 @@ trait BackendDriver: Send {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
-    fn refresh_backend_info(
+    fn wait_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
@@ -371,76 +364,6 @@ struct RBackendDriver;
 impl RBackendDriver {
     fn new() -> Self {
         Self
-    }
-}
-
-#[cfg_attr(
-    any(target_family = "unix", target_family = "windows"),
-    allow(dead_code)
-)]
-fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-    ipc.begin_request();
-    if let Some(message) = ipc.take_protocol_error() {
-        return Err(WorkerError::Protocol(message));
-    }
-    Ok(())
-}
-
-#[cfg_attr(
-    any(target_family = "unix", target_family = "windows"),
-    allow(dead_code)
-)]
-fn driver_announce_stdin_write(
-    byte_len: usize,
-    line_count: usize,
-    final_prompt: Option<String>,
-    ipc: &ServerIpcConnection,
-) -> Result<(), WorkerError> {
-    ipc.send(ServerToWorkerIpcMessage::StdinWrite {
-        byte_len,
-        line_count,
-        final_prompt,
-    })
-    .map_err(WorkerError::Io)
-}
-
-fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-    ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
-        .map_err(WorkerError::Io)
-}
-
-fn driver_wait_for_stdin_write_ack(
-    ipc: &ServerIpcConnection,
-    timeout: Duration,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_stdin_write_ack(timeout) {
-        Ok(()) => Ok(()),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before accepting stdin".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected before worker accepted stdin".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
-#[cfg(any(target_family = "unix", target_family = "windows"))]
-fn driver_wait_for_python_interrupt_ack(
-    ipc: &ServerIpcConnection,
-    timeout: Duration,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_python_interrupt_ack(timeout) {
-        Ok(()) => Ok(()),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before cleaning up interrupt".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected before worker cleaned up interrupt".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
@@ -465,59 +388,19 @@ fn driver_wait_for_completion(
 }
 
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc.get() {
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+    if let Some(ipc) = process.ipc.get()
+        && ipc.send(ServerToWorkerIpcMessage::Interrupt).is_ok()
+    {
+        return Ok(());
     }
     process.send_interrupt()
 }
 
-#[cfg_attr(
-    any(target_family = "unix", target_family = "windows"),
-    allow(dead_code)
-)]
-fn driver_refresh_backend_info(
-    ipc: ServerIpcConnection,
-    timeout: Duration,
-    timeout_is_ok: bool,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
-        Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
-                return Err(WorkerError::Protocol(format!(
-                    "unsupported worker protocol {} version {}",
-                    protocol.name, protocol.version
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(WorkerError::Protocol(
-            "unexpected ipc message while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::Timeout) => {
-            if timeout_is_ok {
-                Ok(())
-            } else {
-                Err(WorkerError::Protocol(
-                    "timed out waiting for backend info".to_string(),
-                ))
-            }
-        }
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before backend info".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
-fn driver_refresh_worker_ready(
+fn driver_wait_worker_ready(
     ipc: ServerIpcConnection,
     timeout: Duration,
 ) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
+    match ipc.wait_for_worker_ready(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
                 return Err(WorkerError::Protocol(format!(
@@ -544,10 +427,6 @@ fn driver_refresh_worker_ready(
 }
 
 impl BackendDriver for RBackendDriver {
-    fn prepare_input_text(&self, text: String) -> String {
-        normalize_input_newlines(&text)
-    }
-
     fn on_input_start(
         &mut self,
         _text: &str,
@@ -590,429 +469,71 @@ impl BackendDriver for RBackendDriver {
         process.send_r_interrupt()
     }
 
-    fn refresh_backend_info(
+    fn wait_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_worker_ready(ipc, timeout)
-    }
-}
-
-#[cfg(not(target_family = "unix"))]
-struct PythonBackendDriver;
-
-#[cfg(not(target_family = "unix"))]
-impl PythonBackendDriver {
-    fn new() -> Self {
-        Self
-    }
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_final_prompt_hint(text: &str) -> Option<String> {
-    if text.trim().is_empty() {
-        return None;
-    }
-    if python_requires_continuation(text) {
-        return Some("... ".to_string());
-    }
-    if text_ends_with_blank_line(text) {
-        return None;
-    }
-    let text = text.trim_end_matches(['\r', '\n']);
-    let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
-    let has_previous_line = text.contains(['\n', '\r']);
-    let trimmed_last = last_line.trim_end();
-    let code_last = python_line_code_before_comment(trimmed_last).trim_end();
-    if code_last.ends_with(':')
-        || code_last.trim_start().starts_with('@')
-        || (has_previous_line && python_has_open_block_suite(text))
-    {
-        Some("... ".to_string())
-    } else {
-        None
-    }
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_has_open_block_suite(text: &str) -> bool {
-    let mut block_indents = Vec::new();
-    let mut scan_state = PythonLineScanState::default();
-    for line in text.lines() {
-        let code = python_line_code_before_comment_with_state(line, &mut scan_state);
-        let code = code.trim_end();
-        if code.trim().is_empty() {
-            if line.trim().is_empty() && !scan_state.continuation_active() {
-                block_indents.clear();
-            }
-            continue;
-        }
-        let indent = python_line_indent(line);
-        while block_indents
-            .last()
-            .is_some_and(|block_indent| indent <= *block_indent)
-        {
-            block_indents.pop();
-        }
-        if code.ends_with(':') {
-            block_indents.push(indent);
-        }
-    }
-    !block_indents.is_empty()
-}
-
-#[cfg(not(target_family = "unix"))]
-#[derive(Default)]
-struct PythonLineScanState {
-    quote: Option<(char, bool)>,
-    escaped: bool,
-    groups: Vec<char>,
-}
-
-#[cfg(not(target_family = "unix"))]
-impl PythonLineScanState {
-    fn continuation_active(&self) -> bool {
-        self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
-    }
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_line_code_before_comment_with_state(
-    line: &str,
-    state: &mut PythonLineScanState,
-) -> String {
-    let mut code = String::with_capacity(line.len());
-    let mut chars = line.char_indices().peekable();
-
-    while let Some((_, ch)) = chars.next() {
-        if let Some((delimiter, triple)) = state.quote {
-            if triple {
-                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
-                    state.quote = None;
-                }
-                continue;
-            }
-
-            if state.escaped {
-                state.escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                state.escaped = true;
-                continue;
-            }
-            if ch == delimiter {
-                state.quote = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '#' => break,
-            '\'' | '"' => {
-                let triple = take_next_two_indexed(&mut chars, ch);
-                state.quote = Some((ch, triple));
-            }
-            '(' => {
-                state.groups.push(')');
-                code.push(ch);
-            }
-            '[' => {
-                state.groups.push(']');
-                code.push(ch);
-            }
-            '{' => {
-                state.groups.push('}');
-                code.push(ch);
-            }
-            ')' | ']' | '}' if state.groups.last() == Some(&ch) => {
-                state.groups.pop();
-                code.push(ch);
-            }
-            ')' | ']' | '}' => {
-                code.push(ch);
-            }
-            _ => code.push(ch),
-        }
-    }
-
-    if state.quote.is_some_and(|(_, triple)| !triple) {
-        state.quote = None;
-        state.escaped = false;
-    }
-    code
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_line_indent(line: &str) -> usize {
-    line.chars()
-        .take_while(|ch| matches!(ch, ' ' | '\t'))
-        .count()
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_line_code_before_comment(line: &str) -> &str {
-    let mut chars = line.char_indices().peekable();
-    let mut quote: Option<(char, bool)> = None;
-    let mut escaped = false;
-
-    while let Some((idx, ch)) = chars.next() {
-        if let Some((delimiter, triple)) = quote {
-            if triple {
-                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
-                    quote = None;
-                }
-                continue;
-            }
-
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '#' => return &line[..idx],
-            '\'' | '"' => {
-                let triple = take_next_two_indexed(&mut chars, ch);
-                quote = Some((ch, triple));
-            }
-            _ => {}
-        }
-    }
-
-    line
-}
-
-#[cfg(not(target_family = "unix"))]
-fn python_requires_continuation(text: &str) -> bool {
-    has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
-}
-
-#[cfg(not(target_family = "unix"))]
-fn final_line_continues_with_backslash(text: &str) -> bool {
-    let Some(line) = text.lines().last() else {
-        return false;
-    };
-    python_line_code_before_comment(line)
-        .trim_end()
-        .chars()
-        .rev()
-        .take_while(|ch| *ch == '\\')
-        .count()
-        % 2
-        == 1
-}
-
-#[cfg(not(target_family = "unix"))]
-fn has_unclosed_python_group_or_string(text: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut chars = text.chars().peekable();
-    let mut quote: Option<(char, bool)> = None;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if let Some((delimiter, triple)) = quote {
-            if triple {
-                if ch == delimiter && take_next_two(&mut chars, delimiter) {
-                    quote = None;
-                }
-                continue;
-            }
-
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '#' => {
-                for next in chars.by_ref() {
-                    if matches!(next, '\n' | '\r') {
-                        break;
-                    }
-                }
-            }
-            '\'' | '"' => {
-                let triple = take_next_two(&mut chars, ch);
-                quote = Some((ch, triple));
-            }
-            '(' => stack.push(')'),
-            '[' => stack.push(']'),
-            '{' => stack.push('}'),
-            ')' | ']' | '}' if stack.last() == Some(&ch) => {
-                stack.pop();
-            }
-            ')' | ']' | '}' => {}
-            _ => {}
-        }
-    }
-
-    match quote {
-        Some((_, true)) => true,
-        Some((_, false)) => false,
-        None => !stack.is_empty(),
-    }
-}
-
-#[cfg(not(target_family = "unix"))]
-fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
-    let mut clone = chars.clone();
-    if clone.next() != Some(expected) || clone.next() != Some(expected) {
-        return false;
-    }
-    chars.next();
-    chars.next();
-    true
-}
-
-#[cfg(not(target_family = "unix"))]
-fn take_next_two_indexed(
-    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    expected: char,
-) -> bool {
-    let mut clone = chars.clone();
-    if clone.next().map(|(_, ch)| ch) != Some(expected)
-        || clone.next().map(|(_, ch)| ch) != Some(expected)
-    {
-        return false;
-    }
-    chars.next();
-    chars.next();
-    true
-}
-
-#[cfg(not(target_family = "unix"))]
-fn text_ends_with_blank_line(text: &str) -> bool {
-    let Some(text) = strip_one_line_ending(text) else {
-        return false;
-    };
-    text.ends_with('\n') || text.ends_with('\r')
-}
-
-#[cfg(not(target_family = "unix"))]
-fn strip_one_line_ending(text: &str) -> Option<&str> {
-    text.strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .or_else(|| text.strip_suffix('\r'))
-}
-
-#[cfg(not(target_family = "unix"))]
-impl BackendDriver for PythonBackendDriver {
-    fn on_input_start(
-        &mut self,
-        text: &str,
-        payload: &[u8],
-        ipc: &ServerIpcConnection,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        driver_on_input_start(text, ipc)?;
-        let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
-        let final_prompt = python_final_prompt_hint(text);
-        driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
-        driver_wait_for_stdin_write_ack(ipc, timeout)
-    }
-
-    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        driver_announce_stdin_write_complete(ipc)
-    }
-
-    fn should_settle_output_after_timeout(
-        &self,
-        _oversized_output: OversizedOutputMode,
-        _pending_input: Option<&str>,
-    ) -> bool {
-        false
-    }
-
-    fn wait_for_completion(
-        &mut self,
-        timeout: Duration,
-        ipc: ServerIpcConnection,
-    ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
-    }
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        driver_interrupt(process)
-    }
-
-    fn refresh_backend_info(
-        &mut self,
-        ipc: ServerIpcConnection,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        driver_refresh_backend_info(ipc, timeout, false)
+        driver_wait_worker_ready(ipc, timeout)
     }
 }
 
 struct ProtocolBackendDriver {
-    #[cfg(any(target_family = "unix", target_family = "windows"))]
-    python_request_generation: Option<u64>,
-    #[cfg(target_family = "windows")]
-    normalize_input_newlines: bool,
+    stdin_transport: WorkerStdinTransport,
+    stdin_accounting: ProtocolStdinAccounting,
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolStdinAccounting {
+    Payload,
+    NormalizeNewlines,
+    ExternalWorker,
 }
 
 impl ProtocolBackendDriver {
-    fn new() -> Self {
+    fn new(
+        stdin_transport: WorkerStdinTransport,
+        stdin_accounting: ProtocolStdinAccounting,
+    ) -> Self {
         Self {
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
-            python_request_generation: None,
-            #[cfg(target_family = "windows")]
-            normalize_input_newlines: false,
+            stdin_transport,
+            stdin_accounting,
         }
-    }
-
-    #[cfg(any(target_family = "unix", target_family = "windows"))]
-    fn python() -> Self {
-        Self {
-            python_request_generation: Some(0),
-            #[cfg(target_family = "windows")]
-            normalize_input_newlines: true,
-        }
-    }
-
-    #[cfg(target_family = "windows")]
-    fn windows_pty() -> Self {
-        Self {
-            python_request_generation: None,
-            normalize_input_newlines: true,
-        }
-    }
-
-    #[cfg(any(target_family = "unix", target_family = "windows"))]
-    fn next_python_request_generation(&mut self) -> Option<u64> {
-        let generation = self.python_request_generation.as_mut()?;
-        *generation = generation.wrapping_add(1);
-        Some(*generation)
     }
 }
 
 impl BackendDriver for ProtocolBackendDriver {
-    fn prepare_input_text(&self, text: String) -> String {
+    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
+        let payload = match self.stdin_accounting {
+            ProtocolStdinAccounting::NormalizeNewlines => {
+                prepare_worker_stdin_payload(&normalize_input_newlines(text))
+            }
+            ProtocolStdinAccounting::Payload | ProtocolStdinAccounting::ExternalWorker => {
+                prepare_worker_stdin_payload(text)
+            }
+        };
         #[cfg(target_family = "windows")]
-        if self.normalize_input_newlines {
-            return normalize_input_newlines(&text);
+        {
+            if matches!(self.stdin_transport, WorkerStdinTransport::Pty)
+                && matches!(
+                    self.stdin_accounting,
+                    ProtocolStdinAccounting::ExternalWorker
+                )
+            {
+                return windows_pty_accounting_payload(&payload);
+            }
         }
-        text
+        payload
+    }
+
+    fn prepare_stdin_write_payload(&self, payload: &[u8]) -> Vec<u8> {
+        #[cfg(target_family = "windows")]
+        {
+            if matches!(self.stdin_transport, WorkerStdinTransport::Pty) {
+                return windows_pty_input_payload(payload);
+            }
+        }
+        payload.to_vec()
     }
 
     fn on_input_start(
@@ -1020,36 +541,12 @@ impl BackendDriver for ProtocolBackendDriver {
         _text: &str,
         payload: &[u8],
         ipc: &ServerIpcConnection,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<(), WorkerError> {
         ipc.begin_request_with_stdin(payload);
-        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
-        let _ = timeout;
-        #[cfg(any(target_family = "unix", target_family = "windows"))]
-        if let Some(request_generation) = self.next_python_request_generation() {
-            // Built-in PTY-backed Python reads request bytes through worker stdin
-            // like a protocol worker, but its plot hooks still need a Python-side
-            // request boundary before follow-up stdin is consumed. The generation
-            // also lets a late interrupt avoid draining fd 0 after the next request
-            // has started. Custom protocol workers do not receive this private
-            // bridge message.
-            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart { request_generation })
-                .map_err(WorkerError::Io)?;
-            driver_wait_for_stdin_write_ack(ipc, timeout)?;
-        }
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
-        Ok(())
-    }
-
-    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        #[cfg(any(target_family = "unix", target_family = "windows"))]
-        if self.python_request_generation.is_some() {
-            driver_announce_stdin_write_complete(ipc)?;
-        }
-        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
-        let _ = ipc;
         Ok(())
     }
 
@@ -1070,33 +567,15 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        #[cfg(any(target_family = "unix", target_family = "windows"))]
-        if let Some(request_generation) = self.python_request_generation {
-            if let Some(ipc) = process.ipc.get() {
-                ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
-                    .map_err(WorkerError::Io)?;
-                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
-            }
-            #[cfg(target_family = "windows")]
-            {
-                let _ = process.send_interrupt();
-                return Ok(());
-            }
-            #[cfg(not(target_family = "windows"))]
-            {
-                return process.send_interrupt();
-            }
-        }
-
         driver_interrupt(process)
     }
 
-    fn refresh_backend_info(
+    fn wait_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_worker_ready(ipc, timeout)
+        driver_wait_worker_ready(ipc, timeout)
     }
 }
 
@@ -1125,9 +604,7 @@ impl std::error::Error for WorkerError {
     }
 }
 
-const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_family = "unix", target_family = "windows"))]
-const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -1146,8 +623,6 @@ const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt();
     let mut prompt_variants = ipc.take_prompt_history();
-    let mut echo_event_count = ipc.pending_echo_event_count();
-    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -1155,25 +630,18 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt();
         let mut next_prompt_variants = ipc.take_prompt_history();
-        let next_echo_event_count = ipc.pending_echo_event_count();
-        if next_echo_event_count > echo_event_count {
-            saw_late_echo_event = true;
-        }
-        let changed = next_prompt.is_some()
-            || !next_prompt_variants.is_empty()
-            || next_echo_event_count != echo_event_count;
+        let changed = next_prompt.is_some() || !next_prompt_variants.is_empty();
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
-        echo_event_count = next_echo_event_count;
 
         if changed {
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
+            if stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -1252,7 +720,7 @@ struct CompletionInfo {
 fn completion_info_from_ipc(
     ipc: &ServerIpcConnection,
     session_end_seen: bool,
-    echo_source: OutputTextSource,
+    _echo_source: OutputTextSource,
 ) -> CompletionInfo {
     let (prompt, prompt_variants) = if session_end_seen {
         (None, None)
@@ -1261,15 +729,10 @@ fn completion_info_from_ipc(
         (prompt, Some(prompt_variants))
     };
 
-    let mut echo_events = ipc.take_echo_events();
-    for event in &mut echo_events {
-        event.source = echo_source;
-    }
-
     CompletionInfo {
         prompt,
         prompt_variants,
-        echo_events,
+        echo_events: Vec::new(),
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
     }
@@ -1326,14 +789,7 @@ fn worker_launch_stdin_transport(
     sandbox_state: &SandboxState,
 ) -> WorkerStdinTransport {
     let default_transport = worker_launch.stdin_transport();
-    #[cfg(target_family = "windows")]
-    {
-        if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
-            && sandbox_state.sandbox_policy.requires_sandbox()
-        {
-            return WorkerStdinTransport::Pipe;
-        }
-    }
+    let _ = sandbox_state;
     default_transport
 }
 
@@ -1356,35 +812,29 @@ fn backend_driver_for_launch(
 }
 
 fn protocol_backend_driver(spec: &CustomWorkerSpec) -> Box<dyn BackendDriver> {
-    #[cfg(target_family = "windows")]
-    if spec.stdin.transport() == WorkerStdinTransport::Pty {
-        return Box::new(ProtocolBackendDriver::windows_pty());
-    }
-    let _ = spec;
-    Box::new(ProtocolBackendDriver::new())
+    Box::new(ProtocolBackendDriver::new(
+        spec.stdin.transport(),
+        ProtocolStdinAccounting::ExternalWorker,
+    ))
 }
 
 fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver> {
-    #[cfg(target_family = "unix")]
+    let stdin_transport = builtin_worker_stdin_transport(Backend::Python, sandbox_state);
+    let stdin_accounting = if cfg!(target_family = "windows")
+        && matches!(stdin_transport, WorkerStdinTransport::Pty)
     {
-        let _ = sandbox_state;
-        Box::new(ProtocolBackendDriver::python())
-    }
-    #[cfg(target_family = "windows")]
-    {
-        if builtin_worker_stdin_transport(Backend::Python, sandbox_state)
-            == WorkerStdinTransport::Pty
-        {
-            Box::new(ProtocolBackendDriver::python())
+        if sandbox_state.sandbox_policy.requires_sandbox() {
+            ProtocolStdinAccounting::ExternalWorker
         } else {
-            Box::new(PythonBackendDriver::new())
+            ProtocolStdinAccounting::NormalizeNewlines
         }
-    }
-    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
-    {
-        let _ = sandbox_state;
-        Box::new(PythonBackendDriver::new())
-    }
+    } else {
+        ProtocolStdinAccounting::Payload
+    };
+    Box::new(ProtocolBackendDriver::new(
+        stdin_transport,
+        stdin_accounting,
+    ))
 }
 
 pub struct WorkerManager {
@@ -2707,10 +2157,11 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
+        let write_payload = self.driver.prepare_stdin_write_payload(&payload);
         self.process
             .as_mut()
             .expect("worker process should be available")
-            .write_stdin_payload(payload, remaining)?;
+            .write_stdin_payload(write_payload, remaining)?;
         self.driver.on_input_written(&ipc)?;
         Ok(RequestState {
             timeout: worker_timeout,
@@ -3219,8 +2670,7 @@ impl WorkerManager {
         while start.elapsed() < total {
             thread::sleep(poll);
             let now = self.pending_output_tape.current_settle_state();
-            if !ready
-                && (now.has_image || now.readline_results_seen > baseline.readline_results_seen)
+            if !ready && (now.has_image || now.sideband_events_seen > baseline.sideband_events_seen)
             {
                 ready = true;
                 stable_for = Duration::from_millis(0);
@@ -4364,7 +3814,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.wait_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -4453,7 +3903,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.wait_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -6084,13 +5534,22 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
+        #[cfg(target_family = "windows")]
+        if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
+            && sandbox_state.sandbox_policy.requires_sandbox()
+        {
+            return Err(WorkerError::Protocol(
+                "python backend unavailable: Windows sandboxed Python cannot satisfy strict sideband stdin accounting until sandboxed ConPTY launch is supported"
+                    .to_string(),
+            ));
+        }
+
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(
             oversized_output,
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
-        let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -6149,22 +5608,12 @@ impl WorkerProcess {
                         text.is_continuation,
                     );
                 })),
-                on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
+                on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
                     image_capture.append_image(image);
                 })),
                 on_readline_start: Some(Arc::new(move |prompt: String| {
                     sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
                 })),
-                on_readline_result: {
-                    let sideband_capture = live_output.clone();
-                    Some(Arc::new(move |event: IpcEchoEvent| {
-                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                            prompt: event.prompt,
-                            line: event.line,
-                            echo_source: readline_echo_source,
-                        });
-                    }))
-                },
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
@@ -7250,8 +6699,8 @@ fn maybe_report_sandbox_exec_failure(
 fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
     match err {
         WorkerError::Protocol(message) => {
-            message.contains("ipc disconnected while waiting for backend info")
-                || message.contains("worker session ended before backend info")
+            message.contains("ipc disconnected while waiting for worker_ready")
+                || message.contains("worker session ended before worker_ready")
                 || message.contains("worker process exited immediately")
         }
         _ => false,
@@ -8044,9 +7493,8 @@ where
         for command in rx {
             match command {
                 StdinCommand::Write { payload, reply } => {
-                    let translated = windows_pty_input_payload(&payload);
                     let result = writer
-                        .write_all(&translated)
+                        .write_all(&payload)
                         .and_then(|_| writer.flush())
                         .map_err(WorkerError::Io);
                     let _ = reply.send(result);
@@ -8078,6 +7526,35 @@ fn windows_pty_input_payload(payload: &[u8]) -> Vec<u8> {
             }
             b'\n' => {
                 translated.push(b'\r');
+                index += 1;
+            }
+            byte => {
+                translated.push(byte);
+                index += 1;
+            }
+        }
+    }
+    translated
+}
+
+#[cfg(target_family = "windows")]
+fn windows_pty_accounting_payload(payload: &[u8]) -> Vec<u8> {
+    let mut translated = Vec::with_capacity(payload.len().saturating_mul(2));
+    let mut index = 0;
+    while index < payload.len() {
+        match payload[index] {
+            b'\r' => {
+                translated.push(b'\r');
+                translated.push(b'\n');
+                if payload.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            b'\n' => {
+                translated.push(b'\r');
+                translated.push(b'\n');
                 index += 1;
             }
             byte => {
@@ -8263,7 +7740,7 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_sandboxed_python_falls_back_to_pipe_stdin_transport() {
+    fn windows_sandboxed_python_reports_pty_stdin_transport() {
         let sandbox_state = SandboxState {
             sandbox_policy: SandboxPolicy::ReadOnly,
             ..SandboxState::default()
@@ -8271,7 +7748,7 @@ mod tests {
 
         assert_eq!(
             builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
-            WorkerStdinTransport::Pipe
+            WorkerStdinTransport::Pty
         );
         assert!(
             matches!(
@@ -8282,9 +7759,9 @@ mod tests {
                 )
                 .get("stdin_transport")
                 .and_then(serde_json::Value::as_str),
-                Some("pipe")
+                Some("pty")
             ),
-            "sandboxed Windows Python should report the effective pipe transport"
+            "sandboxed Windows Python should report PTY transport even though launch currently fails fast"
         );
     }
 
@@ -8302,56 +7779,17 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_family = "unix"))]
-    #[test]
-    fn python_pipe_driver_drops_stale_stdin_write_ack_before_waiting() {
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        worker
-            .send(WorkerToServerIpcMessage::StdinWriteAck)
-            .expect("seed ack");
-        server
-            .wait_for_stdin_write_ack(Duration::from_secs(1))
-            .expect("consume seed ack");
-        worker
-            .send(WorkerToServerIpcMessage::StdinWriteAck)
-            .expect("seed stale ack");
-        for _ in 0..100 {
-            if server.has_stdin_write_ack_for_test() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            server.has_stdin_write_ack_for_test(),
-            "expected stale ack to reach the server inbox before starting the next request"
-        );
-
-        let mut driver = PythonBackendDriver::new();
-        let result = driver.on_input_start(
-            "print(1)",
-            b"print(1)\n",
-            &server,
-            Duration::from_millis(20),
-        );
-
-        assert!(
-            matches!(result, Err(WorkerError::Timeout(_))),
-            "driver should drop stale acks before waiting for the new worker ack, got {result:?}"
-        );
-        assert!(
-            matches!(
-                worker.recv(Some(Duration::from_secs(1))),
-                Some(ServerToWorkerIpcMessage::StdinWrite { .. })
-            ),
-            "driver should still announce the new stdin write after resetting the request"
-        );
-    }
-
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
             source: OutputTextSource::Ipc,
+        }
+    }
+
+    fn readline_input_bytes(bytes: &[u8]) -> WorkerToServerIpcMessage {
+        WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
     }
 
@@ -8555,24 +7993,24 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_python_interrupt_ignores_ctrl_break_delivery_failure() {
-        let child = sleeping_test_child();
-        let child_id = child.id();
+    fn windows_protocol_interrupt_uses_sideband_without_ctrl_break() {
+        let child = successful_test_child();
         let mut process = test_worker_process(child);
-        let mut driver = ProtocolBackendDriver::python();
+        let (server, _worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        process.ipc.set(server);
+        let mut driver =
+            ProtocolBackendDriver::new(WorkerStdinTransport::Pty, ProtocolStdinAccounting::Payload);
         let (result, events) =
             capture_recorded_windows_ctrl_events_with_result(0, || driver.interrupt(&mut process));
 
-        let _ = process.kill();
-
         assert!(
             result.is_ok(),
-            "Python sideband interrupt should not fail when Ctrl-Break delivery fails: {result:?}"
+            "protocol sideband interrupt should not fail when Ctrl-Break delivery fails: {result:?}"
         );
         assert_eq!(
             events,
-            vec![(CTRL_BREAK_EVENT, child_id)],
-            "expected best-effort Ctrl-Break attempt to still target the worker process group"
+            Vec::<(u32, u32)>::new(),
+            "expected protocol interrupts to use sideband without Ctrl-Break"
         );
     }
 
@@ -8618,6 +8056,15 @@ mod tests {
     #[test]
     fn windows_pty_input_payload_translates_crlf_as_one_enter() {
         assert_eq!(windows_pty_input_payload(b"a\r\nb\nc\rd"), b"a\rb\rc\rd");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_pty_accounting_payload_reports_console_line_endings() {
+        assert_eq!(
+            windows_pty_accounting_payload(b"a\r\nb\nc\rd"),
+            b"a\r\nb\r\nc\r\nd"
+        );
     }
 
     #[test]
@@ -8881,16 +8328,14 @@ mod tests {
     #[test]
     fn completion_infers_nested_waiting_prompt_that_reuses_primary_prompt_text() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("value <- readline(prompt = \"> \")", &server)
-            .expect("begin request");
+        server.begin_request_with_stdin(b"value <- readline(prompt = \"> \")\n");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: prompt.clone(),
-            line: "value <- readline(prompt = \"> \")\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(
+            b"value <- readline(prompt = \"> \")\n",
+        ));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8899,26 +8344,18 @@ mod tests {
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
                 .expect("expected stable waiting prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(
-            completion.echo_events[0].line,
-            "value <- readline(prompt = \"> \")\n"
-        );
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
     fn completion_infers_stable_waiting_prompt_without_worker_completion_event() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server).expect("begin request");
+        server.begin_request_with_stdin(b"1+1\n");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: prompt.clone(),
-            line: "1+1\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"1+1\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8928,22 +8365,18 @@ mod tests {
                 .expect("expected stable waiting prompt to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].line, "1+1\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
     fn completion_settle_after_prompt_does_not_count_as_execution_timeout() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server).expect("begin request");
+        server.begin_request_with_stdin(b"1+1\n");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: prompt.clone(),
-            line: "1+1\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"1+1\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8954,21 +8387,17 @@ mod tests {
                 .expect("expected prompt seen before timeout to complete after stable settle");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].line, "1+1\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
     fn completion_infers_stable_continuation_prompt_when_input_is_consumed() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server).expect("begin request");
+        server.begin_request_with_stdin(b"1+\n");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "1+\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"1+\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
         });
@@ -8980,9 +8409,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_settle_waits_for_late_echo_events() {
+    fn completion_settle_waits_for_late_stdin_accounting() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+\n1", &server).expect("begin request");
+        server.begin_request_with_stdin(b"1+\n1\n");
         let prompt = "> ".to_string();
         let delayed_worker = worker.clone();
 
@@ -8992,15 +8421,9 @@ mod tests {
 
         let late_sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(1));
-            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "1+\n".to_string(),
-            });
+            let _ = delayed_worker.send(readline_input_bytes(b"1+\n"));
             thread::sleep(Duration::from_millis(21));
-            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "+ ".to_string(),
-                line: "1\n".to_string(),
-            });
+            let _ = delayed_worker.send(readline_input_bytes(b"1\n"));
             let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineStart {
                 prompt: "> ".to_string(),
             });
@@ -9012,12 +8435,8 @@ mod tests {
         late_sender.join().expect("late sender should join");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 2);
+        assert!(completion.echo_events.is_empty());
         assert!(completion.protocol_warnings.is_empty());
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "1+\n");
-        assert_eq!(completion.echo_events[1].prompt, "+ ");
-        assert_eq!(completion.echo_events[1].line, "1\n");
     }
 
     #[test]
@@ -9036,13 +8455,7 @@ mod tests {
             "did not expect buffered readline start to complete request, got {early:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1+\n".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "1+\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"1+\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
         });
@@ -9054,13 +8467,7 @@ mod tests {
             "did not expect buffered continuation start to complete request, got {continuation:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1\n".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "+ ".to_string(),
-            line: "1\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"1\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -9070,16 +8477,15 @@ mod tests {
                 .expect("expected completion after final unsatisfied prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 2);
-        assert_eq!(completion.echo_events[0].line, "1+\n");
-        assert_eq!(completion.echo_events[1].line, "1\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
-    fn next_request_result_is_retained_when_prompt_is_already_active() {
+    fn next_request_prompt_is_retained_when_prompt_is_already_active() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        driver_on_input_start("first()", &server).expect("begin request");
+        server.begin_request_with_stdin(b"first()\n");
+        let _ = worker.send(readline_input_bytes(b"first()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -9091,11 +8497,8 @@ mod tests {
         .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
-        driver_on_input_start("second()", &server).expect("begin request");
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "second()\n".to_string(),
-        });
+        server.begin_request_with_stdin(b"second()\n");
+        let _ = worker.send(readline_input_bytes(b"second()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -9105,23 +8508,18 @@ mod tests {
                 .expect("expected second completion");
 
         assert!(second.protocol_warnings.is_empty());
-        assert_eq!(second.echo_events.len(), 1);
-        assert_eq!(second.echo_events[0].prompt, "> ");
-        assert_eq!(second.echo_events[0].line, "second()\n");
+        assert!(second.echo_events.is_empty());
     }
 
     #[test]
-    fn completion_preserves_echo_events_when_next_prompt_arrives_immediately() {
+    fn completion_preserves_prompt_when_next_prompt_arrives_immediately() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        driver_on_input_start("first()", &server).expect("begin request");
+        server.begin_request_with_stdin(b"first()\n");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "first()\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"first()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -9132,25 +8530,20 @@ mod tests {
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "first()\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
-    fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
+    fn completion_reports_session_end_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("quit()", &server).expect("begin request");
+        server.begin_request_with_stdin(b"quit()\n");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "quit()\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"quit()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
-            reason: None,
+            reason: "runtime_exit".to_string(),
             message_b64: None,
         });
 
@@ -9159,29 +8552,24 @@ mod tests {
                 .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
     fn completion_reports_session_end_when_prompt_is_also_stable() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("quit()", &server).expect("begin request");
+        server.begin_request_with_stdin(b"quit()\n");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "quit()\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"quit()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
         thread::sleep(Duration::from_millis(25));
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
-            reason: None,
+            reason: "runtime_exit".to_string(),
             message_b64: None,
         });
         thread::sleep(Duration::from_millis(25));
@@ -9191,9 +8579,7 @@ mod tests {
                 .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
+        assert!(completion.echo_events.is_empty());
     }
 
     #[test]
@@ -9400,15 +8786,13 @@ mod tests {
         manager.pending_request = true;
         manager.pending_request_started_at = Some(std::time::Instant::now());
         manager.pending_request_input = Some("quit()\n".to_string());
+        server.begin_request_with_stdin(b"quit()\n");
 
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt,
-            line: "quit()\n".to_string(),
-        });
+        let _ = worker.send(readline_input_bytes(b"quit()\n"));
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: ">>> ".to_string(),
         });
@@ -9705,94 +9089,6 @@ mod tests {
             contents_text(&second.detached_prefix_contents),
             "\\xA9\n",
             "expected the next request output to stay split after the detached prefix was sealed"
-        );
-    }
-
-    #[test]
-    fn files_nonfinal_drain_preserves_echo_only_input() {
-        let manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Files,
-        )
-        .expect("worker manager");
-
-        manager
-            .pending_output_tape
-            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
-        manager
-            .pending_output_tape
-            .append_sideband(PendingSidebandKind::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
-            });
-
-        let formatted = manager.drain_formatted_output();
-
-        assert_eq!(
-            formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected an in-flight files-mode drain to keep the echoed command visible"
-        );
-    }
-
-    #[test]
-    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
-        let manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Files,
-        )
-        .expect("worker manager");
-
-        manager
-            .pending_output_tape
-            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
-        manager
-            .pending_output_tape
-            .append_sideband(PendingSidebandKind::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
-            });
-        manager.pending_output_tape.append_stdout_bytes(b"start\n");
-
-        let formatted = manager.drain_formatted_output();
-
-        assert_eq!(
-            formatted.contents,
-            vec![WorkerContent::stdout("start\n")],
-            "expected worker output to hide the leading timed-out REPL echo again"
-        );
-    }
-
-    #[test]
-    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
-        let mut manager = WorkerManager::new(
-            Backend::R,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Files,
-        )
-        .expect("worker manager");
-
-        manager
-            .pending_output_tape
-            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
-        manager
-            .pending_output_tape
-            .append_sideband(PendingSidebandKind::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
-            });
-
-        let context = manager.prepare_input_context_files();
-
-        assert_eq!(
-            context.detached_prefix_contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
         );
     }
 
@@ -10181,13 +9477,12 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
             updates_previous_image: false,
-            readline_results_seen: 0,
         });
         capture.append_sideband(PendingSidebandKind::RequestBoundary);
 
@@ -10218,50 +9513,6 @@ mod tests {
     }
 
     #[test]
-    fn files_output_capture_anchors_update_notice_before_late_echo() {
-        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            OversizedOutputMode::Files,
-            tape.clone(),
-            OutputTimeline::new(output_ring),
-        );
-
-        capture.append_sideband(PendingSidebandKind::ReadlineResult {
-            prompt: "> ".to_string(),
-            line: "lines(4:8, 4:8)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
-        });
-        capture.append_image(IpcPlotImage {
-            id: "img-1".to_string(),
-            data: "AA==".to_string(),
-            mime_type: "image/png".to_string(),
-            is_new: true,
-            updates_previous_image: true,
-            readline_results_seen: 1,
-        });
-        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
-
-        let contents = tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
-            .contents;
-
-        assert_eq!(
-            contents,
-            vec![
-                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
-                WorkerContent::ContentImage {
-                    data: "AA==".to_string(),
-                    mime_type: "image/png".to_string(),
-                    id: "img-1".to_string(),
-                    is_new: true,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
@@ -10274,7 +9525,6 @@ mod tests {
 
         let output_capture = capture.clone();
         let start_capture = capture.clone();
-        let result_capture = capture.clone();
         let image_capture = capture.clone();
         let session_capture = capture.clone();
         let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
@@ -10284,14 +9534,7 @@ mod tests {
             on_readline_start: Some(Arc::new(move |prompt| {
                 start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
             })),
-            on_readline_result: Some(Arc::new(move |event| {
-                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                    prompt: event.prompt,
-                    line: event.line,
-                    echo_source: PendingTextSource::Ipc,
-                });
-            })),
-            on_plot_image: Some(Arc::new(move |image| {
+            on_output_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
             })),
             on_session_end: Some(Arc::new(move || {
@@ -10314,19 +9557,13 @@ mod tests {
             })
             .expect("send stdout output_text");
         worker
-            .send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "plot(1)\n".to_string(),
-            })
-            .expect("send readline_result");
-        worker
-            .send(WorkerToServerIpcMessage::PlotImage {
+            .send(WorkerToServerIpcMessage::OutputImage {
+                image_id: "plot-1".to_string(),
                 mime_type: "image/png".to_string(),
-                data: "AA==".to_string(),
-                is_update: false,
-                source: None,
+                data_b64: "AA==".to_string(),
+                update: false,
             })
-            .expect("send plot_image");
+            .expect("send output_image");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
@@ -10336,7 +9573,7 @@ mod tests {
             .expect("send stderr output_text");
         worker
             .send(WorkerToServerIpcMessage::SessionEnd {
-                reason: None,
+                reason: "runtime_exit".to_string(),
                 message_b64: None,
             })
             .expect("send session_end");
@@ -10346,7 +9583,7 @@ mod tests {
             .expect("server IPC consumed session_end");
 
         let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 6);
+        assert_eq!(snapshot.events.len(), 5);
         assert!(matches!(
             &snapshot.events[0],
             PendingOutputEvent::Sideband {
@@ -10365,22 +9602,15 @@ mod tests {
         ));
         assert!(matches!(
             &snapshot.events[2],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
-                ..
-            } if prompt == "> " && line == "plot(1)\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[3],
             PendingOutputEvent::Image {
                 id,
                 mime_type,
-                readline_results_seen: 1,
+                readline_results_seen: 0,
                 ..
             } if id.starts_with("image-") && mime_type == "image/png"
         ));
         assert!(matches!(
-            &snapshot.events[4],
+            &snapshot.events[3],
             PendingOutputEvent::TextFragment {
                 stream: TextStream::Stderr,
                 origin: ContentOrigin::Worker,
@@ -10389,7 +9619,7 @@ mod tests {
             } if bytes == b"err\n"
         ));
         assert!(matches!(
-            &snapshot.events[5],
+            &snapshot.events[4],
             PendingOutputEvent::Sideband {
                 kind: PendingSidebandKind::SessionEnd,
                 ..
@@ -10415,7 +9645,7 @@ mod tests {
         assert_eq!(image_event.0, b"before\n".len() as u64);
         assert!(image_event.1.starts_with("image-"));
         assert_eq!(image_event.2, "image/png");
-        assert_eq!(*image_event.3, 1);
+        assert_eq!(*image_event.3, 0);
     }
 
     #[test]
@@ -10427,13 +9657,12 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
 
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
             updates_previous_image: true,
-            readline_results_seen: 1,
         });
         capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
@@ -10462,6 +9691,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }
@@ -10517,13 +9747,13 @@ mod tests {
         });
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
             false,
         );
 
         assert!(
             retry,
-            "expected backend-info disconnect to trigger bwrap fallback"
+            "expected worker_ready disconnect to trigger bwrap fallback"
         );
         assert!(
             !manager.sandbox_state.use_linux_sandbox_bwrap,
@@ -10588,7 +9818,7 @@ mod tests {
         );
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
             false,
         );
         assert!(retry, "expected startup failure to disable bwrap");
@@ -10660,7 +9890,7 @@ mod tests {
         );
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
             false,
         );
         assert!(retry, "expected startup failure to disable bwrap");
@@ -11156,7 +10386,7 @@ mod tests {
             }
             Err(WorkerError::Protocol(message)) => {
                 assert!(
-                    message.contains("backend info") || message.contains("ipc disconnected"),
+                    message.contains("worker_ready") || message.contains("ipc disconnected"),
                     "expected the failed interrupt-tail respawn attempt to fail during worker startup, got: {message:?}"
                 );
             }
@@ -11231,7 +10461,7 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_custom_pty_driver_normalizes_input_newlines_for_accounting() {
+    fn windows_custom_pty_driver_reports_console_line_endings_for_accounting() {
         let spec = CustomWorkerSpec {
             executable: PathBuf::from("worker.exe"),
             args: Vec::new(),
@@ -11244,8 +10474,8 @@ mod tests {
         let driver = protocol_backend_driver(&spec);
 
         assert_eq!(
-            driver.prepare_input_text("a\r\nb\rc\n".to_string()),
-            "a\nb\nc\n"
+            driver.prepare_input_payload("a\r\nb\rc\n"),
+            b"a\r\nb\r\nc\r\n"
         );
     }
 

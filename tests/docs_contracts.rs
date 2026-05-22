@@ -101,13 +101,13 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
-fn worker_sideband_protocol_keeps_plot_images_one_way() {
+fn worker_sideband_protocol_keeps_output_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
-        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        "There is no plot-image acknowledgement message.",
+        r#"{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }"#,
+        "There is no image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
     ] {
         assert!(
@@ -116,7 +116,11 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
         );
     }
 
-    for forbidden in ["`plot_image_ack`", r#""sequence": <integer|null>"#] {
+    for forbidden in [
+        "`plot_image`",
+        "`output_image_ack`",
+        r#""sequence": <integer|null>"#,
+    ] {
         assert!(
             !protocol.contains(forbidden),
             "did not expect {forbidden} in docs/worker_sideband_protocol.md"
