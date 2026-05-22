@@ -388,11 +388,24 @@ fn driver_wait_for_completion(
 }
 
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc.get()
-        && ipc.send(ServerToWorkerIpcMessage::Interrupt).is_ok()
+    #[cfg(target_family = "windows")]
     {
-        return Ok(());
+        if process
+            .ipc
+            .get()
+            .is_some_and(|ipc| ipc.send(ServerToWorkerIpcMessage::Interrupt).is_ok())
+        {
+            return Ok(());
+        }
     }
+
+    #[cfg(not(target_family = "windows"))]
+    {
+        if let Some(ipc) = process.ipc.get() {
+            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+        }
+    }
+
     process.send_interrupt()
 }
 
@@ -7986,6 +7999,36 @@ mod tests {
             events,
             vec![(CTRL_BREAK_EVENT, child_id)],
             "expected Ctrl-Break to target the worker process group"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_protocol_interrupt_sends_sideband_and_sigint() {
+        let child = successful_test_child();
+        let child_id = child.id() as i32;
+        let mut process = test_worker_process(child);
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        process.ipc.set(server);
+        let mut driver =
+            ProtocolBackendDriver::new(WorkerStdinTransport::Pty, ProtocolStdinAccounting::Payload);
+
+        let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
+        let sideband = worker.recv(Some(Duration::from_secs(1)));
+        let _ = process.finish_exited();
+
+        assert!(
+            result.is_ok(),
+            "expected protocol interrupt to succeed: {result:?}"
+        );
+        assert!(
+            matches!(sideband, Some(ServerToWorkerIpcMessage::Interrupt)),
+            "expected protocol interrupt to notify sideband, got: {sideband:?}"
+        );
+        assert_eq!(
+            kills,
+            vec![(-child_id, libc::SIGINT)],
+            "expected Unix protocol interrupt to continue with SIGINT after sideband"
         );
     }
 
