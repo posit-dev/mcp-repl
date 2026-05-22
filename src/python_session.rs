@@ -157,6 +157,11 @@ fn take_exit_requested() -> bool {
 }
 
 pub(crate) fn interrupt() {
+    #[cfg(target_family = "unix")]
+    if !interrupt_cleanup_belongs_to_current_request() {
+        return;
+    }
+
     discard_pending_stdin();
     #[cfg(target_family = "unix")]
     flush_terminal_input();
@@ -170,6 +175,20 @@ pub(crate) fn interrupt() {
     finish_active_request_at_next_read();
     mark_interrupt_requested();
     request_platform_interrupt();
+}
+
+#[cfg(target_family = "unix")]
+fn interrupt_cleanup_belongs_to_current_request() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let guard = state.inner.lock().unwrap();
+    interrupt_cleanup_belongs_to_current_request_locked(&guard)
+}
+
+#[cfg(any(test, target_family = "unix"))]
+fn interrupt_cleanup_belongs_to_current_request_locked(guard: &SessionStateInner) -> bool {
+    guard.request_active && !guard.request_completed_at_stdin_wait
 }
 
 #[cfg(target_family = "unix")]
@@ -1096,8 +1115,21 @@ fn mark_request_input_delivered() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
+    if request_input_should_record_background_plots(state) {
+        record_background_plots();
+    }
     let mut guard = state.inner.lock().unwrap();
     mark_request_input_delivered_locked(&mut guard);
+}
+
+#[cfg(any(target_family = "unix", windows))]
+fn request_input_should_record_background_plots(state: &Arc<SessionState>) -> bool {
+    let guard = state.inner.lock().unwrap();
+    request_input_should_record_background_plots_locked(&guard)
+}
+
+fn request_input_should_record_background_plots_locked(guard: &SessionStateInner) -> bool {
+    !guard.request_active || guard.request_completed_at_stdin_wait
 }
 
 #[cfg(any(target_family = "unix", windows))]
@@ -2172,6 +2204,21 @@ fn emit_plots() {
     }
 }
 
+fn record_background_plots() {
+    let _gil = GilGuard::acquire();
+    let api = PythonApi::global();
+    let Ok(main) = api.import_module("__main__") else {
+        return;
+    };
+    let Ok(func) = api.get_attr_string(main.as_ptr(), "_mcp_repl_record_background_plots") else {
+        return;
+    };
+    let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
+    if let Ok(result) = PyPtr::from_owned(result, "Python background plot recording failed") {
+        drop(result);
+    }
+}
+
 fn request_active() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
@@ -2812,5 +2859,38 @@ mod tests {
         assert!(!guard.request_completed_at_stdin_wait);
         assert!(guard.plot_reset_pending);
         assert!(!guard.waiting_for_input);
+    }
+
+    #[test]
+    fn late_interrupt_cleanup_does_not_cross_request_boundary() {
+        let state = SessionState::new();
+        let mut guard = state.inner.lock().unwrap();
+
+        guard.request_active = true;
+        guard.request_completed_at_stdin_wait = false;
+        assert!(interrupt_cleanup_belongs_to_current_request_locked(&guard));
+
+        guard.request_completed_at_stdin_wait = true;
+        assert!(!interrupt_cleanup_belongs_to_current_request_locked(&guard));
+
+        guard.request_active = false;
+        guard.request_completed_at_stdin_wait = false;
+        assert!(!interrupt_cleanup_belongs_to_current_request_locked(&guard));
+    }
+
+    #[test]
+    fn delivered_input_records_background_plots_before_reopening_gate() {
+        let state = SessionState::new();
+        let mut guard = state.inner.lock().unwrap();
+
+        guard.request_active = false;
+        guard.request_completed_at_stdin_wait = false;
+        assert!(request_input_should_record_background_plots_locked(&guard));
+
+        guard.request_active = true;
+        assert!(!request_input_should_record_background_plots_locked(&guard));
+
+        guard.request_completed_at_stdin_wait = true;
+        assert!(request_input_should_record_background_plots_locked(&guard));
     }
 }
