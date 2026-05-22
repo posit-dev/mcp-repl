@@ -163,13 +163,11 @@ Optional `bwrap` stage:
 
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
 - Python support is not part of the stable Windows surface yet. The embedded
-  backend uses ConPTY for `danger-full-access` and `external-sandbox` launches,
-  but sandboxed `read-only` and `workspace-write` Python currently fail fast.
-  The removed pipe stdin compatibility path cannot satisfy byte-accurate
-  sideband stdin accounting; those modes can be restored when the Windows
-  wrapper can create ConPTY for the restricted child. Windows Python also
-  depends on the selected CPython installation exposing a loadable runtime
-  library.
+  backend uses ConPTY for `danger-full-access` and `external-sandbox` launches.
+  For sandboxed `read-only` and `workspace-write`, the server uses pipe stdio to
+  the sandbox wrapper, and the wrapper creates ConPTY for the restricted Python
+  child. Windows Python also depends on the selected CPython installation
+  exposing a loadable runtime library.
 - managed domain allowlists are not enforced on Windows yet; configuring allowed
   or denied domains with enabled network access currently fails closed.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:

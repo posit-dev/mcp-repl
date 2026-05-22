@@ -31,10 +31,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - Worker launch chooses the runtime stdin transport up front. R and the default
   protocol-worker path use pipes; built-in Python uses PTY-backed C
   stdin/stdout/stderr where the platform launch supports it so CPython takes
-  its normal interactive readline path. On Windows, sandboxed Python currently
-  fails fast because the old pipe stdin compatibility path cannot satisfy the
-  byte sideband accounting contract; it can be restored once ConPTY can be
-  attached inside the restricted wrapper.
+  its normal interactive readline path. On Windows sandboxed Python, the server
+  uses pipes to the sandbox wrapper and the wrapper creates ConPTY for the
+  restricted Python child, so CPython still sees a console inside the sandbox.
 - Both backends receive request payloads through worker stdin and use sideband
   IPC for structured facts. R owns stdin through a worker reader thread keyed by
   payload byte length. PTY-backed Python lets CPython own stdin through

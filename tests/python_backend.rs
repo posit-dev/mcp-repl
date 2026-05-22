@@ -108,7 +108,6 @@ fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
         || text.contains("worker io error: Permission denied")
         || text.contains("failed to locate a shared libpython")
-        || text.contains("Windows sandboxed Python cannot satisfy strict sideband stdin accounting")
 }
 
 #[cfg(windows)]
@@ -1762,20 +1761,20 @@ async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResu
     );
     assert!(
         !text.contains("readline_input_bytes reported input with no active turn"),
-        "sandboxed Python pipe fallback lost active stdin accounting: {text:?}"
+        "sandboxed Python wrapper ConPTY lost active stdin accounting: {text:?}"
     );
     Ok(())
 }
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_windows_read_only_sandbox_preserves_raw_pipe_bytes() -> TestResult<()> {
+async fn python_windows_read_only_sandbox_normalizes_console_read_bytes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = start_windows_read_only_python_session().await?;
 
     let result = session
         .write_stdin_raw_with(
-            "import os\nparts = [os.read(0, 1) for _ in range(3)]\nab\r\nprint('RAW_PIPE_PARTS', parts)\nprint('AFTER_RAW_PIPE')",
+            "import os\nparts = [os.read(0, 1) for _ in range(3)]\nab\r\nprint('RAW_CONSOLE_PARTS', parts)\nprint('AFTER_RAW_CONSOLE')",
             Some(10.0),
         )
         .await?;
@@ -1787,18 +1786,18 @@ async fn python_windows_read_only_sandbox_preserves_raw_pipe_bytes() -> TestResu
     }
     if is_busy_response(&text) {
         session.cancel().await?;
-        return Err("python Windows read-only sandbox raw pipe read remained busy".into());
+        return Err("python Windows read-only sandbox console read remained busy".into());
     }
 
     session.cancel().await?;
 
     assert!(
-        text.contains("RAW_PIPE_PARTS [b'a', b'b', b'\\r']"),
-        "expected os.read(0, ...) on pipe stdin to preserve CRLF bytes, got: {text:?}"
+        text.contains("RAW_CONSOLE_PARTS [b'a', b'b', b'\\n']"),
+        "expected os.read(0, ...) through wrapper ConPTY to observe console-normalized newline bytes, got: {text:?}"
     );
     assert!(
-        text.contains("AFTER_RAW_PIPE"),
-        "expected REPL input after raw pipe read to execute, got: {text:?}"
+        text.contains("AFTER_RAW_CONSOLE"),
+        "expected REPL input after console read to execute, got: {text:?}"
     );
     Ok(())
 }

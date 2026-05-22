@@ -35,10 +35,11 @@ does not send shutdown code or a sideband shutdown command. See
 Built-in Python uses PTY-backed C stdin/stdout/stderr where the platform launch
 supports it so CPython calls `PyOS_ReadlineFunctionPointer`. The Python callback
 emits readline accounting facts from that CPython path. Sideband IPC stays
-separate from the PTY. On Windows, sandboxed Python currently fails fast because
-the old pipe-backed compatibility path cannot satisfy byte-accurate sideband
-stdin accounting; the restricted wrapper must own ConPTY process creation before
-that mode can be restored.
+separate from the PTY. On Windows sandboxed Python, the server speaks pipe
+stdio to the sandbox wrapper; the wrapper owns ConPTY process creation for the
+restricted Python child and forwards stdin/stdout between the wrapper and
+ConPTY. That keeps the sandbox boundary intact while preserving CPython's
+console-backed readline path.
 
 ## Direction: server -> worker
 

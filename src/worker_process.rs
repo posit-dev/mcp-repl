@@ -789,6 +789,13 @@ fn worker_launch_stdin_transport(
     sandbox_state: &SandboxState,
 ) -> WorkerStdinTransport {
     let default_transport = worker_launch.stdin_transport();
+    #[cfg(target_family = "windows")]
+    if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
+        && sandbox_state.sandbox_policy.requires_sandbox()
+    {
+        return WorkerStdinTransport::Pipe;
+    }
+    #[cfg(not(target_family = "windows"))]
     let _ = sandbox_state;
     default_transport
 }
@@ -820,14 +827,8 @@ fn protocol_backend_driver(spec: &CustomWorkerSpec) -> Box<dyn BackendDriver> {
 
 fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver> {
     let stdin_transport = builtin_worker_stdin_transport(Backend::Python, sandbox_state);
-    let stdin_accounting = if cfg!(target_family = "windows")
-        && matches!(stdin_transport, WorkerStdinTransport::Pty)
-    {
-        if sandbox_state.sandbox_policy.requires_sandbox() {
-            ProtocolStdinAccounting::ExternalWorker
-        } else {
-            ProtocolStdinAccounting::NormalizeNewlines
-        }
+    let stdin_accounting = if cfg!(target_family = "windows") {
+        ProtocolStdinAccounting::NormalizeNewlines
     } else {
         ProtocolStdinAccounting::Payload
     };
@@ -5534,16 +5535,6 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
-        #[cfg(target_family = "windows")]
-        if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
-            && sandbox_state.sandbox_policy.requires_sandbox()
-        {
-            return Err(WorkerError::Protocol(
-                "python backend unavailable: Windows sandboxed Python cannot satisfy strict sideband stdin accounting until sandboxed ConPTY launch is supported"
-                    .to_string(),
-            ));
-        }
-
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(
             oversized_output,
@@ -5719,6 +5710,10 @@ impl WorkerProcess {
                 python_executable,
             );
         }
+        #[cfg(target_os = "windows")]
+        if matches!(backend, Backend::Python) && prepared_windows_launch.is_some() {
+            command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
+        }
         #[cfg(target_family = "windows")]
         let mut pty_command = {
             let mut builder = WindowsPtyCommand::new(&prepared.program);
@@ -5741,6 +5736,9 @@ impl WorkerProcess {
                     crate::python_session::PYTHON_EXECUTABLE_ENV,
                     python_executable,
                 );
+            }
+            if matches!(backend, Backend::Python) && prepared_windows_launch.is_some() {
+                builder.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
             }
             builder
         };
@@ -7740,7 +7738,7 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_sandboxed_python_reports_pty_stdin_transport() {
+    fn windows_sandboxed_python_reports_wrapper_pipe_transport() {
         let sandbox_state = SandboxState {
             sandbox_policy: SandboxPolicy::ReadOnly,
             ..SandboxState::default()
@@ -7748,7 +7746,7 @@ mod tests {
 
         assert_eq!(
             builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
-            WorkerStdinTransport::Pty
+            WorkerStdinTransport::Pipe
         );
         assert!(
             matches!(
@@ -7759,9 +7757,9 @@ mod tests {
                 )
                 .get("stdin_transport")
                 .and_then(serde_json::Value::as_str),
-                Some("pty")
+                Some("pipe")
             ),
-            "sandboxed Windows Python should report PTY transport even though launch currently fails fast"
+            "sandboxed Windows Python uses pipe transport to the wrapper; the wrapper owns ConPTY for the restricted child"
         );
     }
 
@@ -10477,6 +10475,18 @@ mod tests {
             driver.prepare_input_payload("a\r\nb\rc\n"),
             b"a\r\nb\r\nc\r\n"
         );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandboxed_python_driver_normalizes_input_for_wrapper_conpty() {
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            ..SandboxState::default()
+        };
+        let driver = python_backend_driver(&sandbox_state);
+
+        assert_eq!(driver.prepare_input_payload("a\r\nb\rc\n"), b"a\nb\nc\n");
     }
 
     #[test]

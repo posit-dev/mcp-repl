@@ -407,6 +407,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
+    crate::diagnostics::startup_log("python-session: runtime config resolved");
     let api = match PythonApi::initialize(&runtime_config.libpython) {
         Ok(api) => api,
         Err(err) => {
@@ -414,6 +415,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
+    crate::diagnostics::startup_log("python-session: api initialized");
     let thread_state = match initialize_python(api, &runtime_config.executable) {
         Ok(thread_state) => thread_state,
         Err(err) => {
@@ -421,6 +423,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
+    crate::diagnostics::startup_log("python-session: python initialized");
     if thread_state.is_null() {
         let err = "failed to release initialized Python thread state".to_string();
         init.mark_failed(err.clone());
@@ -433,6 +436,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
+    crate::diagnostics::startup_log("python-session: stdio opened");
 
     if let Err(err) = configure_python(api) {
         let _gil = GilGuard::acquire();
@@ -440,9 +444,11 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         init.mark_failed(err.clone());
         return Err(err);
     }
+    crate::diagnostics::startup_log("python-session: python configured");
 
     init.mark_ready();
     ipc::emit_worker_ready("python", plot_capable());
+    crate::diagnostics::startup_log("python-session: worker_ready emitted");
 
     let result = run_repl(&runtime);
     let finalize_result = finalize_python(api, thread_state);

@@ -53,10 +53,11 @@ control flow while keeping the server's request handling interpreter-neutral.
 
 ## Diff Size Note
 
-This branch can look like a large addition because it keeps transitional
-pipe-backed compatibility scaffolding while adding the PTY path. After
-sandboxed Windows ConPTY support lands, the remaining broad stdin interception
-and protocol compatibility code should be deleted instead of carried forward.
+This branch originally looked like a large addition because it kept
+transitional pipe-backed compatibility scaffolding while adding the PTY path.
+Sandboxed Windows Python now creates ConPTY inside the restricted wrapper, so
+the remaining broad stdin interception and protocol compatibility code should
+be deleted instead of carried forward.
 
 ## Long-Term Direction
 
