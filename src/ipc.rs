@@ -1518,6 +1518,14 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
             }
 
             if let Some((reader, writer)) = take_pipe_pair_if_ready(&mut reader, &mut writer) {
+                // The main worker owns the live sideband pipe handles. Once startup has consumed
+                // the bootstrap names, user code and descendants must not see or reuse them.
+                // SAFETY: worker startup consumes these env vars before any worker-managed
+                // threads exist.
+                unsafe {
+                    std::env::remove_var(IPC_PIPE_TO_WORKER_ENV);
+                    std::env::remove_var(IPC_PIPE_FROM_WORKER_ENV);
+                }
                 return WorkerIpcConnection::new(IpcTransport {
                     reader: Box::new(reader),
                     writer: Box::new(writer),
@@ -1955,6 +1963,39 @@ mod protocol_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(target_family = "windows")]
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_family = "windows")]
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_family = "windows")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[test]
     fn backend_info_protocol_is_removed() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
@@ -2011,6 +2052,41 @@ mod protocol_tests {
     fn readline_accounting_emitters_are_platform_neutral_noops_without_global_ipc() {
         emit_readline_input_bytes(&[0xc3]);
         emit_readline_discard_bytes(&[0xa9]);
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_connect_from_env_scrubs_pipe_name_env_vars() {
+        let _guard = ENV_TEST_MUTEX.lock().expect("env test mutex");
+        let mut server = super::IpcServer::bind().expect("bind IPC server");
+        let (to_worker, from_worker) = server.take_pipe_names().expect("pipe names");
+        let _to_guard = EnvVarGuard::set(super::IPC_PIPE_TO_WORKER_ENV, &to_worker);
+        let _from_guard = EnvVarGuard::set(super::IPC_PIPE_FROM_WORKER_ENV, &from_worker);
+        let handle = super::IpcHandle::new();
+        let server_thread = thread::spawn(move || {
+            server.connect(
+                handle,
+                IpcHandlers::default(),
+                || Ok(false),
+                Duration::from_secs(5),
+            )
+        });
+
+        let worker = super::connect_from_env(Duration::from_secs(5)).expect("worker IPC connect");
+        server_thread
+            .join()
+            .expect("join IPC server connect")
+            .expect("server IPC connect");
+
+        assert!(
+            std::env::var_os(super::IPC_PIPE_TO_WORKER_ENV).is_none(),
+            "to-worker pipe name should be scrubbed after IPC connect"
+        );
+        assert!(
+            std::env::var_os(super::IPC_PIPE_FROM_WORKER_ENV).is_none(),
+            "from-worker pipe name should be scrubbed after IPC connect"
+        );
+        drop(worker);
     }
 
     #[test]
