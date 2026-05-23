@@ -30,6 +30,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
+use crate::windows_pty_filter::WindowsPtyOutputFilter;
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(test)]
 use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
@@ -2354,7 +2355,7 @@ fn spawn_wrapper_conpty_forwarders(stdio: WrapperChildConPtyStdio) -> WrapperStd
     let stdout_state_thread = Arc::clone(&stdout_state);
     let stdout_forwarder = thread::spawn(move || {
         let _keep_conpty_alive = conpty;
-        copy_wrapper_output(stdout_read, io::stdout(), &stdout_state_thread);
+        copy_wrapper_conpty_output(stdout_read, io::stdout(), &stdout_state_thread);
     });
     let stderr_state = Arc::new(WrapperForwarderState::new());
     stderr_state.done.store(true, Ordering::Release);
@@ -2406,20 +2407,45 @@ fn copy_wrapper_input_to_conpty(mut wrapper_input: impl Read, mut child_input: i
 }
 
 fn copy_wrapper_output(
+    child_output: File,
+    wrapper_output: impl Write,
+    state: &WrapperForwarderState,
+) {
+    copy_wrapper_output_filtered(child_output, wrapper_output, state, |bytes| bytes.to_vec());
+}
+
+fn copy_wrapper_conpty_output(
+    child_output: File,
+    wrapper_output: impl Write,
+    state: &WrapperForwarderState,
+) {
+    let mut filter = WindowsPtyOutputFilter::default();
+    copy_wrapper_output_filtered(child_output, wrapper_output, state, |bytes| {
+        filter.filter(bytes)
+    });
+}
+
+fn copy_wrapper_output_filtered(
     mut child_output: File,
     mut wrapper_output: impl Write,
     state: &WrapperForwarderState,
+    mut transform: impl FnMut(&[u8]) -> Vec<u8>,
 ) {
     let mut buffer = [0u8; 8192];
     loop {
         match child_output.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                let output = transform(&buffer[..count]);
                 let write_result = {
                     let _write_guard = state.begin_write();
-                    let result = wrapper_output
-                        .write_all(&buffer[..count])
-                        .and_then(|_| wrapper_output.flush());
+                    let result = if output.is_empty() {
+                        wrapper_output.flush()
+                    } else {
+                        wrapper_output
+                            .write_all(&output)
+                            .and_then(|_| wrapper_output.flush())
+                    };
                     if result.is_ok() {
                         state
                             .bytes_copied
@@ -4000,6 +4026,31 @@ mod tests {
         assert!(
             recorded.flush_count >= 2,
             "forwarded output should flush each chunk as well as the final stream flush"
+        );
+    }
+
+    #[test]
+    fn copy_wrapper_conpty_output_filters_terminal_control_sequences() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        let payload = b"\r\nmcp-repl\n\x1b[?25l\x1b[15;1H\x1b[?25h\x1b]0;title\x07>>> ";
+        std::fs::write(&payload_path, payload).expect("write payload");
+
+        let state = WrapperForwarderState::new();
+        let writer_state = Arc::new(Mutex::new(RecordingWriterState::default()));
+        let writer = RecordingWriter {
+            state: Arc::clone(&writer_state),
+        };
+
+        let input = File::open(&payload_path).expect("open payload");
+        copy_wrapper_conpty_output(input, writer, &state);
+
+        let recorded = writer_state.lock().expect("recording writer state mutex");
+        assert_eq!(recorded.bytes, b"\r\nmcp-repl\n>>> ");
+        assert_eq!(
+            state.bytes_copied.load(Ordering::Relaxed),
+            payload.len() as u64,
+            "filtered control-only bytes should still count as drain progress"
         );
     }
 

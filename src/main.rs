@@ -24,6 +24,8 @@ mod sandbox;
 mod sandbox_cli;
 mod server;
 mod stdin_payload;
+#[cfg(target_family = "windows")]
+mod windows_pty_filter;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;
