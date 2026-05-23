@@ -494,6 +494,7 @@ impl BackendDriver for RBackendDriver {
 struct ProtocolBackendDriver {
     stdin_transport: WorkerStdinTransport,
     stdin_accounting: ProtocolStdinAccounting,
+    python_request_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -511,7 +512,25 @@ impl ProtocolBackendDriver {
         Self {
             stdin_transport,
             stdin_accounting,
+            python_request_generation: None,
         }
+    }
+
+    fn python(
+        stdin_transport: WorkerStdinTransport,
+        stdin_accounting: ProtocolStdinAccounting,
+    ) -> Self {
+        Self {
+            stdin_transport,
+            stdin_accounting,
+            python_request_generation: Some(0),
+        }
+    }
+
+    fn next_python_request_generation(&mut self) -> Option<u64> {
+        let generation = self.python_request_generation.as_mut()?;
+        *generation = generation.wrapping_add(1);
+        Some(*generation)
     }
 }
 
@@ -556,6 +575,7 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: &ServerIpcConnection,
         _timeout: Duration,
     ) -> Result<(), WorkerError> {
+        let _ = self.next_python_request_generation();
         ipc.begin_request_with_stdin(payload);
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
@@ -580,6 +600,26 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
+        if let Some(request_generation) = self.python_request_generation {
+            if let Some(ipc) = process.ipc.get()
+                && ipc
+                    .send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
+                    .is_ok()
+            {
+                #[cfg(target_family = "windows")]
+                {
+                    return Ok(());
+                }
+            }
+            #[cfg(target_family = "windows")]
+            {
+                return process.send_interrupt();
+            }
+            #[cfg(not(target_family = "windows"))]
+            {
+                return process.send_interrupt();
+            }
+        }
         driver_interrupt(process)
     }
 
@@ -820,6 +860,21 @@ fn builtin_worker_stdin_transport(
     worker_launch_stdin_transport(&WorkerLaunch::Builtin(backend), sandbox_state)
 }
 
+#[cfg(target_family = "windows")]
+fn custom_worker_requests_wrapper_conpty(spec: &CustomWorkerSpec, windows_sandboxed: bool) -> bool {
+    windows_sandboxed && matches!(spec.stdin, crate::backend::CustomWorkerStdin::Pty)
+}
+
+#[cfg(target_family = "windows")]
+fn apply_windows_sandbox_conpty_env(command: &mut Command) {
+    command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
+}
+
+#[cfg(target_family = "windows")]
+fn apply_windows_sandbox_conpty_env_to_pty(command: &mut WindowsPtyCommand) {
+    command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
+}
+
 fn backend_driver_for_launch(
     worker_launch: &WorkerLaunch,
     sandbox_state: &SandboxState,
@@ -845,7 +900,7 @@ fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver>
     } else {
         ProtocolStdinAccounting::Payload
     };
-    Box::new(ProtocolBackendDriver::new(
+    Box::new(ProtocolBackendDriver::python(
         stdin_transport,
         stdin_accounting,
     ))
@@ -5881,6 +5936,13 @@ impl WorkerProcess {
         command.args(&prepared.args);
         command.envs(spec.env.iter());
         command.envs(prepared.env.iter());
+        #[cfg(target_family = "windows")]
+        let custom_worker_wrapper_conpty =
+            custom_worker_requests_wrapper_conpty(spec, prepared_windows_launch.is_some());
+        #[cfg(target_family = "windows")]
+        if custom_worker_wrapper_conpty {
+            apply_windows_sandbox_conpty_env(&mut command);
+        }
         match &spec.working_dir {
             CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit) => {}
             CustomWorkerWorkingDir::Path { path } => {
@@ -5896,6 +5958,9 @@ impl WorkerProcess {
             }
             for (key, value) in prepared.env.iter() {
                 builder.env(key, value);
+            }
+            if custom_worker_wrapper_conpty {
+                apply_windows_sandbox_conpty_env_to_pty(&mut builder);
             }
             if let CustomWorkerWorkingDir::Path { path } = &spec.working_dir {
                 builder.cwd(path);
@@ -8028,6 +8093,46 @@ mod tests {
             kills,
             vec![(-child_id, libc::SIGINT)],
             "expected Unix protocol interrupt to continue with SIGINT after sideband"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_python_interrupt_sends_request_generation_and_sigint() {
+        let child = successful_test_child();
+        let child_id = child.id() as i32;
+        let mut process = test_worker_process(child);
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        process.ipc.set(server.clone());
+        let mut driver = ProtocolBackendDriver::python(
+            WorkerStdinTransport::Pty,
+            ProtocolStdinAccounting::Payload,
+        );
+        driver
+            .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
+            .expect("request start");
+
+        let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
+        let sideband = worker.recv(Some(Duration::from_secs(1)));
+        let _ = process.finish_exited();
+
+        assert!(
+            result.is_ok(),
+            "expected Python interrupt to succeed: {result:?}"
+        );
+        assert!(
+            matches!(
+                sideband,
+                Some(ServerToWorkerIpcMessage::PythonInterrupt {
+                    request_generation: 1
+                })
+            ),
+            "expected Python interrupt generation sideband, got: {sideband:?}"
+        );
+        assert_eq!(
+            kills,
+            vec![(-child_id, libc::SIGINT)],
+            "expected Unix Python interrupt to continue with SIGINT after sideband"
         );
     }
 
@@ -10505,6 +10610,56 @@ mod tests {
         assert_eq!(
             driver.prepare_input_payload("a\r\nb\rc\n"),
             b"a\r\nb\r\nc\r\n"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandboxed_custom_pty_requests_wrapper_conpty() {
+        let mut spec = CustomWorkerSpec {
+            executable: PathBuf::from("worker.exe"),
+            args: Vec::new(),
+            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
+            env: Default::default(),
+            stdin: crate::backend::CustomWorkerStdin::Pty,
+            sandbox: crate::backend::CustomWorkerSandbox::Server,
+        };
+
+        assert!(custom_worker_requests_wrapper_conpty(&spec, true));
+        assert!(!custom_worker_requests_wrapper_conpty(&spec, false));
+
+        spec.stdin = crate::backend::CustomWorkerStdin::Pipe;
+        assert!(!custom_worker_requests_wrapper_conpty(&spec, true));
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_conpty_env_applies_to_process_and_pty_launch() {
+        let mut command = Command::new("worker.exe");
+        let mut pty_command = WindowsPtyCommand::new(Path::new("worker.exe"));
+
+        apply_windows_sandbox_conpty_env(&mut command);
+        apply_windows_sandbox_conpty_env_to_pty(&mut pty_command);
+
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV),
+            Some(&Some("1".to_string()))
+        );
+        assert!(
+            pty_command.env.iter().any(|(key, value)| {
+                key.to_string_lossy() == crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV
+                    && value.to_string_lossy() == "1"
+            }),
+            "expected PTY launch to ask the sandbox wrapper for child ConPTY"
         );
     }
 

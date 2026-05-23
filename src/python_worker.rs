@@ -29,6 +29,9 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
+                    Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
+                        python_session::interrupt_request_generation(request_generation);
+                    }
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();
                     }

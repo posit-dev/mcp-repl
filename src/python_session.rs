@@ -157,10 +157,20 @@ fn take_exit_requested() -> bool {
 }
 
 pub(crate) fn interrupt() {
+    interrupt_for_request_generation(None);
+}
+
+pub(crate) fn interrupt_request_generation(request_generation: u64) {
+    interrupt_for_request_generation(Some(request_generation));
+}
+
+fn interrupt_for_request_generation(request_generation: Option<u64>) {
     #[cfg(target_family = "unix")]
-    if !interrupt_cleanup_belongs_to_current_request() {
+    if !interrupt_cleanup_belongs_to_current_request(request_generation) {
         return;
     }
+    #[cfg(not(target_family = "unix"))]
+    let _ = request_generation;
 
     discard_pending_stdin();
     #[cfg(target_family = "unix")]
@@ -178,17 +188,24 @@ pub(crate) fn interrupt() {
 }
 
 #[cfg(target_family = "unix")]
-fn interrupt_cleanup_belongs_to_current_request() -> bool {
+fn interrupt_cleanup_belongs_to_current_request(request_generation: Option<u64>) -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let guard = state.inner.lock().unwrap();
-    interrupt_cleanup_belongs_to_current_request_locked(&guard)
+    interrupt_cleanup_belongs_to_current_request_locked(&guard, request_generation)
 }
 
 #[cfg(any(test, target_family = "unix"))]
-fn interrupt_cleanup_belongs_to_current_request_locked(guard: &SessionStateInner) -> bool {
-    guard.request_active && !guard.request_completed_at_stdin_wait
+fn interrupt_cleanup_belongs_to_current_request_locked(
+    guard: &SessionStateInner,
+    request_generation: Option<u64>,
+) -> bool {
+    if !guard.request_active || guard.request_completed_at_stdin_wait {
+        return false;
+    }
+    request_generation
+        .is_none_or(|request_generation| guard.request_generation == request_generation)
 }
 
 #[cfg(target_family = "unix")]
@@ -1134,7 +1151,8 @@ fn request_input_should_record_background_plots_locked(guard: &SessionStateInner
 
 #[cfg(any(target_family = "unix", windows))]
 fn mark_request_input_delivered_locked(guard: &mut SessionStateInner) {
-    if !guard.request_active {
+    if !guard.request_active || guard.request_completed_at_stdin_wait {
+        guard.request_generation = guard.request_generation.wrapping_add(1);
         guard.plot_reset_pending = true;
     }
     guard.request_active = true;
@@ -2264,6 +2282,7 @@ struct SessionState {
 
 struct SessionStateInner {
     active_request: Option<ActiveRequest>,
+    request_generation: u64,
     request_active: bool,
     request_completed_at_stdin_wait: bool,
     current_prompt: Option<String>,
@@ -2297,6 +2316,7 @@ impl SessionState {
         Self {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
+                request_generation: 0,
                 request_active: false,
                 request_completed_at_stdin_wait: false,
                 current_prompt: None,
@@ -2856,6 +2876,7 @@ mod tests {
         mark_request_input_delivered_locked(&mut guard);
 
         assert!(guard.request_active);
+        assert_eq!(guard.request_generation, 1);
         assert!(!guard.request_completed_at_stdin_wait);
         assert!(guard.plot_reset_pending);
         assert!(!guard.waiting_for_input);
@@ -2868,14 +2889,31 @@ mod tests {
 
         guard.request_active = true;
         guard.request_completed_at_stdin_wait = false;
-        assert!(interrupt_cleanup_belongs_to_current_request_locked(&guard));
+        guard.request_generation = 7;
+        assert!(interrupt_cleanup_belongs_to_current_request_locked(
+            &guard, None
+        ));
+        assert!(interrupt_cleanup_belongs_to_current_request_locked(
+            &guard,
+            Some(7)
+        ));
+        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
+            &guard,
+            Some(6)
+        ));
 
         guard.request_completed_at_stdin_wait = true;
-        assert!(!interrupt_cleanup_belongs_to_current_request_locked(&guard));
+        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
+            &guard,
+            Some(7)
+        ));
 
         guard.request_active = false;
         guard.request_completed_at_stdin_wait = false;
-        assert!(!interrupt_cleanup_belongs_to_current_request_locked(&guard));
+        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
+            &guard,
+            Some(7)
+        ));
     }
 
     #[test]

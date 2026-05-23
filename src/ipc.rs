@@ -86,6 +86,7 @@ static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
+    PythonInterrupt { request_generation: u64 },
     Interrupt,
 }
 
@@ -1993,6 +1994,32 @@ mod protocol_tests {
         assert!(
             server_to_worker.is_err(),
             "server-to-worker protocol should not include output_image_ack"
+        );
+    }
+
+    #[test]
+    fn python_interrupt_generation_is_server_to_worker_only() {
+        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            matches!(
+                interrupt,
+                Ok(ServerToWorkerIpcMessage::PythonInterrupt {
+                    request_generation: 7
+                })
+            ),
+            "python_interrupt should carry the request generation"
+        );
+
+        let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "python_interrupt",
+            "request_generation": 7
+        }));
+        assert!(
+            worker_to_server.is_err(),
+            "python_interrupt should not deserialize as a worker-to-server message"
         );
     }
 
