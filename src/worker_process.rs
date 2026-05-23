@@ -388,22 +388,8 @@ fn driver_wait_for_completion(
 }
 
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    #[cfg(target_family = "windows")]
-    {
-        if process
-            .ipc
-            .get()
-            .is_some_and(|ipc| ipc.send(ServerToWorkerIpcMessage::Interrupt).is_ok())
-        {
-            return Ok(());
-        }
-    }
-
-    #[cfg(not(target_family = "windows"))]
-    {
-        if let Some(ipc) = process.ipc.get() {
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
-        }
+    if let Some(ipc) = process.ipc.get() {
+        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
     }
 
     process.send_interrupt()
@@ -601,24 +587,10 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(request_generation) = self.python_request_generation {
-            if let Some(ipc) = process.ipc.get()
-                && ipc
-                    .send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
-                    .is_ok()
-            {
-                #[cfg(target_family = "windows")]
-                {
-                    return Ok(());
-                }
+            if let Some(ipc) = process.ipc.get() {
+                let _ = ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation });
             }
-            #[cfg(target_family = "windows")]
-            {
-                return process.send_interrupt();
-            }
-            #[cfg(not(target_family = "windows"))]
-            {
-                return process.send_interrupt();
-            }
+            return process.send_interrupt();
         }
         driver_interrupt(process)
     }
@@ -8138,24 +8110,76 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_protocol_interrupt_uses_sideband_without_ctrl_break() {
-        let child = successful_test_child();
+    fn windows_protocol_interrupt_sends_sideband_and_ctrl_break() {
+        let child = sleeping_test_child();
+        let child_id = child.id();
         let mut process = test_worker_process(child);
-        let (server, _worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         process.ipc.set(server);
         let mut driver =
             ProtocolBackendDriver::new(WorkerStdinTransport::Pty, ProtocolStdinAccounting::Payload);
         let (result, events) =
-            capture_recorded_windows_ctrl_events_with_result(0, || driver.interrupt(&mut process));
+            capture_recorded_windows_ctrl_events(|| driver.interrupt(&mut process));
+        let sideband = worker.recv(Some(Duration::from_secs(1)));
+        drop(worker);
+        process.ipc = IpcHandle::new();
+        let _ = process.kill();
 
         assert!(
             result.is_ok(),
-            "protocol sideband interrupt should not fail when Ctrl-Break delivery fails: {result:?}"
+            "expected protocol interrupt to succeed: {result:?}"
+        );
+        assert!(
+            matches!(sideband, Some(ServerToWorkerIpcMessage::Interrupt)),
+            "expected protocol interrupt to notify sideband, got: {sideband:?}"
         );
         assert_eq!(
             events,
-            Vec::<(u32, u32)>::new(),
-            "expected protocol interrupts to use sideband without Ctrl-Break"
+            vec![(CTRL_BREAK_EVENT, child_id)],
+            "expected Windows protocol interrupt to continue with Ctrl-Break after sideband"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_python_interrupt_sends_request_generation_and_ctrl_break() {
+        let child = sleeping_test_child();
+        let child_id = child.id();
+        let mut process = test_worker_process(child);
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        process.ipc.set(server.clone());
+        let mut driver = ProtocolBackendDriver::python(
+            WorkerStdinTransport::Pty,
+            ProtocolStdinAccounting::Payload,
+        );
+        driver
+            .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
+            .expect("request start");
+
+        let (result, events) =
+            capture_recorded_windows_ctrl_events(|| driver.interrupt(&mut process));
+        let sideband = worker.recv(Some(Duration::from_secs(1)));
+        drop(worker);
+        process.ipc = IpcHandle::new();
+        let _ = process.kill();
+
+        assert!(
+            result.is_ok(),
+            "expected Python interrupt to succeed: {result:?}"
+        );
+        assert!(
+            matches!(
+                sideband,
+                Some(ServerToWorkerIpcMessage::PythonInterrupt {
+                    request_generation: 1
+                })
+            ),
+            "expected Python interrupt generation sideband, got: {sideband:?}"
+        );
+        assert_eq!(
+            events,
+            vec![(CTRL_BREAK_EVENT, child_id)],
+            "expected Windows Python interrupt to continue with Ctrl-Break after sideband"
         );
     }
 
