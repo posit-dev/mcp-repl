@@ -108,6 +108,12 @@ pub enum WorkerToServerIpcMessage {
     ReadlineStart {
         prompt: String,
     },
+    ReadlineInput {
+        text: String,
+    },
+    ReadlineDiscard {
+        text: String,
+    },
     ReadlineInputBytes {
         data_b64: String,
     },
@@ -398,6 +404,19 @@ impl ServerIpcConnection {
                         }
                         reader_cvar.notify_all();
                     }
+                    WorkerToServerIpcMessage::ReadlineInput { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) = account_active_stdin_bytes(
+                            &mut guard,
+                            text.as_bytes(),
+                            "readline_input",
+                        ) {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
                     WorkerToServerIpcMessage::ReadlineDiscardBytes { data_b64 } => {
                         let bytes =
                             match decode_sideband_base64(&data_b64, "readline_discard_bytes") {
@@ -413,6 +432,19 @@ impl ServerIpcConnection {
                         if let Err(err) =
                             account_active_stdin_bytes(&mut guard, &bytes, "readline_discard_bytes")
                         {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::ReadlineDiscard { text } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) = account_active_stdin_bytes(
+                            &mut guard,
+                            text.as_bytes(),
+                            "readline_discard",
+                        ) {
                             latch_protocol_error(&mut guard, err);
                             reader_cvar.notify_all();
                             break;
@@ -2033,6 +2065,33 @@ mod protocol_tests {
     }
 
     #[test]
+    fn protocol_v1_text_input_frames_still_deserialize() {
+        let input = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "readline_input",
+            "text": "done\n"
+        }));
+        assert!(
+            matches!(
+                input,
+                Ok(WorkerToServerIpcMessage::ReadlineInput { ref text }) if text == "done\n"
+            ),
+            "readline_input should remain a protocol v1 compatibility alias"
+        );
+
+        let discard = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "readline_discard",
+            "text": "stale\n"
+        }));
+        assert!(
+            matches!(
+                discard,
+                Ok(WorkerToServerIpcMessage::ReadlineDiscard { ref text }) if text == "stale\n"
+            ),
+            "readline_discard should remain a protocol v1 compatibility alias"
+        );
+    }
+
+    #[test]
     fn output_image_protocol_rejects_sequence_ack_handshake() {
         let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "output_image",
@@ -2210,6 +2269,38 @@ mod protocol_tests {
         assert!(
             completion.is_ok(),
             "split UTF-8 byte accounting should allow prompt completion, got: {completion:?}"
+        );
+    }
+
+    #[test]
+    fn request_completion_accepts_protocol_v1_text_input_frames() {
+        let stable_wait = Duration::from_millis(20);
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        server.begin_request_with_stdin(b"done\nstale\n");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineInput {
+                text: "done\n".to_string(),
+            })
+            .expect("send readline_input");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineDiscard {
+                text: "stale\n".to_string(),
+            })
+            .expect("send readline_discard");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: ">>> ".to_string(),
+            })
+            .expect("send readline_start");
+        thread::sleep(stable_wait + Duration::from_millis(5));
+
+        let completion = server.wait_for_request_completion(Duration::from_secs(1), stable_wait);
+
+        assert!(
+            completion.is_ok(),
+            "protocol v1 text input/discard accounting should allow prompt completion, got: {completion:?}"
         );
     }
 

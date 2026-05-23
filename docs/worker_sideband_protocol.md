@@ -88,6 +88,9 @@ invalid base64, and unknown message types are protocol errors.
   this accounting event reports the pre-normalized wire bytes.
 - The server decodes `data_b64` and removes those bytes from the active stdin
   queue. Invalid base64 or a byte mismatch is a protocol error.
+- Protocol version 1 compatibility: the server also accepts legacy
+  `{ "type": "readline_input", "text": <string> }` frames and accounts for
+  the UTF-8 encoding of `text`.
 
 `readline_discard_bytes`
 - `{ "type": "readline_discard_bytes", "data_b64": <base64> }`
@@ -99,6 +102,9 @@ invalid base64, and unknown message types are protocol errors.
   queue. Invalid base64 or a byte mismatch is a protocol error.
 - Workers must emit this only for exact bytes they can identify. Bytes flushed
   from terminal state without being observed are not reportable.
+- Protocol version 1 compatibility: the server also accepts legacy
+  `{ "type": "readline_discard", "text": <string> }` frames and accounts for
+  the UTF-8 encoding of `text`.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
