@@ -860,6 +860,18 @@ fn custom_worker_requests_wrapper_conpty(spec: &CustomWorkerSpec, windows_sandbo
 }
 
 #[cfg(target_family = "windows")]
+fn custom_worker_launch_stdin_transport(
+    spec: &CustomWorkerSpec,
+    custom_worker_wrapper_conpty: bool,
+) -> WorkerStdinTransport {
+    if custom_worker_wrapper_conpty {
+        WorkerStdinTransport::Pipe
+    } else {
+        spec.stdin.transport()
+    }
+}
+
+#[cfg(target_family = "windows")]
 fn apply_windows_sandbox_conpty_env(command: &mut Command) {
     command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
 }
@@ -5985,6 +5997,10 @@ impl WorkerProcess {
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "windows")]
         apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
+        #[cfg(target_family = "windows")]
+        let stdin_transport =
+            custom_worker_launch_stdin_transport(spec, custom_worker_wrapper_conpty);
+        #[cfg(not(target_family = "windows"))]
         let stdin_transport = spec.stdin.transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
@@ -10689,6 +10705,35 @@ mod tests {
 
         spec.stdin = crate::backend::CustomWorkerStdin::Pipe;
         assert!(!custom_worker_requests_wrapper_conpty(&spec, true));
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandboxed_custom_pty_uses_pipe_transport_to_wrapper() {
+        let mut spec = CustomWorkerSpec {
+            executable: PathBuf::from("worker.exe"),
+            args: Vec::new(),
+            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
+            env: Default::default(),
+            stdin: crate::backend::CustomWorkerStdin::Pty,
+            sandbox: crate::backend::CustomWorkerSandbox::Server,
+        };
+
+        assert_eq!(
+            custom_worker_launch_stdin_transport(&spec, true),
+            WorkerStdinTransport::Pipe,
+            "sandboxed custom PTY workers should use pipe stdio to the wrapper"
+        );
+        assert_eq!(
+            custom_worker_launch_stdin_transport(&spec, false),
+            WorkerStdinTransport::Pty
+        );
+
+        spec.stdin = crate::backend::CustomWorkerStdin::Pipe;
+        assert_eq!(
+            custom_worker_launch_stdin_transport(&spec, true),
+            WorkerStdinTransport::Pipe
+        );
     }
 
     #[cfg(target_family = "windows")]
