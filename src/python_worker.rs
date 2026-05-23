@@ -1,7 +1,9 @@
 use std::thread;
 use std::time::Duration;
 
-use crate::ipc::{ServerToWorkerIpcMessage, connect_from_env, set_global_ipc};
+use crate::ipc::{
+    ServerToWorkerIpcMessage, connect_from_env, emit_python_interrupt_ack, set_global_ipc,
+};
 use crate::python_session::{self, PythonSession};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +33,7 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
                         python_session::interrupt_request_generation(request_generation);
+                        emit_python_interrupt_ack();
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt) => {
                         python_session::interrupt();

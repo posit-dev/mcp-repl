@@ -368,6 +368,7 @@ impl RBackendDriver {
 }
 
 const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
+const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
@@ -382,6 +383,23 @@ fn driver_wait_for_completion(
         Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true, echo_source)),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected while waiting for request completion".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
+fn driver_wait_for_python_interrupt_ack(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_python_interrupt_ack(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before Python interrupt cleanup completed".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before Python interrupt cleanup completed".to_string(),
         )),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
@@ -587,8 +605,12 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(request_generation) = self.python_request_generation {
-            if let Some(ipc) = process.ipc.get() {
-                let _ = ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation });
+            if let Some(ipc) = process.ipc.get()
+                && ipc
+                    .send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
+                    .is_ok()
+            {
+                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
             }
             return process.send_interrupt();
         }
@@ -8084,8 +8106,15 @@ mod tests {
             .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
             .expect("request start");
 
+        let ack_thread = std::thread::spawn(move || {
+            let sideband = worker.recv(Some(Duration::from_secs(1)));
+            worker
+                .send(WorkerToServerIpcMessage::PythonInterruptAck)
+                .expect("send Python interrupt ack");
+            sideband
+        });
         let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
-        let sideband = worker.recv(Some(Duration::from_secs(1)));
+        let sideband = ack_thread.join().expect("join Python interrupt ack thread");
         let _ = process.finish_exited();
 
         assert!(
@@ -8156,10 +8185,16 @@ mod tests {
             .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
             .expect("request start");
 
+        let ack_thread = std::thread::spawn(move || {
+            let sideband = worker.recv(Some(Duration::from_secs(1)));
+            worker
+                .send(WorkerToServerIpcMessage::PythonInterruptAck)
+                .expect("send Python interrupt ack");
+            sideband
+        });
         let (result, events) =
             capture_recorded_windows_ctrl_events(|| driver.interrupt(&mut process));
-        let sideband = worker.recv(Some(Duration::from_secs(1)));
-        drop(worker);
+        let sideband = ack_thread.join().expect("join Python interrupt ack thread");
         process.ipc = IpcHandle::new();
         let _ = process.kill();
 

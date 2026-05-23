@@ -3,6 +3,8 @@
 #[cfg(test)]
 #[path = "windows_sandbox_test_support.rs"]
 mod test_support;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -96,6 +98,7 @@ use windows_sys::Win32::System::Console::COORD;
 use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
 use windows_sys::Win32::System::Console::ClosePseudoConsole;
 use windows_sys::Win32::System::Console::CreatePseudoConsole;
+use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::HPCON;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
@@ -162,6 +165,18 @@ const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
 const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const WINDOWS_SANDBOX_CONPTY_ENV: &str = "MCP_REPL_WINDOWS_SANDBOX_CONPTY";
+static WRAPPER_CTRL_BREAK_TARGET: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONSOLE_CTRL_EVENT_RECORDER: RefCell<Option<TestConsoleCtrlEventRecorder>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestConsoleCtrlEventRecorder {
+    result: i32,
+    events: Vec<(u32, u32)>,
+}
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -321,6 +336,8 @@ struct ConsoleCtrlHandlerGuard {
     handler: unsafe extern "system" fn(u32) -> i32,
 }
 
+struct WrapperCtrlBreakForwardTarget;
+
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
@@ -332,6 +349,19 @@ impl Drop for ConsoleCtrlHandlerGuard {
         unsafe {
             let _ = SetConsoleCtrlHandler(Some(self.handler), 0);
         }
+    }
+}
+
+impl WrapperCtrlBreakForwardTarget {
+    fn set(process_group_id: u32) -> Self {
+        WRAPPER_CTRL_BREAK_TARGET.store(process_group_id as u64, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for WrapperCtrlBreakForwardTarget {
+    fn drop(&mut self) {
+        WRAPPER_CTRL_BREAK_TARGET.store(0, Ordering::Release);
     }
 }
 
@@ -358,7 +388,16 @@ fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
 }
 
 unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
-    if event == CTRL_BREAK_EVENT { 1 } else { 0 }
+    if event != CTRL_BREAK_EVENT {
+        return 0;
+    }
+    let target = WRAPPER_CTRL_BREAK_TARGET.load(Ordering::Acquire);
+    if let Ok(process_group_id) = u32::try_from(target)
+        && process_group_id != 0
+    {
+        let _ = raw_generate_console_ctrl_event(CTRL_BREAK_EVENT, process_group_id);
+    }
+    1
 }
 
 fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, String> {
@@ -372,6 +411,21 @@ fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, Strin
     Ok(ConsoleCtrlHandlerGuard {
         handler: ignore_wrapper_ctrl_break,
     })
+}
+
+fn raw_generate_console_ctrl_event(ctrl_event: u32, process_group_id: u32) -> i32 {
+    #[cfg(test)]
+    if let Ok(Some(result)) = TEST_CONSOLE_CTRL_EVENT_RECORDER.try_with(|recorder| {
+        let mut recorder = recorder.borrow_mut();
+        recorder.as_mut().map(|recorder| {
+            recorder.events.push((ctrl_event, process_group_id));
+            recorder.result
+        })
+    }) {
+        return result;
+    }
+
+    unsafe { GenerateConsoleCtrlEvent(ctrl_event, process_group_id) }
 }
 
 fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -1683,6 +1737,8 @@ fn run_sandboxed_command_with_env_map(
             crate::diagnostics::startup_log("windows-sandbox: child spawned");
             (proc_info, spawn_wrapper_stdio_forwarders(stdio_pipes))
         };
+        let _ctrl_break_forward_target =
+            use_conpty.then(|| WrapperCtrlBreakForwardTarget::set(proc_info.dwProcessId));
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -3617,6 +3673,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn capture_recorded_ctrl_events<F, R>(f: F) -> (R, Vec<(u32, u32)>)
+    where
+        F: FnOnce() -> R,
+    {
+        TEST_CONSOLE_CTRL_EVENT_RECORDER.with(|recorder| {
+            assert!(
+                recorder.borrow().is_none(),
+                "did not expect nested console ctrl-event recorder"
+            );
+            *recorder.borrow_mut() = Some(TestConsoleCtrlEventRecorder {
+                result: 1,
+                events: Vec::new(),
+            });
+        });
+        let result = f();
+        let events = TEST_CONSOLE_CTRL_EVENT_RECORDER.with(|recorder| {
+            recorder
+                .borrow_mut()
+                .take()
+                .expect("recorded console ctrl events")
+                .events
+        });
+        (result, events)
+    }
+
+    #[test]
+    fn wrapper_ctrl_break_handler_forwards_to_conpty_child_process_group() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let target = WrapperCtrlBreakForwardTarget::set(4242);
+
+        let (handled, events) =
+            capture_recorded_ctrl_events(|| unsafe { ignore_wrapper_ctrl_break(CTRL_BREAK_EVENT) });
+
+        assert_eq!(handled, 1);
+        assert_eq!(
+            events,
+            vec![(CTRL_BREAK_EVENT, 4242)],
+            "expected wrapper Ctrl-Break handler to forward to the ConPTY child process group"
+        );
+
+        drop(target);
+        let (handled_after_drop, events_after_drop) =
+            capture_recorded_ctrl_events(|| unsafe { ignore_wrapper_ctrl_break(CTRL_BREAK_EVENT) });
+        assert_eq!(handled_after_drop, 1);
+        assert!(
+            events_after_drop.is_empty(),
+            "did not expect Ctrl-Break forwarding after the target guard is dropped"
+        );
     }
 
     #[cfg(target_os = "windows")]

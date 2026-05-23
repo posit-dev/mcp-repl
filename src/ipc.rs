@@ -98,6 +98,7 @@ pub enum WorkerToServerIpcMessage {
         worker: WorkerIdentity,
         capabilities: WorkerCapabilities,
     },
+    PythonInterruptAck,
     OutputText {
         stream: TextStream,
         data_b64: String,
@@ -552,6 +553,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
     }
@@ -559,6 +561,7 @@ impl ServerIpcConnection {
     pub fn begin_request_with_stdin(&self, payload: &[u8]) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
         guard.active_stdin = Some(payload.iter().copied().collect());
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -673,6 +676,39 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    pub fn wait_for_python_interrupt_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if take_python_interrupt_ack(&mut guard) {
+                return Ok(());
+            }
+            if let Some(message) = take_latched_protocol_error(&mut guard) {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                if take_python_interrupt_ack(&mut guard) {
+                    return Ok(());
+                }
                 return Err(IpcWaitError::Timeout);
             }
         }
@@ -1596,6 +1632,12 @@ pub fn emit_session_end() {
     }
 }
 
+pub fn emit_python_interrupt_ack() {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::PythonInterruptAck);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_connection_pair() -> io::Result<(ServerIpcConnection, WorkerIpcConnection)> {
     test_connection_pair_with_handlers(IpcHandlers::default())
@@ -1844,6 +1886,24 @@ fn take_worker_ready(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
+fn take_python_interrupt_ack(guard: &mut ServerIpcInbox) -> bool {
+    if let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck))
+    {
+        guard.queue.remove(idx);
+        return true;
+    }
+    false
+}
+
+fn drop_python_interrupt_acks(guard: &mut ServerIpcInbox) {
+    guard
+        .queue
+        .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck));
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2020,6 +2080,22 @@ mod protocol_tests {
         assert!(
             worker_to_server.is_err(),
             "python_interrupt should not deserialize as a worker-to-server message"
+        );
+
+        let ack = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "python_interrupt_ack"
+        }));
+        assert!(
+            matches!(ack, Ok(WorkerToServerIpcMessage::PythonInterruptAck)),
+            "python_interrupt_ack should deserialize as the worker-side cleanup signal"
+        );
+
+        let server_to_worker_ack = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "python_interrupt_ack"
+        }));
+        assert!(
+            server_to_worker_ack.is_err(),
+            "python_interrupt_ack should not deserialize as a server-to-worker message"
         );
     }
 
