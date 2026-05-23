@@ -811,7 +811,7 @@ Required migration work:
   arguments.
 - Keep worker stdin as the only user-input transport from server to
   worker.
-- Remove legacy request-boundary sideband frames, including
+- Remove superseded request-boundary sideband frames, including
   `stdin_write`, `stdin_write_complete`, byte counts, line counts,
   `stdin_write_ack`, and the private Python interrupt acknowledgement.
 - Remove IPC-carried request ids and request payloads.

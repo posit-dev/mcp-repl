@@ -68,33 +68,23 @@ fn home_env_vars(home_dir: &Path) -> Vec<(String, String)> {
     env_vars
 }
 
-fn linux_sandbox_exe_value(use_legacy_landlock: bool) -> Value {
+fn linux_sandbox_exe_value() -> Value {
     #[cfg(target_os = "linux")]
     {
-        if use_legacy_landlock {
-            Value::Null
-        } else {
-            Value::String("/tmp/codex-linux-sandbox".to_string())
-        }
+        Value::String("/tmp/codex-linux-sandbox".to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = use_legacy_landlock;
         Value::Null
     }
 }
 
-fn codex_sandbox_state_meta(
-    sandbox_policy: Value,
-    sandbox_cwd: &Path,
-    use_legacy_landlock: bool,
-) -> Value {
+fn codex_sandbox_state_meta(sandbox_policy: Value, sandbox_cwd: &Path) -> Value {
     json!({
         SANDBOX_STATE_META_CAPABILITY: {
             "sandboxPolicy": sandbox_policy,
             "sandboxCwd": sandbox_cwd,
-            "useLegacyLandlock": use_legacy_landlock,
-            "codexLinuxSandboxExe": linux_sandbox_exe_value(use_legacy_landlock),
+            "codexLinuxSandboxExe": linux_sandbox_exe_value(),
         }
     })
 }
@@ -109,7 +99,6 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
             "exclude_slash_tmp": false,
         }),
         sandbox_cwd,
-        /*use_legacy_landlock*/ false,
     )
 }
 
@@ -126,12 +115,11 @@ fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
             },
         }),
         sandbox_cwd,
-        /*use_legacy_landlock*/ false,
     )
 }
 
 fn read_only_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd)
 }
 
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
@@ -143,7 +131,6 @@ fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
             },
         }),
         sandbox_cwd,
-        false,
     )
 }
 
@@ -154,12 +141,11 @@ fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
             "network_access": true,
         }),
         sandbox_cwd,
-        false,
     )
 }
 
 fn full_access_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd)
 }
 
 fn encode_path(path: &Path) -> TestResult<String> {

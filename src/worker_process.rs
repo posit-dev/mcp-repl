@@ -1064,7 +1064,6 @@ impl WorkerManager {
             sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
             sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
             use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
-            use_legacy_landlock: None,
         };
         crate::event_log::log(
             "worker_local_inherit_bootstrap",
@@ -9844,7 +9843,6 @@ mod tests {
             },
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: Some(true),
-            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_state.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -9873,7 +9871,6 @@ mod tests {
                 "exclude_slash_tmp": false
             },
             "sandboxCwd": std::env::temp_dir(),
-            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
         .expect("Codex sandbox metadata");
@@ -9916,7 +9913,6 @@ mod tests {
             },
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: None,
-            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_state.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -9945,7 +9941,6 @@ mod tests {
                 "exclude_slash_tmp": false
             },
             "sandboxCwd": std::env::temp_dir(),
-            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
         .expect("Codex sandbox metadata");
@@ -10019,7 +10014,6 @@ mod tests {
                 },
                 sandbox_cwd: Some(writable_root.clone()),
                 use_linux_sandbox_bwrap: None,
-                use_legacy_landlock: None,
             })
             .expect("workspace-write Codex metadata should satisfy deferred refinements");
 
@@ -10073,7 +10067,6 @@ mod tests {
             },
             sandbox_cwd: None,
             use_linux_sandbox_bwrap: None,
-            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_before.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -10089,7 +10082,6 @@ mod tests {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
                     sandbox_cwd: None,
                     use_linux_sandbox_bwrap: None,
-                    use_legacy_landlock: None,
                 },
                 Duration::from_millis(1),
             )
@@ -10286,7 +10278,6 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
-                use_legacy_landlock: None,
             })
             .expect("initial inherited state");
         let mut process = test_worker_process(successful_test_child());
@@ -10330,7 +10321,6 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
-                use_legacy_landlock: None,
             })
             .expect("initial inherited state");
         let mut process = test_worker_process(successful_test_child());
@@ -10381,7 +10371,6 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: Some(sandbox_cwd.clone()),
                 use_linux_sandbox_bwrap: None,
-                use_legacy_landlock: None,
             })
             .expect("initial inherited read-only state");
         let mut process = test_worker_process(successful_test_child());
@@ -10406,7 +10395,6 @@ mod tests {
                     },
                     sandbox_cwd: Some(sandbox_cwd.clone()),
                     use_linux_sandbox_bwrap: None,
-                    use_legacy_landlock: None,
                 }),
                 ..WriteStdinOptions::default()
             },

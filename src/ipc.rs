@@ -1898,7 +1898,7 @@ mod protocol_tests {
     }
 
     #[test]
-    fn output_image_protocol_rejects_legacy_plot_image_shape() {
+    fn output_image_protocol_rejects_plot_image_shape() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "plot_image",
             "id": "plot-1",
@@ -1910,7 +1910,7 @@ mod protocol_tests {
 
         assert!(
             parsed.is_err(),
-            "legacy plot_image frames are no longer part of IPC"
+            "plot_image frames are no longer part of IPC"
         );
     }
 
