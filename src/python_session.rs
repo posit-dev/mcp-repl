@@ -35,6 +35,8 @@ const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
+#[cfg(windows)]
+const WINDOWS_CONSOLE_LINE_READ_BUFFER_UNITS: usize = 8192;
 const PYTHON_CONFIG_SNIPPET: &str = r#"
 import json
 import sys
@@ -1992,7 +1994,7 @@ fn read_windows_console_line_bytes_uncached() -> Option<StdioLineRead> {
     }
 
     let mut units = Vec::new();
-    let mut buffer = [0u16; 256];
+    let mut buffer = vec![0u16; WINDOWS_CONSOLE_LINE_READ_BUFFER_UNITS];
     loop {
         let mut read = 0u32;
         let ok = unsafe {

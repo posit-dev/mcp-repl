@@ -130,6 +130,15 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         )
         test_case = self
         self_module = self.module
+        restart_output = self_module.r_repl_output(
+            'print(exists("x"))\n',
+            "[1] FALSE\n",
+        )
+        restart_response = self_module.tool_result(
+            self_module.text("[repl] new session started\n"),
+            *([self_module.text(restart_output)] if restart_output else []),
+            self_module.text("> "),
+        )
 
         class FakeClient:
             def __init__(self):
@@ -137,19 +146,12 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                     (
                         "x <- 1\n",
                         30000,
-                        self_module.tool_result(
-                            self_module.text("> x <- 1\n"),
-                            self_module.text("> "),
-                        ),
+                        self_module.r_repl_result("x <- 1\n"),
                     ),
                     (
                         '\u0004print(exists("x"))\n',
                         30000,
-                        self_module.tool_result(
-                            self_module.text("[repl] new session started\n"),
-                            self_module.text('> print(exists("x"))\n[1] FALSE\n'),
-                            self_module.text("> "),
-                        ),
+                        restart_response,
                     ),
                     (None, 1000, initial_busy),
                     ('\u0003cat("AFTER_INTERRUPT\\n")', 5000, interrupt_busy),
