@@ -811,8 +811,81 @@ async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("readline_input text does not match active stdin"),
-        "expected readline_input accounting protocol error, got: {text:?}"
+        text.contains("readline_input_bytes bytes does not match active stdin"),
+        "expected readline_input_bytes accounting protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_split_utf8_byte_accounting_completes_request() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-split-utf8-tail\né\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("split-tail bytes: [195, 169]"),
+        "expected split UTF-8 tail bytes to be accounted, got: {text:?}"
+    );
+    assert!(
+        !text.contains("<<repl status: busy") && !text.contains("worker protocol error"),
+        "split UTF-8 byte accounting should complete cleanly, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_old_readline_input_frame_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "old-readline-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid worker sideband JSON") && text.contains("readline_input"),
+        "expected old readline_input frame to be rejected, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_old_readline_discard_frame_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "old-readline-discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid worker sideband JSON") && text.contains("readline_discard"),
+        "expected old readline_discard frame to be rejected, got: {text:?}"
     );
 
     session.cancel().await?;

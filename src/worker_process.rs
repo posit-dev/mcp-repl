@@ -422,7 +422,9 @@ fn driver_refresh_backend_info(
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+            {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
                     protocol.name, protocol.version
@@ -458,7 +460,9 @@ fn driver_refresh_worker_ready(
 ) -> Result<(), WorkerError> {
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+            {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
                     protocol.name, protocol.version
@@ -7783,8 +7787,8 @@ mod tests {
             "did not expect buffered readline start to complete request, got {early:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1+\n".to_string(),
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1+\n"),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7801,8 +7805,8 @@ mod tests {
             "did not expect buffered continuation start to complete request, got {continuation:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1\n".to_string(),
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1\n"),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "+ ".to_string(),

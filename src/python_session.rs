@@ -400,14 +400,11 @@ fn finish_active_request_at_next_read() {
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
     let mut discarded = Vec::new();
-    discarded.extend(PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap().drain(..));
     discarded.extend(drain_process_stdin_pipe());
     if discarded.is_empty() {
         return;
     }
-    let text =
-        String::from_utf8(discarded).expect("discarded Python stdin must be valid UTF-8 text");
-    ipc::emit_readline_discard(&text);
+    ipc::emit_readline_discard_bytes(&discarded);
 }
 
 #[cfg(target_family = "unix")]
@@ -508,11 +505,7 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-        .lock()
-        .unwrap()
-        .is_empty()
-        && stdin_pending_byte_count() == Some(0)
+    stdin_pending_byte_count() == Some(0)
 }
 
 #[cfg(windows)]
@@ -1916,9 +1909,30 @@ fn note_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = protocol_stdin_bytes(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
+}
+
+#[cfg(target_family = "unix")]
+fn protocol_stdin_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' {
+            normalized.push(b'\n');
+            if bytes.get(index + 1) == Some(&b'\n') {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
 }
 
 #[cfg(target_family = "unix")]
@@ -1945,29 +1959,7 @@ fn emit_readline_input_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
-    pending.extend_from_slice(bytes);
-    loop {
-        match std::str::from_utf8(&pending) {
-            Ok(text) => {
-                if !text.is_empty() {
-                    ipc::emit_readline_input(text);
-                }
-                pending.clear();
-                return;
-            }
-            Err(err) => {
-                let valid_up_to = err.valid_up_to();
-                if valid_up_to == 0 {
-                    return;
-                }
-                let text = std::str::from_utf8(&pending[..valid_up_to])
-                    .expect("valid UTF-8 prefix should decode");
-                ipc::emit_readline_input(text);
-                pending.drain(..valid_up_to);
-            }
-        }
-    }
+    ipc::emit_readline_input_bytes(bytes);
 }
 
 #[cfg(not(target_family = "unix"))]
@@ -2442,8 +2434,6 @@ static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut()
 static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 #[cfg(target_family = "unix")]
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
-#[cfg(target_family = "unix")]
-static PYTHON_DIRECT_STDIN_SIDEBAND_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests {
