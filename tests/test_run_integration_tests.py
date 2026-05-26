@@ -1,8 +1,10 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from textwrap import dedent
+from unittest.mock import patch
 
 
 def load_module():
@@ -43,6 +45,15 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 "isError": False,
             },
         )
+
+    def test_resolve_binary_path_accepts_extensionless_windows_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binary = Path(temp_dir) / "mcp-repl"
+            exe_binary = Path(temp_dir) / "mcp-repl.exe"
+            exe_binary.write_text("", encoding="utf-8")
+
+            with patch.object(self.module.sys, "platform", "win32"):
+                self.assertEqual(exe_binary, self.module.resolve_binary_path(binary))
 
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(
@@ -119,19 +130,28 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         )
         test_case = self
         self_module = self.module
+        restart_output = self_module.r_repl_output(
+            'print(exists("x"))\n',
+            "[1] FALSE\n",
+        )
+        restart_response = self_module.tool_result(
+            self_module.text("[repl] new session started\n"),
+            *([self_module.text(restart_output)] if restart_output else []),
+            self_module.text("> "),
+        )
 
         class FakeClient:
             def __init__(self):
                 self.responses = [
-                    ("x <- 1\n", 30000, self_module.tool_result(self_module.text("> "))),
+                    (
+                        "x <- 1\n",
+                        30000,
+                        self_module.r_repl_result("x <- 1\n"),
+                    ),
                     (
                         '\u0004print(exists("x"))\n',
                         30000,
-                        self_module.tool_result(
-                            self_module.text("[repl] new session started\n"),
-                            self_module.text("[1] FALSE\n"),
-                            self_module.text("> "),
-                        ),
+                        restart_response,
                     ),
                     (None, 1000, initial_busy),
                     ('\u0003cat("AFTER_INTERRUPT\\n")', 5000, interrupt_busy),

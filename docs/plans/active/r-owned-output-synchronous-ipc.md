@@ -31,10 +31,11 @@
   framed prompt facts instead of stripping prompt-shaped raw stdout. A public
   files-mode regression covers raw child stdout that exactly matches a later
   R-owned prompt/input echo.
-- Phase 4: planned - evaluate a bounded pre-input drain gate. `stdin_write_ack`
-  only means the worker has installed request metadata before raw stdin bytes
-  arrive; any raw-output drain gate should be a separate request-boundary
-  protocol step.
+- Phase 4: planned - evaluate a bounded pre-input drain gate. Earlier notes
+  proposed a request-boundary acknowledgement frame, but the active protocol
+  keeps user input on worker stdin and uses byte-level sideband accounting.
+  Any raw-output drain gate should be a separate request-boundary protocol
+  step.
 
 ## Locked Decisions
 
@@ -76,10 +77,9 @@
   R-owned stdout, stderr, readline echo, plots, direct file-descriptor writes,
   child output, and large output.
 - 2026-05-08: Narrowed files-mode sideband-first echo carryover so ordinary R
-  prompts no longer trim later raw stdout. The backend now records the expected
-  echo source on `readline_result`, so backend-owned `output_text` echo can
-  carry across drain boundaries without deriving the source from prompt
-  spelling.
+  prompts no longer trim later raw stdout. That older implementation used
+  text-level readline source facts; the active worker protocol now uses exact
+  `readline_input_bytes` and `readline_discard_bytes` accounting instead.
 - 2026-05-08: Stopped treating R raw stdout that equals the primary prompt as
   the completion prompt. The server now appends the R completion prompt from
   framed IPC facts, including interrupt-drained completions, while leaving
@@ -88,7 +88,7 @@
   public regression proving raw child stdout that exactly matches a later
   R-owned prompt/input echo remains visible. No runtime change was needed
   because same-drain and carryover echo collapse already require matching
-  `readline_result` source facts.
+  worker sideband accounting facts.
 - 2026-05-08: Kept ACK-gated input delivery open as a request-boundary tool, not
   a per-output ACK. The useful shape is: before the worker consumes the next
   input, the server gets a bounded opportunity to drain raw stdout/stderr from

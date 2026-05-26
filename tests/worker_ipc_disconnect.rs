@@ -3,7 +3,6 @@ mod common;
 #[cfg(target_family = "unix")]
 mod unix {
     use base64::Engine as _;
-    use serde_json::json;
     use std::os::fd::FromRawFd;
     use std::os::unix::io::RawFd;
     use std::path::PathBuf;
@@ -113,7 +112,7 @@ mod unix {
     }
 
     #[tokio::test]
-    async fn worker_reads_raw_stdin_with_ipc_request_boundary() -> TestResult<()> {
+    async fn worker_reads_raw_stdin_without_server_request_frames() -> TestResult<()> {
         let exe = resolve_exe()?;
         let (server_read_fd, child_write_fd) = pipe_pair()?;
         let (child_read_fd, server_write_fd) = pipe_pair()?;
@@ -141,17 +140,10 @@ mod unix {
         let server_read = unsafe { std::fs::File::from_raw_fd(server_read_fd) };
         let server_write = unsafe { std::fs::File::from_raw_fd(server_write_fd) };
         let mut ipc_reader = BufReader::new(tokio::fs::File::from_std(server_read));
-        let mut ipc_writer = tokio::fs::File::from_std(server_write);
+        let ipc_writer = tokio::fs::File::from_std(server_write);
         let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
 
         let input = "if (TRUE) {\ncat(\"RAW_STDIN_OK\\n\")\n}\n";
-        let request = json!({
-            "type": "stdin_write",
-            "byte_len": input.len()
-        });
-        ipc_writer.write_all(request.to_string().as_bytes()).await?;
-        ipc_writer.write_all(b"\n").await?;
-        ipc_writer.flush().await?;
         stdin.write_all(input.as_bytes()).await?;
         stdin.flush().await?;
 
@@ -179,12 +171,8 @@ mod unix {
         })
         .await;
 
-        let session_end = json!({ "type": "session_end" });
-        let _ = ipc_writer
-            .write_all(session_end.to_string().as_bytes())
-            .await;
-        let _ = ipc_writer.write_all(b"\n").await;
-        let _ = ipc_writer.flush().await;
+        drop(stdin);
+        drop(ipc_writer);
         let _ = time::timeout(Duration::from_secs(10), child.wait()).await;
 
         match read_result {

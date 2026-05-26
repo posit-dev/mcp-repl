@@ -477,6 +477,14 @@ def expected_pager_lines(start: int, end: int) -> str:
     return "".join(f"L{index:04d}\n" for index in range(start, end + 1))
 
 
+def r_repl_result(output_text: str = "") -> dict[str, Any]:
+    contents = []
+    if output_text:
+        contents.append(text(output_text))
+    contents.append(text("> "))
+    return tool_result(*contents)
+
+
 def require_transcript_path(text: str, context: str) -> Path:
     transcript_path = bundle_transcript_path(text)
     if transcript_path is None:
@@ -493,10 +501,7 @@ def require_text_file(path: Path, context: str) -> str:
 def r_console_basic(client: McpStdioClient) -> None:
     received = client.repl("1+1\n", timeout_ms=30000)
 
-    expected = tool_result(
-        text("[1] 2\n"),
-        text("> "),
-    )
+    expected = r_repl_result("[1] 2\n")
 
     assert_identical(expected, received, "repl")
 
@@ -504,7 +509,7 @@ def r_console_basic(client: McpStdioClient) -> None:
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        r_repl_result("[1] 2\n"),
         warmup,
         "warmup repl",
     )
@@ -546,7 +551,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
 def r_reset_clears_state(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("> ")),
+        r_repl_result(),
         set_var,
         "set variable repl",
     )
@@ -560,7 +565,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] FALSE\n"), text("> ")),
+        r_repl_result("[1] FALSE\n"),
         after_reset,
         "after reset repl",
     )
@@ -569,7 +574,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("> ")),
+        r_repl_result(),
         set_var,
         "set variable before restart",
     )
@@ -759,10 +764,17 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
         'for (i in 1:80) cat(sprintf("L%04d\\n", i))\n',
         timeout_ms=120000,
     )
+    expected_initial_text = expected_pager_lines(1, 13)
+    expected_initial_footer = "--More-- (6p, 16.2%, @0..78/480)"
+    expected_next_lines = expected_pager_lines(14, 26)
+    expected_next_footer = "--More-- (5p, 32.5%, @78..156/480)"
+    expected_search_offset = 180
+    expected_search_footer = "--More-- (4p, 37.5%, @180/480)"
+    expected_end_footer = "(END, 37.5%, @180/480)"
     assert_identical(
         tool_result(
-            text(expected_pager_lines(1, 13)),
-            text("--More-- (6p, 16.2%, @0..78/480)"),
+            text(expected_initial_text),
+            text(expected_initial_footer),
         ),
         initial,
         "pager initial repl",
@@ -771,8 +783,8 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     next_page = client.repl(":next", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text(expected_pager_lines(14, 26)),
-            text("--More-- (5p, 32.5%, @78..156/480)"),
+            text(expected_next_lines),
+            text(expected_next_footer),
         ),
         next_page,
         "pager next repl",
@@ -781,9 +793,9 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     search = client.repl(":/L0031", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text("[pager] search for `L0031` @180"),
+            text(f"[pager] search for `L0031` @{expected_search_offset}"),
             text("[match] L0031\n"),
-            text("--More-- (4p, 37.5%, @180/480)"),
+            text(expected_search_footer),
         ),
         search,
         "pager search repl",
@@ -792,7 +804,7 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     quit_result = client.repl(":q", timeout_ms=60000)
     assert_identical(
         tool_result(
-            text("(END, 37.5%, @180/480)"),
+            text(expected_end_footer),
             text("> "),
         ),
         quit_result,
@@ -881,11 +893,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_binary_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if sys.platform == "win32" and path.suffix == "":
+        exe_path = path.with_name(f"{path.name}.exe")
+        if exe_path.is_file():
+            return exe_path
+    return path
+
+
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     if args.timeout <= 0:
         print("--timeout must be positive", file=sys.stderr)
         return 2
+    binary = resolve_binary_path(args.binary)
 
     selected = args.case or sorted(CASES)
     failures = 0
@@ -893,7 +916,7 @@ def main(argv: Sequence[str]) -> int:
         case = CASES[case_name]
         try:
             with McpStdioClient(
-                args.binary,
+                binary,
                 ["--sandbox", args.sandbox, *case.server_args],
                 case.server_env,
                 args.timeout,

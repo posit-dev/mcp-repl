@@ -280,7 +280,7 @@ async fn zod_worker_pipe_launch_records_transport_and_starts_sideband() -> TestR
     Ok(())
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_pty_launch_keeps_sideband_separate_and_captures_visible_output()
 -> TestResult<()> {
@@ -323,6 +323,102 @@ async fn zod_worker_pty_launch_keeps_sideband_separate_and_captures_visible_outp
         .find(|entry| entry["event"] == "worker_spawn_begin")
         .ok_or_else(|| "missing worker_spawn_begin event".to_string())?;
     assert_eq!(spawn_begin["payload"]["stdin_transport"], "pty");
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_windows_pty_launch_uses_path_lookup() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let bin_dir = tempdir.path().join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let exe_name = "zod-worker.exe";
+    fs::copy(zod_worker_path()?, bin_dir.join(exe_name))?;
+
+    let spec_path = tempdir.path().join("zod-worker-path.json");
+    let spec = json!({
+        "executable": exe_name,
+        "args": [],
+        "working_dir": "inherit",
+        "env": {},
+        "stdin": "pty",
+        "sandbox": "server"
+    });
+    fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+
+    let mut path_entries = vec![bin_dir];
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&existing_path));
+    }
+    let path = std::env::join_paths(path_entries)?;
+    let session = common::spawn_server_with_args_env(
+        vec![
+            "--worker-spec".to_string(),
+            spec_path.display().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ],
+        vec![("PATH".to_string(), path.to_string_lossy().into_owned())],
+    )
+    .await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "hello from path",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("hello from path\r\n"),
+        "expected PATH-resolved PTY worker to receive input, got: {text:?}"
+    );
+    assert!(
+        text.contains("zod> "),
+        "expected PATH-resolved PTY worker prompt, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_windows_pty_crlf_input_reports_wire_bytes_for_accounting() -> TestResult<()> {
+    let session =
+        spawn_zod_server_with_stdin_env_and_extra_args("pty", Vec::new(), Vec::new()).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "report-raw-line supplied crlf\r\nreport-leading-empty",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("raw-line-debug: report-raw-line supplied crlf"),
+        "expected Windows PTY worker to receive the first CRLF-terminated command, got: {text:?}"
+    );
+    assert!(
+        text.contains("previous empty line: missing\n"),
+        "expected the command after CRLF to run without a protocol mismatch, got: {text:?}"
+    );
+    assert!(
+        !text.contains("readline_input_bytes bytes does not match active stdin"),
+        "server accounting should use the bytes written to the Windows PTY, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())
@@ -797,7 +893,7 @@ async fn zod_worker_protocol_error_after_timeout_is_reported_on_follow_up() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()> {
+async fn zod_worker_readline_input_bytes_mismatch_is_protocol_error() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
     let result = session
@@ -811,8 +907,8 @@ async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("readline_input text does not match active stdin"),
-        "expected readline_input accounting protocol error, got: {text:?}"
+        text.contains("readline_input_bytes bytes does not match active stdin"),
+        "expected readline_input_bytes accounting protocol error, got: {text:?}"
     );
 
     session.cancel().await?;

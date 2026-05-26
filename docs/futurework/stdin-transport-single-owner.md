@@ -14,20 +14,21 @@ The remaining follow-up is broader than that point fix. We still need to tighten
 - The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
 - Future embedded interpreters can run into similar issues if worker stdin
   ownership drifts again.
-- The current R and Python paths now keep stdin raw and use sideband metadata
-  for request boundaries, but their in-worker stdin ownership differs.
+- The current R and Python paths now keep stdin raw and use sideband facts for
+  prompt state plus byte-level input accounting, but their in-worker stdin
+  ownership differs.
 
 ## Current Scope
 
-This repo now uses raw stdin for worker payloads and sideband IPC for request
-metadata:
+This repo now uses raw stdin for worker payloads and sideband IPC for prompt
+state and byte-level accounting:
 
 - R worker mode owns stdin in a worker-side reader thread. The server announces
-  the payload byte length on sideband IPC; the worker reader consumes exactly
-  that many raw bytes and submits them to embedded R.
-- Python worker mode lets CPython own stdin. The server announces request
-  metadata on sideband IPC, waits for `stdin_write_ack`, then writes raw bytes
-  for CPython's interactive loop to consume.
+  payload bytes by writing them to worker stdin; the worker reports exact
+  consumed or discarded bytes on sideband IPC.
+- Python worker mode lets CPython own stdin. The server writes raw bytes for
+  CPython's interactive loop to consume, and the worker reports exact consumed
+  or discarded bytes on sideband IPC.
 
 The remaining follow-up is to make this ownership split more explicit in code
 and reduce server-side backend branching around request metadata.
@@ -36,8 +37,10 @@ and reduce server-side backend branching around request metadata.
 
 - Treat worker stdin as the real raw input stream delivered to the interpreter.
 - Do not add framing headers or other synthetic protocol markers to stdin.
-- Mirror request metadata over IPC instead: request start, expected input payload, completion, and other turn/state signals.
-- Let the worker use the IPC envelope to know when the current stdin payload is complete, while still feeding raw stdin through the interpreter-facing path.
+- Mirror interpreter state over IPC instead: prompt starts, consumed bytes,
+  discarded bytes, completion, and other turn/state signals.
+- Let the worker use exact sideband accounting for stdin bytes while still
+  feeding raw stdin through the interpreter-facing path.
 - For line-oriented runtimes such as embedded R, expect a single logical request to be satisfied across multiple `readline` or `ReadConsole` calls.
 
 The current embedded worker implementation keeps stdin raw and preserves request

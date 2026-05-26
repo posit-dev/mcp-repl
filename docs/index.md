@@ -48,7 +48,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/server-backend-boundary.md`: deferred note on removing backend-specific execution semantics from server-side request handling.
 - `docs/futurework/sidecar-viewer-observability.md`: deferred note on a local read-only sidecar viewer for transcripts, plots, and output bundles.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
-- `docs/futurework/worker-pty-stdin-transport.md`: historical design note for the implemented Unix Python and custom-worker PTY launch path.
+- `docs/futurework/worker-pty-stdin-transport.md`: historical design note for the implemented Python and custom-worker PTY launch path.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
 - `docs/futurework/stdin-transport-single-owner.md`: deferred design for making worker stdin ownership explicit instead of relying on a Windows-only gate.

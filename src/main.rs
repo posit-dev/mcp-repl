@@ -24,6 +24,8 @@ mod sandbox;
 mod sandbox_cli;
 mod server;
 mod stdin_payload;
+#[cfg(target_family = "windows")]
+mod windows_pty_filter;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;
@@ -495,7 +497,7 @@ mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|pytho
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
---oversized-output: choose oversized-output handling (pager: default legacy modal pager; files: spill oversized replies to files)\n\
+--oversized-output: choose oversized-output handling (pager: default interactive pager; files: spill oversized replies to files)\n\
 --sandbox: base sandbox mode (inherit uses client tool-call metadata; --debug-repl bootstraps local defaults)\n\
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\

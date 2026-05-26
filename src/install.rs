@@ -775,7 +775,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--interpreter", "r"] 
 [mcp_servers]
   # keep this note
 repl={command="/usr/local/bin/old-mcp-repl",args=["--interpreter","r"]}
-r = { command = "/usr/local/bin/legacy-repl" }
+r = { command = "/usr/local/bin/other-repl" }
 
 [workspace]
 name="demo"
@@ -804,7 +804,7 @@ name="demo"
         );
         assert_eq!(
             doc["mcp_servers"]["r"]["command"].as_str(),
-            Some("/usr/local/bin/legacy-repl"),
+            Some("/usr/local/bin/other-repl"),
             "other MCP servers should be preserved"
         );
     }

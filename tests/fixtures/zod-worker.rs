@@ -95,12 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let command = line.trim_end_matches(['\r', '\n']);
         let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
-            format!("{text}\n")
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(b'\n');
+            bytes
         } else {
-            line.clone()
+            line.as_bytes().to_vec()
         };
-        writer.send(&WorkerToServer::ReadlineInput {
-            text: reported_input,
+        writer.send(&WorkerToServer::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(reported_input),
         })?;
         timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
@@ -338,18 +340,17 @@ fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()
 }
 
 fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
-    let (text, len) = {
+    let (bytes, len) = {
         let buffer = reader.fill_buf()?;
-        let text = std::str::from_utf8(buffer)
-            .map_err(io::Error::other)?
-            .to_string();
-        (text, buffer.len())
+        (buffer.to_vec(), buffer.len())
     };
     if len == 0 {
         return Ok(());
     }
     reader.consume(len);
-    writer.send(&WorkerToServer::ReadlineDiscard { text })
+    writer.send(&WorkerToServer::ReadlineDiscardBytes {
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 fn escape_bytes(bytes: &[u8]) -> String {
@@ -636,11 +637,11 @@ enum WorkerToServer {
     ReadlineStart {
         prompt: String,
     },
-    ReadlineInput {
-        text: String,
+    ReadlineInputBytes {
+        data_b64: String,
     },
-    ReadlineDiscard {
-        text: String,
+    ReadlineDiscardBytes {
+        data_b64: String,
     },
     OutputText {
         stream: String,
@@ -740,8 +741,8 @@ impl IpcTransport {
         {
             let to_worker = std::env::var(IPC_PIPE_TO_WORKER_ENV).map_err(io::Error::other)?;
             let from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV).map_err(io::Error::other)?;
-            let reader = std::fs::OpenOptions::new().read(true).open(to_worker)?;
-            let writer = std::fs::OpenOptions::new().write(true).open(from_worker)?;
+            let reader = open_named_pipe_with_retry(&to_worker, NamedPipeAccess::Read)?;
+            let writer = open_named_pipe_with_retry(&from_worker, NamedPipeAccess::Write)?;
             Ok(Self {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
@@ -755,6 +756,48 @@ impl IpcTransport {
                 "zod-worker sideband transport is unsupported on this platform",
             ))
         }
+    }
+}
+
+#[cfg(target_family = "windows")]
+#[derive(Clone, Copy)]
+enum NamedPipeAccess {
+    Read,
+    Write,
+}
+
+#[cfg(target_family = "windows")]
+fn open_named_pipe_with_retry(path: &str, access: NamedPipeAccess) -> io::Result<std::fs::File> {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const IPC_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let deadline = Instant::now() + IPC_OPEN_TIMEOUT;
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        match access {
+            NamedPipeAccess::Read => {
+                options.read(true);
+            }
+            NamedPipeAccess::Write => {
+                options.write(true);
+            }
+        }
+        match options.open(path) {
+            Ok(file) => return Ok(file),
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

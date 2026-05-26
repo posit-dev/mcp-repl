@@ -2035,6 +2035,14 @@ tryCatch({
                         {
                             continue;
                         }
+                        if path_matches(path, &["_meta", "codex/sandbox-state-meta"])
+                            && !matches!(
+                                normalized_key.as_str(),
+                                "sandboxPolicy" | "sandboxCwd" | "codexLinuxSandboxExe"
+                            )
+                        {
+                            continue;
+                        }
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
@@ -2770,8 +2778,8 @@ tryCatch({
         item
     }
 
-    fn resolve_tool_call_spec(request: &Value, legacy_tool_name: &str) -> Option<MockToolCallSpec> {
-        let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
+    fn resolve_tool_call_spec(request: &Value, flat_tool_name: &str) -> Option<MockToolCallSpec> {
+        let (namespace, name) = split_flat_tool_name(flat_tool_name)?;
         let tools = request.get("tools")?.as_array()?;
         let namespaced_tool_present = tools.iter().any(|tool| {
             tool.get("type").and_then(Value::as_str) == Some("namespace")
@@ -2792,13 +2800,13 @@ tryCatch({
         })
     }
 
-    fn split_legacy_tool_name(legacy_tool_name: &str) -> Option<(&str, &str)> {
-        let split = legacy_tool_name.rfind("__")?;
+    fn split_flat_tool_name(flat_tool_name: &str) -> Option<(&str, &str)> {
+        let split = flat_tool_name.rfind("__")?;
         let namespace_end = split + 2;
-        (namespace_end < legacy_tool_name.len()).then(|| {
+        (namespace_end < flat_tool_name.len()).then(|| {
             (
-                &legacy_tool_name[..namespace_end],
-                &legacy_tool_name[namespace_end..],
+                &flat_tool_name[..namespace_end],
+                &flat_tool_name[namespace_end..],
             )
         })
     }
