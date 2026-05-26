@@ -2035,7 +2035,7 @@ tryCatch({
                         {
                             continue;
                         }
-                        if path_matches(path, &["codex/sandbox-state-meta"])
+                        if path_matches(path, &["_meta", "codex/sandbox-state-meta"])
                             && !matches!(
                                 normalized_key.as_str(),
                                 "sandboxPolicy" | "sandboxCwd" | "codexLinuxSandboxExe"

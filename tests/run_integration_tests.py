@@ -477,21 +477,10 @@ def expected_pager_lines(start: int, end: int) -> str:
     return "".join(f"L{index:04d}\n" for index in range(start, end + 1))
 
 
-def r_visible_input_echoes() -> bool:
-    return sys.platform == "win32"
-
-
-def r_repl_output(input_text: str, output_text: str = "") -> str:
-    if r_visible_input_echoes():
-        return f"> {input_text}{output_text}"
-    return output_text
-
-
-def r_repl_result(input_text: str, output_text: str = "") -> dict[str, Any]:
+def r_repl_result(output_text: str = "") -> dict[str, Any]:
     contents = []
-    worker_text = r_repl_output(input_text, output_text)
-    if worker_text:
-        contents.append(text(worker_text))
+    if output_text:
+        contents.append(text(output_text))
     contents.append(text("> "))
     return tool_result(*contents)
 
@@ -512,7 +501,7 @@ def require_text_file(path: Path, context: str) -> str:
 def r_console_basic(client: McpStdioClient) -> None:
     received = client.repl("1+1\n", timeout_ms=30000)
 
-    expected = r_repl_result("1+1\n", "[1] 2\n")
+    expected = r_repl_result("[1] 2\n")
 
     assert_identical(expected, received, "repl")
 
@@ -520,7 +509,7 @@ def r_console_basic(client: McpStdioClient) -> None:
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        r_repl_result("1+1\n", "[1] 2\n"),
+        r_repl_result("[1] 2\n"),
         warmup,
         "warmup repl",
     )
@@ -562,7 +551,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
 def r_reset_clears_state(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        r_repl_result("x <- 1\n"),
+        r_repl_result(),
         set_var,
         "set variable repl",
     )
@@ -576,7 +565,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        r_repl_result('print(exists("x"))\n', "[1] FALSE\n"),
+        r_repl_result("[1] FALSE\n"),
         after_reset,
         "after reset repl",
     )
@@ -585,19 +574,18 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
-        r_repl_result("x <- 1\n"),
+        r_repl_result(),
         set_var,
         "set variable before restart",
     )
 
-    restarted_contents = [text("[repl] new session started\n")]
-    restarted_output = r_repl_output('print(exists("x"))\n', "[1] FALSE\n")
-    if restarted_output:
-        restarted_contents.append(text(restarted_output))
-    restarted_contents.append(text("> "))
     restarted = client.repl('\u0004print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        tool_result(*restarted_contents),
+        tool_result(
+            text("[repl] new session started\n"),
+            text("[1] FALSE\n"),
+            text("> "),
+        ),
         restarted,
         "restart prefix repl",
     )
@@ -776,25 +764,13 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
         'for (i in 1:80) cat(sprintf("L%04d\\n", i))\n',
         timeout_ms=120000,
     )
-    if r_visible_input_echoes():
-        expected_initial_text = (
-            '> for (i in 1:80) cat(sprintf("L%04d\\n", i))\n'
-            + expected_pager_lines(1, 5)
-        )
-        expected_initial_footer = "--More-- (6p, 14.2%, @0..75/525)"
-        expected_next_lines = expected_pager_lines(6, 18)
-        expected_next_footer = "--More-- (5p, 29.1%, @75..153/525)"
-        expected_search_offset = 225
-        expected_search_footer = "--More-- (4p, 42.8%, @225/525)"
-        expected_end_footer = "(END, 42.8%, @225/525)"
-    else:
-        expected_initial_text = expected_pager_lines(1, 13)
-        expected_initial_footer = "--More-- (6p, 16.2%, @0..78/480)"
-        expected_next_lines = expected_pager_lines(14, 26)
-        expected_next_footer = "--More-- (5p, 32.5%, @78..156/480)"
-        expected_search_offset = 180
-        expected_search_footer = "--More-- (4p, 37.5%, @180/480)"
-        expected_end_footer = "(END, 37.5%, @180/480)"
+    expected_initial_text = expected_pager_lines(1, 13)
+    expected_initial_footer = "--More-- (6p, 16.2%, @0..78/480)"
+    expected_next_lines = expected_pager_lines(14, 26)
+    expected_next_footer = "--More-- (5p, 32.5%, @78..156/480)"
+    expected_search_offset = 180
+    expected_search_footer = "--More-- (4p, 37.5%, @180/480)"
+    expected_end_footer = "(END, 37.5%, @180/480)"
     assert_identical(
         tool_result(
             text(expected_initial_text),

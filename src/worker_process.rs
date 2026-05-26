@@ -498,6 +498,7 @@ impl BackendDriver for RBackendDriver {
 }
 
 struct ProtocolBackendDriver {
+    #[cfg_attr(not(target_family = "windows"), allow(dead_code))]
     stdin_transport: WorkerStdinTransport,
     stdin_accounting: ProtocolStdinAccounting,
     python_request_generation: Option<u64>,
@@ -7975,6 +7976,7 @@ mod tests {
 
         let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
         let sideband = worker.recv(Some(Duration::from_secs(1)));
+        drop(worker);
         let _ = process.finish_exited();
 
         assert!(
@@ -8887,7 +8889,7 @@ mod tests {
         .expect("worker manager");
         let mut process = test_worker_process(successful_test_child());
         process.exit_status = Some(process.child.wait().expect("wait test child"));
-        process.ipc.set(server);
+        process.ipc.set(server.clone());
         manager.process = Some(process);
         manager.pending_request = true;
         manager.pending_request_started_at = Some(std::time::Instant::now());

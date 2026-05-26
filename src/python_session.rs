@@ -1343,6 +1343,7 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
     }
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1370,6 +1371,7 @@ fn request_prompt_wait_should_complete(
 }
 
 #[cfg(target_family = "unix")]
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn prompt_wait_can_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1383,6 +1385,7 @@ fn prompt_wait_can_complete(
 }
 
 #[cfg(target_family = "unix")]
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn single_line_client_input_prompt(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1554,6 +1557,10 @@ unsafe extern "C" fn mcp_repl_readline(
     let prompt_matches_repl = prompt_matches_python_repl_prompt(&prompt_text);
     #[cfg(any(target_family = "unix", windows))]
     flush_original_stdio();
+    #[cfg(target_family = "unix")]
+    if !prompt_has_buffered_answer {
+        mark_stdin_wait_prompt_completed_request();
+    }
     #[cfg(any(target_family = "unix", windows))]
     request_cpython_readline_stdin_line(&prompt_text);
     #[cfg(any(target_family = "unix", windows))]

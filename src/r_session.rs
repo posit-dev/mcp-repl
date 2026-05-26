@@ -998,12 +998,6 @@ pub extern "C-unwind" fn r_read_console(
                 }
             }
             ipc::emit_readline_input_bytes(line_text.as_bytes());
-            let mut echoed = String::with_capacity(prompt.len() + runtime_line.len());
-            echoed.push_str(prompt);
-            echoed.push_str(&runtime_line);
-            if !echoed.is_empty() {
-                emit_output_text(TextStream::Stdout, echoed.as_bytes());
-            }
 
             return 1;
         }

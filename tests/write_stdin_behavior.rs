@@ -303,7 +303,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_batch_output_with_echoes() -> TestResult<()> {
+async fn write_stdin_preserves_batch_output_without_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -348,12 +348,8 @@ async fn write_stdin_preserves_batch_output_with_echoes() -> TestResult<()> {
         "expected second expression result, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('A\\n')"),
-        "expected the leading echoed prefix to remain visible, got: {text:?}"
-    );
-    assert!(
-        text.contains("> 1+1"),
-        "expected later echoed expression to remain for attribution after output interleaving, got: {text:?}"
+        !text.contains("> cat('A\\n')") && !text.contains("> 1+1"),
+        "did not expect synthetic input echoes, got: {text:?}"
     );
 
     let result = session
@@ -369,12 +365,8 @@ async fn write_stdin_preserves_batch_output_with_echoes() -> TestResult<()> {
         "expected all expression output, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('SECOND\\n')"),
-        "expected second submitted expression echo for attribution, got: {text:?}"
-    );
-    assert!(
-        text.contains("> cat('THIRD\\n')"),
-        "expected third submitted expression echo for attribution, got: {text:?}"
+        !text.contains("> cat('SECOND\\n')") && !text.contains("> cat('THIRD\\n')"),
+        "did not expect synthetic input echoes, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -383,8 +375,7 @@ async fn write_stdin_preserves_batch_output_with_echoes() -> TestResult<()> {
 
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo() -> TestResult<()>
-{
+async fn write_stdin_preserves_prompt_shaped_child_stdout_before_result() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -406,63 +397,9 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() >= 2,
-        "expected raw child stdout and later R echo to both remain visible, got: {text:?}"
+        text.matches("> 1+1").count() == 1,
+        "expected one raw child prompt-shaped line before the result, got: {text:?}"
     );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_matched_readline_transcripts() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let mut session = spawn_behavior_session().await?;
-
-    let input = format!(
-        "first <- readline('FIRST> '); second <- readline('SECOND> '); big <- paste(rep('z', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('DONE_START\\n'); cat(big); cat('\\nDONE_END\\n')"
-    );
-    let first = session.write_stdin_raw_with(&input, Some(10.0)).await?;
-    let first_text = result_text(&first);
-    if backend_unavailable(&first_text) {
-        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    assert!(
-        first_text.contains("FIRST> "),
-        "expected first readline prompt, got: {first_text:?}"
-    );
-
-    let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
-    let second_text = result_text(&second);
-    assert!(
-        second_text.contains("FIRST> alpha"),
-        "expected matched readline transcript in follow-up reply, got: {second_text:?}"
-    );
-    assert!(
-        second_text.contains("SECOND> "),
-        "expected the unmatched second readline prompt after the first answer, got: {second_text:?}"
-    );
-
-    let third = session.write_stdin_raw_with("beta", Some(30.0)).await?;
-    let third = wait_until_not_busy(&mut session, third).await?;
-    let third_text = result_text(&third);
-    let transcript_path = bundle_transcript_path(&third_text).unwrap_or_else(|| {
-        panic!("expected transcript path in spilled readline reply, got: {third_text:?}")
-    });
-    let transcript = fs::read_to_string(&transcript_path)?;
-
-    session.cancel().await?;
-
-    assert!(
-        transcript.contains("SECOND> beta"),
-        "expected matched readline transcript in transcript.txt, got: {transcript:?}"
-    );
-    assert!(
-        transcript.contains("DONE_START") && transcript.contains("DONE_END"),
-        "expected spilled worker output in transcript.txt, got: {transcript:?}"
-    );
-
     Ok(())
 }
 
@@ -1572,7 +1509,7 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_follow_up_after_resolved_timeout_preserves_visible_echo_prefix() -> TestResult<()> {
+async fn pager_follow_up_after_resolved_timeout_preserves_settled_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
     let temp = workspace_tempdir()?;
@@ -1638,8 +1575,8 @@ async fn pager_follow_up_after_resolved_timeout_preserves_visible_echo_prefix() 
         "expected the fresh pager follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        follow_up_text.contains("file.exists(") && follow_up_text.contains("print(1+1)"),
-        "expected the timed-out request echo to remain visible in the next pager reply, got: {follow_up_text:?}"
+        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
+        "did not expect the timed-out request input to echo into the next pager reply, got: {follow_up_text:?}"
     );
 
     Ok(())
