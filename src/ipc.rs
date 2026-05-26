@@ -92,6 +92,9 @@ pub enum ServerToWorkerIpcMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+// This is an internal server/bundled-worker protocol. The advertised protocol
+// version gates paired implementations in this repository; it is not a public
+// extension contract for external workers.
 pub enum WorkerToServerIpcMessage {
     WorkerReady {
         protocol: WorkerProtocol,
@@ -2141,7 +2144,7 @@ mod protocol_tests {
     }
 
     #[test]
-    fn protocol_v1_text_input_frames_still_deserialize() {
+    fn legacy_text_input_frames_still_deserialize() {
         let input = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "readline_input",
             "text": "done\n"
@@ -2151,7 +2154,7 @@ mod protocol_tests {
                 input,
                 Ok(WorkerToServerIpcMessage::ReadlineInput { ref text }) if text == "done\n"
             ),
-            "readline_input should remain a protocol v1 compatibility alias"
+            "readline_input should remain a bundled-worker transition alias"
         );
 
         let discard = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
@@ -2163,7 +2166,7 @@ mod protocol_tests {
                 discard,
                 Ok(WorkerToServerIpcMessage::ReadlineDiscard { ref text }) if text == "stale\n"
             ),
-            "readline_discard should remain a protocol v1 compatibility alias"
+            "readline_discard should remain a bundled-worker transition alias"
         );
     }
 

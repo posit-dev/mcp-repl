@@ -4,6 +4,10 @@ This document describes the sideband protocol between the server and a worker
 process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
+The sideband protocol is an internal contract between the server and the bundled worker implementations.
+It is not a supported extension interface for external workers.
+The protocol version is a server/worker compatibility gate for this repository, not a public stability promise.
+
 User input is not carried on sideband. The server writes decoded MCP `repl()`
 text to worker stdin, appending exactly one trailing `\n` to non-empty input
 that does not already end in `\n`. The worker owns runtime stdin placement and
@@ -88,7 +92,7 @@ invalid base64, and unknown message types are protocol errors.
   this accounting event reports the pre-normalized wire bytes.
 - The server decodes `data_b64` and removes those bytes from the active stdin
   queue. Invalid base64 or a byte mismatch is a protocol error.
-- Protocol version 1 compatibility: the server also accepts legacy
+- Current bundled-worker transition alias: the server also accepts legacy
   `{ "type": "readline_input", "text": <string> }` frames and accounts for
   the UTF-8 encoding of `text`.
 
@@ -102,7 +106,7 @@ invalid base64, and unknown message types are protocol errors.
   queue. Invalid base64 or a byte mismatch is a protocol error.
 - Workers must emit this only for exact bytes they can identify. Bytes flushed
   from terminal state without being observed are not reportable.
-- Protocol version 1 compatibility: the server also accepts legacy
+- Current bundled-worker transition alias: the server also accepts legacy
   `{ "type": "readline_discard", "text": <string> }` frames and accounts for
   the UTF-8 encoding of `text`.
 

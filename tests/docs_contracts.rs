@@ -101,6 +101,22 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn worker_sideband_protocol_documents_internal_boundary() {
+    let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
+
+    for required in [
+        "The sideband protocol is an internal contract between the server and the bundled worker implementations.",
+        "It is not a supported extension interface for external workers.",
+        "The protocol version is a server/worker compatibility gate for this repository, not a public stability promise.",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "missing {required} in docs/worker_sideband_protocol.md"
+        );
+    }
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_output_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
