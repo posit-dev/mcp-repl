@@ -199,17 +199,17 @@ errors.
 
 ## Text and Byte Encoding
 
-Sideband itself is UTF-8 JSONL. Fields that describe MCP input and
-runtime line-input state use JSON strings:
+Sideband itself is UTF-8 JSONL. Prompt text uses a JSON string:
 
 - `readline_start.prompt`
-- `readline_input.text`
-- `readline_discard.text`
 
-These fields are UTF-8 text because MCP tool input is text and the
-readline contract is line-oriented text. For stdin accounting, the
-server encodes `readline_input.text` or `readline_discard.text` as UTF-8
-and compares those bytes with the active-turn stdin byte queue.
+Stdin accounting uses base64 byte payloads:
+
+- `readline_input_bytes.data_b64`
+- `readline_discard_bytes.data_b64`
+
+The server decodes those fields and compares the bytes with the
+active-turn stdin byte queue.
 
 This does not add a new user-visible input restriction beyond MCP. A
 normal `repl()` call supplies a JSON string inside a UTF-8 JSON-RPC
@@ -239,7 +239,7 @@ The first worker-to-server message must be:
 ```json
 {
   "type": "worker_ready",
-  "protocol": { "name": "mcp-repl-worker", "version": 1 },
+  "protocol": { "name": "mcp-repl-worker", "version": 2 },
   "worker": { "name": "zod", "version": "0.1.0" },
   "capabilities": {
     "images": false
@@ -325,10 +325,10 @@ block: it can be satisfied immediately by bytes already available on
 stdin.
 
 If the server still has bytes from the active turn that have not been
-matched by `readline_input.text` or `readline_discard.text`, this prompt
-is satisfied by already-written input and the turn is not complete. If
-no such bytes remain, this prompt is unsatisfied and the server may seal
-the reply for the active turn.
+matched by `readline_input_bytes` or `readline_discard_bytes`, this
+prompt is satisfied by already-written input and the turn is not
+complete. If no such bytes remain, this prompt is unsatisfied and the
+server may seal the reply for the active turn.
 
 For an unsatisfied `readline_start`, the server will render non-empty
 worker-supplied prompt text in the MCP response to show that the runtime
@@ -345,60 +345,59 @@ cannot suppress. If prompt-like text does arrive as output, the server
 must preserve it as ordinary output and must not deduplicate it by
 comparing it with `readline_start.prompt`.
 
-### `readline_input`
+### `readline_input_bytes`
 
 Worker to server:
 
 ```json
 {
-  "type": "readline_input",
-  "text": "1+1\n"
+  "type": "readline_input_bytes",
+  "data_b64": "MSsxCg=="
 }
 ```
 
 Fields:
 
-- `text`: exact UTF-8 text delivered to the runtime-facing input layer
-  for this read, including a server-appended trailing newline if one was
-  added before writing to worker stdin.
+- `data_b64`: exact active-turn bytes delivered to the runtime-facing
+  input layer, encoded as base64.
 
-The server may use `readline_input` only for generic accounting against
-the bytes it already wrote to worker stdin. It must not interpret the
-text as language syntax. A mismatch between `readline_input.text`
-encoded as UTF-8 and the server's active-turn byte queue is a protocol
-error because it means the worker's input placement is not describing
-what it delivered to the runtime-facing input layer.
+The server may use `readline_input_bytes` only for generic accounting
+against the bytes it already wrote to worker stdin. It must not
+interpret the bytes as language syntax. Invalid base64 or a mismatch
+with the server's active-turn byte queue is a protocol error because it
+means the worker's input placement is not describing what it delivered
+to the runtime-facing input layer.
 
-`readline_input` is not itself a completion signal. Completion is the
-next unsatisfied `readline_start` or `session_end`.
+`readline_input_bytes` is not itself a completion signal. Completion is
+the next unsatisfied `readline_start` or `session_end`.
 
-### `readline_discard`
+### `readline_discard_bytes`
 
 Worker to server:
 
 ```json
 {
-  "type": "readline_discard",
-  "text": "cancelled\n"
+  "type": "readline_discard_bytes",
+  "data_b64": "Y2FuY2VsbGVkCg=="
 }
 ```
 
 Fields:
 
-- `text`: exact UTF-8 text from the active turn that the worker
-  discarded without delivering to the runtime.
+- `data_b64`: exact active-turn bytes that the worker discarded without
+  delivering to the runtime, encoded as base64.
 
 The worker emits this only for bytes it can account for. The server
 removes these bytes from the active-turn byte queue exactly like
-delivered input bytes, but it does not display them as runtime output. A
-mismatch between `readline_discard.text` encoded as UTF-8 and the
-server's active-turn byte queue is a protocol error.
+delivered input bytes, but it does not display them as runtime output.
+Invalid base64 or a mismatch with the server's active-turn byte queue is
+a protocol error.
 
 If the worker discards input after interrupt or reset cleanup and cannot
 report which bytes were discarded, the server cannot prove recovery for
 any control tail. In that case, the worker should not emit
-`readline_discard` for unknown bytes, and the server must not write a
-tail that depends on clean recovery.
+`readline_discard_bytes` for unknown bytes, and the server must not
+write a tail that depends on clean recovery.
 
 ## Output Events
 
@@ -471,16 +470,15 @@ carries no request id because the server allows only one active turn.
 
 The worker uses this message to clean up worker-owned input state. In
 response, the worker should cancel or drain any pending stdin bytes that
-it owns or can observe, and emit `readline_discard` for the exact
-active-turn text it discarded. The worker must not emit
-`readline_discard` for bytes it already delivered to the runtime-facing
-input layer, bytes it cannot identify, or bytes that belong to no active
-turn.
+it owns or can observe, and emit `readline_discard_bytes` for the exact
+active-turn bytes it discarded. The worker must not emit discard events
+for bytes it already delivered to the runtime-facing input layer, bytes
+it cannot identify, or bytes that belong to no active turn.
 
 The worker's sideband control listener must not be blocked by runtime
 evaluation. If the worker cannot process the sideband `interrupt` before
 the runtime consumes pending bytes, those bytes should be reported as
-`readline_input`, not `readline_discard`.
+`readline_input_bytes`, not `readline_discard_bytes`.
 
 The server does not wait for an acknowledgement to `interrupt`. Recovery
 is proven only by later worker events: exact input accounting followed
@@ -545,10 +543,9 @@ sleep or a signal-delivery acknowledgement. The worker has recovered
 only when it emits one of these events after the interrupt:
 
 - an unsatisfied `readline_start` after the active-turn byte queue has
-  been fully accounted for by `readline_input` and/or
-  `readline_discard`, meaning the runtime is ready for the next client
-  input and no bytes from the interrupted turn remain to satisfy that
-  read;
+  been fully accounted for by input and/or discard byte events, meaning
+  the runtime is ready for the next client input and no bytes from the
+  interrupted turn remain to satisfy that read;
 - `session_end`, meaning the old runtime is gone and cannot consume a
   follow-up tail.
 
@@ -628,10 +625,10 @@ For a conforming worker:
 1. `worker_ready` is first.
 2. `readline_start` is emitted when the runtime enters a line-read
    operation, before it reads input bytes for that operation.
-3. `readline_input` is emitted after the worker delivers input bytes to
-   the runtime-facing input layer.
-4. `readline_discard` is emitted after the worker discards accounted-for
-   input bytes during interrupt/reset cleanup.
+3. `readline_input_bytes` is emitted after the worker delivers input
+   bytes to the runtime-facing input layer.
+4. `readline_discard_bytes` is emitted after the worker discards
+   accounted-for input bytes during interrupt/reset cleanup.
 5. `output_text` and `output_image` are emitted in runtime-visible
    order.
 6. `session_end` is final.
@@ -645,7 +642,7 @@ Server-to-worker `interrupt` messages are ordered on the
 server-to-worker sideband stream. Worker-to-server recovery facts are
 ordered on the worker-to-server sideband stream. The server must not
 assume that writing the `interrupt` message means the worker has already
-processed it; later `readline_input`, `readline_discard`,
+processed it; later `readline_input_bytes`, `readline_discard_bytes`,
 `readline_start`, and `session_end` events determine recovery.
 Built-in Unix Python currently has a private `python_interrupt` /
 `python_interrupt_ack` cleanup handshake so it can drain PTY input before
@@ -685,10 +682,10 @@ Protocol errors are fail-fast:
 - Missing required field.
 - Invalid enum value.
 - Invalid base64.
-- `readline_input.text` that does not match bytes the server wrote for
-  the active turn after UTF-8 encoding.
-- `readline_discard.text` that does not match bytes the server wrote for
-  the active turn after UTF-8 encoding.
+- `readline_input_bytes.data_b64` that is invalid base64 or does not
+  match bytes the server wrote for the active turn.
+- `readline_discard_bytes.data_b64` that is invalid base64 or does not
+  match bytes the server wrote for the active turn.
 - Worker-owned output after `session_end`.
 - Second non-empty input while a turn is still active.
 
@@ -710,10 +707,10 @@ A third-party worker must:
 4. Arrange for server-written input bytes to reach the runtime.
 5. Emit `readline_start` when the runtime enters a line-read operation,
    before it reads input bytes for that operation.
-6. Emit `readline_input` after delivering input bytes to the
+6. Emit `readline_input_bytes` after delivering input bytes to the
    runtime-facing input layer.
-7. Emit `readline_discard` for accounted-for active-turn bytes discarded
-   during interrupt/reset cleanup.
+7. Emit `readline_discard_bytes` for accounted-for active-turn bytes
+   discarded during interrupt/reset cleanup.
 8. Emit worker-owned output as `output_text` or `output_image`.
 9. Arrange OS interrupt/reset/shutdown controls to affect the runtime.
 10. Emit `session_end` before clean shutdown.
@@ -791,7 +788,7 @@ surface with Zod as the worker:
 - Ctrl-C sends the sideband `interrupt` notification and is delivered as
   an OS interrupt to an existing worker.
 - Ctrl-C cancels any not-yet-written stdin tail, and the worker
-  best-effort discards pending input it owns with `readline_discard`
+  best-effort discards pending input it owns with `readline_discard_bytes`
   accounting.
 - Interrupt tail input is sent only after all prior active-turn bytes
   are accounted for as delivered or discarded and the worker emits an
@@ -849,10 +846,10 @@ worker implementation task, not a server request-handling task.
 - User input travels to the worker only as stdin bytes, with exactly one
   trailing `\n` appended by the server when non-empty input does not already
   end in `\n`.
-- R and Python workers emit `readline_start`/`readline_input` facts
+- R and Python workers emit `readline_start`/`readline_input_bytes` facts
   sufficient for the server to identify unsatisfied input waits.
-- R and Python workers emit `readline_discard` for any active-turn input
-  bytes they discard during interrupt/reset cleanup.
+- R and Python workers emit `readline_discard_bytes` for any active-turn
+  input bytes they discard during interrupt/reset cleanup.
 - The server does not parse or strip prompts from stdout/stderr.
 - The server delivers OS interrupts to an existing worker without
   consulting interpreter state.
