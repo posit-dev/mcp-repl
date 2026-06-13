@@ -252,6 +252,18 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("read-one-byte-then-discard-on-interrupt ") {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        writer.send(&WorkerToServer::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(byte),
+        })?;
+        if sleep_for(parse_millis(millis)?, sideband_interrupted, true) {
+            discard_buffered_stdin(reader, writer)?;
+        }
+        return Ok(());
+    }
+
     if command == "read-user-stdin" {
         let mut user_line = String::new();
         let bytes = reader.read_line(&mut user_line)?;
@@ -372,19 +384,17 @@ fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()
 }
 
 fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
-    let (text, len) = {
+    let bytes = {
         let buffer = reader.fill_buf()?;
-        let text = std::str::from_utf8(buffer)
-            .map_err(io::Error::other)?
-            .to_string();
-        (text, buffer.len())
+        buffer.to_vec()
     };
+    let len = bytes.len();
     if len == 0 {
         return Ok(());
     }
     reader.consume(len);
     writer.send(&WorkerToServer::ReadlineDiscardBytes {
-        data_b64: base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
 }
 

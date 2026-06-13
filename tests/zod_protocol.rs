@@ -1310,3 +1310,64 @@ async fn zod_worker_interrupt_discards_buffered_tail_before_follow_up() -> TestR
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_discards_split_utf8_buffer_bytes() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_server_with_env_and_extra_args(
+        Vec::new(),
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-one-byte-then-discard-on-interrupt 1000\né",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}after split discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("after split discard\n"),
+        "expected follow-up tail to run after split UTF-8 discard, got: {text:?}"
+    );
+    assert!(
+        !text.contains("worker protocol error"),
+        "split UTF-8 discard should account raw bytes, got: {text:?}"
+    );
+    assert!(
+        !text.contains("new session started"),
+        "split UTF-8 discard should not restart the worker, got: {text:?}"
+    );
+
+    let spawn_count = latest_debug_events(&debug_dir)?
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "split UTF-8 discard should not replace the worker"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
