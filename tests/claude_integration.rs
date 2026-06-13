@@ -197,8 +197,6 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
     cmd.arg(CLAUDE_PERMISSION_MODE);
     cmd.arg("--output-format");
     cmd.arg("json");
-    cmd.arg("--tools");
-    cmd.arg("");
 
     let output = run_command_with_timeout(cmd, CLAUDE_PROMPT, CLAUDE_TIMEOUT)?;
     let stdout = String::from_utf8(output.stdout)
@@ -214,7 +212,8 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
         .into());
     }
 
-    parse_snapshot(stdout.trim(), &staged.workspace)?
+    parse_snapshot(stdout.trim(), &staged.workspace)
+        .map_err(|err| format!("{err}\nstdout:\n{stdout}\nstderr:\n{stderr}"))?
         .ok_or_else(|| "Claude snapshot unexpectedly missing".into())
 }
 
@@ -751,6 +750,7 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
         .ok_or_else(|| "Claude init event missing tools".to_string())?
         .iter()
         .filter_map(JsonValue::as_str)
+        .filter(|tool| tool.starts_with("mcp__r__") || *tool == "ToolSearch")
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     tools.sort();
@@ -844,6 +844,9 @@ fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot>
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "Claude tool_use missing name".to_string())?
                 .to_string();
+            if name != "mcp__r__repl" {
+                continue;
+            }
             let input = content
                 .get("input")
                 .and_then(JsonValue::as_object)
@@ -1006,7 +1009,7 @@ fn render_transcript(snapshot: &ClaudeSnapshot) -> String {
 }
 
 fn snapshot_command() -> String {
-    "$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json --tools \"\"".to_string()
+    "$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json".to_string()
 }
 
 fn normalize_workspace_path(path: &str, workspace: &Path) -> String {
