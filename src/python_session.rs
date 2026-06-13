@@ -1948,17 +1948,17 @@ fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
 
     for (&original_byte, &runtime_byte) in guard.protocol_stdin_bytes.iter().zip(runtime_bytes) {
         protocol_bytes.push(original_byte);
-        let normalized_byte = if original_byte == b'\r' {
-            b'\n'
-        } else {
-            original_byte
-        };
-        if normalized_byte != runtime_byte {
+        if !protocol_stdin_byte_matches_runtime(original_byte, runtime_byte) {
             return runtime_bytes.to_vec();
         }
     }
     guard.protocol_stdin_bytes.drain(..protocol_bytes.len());
     protocol_bytes
+}
+
+#[cfg(target_family = "unix")]
+fn protocol_stdin_byte_matches_runtime(protocol_byte: u8, runtime_byte: u8) -> bool {
+    protocol_byte == runtime_byte || (protocol_byte == b'\r' && runtime_byte == b'\n')
 }
 
 #[cfg(target_family = "unix")]
@@ -2561,6 +2561,15 @@ mod tests {
             &active,
             Some(PythonReadlineState::Primary)
         ));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_protocol_stdin_matching_accepts_pty_normalized_and_raw_cr() {
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\n'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\r'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\n', b'\n'));
+        assert!(!protocol_stdin_byte_matches_runtime(b'\n', b'\r'));
     }
 
     #[test]
