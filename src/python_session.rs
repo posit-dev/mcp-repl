@@ -1941,12 +1941,12 @@ fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
         return runtime_bytes.to_vec();
     }
 
-    let mut remaining = guard.protocol_stdin_bytes.clone();
     let mut protocol_bytes = Vec::with_capacity(runtime_bytes.len());
-    for &runtime_byte in runtime_bytes {
-        let Some(original_byte) = remaining.pop_front() else {
-            return runtime_bytes.to_vec();
-        };
+    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
+        return runtime_bytes.to_vec();
+    }
+
+    for (&original_byte, &runtime_byte) in guard.protocol_stdin_bytes.iter().zip(runtime_bytes) {
         protocol_bytes.push(original_byte);
         let normalized_byte = if original_byte == b'\r' {
             b'\n'
@@ -1957,7 +1957,7 @@ fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
             return runtime_bytes.to_vec();
         }
     }
-    guard.protocol_stdin_bytes = remaining;
+    guard.protocol_stdin_bytes.drain(..protocol_bytes.len());
     protocol_bytes
 }
 
