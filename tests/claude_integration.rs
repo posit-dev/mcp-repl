@@ -666,6 +666,40 @@ fn assert_arg_pair(args: &[String], flag: &str, expected: &str) -> TestResult<()
     Err(format!("missing argument pair {flag} {expected} in {:?}", args).into())
 }
 
+#[test]
+fn extract_tool_call_rejects_unexpected_mcp_tools() {
+    let events = vec![serde_json::json!({
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "ToolSearch",
+                    "input": { "query": "mcp__r__repl" }
+                },
+                {
+                    "type": "tool_use",
+                    "name": "mcp__r__repl_reset",
+                    "input": {}
+                },
+                {
+                    "type": "tool_use",
+                    "name": "mcp__r__repl",
+                    "input": { "input": TOOL_INPUT }
+                }
+            ]
+        }
+    })];
+
+    let err = extract_tool_call(&events)
+        .expect_err("expected unexpected MCP tool uses to fail the Claude contract");
+
+    assert!(
+        err.to_string()
+            .contains("unexpected Claude tool call: mcp__r__repl_reset"),
+        "unexpected error: {err}"
+    );
+}
+
 fn stage_bedrock_env(
     temp_home: &Path,
     host_settings_env: &std::collections::BTreeMap<String, String>,
@@ -844,8 +878,11 @@ fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot>
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "Claude tool_use missing name".to_string())?
                 .to_string();
-            if name != "mcp__r__repl" {
+            if name == "ToolSearch" {
                 continue;
+            }
+            if name != "mcp__r__repl" {
+                return Err(format!("unexpected Claude tool call: {name}").into());
             }
             let input = content
                 .get("input")
