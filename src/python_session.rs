@@ -1,3 +1,5 @@
+#[cfg(target_family = "unix")]
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::RawFd;
@@ -332,14 +334,14 @@ pub(crate) fn mark_stdin_write_complete() {
 }
 
 pub(crate) fn mark_request_started() {
-    mark_request_started_with_generation(None);
+    mark_request_started_with_generation(None, Vec::new());
 }
 
-pub(crate) fn mark_request_started_for_generation(request_generation: u64) {
-    mark_request_started_with_generation(Some(request_generation));
+pub(crate) fn mark_request_started_for_generation(request_generation: u64, stdin_bytes: Vec<u8>) {
+    mark_request_started_with_generation(Some(request_generation), stdin_bytes);
 }
 
-fn mark_request_started_with_generation(request_generation: Option<u64>) {
+fn mark_request_started_with_generation(request_generation: Option<u64>, stdin_bytes: Vec<u8>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
@@ -364,6 +366,14 @@ fn mark_request_started_with_generation(request_generation: Option<u64>) {
     guard.interrupt_requested = false;
     guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
+    #[cfg(target_family = "unix")]
+    {
+        guard.protocol_stdin_bytes = stdin_bytes.into();
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = stdin_bytes;
+    }
     guard.plot_reset_pending = true;
 }
 
@@ -404,6 +414,7 @@ fn discard_pending_stdin() {
     if discarded.is_empty() {
         return;
     }
+    let discarded = take_protocol_stdin_bytes_for_runtime_read(&discarded);
     ipc::emit_readline_discard_bytes(&discarded);
 }
 
@@ -505,7 +516,11 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    stdin_pending_byte_count() == Some(0)
+    let Some(state) = SESSION_STATE.get() else {
+        return stdin_pending_byte_count() == Some(0);
+    };
+    let guard = state.inner.lock().unwrap();
+    guard.protocol_stdin_bytes.is_empty()
 }
 
 #[cfg(windows)]
@@ -1631,9 +1646,10 @@ fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
 }
 
 #[cfg(not(target_family = "unix"))]
@@ -1909,30 +1925,40 @@ fn note_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let protocol_bytes = protocol_stdin_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
     emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
     note_active_stdin_line_read(&protocol_bytes);
 }
 
 #[cfg(target_family = "unix")]
-fn protocol_stdin_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\r' {
-            normalized.push(b'\n');
-            if bytes.get(index + 1) == Some(&b'\n') {
-                index += 2;
-            } else {
-                index += 1;
-            }
+fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
+    let Some(state) = SESSION_STATE.get() else {
+        return runtime_bytes.to_vec();
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if guard.protocol_stdin_bytes.is_empty() {
+        return runtime_bytes.to_vec();
+    }
+
+    let mut remaining = guard.protocol_stdin_bytes.clone();
+    let mut protocol_bytes = Vec::with_capacity(runtime_bytes.len());
+    for &runtime_byte in runtime_bytes {
+        let Some(original_byte) = remaining.pop_front() else {
+            return runtime_bytes.to_vec();
+        };
+        protocol_bytes.push(original_byte);
+        let normalized_byte = if original_byte == b'\r' {
+            b'\n'
         } else {
-            normalized.push(bytes[index]);
-            index += 1;
+            original_byte
+        };
+        if normalized_byte != runtime_byte {
+            return runtime_bytes.to_vec();
         }
     }
-    normalized
+    guard.protocol_stdin_bytes = remaining;
+    protocol_bytes
 }
 
 #[cfg(target_family = "unix")]
@@ -2080,6 +2106,8 @@ struct SessionStateInner {
     session_end_emitted: bool,
     plot_reset_pending: bool,
     interrupt_requested: bool,
+    #[cfg(target_family = "unix")]
+    protocol_stdin_bytes: VecDeque<u8>,
 }
 
 #[allow(dead_code)]
@@ -2115,6 +2143,8 @@ impl SessionState {
                 session_end_emitted: false,
                 plot_reset_pending: false,
                 interrupt_requested: false,
+                #[cfg(target_family = "unix")]
+                protocol_stdin_bytes: VecDeque::new(),
             }),
             cvar: Condvar::new(),
         }

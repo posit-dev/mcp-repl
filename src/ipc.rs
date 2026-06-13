@@ -91,6 +91,7 @@ pub enum ServerToWorkerIpcMessage {
     RequestStart,
     PythonRequestStart {
         request_generation: u64,
+        stdin_b64: String,
     },
     StdinWrite {
         byte_len: usize,
@@ -2292,13 +2293,15 @@ mod protocol_tests {
     fn python_request_generation_messages_are_server_to_worker_only() {
         let request_start = serde_json::to_value(ServerToWorkerIpcMessage::PythonRequestStart {
             request_generation: 7,
+            stdin_b64: base64::engine::general_purpose::STANDARD.encode(b"input\r\n"),
         })
         .expect("serialize python_request_start");
         assert_eq!(
             request_start,
             json!({
                 "type": "python_request_start",
-                "request_generation": 7
+                "request_generation": 7,
+                "stdin_b64": "aW5wdXQNCg=="
             })
         );
 
