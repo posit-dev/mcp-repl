@@ -2044,7 +2044,11 @@ tryCatch({
                                 &child,
                                 Value::Array(items)
                                     if items.iter().all(|item| {
-                                        item.as_str() == Some("<CODEX_HOME>/memories")
+                                        matches!(
+                                            item.as_str(),
+                                            Some("<CODEX_HOME>/memories")
+                                                | Some("<CODEX_HOME>\\memories")
+                                        )
                                     })
                             )
                         {
@@ -2225,6 +2229,32 @@ tryCatch({
                 }
             }),
             "wire snapshots should not retain Codex's default memories writable root"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": ["<CODEX_HOME>\\memories"],
+                "network_access": false
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sandboxPolicy": {
+                    "type": "workspace-write",
+                    "network_access": false
+                }
+            }),
+            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
         );
     }
 
