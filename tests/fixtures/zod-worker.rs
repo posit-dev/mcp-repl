@@ -194,6 +194,7 @@ fn run_v3_worker(
         next_prompt: "v3> ".to_string(),
         previous_line_empty: false,
         input_line_after_idle: false,
+        session_end_after_idle: false,
         bad_output_after_idle: None,
     };
     while let Ok(message) = rx.recv() {
@@ -281,6 +282,14 @@ fn run_v3_turn(
             text: "late\n".to_string(),
         })?;
     }
+    if state.session_end_after_idle {
+        state.session_end_after_idle = false;
+        append_control_log(
+            control_log_path.as_deref(),
+            &format!("late_session_end turn_id={turn_id}"),
+        )?;
+        send_v3_session_end(writer, Some(turn_id), "runtime_exit")?;
+    }
     if let Some(delay) = state.bad_output_after_idle.take() {
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
@@ -354,6 +363,11 @@ fn run_v3_command(
         return Ok(false);
     }
 
+    if command == "session-end-after-idle" {
+        state.session_end_after_idle = true;
+        return Ok(false);
+    }
+
     if let Some(millis) = command.strip_prefix("bad-output-after-idle ") {
         state.bad_output_after_idle = Some(Duration::from_millis(parse_millis(millis)?));
         return Ok(false);
@@ -413,6 +427,7 @@ struct V3CommandState {
     next_prompt: String,
     previous_line_empty: bool,
     input_line_after_idle: bool,
+    session_end_after_idle: bool,
     bad_output_after_idle: Option<Duration>,
 }
 

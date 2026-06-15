@@ -663,6 +663,56 @@ async fn zod_worker_v3_input_line_after_idle_is_protocol_error() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v3_session_end_after_idle_is_protocol_error() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_v3_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-after-idle",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    wait_for_log_contains(&control_log, "late_session_end turn_id=1")?;
+    if first_text.contains("session_end") {
+        assert!(
+            first_text.contains("arrived after idle") || first_text.contains("with no active turn"),
+            "expected late session_end to fail closed as protocol error, got: {first_text:?}"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("v3> "),
+        "expected first turn to complete before reporting late session_end, got: {first_text:?}"
+    );
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "after late session end",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("session_end turn_id 1 arrived after idle")
+            || second_text.contains("session_end reported turn_id 1 with no active turn"),
+        "expected late session_end to fail closed as protocol error, got: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v3_latched_protocol_error_blocks_next_turn_start() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
