@@ -306,9 +306,6 @@ trait BackendDriver: Send {
     fn should_write_stdin_payload(&self) -> bool {
         true
     }
-    fn uses_turn_protocol(&self) -> bool {
-        false
-    }
     fn clear_active_turn(&mut self) {}
     fn wait_for_completion(
         &mut self,
@@ -1068,10 +1065,6 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn should_write_stdin_payload(&self) -> bool {
         !self.is_v3()
-    }
-
-    fn uses_turn_protocol(&self) -> bool {
-        self.is_v3()
     }
 
     fn clear_active_turn(&mut self) {
@@ -2219,6 +2212,7 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let _ = self.reset_preserving_detached_prefix_item_count();
             return Err(err);
         }
         if self.pending_request {
@@ -2378,6 +2372,8 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let preserve_pager = self.pager.is_active();
+            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             return Err(err);
         }
         if self.pending_request {
@@ -4650,9 +4646,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
-                if self.driver.uses_turn_protocol() {
-                    self.clear_pending_request_state();
-                }
+                self.driver.clear_active_turn();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {

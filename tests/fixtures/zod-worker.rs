@@ -309,6 +309,17 @@ fn run_v3_command(
         return Ok(false);
     }
 
+    if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
+        append_control_log(
+            control_log_path.as_deref(),
+            &format!("bad_output_after_sleep turn_id={turn_id}"),
+        )?;
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
+        sleep_for(5_000, sideband_interrupted, false);
+        return Ok(false);
+    }
+
     if let Some(millis) = command.strip_prefix("interrupt-report ") {
         let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
         let text = format!(

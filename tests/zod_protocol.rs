@@ -618,6 +618,53 @@ async fn zod_worker_v3_latched_protocol_error_blocks_next_turn_start() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v3_protocol_error_after_timeout_blocks_next_turn_start() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_v3_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "bad-output-after-sleep 80",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout busy status, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "bad_output_after_sleep turn_id=1")?;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "must not reach timed-out v3 worker",
+                "timeout_ms": 100
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("invalid output_text base64"),
+        "expected delayed protocol error on follow-up, got: {second_text:?}"
+    );
+
+    let log = read_optional(&control_log);
+    assert!(
+        !log.contains("must not reach timed-out v3 worker"),
+        "delayed protocol error must prevent the next turn_start, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_raw_line_escape_preserves_stdin_bytes() -> TestResult<()> {
     let session = spawn_zod_server().await?;
 
