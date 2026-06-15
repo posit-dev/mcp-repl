@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::legacy_ack_state::LegacyAckState;
-use crate::legacy_request_state::LegacyRequestState;
+use crate::builtin_adapter_ack_state::BuiltinAdapterAckState;
+use crate::builtin_adapter_request_state::BuiltinAdapterRequestState;
 use crate::output_capture::OutputTextSource;
 use crate::turn_state::TurnState;
 use crate::worker_protocol::TextStream;
@@ -85,7 +85,6 @@ static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
-pub const BUILTIN_WORKER_PROTOCOL_VERSION: u32 = 2;
 pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,10 +123,6 @@ pub enum WorkerToServerIpcMessage {
         protocol: WorkerProtocol,
         worker: WorkerIdentity,
         capabilities: WorkerCapabilities,
-    },
-    BackendInfo {
-        #[serde(default)]
-        supports_images: bool,
     },
     StdinWriteAck,
     PythonInterruptAck,
@@ -210,9 +205,9 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
-    legacy_ack_state: LegacyAckState,
+    builtin_adapter_ack_state: BuiltinAdapterAckState,
     turn_state: TurnState,
-    legacy_request_state: LegacyRequestState,
+    builtin_adapter_request_state: BuiltinAdapterRequestState,
     current_image_id: Option<String>,
     request_image_id: Option<String>,
     plot_source_image_ids: HashMap<String, String>,
@@ -414,13 +409,12 @@ impl ServerIpcConnection {
                     if !guard.startup_message_seen {
                         let startup_message = matches!(
                             &message,
-                            WorkerToServerIpcMessage::BackendInfo { .. }
-                                | WorkerToServerIpcMessage::WorkerReady { .. }
+                            WorkerToServerIpcMessage::WorkerReady { .. }
                                 | WorkerToServerIpcMessage::SessionEnd { .. }
                         );
                         if !startup_message {
                             guard.turn_state.latch_protocol_error(
-                                "first worker sideband message must be worker_ready or backend_info",
+                                "first worker sideband message must be worker_ready",
                             );
                             reader_cvar.notify_all();
                             break;
@@ -433,7 +427,7 @@ impl ServerIpcConnection {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
                         guard
-                            .legacy_request_state
+                            .builtin_adapter_request_state
                             .record_readline_start(Instant::now());
                         push_prompt_history(&mut guard, prompt.clone());
                         guard.last_prompt = Some(prompt);
@@ -456,7 +450,7 @@ impl ServerIpcConnection {
                         };
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) = guard
-                            .legacy_request_state
+                            .builtin_adapter_request_state
                             .account_stdin(&bytes, "readline_input_bytes")
                         {
                             guard.turn_state.latch_protocol_error(err);
@@ -478,7 +472,7 @@ impl ServerIpcConnection {
                             };
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) = guard
-                            .legacy_request_state
+                            .builtin_adapter_request_state
                             .account_stdin(&bytes, "readline_discard_bytes")
                         {
                             guard.turn_state.latch_protocol_error(err);
@@ -494,7 +488,7 @@ impl ServerIpcConnection {
                             source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.legacy_request_state.record_readline_result();
+                        guard.builtin_adapter_request_state.record_readline_result();
                         guard.echo_events.push_back(echo_event.clone());
                         reader_cvar.notify_all();
                         drop(guard);
@@ -504,12 +498,14 @@ impl ServerIpcConnection {
                     }
                     WorkerToServerIpcMessage::StdinWriteAck => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.legacy_ack_state.record_stdin_write_ack();
+                        guard.builtin_adapter_ack_state.record_stdin_write_ack();
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::PythonInterruptAck => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.legacy_ack_state.record_python_interrupt_ack();
+                        guard
+                            .builtin_adapter_ack_state
+                            .record_python_interrupt_ack();
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::InputLine {
@@ -531,7 +527,7 @@ impl ServerIpcConnection {
                             reader_cvar.notify_all();
                             break;
                         }
-                        guard.legacy_request_state.record_readline_result();
+                        guard.builtin_adapter_request_state.record_readline_result();
                         push_prompt_history(&mut guard, prompt);
                         guard.echo_events.push_back(echo_event.clone());
                         reader_cvar.notify_all();
@@ -633,7 +629,7 @@ impl ServerIpcConnection {
                                 id,
                                 is_new,
                                 updates_previous_image,
-                                guard.legacy_request_state.readline_result_count(),
+                                guard.builtin_adapter_request_state.readline_result_count(),
                             )
                         };
                         if let Some(handler) = plot_handler.as_ref() {
@@ -681,7 +677,7 @@ impl ServerIpcConnection {
                                 id,
                                 is_new,
                                 updates_previous_image,
-                                guard.legacy_request_state.readline_result_count(),
+                                guard.builtin_adapter_request_state.readline_result_count(),
                             )
                         };
                         if let Some(handler) = plot_handler.as_ref() {
@@ -751,7 +747,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.legacy_ack_state.clear();
+        guard.builtin_adapter_ack_state.clear();
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -760,8 +756,10 @@ impl ServerIpcConnection {
     pub fn begin_request_with_stdin(&self, payload: &[u8]) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.legacy_ack_state.clear();
-        guard.legacy_request_state.begin_with_stdin(payload);
+        guard.builtin_adapter_ack_state.clear();
+        guard
+            .builtin_adapter_request_state
+            .begin_with_stdin(payload);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -770,7 +768,7 @@ impl ServerIpcConnection {
     pub fn begin_turn(&self, turn_id: u64) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.legacy_ack_state.clear();
+        guard.builtin_adapter_ack_state.clear();
         guard.turn_state.begin_turn(turn_id);
         guard.echo_events.clear();
         guard.prompt_history.clear();
@@ -906,14 +904,14 @@ impl ServerIpcConnection {
         guard.last_prompt.take()
     }
 
-    pub fn wait_for_backend_info(
+    pub fn wait_for_worker_ready(
         &self,
         timeout: Duration,
     ) -> Result<WorkerToServerIpcMessage, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if let Some(info) = take_backend_info(&mut guard) {
+            if let Some(info) = take_worker_ready(&mut guard) {
                 let _ = take_session_end(&mut guard);
                 return Ok(info);
             }
@@ -945,7 +943,7 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if guard.legacy_ack_state.take_stdin_write_ack() {
+            if guard.builtin_adapter_ack_state.take_stdin_write_ack() {
                 return Ok(());
             }
             if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -966,7 +964,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if guard.legacy_ack_state.take_stdin_write_ack() {
+                if guard.builtin_adapter_ack_state.take_stdin_write_ack() {
                     return Ok(());
                 }
                 if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -982,7 +980,7 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if guard.legacy_ack_state.take_python_interrupt_ack() {
+            if guard.builtin_adapter_ack_state.take_python_interrupt_ack() {
                 return Ok(());
             }
             if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -1003,7 +1001,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if guard.legacy_ack_state.take_python_interrupt_ack() {
+                if guard.builtin_adapter_ack_state.take_python_interrupt_ack() {
                     return Ok(());
                 }
                 if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -1882,19 +1880,23 @@ pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Opt
 
 pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
-            protocol: WorkerProtocol {
-                name: "mcp-repl-worker".to_string(),
-                version: BUILTIN_WORKER_PROTOCOL_VERSION,
-            },
-            worker: WorkerIdentity {
-                name: worker_name.to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            capabilities: WorkerCapabilities {
-                images: supports_images,
-            },
-        });
+        let _ = ipc.send(worker_ready_message(worker_name, supports_images));
+    }
+}
+
+fn worker_ready_message(worker_name: &str, supports_images: bool) -> WorkerToServerIpcMessage {
+    WorkerToServerIpcMessage::WorkerReady {
+        protocol: WorkerProtocol {
+            name: "mcp-repl-worker".to_string(),
+            version: WORKER_PROTOCOL_VERSION,
+        },
+        worker: WorkerIdentity {
+            name: worker_name.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        capabilities: WorkerCapabilities {
+            images: supports_images,
+        },
     }
 }
 
@@ -1984,7 +1986,7 @@ fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bo
         return guard.turn_state.request_completion_ready();
     }
     guard
-        .legacy_request_state
+        .builtin_adapter_request_state
         .request_completion_ready(stable_wait)
 }
 
@@ -2029,7 +2031,7 @@ fn request_completion_precedes_latched_protocol_error(
         return false;
     };
     guard
-        .legacy_request_state
+        .builtin_adapter_request_state
         .request_completion_precedes_protocol_error(error_observed_at, stable_wait)
 }
 
@@ -2052,7 +2054,7 @@ fn request_completion_observed_before_deadline(
             .request_completion_observed_before(deadline);
     }
     guard
-        .legacy_request_state
+        .builtin_adapter_request_state
         .request_completion_observed_before(deadline, allow_completion_settle_after_deadline)
 }
 
@@ -2067,11 +2069,13 @@ fn completion_wait_duration(
     if guard.turn_state.has_active_turn() {
         return until_deadline;
     }
-    guard.legacy_request_state.completion_wait_duration(
-        deadline,
-        stable_wait,
-        allow_completion_settle_after_deadline,
-    )
+    guard
+        .builtin_adapter_request_state
+        .completion_wait_duration(
+            deadline,
+            stable_wait,
+            allow_completion_settle_after_deadline,
+        )
 }
 
 fn allocate_plot_image_id() -> String {
@@ -2124,7 +2128,7 @@ fn assign_plot_image_id(
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
     guard.turn_state.clear_request_progress();
-    guard.legacy_request_state.reset_request_progress();
+    guard.builtin_adapter_request_state.reset_request_progress();
 }
 
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
@@ -2134,14 +2138,11 @@ fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     guard.last_prompt = None;
 }
 
-fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
-    let idx = guard.queue.iter().position(|msg| {
-        matches!(
-            msg,
-            WorkerToServerIpcMessage::BackendInfo { .. }
-                | WorkerToServerIpcMessage::WorkerReady { .. }
-        )
-    })?;
+fn take_worker_ready(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
+    let idx = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::WorkerReady { .. }))?;
     guard.queue.remove(idx)
 }
 
@@ -2166,24 +2167,13 @@ mod protocol_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn backend_info_protocol_does_not_include_language() {
-        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "backend_info",
-            "supports_images": true
-        }));
-
-        assert!(parsed.is_ok(), "backend_info should not require language");
-    }
-
-    #[test]
-    fn backend_info_protocol_rejects_language() {
-        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "backend_info",
-            "language": "r",
-            "supports_images": true
-        }));
-
-        assert!(parsed.is_err(), "backend_info should reject language");
+    fn builtin_worker_ready_uses_current_protocol_version() {
+        let WorkerToServerIpcMessage::WorkerReady { protocol, .. } =
+            super::worker_ready_message("r", true)
+        else {
+            panic!("worker_ready_message should create worker_ready");
+        };
+        assert_eq!(protocol.version, super::WORKER_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -2309,13 +2299,13 @@ mod protocol_tests {
     }
 
     #[test]
-    fn stdin_write_ack_is_worker_to_server_only() {
+    fn builtin_adapter_stdin_write_ack_is_worker_to_server_only() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "stdin_write_ack"
         }));
         assert!(
             matches!(parsed, Ok(WorkerToServerIpcMessage::StdinWriteAck)),
-            "stdin_write_ack should deserialize as the worker-side stdin acceptance signal"
+            "stdin_write_ack should deserialize as the built-in adapter stdin acceptance signal"
         );
 
         let parsed = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
@@ -2328,7 +2318,7 @@ mod protocol_tests {
     }
 
     #[test]
-    fn python_request_generation_messages_are_server_to_worker_only() {
+    fn builtin_python_request_generation_messages_are_server_to_worker_only() {
         let request_start = serde_json::to_value(ServerToWorkerIpcMessage::PythonRequestStart {
             request_generation: 7,
             stdin_b64: base64::engine::general_purpose::STANDARD.encode(b"input\r\n"),
@@ -2377,7 +2367,7 @@ mod protocol_tests {
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut guard = server.inbox.lock().unwrap();
-        while !guard.legacy_ack_state.has_stdin_write_ack() {
+        while !guard.builtin_adapter_ack_state.has_stdin_write_ack() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
@@ -2426,14 +2416,15 @@ mod protocol_tests {
             worker_write,
             "{}",
             json!({
-                "type": "backend_info",
-                "language": "r",
-                "supports_images": true
+                "type": "worker_ready",
+                "protocol": { "name": "mcp-repl-worker", "version": 3, "extra": true },
+                "worker": { "name": "r", "version": "0.0.0" },
+                "capabilities": { "images": true }
             })
         )
         .expect("invalid worker message");
 
-        let result = server.wait_for_backend_info(Duration::from_millis(200));
+        let result = server.wait_for_worker_ready(Duration::from_millis(200));
 
         assert!(
             matches!(result, Err(super::IpcWaitError::Protocol(ref message)) if message.starts_with("invalid worker sideband JSON:")),

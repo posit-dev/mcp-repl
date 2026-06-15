@@ -313,7 +313,7 @@ trait BackendDriver: Send {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
@@ -419,84 +419,11 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
-fn driver_refresh_backend_info(
-    ipc: ServerIpcConnection,
-    timeout: Duration,
-    timeout_is_ok: bool,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
-        Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
-            {
-                return Err(WorkerError::Protocol(format!(
-                    "unsupported worker protocol {} version {}",
-                    protocol.name, protocol.version
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(WorkerError::Protocol(
-            "unexpected ipc message while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::Timeout) => {
-            if timeout_is_ok {
-                Ok(())
-            } else {
-                Err(WorkerError::Protocol(
-                    "timed out waiting for backend info".to_string(),
-                ))
-            }
-        }
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before backend info".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
 fn driver_refresh_worker_ready(
     ipc: ServerIpcConnection,
     timeout: Duration,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
-            {
-                return Err(WorkerError::Protocol(format!(
-                    "unsupported worker protocol {} version {}",
-                    protocol.name, protocol.version
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(WorkerError::Protocol(
-            "expected worker_ready before user input".to_string(),
-        )),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
-            "timed out waiting for worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
-fn driver_refresh_custom_worker_ready(
-    ipc: ServerIpcConnection,
-    timeout: Duration,
 ) -> Result<u32, WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
+    match ipc.wait_for_worker_ready(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker"
                 || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
@@ -571,12 +498,12 @@ impl BackendDriver for RBackendDriver {
         process.send_r_interrupt()
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_worker_ready(ipc, timeout)
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
@@ -936,19 +863,19 @@ impl BackendDriver for PythonBackendDriver {
         driver_interrupt(process)
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_backend_info(ipc, timeout, false)
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
 struct ProtocolBackendDriver {
     #[cfg(target_family = "unix")]
     python_request_generation: Option<u64>,
-    protocol_version: Option<u32>,
+    uses_turn_start_transport: bool,
     next_turn_id: u64,
     active_turn_id: Option<u64>,
 }
@@ -958,7 +885,7 @@ impl ProtocolBackendDriver {
         Self {
             #[cfg(target_family = "unix")]
             python_request_generation: None,
-            protocol_version: None,
+            uses_turn_start_transport: true,
             next_turn_id: 1,
             active_turn_id: None,
         }
@@ -968,7 +895,7 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
-            protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
+            uses_turn_start_transport: false,
             next_turn_id: 1,
             active_turn_id: None,
         }
@@ -981,8 +908,8 @@ impl ProtocolBackendDriver {
         Some(*generation)
     }
 
-    fn is_v3(&self) -> bool {
-        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_VERSION)
+    fn uses_turn_start_transport(&self) -> bool {
+        self.uses_turn_start_transport
     }
 
     fn uses_builtin_stdin_adapter(&self) -> bool {
@@ -1011,7 +938,7 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        if self.is_v3() {
+        if self.uses_turn_start_transport() {
             if let Some(message) = ipc.take_protocol_error() {
                 return Err(WorkerError::Protocol(message));
             }
@@ -1048,12 +975,11 @@ impl BackendDriver for ProtocolBackendDriver {
         let _ = timeout;
         #[cfg(target_family = "unix")]
         if let Some(request_generation) = self.next_python_request_generation() {
-            // Built-in Unix Python reads request bytes through the worker stdin fd
-            // like a protocol worker, but its plot hooks still need a Python-side
-            // request boundary before follow-up stdin is consumed. The generation
-            // also lets a late interrupt avoid draining fd 0 after the next request
-            // has started. Custom protocol workers do not receive this private
-            // bridge message.
+            // Built-in Unix Python reads request bytes through the worker stdin fd,
+            // but its plot hooks still need a Python-side request boundary before
+            // follow-up stdin is consumed. The generation also lets a late
+            // interrupt avoid draining fd 0 after the next request has started.
+            // Custom protocol workers do not receive this private adapter message.
             ipc.send(ServerToWorkerIpcMessage::PythonRequestStart {
                 request_generation,
                 stdin_b64: base64::engine::general_purpose::STANDARD.encode(payload),
@@ -1086,7 +1012,7 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn should_write_stdin_payload(&self) -> bool {
-        !self.is_v3()
+        !self.uses_turn_start_transport()
     }
 
     fn clear_active_turn(&mut self) {
@@ -1106,7 +1032,7 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if self.is_v3() {
+        if self.uses_turn_start_transport() {
             if let Some(turn_id) = self.active_turn_id
                 && let Some(ipc) = process.ipc.get()
             {
@@ -1131,18 +1057,12 @@ impl BackendDriver for ProtocolBackendDriver {
         driver_interrupt(process)
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
-        if self.python_request_generation.is_some() {
-            return driver_refresh_worker_ready(ipc, timeout);
-        }
-
-        self.protocol_version = Some(driver_refresh_custom_worker_ready(ipc, timeout)?);
-        Ok(())
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
@@ -1171,7 +1091,7 @@ impl std::error::Error for WorkerError {
     }
 }
 
-const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "unix")]
 const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_family = "windows")]
@@ -4362,7 +4282,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -4450,7 +4370,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",

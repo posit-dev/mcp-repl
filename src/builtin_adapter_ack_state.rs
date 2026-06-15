@@ -1,10 +1,10 @@
 #[derive(Default)]
-pub(crate) struct LegacyAckState {
+pub(crate) struct BuiltinAdapterAckState {
     stdin_write_acks: usize,
     python_interrupt_acks: usize,
 }
 
-impl LegacyAckState {
+impl BuiltinAdapterAckState {
     pub(crate) fn record_stdin_write_ack(&mut self) {
         self.stdin_write_acks += 1;
     }

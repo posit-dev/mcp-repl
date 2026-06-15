@@ -669,7 +669,7 @@ async fn python_smoke() -> TestResult<()> {
 
 #[cfg(not(target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<()> {
+async fn python_input_prompt_is_not_duplicated_on_builtin_adapter_stdio() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -704,7 +704,7 @@ async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<(
 
 #[cfg(not(unix))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
+async fn python_plot_show_during_timeout_emits_on_builtin_adapter_stdin() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
