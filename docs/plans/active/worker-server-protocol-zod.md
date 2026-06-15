@@ -835,6 +835,16 @@ Required migration work:
 After this migration, adding Julia or another language should be a
 worker implementation task, not a server request-handling task.
 
+## Current Refactor Status
+
+- 2026-06-15: Active v3 turn id, idle completion, protocol-error
+  latching, and session-end latching moved out of `src/ipc.rs` into
+  `src/turn_state.rs`. IPC still owns legacy active-stdin accounting and
+  readline stable-wait completion.
+- Next safe slice: separate legacy stdin/readline completion state from
+  `ServerIpcInbox`, then delete any compatibility branches once R,
+  Python, and Zod exercise the same public protocol path.
+
 ## Acceptance Criteria Before Unblocking Embedded Python
 
 - This protocol contract is merged.
