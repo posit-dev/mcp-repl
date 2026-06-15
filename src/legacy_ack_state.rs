@@ -9,6 +9,7 @@ impl LegacyAckState {
         self.stdin_write_acks += 1;
     }
 
+    #[cfg_attr(target_family = "windows", allow(dead_code))]
     pub(crate) fn take_stdin_write_ack(&mut self) -> bool {
         if self.stdin_write_acks == 0 {
             return false;

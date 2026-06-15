@@ -7,7 +7,7 @@ use base64::Engine as _;
 
 use crate::ipc::{
     ServerToWorkerIpcMessage, connect_from_env, emit_python_interrupt_ack, emit_session_end,
-    emit_stdin_write_ack, set_global_ipc,
+    emit_session_end_with_reason, emit_stdin_write_ack, set_global_ipc,
 };
 use crate::python_session::{self, PythonSession};
 
@@ -90,7 +90,17 @@ fn init_ipc(
                         python_session::mark_request_started();
                         emit_stdin_write_ack();
                     }
-                    Some(ServerToWorkerIpcMessage::TurnStart { .. }) => {}
+                    Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
+                        match wait_for_python_session()
+                            .and_then(|session| session.begin_turn(turn_id, input))
+                        {
+                            Ok(()) => {}
+                            Err(err) => {
+                                emit_stderr_message(&err);
+                                emit_session_end_with_reason("protocol_error", Some(turn_id));
+                            }
+                        }
+                    }
                     Some(ServerToWorkerIpcMessage::PythonRequestStart {
                         request_generation,
                         stdin_b64,
@@ -126,8 +136,12 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {
                         python_session::mark_stdin_write_complete();
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
-                        python_session::interrupt();
+                    Some(ServerToWorkerIpcMessage::Interrupt { turn_id }) => {
+                        if let Some(turn_id) = turn_id {
+                            python_session::interrupt_turn(turn_id);
+                        } else {
+                            python_session::interrupt();
+                        }
                     }
                     Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
                         python_session::interrupt_request_generation(request_generation);

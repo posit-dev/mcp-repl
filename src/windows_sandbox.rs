@@ -1561,6 +1561,93 @@ fn run_sandboxed_command_with_env_map(
             }
         }
 
+        if crate::windows_conpty::request_env_enabled(&env_map) {
+            crate::diagnostics::startup_log("windows-sandbox: conpty requested");
+            let spawn_result = crate::windows_conpty::spawn_conpty_process_as_user(
+                restricted_token,
+                command,
+                sandbox_policy_cwd,
+                &mut env_map,
+            );
+            let (proc_info, conpty, output_forwarder) = match spawn_result {
+                Ok(value) => value,
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
+                }
+            };
+            crate::diagnostics::startup_log("windows-sandbox: conpty child spawned");
+
+            let job_handle = create_job_kill_on_close().ok();
+            if let Some(job) = job_handle {
+                let _ = AssignProcessToJobObject(job, proc_info.hProcess);
+            }
+
+            let wait_status = WaitForSingleObject(proc_info.hProcess, INFINITE);
+            if wait_status == WAIT_FAILED {
+                if let Some(job) = job_handle {
+                    CloseHandle(job);
+                }
+                drop(conpty);
+                let _ = output_forwarder.join();
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(proc_info.hThread);
+                CloseHandle(proc_info.hProcess);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(format!(
+                    "WaitForSingleObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut exit_code: u32 = 1;
+            if GetExitCodeProcess(proc_info.hProcess, &mut exit_code) == 0 {
+                if let Some(job) = job_handle {
+                    CloseHandle(job);
+                }
+                drop(conpty);
+                let _ = output_forwarder.join();
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(proc_info.hThread);
+                CloseHandle(proc_info.hProcess);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(format!(
+                    "GetExitCodeProcess failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            if let Some(job) = job_handle {
+                CloseHandle(job);
+            }
+            drop(conpty);
+            let _ = output_forwarder.join();
+            cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+            drop(live_marker);
+            CloseHandle(proc_info.hThread);
+            CloseHandle(proc_info.hProcess);
+            CloseHandle(restricted_token);
+            if launch_sid_is_distinct {
+                LocalFree(psid_launch as HLOCAL);
+            }
+            LocalFree(psid_capability as HLOCAL);
+
+            return Ok(exit_code as i32);
+        }
+
         let stdio_pipes = match create_wrapper_child_stdio() {
             Ok(pipes) => pipes,
             Err(err) => {

@@ -747,7 +747,10 @@ impl ServerIpcConnection {
         Ok(())
     }
 
-    #[cfg_attr(target_family = "unix", allow(dead_code))]
+    #[cfg_attr(
+        any(target_family = "unix", target_family = "windows"),
+        allow(dead_code)
+    )]
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
@@ -940,7 +943,10 @@ impl ServerIpcConnection {
         }
     }
 
-    #[cfg_attr(target_family = "unix", allow(dead_code))]
+    #[cfg_attr(
+        any(target_family = "unix", target_family = "windows"),
+        allow(dead_code)
+    )]
     pub fn wait_for_stdin_write_ack(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -1881,11 +1887,23 @@ pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Opt
 }
 
 pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
+    emit_worker_ready_with_protocol(
+        worker_name,
+        supports_images,
+        BUILTIN_WORKER_PROTOCOL_VERSION,
+    );
+}
+
+pub fn emit_worker_ready_v3(worker_name: &str, supports_images: bool) {
+    emit_worker_ready_with_protocol(worker_name, supports_images, WORKER_PROTOCOL_VERSION);
+}
+
+fn emit_worker_ready_with_protocol(worker_name: &str, supports_images: bool, version: u32) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
             protocol: WorkerProtocol {
                 name: "mcp-repl-worker".to_string(),
-                version: BUILTIN_WORKER_PROTOCOL_VERSION,
+                version,
             },
             worker: WorkerIdentity {
                 name: worker_name.to_string(),
@@ -1894,6 +1912,25 @@ pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
             capabilities: WorkerCapabilities {
                 images: supports_images,
             },
+        });
+    }
+}
+
+pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
+            turn_id,
+            prompt: prompt.to_string(),
+            text: text.to_string(),
+        });
+    }
+}
+
+pub fn emit_idle(turn_id: u64, prompt: &str) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::Idle {
+            turn_id,
+            prompt: prompt.to_string(),
         });
     }
 }
@@ -1916,6 +1953,16 @@ pub fn emit_session_end() {
             reason: None,
             message_b64: None,
             turn_id: None,
+        });
+    }
+}
+
+pub fn emit_session_end_with_reason(reason: &str, turn_id: Option<u64>) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
+            reason: Some(reason.to_string()),
+            message_b64: None,
+            turn_id,
         });
     }
 }

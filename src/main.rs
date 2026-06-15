@@ -28,6 +28,8 @@ mod server;
 mod stdin_payload;
 mod turn_state;
 #[cfg(target_os = "windows")]
+mod windows_conpty;
+#[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;
 mod worker_process;
@@ -72,6 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     if sandbox::invoked_as_codex_linux_sandbox() {
         sandbox::run_linux_sandbox_main();
+    }
+    #[cfg(target_os = "windows")]
+    if windows_conpty::invoked_as_windows_conpty() {
+        windows_conpty::run_windows_conpty_main();
     }
     #[cfg(target_os = "windows")]
     if sandbox::invoked_as_codex_windows_sandbox() {

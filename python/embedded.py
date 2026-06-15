@@ -1,5 +1,6 @@
 import base64
 import builtins
+import code
 import codecs
 import errno
 import hashlib
@@ -38,9 +39,14 @@ _plot_emit_in_progress = False
 _plot_axes_plot = None
 _plot_show = None
 _plot_emitted_this_request = {}
+_mcp_repl_windows_conpty = (
+    os.name == "nt" and os.environ.get("MCP_REPL_WINDOWS_CONPTY") == "1"
+)
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
-_mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
+_mcp_repl_c_stdio_tty = (os.isatty(0) and os.isatty(1)) or _mcp_repl_windows_conpty
+_mcp_repl_interpreter = code.InteractiveInterpreter(globals())
+_mcp_repl_last_incomplete = False
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -98,6 +104,11 @@ def _mcp_repl_capture_prompts():
     if not _mcp_repl_c_stdio_tty:
         sys.ps1 = _mcp_repl_suppressed_ps1
         sys.ps2 = _mcp_repl_suppressed_ps2
+
+
+def _mcp_repl_runsource_b64(source_b64):
+    source = base64.b64decode(source_b64).decode("utf-8", "replace")
+    return _mcp_repl_interpreter.runsource(source, "<stdin>", "single")
 
 
 def _input(prompt=""):
@@ -313,7 +324,7 @@ class McpInputStream:
         return False
 
     def isatty(self):
-        return False
+        return bool(_mcp_repl_c_stdio_tty)
 
     def fileno(self):
         return self._fileno
@@ -404,7 +415,7 @@ class McpInputBuffer:
         return False
 
     def isatty(self):
-        return False
+        return bool(_mcp_repl_c_stdio_tty)
 
     def fileno(self):
         return self._text_stream.fileno()
@@ -493,7 +504,7 @@ class McpRawInputBuffer(io.RawIOBase):
         return False
 
     def isatty(self):
-        return False
+        return bool(_mcp_repl_c_stdio_tty)
 
     def fileno(self):
         return self._fileno
@@ -755,8 +766,9 @@ _original_builtins_open = builtins.open
 _original_io_FileIO = io.FileIO
 _original_os_fdopen = os.fdopen
 _original_os_read = os.read
+_original_os_isatty = os.isatty
 _original_os_readv = getattr(os, "readv", None)
-_mcp_repl_raw_stdin_read_supported = os.name == "posix"
+_mcp_repl_raw_stdin_read_supported = os.name in ("posix", "nt")
 # Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
 _mcp_repl_raw_stdin_stat = None
 if _mcp_repl_raw_stdin_read_supported:
@@ -1010,6 +1022,13 @@ def _mcp_repl_os_read(fd, n):
     return _original_os_read(fd, n)
 
 
+def _mcp_repl_os_isatty(fd):
+    fd = operator.index(fd)
+    if _mcp_repl_windows_conpty and fd in (0, 1, 2):
+        return True
+    return _original_os_isatty(fd)
+
+
 def _mcp_repl_os_readv(fd, buffers):
     fd = operator.index(fd)
     if not _mcp_repl_is_raw_stdin_fd(fd):
@@ -1037,6 +1056,20 @@ _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 if _mcp_repl_c_stdio_tty:
     sys.ps1 = _mcp_repl_ps1
     sys.ps2 = _mcp_repl_ps2
+    if os.name == "nt":
+        builtins.open = _mcp_repl_open
+        io.open = _mcp_repl_open
+        io.FileIO = _McpReplFileIO
+        _io.open = _mcp_repl_open
+        _io.FileIO = _McpReplFileIO
+        os.fdopen = _mcp_repl_os_fdopen
+        os.isatty = _mcp_repl_os_isatty
+        os.read = _mcp_repl_os_read
+        if _original_os_readv is not None:
+            os.readv = _mcp_repl_os_readv
+        _mcp_repl_stdin = McpInputStream()
+        sys.stdin = _mcp_repl_stdin
+        sys.__stdin__ = _mcp_repl_stdin
 else:
     builtins.input = _input
     builtins.open = _mcp_repl_open

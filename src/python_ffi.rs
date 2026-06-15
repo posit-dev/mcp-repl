@@ -88,6 +88,7 @@ pub struct PythonApi {
         *mut PyObject,
         *mut std::ffi::c_void,
     ) -> *mut PyObject,
+    #[cfg_attr(windows, allow(dead_code))]
     pub py_run_interactive_one_flags:
         unsafe extern "C" fn(*mut libc::FILE, *const c_char, *mut c_void) -> c_int,
     pub py_object_get_attr_string:
