@@ -1894,6 +1894,7 @@ pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
     );
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn emit_worker_ready_v3(worker_name: &str, supports_images: bool) {
     emit_worker_ready_with_protocol(worker_name, supports_images, WORKER_PROTOCOL_VERSION);
 }
@@ -1916,6 +1917,7 @@ fn emit_worker_ready_with_protocol(worker_name: &str, supports_images: bool, ver
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
@@ -1926,6 +1928,7 @@ pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn emit_idle(turn_id: u64, prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::Idle {

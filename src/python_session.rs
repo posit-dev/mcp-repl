@@ -1358,6 +1358,7 @@ fn input_hook_prompt(guard: &SessionStateInner, fallback_prompt: Option<&str>) -
     )
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn emit_turn_input_line(turn_id: u64, prompt: &str, line: &mut TurnInputLine) {
     if line.input_line_emitted {
         return;
@@ -2526,9 +2527,11 @@ struct ActiveRequest {
 }
 
 struct TurnInputLine {
+    #[cfg_attr(not(windows), allow(dead_code))]
     text: String,
     bytes: Vec<u8>,
     offset: usize,
+    #[cfg_attr(not(windows), allow(dead_code))]
     input_line_emitted: bool,
 }
 
