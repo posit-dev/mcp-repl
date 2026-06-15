@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 use std::path::Path;
 use std::thread;
 
@@ -13,7 +14,11 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
     WAIT_FAILED,
 };
-use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON};
+use windows_sys::Win32::Storage::FileSystem::GetFileType;
+use windows_sys::Win32::System::Console::{
+    COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, HPCON,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
@@ -25,9 +30,16 @@ use windows_sys::Win32::System::Threading::{
 
 pub const WINDOWS_CONPTY_ARG: &str = "--windows-conpty";
 pub const WINDOWS_CONPTY_REQUEST_ENV: &str = "MCP_REPL_WINDOWS_CONPTY";
+const WINDOWS_CONPTY_ATTACHED_ENV: &str = "MCP_REPL_WINDOWS_CONPTY_ATTACHED";
 
 const CONPTY_COLS: i16 = 80;
 const CONPTY_ROWS: i16 = 24;
+
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    fn _isatty(fd: i32) -> i32;
+    fn _get_osfhandle(fd: i32) -> isize;
+}
 
 pub fn invoked_as_windows_conpty() -> bool {
     std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WINDOWS_CONPTY_ARG))
@@ -41,6 +53,83 @@ pub fn run_windows_conpty_main() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+pub fn emit_stdio_diagnostics_if_requested(label: &str) {
+    if std::env::var_os("MCP_REPL_STDIO_DIAG").is_none() {
+        return;
+    }
+    unsafe {
+        for fd in 0..=2 {
+            let handle = _get_osfhandle(fd) as HANDLE;
+            let mut mode = 0u32;
+            let console = GetConsoleMode(handle, &mut mode) != 0;
+            eprintln!(
+                "STDIO_DIAG {label} fd={fd} isatty={} handle={handle:p} file_type={} console={console} mode={mode}",
+                _isatty(fd),
+                GetFileType(handle)
+            );
+        }
+        for (name, code) in [
+            ("stdin", STD_INPUT_HANDLE),
+            ("stdout", STD_OUTPUT_HANDLE),
+            ("stderr", STD_ERROR_HANDLE),
+        ] {
+            let handle = GetStdHandle(code);
+            let mut mode = 0u32;
+            let console = GetConsoleMode(handle, &mut mode) != 0;
+            eprintln!(
+                "STDIO_DIAG {label} std={name} handle={handle:p} file_type={} console={console} mode={mode}",
+                GetFileType(handle)
+            );
+        }
+    }
+}
+
+pub fn attach_stdio_to_conpty_if_attached() -> Result<(), String> {
+    if std::env::var_os(WINDOWS_CONPTY_ATTACHED_ENV).is_none() {
+        return Ok(());
+    }
+    rebind_crt_fd_to_conpty_device(0, "CONIN$", libc::O_RDONLY | libc::O_TEXT)?;
+    rebind_crt_fd_to_conpty_device(1, "CONOUT$", libc::O_WRONLY | libc::O_TEXT)?;
+    rebind_crt_fd_to_conpty_device(2, "CONOUT$", libc::O_WRONLY | libc::O_TEXT)?;
+    Ok(())
+}
+
+fn rebind_crt_fd_to_conpty_device(fd: i32, device: &str, flags: i32) -> Result<(), String> {
+    let file = if flags & libc::O_WRONLY != 0 {
+        OpenOptions::new()
+            .write(true)
+            .open(device)
+            .map_err(|err| format!("failed to open {device} for fd {fd}: {err}"))?
+    } else {
+        OpenOptions::new()
+            .read(true)
+            .open(device)
+            .map_err(|err| format!("failed to open {device} for fd {fd}: {err}"))?
+    };
+    let handle = file.into_raw_handle();
+    let new_fd = unsafe { libc::open_osfhandle(handle as isize, flags) };
+    if new_fd < 0 {
+        unsafe {
+            CloseHandle(handle as HANDLE);
+        }
+        return Err(format!(
+            "failed to convert {device} handle into CRT fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::dup2(new_fd, fd) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(new_fd);
+        }
+        return Err(format!("failed to duplicate {device} onto fd {fd}: {err}"));
+    }
+    unsafe {
+        libc::close(new_fd);
+    }
+    Ok(())
 }
 
 fn windows_conpty_main_impl() -> Result<i32, String> {
@@ -83,6 +172,7 @@ pub fn run_conpty_command_with_env_map(
         crate::diagnostics::startup_log("windows-conpty: creating conpty");
         let mut conpty = Conpty::new()?;
         upsert_env_case_insensitive(&mut env_map, WINDOWS_CONPTY_REQUEST_ENV, "1");
+        upsert_env_case_insensitive(&mut env_map, WINDOWS_CONPTY_ATTACHED_ENV, "1");
         crate::diagnostics::startup_log("windows-conpty: conpty created");
         let output_read = conpty
             .output_read
@@ -129,6 +219,7 @@ pub unsafe fn spawn_conpty_process_as_user(
 ) -> Result<(PROCESS_INFORMATION, Conpty, thread::JoinHandle<()>), String> {
     let mut conpty = Conpty::new()?;
     upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_REQUEST_ENV, "1");
+    upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_ATTACHED_ENV, "1");
     let output_read = conpty
         .output_read
         .try_clone()

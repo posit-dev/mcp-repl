@@ -10,8 +10,6 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
-#[cfg(windows)]
-use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::ipc;
@@ -28,7 +26,6 @@ use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
 pub const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
-#[cfg(not(windows))]
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
@@ -1142,39 +1139,30 @@ fn configure_python(api: &'static PythonApi) -> Result<(), String> {
 }
 
 fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let _ = runtime;
-        run_windows_turn_repl()
-    }
-
-    #[cfg(not(windows))]
-    {
-        let api = PythonApi::global();
-        loop {
-            let status = {
-                let _gil = GilGuard::acquire();
-                begin_repl_turn();
-                let status = unsafe {
-                    (api.py_run_interactive_one_flags)(
-                        runtime.stdin,
-                        c"<stdin>".as_ptr(),
-                        ptr::null_mut(),
-                    )
-                };
-                capture_python_prompts(api)?;
-                status
+    let api = PythonApi::global();
+    loop {
+        let status = {
+            let _gil = GilGuard::acquire();
+            begin_repl_turn();
+            let status = unsafe {
+                (api.py_run_interactive_one_flags)(
+                    runtime.stdin,
+                    c"<stdin>".as_ptr(),
+                    ptr::null_mut(),
+                )
             };
-            if take_exit_requested() {
-                flush_original_stdio();
-                return Ok(());
-            }
-            emit_plots();
-            finish_repl_turn_request();
-            if status == PYTHON_EOF {
-                flush_original_stdio();
-                return Ok(());
-            }
+            capture_python_prompts(api)?;
+            status
+        };
+        if take_exit_requested() {
+            flush_original_stdio();
+            return Ok(());
+        }
+        emit_plots();
+        finish_repl_turn_request();
+        if status == PYTHON_EOF {
+            flush_original_stdio();
+            return Ok(());
         }
     }
 }
@@ -1426,12 +1414,16 @@ fn read_windows_turn_line(
                         line
                     };
                     if let Some(line) = line {
+                        let prompt_already_visible =
+                            guard.visible_input_prompt.as_deref() == Some(prompt);
+                        guard.visible_input_prompt = None;
                         guard.waiting_for_input = false;
                         guard.request_active = true;
-                        Some((turn_id, Some(line)))
+                        Some((turn_id, Some(line), prompt_already_visible))
                     } else {
                         guard.active_request.take();
-                        Some((turn_id, None))
+                        guard.visible_input_prompt = Some(prompt.to_string());
+                        Some((turn_id, None, false))
                     }
                 }
                 None => {
@@ -1449,9 +1441,9 @@ fn read_windows_turn_line(
             }
         };
 
-        if let Some((turn_id, Some(mut line))) = action {
+        if let Some((turn_id, Some(mut line), prompt_already_visible)) = action {
             emit_turn_input_line(turn_id, prompt, &mut line);
-            if emit_prompt_to_stdout && !prompt.is_empty() {
+            if emit_prompt_to_stdout && !prompt.is_empty() && !prompt_already_visible {
                 emit_output_text(TextStream::Stdout, prompt.as_bytes());
             }
             return Ok(StdioLineRead {
@@ -1460,92 +1452,13 @@ fn read_windows_turn_line(
             });
         }
 
-        if let Some((turn_id, None)) = action {
+        if let Some((turn_id, None, _)) = action {
             emit_plots();
             mark_stdin_wait_prompt_completed_request();
             remember_emitted_prompt(prompt);
             ipc::emit_idle(turn_id, prompt);
         }
     }
-}
-
-#[cfg(windows)]
-fn run_windows_turn_repl() -> Result<(), String> {
-    let api = PythonApi::global();
-    let mut source = String::new();
-    let mut continuation = false;
-
-    loop {
-        if source.is_empty() {
-            begin_repl_turn();
-        }
-        let prompt = python_repl_prompt(continuation);
-        set_current_repl_readline_prompt(&prompt);
-        let read = read_windows_turn_line(&prompt, false, false)?;
-        clear_current_readline_prompt();
-        if read.interrupted || take_interrupt_requested() {
-            PythonApi::global().set_interrupt();
-            source.clear();
-            continuation = false;
-            continue;
-        }
-        if read.bytes.is_empty() {
-            flush_original_stdio();
-            return Ok(());
-        }
-
-        source.push_str(&String::from_utf8_lossy(&read.bytes));
-        let incomplete = {
-            let _gil = GilGuard::acquire();
-            let incomplete = run_windows_interactive_source(api, &source)?;
-            capture_python_prompts(api)?;
-            incomplete
-        };
-        if take_exit_requested() {
-            flush_original_stdio();
-            return Ok(());
-        }
-        emit_plots();
-        finish_repl_turn_request();
-        if incomplete {
-            continuation = true;
-        } else {
-            source.clear();
-            continuation = false;
-        }
-    }
-}
-
-#[cfg(windows)]
-fn python_repl_prompt(continuation: bool) -> String {
-    let Some(state) = SESSION_STATE.get() else {
-        return if continuation { "... " } else { ">>> " }.to_string();
-    };
-    let guard = state.inner.lock().unwrap();
-    if continuation {
-        guard.python_continuation_prompt.clone()
-    } else {
-        guard.python_primary_prompt.clone()
-    }
-}
-
-#[cfg(windows)]
-fn run_windows_interactive_source(api: &'static PythonApi, source: &str) -> Result<bool, String> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(source.as_bytes());
-    let wrapper = format!("_mcp_repl_last_incomplete = _mcp_repl_runsource_b64({encoded:?})\n");
-    let main = api.import_module("__main__")?;
-    let globals = unsafe { (api.py_module_get_dict)(main.as_ptr()) };
-    if globals.is_null() {
-        return Err("failed to get __main__ globals".to_string());
-    }
-    api.run_code(&wrapper, globals)?;
-    let value = api.get_attr_string(main.as_ptr(), "_mcp_repl_last_incomplete")?;
-    let truth = unsafe { (api.py_object_is_true)(value.as_ptr()) };
-    if truth < 0 {
-        api.clear_error();
-        return Err("failed to read Python interactive incomplete state".to_string());
-    }
-    Ok(truth == 1)
 }
 
 fn handle_input_hook() {
@@ -1914,10 +1827,12 @@ unsafe extern "C" fn mcp_repl_readline(
     handle_input_hook();
 
     #[cfg(windows)]
+    flush_original_stdio();
+    #[cfg(windows)]
     let read = match read_windows_turn_line(
         &prompt_text,
         !prompt_text.is_empty() && !prompt_matches_python_repl_prompt(&prompt_text),
-        true,
+        false,
     ) {
         Ok(read) => read,
         Err(err) => {
@@ -2566,6 +2481,8 @@ struct SessionStateInner {
     request_completed_at_stdin_wait: bool,
     current_prompt: Option<String>,
     current_readline_state: Option<PythonReadlineState>,
+    #[cfg(windows)]
+    visible_input_prompt: Option<String>,
     python_primary_prompt: String,
     python_continuation_prompt: String,
     repl_readline_count: usize,
@@ -2616,6 +2533,8 @@ impl SessionState {
                 request_completed_at_stdin_wait: false,
                 current_prompt: None,
                 current_readline_state: None,
+                #[cfg(windows)]
+                visible_input_prompt: None,
                 python_primary_prompt: ">>> ".to_string(),
                 python_continuation_prompt: "... ".to_string(),
                 repl_readline_count: 0,

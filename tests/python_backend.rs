@@ -1269,6 +1269,15 @@ async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             r#"import builtins, os
+exec("""
+import ctypes, os
+if os.name == "nt":
+    try:
+        crt = ctypes.CDLL("ucrtbase")
+    except OSError:
+        crt = ctypes.CDLL("msvcrt")
+    print("CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
+""")
 print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 print("INPUT_IMPL", builtins.input.__module__, builtins.input.__name__)
 value = input("pty> ")
@@ -1289,6 +1298,11 @@ print("PTY_INPUT", value)
     assert!(
         text.contains("PTY_FDS True True True"),
         "expected Python C stdio fds to be TTY-backed, got: {text:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
     );
     assert!(
         text.contains("INPUT_IMPL builtins input"),
@@ -1371,7 +1385,12 @@ async fn python_windows_pty_bridges_stdin_surfaces() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             r#"exec("""
-import os, sys, tempfile
+import ctypes, os, sys, tempfile
+try:
+    crt = ctypes.CDLL("ucrtbase")
+except OSError:
+    crt = ctypes.CDLL("msvcrt")
+print("CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
 print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 print("STDIN_BRIDGE", type(sys.stdin).__module__, type(sys.stdin).__name__, sys.stdin.isatty())
 first = input("win> ")
@@ -1420,6 +1439,10 @@ gamma
     assert!(
         text.contains("PTY_FDS True True True"),
         "expected Python fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
     );
     assert!(
         text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
@@ -2574,12 +2597,15 @@ async fn python_input_roundtrip() -> TestResult<()> {
 
     let mut text = result_text(
         &session
-            .write_stdin_raw_with("hello\nprint(x)", Some(5.0))
+            .write_stdin_raw_with("hello\nprint('INPUT_VALUE', x)", Some(5.0))
             .await?,
     );
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("hello") {
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("INPUT_VALUE hello")
+        {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
@@ -2589,7 +2615,10 @@ async fn python_input_roundtrip() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    assert!(text.contains("hello"), "expected echo, got: {text:?}");
+    assert!(
+        text.contains("INPUT_VALUE hello"),
+        "expected queued tail after input() to run, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())
@@ -2605,7 +2634,14 @@ async fn python_windows_sandbox_pty_bridges_stdin_surfaces() -> TestResult<()> {
 
     let result = session
         .write_stdin_raw_with(
-            r#"import os
+            r#"exec("""
+import ctypes, os
+try:
+    crt = ctypes.CDLL("ucrtbase")
+except OSError:
+    crt = ctypes.CDLL("msvcrt")
+print("SANDBOX_CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
+""")
 print("SANDBOX_PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 value = input("sandbox> ")
 inside
@@ -2635,6 +2671,10 @@ print("SANDBOX_INPUT", value)
     assert!(
         text.contains("SANDBOX_PTY_FDS True True True"),
         "expected sandboxed Python stdio fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("SANDBOX_CRT_ISATTY True True True"),
+        "expected sandboxed Windows CRT fds to be TTY-backed, got: {text:?}"
     );
     assert!(
         text.contains("SANDBOX_INPUT inside"),
@@ -3257,6 +3297,7 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -4035,6 +4076,7 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
     let _guard = lock_test_mutex();

@@ -44,7 +44,7 @@ _mcp_repl_windows_conpty = (
 )
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
-_mcp_repl_c_stdio_tty = (os.isatty(0) and os.isatty(1)) or _mcp_repl_windows_conpty
+_mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
 _mcp_repl_interpreter = code.InteractiveInterpreter(globals())
 _mcp_repl_last_incomplete = False
 
@@ -769,7 +769,6 @@ _original_os_dup = os.dup
 _original_os_dup2 = os.dup2
 _original_os_close = os.close
 _original_os_read = os.read
-_original_os_isatty = os.isatty
 _original_os_readv = getattr(os, "readv", None)
 _mcp_repl_raw_stdin_read_supported = os.name in ("posix", "nt")
 # Keep the original fd 0 identity so duplicated stdin fds still use the bridge.
@@ -779,17 +778,14 @@ if _mcp_repl_raw_stdin_read_supported:
         _mcp_repl_raw_stdin_stat = os.fstat(0)
     except OSError:
         pass
-_mcp_repl_windows_stdio_fds = set()
 _mcp_repl_windows_raw_stdin_fds = set()
 if _mcp_repl_windows_conpty:
-    for _mcp_repl_fd in (0, 1, 2):
-        try:
-            os.fstat(_mcp_repl_fd)
-        except OSError:
-            continue
-        _mcp_repl_windows_stdio_fds.add(_mcp_repl_fd)
-        if _mcp_repl_fd == 0:
-            _mcp_repl_windows_raw_stdin_fds.add(_mcp_repl_fd)
+    try:
+        os.fstat(0)
+    except OSError:
+        pass
+    else:
+        _mcp_repl_windows_raw_stdin_fds.add(0)
 _mcp_repl_stdin_path_aliases = frozenset(("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 
 
@@ -824,17 +820,9 @@ def _mcp_repl_is_raw_stdin_fd(fd):
     )
 
 
-def _mcp_repl_is_managed_windows_stdio_fd(fd):
-    return _mcp_repl_windows_conpty and fd in _mcp_repl_windows_stdio_fds
-
-
 def _mcp_repl_note_windows_dup(source_fd, target_fd):
     if not _mcp_repl_windows_conpty:
         return
-    if source_fd in _mcp_repl_windows_stdio_fds:
-        _mcp_repl_windows_stdio_fds.add(target_fd)
-    else:
-        _mcp_repl_windows_stdio_fds.discard(target_fd)
     if source_fd in _mcp_repl_windows_raw_stdin_fds:
         _mcp_repl_windows_raw_stdin_fds.add(target_fd)
     else:
@@ -844,7 +832,6 @@ def _mcp_repl_note_windows_dup(source_fd, target_fd):
 def _mcp_repl_note_windows_close(fd):
     if not _mcp_repl_windows_conpty:
         return
-    _mcp_repl_windows_stdio_fds.discard(fd)
     _mcp_repl_windows_raw_stdin_fds.discard(fd)
 
 
@@ -1083,13 +1070,6 @@ def _mcp_repl_os_read(fd, n):
     return _original_os_read(fd, n)
 
 
-def _mcp_repl_os_isatty(fd):
-    fd = operator.index(fd)
-    if _mcp_repl_is_managed_windows_stdio_fd(fd):
-        return True
-    return _original_os_isatty(fd)
-
-
 def _mcp_repl_os_readv(fd, buffers):
     fd = operator.index(fd)
     if not _mcp_repl_is_raw_stdin_fd(fd):
@@ -1127,7 +1107,6 @@ if _mcp_repl_c_stdio_tty:
         os.dup = _mcp_repl_os_dup
         os.dup2 = _mcp_repl_os_dup2
         os.close = _mcp_repl_os_close
-        os.isatty = _mcp_repl_os_isatty
         os.read = _mcp_repl_os_read
         if _original_os_readv is not None:
             os.readv = _mcp_repl_os_readv

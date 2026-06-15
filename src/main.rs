@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // crashing.
     ignore_sigpipe();
     crate::diagnostics::startup_log("main: entry");
+    #[cfg(target_os = "windows")]
+    windows_conpty::attach_stdio_to_conpty_if_attached()?;
+    #[cfg(target_os = "windows")]
+    windows_conpty::emit_stdio_diagnostics_if_requested("main-entry");
     #[cfg(target_os = "linux")]
     if sandbox::invoked_as_codex_linux_sandbox() {
         sandbox::run_linux_sandbox_main();
