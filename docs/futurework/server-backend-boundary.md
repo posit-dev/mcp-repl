@@ -3,9 +3,9 @@
 ## Summary
 
 The server should be mostly blind to how the worker implements a selected REPL
-runtime. It should spawn the worker, send accepted input over stdin, capture
-stdout/stderr, consume sideband facts, assemble the output timeline, and finalize
-the MCP reply.
+runtime. It should spawn the worker, send accepted input through the worker
+protocol, capture stdout/stderr, consume sideband facts, assemble the output
+timeline, and finalize the MCP reply.
 
 Backend-specific execution semantics should live on the worker side. Any current
 R/Python branching in server request handling should be treated as abstraction
@@ -16,12 +16,12 @@ description selection.
 
 The intended contract is a narrow server/worker boundary:
 
-- stdin carries user input to the worker,
+- `turn_start` carries user input to protocol workers,
 - `output_text` sideband frames carry worker-owned text back to the server,
 - raw stdout/stderr carry unowned visible text from child processes or direct
   file-descriptor writes,
-- sideband IPC also carries structural facts such as prompts, readline results,
-  images, request completion, and session end,
+- sideband IPC also carries structural facts such as input lines, images,
+  request completion, and session end,
 - the server formats replies from those streams without understanding the
   runtime's internal implementation.
 
@@ -51,11 +51,10 @@ buckets:
   is documentation wiring, not request execution policy, and should move with
   `docs/futurework/composable-tool-descriptions.md`.
 - `src/worker_process.rs` selects a `BackendDriver` at `WorkerManager`
-  creation. The driver owns backend-specific request metadata such as Python
-  newline normalization, Python `line_count`, whether to wait for
-  `stdin_write_ack`, interrupt behavior, completion waiting, and backend-info
-  startup tolerance. This is acceptable only as a server-side adapter until the
-  worker can advertise these narrow capabilities.
+  creation. The driver owns backend-specific adapter behavior such as Python
+  newline normalization, interrupt behavior, completion waiting, and startup
+  tolerance. This is acceptable only as a server-side adapter until the worker
+  can advertise these narrow capabilities or move behind the v3 turn boundary.
 - `src/worker_process.rs` also branches at spawn time to configure R worker mode
   or Python worker mode in the same `mcp-repl` executable. Python launch setup
   additionally resolves the selected interpreter executable and loadable
@@ -72,8 +71,8 @@ buckets:
 
 - Treat `--interpreter r|python` as user-facing worker selection.
 - Keep backend-specific runtime behavior in the worker process.
-- Keep the server's steady-state contract generic: stdin in, worker-owned
-  `output_text` plus raw stdout/stderr and sideband facts out.
+- Keep the server's steady-state contract generic: accepted input in,
+  worker-owned `output_text` plus raw stdout/stderr and sideband facts out.
 - Prefer worker-advertised capabilities or narrow launch-time metadata over
   server-side branching on backend.
 - Coordinate tool-description cleanup with
@@ -90,8 +89,8 @@ Initial candidates:
 
 - `supports_images`: already present in `backend_info`; controls whether image
   events are expected.
-- `stdin_write_ack`: whether the server must wait for worker acceptance after
-  `stdin_write` before writing raw stdin bytes.
+- `turn_input_transport`: whether accepted input is carried by `turn_start` or
+  by a backend-internal adapter.
 - `backend_info_startup_timeout`: whether startup may continue after a short
   backend-info timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional

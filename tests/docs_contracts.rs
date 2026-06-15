@@ -113,7 +113,7 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
         r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
         r#"{ "type": "interrupt", "turn_id": <integer> }"#,
         "This document defines worker protocol version 3.",
-        "version 2 from built-in and migrating workers",
+        "The server rejects other",
         "There is no plot-image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
         "Submitted input must not be emitted as `output_text`.",
@@ -125,7 +125,12 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
         );
     }
 
-    for forbidden in ["`plot_image_ack`", r#""sequence": <integer|null>"#] {
+    for forbidden in [
+        "`plot_image_ack`",
+        r#""sequence": <integer|null>"#,
+        "version 2 from built-in and migrating workers",
+        "Legacy v2 image event retained for built-in workers during migration.",
+    ] {
         assert!(
             !protocol.contains(forbidden),
             "did not expect {forbidden} in docs/worker_sideband_protocol.md"

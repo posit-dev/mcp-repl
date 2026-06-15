@@ -85,8 +85,8 @@ static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_family = "unix")]
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 2;
-pub const WORKER_PROTOCOL_V3_VERSION: u32 = 3;
+pub const BUILTIN_WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1885,7 +1885,7 @@ pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
         let _ = ipc.send(WorkerToServerIpcMessage::WorkerReady {
             protocol: WorkerProtocol {
                 name: "mcp-repl-worker".to_string(),
-                version: WORKER_PROTOCOL_VERSION,
+                version: BUILTIN_WORKER_PROTOCOL_VERSION,
             },
             worker: WorkerIdentity {
                 name: worker_name.to_string(),
