@@ -1,5 +1,4 @@
 mod backend;
-mod builtin_adapter_ack_state;
 mod builtin_adapter_request_state;
 mod debug_logs;
 mod debug_repl;

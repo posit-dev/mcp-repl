@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::builtin_adapter_ack_state::BuiltinAdapterAckState;
 use crate::builtin_adapter_request_state::BuiltinAdapterRequestState;
 use crate::output_capture::OutputTextSource;
 use crate::turn_state::TurnState;
@@ -205,7 +204,6 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
-    builtin_adapter_ack_state: BuiltinAdapterAckState,
     turn_state: TurnState,
     builtin_adapter_request_state: BuiltinAdapterRequestState,
     current_image_id: Option<String>,
@@ -498,14 +496,16 @@ impl ServerIpcConnection {
                     }
                     WorkerToServerIpcMessage::StdinWriteAck => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.builtin_adapter_ack_state.record_stdin_write_ack();
+                        guard
+                            .queue
+                            .push_back(WorkerToServerIpcMessage::StdinWriteAck);
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::PythonInterruptAck => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard
-                            .builtin_adapter_ack_state
-                            .record_python_interrupt_ack();
+                            .queue
+                            .push_back(WorkerToServerIpcMessage::PythonInterruptAck);
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::InputLine {
@@ -747,7 +747,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.builtin_adapter_ack_state.clear();
+        clear_builtin_adapter_acks(&mut guard);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -756,7 +756,7 @@ impl ServerIpcConnection {
     pub fn begin_request_with_stdin(&self, payload: &[u8]) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.builtin_adapter_ack_state.clear();
+        clear_builtin_adapter_acks(&mut guard);
         guard
             .builtin_adapter_request_state
             .begin_with_stdin(payload);
@@ -768,7 +768,7 @@ impl ServerIpcConnection {
     pub fn begin_turn(&self, turn_id: u64) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.builtin_adapter_ack_state.clear();
+        clear_builtin_adapter_acks(&mut guard);
         guard.turn_state.begin_turn(turn_id);
         guard.echo_events.clear();
         guard.prompt_history.clear();
@@ -943,7 +943,7 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if guard.builtin_adapter_ack_state.take_stdin_write_ack() {
+            if take_stdin_write_ack(&mut guard) {
                 return Ok(());
             }
             if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -964,7 +964,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if guard.builtin_adapter_ack_state.take_stdin_write_ack() {
+                if take_stdin_write_ack(&mut guard) {
                     return Ok(());
                 }
                 if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -980,7 +980,7 @@ impl ServerIpcConnection {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
-            if guard.builtin_adapter_ack_state.take_python_interrupt_ack() {
+            if take_python_interrupt_ack(&mut guard) {
                 return Ok(());
             }
             if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -1001,7 +1001,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if guard.builtin_adapter_ack_state.take_python_interrupt_ack() {
+                if take_python_interrupt_ack(&mut guard) {
                     return Ok(());
                 }
                 if let Some(message) = guard.turn_state.take_protocol_error() {
@@ -2146,6 +2146,39 @@ fn take_worker_ready(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
     guard.queue.remove(idx)
 }
 
+fn take_stdin_write_ack(guard: &mut ServerIpcInbox) -> bool {
+    let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+    else {
+        return false;
+    };
+    guard.queue.remove(idx);
+    true
+}
+
+fn take_python_interrupt_ack(guard: &mut ServerIpcInbox) -> bool {
+    let Some(idx) = guard
+        .queue
+        .iter()
+        .position(|msg| matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck))
+    else {
+        return false;
+    };
+    guard.queue.remove(idx);
+    true
+}
+
+fn clear_builtin_adapter_acks(guard: &mut ServerIpcInbox) {
+    guard.queue.retain(|msg| {
+        !matches!(
+            msg,
+            WorkerToServerIpcMessage::StdinWriteAck | WorkerToServerIpcMessage::PythonInterruptAck
+        )
+    });
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2367,7 +2400,11 @@ mod protocol_tests {
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut guard = server.inbox.lock().unwrap();
-        while !guard.builtin_adapter_ack_state.has_stdin_write_ack() {
+        while !guard
+            .queue
+            .iter()
+            .any(|msg| matches!(msg, WorkerToServerIpcMessage::StdinWriteAck))
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
