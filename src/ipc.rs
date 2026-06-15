@@ -2060,8 +2060,15 @@ fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bo
 }
 
 fn latch_protocol_error(guard: &mut ServerIpcInbox, message: impl Into<String>) {
+    let message = message.into();
+    crate::event_log::log(
+        "worker_protocol_error_latched",
+        serde_json::json!({
+            "message": message.clone(),
+        }),
+    );
     guard.protocol_error = Some(LatchedProtocolError {
-        message: message.into(),
+        message,
         observed_at: Instant::now(),
     });
 }

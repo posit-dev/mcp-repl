@@ -59,6 +59,36 @@ fn wait_for_log_contains(path: &std::path::Path, needle: &str) -> TestResult<Str
     }
 }
 
+fn wait_for_debug_event_message_contains(
+    debug_dir: &std::path::Path,
+    event: &str,
+    needle: &str,
+) -> TestResult<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut latest = Vec::new();
+    loop {
+        if let Ok(events) = latest_debug_events(debug_dir) {
+            latest = events;
+            if let Some(entry) = latest.iter().find(|entry| {
+                entry["event"] == event
+                    && entry["payload"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(needle))
+            }) {
+                return Ok(entry.clone());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "expected {event:?} containing {needle:?} in {}, got {latest:?}",
+                debug_dir.display()
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn zod_worker_path() -> TestResult<PathBuf> {
     match ZOD_WORKER_PATH.get_or_init(build_zod_worker) {
         Ok(path) => Ok(path.clone()),
@@ -153,11 +183,21 @@ async fn spawn_zod_server() -> TestResult<common::McpTestSession> {
 }
 
 async fn spawn_zod_v3_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
+    spawn_zod_v3_server_with_extra_args(control_log, Vec::new()).await
+}
+
+async fn spawn_zod_v3_server_with_extra_args(
+    control_log: &std::path::Path,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let control_log_text = control_log.display().to_string();
-    spawn_zod_server_with_env(vec![
-        ("MCP_REPL_ZOD_PROTOCOL_VERSION", "3"),
-        ("MCP_REPL_ZOD_CONTROL_LOG", control_log_text.as_str()),
-    ])
+    spawn_zod_server_with_env_and_extra_args(
+        vec![
+            ("MCP_REPL_ZOD_PROTOCOL_VERSION", "3"),
+            ("MCP_REPL_ZOD_CONTROL_LOG", control_log_text.as_str()),
+        ],
+        extra_args,
+    )
     .await
 }
 
@@ -574,7 +614,12 @@ async fn zod_worker_v3_input_line_after_idle_is_protocol_error() -> TestResult<(
 async fn zod_worker_v3_latched_protocol_error_blocks_next_turn_start() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_v3_server(&control_log).await?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_v3_server_with_extra_args(
+        &control_log,
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
 
     let first = session
         .call_tool_raw(
@@ -590,7 +635,11 @@ async fn zod_worker_v3_latched_protocol_error_blocks_next_turn_start() -> TestRe
         first_text.contains("v3> "),
         "expected first turn to complete before delayed protocol error, got: {first_text:?}"
     );
-    wait_for_log_contains(&control_log, "late_bad_output turn_id=1")?;
+    wait_for_debug_event_message_contains(
+        &debug_dir,
+        "worker_protocol_error_latched",
+        "invalid output_text base64",
+    )?;
 
     let second = session
         .call_tool_raw(
@@ -621,7 +670,12 @@ async fn zod_worker_v3_latched_protocol_error_blocks_next_turn_start() -> TestRe
 async fn zod_worker_v3_protocol_error_after_timeout_blocks_next_turn_start() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_v3_server(&control_log).await?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_v3_server_with_extra_args(
+        &control_log,
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
 
     let first = session
         .call_tool_raw(
@@ -637,7 +691,11 @@ async fn zod_worker_v3_protocol_error_after_timeout_blocks_next_turn_start() -> 
         first_text.contains("<<repl status: busy"),
         "expected initial timeout busy status, got: {first_text:?}"
     );
-    wait_for_log_contains(&control_log, "bad_output_after_sleep turn_id=1")?;
+    wait_for_debug_event_message_contains(
+        &debug_dir,
+        "worker_protocol_error_latched",
+        "invalid output_text base64",
+    )?;
 
     let second = session
         .call_tool_raw(
