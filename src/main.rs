@@ -6,6 +6,7 @@ mod event_log;
 mod html_to_markdown;
 mod install;
 mod ipc;
+mod legacy_request_state;
 mod managed_network;
 mod output_capture;
 mod output_stream;
