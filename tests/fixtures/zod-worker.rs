@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +25,9 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const SHUTDOWN_LOG_ENV: &str = "MCP_REPL_ZOD_SHUTDOWN_LOG";
+const PROTOCOL_VERSION_ENV: &str = "MCP_REPL_ZOD_PROTOCOL_VERSION";
+const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
+const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const INVALID_SESSION_END_REASON: &str =
@@ -38,6 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport = IpcTransport::connect_from_env()?;
     let writer = IpcWriter::new(transport.writer);
+    let protocol_version = std::env::var(PROTOCOL_VERSION_ENV)
+        .ok()
+        .as_deref()
+        .unwrap_or("2")
+        .parse::<u32>()?;
+    if protocol_version == 3 {
+        return run_v3_worker(transport.reader, writer);
+    }
+
     let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let control_session_end = Arc::new(AtomicBool::new(false));
     let shutdown_log_path = std::env::var_os(SHUTDOWN_LOG_ENV).map(PathBuf::from);
@@ -132,6 +145,275 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::mem::replace(&mut command_state.next_prompt, "zod> ".to_string()),
         )?;
     }
+}
+
+fn run_v3_worker(
+    sideband_reader: Box<dyn Read + Send>,
+    writer: IpcWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    let shutdown_log_path = std::env::var_os(SHUTDOWN_LOG_ENV).map(PathBuf::from);
+    let sideband_interrupted = Arc::new(AtomicBool::new(false));
+    let control_session_end = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+
+    start_v3_stdin_observer(control_log_path.clone());
+
+    writer.send(&WorkerToServer::WorkerReady {
+        protocol: Protocol {
+            name: "mcp-repl-worker".to_string(),
+            version: 3,
+        },
+        worker: WorkerIdentity {
+            name: "zod".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        capabilities: Capabilities { images: true },
+    })?;
+    if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
+    }
+    if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
+        let _sideband_reader = sideband_reader;
+        let _turn_tx = tx;
+        loop {
+            thread::park();
+        }
+    }
+
+    start_v3_control_reader(
+        sideband_reader,
+        tx,
+        sideband_interrupted.clone(),
+        control_session_end.clone(),
+        control_log_path.clone(),
+        shutdown_log_path.clone(),
+    );
+
+    let mut state = V3CommandState {
+        next_prompt: "v3> ".to_string(),
+        previous_line_empty: false,
+        input_line_after_idle: false,
+        bad_output_after_idle: None,
+    };
+    while let Ok(message) = rx.recv() {
+        match message {
+            ServerToWorker::TurnStart { turn_id, input } => {
+                if run_v3_turn(
+                    &writer,
+                    &sideband_interrupted,
+                    &control_log_path,
+                    turn_id,
+                    &input,
+                    &mut state,
+                )? {
+                    return Ok(());
+                }
+            }
+            ServerToWorker::SessionEnd => {
+                let shutdown_event = if control_session_end.load(Ordering::SeqCst) {
+                    "sideband_shutdown"
+                } else {
+                    "sideband_reader_closed"
+                };
+                append_shutdown_log(shutdown_log_path.as_deref(), shutdown_event)?;
+                send_v3_session_end(&writer, None, "shutdown")?;
+                return Ok(());
+            }
+            ServerToWorker::Interrupt { .. } | ServerToWorker::Other => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn run_v3_turn(
+    writer: &IpcWriter,
+    sideband_interrupted: &AtomicBool,
+    control_log_path: &Option<PathBuf>,
+    turn_id: u64,
+    input: &str,
+    state: &mut V3CommandState,
+) -> io::Result<bool> {
+    for raw_line in v3_runtime_lines(input) {
+        let prompt = state.next_prompt.clone();
+        writer.send(&WorkerToServer::InputLine {
+            turn_id,
+            prompt,
+            text: raw_line.clone(),
+        })?;
+        append_control_log(
+            control_log_path.as_deref(),
+            &format!(
+                "input_line turn_id={turn_id} text={}",
+                escape_bytes(raw_line.as_bytes())
+            ),
+        )?;
+        let command = raw_line.trim_end_matches(['\r', '\n']);
+        if run_v3_command(
+            writer,
+            sideband_interrupted,
+            control_log_path,
+            turn_id,
+            command,
+            state,
+        )? {
+            return Ok(true);
+        }
+        state.previous_line_empty = command.is_empty();
+    }
+
+    let prompt = std::mem::replace(&mut state.next_prompt, "v3> ".to_string());
+    writer.send(&WorkerToServer::Idle { turn_id, prompt })?;
+    append_control_log(
+        control_log_path.as_deref(),
+        &format!("idle turn_id={turn_id}"),
+    )?;
+    if state.input_line_after_idle {
+        state.input_line_after_idle = false;
+        append_control_log(
+            control_log_path.as_deref(),
+            &format!("late_input_line turn_id={turn_id}"),
+        )?;
+        writer.send(&WorkerToServer::InputLine {
+            turn_id,
+            prompt: "v3> ".to_string(),
+            text: "late\n".to_string(),
+        })?;
+    }
+    if let Some(delay) = state.bad_output_after_idle.take() {
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let _ = append_control_log(
+                control_log_path.as_deref(),
+                &format!("late_bad_output turn_id={turn_id}"),
+            );
+            let _ = writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64);
+        });
+    }
+    Ok(false)
+}
+
+fn run_v3_command(
+    writer: &IpcWriter,
+    sideband_interrupted: &AtomicBool,
+    control_log_path: &Option<PathBuf>,
+    turn_id: u64,
+    command: &str,
+    state: &mut V3CommandState,
+) -> io::Result<bool> {
+    if command == "idle-only" {
+        return Ok(false);
+    }
+
+    if let Some(prompt) = command.strip_prefix("wait ") {
+        state.next_prompt = prompt.to_string();
+        return Ok(false);
+    }
+
+    if let Some(millis) = command.strip_prefix("sleep ") {
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
+        sleep_for(parse_millis(millis)?, sideband_interrupted, false);
+        append_control_log(
+            control_log_path.as_deref(),
+            &format!("bad_output_after_sleep turn_id={turn_id}"),
+        )?;
+        writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
+        sleep_for(5_000, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if let Some(millis) = command.strip_prefix("interrupt-report ") {
+        let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
+        let text = format!(
+            "sideband interrupt: {}\nos interrupt: {}\n",
+            if report.sideband {
+                "observed"
+            } else {
+                "missing"
+            },
+            if report.os { "observed" } else { "missing" },
+        );
+        v3_output_text(writer, control_log_path, turn_id, text.as_bytes())?;
+        return Ok(false);
+    }
+
+    if command == "emit-output-after-input" {
+        v3_output_text(writer, control_log_path, turn_id, b"after input_line\n")?;
+        return Ok(false);
+    }
+
+    if command == "late-input-line-after-idle" {
+        state.input_line_after_idle = true;
+        return Ok(false);
+    }
+
+    if let Some(millis) = command.strip_prefix("bad-output-after-idle ") {
+        state.bad_output_after_idle = Some(Duration::from_millis(parse_millis(millis)?));
+        return Ok(false);
+    }
+
+    if command == "exit" {
+        send_v3_session_end(writer, Some(turn_id), "runtime_exit")?;
+        return Ok(true);
+    }
+
+    let text = format!("v3-output: {command}\n");
+    v3_output_text(writer, control_log_path, turn_id, text.as_bytes())?;
+    Ok(false)
+}
+
+fn v3_output_text(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    turn_id: u64,
+    bytes: &[u8],
+) -> io::Result<()> {
+    append_control_log(
+        control_log_path.as_deref(),
+        &format!("output_text turn_id={turn_id}"),
+    )?;
+    writer.output_text("stdout", bytes)
+}
+
+fn send_v3_session_end(writer: &IpcWriter, turn_id: Option<u64>, reason: &str) -> io::Result<()> {
+    writer.send(&WorkerToServer::SessionEnd {
+        reason: reason.to_string(),
+        message_b64: None,
+        turn_id,
+    })
+}
+
+fn v3_runtime_lines(input: &str) -> Vec<String> {
+    let mut text = input.to_string();
+    if !text.ends_with(['\n', '\r']) {
+        text.push('\n');
+    }
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            lines.push(text[start..=idx].to_string());
+            start = idx + ch.len_utf8();
+        }
+    }
+    if start < text.len() {
+        lines.push(text[start..].to_string());
+    }
+    lines
+}
+
+struct V3CommandState {
+    next_prompt: String,
+    previous_line_empty: bool,
+    input_line_after_idle: bool,
+    bad_output_after_idle: Option<Duration>,
 }
 
 fn run_command(
@@ -428,8 +710,92 @@ fn send_session_end(writer: &IpcWriter, timeline: &mut Timeline, reason: &str) -
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
         message_b64: None,
+        turn_id: None,
     })?;
     timeline.run(LifecyclePoint::AfterSessionEnd, writer)
+}
+
+fn start_v3_control_reader(
+    reader: Box<dyn Read + Send>,
+    turn_tx: mpsc::Sender<ServerToWorker>,
+    interrupted: Arc<AtomicBool>,
+    control_session_end: Arc<AtomicBool>,
+    control_log_path: Option<PathBuf>,
+    shutdown_log_path: Option<PathBuf>,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let message = serde_json::from_str::<ServerToWorker>(line.trim_end());
+            match message {
+                Ok(ServerToWorker::TurnStart { turn_id, input }) => {
+                    let _ = append_control_log(
+                        control_log_path.as_deref(),
+                        &format!(
+                            "turn_start turn_id={turn_id} input={}",
+                            escape_bytes(input.as_bytes())
+                        ),
+                    );
+                    let _ = turn_tx.send(ServerToWorker::TurnStart { turn_id, input });
+                }
+                Ok(ServerToWorker::Interrupt { turn_id }) => {
+                    interrupted.store(true, Ordering::SeqCst);
+                    let rendered_turn = turn_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let _ = append_control_log(
+                        control_log_path.as_deref(),
+                        &format!("interrupt turn_id={rendered_turn}"),
+                    );
+                }
+                Ok(ServerToWorker::SessionEnd) => {
+                    control_session_end.store(true, Ordering::SeqCst);
+                    let _ =
+                        append_shutdown_log(shutdown_log_path.as_deref(), "control_session_end");
+                    let _ = append_control_log(control_log_path.as_deref(), "session_end");
+                    let _ = turn_tx.send(ServerToWorker::SessionEnd);
+                    return;
+                }
+                Ok(ServerToWorker::Other) | Err(_) => {}
+            }
+        }
+    });
+}
+
+fn start_v3_stdin_observer(control_log_path: Option<PathBuf>) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(len) => {
+                    let _ = append_control_log(
+                        control_log_path.as_deref(),
+                        &format!("stdin:{}", escape_bytes(&buffer[..len])),
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn append_control_log(path: Option<&Path>, event: &str) -> io::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(format!("{event}\n").as_bytes())
 }
 
 fn append_shutdown_log(path: Option<&Path>, event: &str) -> io::Result<()> {
@@ -665,7 +1031,14 @@ fn install_signal_handler() {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerToWorker {
-    Interrupt,
+    TurnStart {
+        turn_id: u64,
+        input: String,
+    },
+    Interrupt {
+        #[serde(default)]
+        turn_id: Option<u64>,
+    },
     SessionEnd,
     #[serde(other)]
     Other,
@@ -688,6 +1061,15 @@ enum WorkerToServer {
     ReadlineDiscardBytes {
         data_b64: String,
     },
+    InputLine {
+        turn_id: u64,
+        prompt: String,
+        text: String,
+    },
+    Idle {
+        turn_id: u64,
+        prompt: String,
+    },
     OutputText {
         stream: String,
         data_b64: String,
@@ -702,6 +1084,8 @@ enum WorkerToServer {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message_b64: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
     },
 }
 
@@ -829,7 +1213,7 @@ fn start_control_reader(
             }
             let message = serde_json::from_str::<ServerToWorker>(line.trim_end());
             match message {
-                Ok(ServerToWorker::Interrupt) => {
+                Ok(ServerToWorker::Interrupt { .. }) => {
                     interrupted.store(true, Ordering::SeqCst);
                 }
                 Ok(ServerToWorker::SessionEnd) => {
@@ -838,7 +1222,7 @@ fn start_control_reader(
                         append_shutdown_log(shutdown_log_path.as_deref(), "control_session_end");
                     return;
                 }
-                Ok(ServerToWorker::Other) | Err(_) => {}
+                Ok(ServerToWorker::TurnStart { .. }) | Ok(ServerToWorker::Other) | Err(_) => {}
             }
         }
     });

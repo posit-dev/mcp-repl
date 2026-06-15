@@ -90,6 +90,7 @@ fn init_ipc(
                         python_session::mark_request_started();
                         emit_stdin_write_ack();
                     }
+                    Some(ServerToWorkerIpcMessage::TurnStart { .. }) => {}
                     Some(ServerToWorkerIpcMessage::PythonRequestStart {
                         request_generation,
                         stdin_b64,
@@ -125,7 +126,7 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {
                         python_session::mark_stdin_write_complete();
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt) => {
+                    Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
                         python_session::interrupt();
                     }
                     Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {

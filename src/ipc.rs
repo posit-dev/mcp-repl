@@ -18,7 +18,6 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 #[cfg(target_family = "unix")]
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-#[cfg(target_family = "windows")]
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -84,11 +83,16 @@ static NEXT_SERVER_IMAGE_ID: AtomicU64 = AtomicU64::new(0);
 static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
 pub const WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WORKER_PROTOCOL_V3_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWorkerIpcMessage {
     RequestStart,
+    TurnStart {
+        turn_id: u64,
+        input: String,
+    },
     PythonRequestStart {
         request_generation: u64,
         stdin_b64: String,
@@ -104,7 +108,10 @@ pub enum ServerToWorkerIpcMessage {
     PythonInterrupt {
         request_generation: u64,
     },
-    Interrupt,
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +147,15 @@ pub enum WorkerToServerIpcMessage {
         prompt: String,
         line: String,
     },
+    InputLine {
+        turn_id: u64,
+        prompt: String,
+        text: String,
+    },
+    Idle {
+        turn_id: u64,
+        prompt: String,
+    },
     PlotImage {
         mime_type: String,
         data: String,
@@ -158,6 +174,8 @@ pub enum WorkerToServerIpcMessage {
         reason: Option<String>,
         #[serde(default)]
         message_b64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
     },
 }
 
@@ -190,6 +208,9 @@ struct ServerIpcInbox {
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
     active_stdin: Option<VecDeque<u8>>,
+    active_turn_id: Option<u64>,
+    completed_turn_id: Option<u64>,
+    completed_turn_observed_at: Option<Instant>,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
@@ -283,6 +304,39 @@ impl OutputCriticalIpcWriter {
             .lock()
             .map_err(|_| io::Error::other("ipc writer mutex poisoned"))?;
         write_ipc_message(&mut **writer, &message)
+    }
+
+    pub fn send_with_timeout<T>(&self, message: T, timeout: Duration) -> io::Result<()>
+    where
+        T: Serialize + Send + 'static,
+    {
+        if timeout.is_zero() {
+            return Err(ipc_send_timeout_error());
+        }
+
+        let writer = self.writer.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = {
+                let mut writer = match writer.lock() {
+                    Ok(writer) => writer,
+                    Err(_) => {
+                        let _ = tx.send(Err(io::Error::other("ipc writer mutex poisoned")));
+                        return;
+                    }
+                };
+                write_ipc_message(&mut **writer, &message)
+            };
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ipc_send_timeout_error()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("ipc writer thread exited unexpectedly"))
+            }
+        }
     }
 }
 
@@ -401,16 +455,7 @@ impl ServerIpcConnection {
                                 guard.readline_unmatched_since = Some(Instant::now());
                             }
                         }
-                        if guard
-                            .prompt_history
-                            .back()
-                            .is_none_or(|last| last != &prompt)
-                        {
-                            guard.prompt_history.push_back(prompt.clone());
-                            if guard.prompt_history.len() > MAX_PROMPT_HISTORY {
-                                guard.prompt_history.pop_front();
-                            }
-                        }
+                        push_prompt_history(&mut guard, prompt.clone());
                         guard.last_prompt = Some(prompt);
                         reader_cvar.notify_all();
                         drop(guard);
@@ -481,9 +526,50 @@ impl ServerIpcConnection {
                             handler(echo_event);
                         }
                     }
+                    WorkerToServerIpcMessage::InputLine {
+                        turn_id,
+                        prompt,
+                        text,
+                    } => {
+                        let echo_event = IpcEchoEvent {
+                            prompt: prompt.clone(),
+                            line: text.clone(),
+                            source: OutputTextSource::Ipc,
+                        };
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) =
+                            validate_open_active_turn_id(&guard, turn_id, "input_line")
+                        {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        guard.readline_result_count = guard.readline_result_count.saturating_add(1);
+                        push_prompt_history(&mut guard, prompt);
+                        guard.echo_events.push_back(echo_event.clone());
+                        reader_cvar.notify_all();
+                        drop(guard);
+                        if let Some(handler) = readline_result_handler.as_ref() {
+                            handler(echo_event);
+                        }
+                    }
+                    WorkerToServerIpcMessage::Idle { turn_id, prompt } => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if let Err(err) = validate_open_active_turn_id(&guard, turn_id, "idle") {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        push_prompt_history(&mut guard, prompt.clone());
+                        guard.last_prompt = Some(prompt);
+                        guard.completed_turn_id = Some(turn_id);
+                        guard.completed_turn_observed_at = Some(Instant::now());
+                        reader_cvar.notify_all();
+                    }
                     WorkerToServerIpcMessage::SessionEnd {
                         reason,
                         message_b64,
+                        turn_id,
                     } => {
                         if let Err(err) =
                             validate_session_end(reason.as_deref(), message_b64.as_deref())
@@ -494,11 +580,20 @@ impl ServerIpcConnection {
                             break;
                         }
                         let mut guard = reader_inbox.lock().unwrap();
+                        if let Some(turn_id) = turn_id
+                            && let Err(err) =
+                                validate_active_turn_id(&guard, turn_id, "session_end")
+                        {
+                            latch_protocol_error(&mut guard, err);
+                            reader_cvar.notify_all();
+                            break;
+                        }
                         guard.session_end = true;
                         guard.session_end_final = true;
                         guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
                             reason,
                             message_b64,
+                            turn_id,
                         });
                         reader_cvar.notify_all();
                         drop(guard);
@@ -644,6 +739,14 @@ impl ServerIpcConnection {
         self.writer.send(message)
     }
 
+    pub fn send_with_timeout(
+        &self,
+        message: ServerToWorkerIpcMessage,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.writer.send_with_timeout(message, timeout)
+    }
+
     pub fn join_reader_thread(&self) -> io::Result<()> {
         let handle = self.reader_thread.lock().unwrap().take();
         let Some(handle) = handle else {
@@ -672,6 +775,19 @@ impl ServerIpcConnection {
         drop_stdin_write_acks(&mut guard);
         drop_python_interrupt_acks(&mut guard);
         guard.active_stdin = Some(payload.iter().copied().collect());
+        guard.echo_events.clear();
+        guard.prompt_history.clear();
+        guard.protocol_warnings.clear();
+    }
+
+    pub fn begin_turn(&self, turn_id: u64) {
+        let mut guard = self.inbox.lock().unwrap();
+        reset_after_completed_request(&mut guard);
+        drop_stdin_write_acks(&mut guard);
+        drop_python_interrupt_acks(&mut guard);
+        guard.active_turn_id = Some(turn_id);
+        guard.completed_turn_id = None;
+        guard.completed_turn_observed_at = None;
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -1035,6 +1151,13 @@ fn write_ipc_message<T: Serialize>(writer: &mut dyn Write, message: &T) -> io::R
     writer.write_all(payload.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+fn ipc_send_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out sending IPC message to worker",
+    )
 }
 
 #[derive(Debug)]
@@ -1808,6 +1931,7 @@ pub fn emit_session_end() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
+            turn_id: None,
         });
     }
 }
@@ -1931,7 +2055,51 @@ fn drop_python_interrupt_acks(guard: &mut ServerIpcInbox) {
         .retain(|msg| !matches!(msg, WorkerToServerIpcMessage::PythonInterruptAck));
 }
 
+fn push_prompt_history(guard: &mut ServerIpcInbox, prompt: String) {
+    if guard
+        .prompt_history
+        .back()
+        .is_none_or(|last| last != &prompt)
+    {
+        guard.prompt_history.push_back(prompt);
+        if guard.prompt_history.len() > MAX_PROMPT_HISTORY {
+            guard.prompt_history.pop_front();
+        }
+    }
+}
+
+fn validate_active_turn_id(
+    guard: &ServerIpcInbox,
+    turn_id: u64,
+    event_type: &str,
+) -> Result<(), String> {
+    match guard.active_turn_id {
+        Some(active) if active == turn_id => Ok(()),
+        Some(active) => Err(format!(
+            "{event_type} turn_id {turn_id} does not match active turn_id {active}"
+        )),
+        None => Err(format!(
+            "{event_type} reported turn_id {turn_id} with no active turn"
+        )),
+    }
+}
+
+fn validate_open_active_turn_id(
+    guard: &ServerIpcInbox,
+    turn_id: u64,
+    event_type: &str,
+) -> Result<(), String> {
+    validate_active_turn_id(guard, turn_id, event_type)?;
+    if guard.completed_turn_id == Some(turn_id) {
+        return Err(format!("{event_type} turn_id {turn_id} arrived after idle"));
+    }
+    Ok(())
+}
+
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
+    if let Some(active_turn_id) = guard.active_turn_id {
+        return guard.completed_turn_id == Some(active_turn_id);
+    }
     let Some(since) = guard.readline_unmatched_since else {
         return false;
     };
@@ -1939,8 +2107,15 @@ fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bo
 }
 
 fn latch_protocol_error(guard: &mut ServerIpcInbox, message: impl Into<String>) {
+    let message = message.into();
+    crate::event_log::log(
+        "worker_protocol_error_latched",
+        serde_json::json!({
+            "message": message.clone(),
+        }),
+    );
     guard.protocol_error = Some(LatchedProtocolError {
-        message: message.into(),
+        message,
         observed_at: Instant::now(),
     });
 }
@@ -1984,6 +2159,13 @@ fn request_completion_precedes_latched_protocol_error(
     let Some(error) = guard.protocol_error.as_ref() else {
         return false;
     };
+    if let Some(active_turn_id) = guard.active_turn_id
+        && guard.completed_turn_id == Some(active_turn_id)
+    {
+        return guard
+            .completed_turn_observed_at
+            .is_some_and(|observed_at| observed_at <= error.observed_at);
+    }
     let Some(since) = guard.readline_unmatched_since else {
         return false;
     };
@@ -2006,6 +2188,13 @@ fn request_completion_observed_before_deadline(
     deadline: Instant,
     allow_completion_settle_after_deadline: bool,
 ) -> bool {
+    if let Some(active_turn_id) = guard.active_turn_id
+        && guard.completed_turn_id == Some(active_turn_id)
+    {
+        return guard
+            .completed_turn_observed_at
+            .is_some_and(|observed_at| observed_at <= deadline);
+    }
     allow_completion_settle_after_deadline
         && guard.readline_unmatched_starts > 0
         && guard
@@ -2021,6 +2210,9 @@ fn completion_wait_duration(
 ) -> Duration {
     let now = Instant::now();
     let until_deadline = deadline.saturating_duration_since(now);
+    if guard.active_turn_id.is_some() {
+        return until_deadline;
+    }
     let Some(since) = guard.readline_unmatched_since else {
         return until_deadline;
     };
@@ -2084,6 +2276,9 @@ fn assign_plot_image_id(
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
     guard.active_stdin = None;
+    guard.active_turn_id = None;
+    guard.completed_turn_id = None;
+    guard.completed_turn_observed_at = None;
     guard.readline_result_count = 0;
     guard.readline_unmatched_starts = 0;
     guard.readline_unmatched_since = None;

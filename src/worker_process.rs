@@ -303,6 +303,10 @@ trait BackendDriver: Send {
         oversized_output: OversizedOutputMode,
         pending_input: Option<&str>,
     ) -> bool;
+    fn should_write_stdin_payload(&self) -> bool {
+        true
+    }
+    fn clear_active_turn(&mut self) {}
     fn wait_for_completion(
         &mut self,
         timeout: Duration,
@@ -410,7 +414,7 @@ fn driver_wait_for_completion(
 
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     if let Some(ipc) = process.ipc.get() {
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
     }
     process.send_interrupt()
 }
@@ -488,6 +492,41 @@ fn driver_refresh_worker_ready(
     }
 }
 
+fn driver_refresh_custom_worker_ready(
+    ipc: ServerIpcConnection,
+    timeout: Duration,
+) -> Result<u32, WorkerError> {
+    match ipc.wait_for_backend_info(timeout) {
+        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+            if protocol.name != "mcp-repl-worker"
+                || !matches!(
+                    protocol.version,
+                    crate::ipc::WORKER_PROTOCOL_VERSION | crate::ipc::WORKER_PROTOCOL_V3_VERSION
+                )
+            {
+                return Err(WorkerError::Protocol(format!(
+                    "unsupported worker protocol {} version {}",
+                    protocol.name, protocol.version
+                )));
+            }
+            Ok(protocol.version)
+        }
+        Ok(_) => Err(WorkerError::Protocol(
+            "expected worker_ready before user input".to_string(),
+        )),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
+            "timed out waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 impl BackendDriver for RBackendDriver {
     fn prepare_input_text(&self, text: String) -> String {
         normalize_input_newlines(&text)
@@ -530,7 +569,7 @@ impl BackendDriver for RBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc.get() {
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
         }
         process.send_r_interrupt()
     }
@@ -912,6 +951,9 @@ impl BackendDriver for PythonBackendDriver {
 struct ProtocolBackendDriver {
     #[cfg(target_family = "unix")]
     python_request_generation: Option<u64>,
+    protocol_version: Option<u32>,
+    next_turn_id: u64,
+    active_turn_id: Option<u64>,
 }
 
 impl ProtocolBackendDriver {
@@ -919,6 +961,9 @@ impl ProtocolBackendDriver {
         Self {
             #[cfg(target_family = "unix")]
             python_request_generation: None,
+            protocol_version: None,
+            next_turn_id: 1,
+            active_turn_id: None,
         }
     }
 
@@ -926,6 +971,9 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
+            protocol_version: Some(crate::ipc::WORKER_PROTOCOL_VERSION),
+            next_turn_id: 1,
+            active_turn_id: None,
         }
     }
 
@@ -935,16 +983,52 @@ impl ProtocolBackendDriver {
         *generation = generation.wrapping_add(1);
         Some(*generation)
     }
+
+    fn is_v3(&self) -> bool {
+        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_V3_VERSION)
+    }
+
+    fn next_turn_id(&mut self) -> u64 {
+        let turn_id = self.next_turn_id;
+        self.next_turn_id = self.next_turn_id.wrapping_add(1).max(1);
+        turn_id
+    }
 }
 
 impl BackendDriver for ProtocolBackendDriver {
     fn on_input_start(
         &mut self,
-        _text: &str,
+        text: &str,
         payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
+        if self.is_v3() {
+            if let Some(message) = ipc.take_protocol_error() {
+                return Err(WorkerError::Protocol(message));
+            }
+            let turn_id = self.next_turn_id();
+            ipc.begin_turn(turn_id);
+            match ipc.send_with_timeout(
+                ServerToWorkerIpcMessage::TurnStart {
+                    turn_id,
+                    input: text.to_string(),
+                },
+                timeout,
+            ) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(WorkerError::Timeout(timeout));
+                }
+                Err(err) => return Err(WorkerError::Io(err)),
+            }
+            self.active_turn_id = Some(turn_id);
+            if let Some(message) = ipc.take_protocol_error() {
+                return Err(WorkerError::Protocol(message));
+            }
+            return Ok(());
+        }
+
         ipc.begin_request_with_stdin(payload);
         #[cfg(not(target_family = "unix"))]
         let _ = timeout;
@@ -987,15 +1071,39 @@ impl BackendDriver for ProtocolBackendDriver {
         false
     }
 
+    fn should_write_stdin_payload(&self) -> bool {
+        !self.is_v3()
+    }
+
+    fn clear_active_turn(&mut self) {
+        self.active_turn_id = None;
+    }
+
     fn wait_for_completion(
         &mut self,
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+        let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
+        if matches!(result, Ok(_) | Err(WorkerError::Protocol(_))) {
+            self.active_turn_id = None;
+        }
+        result
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
+        if self.is_v3() {
+            if let Some(turn_id) = self.active_turn_id
+                && let Some(ipc) = process.ipc.get()
+            {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                    turn_id: Some(turn_id),
+                })
+                .map_err(WorkerError::Io)?;
+            }
+            return process.send_interrupt();
+        }
+
         #[cfg(target_family = "unix")]
         if let Some(request_generation) = self.python_request_generation {
             if let Some(ipc) = process.ipc.get() {
@@ -1014,7 +1122,13 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_worker_ready(ipc, timeout)
+        #[cfg(target_family = "unix")]
+        if self.python_request_generation.is_some() {
+            return driver_refresh_worker_ready(ipc, timeout);
+        }
+
+        self.protocol_version = Some(driver_refresh_custom_worker_ready(ipc, timeout)?);
+        Ok(())
     }
 }
 
@@ -2106,6 +2220,7 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let _ = self.reset_preserving_detached_prefix_item_count();
             return Err(err);
         }
         if self.pending_request {
@@ -2265,6 +2380,8 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let preserve_pager = self.pager.is_active();
+            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             return Err(err);
         }
         if self.pending_request {
@@ -2571,11 +2688,13 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        self.process
-            .as_mut()
-            .expect("worker process should be available")
-            .write_stdin_payload(payload, remaining)?;
-        self.driver.on_input_written(&ipc)?;
+        if self.driver.should_write_stdin_payload() {
+            self.process
+                .as_mut()
+                .expect("worker process should be available")
+                .write_stdin_payload(payload, remaining)?;
+            self.driver.on_input_written(&ipc)?;
+        }
         Ok(RequestState {
             timeout: worker_timeout,
             started_at,
@@ -3953,6 +4072,7 @@ impl WorkerManager {
         if !preserve_detached_output {
             self.pending_request_input = None;
         }
+        self.driver.clear_active_turn();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -4023,6 +4143,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
+        self.driver.clear_active_turn();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -4533,6 +4654,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
+                self.driver.clear_active_turn();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
@@ -4562,6 +4684,7 @@ impl WorkerManager {
     fn clear_pending_request_state(&mut self) {
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.driver.clear_active_turn();
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -7907,6 +8030,7 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
+            turn_id: None,
         });
 
         let completion =
@@ -7938,6 +8062,7 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
+            turn_id: None,
         });
         thread::sleep(Duration::from_millis(25));
 
@@ -9093,6 +9218,7 @@ mod tests {
             .send(WorkerToServerIpcMessage::SessionEnd {
                 reason: None,
                 message_b64: None,
+                turn_id: None,
             })
             .expect("send session_end");
 
