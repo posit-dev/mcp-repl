@@ -420,7 +420,7 @@ async fn zod_worker_v3_busy_follow_up_does_not_send_second_turn_start() -> TestR
         .call_tool_raw(
             "repl",
             json!({
-                "input": "sleep 150",
+                "input": "interrupt-report 5000",
                 "timeout_ms": 10
             }),
         )
@@ -446,19 +446,19 @@ async fn zod_worker_v3_busy_follow_up_does_not_send_second_turn_start() -> TestR
         "expected busy follow-up response, got: {busy_text:?}"
     );
 
-    let poll = session
+    let interrupted = session
         .call_tool_raw(
             "repl",
             json!({
-                "input": "",
+                "input": "\u{3}",
                 "timeout_ms": 10_000
             }),
         )
         .await?;
-    let poll_text = result_text(&poll);
+    let interrupted_text = result_text(&interrupted);
     assert!(
-        poll_text.contains("v3> "),
-        "expected first turn to settle on poll, got: {poll_text:?}"
+        interrupted_text.contains("sideband interrupt: observed"),
+        "expected active turn to settle after interrupt, got: {interrupted_text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "idle turn_id=1")?;
