@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::legacy_request_state::LegacyRequestState;
 use crate::output_capture::OutputTextSource;
 use crate::turn_state::TurnState;
 use crate::worker_protocol::TextStream;
@@ -208,11 +209,8 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
-    active_stdin: Option<VecDeque<u8>>,
     turn_state: TurnState,
-    readline_result_count: u64,
-    readline_unmatched_starts: usize,
-    readline_unmatched_since: Option<Instant>,
+    legacy_request_state: LegacyRequestState,
     current_image_id: Option<String>,
     request_image_id: Option<String>,
     plot_source_image_ids: HashMap<String, String>,
@@ -432,17 +430,9 @@ impl ServerIpcConnection {
                     WorkerToServerIpcMessage::ReadlineStart { prompt } => {
                         let prompt_for_handler = prompt.clone();
                         let mut guard = reader_inbox.lock().unwrap();
-                        let waiting_for_new_input = guard
-                            .active_stdin
-                            .as_ref()
-                            .is_none_or(|active_stdin| active_stdin.is_empty());
-                        if waiting_for_new_input {
-                            guard.readline_unmatched_starts =
-                                guard.readline_unmatched_starts.saturating_add(1);
-                            if guard.readline_unmatched_starts == 1 {
-                                guard.readline_unmatched_since = Some(Instant::now());
-                            }
-                        }
+                        guard
+                            .legacy_request_state
+                            .record_readline_start(Instant::now());
                         push_prompt_history(&mut guard, prompt.clone());
                         guard.last_prompt = Some(prompt);
                         reader_cvar.notify_all();
@@ -463,8 +453,9 @@ impl ServerIpcConnection {
                             }
                         };
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) =
-                            account_active_stdin(&mut guard, &bytes, "readline_input_bytes")
+                        if let Err(err) = guard
+                            .legacy_request_state
+                            .account_stdin(&bytes, "readline_input_bytes")
                         {
                             guard.turn_state.latch_protocol_error(err);
                             reader_cvar.notify_all();
@@ -484,8 +475,9 @@ impl ServerIpcConnection {
                                 }
                             };
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) =
-                            account_active_stdin(&mut guard, &bytes, "readline_discard_bytes")
+                        if let Err(err) = guard
+                            .legacy_request_state
+                            .account_stdin(&bytes, "readline_discard_bytes")
                         {
                             guard.turn_state.latch_protocol_error(err);
                             reader_cvar.notify_all();
@@ -500,13 +492,7 @@ impl ServerIpcConnection {
                             source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.readline_result_count = guard.readline_result_count.saturating_add(1);
-                        if guard.readline_unmatched_starts > 0 {
-                            guard.readline_unmatched_starts -= 1;
-                            if guard.readline_unmatched_starts == 0 {
-                                guard.readline_unmatched_since = None;
-                            }
-                        }
+                        guard.legacy_request_state.record_readline_result();
                         guard.echo_events.push_back(echo_event.clone());
                         reader_cvar.notify_all();
                         drop(guard);
@@ -533,7 +519,7 @@ impl ServerIpcConnection {
                             reader_cvar.notify_all();
                             break;
                         }
-                        guard.readline_result_count = guard.readline_result_count.saturating_add(1);
+                        guard.legacy_request_state.record_readline_result();
                         push_prompt_history(&mut guard, prompt);
                         guard.echo_events.push_back(echo_event.clone());
                         reader_cvar.notify_all();
@@ -635,7 +621,7 @@ impl ServerIpcConnection {
                                 id,
                                 is_new,
                                 updates_previous_image,
-                                guard.readline_result_count as usize,
+                                guard.legacy_request_state.readline_result_count(),
                             )
                         };
                         if let Some(handler) = plot_handler.as_ref() {
@@ -683,7 +669,7 @@ impl ServerIpcConnection {
                                 id,
                                 is_new,
                                 updates_previous_image,
-                                guard.readline_result_count as usize,
+                                guard.legacy_request_state.readline_result_count(),
                             )
                         };
                         if let Some(handler) = plot_handler.as_ref() {
@@ -765,7 +751,7 @@ impl ServerIpcConnection {
         reset_after_completed_request(&mut guard);
         drop_stdin_write_acks(&mut guard);
         drop_python_interrupt_acks(&mut guard);
-        guard.active_stdin = Some(payload.iter().copied().collect());
+        guard.legacy_request_state.begin_with_stdin(payload);
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
@@ -1965,38 +1951,6 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     true
 }
 
-fn account_active_stdin(
-    guard: &mut ServerIpcInbox,
-    bytes: &[u8],
-    event_type: &str,
-) -> Result<(), String> {
-    let Some(active_stdin) = guard.active_stdin.as_mut() else {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        return Err(format!("{event_type} reported input with no active turn"));
-    };
-    if bytes.len() > active_stdin.len() {
-        return Err(format!(
-            "{event_type} reported {} bytes but only {} active stdin bytes remain",
-            bytes.len(),
-            active_stdin.len()
-        ));
-    }
-    for (idx, expected) in bytes.iter().enumerate() {
-        if active_stdin.get(idx) != Some(expected) {
-            let actual = active_stdin.get(idx).copied();
-            return Err(format!(
-                "{event_type} bytes does not match active stdin at byte {idx}: expected {actual:?}, got {expected}"
-            ));
-        }
-    }
-    for _ in bytes {
-        active_stdin.pop_front();
-    }
-    Ok(())
-}
-
 fn decode_sideband_base64(data_b64: &str, event_type: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(data_b64)
@@ -2060,10 +2014,9 @@ fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bo
     if guard.turn_state.has_active_turn() {
         return guard.turn_state.request_completion_ready();
     }
-    let Some(since) = guard.readline_unmatched_since else {
-        return false;
-    };
-    guard.readline_unmatched_starts > 0 && since.elapsed() >= stable_wait
+    guard
+        .legacy_request_state
+        .request_completion_ready(stable_wait)
 }
 
 fn validate_session_end(reason: Option<&str>, message_b64: Option<&str>) -> Result<(), String> {
@@ -2106,13 +2059,9 @@ fn request_completion_precedes_latched_protocol_error(
     let Some(error_observed_at) = guard.turn_state.protocol_error_observed_at() else {
         return false;
     };
-    let Some(since) = guard.readline_unmatched_since else {
-        return false;
-    };
-    let Some(stable_at) = since.checked_add(stable_wait) else {
-        return false;
-    };
-    guard.readline_unmatched_starts > 0 && stable_at <= error_observed_at
+    guard
+        .legacy_request_state
+        .request_completion_precedes_protocol_error(error_observed_at, stable_wait)
 }
 
 fn take_request_completion(guard: &mut ServerIpcInbox, stable_wait: Duration) -> bool {
@@ -2133,11 +2082,9 @@ fn request_completion_observed_before_deadline(
             .turn_state
             .request_completion_observed_before(deadline);
     }
-    allow_completion_settle_after_deadline
-        && guard.readline_unmatched_starts > 0
-        && guard
-            .readline_unmatched_since
-            .is_some_and(|since| since <= deadline)
+    guard
+        .legacy_request_state
+        .request_completion_observed_before(deadline, allow_completion_settle_after_deadline)
 }
 
 fn completion_wait_duration(
@@ -2151,17 +2098,11 @@ fn completion_wait_duration(
     if guard.turn_state.has_active_turn() {
         return until_deadline;
     }
-    let Some(since) = guard.readline_unmatched_since else {
-        return until_deadline;
-    };
-    let elapsed = since.elapsed();
-    if elapsed >= stable_wait {
-        Duration::from_millis(0)
-    } else if allow_completion_settle_after_deadline && since <= deadline {
-        stable_wait.saturating_sub(elapsed)
-    } else {
-        until_deadline.min(stable_wait.saturating_sub(elapsed))
-    }
+    guard.legacy_request_state.completion_wait_duration(
+        deadline,
+        stable_wait,
+        allow_completion_settle_after_deadline,
+    )
 }
 
 fn allocate_plot_image_id() -> String {
@@ -2213,11 +2154,8 @@ fn assign_plot_image_id(
 }
 
 fn reset_request_progress(guard: &mut ServerIpcInbox) {
-    guard.active_stdin = None;
     guard.turn_state.clear_request_progress();
-    guard.readline_result_count = 0;
-    guard.readline_unmatched_starts = 0;
-    guard.readline_unmatched_since = None;
+    guard.legacy_request_state.reset_request_progress();
 }
 
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
