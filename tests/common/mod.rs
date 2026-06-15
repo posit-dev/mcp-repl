@@ -1571,6 +1571,8 @@ pub async fn spawn_server_with_args_env_and_cwd(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
+        cmd.env("PAGER", "cat");
+        cmd.env("MANPAGER", "cat");
         if let Some(cwd) = &current_dir {
             cmd.current_dir(cwd);
         }

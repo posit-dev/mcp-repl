@@ -2038,6 +2038,22 @@ tryCatch({
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
+                        if path_matches(path, &["sandboxPolicy"])
+                            && normalized_key == "writable_roots"
+                            && matches!(
+                                &child,
+                                Value::Array(items)
+                                    if items.iter().all(|item| {
+                                        matches!(
+                                            item.as_str(),
+                                            Some("<CODEX_HOME>/memories")
+                                                | Some("<CODEX_HOME>\\memories")
+                                        )
+                                    })
+                            )
+                        {
+                            continue;
+                        }
                         map.insert(normalized_key, child);
                     }
                     if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
@@ -2186,6 +2202,59 @@ tryCatch({
                 }
             }),
             "wire snapshots should normalize Codex elicitation capability shape"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_default_codex_memories_writable_root() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let memories = codex_home.join("memories");
+        let mut value = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [memories],
+                "network_access": false
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sandboxPolicy": {
+                    "type": "workspace-write",
+                    "network_access": false
+                }
+            }),
+            "wire snapshots should not retain Codex's default memories writable root"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": ["<CODEX_HOME>\\memories"],
+                "network_access": false
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sandboxPolicy": {
+                    "type": "workspace-write",
+                    "network_access": false
+                }
+            }),
+            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
         );
     }
 
@@ -2794,13 +2863,9 @@ tryCatch({
 
     fn split_legacy_tool_name(legacy_tool_name: &str) -> Option<(&str, &str)> {
         let split = legacy_tool_name.rfind("__")?;
-        let namespace_end = split + 2;
-        (namespace_end < legacy_tool_name.len()).then(|| {
-            (
-                &legacy_tool_name[..namespace_end],
-                &legacy_tool_name[namespace_end..],
-            )
-        })
+        let name_start = split + 2;
+        (split > 0 && name_start < legacy_tool_name.len())
+            .then(|| (&legacy_tool_name[..split], &legacy_tool_name[name_start..]))
     }
 
     fn message_item(text: &str) -> Value {
@@ -2930,7 +2995,7 @@ tryCatch({
         let request = serde_json::json!({
             "tools": [{
                 "type": "namespace",
-                "name": "mcp__r__",
+                "name": "mcp__r",
                 "tools": [{
                     "type": "function",
                     "name": "repl",
@@ -2941,7 +3006,7 @@ tryCatch({
             resolve_tool_call_spec(&request, "mcp__r__repl"),
             Some(MockToolCallSpec {
                 name: "repl".to_string(),
-                namespace: Some("mcp__r__".to_string()),
+                namespace: Some("mcp__r".to_string()),
             })
         );
     }

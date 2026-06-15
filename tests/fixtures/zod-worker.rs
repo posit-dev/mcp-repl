@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 1,
+            version: 2,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -95,12 +95,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let command = line.trim_end_matches(['\r', '\n']);
         let reported_input = if let Some(text) = command.strip_prefix("misreport-input ") {
-            format!("{text}\n")
+            format!("{text}\n").into_bytes()
         } else {
-            line.clone()
+            line.as_bytes().to_vec()
         };
-        writer.send(&WorkerToServer::ReadlineInput {
-            text: reported_input,
+        writer.send(&WorkerToServer::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(reported_input),
         })?;
         timeline.run(LifecyclePoint::AfterReadlineInput, &writer)?;
         if command == "exit" {
@@ -205,6 +205,16 @@ fn run_command(
         return Ok(());
     }
 
+    if command == "old-readline-input" {
+        writer.send_raw_json(r#"{"type":"readline_input","text":"old\n"}"#)?;
+        return Ok(());
+    }
+
+    if command == "old-readline-discard" {
+        writer.send_raw_json(r#"{"type":"readline_discard","text":"old\n"}"#)?;
+        return Ok(());
+    }
+
     if let Some(millis) = command.strip_prefix("interruptible ") {
         sleep_for(parse_millis(millis)?, sideband_interrupted, true);
         return Ok(());
@@ -242,6 +252,18 @@ fn run_command(
         return Ok(());
     }
 
+    if let Some(millis) = command.strip_prefix("read-one-byte-then-discard-on-interrupt ") {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        writer.send(&WorkerToServer::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(byte),
+        })?;
+        if sleep_for(parse_millis(millis)?, sideband_interrupted, true) {
+            discard_buffered_stdin(reader, writer)?;
+        }
+        return Ok(());
+    }
+
     if command == "read-user-stdin" {
         let mut user_line = String::new();
         let bytes = reader.read_line(&mut user_line)?;
@@ -253,6 +275,30 @@ fn run_command(
                 format!("user-stdin:{}", user_line.trim_end_matches(['\r', '\n'])).as_str(),
             )?;
         }
+        return Ok(());
+    }
+
+    if command == "read-split-utf8-tail" {
+        let mut consumed = Vec::new();
+        for _ in 0..2 {
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte)?;
+            consumed.extend_from_slice(&byte);
+            writer.send(&WorkerToServer::ReadlineInputBytes {
+                data_b64: base64::engine::general_purpose::STANDARD.encode(byte),
+            })?;
+        }
+        let mut rest = Vec::new();
+        reader.read_until(b'\n', &mut rest)?;
+        if !rest.is_empty() {
+            writer.send(&WorkerToServer::ReadlineInputBytes {
+                data_b64: base64::engine::general_purpose::STANDARD.encode(&rest),
+            })?;
+        }
+        writer.output_text(
+            "stdout",
+            format!("split-tail bytes: {consumed:?}\n").as_bytes(),
+        )?;
         return Ok(());
     }
 
@@ -338,18 +384,18 @@ fn apply_shutdown_mode(path: Option<&Path>, mode: ShutdownMode) -> io::Result<()
 }
 
 fn discard_buffered_stdin(reader: &mut dyn BufRead, writer: &IpcWriter) -> io::Result<()> {
-    let (text, len) = {
+    let bytes = {
         let buffer = reader.fill_buf()?;
-        let text = std::str::from_utf8(buffer)
-            .map_err(io::Error::other)?
-            .to_string();
-        (text, buffer.len())
+        buffer.to_vec()
     };
+    let len = bytes.len();
     if len == 0 {
         return Ok(());
     }
     reader.consume(len);
-    writer.send(&WorkerToServer::ReadlineDiscard { text })
+    writer.send(&WorkerToServer::ReadlineDiscardBytes {
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 fn escape_bytes(bytes: &[u8]) -> String {
@@ -636,11 +682,11 @@ enum WorkerToServer {
     ReadlineStart {
         prompt: String,
     },
-    ReadlineInput {
-        text: String,
+    ReadlineInputBytes {
+        data_b64: String,
     },
-    ReadlineDiscard {
-        text: String,
+    ReadlineDiscardBytes {
+        data_b64: String,
     },
     OutputText {
         stream: String,

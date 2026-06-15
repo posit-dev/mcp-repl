@@ -1,8 +1,10 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from textwrap import dedent
+from unittest.mock import patch
 
 
 def load_module():
@@ -43,6 +45,21 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 "isError": False,
             },
         )
+
+    def test_resolve_binary_path_accepts_extensionless_windows_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binary = Path(temp_dir) / "mcp-repl"
+            exe_binary = Path(temp_dir) / "mcp-repl.exe"
+            exe_binary.write_text("", encoding="utf-8")
+
+            with patch.object(self.module.sys, "platform", "win32"):
+                self.assertEqual(exe_binary, self.module.resolve_binary_path(binary))
+
+    def test_server_process_env_uses_plain_pagers_by_default(self):
+        env = self.module.server_process_env(())
+
+        self.assertEqual("cat", env["PAGER"])
+        self.assertEqual("cat", env["MANPAGER"])
 
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(

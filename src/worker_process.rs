@@ -1,3 +1,5 @@
+#[cfg(any(target_family = "unix", test))]
+use base64::Engine as _;
 #[cfg(all(test, target_family = "unix"))]
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
@@ -422,7 +424,9 @@ fn driver_refresh_backend_info(
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+            {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
                     protocol.name, protocol.version
@@ -458,7 +462,9 @@ fn driver_refresh_worker_ready(
 ) -> Result<(), WorkerError> {
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+            {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
                     protocol.name, protocol.version
@@ -950,8 +956,11 @@ impl BackendDriver for ProtocolBackendDriver {
             // also lets a late interrupt avoid draining fd 0 after the next request
             // has started. Custom protocol workers do not receive this private
             // bridge message.
-            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart { request_generation })
-                .map_err(WorkerError::Io)?;
+            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart {
+                request_generation,
+                stdin_b64: base64::engine::general_purpose::STANDARD.encode(payload),
+            })
+            .map_err(WorkerError::Io)?;
             driver_wait_for_stdin_write_ack(ipc, timeout)?;
         }
         if let Some(message) = ipc.take_protocol_error() {
@@ -7191,7 +7200,6 @@ mod tests {
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
-    use base64::Engine as _;
     #[cfg(target_os = "linux")]
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -7783,8 +7791,8 @@ mod tests {
             "did not expect buffered readline start to complete request, got {early:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1+\n".to_string(),
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1+\n"),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "> ".to_string(),
@@ -7801,8 +7809,8 @@ mod tests {
             "did not expect buffered continuation start to complete request, got {continuation:?}"
         );
 
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInput {
-            text: "1\n".to_string(),
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1\n"),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: "+ ".to_string(),

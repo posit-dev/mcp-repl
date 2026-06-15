@@ -1,3 +1,5 @@
+#[cfg(target_family = "unix")]
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::RawFd;
@@ -332,14 +334,14 @@ pub(crate) fn mark_stdin_write_complete() {
 }
 
 pub(crate) fn mark_request_started() {
-    mark_request_started_with_generation(None);
+    mark_request_started_with_generation(None, Vec::new());
 }
 
-pub(crate) fn mark_request_started_for_generation(request_generation: u64) {
-    mark_request_started_with_generation(Some(request_generation));
+pub(crate) fn mark_request_started_for_generation(request_generation: u64, stdin_bytes: Vec<u8>) {
+    mark_request_started_with_generation(Some(request_generation), stdin_bytes);
 }
 
-fn mark_request_started_with_generation(request_generation: Option<u64>) {
+fn mark_request_started_with_generation(request_generation: Option<u64>, stdin_bytes: Vec<u8>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
@@ -364,6 +366,14 @@ fn mark_request_started_with_generation(request_generation: Option<u64>) {
     guard.interrupt_requested = false;
     guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
+    #[cfg(target_family = "unix")]
+    {
+        guard.protocol_stdin_bytes = stdin_bytes.into();
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = stdin_bytes;
+    }
     guard.plot_reset_pending = true;
 }
 
@@ -400,14 +410,12 @@ fn finish_active_request_at_next_read() {
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
     let mut discarded = Vec::new();
-    discarded.extend(PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap().drain(..));
     discarded.extend(drain_process_stdin_pipe());
     if discarded.is_empty() {
         return;
     }
-    let text =
-        String::from_utf8(discarded).expect("discarded Python stdin must be valid UTF-8 text");
-    ipc::emit_readline_discard(&text);
+    let discarded = take_protocol_stdin_bytes_for_runtime_read(&discarded);
+    ipc::emit_readline_discard_bytes(&discarded);
 }
 
 #[cfg(target_family = "unix")]
@@ -508,11 +516,11 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    PYTHON_DIRECT_STDIN_SIDEBAND_INPUT
-        .lock()
-        .unwrap()
-        .is_empty()
-        && stdin_pending_byte_count() == Some(0)
+    let Some(state) = SESSION_STATE.get() else {
+        return stdin_pending_byte_count() == Some(0);
+    };
+    let guard = state.inner.lock().unwrap();
+    guard.protocol_stdin_bytes.is_empty()
 }
 
 #[cfg(windows)]
@@ -1638,9 +1646,10 @@ fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
 }
 
 #[cfg(not(target_family = "unix"))]
@@ -1916,9 +1925,40 @@ fn note_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
+}
+
+#[cfg(target_family = "unix")]
+fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
+    let Some(state) = SESSION_STATE.get() else {
+        return runtime_bytes.to_vec();
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if guard.protocol_stdin_bytes.is_empty() {
+        return runtime_bytes.to_vec();
+    }
+
+    let mut protocol_bytes = Vec::with_capacity(runtime_bytes.len());
+    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
+        return runtime_bytes.to_vec();
+    }
+
+    for (&original_byte, &runtime_byte) in guard.protocol_stdin_bytes.iter().zip(runtime_bytes) {
+        protocol_bytes.push(original_byte);
+        if !protocol_stdin_byte_matches_runtime(original_byte, runtime_byte) {
+            return runtime_bytes.to_vec();
+        }
+    }
+    guard.protocol_stdin_bytes.drain(..protocol_bytes.len());
+    protocol_bytes
+}
+
+#[cfg(target_family = "unix")]
+fn protocol_stdin_byte_matches_runtime(protocol_byte: u8, runtime_byte: u8) -> bool {
+    protocol_byte == runtime_byte || (protocol_byte == b'\r' && runtime_byte == b'\n')
 }
 
 #[cfg(target_family = "unix")]
@@ -1945,29 +1985,7 @@ fn emit_readline_input_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let mut pending = PYTHON_DIRECT_STDIN_SIDEBAND_INPUT.lock().unwrap();
-    pending.extend_from_slice(bytes);
-    loop {
-        match std::str::from_utf8(&pending) {
-            Ok(text) => {
-                if !text.is_empty() {
-                    ipc::emit_readline_input(text);
-                }
-                pending.clear();
-                return;
-            }
-            Err(err) => {
-                let valid_up_to = err.valid_up_to();
-                if valid_up_to == 0 {
-                    return;
-                }
-                let text = std::str::from_utf8(&pending[..valid_up_to])
-                    .expect("valid UTF-8 prefix should decode");
-                ipc::emit_readline_input(text);
-                pending.drain(..valid_up_to);
-            }
-        }
-    }
+    ipc::emit_readline_input_bytes(bytes);
 }
 
 #[cfg(not(target_family = "unix"))]
@@ -2088,6 +2106,8 @@ struct SessionStateInner {
     session_end_emitted: bool,
     plot_reset_pending: bool,
     interrupt_requested: bool,
+    #[cfg(target_family = "unix")]
+    protocol_stdin_bytes: VecDeque<u8>,
 }
 
 #[allow(dead_code)]
@@ -2123,6 +2143,8 @@ impl SessionState {
                 session_end_emitted: false,
                 plot_reset_pending: false,
                 interrupt_requested: false,
+                #[cfg(target_family = "unix")]
+                protocol_stdin_bytes: VecDeque::new(),
             }),
             cvar: Condvar::new(),
         }
@@ -2442,8 +2464,6 @@ static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut()
 static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 #[cfg(target_family = "unix")]
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
-#[cfg(target_family = "unix")]
-static PYTHON_DIRECT_STDIN_SIDEBAND_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests {
@@ -2541,6 +2561,15 @@ mod tests {
             &active,
             Some(PythonReadlineState::Primary)
         ));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_protocol_stdin_matching_accepts_pty_normalized_and_raw_cr() {
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\n'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\r'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\n', b'\n'));
+        assert!(!protocol_stdin_byte_matches_runtime(b'\n', b'\r'));
     }
 
     #[test]

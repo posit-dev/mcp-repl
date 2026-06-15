@@ -105,3 +105,35 @@ cat("RENVIRON=", Sys.getenv("MCP_REPL_RENVIRON_TEST"), "\n", sep = "")
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_server_spawns_with_plain_pager_env() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+cat("PAGER=", Sys.getenv("PAGER"), "\n", sep = "")
+cat("MANPAGER=", Sys.getenv("MANPAGER"), "\n", sep = "")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("r_startup backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("PAGER=cat"),
+        "expected PAGER=cat in test server environment, got: {text:?}"
+    );
+    assert!(
+        text.contains("MANPAGER=cat"),
+        "expected MANPAGER=cat in test server environment, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}

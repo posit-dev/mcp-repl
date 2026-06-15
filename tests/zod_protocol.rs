@@ -811,8 +811,81 @@ async fn zod_worker_readline_input_mismatch_is_protocol_error() -> TestResult<()
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("readline_input text does not match active stdin"),
-        "expected readline_input accounting protocol error, got: {text:?}"
+        text.contains("readline_input_bytes bytes does not match active stdin"),
+        "expected readline_input_bytes accounting protocol error, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_split_utf8_byte_accounting_completes_request() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-split-utf8-tail\né\n",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("split-tail bytes: [195, 169]"),
+        "expected split UTF-8 tail bytes to be accounted, got: {text:?}"
+    );
+    assert!(
+        !text.contains("<<repl status: busy") && !text.contains("worker protocol error"),
+        "split UTF-8 byte accounting should complete cleanly, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_old_readline_input_frame_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "old-readline-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid worker sideband JSON") && text.contains("readline_input"),
+        "expected old readline_input frame to be rejected, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_old_readline_discard_frame_is_protocol_error() -> TestResult<()> {
+    let session = spawn_zod_server().await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "old-readline-discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("invalid worker sideband JSON") && text.contains("readline_discard"),
+        "expected old readline_discard frame to be rejected, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -1232,6 +1305,67 @@ async fn zod_worker_interrupt_discards_buffered_tail_before_follow_up() -> TestR
     assert!(
         !text.contains("SHOULD_NOT_RUN"),
         "expected buffered pre-interrupt tail to be discarded, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_discards_split_utf8_buffer_bytes() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_server_with_env_and_extra_args(
+        Vec::new(),
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "read-one-byte-then-discard-on-interrupt 1000\né",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected timeout busy status, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}after split discard",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&interrupted);
+    assert!(
+        text.contains("after split discard\n"),
+        "expected follow-up tail to run after split UTF-8 discard, got: {text:?}"
+    );
+    assert!(
+        !text.contains("worker protocol error"),
+        "split UTF-8 discard should account raw bytes, got: {text:?}"
+    );
+    assert!(
+        !text.contains("new session started"),
+        "split UTF-8 discard should not restart the worker, got: {text:?}"
+    );
+
+    let spawn_count = latest_debug_events(&debug_dir)?
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "split UTF-8 discard should not replace the worker"
     );
 
     session.cancel().await?;

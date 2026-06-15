@@ -8,3 +8,4 @@ mcp-repl-startup.log
 .agents
 tools/drain-*
 prompts/*
+WORKPAD.md

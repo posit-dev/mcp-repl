@@ -2415,6 +2415,66 @@ async fn python_input_roundtrip() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_accepts_crlf_buffered_line() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut prompt_text = result_text(
+        &session
+            .write_stdin_raw_with("x = input('p> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&prompt_text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&prompt_text) {
+            sleep(Duration::from_millis(50)).await;
+            prompt_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&prompt_text) {
+        eprintln!("python_input_accepts_crlf_buffered_line remained busy before prompt; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        prompt_text.contains("p> "),
+        "expected input prompt before CRLF answer, got: {prompt_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("hello\r\nprint('got', x)\r\n", Some(5.0))
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("got hello") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        eprintln!("python_input_accepts_crlf_buffered_line remained busy after answer; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("worker protocol error"),
+        "expected CRLF input to be accounted without protocol errors, got: {text:?}"
+    );
+    assert!(
+        text.contains("got hello"),
+        "expected input() to consume buffered CRLF line, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_original_stdout_flushes_before_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
