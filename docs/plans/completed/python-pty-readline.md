@@ -9,9 +9,8 @@ continuation state, or emulate Python stdin semantics.
 
 ## Summary
 
-- Move the embedded Python worker to PTY-backed C stdin/stdout on Unix and
-  unsandboxed Windows so CPython takes the `PyOS_ReadlineFunctionPointer` path
-  for supported interactive input.
+- Move the embedded Python worker to PTY-backed C stdin/stdout on Unix so CPython
+  takes the `PyOS_ReadlineFunctionPointer` path for supported interactive input.
 - Keep sideband IPC separate from PTY traffic, with the server continuing to
   write normalized request bytes to worker stdin, consume sideband facts, capture
   visible output, and finalize replies generically.
@@ -26,7 +25,7 @@ continuation state, or emulate Python stdin semantics.
 ## Status
 
 - State: completed
-- Last updated: 2026-05-20
+- Last updated: 2026-05-15
 - Current phase: complete
 - Driving initiative: move embedded Python to PTY-backed CPython readline
 - Final slice: current-state documentation and PTY output contract
@@ -37,9 +36,8 @@ continuation state, or emulate Python stdin semantics.
   sideband protocol feature.
 - Keep the explicit pipe-vs-PTY launch abstraction.
 - Keep PTY transport independent from sideband IPC.
-- Run embedded Python with C stdin, stdout, and stderr attached to a PTY where
-  the platform launch supports it so CPython sees TTY streams and calls
-  `PyOS_ReadlineFunctionPointer`.
+- Run embedded Unix Python with C stdin, stdout, and stderr attached to a PTY so
+  CPython sees TTY streams and calls `PyOS_ReadlineFunctionPointer`.
 - Keep the PTY launch implementation platform-specific where sandbox launch
   semantics require it: Unix can allocate the PTY before sandbox exec, while
   Windows sandbox mode must attach ConPTY to the restricted child itself.
@@ -53,11 +51,10 @@ control flow while keeping the server's request handling interpreter-neutral.
 
 ## Diff Size Note
 
-This branch originally looked like a large addition because it kept
-transitional pipe-backed compatibility scaffolding while adding the PTY path.
-Sandboxed Windows Python now creates ConPTY inside the restricted wrapper, so
-the remaining broad stdin interception and protocol compatibility code should
-be deleted instead of carried forward.
+This branch can look like a large addition because it keeps transitional
+pipe-backed and non-Unix compatibility scaffolding while adding the Unix PTY
+path. After Windows ConPTY support lands, the previous broad stdin interception
+and protocol compatibility code should be deleted instead of carried forward.
 
 ## Long-Term Direction
 
@@ -131,10 +128,10 @@ route.
 
 ## Remaining Follow-Up
 
-- Sandboxed Windows Python still has a pipe-backed compatibility path. A future
-  Windows wrapper ConPTY slice should attach ConPTY inside the restricted child
-  launch boundary, then revisit whether the remaining Python-side stdin bridges
-  can be removed.
+- Non-Unix Python still has a pipe-backed compatibility path. A future Windows
+  ConPTY slice should decide whether to write Ctrl-C through ConPTY input, use
+  console control events for the restricted child, or keep a Python-side
+  interrupt notification for the blocked readline case.
 - If future ordering work needs stricter input-delivery coordination, it should
   preserve the current boundary: sideband facts describe observed runtime events;
   the server must not parse Python prompts from visible PTY output.
@@ -203,7 +200,3 @@ route.
   supported PTY path leaves CPython's `sys.stdin`, `open`, `os.read`,
   `os.readv`, and `io.FileIO` surfaces intact; request-completion accounting
   remains tied to `PyOS_ReadlineFunctionPointer`.
-- 2026-05-20: Added unsandboxed Windows ConPTY launch for built-in Python,
-  keeping sideband named pipes separate from PTY traffic and using
-  sideband-aware direct-stdin bridges only on Windows so CRLF and console reads
-  remain accountably tied to active MCP input.

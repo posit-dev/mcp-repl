@@ -1,4 +1,6 @@
-#[cfg(all(test, any(target_family = "unix", target_family = "windows")))]
+#[cfg(any(target_family = "unix", test))]
+use base64::Engine as _;
+#[cfg(all(test, target_family = "unix"))]
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
@@ -28,7 +30,7 @@ use crate::ipc::{
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
-use crate::ipc::{IpcHandlers, IpcOutputImage};
+use crate::ipc::{IpcHandlers, IpcPlotImage};
 #[cfg(test)]
 use crate::output_capture::OutputRange;
 use crate::output_capture::{
@@ -39,7 +41,9 @@ use crate::output_capture::{
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
-use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
+use crate::pending_output_tape::{
+    FormattedPendingOutput, PendingOutputTape, PendingSidebandKind, PendingTextSource,
+};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate,
     prepare_worker_command_with_managed_network,
@@ -51,72 +55,34 @@ use crate::sandbox_cli::{
 };
 use crate::stdin_payload::prepare_worker_stdin_payload;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
-#[cfg(target_family = "windows")]
-use crate::windows_pty_filter::WindowsPtyOutputFilter;
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
-#[cfg(target_family = "windows")]
-use portable_pty::ExitStatus as WorkerExitStatus;
 #[cfg(target_family = "unix")]
 use portable_pty::{PtySize, native_pty_system};
-#[cfg(target_family = "windows")]
-use std::ffi::{OsStr, OsString};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_family = "windows")]
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
-#[cfg(target_family = "windows")]
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::AsRawHandle;
 #[cfg(target_family = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{
-    COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent,
-    HPCON,
-};
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
-#[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
-};
-
-#[cfg(not(target_family = "windows"))]
-type WorkerChild = Child;
-#[cfg(not(target_family = "windows"))]
-type WorkerExitStatus = std::process::ExitStatus;
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
     static TEST_UNIX_KILL_RECORDER: RefCell<Option<Vec<(i32, i32)>>> = const { RefCell::new(None) };
-}
-
-#[cfg(all(test, target_family = "windows"))]
-thread_local! {
-    static TEST_WINDOWS_CTRL_EVENT_RECORDER: RefCell<Option<TestWindowsCtrlEventRecorder>> = const { RefCell::new(None) };
-}
-
-#[cfg(all(test, target_family = "windows"))]
-struct TestWindowsCtrlEventRecorder {
-    result: i32,
-    events: Vec<(u32, u32)>,
 }
 
 #[cfg(target_family = "unix")]
@@ -133,22 +99,6 @@ fn raw_unix_kill(target: i32, signal: i32) -> i32 {
     }
 
     unsafe { libc::kill(target, signal) }
-}
-
-#[cfg(target_family = "windows")]
-fn raw_windows_generate_console_ctrl_event(ctrl_event: u32, process_group_id: u32) -> i32 {
-    #[cfg(test)]
-    if let Ok(Some(result)) = TEST_WINDOWS_CTRL_EVENT_RECORDER.try_with(|recorder| {
-        let mut recorder = recorder.borrow_mut();
-        recorder.as_mut().map(|recorder| {
-            recorder.events.push((ctrl_event, process_group_id));
-            recorder.result
-        })
-    }) {
-        return result;
-    }
-
-    unsafe { GenerateConsoleCtrlEvent(ctrl_event, process_group_id) }
 }
 
 #[derive(Debug, Clone)]
@@ -246,16 +196,19 @@ impl LiveOutputCapture {
         }
     }
 
-    fn append_image(&self, image: IpcOutputImage) {
+    fn append_image(&self, image: IpcPlotImage) {
         if image.updates_previous_image {
             self.output_timeline.append_text_event(
                 PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
                 false,
                 ContentOrigin::Server,
-                None,
+                Some(image.readline_results_seen),
             );
             if let Some(tape) = &self.pending_output_tape {
-                tape.append_stdout_status_event(PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(), 0);
+                tape.append_stdout_status_event(
+                    PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
+                    image.readline_results_seen,
+                );
             }
         }
         self.output_timeline.append_image(
@@ -263,10 +216,16 @@ impl LiveOutputCapture {
             image.mime_type.clone(),
             image.data.clone(),
             image.is_new,
-            0,
+            image.readline_results_seen,
         );
         if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(image.id, image.mime_type, image.data, image.is_new, 0);
+            tape.append_image(
+                image.id,
+                image.mime_type,
+                image.data,
+                image.is_new,
+                image.readline_results_seen,
+            );
         }
     }
 
@@ -329,10 +288,6 @@ trait BackendDriver: Send {
         prepare_worker_stdin_payload(text)
     }
 
-    fn prepare_stdin_write_payload(&self, payload: &[u8]) -> Vec<u8> {
-        payload.to_vec()
-    }
-
     fn on_input_start(
         &mut self,
         text: &str,
@@ -348,13 +303,17 @@ trait BackendDriver: Send {
         oversized_output: OversizedOutputMode,
         pending_input: Option<&str>,
     ) -> bool;
+    fn should_write_stdin_payload(&self) -> bool {
+        true
+    }
+    fn clear_active_turn(&mut self) {}
     fn wait_for_completion(
         &mut self,
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
-    fn wait_worker_ready(
+    fn refresh_backend_info(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
@@ -369,8 +328,71 @@ impl RBackendDriver {
     }
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
+fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    ipc.begin_request();
+    if let Some(message) = ipc.take_protocol_error() {
+        return Err(WorkerError::Protocol(message));
+    }
+    Ok(())
+}
+
+#[cfg_attr(target_family = "unix", allow(dead_code))]
+fn driver_announce_stdin_write(
+    byte_len: usize,
+    line_count: usize,
+    final_prompt: Option<String>,
+    ipc: &ServerIpcConnection,
+) -> Result<(), WorkerError> {
+    ipc.send(ServerToWorkerIpcMessage::StdinWrite {
+        byte_len,
+        line_count,
+        final_prompt,
+    })
+    .map_err(WorkerError::Io)
+}
+
+fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
+        .map_err(WorkerError::Io)
+}
+
+fn driver_wait_for_stdin_write_ack(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_stdin_write_ack(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before accepting stdin".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before worker accepted stdin".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn driver_wait_for_python_interrupt_ack(
+    ipc: &ServerIpcConnection,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    match ipc.wait_for_python_interrupt_ack(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before cleaning up interrupt".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before worker cleaned up interrupt".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
-const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
@@ -390,38 +412,63 @@ fn driver_wait_for_completion(
     }
 }
 
-fn driver_wait_for_python_interrupt_ack(
-    ipc: &ServerIpcConnection,
+fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
+    if let Some(ipc) = process.ipc.get() {
+        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
+    }
+    process.send_interrupt()
+}
+
+#[cfg_attr(target_family = "unix", allow(dead_code))]
+fn driver_refresh_backend_info(
+    ipc: ServerIpcConnection,
     timeout: Duration,
+    timeout_is_ok: bool,
 ) -> Result<(), WorkerError> {
-    match ipc.wait_for_python_interrupt_ack(timeout) {
-        Ok(()) => Ok(()),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before Python interrupt cleanup completed".to_string(),
+    match ipc.wait_for_backend_info(timeout) {
+        Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
+        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
+            {
+                return Err(WorkerError::Protocol(format!(
+                    "unsupported worker protocol {} version {}",
+                    protocol.name, protocol.version
+                )));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(WorkerError::Protocol(
+            "unexpected ipc message while waiting for backend info".to_string(),
         )),
+        Err(IpcWaitError::Timeout) => {
+            if timeout_is_ok {
+                Ok(())
+            } else {
+                Err(WorkerError::Protocol(
+                    "timed out waiting for backend info".to_string(),
+                ))
+            }
+        }
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected before Python interrupt cleanup completed".to_string(),
+            "ipc disconnected while waiting for backend info".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before backend info".to_string(),
         )),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
 }
 
-fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc.get() {
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
-    }
-
-    process.send_interrupt()
-}
-
-fn driver_wait_worker_ready(
+fn driver_refresh_worker_ready(
     ipc: ServerIpcConnection,
     timeout: Duration,
 ) -> Result<(), WorkerError> {
-    match ipc.wait_for_worker_ready(timeout) {
+    match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker" || protocol.version != 1 {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
+            {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
                     protocol.name, protocol.version
@@ -445,7 +492,43 @@ fn driver_wait_worker_ready(
     }
 }
 
+fn driver_refresh_custom_worker_ready(
+    ipc: ServerIpcConnection,
+    timeout: Duration,
+) -> Result<u32, WorkerError> {
+    match ipc.wait_for_backend_info(timeout) {
+        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+            if protocol.name != "mcp-repl-worker"
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+            {
+                return Err(WorkerError::Protocol(format!(
+                    "unsupported worker protocol {} version {}",
+                    protocol.name, protocol.version
+                )));
+            }
+            Ok(protocol.version)
+        }
+        Ok(_) => Err(WorkerError::Protocol(
+            "expected worker_ready before user input".to_string(),
+        )),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
+            "timed out waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before worker_ready".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 impl BackendDriver for RBackendDriver {
+    fn prepare_input_text(&self, text: String) -> String {
+        normalize_input_newlines(&text)
+    }
+
     fn on_input_start(
         &mut self,
         _text: &str,
@@ -483,111 +566,354 @@ impl BackendDriver for RBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc.get() {
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt);
+            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
         }
         process.send_r_interrupt()
     }
 
-    fn wait_worker_ready(
+    fn refresh_backend_info(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_wait_worker_ready(ipc, timeout)
+        driver_refresh_worker_ready(ipc, timeout)
     }
 }
 
-struct ProtocolBackendDriver {
-    #[cfg_attr(not(target_family = "windows"), allow(dead_code))]
-    stdin_transport: WorkerStdinTransport,
-    stdin_accounting: ProtocolStdinAccounting,
-    python_request_generation: Option<u64>,
-}
+#[cfg(not(target_family = "unix"))]
+struct PythonBackendDriver;
 
-#[derive(Clone, Copy)]
-enum ProtocolStdinAccounting {
-    Payload,
-    NormalizeNewlines,
-    ExternalWorker,
-}
-
-impl ProtocolBackendDriver {
-    fn new(
-        stdin_transport: WorkerStdinTransport,
-        stdin_accounting: ProtocolStdinAccounting,
-    ) -> Self {
-        Self {
-            stdin_transport,
-            stdin_accounting,
-            python_request_generation: None,
-        }
-    }
-
-    fn python(
-        stdin_transport: WorkerStdinTransport,
-        stdin_accounting: ProtocolStdinAccounting,
-    ) -> Self {
-        Self {
-            stdin_transport,
-            stdin_accounting,
-            python_request_generation: Some(0),
-        }
-    }
-
-    fn next_python_request_generation(&mut self) -> Option<u64> {
-        let generation = self.python_request_generation.as_mut()?;
-        *generation = generation.wrapping_add(1);
-        Some(*generation)
+#[cfg(not(target_family = "unix"))]
+impl PythonBackendDriver {
+    fn new() -> Self {
+        Self
     }
 }
 
-impl BackendDriver for ProtocolBackendDriver {
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        let payload = match self.stdin_accounting {
-            ProtocolStdinAccounting::NormalizeNewlines => {
-                prepare_worker_stdin_payload(&normalize_input_newlines(text))
+#[cfg(not(target_family = "unix"))]
+fn python_final_prompt_hint(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    if python_requires_continuation(text) {
+        return Some("... ".to_string());
+    }
+    if text_ends_with_blank_line(text) {
+        return None;
+    }
+    let text = text.trim_end_matches(['\r', '\n']);
+    let last_line = text.rsplit(['\n', '\r']).next().unwrap_or(text);
+    let has_previous_line = text.contains(['\n', '\r']);
+    let trimmed_last = last_line.trim_end();
+    let code_last = python_line_code_before_comment(trimmed_last).trim_end();
+    if code_last.ends_with(':')
+        || code_last.trim_start().starts_with('@')
+        || (has_previous_line && python_has_open_block_suite(text))
+    {
+        Some("... ".to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn python_has_open_block_suite(text: &str) -> bool {
+    let mut block_indents = Vec::new();
+    let mut scan_state = PythonLineScanState::default();
+    for line in text.lines() {
+        let code = python_line_code_before_comment_with_state(line, &mut scan_state);
+        let code = code.trim_end();
+        if code.trim().is_empty() {
+            if line.trim().is_empty() && !scan_state.continuation_active() {
+                block_indents.clear();
             }
-            ProtocolStdinAccounting::Payload | ProtocolStdinAccounting::ExternalWorker => {
-                prepare_worker_stdin_payload(text)
-            }
-        };
-        #[cfg(target_family = "windows")]
+            continue;
+        }
+        let indent = python_line_indent(line);
+        while block_indents
+            .last()
+            .is_some_and(|block_indent| indent <= *block_indent)
         {
-            if matches!(self.stdin_transport, WorkerStdinTransport::Pty)
-                && matches!(
-                    self.stdin_accounting,
-                    ProtocolStdinAccounting::ExternalWorker
-                )
-            {
-                return windows_pty_accounting_payload(&payload);
-            }
+            block_indents.pop();
         }
-        payload
+        if code.ends_with(':') {
+            block_indents.push(indent);
+        }
+    }
+    !block_indents.is_empty()
+}
+
+#[cfg(not(target_family = "unix"))]
+#[derive(Default)]
+struct PythonLineScanState {
+    quote: Option<(char, bool)>,
+    escaped: bool,
+    groups: Vec<char>,
+}
+
+#[cfg(not(target_family = "unix"))]
+impl PythonLineScanState {
+    fn continuation_active(&self) -> bool {
+        self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn python_line_code_before_comment_with_state(
+    line: &str,
+    state: &mut PythonLineScanState,
+) -> String {
+    let mut code = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((_, ch)) = chars.next() {
+        if let Some((delimiter, triple)) = state.quote {
+            if triple {
+                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
+                    state.quote = None;
+                }
+                continue;
+            }
+
+            if state.escaped {
+                state.escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                state.escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                state.quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => break,
+            '\'' | '"' => {
+                let triple = take_next_two_indexed(&mut chars, ch);
+                state.quote = Some((ch, triple));
+            }
+            '(' => {
+                state.groups.push(')');
+                code.push(ch);
+            }
+            '[' => {
+                state.groups.push(']');
+                code.push(ch);
+            }
+            '{' => {
+                state.groups.push('}');
+                code.push(ch);
+            }
+            ')' | ']' | '}' if state.groups.last() == Some(&ch) => {
+                state.groups.pop();
+                code.push(ch);
+            }
+            ')' | ']' | '}' => {
+                code.push(ch);
+            }
+            _ => code.push(ch),
+        }
     }
 
-    fn prepare_stdin_write_payload(&self, payload: &[u8]) -> Vec<u8> {
-        #[cfg(target_family = "windows")]
-        {
-            if matches!(self.stdin_transport, WorkerStdinTransport::Pty) {
-                return windows_pty_input_payload(payload);
+    if state.quote.is_some_and(|(_, triple)| !triple) {
+        state.quote = None;
+        state.escaped = false;
+    }
+    code
+}
+
+#[cfg(not(target_family = "unix"))]
+fn python_line_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count()
+}
+
+#[cfg(not(target_family = "unix"))]
+fn python_line_code_before_comment(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    let mut quote: Option<(char, bool)> = None;
+    let mut escaped = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some((delimiter, triple)) = quote {
+            if triple {
+                if ch == delimiter && take_next_two_indexed(&mut chars, delimiter) {
+                    quote = None;
+                }
+                continue;
             }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
         }
-        payload.to_vec()
+
+        match ch {
+            '#' => return &line[..idx],
+            '\'' | '"' => {
+                let triple = take_next_two_indexed(&mut chars, ch);
+                quote = Some((ch, triple));
+            }
+            _ => {}
+        }
     }
 
+    line
+}
+
+#[cfg(not(target_family = "unix"))]
+fn python_requires_continuation(text: &str) -> bool {
+    has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn final_line_continues_with_backslash(text: &str) -> bool {
+    let Some(line) = text.lines().last() else {
+        return false;
+    };
+    python_line_code_before_comment(line)
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\\')
+        .count()
+        % 2
+        == 1
+}
+
+#[cfg(not(target_family = "unix"))]
+fn has_unclosed_python_group_or_string(text: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<(char, bool)> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some((delimiter, triple)) = quote {
+            if triple {
+                if ch == delimiter && take_next_two(&mut chars, delimiter) {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '#' => {
+                for next in chars.by_ref() {
+                    if matches!(next, '\n' | '\r') {
+                        break;
+                    }
+                }
+            }
+            '\'' | '"' => {
+                let triple = take_next_two(&mut chars, ch);
+                quote = Some((ch, triple));
+            }
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ')' | ']' | '}' if stack.last() == Some(&ch) => {
+                stack.pop();
+            }
+            ')' | ']' | '}' => {}
+            _ => {}
+        }
+    }
+
+    match quote {
+        Some((_, true)) => true,
+        Some((_, false)) => false,
+        None => !stack.is_empty(),
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
+    let mut clone = chars.clone();
+    if clone.next() != Some(expected) || clone.next() != Some(expected) {
+        return false;
+    }
+    chars.next();
+    chars.next();
+    true
+}
+
+#[cfg(not(target_family = "unix"))]
+fn take_next_two_indexed(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    expected: char,
+) -> bool {
+    let mut clone = chars.clone();
+    if clone.next().map(|(_, ch)| ch) != Some(expected)
+        || clone.next().map(|(_, ch)| ch) != Some(expected)
+    {
+        return false;
+    }
+    chars.next();
+    chars.next();
+    true
+}
+
+#[cfg(not(target_family = "unix"))]
+fn text_ends_with_blank_line(text: &str) -> bool {
+    let Some(text) = strip_one_line_ending(text) else {
+        return false;
+    };
+    text.ends_with('\n') || text.ends_with('\r')
+}
+
+#[cfg(not(target_family = "unix"))]
+fn strip_one_line_ending(text: &str) -> Option<&str> {
+    text.strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .or_else(|| text.strip_suffix('\r'))
+}
+
+#[cfg(not(target_family = "unix"))]
+impl BackendDriver for PythonBackendDriver {
     fn on_input_start(
         &mut self,
-        _text: &str,
+        text: &str,
         payload: &[u8],
         ipc: &ServerIpcConnection,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<(), WorkerError> {
-        let _ = self.next_python_request_generation();
-        ipc.begin_request_with_stdin(payload);
-        if let Some(message) = ipc.take_protocol_error() {
-            return Err(WorkerError::Protocol(message));
-        }
-        Ok(())
+        driver_on_input_start(text, ipc)?;
+        let line_count = payload.iter().filter(|byte| **byte == b'\n').count();
+        let final_prompt = python_final_prompt_hint(text);
+        driver_announce_stdin_write(payload.len(), line_count, final_prompt, ipc)?;
+        driver_wait_for_stdin_write_ack(ipc, timeout)
+    }
+
+    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        driver_announce_stdin_write_complete(ipc)
     }
 
     fn should_settle_output_after_timeout(
@@ -607,25 +933,216 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(request_generation) = self.python_request_generation {
-            if let Some(ipc) = process.ipc.get()
-                && ipc
-                    .send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
-                    .is_ok()
-            {
-                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
-            }
-            return process.send_interrupt();
-        }
         driver_interrupt(process)
     }
 
-    fn wait_worker_ready(
+    fn refresh_backend_info(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_wait_worker_ready(ipc, timeout)
+        driver_refresh_backend_info(ipc, timeout, false)
+    }
+}
+
+struct ProtocolBackendDriver {
+    #[cfg(target_family = "unix")]
+    python_request_generation: Option<u64>,
+    protocol_version: Option<u32>,
+    next_turn_id: u64,
+    active_turn_id: Option<u64>,
+}
+
+impl ProtocolBackendDriver {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_family = "unix")]
+            python_request_generation: None,
+            protocol_version: None,
+            next_turn_id: 1,
+            active_turn_id: None,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn python() -> Self {
+        Self {
+            python_request_generation: Some(0),
+            protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
+            next_turn_id: 1,
+            active_turn_id: None,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn next_python_request_generation(&mut self) -> Option<u64> {
+        let generation = self.python_request_generation.as_mut()?;
+        *generation = generation.wrapping_add(1);
+        Some(*generation)
+    }
+
+    fn is_v3(&self) -> bool {
+        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_VERSION)
+    }
+
+    fn uses_builtin_stdin_adapter(&self) -> bool {
+        #[cfg(target_family = "unix")]
+        {
+            self.python_request_generation.is_some()
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            false
+        }
+    }
+
+    fn next_turn_id(&mut self) -> u64 {
+        let turn_id = self.next_turn_id;
+        self.next_turn_id = self.next_turn_id.wrapping_add(1).max(1);
+        turn_id
+    }
+}
+
+impl BackendDriver for ProtocolBackendDriver {
+    fn on_input_start(
+        &mut self,
+        text: &str,
+        payload: &[u8],
+        ipc: &ServerIpcConnection,
+        timeout: Duration,
+    ) -> Result<(), WorkerError> {
+        if self.is_v3() {
+            if let Some(message) = ipc.take_protocol_error() {
+                return Err(WorkerError::Protocol(message));
+            }
+            let turn_id = self.next_turn_id();
+            ipc.begin_turn(turn_id);
+            match ipc.send_with_timeout(
+                ServerToWorkerIpcMessage::TurnStart {
+                    turn_id,
+                    input: text.to_string(),
+                },
+                timeout,
+            ) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(WorkerError::Timeout(timeout));
+                }
+                Err(err) => return Err(WorkerError::Io(err)),
+            }
+            self.active_turn_id = Some(turn_id);
+            if let Some(message) = ipc.take_protocol_error() {
+                return Err(WorkerError::Protocol(message));
+            }
+            return Ok(());
+        }
+
+        if !self.uses_builtin_stdin_adapter() {
+            return Err(WorkerError::Protocol(
+                "custom workers must speak worker protocol version 3".to_string(),
+            ));
+        }
+
+        ipc.begin_request_with_stdin(payload);
+        #[cfg(not(target_family = "unix"))]
+        let _ = timeout;
+        #[cfg(target_family = "unix")]
+        if let Some(request_generation) = self.next_python_request_generation() {
+            // Built-in Unix Python reads request bytes through the worker stdin fd
+            // like a protocol worker, but its plot hooks still need a Python-side
+            // request boundary before follow-up stdin is consumed. The generation
+            // also lets a late interrupt avoid draining fd 0 after the next request
+            // has started. Custom protocol workers do not receive this private
+            // bridge message.
+            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart {
+                request_generation,
+                stdin_b64: base64::engine::general_purpose::STANDARD.encode(payload),
+            })
+            .map_err(WorkerError::Io)?;
+            driver_wait_for_stdin_write_ack(ipc, timeout)?;
+        }
+        if let Some(message) = ipc.take_protocol_error() {
+            return Err(WorkerError::Protocol(message));
+        }
+        Ok(())
+    }
+
+    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        if self.python_request_generation.is_some() {
+            driver_announce_stdin_write_complete(ipc)?;
+        }
+        #[cfg(not(target_family = "unix"))]
+        let _ = ipc;
+        Ok(())
+    }
+
+    fn should_settle_output_after_timeout(
+        &self,
+        _oversized_output: OversizedOutputMode,
+        _pending_input: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    fn should_write_stdin_payload(&self) -> bool {
+        !self.is_v3()
+    }
+
+    fn clear_active_turn(&mut self) {
+        self.active_turn_id = None;
+    }
+
+    fn wait_for_completion(
+        &mut self,
+        timeout: Duration,
+        ipc: ServerIpcConnection,
+    ) -> Result<CompletionInfo, WorkerError> {
+        let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
+        if matches!(result, Ok(_) | Err(WorkerError::Protocol(_))) {
+            self.active_turn_id = None;
+        }
+        result
+    }
+
+    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
+        if self.is_v3() {
+            if let Some(turn_id) = self.active_turn_id
+                && let Some(ipc) = process.ipc.get()
+            {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                    turn_id: Some(turn_id),
+                })
+                .map_err(WorkerError::Io)?;
+            }
+            return process.send_interrupt();
+        }
+
+        #[cfg(target_family = "unix")]
+        if let Some(request_generation) = self.python_request_generation {
+            if let Some(ipc) = process.ipc.get() {
+                ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
+                    .map_err(WorkerError::Io)?;
+                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
+            }
+            return process.send_interrupt();
+        }
+
+        driver_interrupt(process)
+    }
+
+    fn refresh_backend_info(
+        &mut self,
+        ipc: ServerIpcConnection,
+        timeout: Duration,
+    ) -> Result<(), WorkerError> {
+        #[cfg(target_family = "unix")]
+        if self.python_request_generation.is_some() {
+            return driver_refresh_worker_ready(ipc, timeout);
+        }
+
+        self.protocol_version = Some(driver_refresh_custom_worker_ready(ipc, timeout)?);
+        Ok(())
     }
 }
 
@@ -654,7 +1171,9 @@ impl std::error::Error for WorkerError {
     }
 }
 
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_family = "unix")]
+const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -673,6 +1192,8 @@ const OUTPUT_READER_STOP_DRAIN_GRACE: Duration = Duration::from_millis(50);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt();
     let mut prompt_variants = ipc.take_prompt_history();
+    let mut echo_event_count = ipc.pending_echo_event_count();
+    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -680,18 +1201,25 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt();
         let mut next_prompt_variants = ipc.take_prompt_history();
-        let changed = next_prompt.is_some() || !next_prompt_variants.is_empty();
+        let next_echo_event_count = ipc.pending_echo_event_count();
+        if next_echo_event_count > echo_event_count {
+            saw_late_echo_event = true;
+        }
+        let changed = next_prompt.is_some()
+            || !next_prompt_variants.is_empty()
+            || next_echo_event_count != echo_event_count;
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
+        echo_event_count = next_echo_event_count;
 
         if changed {
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if stable_for >= COMPLETION_METADATA_STABLE {
+            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -770,7 +1298,7 @@ struct CompletionInfo {
 fn completion_info_from_ipc(
     ipc: &ServerIpcConnection,
     session_end_seen: bool,
-    _echo_source: OutputTextSource,
+    echo_source: OutputTextSource,
 ) -> CompletionInfo {
     let (prompt, prompt_variants) = if session_end_seen {
         (None, None)
@@ -779,10 +1307,15 @@ fn completion_info_from_ipc(
         (prompt, Some(prompt_variants))
     };
 
+    let mut echo_events = ipc.take_echo_events();
+    for event in &mut echo_events {
+        event.source = echo_source;
+    }
+
     CompletionInfo {
         prompt,
         prompt_variants,
-        echo_events: Vec::new(),
+        echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
     }
@@ -821,7 +1354,7 @@ fn worker_context_event_payload(
     serde_json::json!({
         "backend": format!("{backend:?}"),
         "worker_launch": worker_launch.label(),
-        "stdin_transport": worker_launch_stdin_transport(worker_launch, sandbox_state).as_str(),
+        "stdin_transport": worker_launch.stdin_transport().as_str(),
         "sandbox_policy": sandbox_policy,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
@@ -832,87 +1365,6 @@ fn worker_context_event_payload(
             "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,
         },
     })
-}
-
-fn worker_launch_stdin_transport(
-    worker_launch: &WorkerLaunch,
-    sandbox_state: &SandboxState,
-) -> WorkerStdinTransport {
-    let default_transport = worker_launch.stdin_transport();
-    #[cfg(target_family = "windows")]
-    if matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python))
-        && sandbox_state.sandbox_policy.requires_sandbox()
-    {
-        return WorkerStdinTransport::Pipe;
-    }
-    #[cfg(not(target_family = "windows"))]
-    let _ = sandbox_state;
-    default_transport
-}
-
-fn builtin_worker_stdin_transport(
-    backend: Backend,
-    sandbox_state: &SandboxState,
-) -> WorkerStdinTransport {
-    worker_launch_stdin_transport(&WorkerLaunch::Builtin(backend), sandbox_state)
-}
-
-#[cfg(target_family = "windows")]
-fn custom_worker_requests_wrapper_conpty(spec: &CustomWorkerSpec, windows_sandboxed: bool) -> bool {
-    windows_sandboxed && matches!(spec.stdin, crate::backend::CustomWorkerStdin::Pty)
-}
-
-#[cfg(target_family = "windows")]
-fn custom_worker_launch_stdin_transport(
-    spec: &CustomWorkerSpec,
-    custom_worker_wrapper_conpty: bool,
-) -> WorkerStdinTransport {
-    if custom_worker_wrapper_conpty {
-        WorkerStdinTransport::Pipe
-    } else {
-        spec.stdin.transport()
-    }
-}
-
-#[cfg(target_family = "windows")]
-fn apply_windows_sandbox_conpty_env(command: &mut Command) {
-    command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
-}
-
-#[cfg(target_family = "windows")]
-fn apply_windows_sandbox_conpty_env_to_pty(command: &mut WindowsPtyCommand) {
-    command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
-}
-
-fn backend_driver_for_launch(
-    worker_launch: &WorkerLaunch,
-    sandbox_state: &SandboxState,
-) -> Box<dyn BackendDriver> {
-    match worker_launch {
-        WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
-        WorkerLaunch::Builtin(Backend::Python) => python_backend_driver(sandbox_state),
-        WorkerLaunch::Custom(spec) => protocol_backend_driver(spec),
-    }
-}
-
-fn protocol_backend_driver(spec: &CustomWorkerSpec) -> Box<dyn BackendDriver> {
-    Box::new(ProtocolBackendDriver::new(
-        spec.stdin.transport(),
-        ProtocolStdinAccounting::ExternalWorker,
-    ))
-}
-
-fn python_backend_driver(sandbox_state: &SandboxState) -> Box<dyn BackendDriver> {
-    let stdin_transport = builtin_worker_stdin_transport(Backend::Python, sandbox_state);
-    let stdin_accounting = if cfg!(target_family = "windows") {
-        ProtocolStdinAccounting::NormalizeNewlines
-    } else {
-        ProtocolStdinAccounting::Payload
-    };
-    Box::new(ProtocolBackendDriver::python(
-        stdin_transport,
-        stdin_accounting,
-    ))
 }
 
 pub struct WorkerManager {
@@ -1012,7 +1464,6 @@ impl WorkerManager {
             reset_last_reply_marker_offset();
             OutputTimeline::new(output_ring)
         };
-        let driver = backend_driver_for_launch(&worker_launch, &sandbox_state);
         Ok(Self {
             exe_path,
             worker_launch: worker_launch.clone(),
@@ -1030,7 +1481,20 @@ impl WorkerManager {
             output: OutputBuffer::default(),
             pager: Pager::default(),
             output_timeline,
-            driver,
+            driver: match worker_launch {
+                WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
+                WorkerLaunch::Builtin(Backend::Python) => {
+                    #[cfg(target_family = "unix")]
+                    {
+                        Box::new(ProtocolBackendDriver::python())
+                    }
+                    #[cfg(not(target_family = "unix"))]
+                    {
+                        Box::new(PythonBackendDriver::new())
+                    }
+                }
+                WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
+            },
             pending_request: false,
             pending_request_started_at: None,
             pending_request_input: None,
@@ -1128,6 +1592,7 @@ impl WorkerManager {
             sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
             sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
             use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
+            use_legacy_landlock: None,
         };
         crate::event_log::log(
             "worker_local_inherit_bootstrap",
@@ -1769,6 +2234,7 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let _ = self.reset_preserving_detached_prefix_item_count();
             return Err(err);
         }
         if self.pending_request {
@@ -1928,6 +2394,8 @@ impl WorkerManager {
         };
 
         if let Some(err) = self.settled_pending_error.take() {
+            let preserve_pager = self.pager.is_active();
+            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
             return Err(err);
         }
         if self.pending_request {
@@ -2234,12 +2702,13 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        let write_payload = self.driver.prepare_stdin_write_payload(&payload);
-        self.process
-            .as_mut()
-            .expect("worker process should be available")
-            .write_stdin_payload(write_payload, remaining)?;
-        self.driver.on_input_written(&ipc)?;
+        if self.driver.should_write_stdin_payload() {
+            self.process
+                .as_mut()
+                .expect("worker process should be available")
+                .write_stdin_payload(payload, remaining)?;
+            self.driver.on_input_written(&ipc)?;
+        }
         Ok(RequestState {
             timeout: worker_timeout,
             started_at,
@@ -2747,7 +3216,8 @@ impl WorkerManager {
         while start.elapsed() < total {
             thread::sleep(poll);
             let now = self.pending_output_tape.current_settle_state();
-            if !ready && (now.has_image || now.sideband_events_seen > baseline.sideband_events_seen)
+            if !ready
+                && (now.has_image || now.readline_results_seen > baseline.readline_results_seen)
             {
                 ready = true;
                 stable_for = Duration::from_millis(0);
@@ -3367,7 +3837,7 @@ impl WorkerManager {
     fn reset(&mut self) -> Result<(), WorkerError> {
         crate::event_log::log("worker_reset_begin", serde_json::json!({}));
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
+            let _ = process.kill();
         }
         if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
@@ -3394,7 +3864,7 @@ impl WorkerManager {
             }),
         );
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
+            let _ = process.kill();
         }
         if self.missing_inherited_sandbox_state() {
             return Err(WorkerError::Sandbox(
@@ -3616,6 +4086,7 @@ impl WorkerManager {
         if !preserve_detached_output {
             self.pending_request_input = None;
         }
+        self.driver.clear_active_turn();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -3686,6 +4157,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
+        self.driver.clear_active_turn();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -3872,7 +4344,6 @@ impl WorkerManager {
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
-        self.driver = backend_driver_for_launch(&self.worker_launch, &self.sandbox_state);
         let process = WorkerProcess::spawn(
             self.worker_launch.clone(),
             &self.exe_path,
@@ -3891,7 +4362,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.wait_worker_ready(ipc, WORKER_READY_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -3961,7 +4432,6 @@ impl WorkerManager {
         self.ensure_managed_network_proxy()?;
         #[cfg(target_os = "windows")]
         let prepared_windows_launch = self.ensure_windows_sandbox_launch()?;
-        self.driver = backend_driver_for_launch(&self.worker_launch, &self.sandbox_state);
         let process = WorkerProcess::spawn(
             self.worker_launch.clone(),
             &self.exe_path,
@@ -3980,7 +4450,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.wait_worker_ready(ipc, WORKER_READY_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -4198,6 +4668,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
+                self.driver.clear_active_turn();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
@@ -4227,6 +4698,7 @@ impl WorkerManager {
     fn clear_pending_request_state(&mut self) {
         self.pending_request = false;
         self.pending_request_started_at = None;
+        self.driver.clear_active_turn();
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -5330,16 +5802,14 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
 }
 
 struct WorkerProcess {
-    child: WorkerChild,
+    child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
-    #[cfg(target_family = "windows")]
-    _pty_conpty: Option<WindowsConPty>,
     expected_exit: bool,
-    exit_status: Option<WorkerExitStatus>,
+    exit_status: Option<std::process::ExitStatus>,
     #[cfg(target_family = "unix")]
     guardrail_stop: Arc<AtomicBool>,
     #[cfg(target_family = "unix")]
@@ -5361,13 +5831,11 @@ enum StdinCommand {
 }
 
 struct SpawnedWorker {
-    child: WorkerChild,
+    child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
-    #[cfg(target_family = "windows")]
-    pty_conpty: Option<WindowsConPty>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -5376,177 +5844,18 @@ struct SpawnedWorkerStdio {
     stdin_tx: mpsc::Sender<StdinCommand>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
-    #[cfg(target_family = "windows")]
-    pty_conpty: Option<WindowsConPty>,
 }
 
 struct SpawnedCommand {
-    child: WorkerChild,
-    #[cfg(any(target_family = "unix", target_family = "windows"))]
+    child: Child,
+    #[cfg(target_family = "unix")]
     pty_stdio: Option<SpawnedPtyStdio>,
 }
 
-#[cfg(target_family = "windows")]
-enum WorkerChild {
-    Process(Child),
-    Pty(WindowsPtyChild),
-}
-
-#[cfg(target_family = "windows")]
-impl WorkerChild {
-    fn from_process(child: Child) -> Self {
-        Self::Process(child)
-    }
-
-    fn from_pty(child: WindowsPtyChild) -> Self {
-        Self::Pty(child)
-    }
-
-    fn as_process_mut(&mut self) -> Option<&mut Child> {
-        match self {
-            Self::Process(child) => Some(child),
-            Self::Pty(_) => None,
-        }
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<WorkerExitStatus>> {
-        match self {
-            Self::Process(child) => portable_pty::Child::try_wait(child),
-            Self::Pty(child) => child.try_wait(),
-        }
-    }
-
-    fn wait(&mut self) -> std::io::Result<WorkerExitStatus> {
-        match self {
-            Self::Process(child) => portable_pty::Child::wait(child),
-            Self::Pty(child) => child.wait(),
-        }
-    }
-
-    fn kill(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Process(child) => child.kill(),
-            Self::Pty(child) => child.kill(),
-        }
-    }
-
-    fn process_id(&self) -> Option<u32> {
-        match self {
-            Self::Process(child) => Some(child.id()),
-            Self::Pty(child) => child.process_id(),
-        }
-    }
-}
-
-#[cfg(target_family = "windows")]
-struct WindowsPtyChild {
-    process: HANDLE,
-    process_id: u32,
-}
-
-#[cfg(target_family = "windows")]
-unsafe impl Send for WindowsPtyChild {}
-
-#[cfg(target_family = "windows")]
-impl WindowsPtyChild {
-    fn try_wait(&mut self) -> std::io::Result<Option<WorkerExitStatus>> {
-        let mut status = 0u32;
-        let ok = unsafe { GetExitCodeProcess(self.process, &mut status) };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if status == windows_sys::Win32::Foundation::STILL_ACTIVE as u32 {
-            let wait = unsafe { WaitForSingleObject(self.process, 0) };
-            if wait == WAIT_FAILED {
-                return Err(std::io::Error::last_os_error());
-            }
-            if wait == WAIT_TIMEOUT {
-                return Ok(None);
-            }
-        }
-        Ok(Some(WorkerExitStatus::with_exit_code(status)))
-    }
-
-    fn wait(&mut self) -> std::io::Result<WorkerExitStatus> {
-        loop {
-            match self.try_wait()? {
-                Some(status) => return Ok(status),
-                None => {
-                    let wait = unsafe { WaitForSingleObject(self.process, INFINITE) };
-                    if wait == WAIT_FAILED {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-            }
-        }
-    }
-
-    fn kill(&mut self) -> std::io::Result<()> {
-        let ok = unsafe { TerminateProcess(self.process, 1) };
-        if ok == 0 {
-            let err = std::io::Error::last_os_error();
-            if self.try_wait()?.is_some() {
-                return Ok(());
-            }
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    fn process_id(&self) -> Option<u32> {
-        Some(self.process_id)
-    }
-}
-
-#[cfg(target_family = "windows")]
-impl Drop for WindowsPtyChild {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.process);
-        }
-    }
-}
-
-#[cfg(not(target_family = "windows"))]
-fn worker_child_from_process(child: Child) -> WorkerChild {
-    child
-}
-
-#[cfg(target_family = "windows")]
-fn worker_child_from_process(child: Child) -> WorkerChild {
-    WorkerChild::from_process(child)
-}
-
-#[cfg(any(target_family = "unix", target_family = "windows"))]
+#[cfg(target_family = "unix")]
 struct SpawnedPtyStdio {
-    #[cfg(target_family = "unix")]
     reader: File,
-    #[cfg(target_family = "windows")]
-    reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
-    #[cfg(target_family = "windows")]
-    _conpty: WindowsConPty,
-}
-
-#[cfg(target_family = "windows")]
-struct WindowsConPty {
-    hpc: HPCON,
-    input_read: HANDLE,
-    output_write: HANDLE,
-}
-
-#[cfg(target_family = "windows")]
-unsafe impl Send for WindowsConPty {}
-
-#[cfg(target_family = "windows")]
-impl Drop for WindowsConPty {
-    fn drop(&mut self) {
-        unsafe {
-            ClosePseudoConsole(self.hpc);
-            CloseHandle(self.input_read);
-            CloseHandle(self.output_write);
-        }
-    }
 }
 
 struct WorkerSpawnContext<'a> {
@@ -5617,14 +5926,13 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
+        let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
             stdin_tx,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match &worker_launch {
@@ -5675,12 +5983,22 @@ impl WorkerProcess {
                         text.is_continuation,
                     );
                 })),
-                on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
+                on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
                 })),
                 on_readline_start: Some(Arc::new(move |prompt: String| {
                     sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
                 })),
+                on_readline_result: {
+                    let sideband_capture = live_output.clone();
+                    Some(Arc::new(move |event: IpcEchoEvent| {
+                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                            prompt: event.prompt,
+                            line: event.line,
+                            echo_source: readline_echo_source,
+                        });
+                    }))
+                },
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
@@ -5693,15 +6011,15 @@ impl WorkerProcess {
                 .connect(ipc.clone(), handlers)
                 .map_err(WorkerError::Io)?;
             #[cfg(target_family = "windows")]
-            {
-                let connect_result = ipc_server.connect(
+            handle_windows_ipc_connect_result(
+                ipc_server.connect(
                     ipc.clone(),
                     handlers,
-                    || child.try_wait().map(|status| status.is_some()),
+                    &mut child,
                     WINDOWS_IPC_CONNECT_MAX_WAIT,
-                );
-                handle_windows_ipc_connect_result(connect_result, &mut child)?;
-            }
+                ),
+                &mut child,
+            )?;
         }
 
         #[cfg(target_family = "unix")]
@@ -5715,8 +6033,6 @@ impl WorkerProcess {
             ipc,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            _pty_conpty: pty_conpty,
             expected_exit: false,
             exit_status: None,
             #[cfg(target_family = "unix")]
@@ -5786,38 +6102,6 @@ impl WorkerProcess {
                 python_executable,
             );
         }
-        #[cfg(target_os = "windows")]
-        if matches!(backend, Backend::Python) && prepared_windows_launch.is_some() {
-            command.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
-        }
-        #[cfg(target_family = "windows")]
-        let mut pty_command = {
-            let mut builder = WindowsPtyCommand::new(&prepared.program);
-            builder.args(&prepared.args);
-            for (key, value) in prepared.env.iter() {
-                builder.env(key, value);
-            }
-            builder.env(
-                crate::backend::INTERPRETER_ENV,
-                match backend {
-                    Backend::R => "r",
-                    Backend::Python => "python",
-                },
-            );
-            if matches!(backend, Backend::Python)
-                && let Some(python_executable) =
-                    std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
-            {
-                builder.env(
-                    crate::python_session::PYTHON_EXECUTABLE_ENV,
-                    python_executable,
-                );
-            }
-            if matches!(backend, Backend::Python) && prepared_windows_launch.is_some() {
-                builder.env(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV, "1");
-            }
-            builder
-        };
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -5833,24 +6117,18 @@ impl WorkerProcess {
         })?;
         #[cfg(target_family = "windows")]
         {
-            command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
-            command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
-            pty_command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
-            pty_command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
+            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
-        #[cfg(target_family = "windows")]
-        apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
-        let stdin_transport = builtin_worker_stdin_transport(backend, sandbox_state);
+        let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
         let child_result = spawn_command_with_transport(
             &mut command,
             stdin_transport,
             !matches!(backend, Backend::Python),
-            #[cfg(target_family = "windows")]
-            Some(pty_command),
         );
         #[cfg(target_family = "unix")]
         {
@@ -5861,11 +6139,11 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
+            #[cfg(target_family = "unix")]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
-            maybe_report_sandbox_exec_failure(&prepared.program, &status)?;
+            maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
                 "worker process exited immediately with status {status}"
             )));
@@ -5875,12 +6153,10 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            pty_conpty,
         } = attach_spawned_worker_stdio(
             &mut child,
             stdin_transport,
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
+            #[cfg(target_family = "unix")]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -5898,8 +6174,6 @@ impl WorkerProcess {
             session_tmpdir,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -5945,37 +6219,12 @@ impl WorkerProcess {
         command.args(&prepared.args);
         command.envs(spec.env.iter());
         command.envs(prepared.env.iter());
-        #[cfg(target_family = "windows")]
-        let custom_worker_wrapper_conpty =
-            custom_worker_requests_wrapper_conpty(spec, prepared_windows_launch.is_some());
-        #[cfg(target_family = "windows")]
-        if custom_worker_wrapper_conpty {
-            apply_windows_sandbox_conpty_env(&mut command);
-        }
         match &spec.working_dir {
             CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit) => {}
             CustomWorkerWorkingDir::Path { path } => {
                 command.current_dir(path);
             }
         }
-        #[cfg(target_family = "windows")]
-        let mut pty_command = {
-            let mut builder = WindowsPtyCommand::new(&prepared.program);
-            builder.args(&prepared.args);
-            for (key, value) in spec.env.iter() {
-                builder.env(key, value);
-            }
-            for (key, value) in prepared.env.iter() {
-                builder.env(key, value);
-            }
-            if custom_worker_wrapper_conpty {
-                apply_windows_sandbox_conpty_env_to_pty(&mut builder);
-            }
-            if let CustomWorkerWorkingDir::Path { path } = &spec.working_dir {
-                builder.cwd(path);
-            }
-            builder
-        };
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {
             WorkerError::Protocol("IPC pipe setup failed; no client fds available".to_string())
@@ -5991,29 +6240,15 @@ impl WorkerProcess {
         })?;
         #[cfg(target_family = "windows")]
         {
-            command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
-            command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
-            pty_command.env(IPC_PIPE_TO_WORKER_ENV, &pipe_to_worker);
-            pty_command.env(IPC_PIPE_FROM_WORKER_ENV, &pipe_from_worker);
+            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
             command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
-        #[cfg(target_family = "windows")]
-        apply_debug_startup_env_to_pty(&mut pty_command, session_tmpdir.as_ref());
-        #[cfg(target_family = "windows")]
-        let stdin_transport =
-            custom_worker_launch_stdin_transport(spec, custom_worker_wrapper_conpty);
-        #[cfg(not(target_family = "windows"))]
         let stdin_transport = spec.stdin.transport();
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
-        let child_result = spawn_command_with_transport(
-            &mut command,
-            stdin_transport,
-            true,
-            #[cfg(target_family = "windows")]
-            Some(pty_command),
-        );
+        let child_result = spawn_command_with_transport(&mut command, stdin_transport, true);
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6023,11 +6258,11 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
+            #[cfg(target_family = "unix")]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
-            maybe_report_sandbox_exec_failure(&prepared.program, &status)?;
+            maybe_report_sandbox_exec_failure(&prepared.program, status)?;
             return Err(WorkerError::Protocol(format!(
                 "worker process exited immediately with status {status}"
             )));
@@ -6037,12 +6272,10 @@ impl WorkerProcess {
             stdin_tx,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            pty_conpty,
         } = attach_spawned_worker_stdio(
             &mut child,
             stdin_transport,
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
+            #[cfg(target_family = "unix")]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -6060,8 +6293,6 @@ impl WorkerProcess {
             session_tmpdir,
             stdout_reader,
             stderr_reader,
-            #[cfg(target_family = "windows")]
-            pty_conpty,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -6113,27 +6344,18 @@ impl WorkerProcess {
         {
             self.send_signal(libc::SIGINT)
         }
-        #[cfg(target_family = "windows")]
-        {
-            self.send_windows_ctrl_break()
-        }
-        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+        #[cfg(not(target_family = "unix"))]
         {
             Ok(())
         }
     }
 
     #[cfg(target_family = "windows")]
-    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
+    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        let Some(process_id) = self.child.process_id() else {
-            return Err(WorkerError::Protocol(
-                "worker process id unavailable for interrupt".to_string(),
-            ));
-        };
-        let ok = raw_windows_generate_console_ctrl_event(CTRL_BREAK_EVENT, process_id);
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
         if ok != 0 {
             return Ok(());
         }
@@ -6142,11 +6364,6 @@ impl WorkerProcess {
             Some(_) => Ok(()),
             None => Err(WorkerError::Io(std::io::Error::last_os_error())),
         }
-    }
-
-    #[cfg(target_family = "windows")]
-    fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
-        self.send_windows_ctrl_break()
     }
 
     #[cfg(not(target_family = "windows"))]
@@ -6240,6 +6457,7 @@ impl WorkerProcess {
 
     fn is_running(&mut self) -> Result<bool, WorkerError> {
         if let Some(status) = self.child.try_wait()? {
+            self.exit_status = Some(status);
             let should_log = !status.success() && !self.expected_exit;
             if should_log {
                 #[cfg(target_family = "unix")]
@@ -6251,7 +6469,6 @@ impl WorkerProcess {
                 #[cfg(not(target_family = "unix"))]
                 eprintln!("worker exited with status {status}");
             }
-            self.exit_status = Some(status);
             return Ok(false);
         }
         Ok(true)
@@ -6344,10 +6561,6 @@ impl WorkerProcess {
         // sideband fds. Backend startup strips the bootstrap env vars, marks the fds
         // close-on-exec, and closes them again in forked children, so EOF should track the root
         // worker lifetime.
-        #[cfg(target_family = "windows")]
-        {
-            let _ = self._pty_conpty.take();
-        }
         if let Some(reader) = self.stdout_reader.take() {
             reader.stop_and_join("worker stdout reader thread panicked")?;
         }
@@ -6581,191 +6794,9 @@ fn apply_debug_startup_env(command: &mut Command, session_tmpdir: Option<&PathBu
     }
 }
 
-#[cfg(target_family = "windows")]
-#[derive(Clone)]
-struct WindowsPtyCommand {
-    program: PathBuf,
-    args: Vec<String>,
-    env: Vec<(OsString, OsString)>,
-    cwd: Option<PathBuf>,
-}
-
-#[cfg(target_family = "windows")]
-impl WindowsPtyCommand {
-    fn new(program: &Path) -> Self {
-        Self {
-            program: program.to_path_buf(),
-            args: Vec::new(),
-            env: Vec::new(),
-            cwd: None,
-        }
-    }
-
-    fn args(&mut self, args: &[String]) {
-        self.args.extend(args.iter().cloned());
-    }
-
-    fn env<K, V>(&mut self, key: K, value: V)
-    where
-        K: AsRef<OsStr>,
-        V: AsRef<OsStr>,
-    {
-        self.env
-            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
-    }
-
-    fn cwd(&mut self, path: &Path) {
-        self.cwd = Some(path.to_path_buf());
-    }
-
-    fn command_line_wide(&self) -> Vec<u16> {
-        let mut command_line = Vec::new();
-        append_windows_quoted_arg(self.program.as_os_str(), &mut command_line);
-        for arg in &self.args {
-            command_line.push(' ' as u16);
-            append_windows_quoted_arg(OsStr::new(arg), &mut command_line);
-        }
-        command_line.push(0);
-        command_line
-    }
-
-    fn environment_block_wide(&self) -> Vec<u16> {
-        let mut entries = std::collections::BTreeMap::<String, (OsString, OsString)>::new();
-        for (key, value) in current_windows_environment() {
-            entries.insert(windows_env_key(&key), (key, value));
-        }
-        for (key, value) in &self.env {
-            entries.insert(windows_env_key(key), (key.clone(), value.clone()));
-        }
-
-        let mut block = Vec::new();
-        for (_normalized, (key, value)) in entries {
-            block.extend(key.encode_wide());
-            block.push('=' as u16);
-            block.extend(value.encode_wide());
-            block.push(0);
-        }
-        block.push(0);
-        block
-    }
-
-    fn cwd_wide(&self) -> Option<Vec<u16>> {
-        self.cwd.as_ref().map(|path| {
-            let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-            wide.push(0);
-            wide
-        })
-    }
-}
-
-#[cfg(target_family = "windows")]
-fn current_windows_environment() -> Vec<(OsString, OsString)> {
-    let block = unsafe { GetEnvironmentStringsW() };
-    if block.is_null() {
-        return std::env::vars_os().collect();
-    }
-
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-    loop {
-        let mut len = 0usize;
-        while unsafe { *block.add(offset + len) } != 0 {
-            len += 1;
-        }
-        if len == 0 {
-            break;
-        }
-        let slice = unsafe { std::slice::from_raw_parts(block.add(offset), len) };
-        if let Some(eq) = environment_entry_separator(slice) {
-            let key = OsString::from_wide(&slice[..eq]);
-            let value = OsString::from_wide(&slice[eq + 1..]);
-            entries.push((key, value));
-        }
-        offset += len + 1;
-    }
-    unsafe {
-        FreeEnvironmentStringsW(block);
-    }
-    entries
-}
-
-#[cfg(target_family = "windows")]
-fn environment_entry_separator(entry: &[u16]) -> Option<usize> {
-    let start = usize::from(entry.first() == Some(&('=' as u16)));
-    entry
-        .iter()
-        .enumerate()
-        .skip(start)
-        .find_map(|(index, ch)| (*ch == '=' as u16).then_some(index))
-}
-
-#[cfg(target_family = "windows")]
-fn windows_env_key(key: &OsStr) -> String {
-    key.to_string_lossy().to_ascii_lowercase()
-}
-
-#[cfg(target_family = "windows")]
-fn append_windows_quoted_arg(arg: &OsStr, command_line: &mut Vec<u16>) {
-    let wide = arg.encode_wide().collect::<Vec<_>>();
-    if !wide.is_empty()
-        && !wide.iter().any(|ch| {
-            *ch == b' ' as u16
-                || *ch == b'\t' as u16
-                || *ch == b'\n' as u16
-                || *ch == 0x0b
-                || *ch == b'"' as u16
-        })
-    {
-        command_line.extend(wide);
-        return;
-    }
-
-    command_line.push('"' as u16);
-    let mut index = 0;
-    while index < wide.len() {
-        let mut backslashes = 0;
-        while index < wide.len() && wide[index] == b'\\' as u16 {
-            index += 1;
-            backslashes += 1;
-        }
-
-        if index == wide.len() {
-            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
-            break;
-        }
-        if wide[index] == b'"' as u16 {
-            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
-        } else {
-            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
-        }
-        command_line.push(wide[index]);
-        index += 1;
-    }
-    command_line.push('"' as u16);
-}
-
-#[cfg(target_family = "windows")]
-fn apply_debug_startup_env_to_pty(
-    command: &mut WindowsPtyCommand,
-    session_tmpdir: Option<&PathBuf>,
-) {
-    if let Some(debug_session_dir) =
-        crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME)
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-    {
-        command.env(crate::debug_logs::DEBUG_SESSION_DIR_ENV, debug_session_dir);
-    }
-    if let Some(tmpdir) = session_tmpdir {
-        command.env(
-            crate::diagnostics::STARTUP_LOG_PATH_ENV,
-            tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
-        );
-    }
-}
-
 fn maybe_report_sandbox_exec_failure(
     _program: &Path,
-    _status: &WorkerExitStatus,
+    _status: std::process::ExitStatus,
 ) -> Result<(), WorkerError> {
     #[cfg(target_os = "macos")]
     {
@@ -6787,8 +6818,8 @@ fn maybe_report_sandbox_exec_failure(
 fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
     match err {
         WorkerError::Protocol(message) => {
-            message.contains("ipc disconnected while waiting for worker_ready")
-                || message.contains("worker session ended before worker_ready")
+            message.contains("ipc disconnected while waiting for backend info")
+                || message.contains("worker session ended before backend info")
                 || message.contains("worker process exited immediately")
         }
         _ => false,
@@ -6982,72 +7013,25 @@ where
     }))
 }
 
-#[cfg(target_family = "windows")]
-fn spawn_blocking_output_reader<R>(
-    stream: Option<R>,
-    output_stream: TextStream,
-    live_output: LiveOutputCapture,
-) -> Result<Option<OutputReader>, WorkerError>
-where
-    R: Read + Send + 'static,
-{
-    let Some(mut stream) = stream else {
-        return Ok(None);
-    };
-    let (done_tx, done_rx) = mpsc::channel();
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let handle = thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        let mut filter = WindowsPtyOutputFilter::default();
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let filtered = filter.filter(&buffer[..n]);
-                    if !filtered.is_empty() {
-                        live_output.append_raw_text(&filtered, output_stream);
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        let _ = done_tx.send(());
-    });
-    Ok(Some(OutputReader {
-        handle,
-        done_rx,
-        stop_requested,
-    }))
-}
-
 fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
     pty_echo: bool,
-    #[cfg(target_family = "windows")] pty_command: Option<WindowsPtyCommand>,
 ) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
-            #[cfg(target_family = "windows")]
-            let _ = pty_command;
             let child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
             Ok(SpawnedCommand {
-                child: worker_child_from_process(child),
-                #[cfg(any(target_family = "unix", target_family = "windows"))]
+                child,
+                #[cfg(target_family = "unix")]
                 pty_stdio: None,
             })
         }
-        WorkerStdinTransport::Pty => spawn_command_with_pty(
-            command,
-            pty_echo,
-            #[cfg(target_family = "windows")]
-            pty_command,
-        ),
+        WorkerStdinTransport::Pty => spawn_command_with_pty(command, pty_echo),
     }
 }
 
@@ -7055,7 +7039,6 @@ fn spawn_command_with_transport(
 fn spawn_command_with_pty(
     command: &mut Command,
     echo: bool,
-    #[cfg(target_family = "windows")] _pty_command: Option<WindowsPtyCommand>,
 ) -> Result<SpawnedCommand, WorkerError> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -7113,32 +7096,7 @@ fn spawn_command_with_pty(
     })
 }
 
-#[cfg(target_family = "windows")]
-fn spawn_command_with_pty(
-    _command: &mut Command,
-    _echo: bool,
-    pty_command: Option<WindowsPtyCommand>,
-) -> Result<SpawnedCommand, WorkerError> {
-    let pty_command = pty_command
-        .ok_or_else(|| WorkerError::Protocol("worker PTY command unavailable".to_string()))?;
-    let WindowsPtySpawn {
-        child,
-        reader,
-        writer,
-        conpty,
-    } = spawn_windows_pty_command(&pty_command)?;
-
-    Ok(SpawnedCommand {
-        child: WorkerChild::from_pty(child),
-        pty_stdio: Some(SpawnedPtyStdio {
-            reader,
-            writer,
-            _conpty: conpty,
-        }),
-    })
-}
-
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+#[cfg(not(target_family = "unix"))]
 fn spawn_command_with_pty(
     _command: &mut Command,
     _echo: bool,
@@ -7177,189 +7135,16 @@ fn configure_pty_slave_echo(fd: libc::c_int, enabled: bool) -> Result<(), Worker
     Ok(())
 }
 
-#[cfg(target_family = "windows")]
-struct WindowsPtySpawn {
-    child: WindowsPtyChild,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
-    conpty: WindowsConPty,
-}
-
-#[cfg(target_family = "windows")]
-fn spawn_windows_pty_command(command: &WindowsPtyCommand) -> Result<WindowsPtySpawn, WorkerError> {
-    let (input_read, input_write) = create_windows_pipe("PTY input")?;
-    let (output_read, output_write) = create_windows_pipe("PTY output")?;
-    let mut hpc: HPCON = 0;
-    let hr = unsafe {
-        CreatePseudoConsole(
-            COORD { X: 4096, Y: 24 },
-            input_read,
-            output_write,
-            0,
-            &mut hpc,
-        )
-    };
-    if hr != 0 {
-        unsafe {
-            CloseHandle(input_read);
-            CloseHandle(input_write);
-            CloseHandle(output_read);
-            CloseHandle(output_write);
-        }
-        return Err(WorkerError::Protocol(format!(
-            "failed to create worker PTY: HRESULT {hr}"
-        )));
-    }
-
-    let conpty = WindowsConPty {
-        hpc,
-        input_read,
-        output_write,
-    };
-    let spawn_result = spawn_windows_pty_process(command, hpc);
-    match spawn_result {
-        Ok(child) => {
-            let reader = unsafe { std::fs::File::from_raw_handle(output_read as _) };
-            let writer = unsafe { std::fs::File::from_raw_handle(input_write as _) };
-            Ok(WindowsPtySpawn {
-                child,
-                reader: Box::new(reader),
-                writer: Box::new(writer),
-                conpty,
-            })
-        }
-        Err(err) => {
-            drop(conpty);
-            unsafe {
-                CloseHandle(input_write);
-                CloseHandle(output_read);
-            }
-            Err(err)
-        }
-    }
-}
-
-#[cfg(target_family = "windows")]
-fn create_windows_pipe(label: &str) -> Result<(HANDLE, HANDLE), WorkerError> {
-    let mut read = std::ptr::null_mut();
-    let mut write = std::ptr::null_mut();
-    let ok = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
-    if ok == 0 {
-        return Err(WorkerError::Io(std::io::Error::new(
-            std::io::Error::last_os_error().kind(),
-            format!(
-                "CreatePipe {label} failed: {}",
-                std::io::Error::last_os_error()
-            ),
-        )));
-    }
-    Ok((read, write))
-}
-
-#[cfg(target_family = "windows")]
-fn spawn_windows_pty_process(
-    command: &WindowsPtyCommand,
-    hpc: HPCON,
-) -> Result<WindowsPtyChild, WorkerError> {
-    let mut startup_info = STARTUPINFOEXW::default();
-    startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-
-    let mut attribute_list_size = 0usize;
-    unsafe {
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_list_size);
-    }
-    let mut attribute_list = vec![0u8; attribute_list_size];
-    let attribute_list_ptr = attribute_list.as_mut_ptr().cast();
-    let ok = unsafe {
-        InitializeProcThreadAttributeList(attribute_list_ptr, 1, 0, &mut attribute_list_size)
-    };
-    if ok == 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    startup_info.lpAttributeList = attribute_list_ptr;
-
-    let update_ok = unsafe {
-        UpdateProcThreadAttribute(
-            startup_info.lpAttributeList,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            hpc as *const std::ffi::c_void,
-            std::mem::size_of::<HPCON>(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if update_ok == 0 {
-        unsafe {
-            DeleteProcThreadAttributeList(startup_info.lpAttributeList);
-        }
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-
-    let mut command_line = command.command_line_wide();
-    let environment = command.environment_block_wide();
-    let cwd = command.cwd_wide();
-    let mut process_info = PROCESS_INFORMATION::default();
-    let ok = unsafe {
-        CreateProcessW(
-            std::ptr::null(),
-            command_line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            windows_pty_creation_flags(),
-            environment.as_ptr().cast(),
-            cwd.as_ref()
-                .map(|wide| wide.as_ptr())
-                .unwrap_or(std::ptr::null()),
-            &startup_info.StartupInfo,
-            &mut process_info,
-        )
-    };
-    unsafe {
-        DeleteProcThreadAttributeList(startup_info.lpAttributeList);
-    }
-    if ok == 0 {
-        return Err(WorkerError::Protocol(format!(
-            "failed to spawn worker PTY child: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    unsafe {
-        CloseHandle(process_info.hThread);
-    }
-    Ok(WindowsPtyChild {
-        process: process_info.hProcess,
-        process_id: process_info.dwProcessId,
-    })
-}
-
-#[cfg(target_family = "windows")]
-fn windows_pty_creation_flags() -> u32 {
-    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP
-}
-
 fn attach_spawned_worker_stdio(
-    child: &mut WorkerChild,
+    child: &mut Child,
     stdin_transport: WorkerStdinTransport,
-    #[cfg(any(target_family = "unix", target_family = "windows"))] pty_stdio: Option<
-        SpawnedPtyStdio,
-    >,
+    #[cfg(target_family = "unix")] pty_stdio: Option<SpawnedPtyStdio>,
     live_output: LiveOutputCapture,
 ) -> Result<SpawnedWorkerStdio, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
-            #[cfg(any(target_family = "unix", target_family = "windows"))]
+            #[cfg(target_family = "unix")]
             let _ = pty_stdio;
-            #[cfg(target_family = "windows")]
-            let child = child.as_process_mut().ok_or_else(|| {
-                WorkerError::Protocol("pipe worker process stdio unavailable".to_string())
-            })?;
             let stdin = child
                 .stdin
                 .take()
@@ -7373,8 +7158,6 @@ fn attach_spawned_worker_stdio(
                 stdin_tx,
                 stdout_reader,
                 stderr_reader,
-                #[cfg(target_family = "windows")]
-                pty_conpty: None,
             })
         }
         WorkerStdinTransport::Pty => {
@@ -7390,32 +7173,9 @@ fn attach_spawned_worker_stdio(
                     stdin_tx,
                     stdout_reader,
                     stderr_reader: None,
-                    #[cfg(target_family = "windows")]
-                    pty_conpty: None,
                 })
             }
-            #[cfg(target_family = "windows")]
-            {
-                let _ = child;
-                let pty_stdio = pty_stdio.ok_or_else(|| {
-                    WorkerError::Protocol("worker PTY stdio unavailable".to_string())
-                })?;
-                let SpawnedPtyStdio {
-                    reader,
-                    writer,
-                    _conpty,
-                } = pty_stdio;
-                let stdin_tx = spawn_windows_pty_stdin_writer(writer);
-                let stdout_reader =
-                    spawn_blocking_output_reader(Some(reader), TextStream::Stdout, live_output)?;
-                Ok(SpawnedWorkerStdio {
-                    stdin_tx,
-                    stdout_reader,
-                    stderr_reader: None,
-                    pty_conpty: Some(_conpty),
-                })
-            }
-            #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+            #[cfg(not(target_family = "unix"))]
             {
                 let _ = child;
                 let _ = live_output;
@@ -7454,90 +7214,6 @@ where
     tx
 }
 
-#[cfg(target_family = "windows")]
-fn spawn_windows_pty_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>
-where
-    W: Write + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel::<StdinCommand>();
-    thread::spawn(move || {
-        let mut writer = std::io::BufWriter::new(stdin);
-        for command in rx {
-            match command {
-                StdinCommand::Write { payload, reply } => {
-                    let result = writer
-                        .write_all(&payload)
-                        .and_then(|_| writer.flush())
-                        .map_err(WorkerError::Io);
-                    let _ = reply.send(result);
-                }
-                StdinCommand::Close { reply } => {
-                    let result = writer.flush().map_err(WorkerError::Io);
-                    let _ = reply.send(result);
-                    break;
-                }
-            }
-        }
-    });
-    tx
-}
-
-#[cfg(target_family = "windows")]
-fn windows_pty_input_payload(payload: &[u8]) -> Vec<u8> {
-    let mut translated = Vec::with_capacity(payload.len());
-    let mut index = 0;
-    while index < payload.len() {
-        match payload[index] {
-            b'\r' => {
-                translated.push(b'\r');
-                if payload.get(index + 1) == Some(&b'\n') {
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            b'\n' => {
-                translated.push(b'\r');
-                index += 1;
-            }
-            byte => {
-                translated.push(byte);
-                index += 1;
-            }
-        }
-    }
-    translated
-}
-
-#[cfg(target_family = "windows")]
-fn windows_pty_accounting_payload(payload: &[u8]) -> Vec<u8> {
-    let mut translated = Vec::with_capacity(payload.len().saturating_mul(2));
-    let mut index = 0;
-    while index < payload.len() {
-        match payload[index] {
-            b'\r' => {
-                translated.push(b'\r');
-                translated.push(b'\n');
-                if payload.get(index + 1) == Some(&b'\n') {
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            b'\n' => {
-                translated.push(b'\r');
-                translated.push(b'\n');
-                index += 1;
-            }
-            byte => {
-                translated.push(byte);
-                index += 1;
-            }
-        }
-    }
-    translated
-}
-
 fn duration_to_millis(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     if millis > u64::MAX as u128 {
@@ -7569,19 +7245,13 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
 #[cfg(target_family = "windows")]
 fn handle_windows_ipc_connect_result(
     connect_result: Result<(), std::io::Error>,
-    child: &mut WorkerChild,
+    child: &mut Child,
 ) -> Result<(), WorkerError> {
     match connect_result {
         Ok(()) => Ok(()),
         // The child here is the sandbox wrapper process. Give it a short grace
         // period to unwind ACL changes before forcing termination/reap.
         Err(err) => {
-            if let Some(status) = child.try_wait()? {
-                return Err(WorkerError::Io(std::io::Error::new(
-                    err.kind(),
-                    format!("{err}; worker exited with status {status}"),
-                )));
-            }
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
             loop {
@@ -7608,7 +7278,7 @@ fn handle_windows_ipc_connect_result(
 }
 
 #[cfg(target_family = "windows")]
-fn request_soft_termination(_child: &mut WorkerChild) -> Result<(), WorkerError> {
+fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
     // The Windows child is the sandbox wrapper. Let it exit naturally so it can
     // roll back temporary ACL state before process teardown.
     Ok(())
@@ -7635,16 +7305,11 @@ fn set_command_arg0(command: &mut Command, arg0: &str) {
 #[cfg(not(target_family = "unix"))]
 fn set_command_arg0(_command: &mut Command, _arg0: &str) {}
 
-fn format_exit_status_message(status: &WorkerExitStatus) -> String {
+fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
     #[cfg(target_family = "unix")]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
         return format!("[repl] worker exited with signal {signal}");
     }
-    #[cfg(target_family = "windows")]
-    {
-        format!("[repl] worker exited with status {}", status.exit_code())
-    }
-    #[cfg(not(target_family = "windows"))]
     match status.code() {
         Some(code) => format!("[repl] worker exited with status {code}"),
         None => "[repl] worker exited with unknown status".to_string(),
@@ -7672,7 +7337,6 @@ mod tests {
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
-    use base64::Engine as _;
     #[cfg(target_os = "linux")]
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -7710,58 +7374,11 @@ mod tests {
         );
     }
 
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_sandboxed_python_reports_wrapper_pipe_transport() {
-        let sandbox_state = SandboxState {
-            sandbox_policy: SandboxPolicy::ReadOnly,
-            ..SandboxState::default()
-        };
-
-        assert_eq!(
-            builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
-            WorkerStdinTransport::Pipe
-        );
-        assert!(
-            matches!(
-                worker_context_event_payload(
-                    &WorkerLaunch::Builtin(Backend::Python),
-                    Backend::Python,
-                    &sandbox_state
-                )
-                .get("stdin_transport")
-                .and_then(serde_json::Value::as_str),
-                Some("pipe")
-            ),
-            "sandboxed Windows Python uses pipe transport to the wrapper; the wrapper owns ConPTY for the restricted child"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_unsandboxed_python_uses_pty_stdin_transport() {
-        let sandbox_state = SandboxState {
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            ..SandboxState::default()
-        };
-
-        assert_eq!(
-            builtin_worker_stdin_transport(Backend::Python, &sandbox_state),
-            WorkerStdinTransport::Pty
-        );
-    }
-
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
             source: OutputTextSource::Ipc,
-        }
-    }
-
-    fn readline_input_bytes(bytes: &[u8]) -> WorkerToServerIpcMessage {
-        WorkerToServerIpcMessage::ReadlineInputBytes {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
     }
 
@@ -7846,7 +7463,7 @@ mod tests {
     fn test_worker_process(child: Child) -> WorkerProcess {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         WorkerProcess {
-            child: worker_child_from_process(child),
+            child,
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
@@ -7866,13 +7483,12 @@ mod tests {
     fn test_worker_process(child: Child) -> WorkerProcess {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         WorkerProcess {
-            child: worker_child_from_process(child),
+            child,
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
             stdout_reader: None,
             stderr_reader: None,
-            _pty_conpty: None,
             expected_exit: false,
             exit_status: None,
         }
@@ -7894,285 +7510,6 @@ mod tests {
         let kills = TEST_UNIX_KILL_RECORDER
             .with(|recorder| recorder.borrow_mut().take().expect("recorded kills"));
         (result, kills)
-    }
-
-    #[cfg(target_family = "windows")]
-    fn capture_recorded_windows_ctrl_events<F, R>(f: F) -> (R, Vec<(u32, u32)>)
-    where
-        F: FnOnce() -> R,
-    {
-        capture_recorded_windows_ctrl_events_with_result(1, f)
-    }
-
-    #[cfg(target_family = "windows")]
-    fn capture_recorded_windows_ctrl_events_with_result<F, R>(
-        result: i32,
-        f: F,
-    ) -> (R, Vec<(u32, u32)>)
-    where
-        F: FnOnce() -> R,
-    {
-        TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
-            assert!(
-                recorder.borrow().is_none(),
-                "did not expect nested Windows ctrl-event recorder"
-            );
-            *recorder.borrow_mut() = Some(TestWindowsCtrlEventRecorder {
-                result,
-                events: Vec::new(),
-            });
-        });
-        let result = f();
-        let events = TEST_WINDOWS_CTRL_EVENT_RECORDER.with(|recorder| {
-            recorder
-                .borrow_mut()
-                .take()
-                .expect("recorded Windows ctrl events")
-                .events
-        });
-        (result, events)
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_creation_flags_create_process_group_for_interrupts() {
-        assert!(
-            windows_pty_creation_flags() & CREATE_NEW_PROCESS_GROUP != 0,
-            "Windows PTY workers must be their own process group so Ctrl-Break can target them"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_generic_interrupt_sends_ctrl_break_to_worker_process_group() {
-        let child = sleeping_test_child();
-        let child_id = child.id();
-        let mut process = test_worker_process(child);
-        let (result, events) = capture_recorded_windows_ctrl_events(|| process.send_interrupt());
-
-        let _ = process.kill();
-
-        assert!(
-            result.is_ok(),
-            "expected Windows interrupt to succeed: {result:?}"
-        );
-        assert_eq!(
-            events,
-            vec![(CTRL_BREAK_EVENT, child_id)],
-            "expected Ctrl-Break to target the worker process group"
-        );
-    }
-
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn unix_protocol_interrupt_sends_sideband_and_sigint() {
-        let child = successful_test_child();
-        let child_id = child.id() as i32;
-        let mut process = test_worker_process(child);
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        process.ipc.set(server);
-        let mut driver =
-            ProtocolBackendDriver::new(WorkerStdinTransport::Pty, ProtocolStdinAccounting::Payload);
-
-        let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
-        let sideband = worker.recv(Some(Duration::from_secs(1)));
-        drop(worker);
-        let _ = process.finish_exited();
-
-        assert!(
-            result.is_ok(),
-            "expected protocol interrupt to succeed: {result:?}"
-        );
-        assert!(
-            matches!(sideband, Some(ServerToWorkerIpcMessage::Interrupt)),
-            "expected protocol interrupt to notify sideband, got: {sideband:?}"
-        );
-        assert_eq!(
-            kills,
-            vec![(-child_id, libc::SIGINT)],
-            "expected Unix protocol interrupt to continue with SIGINT after sideband"
-        );
-    }
-
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn unix_python_interrupt_sends_request_generation_and_sigint() {
-        let child = successful_test_child();
-        let child_id = child.id() as i32;
-        let mut process = test_worker_process(child);
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        process.ipc.set(server.clone());
-        let mut driver = ProtocolBackendDriver::python(
-            WorkerStdinTransport::Pty,
-            ProtocolStdinAccounting::Payload,
-        );
-        driver
-            .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
-            .expect("request start");
-
-        let ack_thread = std::thread::spawn(move || {
-            let sideband = worker.recv(Some(Duration::from_secs(1)));
-            worker
-                .send(WorkerToServerIpcMessage::PythonInterruptAck)
-                .expect("send Python interrupt ack");
-            sideband
-        });
-        let (result, kills) = capture_recorded_unix_kills(|| driver.interrupt(&mut process));
-        let sideband = ack_thread.join().expect("join Python interrupt ack thread");
-        let _ = process.finish_exited();
-
-        assert!(
-            result.is_ok(),
-            "expected Python interrupt to succeed: {result:?}"
-        );
-        assert!(
-            matches!(
-                sideband,
-                Some(ServerToWorkerIpcMessage::PythonInterrupt {
-                    request_generation: 1
-                })
-            ),
-            "expected Python interrupt generation sideband, got: {sideband:?}"
-        );
-        assert_eq!(
-            kills,
-            vec![(-child_id, libc::SIGINT)],
-            "expected Unix Python interrupt to continue with SIGINT after sideband"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_protocol_interrupt_sends_sideband_and_ctrl_break() {
-        let child = sleeping_test_child();
-        let child_id = child.id();
-        let mut process = test_worker_process(child);
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        process.ipc.set(server);
-        let mut driver =
-            ProtocolBackendDriver::new(WorkerStdinTransport::Pty, ProtocolStdinAccounting::Payload);
-        let (result, events) =
-            capture_recorded_windows_ctrl_events(|| driver.interrupt(&mut process));
-        let sideband = worker.recv(Some(Duration::from_secs(1)));
-        drop(worker);
-        process.ipc = IpcHandle::new();
-        let _ = process.kill();
-
-        assert!(
-            result.is_ok(),
-            "expected protocol interrupt to succeed: {result:?}"
-        );
-        assert!(
-            matches!(sideband, Some(ServerToWorkerIpcMessage::Interrupt)),
-            "expected protocol interrupt to notify sideband, got: {sideband:?}"
-        );
-        assert_eq!(
-            events,
-            vec![(CTRL_BREAK_EVENT, child_id)],
-            "expected Windows protocol interrupt to continue with Ctrl-Break after sideband"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_python_interrupt_sends_request_generation_and_ctrl_break() {
-        let child = sleeping_test_child();
-        let child_id = child.id();
-        let mut process = test_worker_process(child);
-        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        process.ipc.set(server.clone());
-        let mut driver = ProtocolBackendDriver::python(
-            WorkerStdinTransport::Pty,
-            ProtocolStdinAccounting::Payload,
-        );
-        driver
-            .on_input_start("1+1\n", b"1+1\n", &server, Duration::from_secs(1))
-            .expect("request start");
-
-        let ack_thread = std::thread::spawn(move || {
-            let sideband = worker.recv(Some(Duration::from_secs(1)));
-            worker
-                .send(WorkerToServerIpcMessage::PythonInterruptAck)
-                .expect("send Python interrupt ack");
-            sideband
-        });
-        let (result, events) =
-            capture_recorded_windows_ctrl_events(|| driver.interrupt(&mut process));
-        let sideband = ack_thread.join().expect("join Python interrupt ack thread");
-        process.ipc = IpcHandle::new();
-        let _ = process.kill();
-
-        assert!(
-            result.is_ok(),
-            "expected Python interrupt to succeed: {result:?}"
-        );
-        assert!(
-            matches!(
-                sideband,
-                Some(ServerToWorkerIpcMessage::PythonInterrupt {
-                    request_generation: 1
-                })
-            ),
-            "expected Python interrupt generation sideband, got: {sideband:?}"
-        );
-        assert_eq!(
-            events,
-            vec![(CTRL_BREAK_EVENT, child_id)],
-            "expected Windows Python interrupt to continue with Ctrl-Break after sideband"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_output_filter_strips_split_conpty_cursor_sequences() {
-        let mut filter = WindowsPtyOutputFilter::default();
-        let mut output = filter.filter(b"\r\nmcp-repl\n\x1b[?25");
-        output.extend(filter.filter(b"l\x1b[15;1H\x1b[?25h>>> "));
-
-        assert_eq!(String::from_utf8(output).unwrap(), "\r\nmcp-repl\n>>> ");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_output_filter_preserves_sgr_sequences() {
-        let mut filter = WindowsPtyOutputFilter::default();
-        let output = filter.filter(b"\x1b[31mred\x1b[0m\n");
-
-        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[31mred\x1b[0m\n");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_output_filter_strips_initial_sgr_reset() {
-        let mut filter = WindowsPtyOutputFilter::default();
-        let output = filter.filter(b"\x1b[mx\n>>> ");
-
-        assert_eq!(String::from_utf8(output).unwrap(), "x\n>>> ");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_output_filter_strips_split_osc_sequences() {
-        let mut filter = WindowsPtyOutputFilter::default();
-        let mut output = filter.filter(b"\x1b]0;mcp");
-        output.extend(filter.filter(b"-repl\x07>>> "));
-
-        assert_eq!(String::from_utf8(output).unwrap(), ">>> ");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_input_payload_translates_crlf_as_one_enter() {
-        assert_eq!(windows_pty_input_payload(b"a\r\nb\nc\rd"), b"a\rb\rc\rd");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_accounting_payload_reports_console_line_endings() {
-        assert_eq!(
-            windows_pty_accounting_payload(b"a\r\nb\nc\rd"),
-            b"a\r\nb\r\nc\r\nd"
-        );
     }
 
     #[test]
@@ -8436,14 +7773,16 @@ mod tests {
     #[test]
     fn completion_infers_nested_waiting_prompt_that_reuses_primary_prompt_text() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"value <- readline(prompt = \"> \")\n");
+        driver_on_input_start("value <- readline(prompt = \"> \")", &server)
+            .expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(readline_input_bytes(
-            b"value <- readline(prompt = \"> \")\n",
-        ));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "value <- readline(prompt = \"> \")\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8452,18 +7791,26 @@ mod tests {
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
                 .expect("expected stable waiting prompt to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(
+            completion.echo_events[0].line,
+            "value <- readline(prompt = \"> \")\n"
+        );
     }
 
     #[test]
     fn completion_infers_stable_waiting_prompt_without_worker_completion_event() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"1+1\n");
+        driver_on_input_start("1+1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(readline_input_bytes(b"1+1\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8473,18 +7820,22 @@ mod tests {
                 .expect("expected stable waiting prompt to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].line, "1+1\n");
     }
 
     #[test]
     fn completion_settle_after_prompt_does_not_count_as_execution_timeout() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"1+1\n");
+        driver_on_input_start("1+1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(readline_input_bytes(b"1+1\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
@@ -8495,17 +7846,21 @@ mod tests {
                 .expect("expected prompt seen before timeout to complete after stable settle");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].line, "1+1\n");
     }
 
     #[test]
     fn completion_infers_stable_continuation_prompt_when_input_is_consumed() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"1+\n");
+        driver_on_input_start("1+\n1", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(readline_input_bytes(b"1+\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
         });
@@ -8517,9 +7872,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_settle_waits_for_late_stdin_accounting() {
+    fn completion_settle_waits_for_late_echo_events() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"1+\n1\n");
+        driver_on_input_start("1+\n1", &server).expect("begin request");
         let prompt = "> ".to_string();
         let delayed_worker = worker.clone();
 
@@ -8529,9 +7884,15 @@ mod tests {
 
         let late_sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(1));
-            let _ = delayed_worker.send(readline_input_bytes(b"1+\n"));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "1+\n".to_string(),
+            });
             thread::sleep(Duration::from_millis(21));
-            let _ = delayed_worker.send(readline_input_bytes(b"1\n"));
+            let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "+ ".to_string(),
+                line: "1\n".to_string(),
+            });
             let _ = delayed_worker.send(WorkerToServerIpcMessage::ReadlineStart {
                 prompt: "> ".to_string(),
             });
@@ -8543,8 +7904,12 @@ mod tests {
         late_sender.join().expect("late sender should join");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 2);
         assert!(completion.protocol_warnings.is_empty());
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "1+\n");
+        assert_eq!(completion.echo_events[1].prompt, "+ ");
+        assert_eq!(completion.echo_events[1].line, "1\n");
     }
 
     #[test]
@@ -8563,7 +7928,13 @@ mod tests {
             "did not expect buffered readline start to complete request, got {early:?}"
         );
 
-        let _ = worker.send(readline_input_bytes(b"1+\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1+\n"),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "+ ".to_string(),
         });
@@ -8575,7 +7946,13 @@ mod tests {
             "did not expect buffered continuation start to complete request, got {continuation:?}"
         );
 
-        let _ = worker.send(readline_input_bytes(b"1\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineInputBytes {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"1\n"),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "+ ".to_string(),
+            line: "1\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -8585,15 +7962,16 @@ mod tests {
                 .expect("expected completion after final unsatisfied prompt");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 2);
+        assert_eq!(completion.echo_events[0].line, "1+\n");
+        assert_eq!(completion.echo_events[1].line, "1\n");
     }
 
     #[test]
-    fn next_request_prompt_is_retained_when_prompt_is_already_active() {
+    fn next_request_result_is_retained_when_prompt_is_already_active() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        server.begin_request_with_stdin(b"first()\n");
-        let _ = worker.send(readline_input_bytes(b"first()\n"));
+        driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -8605,8 +7983,11 @@ mod tests {
         .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
-        server.begin_request_with_stdin(b"second()\n");
-        let _ = worker.send(readline_input_bytes(b"second()\n"));
+        driver_on_input_start("second()", &server).expect("begin request");
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second()\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -8616,18 +7997,23 @@ mod tests {
                 .expect("expected second completion");
 
         assert!(second.protocol_warnings.is_empty());
-        assert!(second.echo_events.is_empty());
+        assert_eq!(second.echo_events.len(), 1);
+        assert_eq!(second.echo_events[0].prompt, "> ");
+        assert_eq!(second.echo_events[0].line, "second()\n");
     }
 
     #[test]
-    fn completion_preserves_prompt_when_next_prompt_arrives_immediately() {
+    fn completion_preserves_echo_events_when_next_prompt_arrives_immediately() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        server.begin_request_with_stdin(b"first()\n");
+        driver_on_input_start("first()", &server).expect("begin request");
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(readline_input_bytes(b"first()\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "first()\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
@@ -8638,21 +8024,27 @@ mod tests {
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "first()\n");
     }
 
     #[test]
-    fn completion_reports_session_end_before_prompt_completion() {
+    fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"quit()\n");
+        driver_on_input_start("quit()", &server).expect("begin request");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(readline_input_bytes(b"quit()\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "quit()\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
-            reason: "runtime_exit".to_string(),
+            reason: None,
             message_b64: None,
+            turn_id: None,
         });
 
         let completion =
@@ -8660,25 +8052,31 @@ mod tests {
                 .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]
     fn completion_reports_session_end_when_prompt_is_also_stable() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_request_with_stdin(b"quit()\n");
+        driver_on_input_start("quit()", &server).expect("begin request");
 
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
-        let _ = worker.send(readline_input_bytes(b"quit()\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "quit()\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: "> ".to_string(),
         });
         thread::sleep(Duration::from_millis(25));
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
-            reason: "runtime_exit".to_string(),
+            reason: None,
             message_b64: None,
+            turn_id: None,
         });
         thread::sleep(Duration::from_millis(25));
 
@@ -8687,7 +8085,9 @@ mod tests {
                 .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert!(completion.echo_events.is_empty());
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]
@@ -8889,18 +8289,20 @@ mod tests {
         .expect("worker manager");
         let mut process = test_worker_process(successful_test_child());
         process.exit_status = Some(process.child.wait().expect("wait test child"));
-        process.ipc.set(server.clone());
+        process.ipc.set(server);
         manager.process = Some(process);
         manager.pending_request = true;
         manager.pending_request_started_at = Some(std::time::Instant::now());
         manager.pending_request_input = Some("quit()\n".to_string());
-        server.begin_request_with_stdin(b"quit()\n");
 
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(readline_input_bytes(b"quit()\n"));
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt,
+            line: "quit()\n".to_string(),
+        });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: ">>> ".to_string(),
         });
@@ -9197,6 +8599,94 @@ mod tests {
             contents_text(&second.detached_prefix_contents),
             "\\xA9\n",
             "expected the next request output to stay split after the detached prefix was sealed"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_preserves_echo_only_input() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected an in-flight files-mode drain to keep the echoed command visible"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+        manager.pending_output_tape.append_stdout_bytes(b"start\n");
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("start\n")],
+            "expected worker output to hide the leading timed-out REPL echo again"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+
+        let context = manager.prepare_input_context_files();
+
+        assert_eq!(
+            context.detached_prefix_contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
         );
     }
 
@@ -9585,12 +9075,13 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
-        capture.append_image(IpcOutputImage {
+        capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
             updates_previous_image: false,
+            readline_results_seen: 0,
         });
         capture.append_sideband(PendingSidebandKind::RequestBoundary);
 
@@ -9621,6 +9112,50 @@ mod tests {
     }
 
     #[test]
+    fn files_output_capture_anchors_update_notice_before_late_echo() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring),
+        );
+
+        capture.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "lines(4:8, 4:8)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
+        });
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: true,
+            readline_results_seen: 1,
+        });
+        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+
+        let contents = tape
+            .drain_final_snapshot()
+            .format_contents_for_reply()
+            .contents;
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
@@ -9633,6 +9168,7 @@ mod tests {
 
         let output_capture = capture.clone();
         let start_capture = capture.clone();
+        let result_capture = capture.clone();
         let image_capture = capture.clone();
         let session_capture = capture.clone();
         let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
@@ -9642,7 +9178,14 @@ mod tests {
             on_readline_start: Some(Arc::new(move |prompt| {
                 start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
             })),
-            on_output_image: Some(Arc::new(move |image| {
+            on_readline_result: Some(Arc::new(move |event| {
+                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                    prompt: event.prompt,
+                    line: event.line,
+                    echo_source: PendingTextSource::Ipc,
+                });
+            })),
+            on_plot_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
             })),
             on_session_end: Some(Arc::new(move || {
@@ -9665,13 +9208,19 @@ mod tests {
             })
             .expect("send stdout output_text");
         worker
-            .send(WorkerToServerIpcMessage::OutputImage {
-                image_id: "plot-1".to_string(),
-                mime_type: "image/png".to_string(),
-                data_b64: "AA==".to_string(),
-                update: false,
+            .send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "plot(1)\n".to_string(),
             })
-            .expect("send output_image");
+            .expect("send readline_result");
+        worker
+            .send(WorkerToServerIpcMessage::PlotImage {
+                mime_type: "image/png".to_string(),
+                data: "AA==".to_string(),
+                is_update: false,
+                source: None,
+            })
+            .expect("send plot_image");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
@@ -9681,8 +9230,9 @@ mod tests {
             .expect("send stderr output_text");
         worker
             .send(WorkerToServerIpcMessage::SessionEnd {
-                reason: "runtime_exit".to_string(),
+                reason: None,
                 message_b64: None,
+                turn_id: None,
             })
             .expect("send session_end");
 
@@ -9691,7 +9241,7 @@ mod tests {
             .expect("server IPC consumed session_end");
 
         let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 5);
+        assert_eq!(snapshot.events.len(), 6);
         assert!(matches!(
             &snapshot.events[0],
             PendingOutputEvent::Sideband {
@@ -9710,15 +9260,22 @@ mod tests {
         ));
         assert!(matches!(
             &snapshot.events[2],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
+                ..
+            } if prompt == "> " && line == "plot(1)\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[3],
             PendingOutputEvent::Image {
                 id,
                 mime_type,
-                readline_results_seen: 0,
+                readline_results_seen: 1,
                 ..
             } if id.starts_with("image-") && mime_type == "image/png"
         ));
         assert!(matches!(
-            &snapshot.events[3],
+            &snapshot.events[4],
             PendingOutputEvent::TextFragment {
                 stream: TextStream::Stderr,
                 origin: ContentOrigin::Worker,
@@ -9727,7 +9284,7 @@ mod tests {
             } if bytes == b"err\n"
         ));
         assert!(matches!(
-            &snapshot.events[4],
+            &snapshot.events[5],
             PendingOutputEvent::Sideband {
                 kind: PendingSidebandKind::SessionEnd,
                 ..
@@ -9753,7 +9310,7 @@ mod tests {
         assert_eq!(image_event.0, b"before\n".len() as u64);
         assert!(image_event.1.starts_with("image-"));
         assert_eq!(image_event.2, "image/png");
-        assert_eq!(*image_event.3, 0);
+        assert_eq!(*image_event.3, 1);
     }
 
     #[test]
@@ -9765,12 +9322,13 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
 
-        capture.append_image(IpcOutputImage {
+        capture.append_image(IpcPlotImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
             is_new: true,
             updates_previous_image: true,
+            readline_results_seen: 1,
         });
         capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
 
@@ -9799,7 +9357,6 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }
@@ -9855,13 +9412,13 @@ mod tests {
         });
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
             false,
         );
 
         assert!(
             retry,
-            "expected worker_ready disconnect to trigger bwrap fallback"
+            "expected backend-info disconnect to trigger bwrap fallback"
         );
         assert!(
             !manager.sandbox_state.use_linux_sandbox_bwrap,
@@ -9911,6 +9468,7 @@ mod tests {
             },
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: Some(true),
+            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_state.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -9925,7 +9483,7 @@ mod tests {
         );
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
             false,
         );
         assert!(retry, "expected startup failure to disable bwrap");
@@ -9939,6 +9497,7 @@ mod tests {
                 "exclude_slash_tmp": false
             },
             "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
         .expect("Codex sandbox metadata");
@@ -9981,6 +9540,7 @@ mod tests {
             },
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_state.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -9995,7 +9555,7 @@ mod tests {
         );
 
         let retry = manager.maybe_retry_spawn_without_linux_bwrap(
-            &WorkerError::Protocol("ipc disconnected while waiting for worker_ready".to_string()),
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
             false,
         );
         assert!(retry, "expected startup failure to disable bwrap");
@@ -10009,6 +9569,7 @@ mod tests {
                 "exclude_slash_tmp": false
             },
             "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
         .expect("Codex sandbox metadata");
@@ -10082,6 +9643,7 @@ mod tests {
                 },
                 sandbox_cwd: Some(writable_root.clone()),
                 use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
             })
             .expect("workspace-write Codex metadata should satisfy deferred refinements");
 
@@ -10135,6 +9697,7 @@ mod tests {
             },
             sandbox_cwd: None,
             use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
         });
         manager.inherited_sandbox_state = Some(inherited_before.clone());
         manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
@@ -10150,6 +9713,7 @@ mod tests {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
                     sandbox_cwd: None,
                     use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
                 },
                 Duration::from_millis(1),
             )
@@ -10346,6 +9910,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
             })
             .expect("initial inherited state");
         let mut process = test_worker_process(successful_test_child());
@@ -10389,6 +9954,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
             })
             .expect("initial inherited state");
         let mut process = test_worker_process(successful_test_child());
@@ -10439,6 +10005,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 sandbox_cwd: Some(sandbox_cwd.clone()),
                 use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
             })
             .expect("initial inherited read-only state");
         let mut process = test_worker_process(successful_test_child());
@@ -10463,6 +10030,7 @@ mod tests {
                     },
                     sandbox_cwd: Some(sandbox_cwd.clone()),
                     use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
                 }),
                 ..WriteStdinOptions::default()
             },
@@ -10483,7 +10051,7 @@ mod tests {
             }
             Err(WorkerError::Protocol(message)) => {
                 assert!(
-                    message.contains("worker_ready") || message.contains("ipc disconnected"),
+                    message.contains("backend info") || message.contains("ipc disconnected"),
                     "expected the failed interrupt-tail respawn attempt to fail during worker startup, got: {message:?}"
                 );
             }
@@ -10554,117 +10122,6 @@ mod tests {
     #[test]
     fn normalize_input_newlines_canonicalizes_crlf_and_cr() {
         assert_eq!(normalize_input_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_custom_pty_driver_reports_console_line_endings_for_accounting() {
-        let spec = CustomWorkerSpec {
-            executable: PathBuf::from("worker.exe"),
-            args: Vec::new(),
-            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
-            env: Default::default(),
-            stdin: crate::backend::CustomWorkerStdin::Pty,
-            sandbox: crate::backend::CustomWorkerSandbox::Server,
-        };
-
-        let driver = protocol_backend_driver(&spec);
-
-        assert_eq!(
-            driver.prepare_input_payload("a\r\nb\rc\n"),
-            b"a\r\nb\r\nc\r\n"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_sandboxed_custom_pty_requests_wrapper_conpty() {
-        let mut spec = CustomWorkerSpec {
-            executable: PathBuf::from("worker.exe"),
-            args: Vec::new(),
-            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
-            env: Default::default(),
-            stdin: crate::backend::CustomWorkerStdin::Pty,
-            sandbox: crate::backend::CustomWorkerSandbox::Server,
-        };
-
-        assert!(custom_worker_requests_wrapper_conpty(&spec, true));
-        assert!(!custom_worker_requests_wrapper_conpty(&spec, false));
-
-        spec.stdin = crate::backend::CustomWorkerStdin::Pipe;
-        assert!(!custom_worker_requests_wrapper_conpty(&spec, true));
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_sandboxed_custom_pty_uses_pipe_transport_to_wrapper() {
-        let mut spec = CustomWorkerSpec {
-            executable: PathBuf::from("worker.exe"),
-            args: Vec::new(),
-            working_dir: CustomWorkerWorkingDir::Policy(CustomWorkerWorkingDirPolicy::Inherit),
-            env: Default::default(),
-            stdin: crate::backend::CustomWorkerStdin::Pty,
-            sandbox: crate::backend::CustomWorkerSandbox::Server,
-        };
-
-        assert_eq!(
-            custom_worker_launch_stdin_transport(&spec, true),
-            WorkerStdinTransport::Pipe,
-            "sandboxed custom PTY workers should use pipe stdio to the wrapper"
-        );
-        assert_eq!(
-            custom_worker_launch_stdin_transport(&spec, false),
-            WorkerStdinTransport::Pty
-        );
-
-        spec.stdin = crate::backend::CustomWorkerStdin::Pipe;
-        assert_eq!(
-            custom_worker_launch_stdin_transport(&spec, true),
-            WorkerStdinTransport::Pipe
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_sandbox_conpty_env_applies_to_process_and_pty_launch() {
-        let mut command = Command::new("worker.exe");
-        let mut pty_command = WindowsPtyCommand::new(Path::new("worker.exe"));
-
-        apply_windows_sandbox_conpty_env(&mut command);
-        apply_windows_sandbox_conpty_env_to_pty(&mut pty_command);
-
-        let envs: std::collections::BTreeMap<_, _> = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().to_string(),
-                    value.map(|value| value.to_string_lossy().to_string()),
-                )
-            })
-            .collect();
-        assert_eq!(
-            envs.get(crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV),
-            Some(&Some("1".to_string()))
-        );
-        assert!(
-            pty_command.env.iter().any(|(key, value)| {
-                key.to_string_lossy() == crate::windows_sandbox::WINDOWS_SANDBOX_CONPTY_ENV
-                    && value.to_string_lossy() == "1"
-            }),
-            "expected PTY launch to ask the sandbox wrapper for child ConPTY"
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_sandboxed_python_driver_normalizes_input_for_wrapper_conpty() {
-        let sandbox_state = SandboxState {
-            sandbox_policy: SandboxPolicy::ReadOnly,
-            ..SandboxState::default()
-        };
-        let driver = python_backend_driver(&sandbox_state);
-
-        assert_eq!(driver.prepare_input_payload("a\r\nb\rc\n"), b"a\nb\nc\n");
     }
 
     #[test]
@@ -10787,11 +10244,10 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_ipc_connect_error_reaps_wrapper_process() {
-        let child = Command::new("powershell.exe")
+        let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn test child process");
-        let mut child = worker_child_from_process(child);
 
         let result = handle_windows_ipc_connect_result(
             Err(std::io::Error::other("ipc connect failed")),
@@ -10817,11 +10273,10 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_soft_termination_does_not_kill_child() {
-        let child = Command::new("powershell.exe")
+        let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn test child process");
-        let mut child = worker_child_from_process(child);
 
         request_soft_termination(&mut child).expect("soft terminate call should succeed");
 
@@ -10833,27 +10288,6 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn windows_pty_child_treats_signaled_still_active_exit_code_as_exited() {
-        use std::os::windows::io::IntoRawHandle;
-
-        let child = Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", "exit 259"])
-            .spawn()
-            .expect("spawn exit-code-259 child process");
-        let process_id = child.id();
-        let process = child.into_raw_handle() as HANDLE;
-        let mut child = WindowsPtyChild {
-            process,
-            process_id,
-        };
-
-        let status = child.wait().expect("wait for exit-code-259 child");
-
-        assert_eq!(status.exit_code(), 259);
     }
 
     #[cfg(target_family = "windows")]

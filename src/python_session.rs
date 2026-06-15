@@ -1,4 +1,4 @@
-#[cfg(windows)]
+#[cfg(target_family = "unix")]
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 #[cfg(target_family = "unix")]
@@ -9,7 +9,7 @@ use std::ptr;
 #[cfg(target_family = "unix")]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use serde::Deserialize;
 
@@ -21,12 +21,7 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FlushConsoleInputBuffer,
-    GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD, KEY_EVENT,
-    ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE, SetConsoleCP, SetConsoleMode,
-    SetConsoleOutputCP,
-};
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
@@ -35,8 +30,6 @@ const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
-#[cfg(windows)]
-const WINDOWS_CONSOLE_LINE_READ_BUFFER_UNITS: usize = 8192;
 const PYTHON_CONFIG_SNIPPET: &str = r#"
 import json
 import sys
@@ -89,15 +82,43 @@ struct PythonRuntimeProbe {
     pythonframeworkinstalldir: String,
 }
 
-pub struct PythonSession;
+#[derive(Debug)]
+pub struct RequestCompleted;
+
+pub struct PythonSession {
+    init: Arc<SessionInit>,
+}
 
 impl PythonSession {
+    pub fn global() -> Result<&'static PythonSession, String> {
+        SESSION
+            .get()
+            .ok_or_else(|| "Python session not initialized".to_string())
+    }
+
     pub fn start_on_current_thread() -> Result<(), String> {
         let init = Arc::new(SessionInit::new());
-        if SESSION.set(PythonSession).is_err() {
+        let session = PythonSession { init: init.clone() };
+        if SESSION.set(session).is_err() {
             return Err("Python session already initialized".to_string());
         }
         run_session_on_current_thread(init)
+    }
+
+    pub fn wait_until_ready(&self) -> Result<(), String> {
+        self.init.wait_ready()
+    }
+
+    pub fn begin_request(
+        &self,
+        byte_len: usize,
+        line_count: usize,
+        fallback_prompt: Option<String>,
+    ) -> Result<mpsc::Receiver<RequestCompleted>, String> {
+        self.wait_until_ready()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        begin_tracked_request(byte_len, line_count, fallback_prompt, reply_tx)?;
+        Ok(reply_rx)
     }
 }
 
@@ -105,7 +126,7 @@ impl PythonSession {
 enum InitState {
     Pending,
     Ready,
-    Failed,
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -128,10 +149,23 @@ impl SessionInit {
         self.cvar.notify_all();
     }
 
-    fn mark_failed(&self, _message: String) {
+    fn mark_failed(&self, message: String) {
         let mut guard = self.state.lock().unwrap();
-        *guard = InitState::Failed;
+        *guard = InitState::Failed(message);
         self.cvar.notify_all();
+    }
+
+    fn wait_ready(&self) -> Result<(), String> {
+        let mut guard = self.state.lock().unwrap();
+        loop {
+            match &*guard {
+                InitState::Pending => {
+                    guard = self.cvar.wait(guard).unwrap();
+                }
+                InitState::Ready => return Ok(()),
+                InitState::Failed(message) => return Err(message.clone()),
+            }
+        }
     }
 }
 
@@ -167,47 +201,16 @@ pub(crate) fn interrupt_request_generation(request_generation: u64) {
 }
 
 fn interrupt_for_request_generation(request_generation: Option<u64>) {
-    #[cfg(target_family = "unix")]
-    if !interrupt_cleanup_belongs_to_current_request(request_generation) {
+    if !interrupt_generation_is_current(request_generation) {
         return;
     }
-    #[cfg(not(target_family = "unix"))]
-    let _ = request_generation;
-
     discard_pending_stdin();
     #[cfg(target_family = "unix")]
     flush_terminal_input();
-    #[cfg(windows)]
-    if windows_stdin_is_console() {
-        flush_terminal_input();
-    } else {
-        finish_active_request_at_next_read();
-    }
-    #[cfg(not(any(target_family = "unix", windows)))]
+    #[cfg(not(target_family = "unix"))]
     finish_active_request_at_next_read();
     mark_interrupt_requested();
     request_platform_interrupt();
-}
-
-#[cfg(target_family = "unix")]
-fn interrupt_cleanup_belongs_to_current_request(request_generation: Option<u64>) -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let guard = state.inner.lock().unwrap();
-    interrupt_cleanup_belongs_to_current_request_locked(&guard, request_generation)
-}
-
-#[cfg(any(test, target_family = "unix"))]
-fn interrupt_cleanup_belongs_to_current_request_locked(
-    guard: &SessionStateInner,
-    request_generation: Option<u64>,
-) -> bool {
-    if !guard.request_active || guard.request_completed_at_stdin_wait {
-        return false;
-    }
-    request_generation
-        .is_none_or(|request_generation| guard.request_generation == request_generation)
 }
 
 #[cfg(target_family = "unix")]
@@ -215,15 +218,24 @@ fn flush_terminal_input() {
     let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
 }
 
-#[cfg(windows)]
-fn flush_terminal_input() {
-    clear_windows_console_drop_next_lf();
-    clear_windows_console_stdin_buffer();
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return;
-    }
-    let _ = unsafe { FlushConsoleInputBuffer(handle) };
+fn interrupt_generation_is_current(request_generation: Option<u64>) -> bool {
+    let Some(request_generation) = request_generation else {
+        return true;
+    };
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let guard = state.inner.lock().unwrap();
+    // Unix Python receives SIGINT out-of-band from the server and an IPC
+    // interrupt message on a separate thread. SIGINT can bring Python back to a
+    // prompt before the IPC thread handles that message; if the next MCP
+    // request has already started, draining fd 0 here would discard the new
+    // request's stdin. Generated Python interrupts are therefore allowed to
+    // clean up only while their original request generation is still current.
+    // The tradeoff is that a very late interrupt stops cleaning old tail bytes
+    // once a later request is accepted; preserving the new request boundary is
+    // the stricter REPL contract.
+    guard.request_generation == request_generation
 }
 
 fn mark_interrupt_requested() {
@@ -253,7 +265,135 @@ fn take_interrupt_requested() -> bool {
     requested
 }
 
-#[cfg_attr(any(target_family = "unix", windows), allow(dead_code))]
+pub(crate) fn mark_stdin_write_complete() {
+    #[cfg(target_family = "unix")]
+    let protocol_input_exhausted = protocol_request_input_exhausted();
+
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut completed = None;
+    let mut prompt = None;
+    {
+        let mut guard = state.inner.lock().unwrap();
+        let current_prompt_from_state = guard.current_prompt.clone();
+        let current_readline_state = guard.current_readline_state;
+        let primary_prompt = guard.python_primary_prompt.clone();
+        let continuation_prompt = guard.python_continuation_prompt.clone();
+        let waiting_for_input = guard.waiting_for_input;
+        #[cfg(target_family = "unix")]
+        if protocol_input_exhausted && guard.active_request.is_none() && waiting_for_input {
+            // Unix protocol-mode Python can reach the next prompt before the IPC
+            // thread observes StdinWriteComplete. In that case the prompt hook
+            // deliberately left the plot gate open because stdin was not yet
+            // accounted; close it here once the explicit write-complete signal
+            // proves the already-emitted prompt is the request boundary.
+            guard.request_active = false;
+        }
+        if let Some(active) = guard.active_request.as_mut() {
+            active.stdin_write_complete = true;
+            let continuation_write_complete =
+                windows_continuation_prompt_write_should_complete(active, current_readline_state);
+            let should_complete = if active.repl_turn_finished {
+                request_repl_turn_should_complete(active)
+            } else {
+                request_prompt_wait_should_complete(active, current_readline_state)
+                    || continuation_write_complete
+            };
+            if (waiting_for_input || continuation_write_complete) && should_complete {
+                let fallback_prompt = if active.repl_turn_finished {
+                    None
+                } else {
+                    active
+                        .fallback_prompt
+                        .as_deref()
+                        .or_else(|| active.started_after_continuation_prompt.then_some(""))
+                };
+                prompt = Some(repl_prompt_for(
+                    current_prompt_from_state.clone(),
+                    fallback_prompt,
+                    current_readline_state,
+                    &primary_prompt,
+                    &continuation_prompt,
+                ));
+                completed = guard.active_request.take();
+            }
+        }
+    }
+
+    if let Some(active) = completed {
+        emit_plots();
+        #[cfg(not(target_family = "unix"))]
+        mark_stdin_wait_prompt_completed_request();
+        // Python object flushes run from handle_input_hook on the Python thread.
+        let prompt = prompt.as_deref().unwrap_or(">>> ");
+        remember_emitted_prompt(prompt);
+        ipc::emit_readline_start(prompt);
+        complete_active_request(state, Some(active), false);
+    }
+}
+
+pub(crate) fn mark_request_started() {
+    mark_request_started_with_generation(None, Vec::new());
+}
+
+pub(crate) fn mark_request_started_for_generation(request_generation: u64, stdin_bytes: Vec<u8>) {
+    mark_request_started_with_generation(Some(request_generation), stdin_bytes);
+}
+
+fn mark_request_started_with_generation(request_generation: Option<u64>, stdin_bytes: Vec<u8>) {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let should_record_background_plots = {
+        let guard = state.inner.lock().unwrap();
+        !guard.request_active || guard.request_completed_at_stdin_wait
+    };
+    if should_record_background_plots {
+        // A stdin-wait prompt closes the MCP request while Python threads can
+        // still mutate matplotlib state. Snapshot those inactive plots before
+        // reopening the gate so a later stdin answer does not flush stale
+        // background figures into its reply. A later explicit plot/show in the
+        // new request still forces a fresh image.
+        record_background_plots();
+    }
+    let mut guard = state.inner.lock().unwrap();
+    if let Some(request_generation) = request_generation {
+        guard.request_generation = request_generation;
+    } else {
+        guard.request_generation = guard.request_generation.wrapping_add(1);
+    }
+    guard.interrupt_requested = false;
+    guard.request_completed_at_stdin_wait = false;
+    guard.request_active = true;
+    #[cfg(target_family = "unix")]
+    {
+        guard.protocol_stdin_bytes = stdin_bytes.into();
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = stdin_bytes;
+    }
+    guard.plot_reset_pending = true;
+}
+
+#[cfg(windows)]
+fn windows_continuation_prompt_write_should_complete(
+    active: &ActiveRequest,
+    _current_readline_state: Option<PythonReadlineState>,
+) -> bool {
+    active.started_after_continuation_prompt && active.line_count == 1
+}
+
+#[cfg(not(windows))]
+fn windows_continuation_prompt_write_should_complete(
+    _active: &ActiveRequest,
+    _current_readline_state: Option<PythonReadlineState>,
+) -> bool {
+    false
+}
+
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn finish_active_request_at_next_read() {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -269,7 +409,13 @@ fn finish_active_request_at_next_read() {
 
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
-    emit_readline_discard_bytes(&drain_process_stdin_pipe());
+    let mut discarded = Vec::new();
+    discarded.extend(drain_process_stdin_pipe());
+    if discarded.is_empty() {
+        return;
+    }
+    let discarded = take_protocol_stdin_bytes_for_runtime_read(&discarded);
+    ipc::emit_readline_discard_bytes(&discarded);
 }
 
 #[cfg(target_family = "unix")]
@@ -342,7 +488,7 @@ impl Drop for NonBlockingFd {
     }
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn request_runtime_stdin_line(prompt: &str) -> bool {
     ipc::emit_readline_start(prompt);
     true
@@ -370,7 +516,11 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 
 #[cfg(target_family = "unix")]
 fn protocol_request_input_exhausted() -> bool {
-    stdin_pending_byte_count() == Some(0)
+    let Some(state) = SESSION_STATE.get() else {
+        return stdin_pending_byte_count() == Some(0);
+    };
+    let guard = state.inner.lock().unwrap();
+    guard.protocol_stdin_bytes.is_empty()
 }
 
 #[cfg(windows)]
@@ -381,7 +531,6 @@ fn discard_pending_stdin() {
             libc::fflush(stdin);
         }
     }
-    emit_readline_discard_bytes(&drain_console_input_bytes());
     drain_stdin_pipe();
 }
 
@@ -445,7 +594,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    crate::diagnostics::startup_log("python-session: runtime config resolved");
     let api = match PythonApi::initialize(&runtime_config.libpython) {
         Ok(api) => api,
         Err(err) => {
@@ -453,7 +601,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    crate::diagnostics::startup_log("python-session: api initialized");
     let thread_state = match initialize_python(api, &runtime_config.executable) {
         Ok(thread_state) => thread_state,
         Err(err) => {
@@ -461,7 +608,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    crate::diagnostics::startup_log("python-session: python initialized");
     if thread_state.is_null() {
         let err = "failed to release initialized Python thread state".to_string();
         init.mark_failed(err.clone());
@@ -474,7 +620,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    crate::diagnostics::startup_log("python-session: stdio opened");
 
     if let Err(err) = configure_python(api) {
         let _gil = GilGuard::acquire();
@@ -482,11 +627,9 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         init.mark_failed(err.clone());
         return Err(err);
     }
-    crate::diagnostics::startup_log("python-session: python configured");
 
     init.mark_ready();
     ipc::emit_worker_ready("python", plot_capable());
-    crate::diagnostics::startup_log("python-session: worker_ready emitted");
 
     let result = run_repl(&runtime);
     let finalize_result = finalize_python(api, thread_state);
@@ -939,7 +1082,6 @@ fn initialize_python(
         }
         api.set_program_name(executable)?;
         api.set_interactive_flags()?;
-        configure_windows_pty_console();
         (api.py_initialize_ex)(1);
         api.install_readline_function(mcp_repl_readline)?;
         let thread_state = (api.py_eval_save_thread)();
@@ -947,120 +1089,6 @@ fn initialize_python(
         Ok(thread_state)
     }
 }
-
-#[cfg(windows)]
-fn take_windows_console_stdin_bytes(max_len: usize) -> Vec<u8> {
-    let mut guard = WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap();
-    let take_len = max_len.min(guard.len());
-    (0..take_len).filter_map(|_| guard.pop_front()).collect()
-}
-
-#[cfg(windows)]
-fn take_windows_console_stdin_line_prefix() -> Vec<u8> {
-    let mut guard = WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap();
-    let mut bytes = Vec::new();
-    while let Some(byte) = guard.pop_front() {
-        bytes.push(byte);
-        if byte == b'\n' {
-            break;
-        }
-    }
-    bytes
-}
-
-#[cfg(windows)]
-fn push_windows_console_stdin_bytes(bytes: &[u8]) {
-    WINDOWS_CONSOLE_STDIN_BYTES
-        .lock()
-        .unwrap()
-        .extend(bytes.iter().copied());
-}
-
-#[cfg(windows)]
-fn drain_windows_console_stdin_buffer() -> Vec<u8> {
-    WINDOWS_CONSOLE_STDIN_BYTES
-        .lock()
-        .unwrap()
-        .drain(..)
-        .collect()
-}
-
-#[cfg(windows)]
-fn clear_windows_console_stdin_buffer() {
-    WINDOWS_CONSOLE_STDIN_BYTES.lock().unwrap().clear();
-}
-
-#[cfg(windows)]
-fn drain_console_input_bytes() -> Vec<u8> {
-    let mut bytes = drain_windows_console_stdin_buffer();
-    bytes.extend(drain_console_input_text().into_bytes());
-    bytes
-}
-
-#[cfg(windows)]
-fn drain_console_input_text() -> String {
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return String::new();
-    }
-
-    let mut text = String::new();
-    loop {
-        let mut available = 0u32;
-        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut available) } == 0 || available == 0 {
-            break;
-        }
-        let to_read = available.min(128);
-        let mut records = vec![INPUT_RECORD::default(); to_read as usize];
-        let mut read = 0u32;
-        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), to_read, &mut read) } == 0
-            || read == 0
-        {
-            break;
-        }
-        for record in records.into_iter().take(read as usize) {
-            if record.EventType != KEY_EVENT as u16 {
-                continue;
-            }
-            let key = unsafe { record.Event.KeyEvent };
-            if key.bKeyDown == 0 {
-                continue;
-            }
-            let raw = unsafe { key.uChar.UnicodeChar };
-            if raw == 0 {
-                continue;
-            }
-            let ch = char::from_u32(raw as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
-            for _ in 0..key.wRepeatCount.max(1) {
-                if ch == '\r' {
-                    text.push('\n');
-                } else {
-                    text.push(ch);
-                }
-            }
-        }
-    }
-    text
-}
-
-#[cfg(windows)]
-fn configure_windows_pty_console() {
-    let _ = unsafe { SetConsoleCP(65001) };
-    let _ = unsafe { SetConsoleOutputCP(65001) };
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return;
-    }
-    let mut mode = 0;
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        return;
-    }
-    let mode = (mode | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) & !ENABLE_ECHO_INPUT;
-    let _ = unsafe { SetConsoleMode(handle, mode) };
-}
-
-#[cfg(not(windows))]
-fn configure_windows_pty_console() {}
 
 fn configure_python(api: &'static PythonApi) -> Result<(), String> {
     let _gil = GilGuard::acquire();
@@ -1129,36 +1157,61 @@ fn finalize_python(
     }
 }
 
-#[cfg(any(target_family = "unix", windows))]
+fn begin_tracked_request(
+    byte_len: usize,
+    line_count: usize,
+    fallback_prompt: Option<String>,
+    reply: mpsc::Sender<RequestCompleted>,
+) -> Result<(), String> {
+    let state = session_state();
+    if line_count == 0 {
+        let _ = reply.send(RequestCompleted);
+        return Ok(());
+    }
+
+    let mut guard = state.inner.lock().unwrap();
+    while guard.active_request.is_some() && !guard.shutdown {
+        guard = state.cvar.wait(guard).unwrap();
+    }
+    if guard.shutdown {
+        return Err("Python session is shutting down".to_string());
+    }
+
+    let skip_next_hook = !guard.waiting_for_input;
+    let started_after_continuation_prompt = guard.last_prompt_was_continuation;
+    guard.waiting_for_input = false;
+    guard.request_generation = guard.request_generation.wrapping_add(1);
+    guard.request_completed_at_stdin_wait = false;
+    guard.active_request = Some(ActiveRequest {
+        reply,
+        byte_len,
+        line_count,
+        fallback_prompt,
+        consumed_lines: 0,
+        skip_next_hook,
+        stdin_write_complete: false,
+        repl_turn_finished: false,
+        started_after_continuation_prompt,
+    });
+    #[cfg(not(target_family = "unix"))]
+    {
+        guard.request_active = true;
+    }
+    guard.plot_reset_pending = true;
+    state.cvar.notify_all();
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
 fn mark_request_input_delivered() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
-    if request_input_should_record_background_plots(state) {
-        record_background_plots();
-    }
     let mut guard = state.inner.lock().unwrap();
-    mark_request_input_delivered_locked(&mut guard);
-}
-
-#[cfg(any(target_family = "unix", windows))]
-fn request_input_should_record_background_plots(state: &Arc<SessionState>) -> bool {
-    let guard = state.inner.lock().unwrap();
-    request_input_should_record_background_plots_locked(&guard)
-}
-
-fn request_input_should_record_background_plots_locked(guard: &SessionStateInner) -> bool {
-    !guard.request_active || guard.request_completed_at_stdin_wait
-}
-
-#[cfg(any(target_family = "unix", windows))]
-fn mark_request_input_delivered_locked(guard: &mut SessionStateInner) {
-    if !guard.request_active || guard.request_completed_at_stdin_wait {
-        guard.request_generation = guard.request_generation.wrapping_add(1);
+    if !guard.request_active {
         guard.plot_reset_pending = true;
     }
     guard.request_active = true;
-    guard.request_completed_at_stdin_wait = false;
     guard.waiting_for_input = false;
 }
 
@@ -1343,7 +1396,6 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
     }
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1357,9 +1409,6 @@ fn request_prompt_wait_should_complete(
     }
     #[cfg(windows)]
     {
-        if !windows_stdin_is_console() {
-            return active.stdin_input_complete && active.consumed_lines >= active.line_count;
-        }
         prompt_can_complete_before_repl_turn(active, current_readline_state)
             && active.byte_len > 0
             && stdin_pending_byte_count() == Some(0)
@@ -1371,7 +1420,6 @@ fn request_prompt_wait_should_complete(
 }
 
 #[cfg(target_family = "unix")]
-#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn prompt_wait_can_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1385,7 +1433,6 @@ fn prompt_wait_can_complete(
 }
 
 #[cfg(target_family = "unix")]
-#[cfg_attr(target_family = "unix", allow(dead_code))]
 fn single_line_client_input_prompt(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1404,9 +1451,6 @@ fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
     }
     #[cfg(windows)]
     {
-        if !windows_stdin_is_console() {
-            return active.stdin_input_complete && active.consumed_lines >= active.line_count;
-        }
         active.line_count == 1 || (active.byte_len > 0 && stdin_pending_byte_count() == Some(0))
     }
     #[cfg(not(any(target_family = "unix", windows)))]
@@ -1428,7 +1472,7 @@ fn prompt_can_complete_before_repl_turn(
 
 #[cfg(target_family = "unix")]
 fn request_input_drained(active: &ActiveRequest) -> bool {
-    if !active.stdin_input_complete || active.byte_len == 0 {
+    if !active.stdin_write_complete || active.byte_len == 0 {
         return false;
     }
     stdin_pending_byte_count() == Some(0)
@@ -1460,15 +1504,6 @@ fn finish_repl_turn_request() {
         }
         if let Some(active) = guard.active_request.as_mut() {
             active.repl_turn_finished = true;
-            #[cfg(windows)]
-            if !windows_stdin_is_console() {
-                active.consumed_lines = active.consumed_lines.saturating_add(1);
-            }
-            #[cfg(windows)]
-            if windows_stdin_is_console() && active.line_count == 1 {
-                active.consumed_lines = active.consumed_lines.max(1);
-            }
-            #[cfg(not(windows))]
             if active.line_count == 1 {
                 active.consumed_lines = active.consumed_lines.max(1);
             }
@@ -1512,9 +1547,7 @@ fn stdin_pending_byte_count() -> Option<usize> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return None;
     }
-    if windows_stdin_is_console() {
-        return None;
-    }
+
     let mut available = 0u32;
     let ok = unsafe {
         PeekNamedPipe(
@@ -1548,44 +1581,40 @@ unsafe extern "C" fn mcp_repl_readline(
     };
     #[cfg(target_family = "unix")]
     if ipc::worker_ipc_disabled_for_process() {
-        return allocate_cpython_readline_buffer(&[]);
+        return allocate_readline_result(&[]);
     }
     set_current_repl_readline_prompt(&prompt_text);
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     let prompt_matches_repl = prompt_matches_python_repl_prompt(&prompt_text);
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     flush_original_stdio();
     #[cfg(target_family = "unix")]
-    if !prompt_has_buffered_answer {
-        mark_stdin_wait_prompt_completed_request();
-    }
-    #[cfg(any(target_family = "unix", windows))]
     request_cpython_readline_stdin_line(&prompt_text);
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     if prompt_has_buffered_answer && !prompt_text.is_empty() && !prompt_matches_repl {
         emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
     }
-    #[cfg(not(any(target_family = "unix", windows)))]
+    #[cfg(not(target_family = "unix"))]
     handle_input_hook();
 
     let read = read_stdio_line_bytes(stdin);
     if read.interrupted {
-        #[cfg(any(target_family = "unix", windows))]
+        #[cfg(target_family = "unix")]
         flush_terminal_input();
     }
-    note_cpython_readline_bytes_read(&prompt_text, &read.bytes);
+    note_cpython_readline_bytes_read(&read.bytes);
     clear_current_readline_prompt();
     if read.interrupted || take_interrupt_requested() {
         PythonApi::global().set_interrupt();
         return ptr::null_mut();
     }
 
-    allocate_cpython_readline_buffer(&read.bytes)
+    allocate_readline_result(&read.bytes)
 }
 
-fn allocate_cpython_readline_buffer(bytes: &[u8]) -> *mut c_char {
+fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
     let api = PythonApi::global();
     let result = unsafe { (api.py_mem_raw_malloc)(bytes.len().saturating_add(1)) }.cast::<c_char>();
     if result.is_null() {
@@ -1598,12 +1627,12 @@ fn allocate_cpython_readline_buffer(bytes: &[u8]) -> *mut c_char {
     result
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn request_cpython_readline_stdin_line(prompt: &str) {
     ipc::emit_readline_start(prompt);
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
@@ -1613,31 +1642,18 @@ fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
 }
 
 #[cfg(target_family = "unix")]
-fn note_cpython_readline_bytes_read(_prompt: &str, bytes: &[u8]) {
+fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
 }
 
-#[cfg(windows)]
-fn note_cpython_readline_bytes_read(prompt: &str, bytes: &[u8]) {
-    if windows_stdin_is_console() {
-        if bytes.is_empty() {
-            return;
-        }
-        emit_readline_input_bytes(bytes);
-        mark_request_input_delivered();
-        note_active_stdin_line_read(bytes);
-    } else {
-        note_windows_prompted_stdin_line_read(prompt, bytes);
-    }
-}
-
-#[cfg(not(any(target_family = "unix", windows)))]
-fn note_cpython_readline_bytes_read(_prompt: &str, bytes: &[u8]) {
+#[cfg(not(target_family = "unix"))]
+fn note_cpython_readline_bytes_read(bytes: &[u8]) {
     note_stdin_line_read(bytes);
 }
 
@@ -1647,11 +1663,6 @@ struct StdioLineRead {
 }
 
 fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
-    #[cfg(windows)]
-    if let Some(read) = read_windows_console_line_bytes() {
-        return read;
-    }
-
     let mut bytes = Vec::new();
     loop {
         let ch = unsafe { libc::fgetc(stdin) };
@@ -1661,20 +1672,6 @@ fn read_stdio_line_bytes(stdin: *mut libc::FILE) -> StdioLineRead {
                 unsafe { clear_stdio_error(stdin) };
             }
             return StdioLineRead { bytes, interrupted };
-        }
-        #[cfg(windows)]
-        if ch == b'\r' as i32 {
-            let next = unsafe { libc::fgetc(stdin) };
-            if next != b'\n' as i32 && next != libc::EOF {
-                unsafe {
-                    libc::ungetc(next, stdin);
-                }
-            }
-            bytes.push(b'\n');
-            return StdioLineRead {
-                bytes,
-                interrupted: false,
-            };
         }
         bytes.push(ch as u8);
         if ch == b'\n' as i32 {
@@ -1828,27 +1825,23 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         prompt_for_sideband.to_str().unwrap_or(""),
         PythonReadlineState::ClientInput,
     );
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     flush_original_stdio();
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
     if !prompt_has_buffered_answer {
         emit_plots();
         mark_stdin_wait_prompt_completed_request();
     }
-    let sideband_prompt = prompt_for_sideband.to_str().unwrap_or("");
-    #[cfg(any(target_family = "unix", windows))]
-    let prompt_delivered_immediately = if cfg!(windows) && prompt_has_buffered_answer {
-        false
-    } else {
-        request_runtime_stdin_line(sideband_prompt)
-    };
-    #[cfg(any(target_family = "unix", windows))]
+    #[cfg(target_family = "unix")]
+    let prompt_delivered_immediately =
+        request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
+    #[cfg(target_family = "unix")]
     if !prompt.is_empty() && (prompt_delivered_immediately || prompt_has_buffered_answer) {
         emit_output_text(TextStream::Stdout, prompt.as_bytes());
     }
-    #[cfg(not(any(target_family = "unix", windows)))]
+    #[cfg(not(target_family = "unix"))]
     {
         flush_original_stdio();
         handle_input_hook();
@@ -1856,12 +1849,9 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     }
     let read = read_stdio_line_bytes_allowing_python_threads(stdin);
     if read.interrupted {
-        #[cfg(any(target_family = "unix", windows))]
+        #[cfg(target_family = "unix")]
         flush_terminal_input();
     }
-    #[cfg(windows)]
-    note_windows_prompted_stdin_line_read(sideband_prompt, &read.bytes);
-    #[cfg(not(windows))]
     note_stdin_line_read(&read.bytes);
     clear_current_readline_prompt();
     if read.interrupted || take_interrupt_requested() {
@@ -1902,214 +1892,7 @@ fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
     bytes
 }
 
-#[cfg(windows)]
-fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
-    if size == 0 {
-        return Vec::new();
-    }
-    let _allow_threads = PythonThreadsAllowed::new();
-    if windows_stdin_is_console() {
-        let bytes = read_windows_console_stdin_bytes(size);
-        note_windows_raw_stdin_bytes_read(&bytes);
-        return bytes;
-    }
-    let bytes = read_windows_stdin_bytes(size);
-    note_windows_raw_stdin_bytes_read(&bytes);
-    bytes
-}
-
-#[cfg(windows)]
-fn read_windows_console_stdin_bytes(size: usize) -> Vec<u8> {
-    let mut bytes = take_windows_console_stdin_bytes(size);
-    while bytes.len() < size {
-        let Some(read) = read_windows_console_line_bytes_uncached() else {
-            break;
-        };
-        if read.bytes.is_empty() {
-            break;
-        }
-        let interrupted = read.interrupted;
-        push_windows_console_stdin_bytes(&read.bytes);
-        bytes.extend(take_windows_console_stdin_bytes(
-            size.saturating_sub(bytes.len()),
-        ));
-        if interrupted {
-            break;
-        }
-    }
-    bytes
-}
-
-#[cfg(windows)]
-fn read_windows_stdin_bytes(size: usize) -> Vec<u8> {
-    if size == 0 {
-        return Vec::new();
-    }
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Vec::new();
-    }
-    let mut bytes = vec![0u8; size.min(u32::MAX as usize)];
-    loop {
-        let mut read = 0u32;
-        let ok = unsafe {
-            ReadFile(
-                handle,
-                bytes.as_mut_ptr().cast(),
-                bytes.len() as u32,
-                &mut read,
-                ptr::null_mut(),
-            )
-        };
-        if ok != 0 {
-            bytes.truncate(read as usize);
-            return bytes;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Vec::new();
-    }
-}
-
-#[cfg(windows)]
-fn read_windows_console_line_bytes() -> Option<StdioLineRead> {
-    if !windows_stdin_is_console() {
-        return None;
-    }
-    let mut bytes = take_windows_console_stdin_line_prefix();
-    if bytes.last() == Some(&b'\n') {
-        return Some(StdioLineRead {
-            bytes,
-            interrupted: false,
-        });
-    }
-    let mut read = read_windows_console_line_bytes_uncached()?;
-    if !bytes.is_empty() {
-        bytes.append(&mut read.bytes);
-        read.bytes = bytes;
-    }
-    Some(read)
-}
-
-#[cfg(windows)]
-fn read_windows_console_line_bytes_uncached() -> Option<StdioLineRead> {
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let mut units = Vec::new();
-    let mut buffer = vec![0u16; WINDOWS_CONSOLE_LINE_READ_BUFFER_UNITS];
-    loop {
-        let mut read = 0u32;
-        let ok = unsafe {
-            ReadConsoleW(
-                handle,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-                &mut read,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let interrupted =
-                std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
-            return Some(StdioLineRead {
-                bytes: String::from_utf16_lossy(&units).into_bytes(),
-                interrupted,
-            });
-        }
-        if read == 0 {
-            return Some(StdioLineRead {
-                bytes: String::from_utf16_lossy(&units).into_bytes(),
-                interrupted: false,
-            });
-        }
-        let read_len = read as usize;
-        for (idx, unit) in buffer.iter().take(read_len).copied().enumerate() {
-            if take_windows_console_drop_next_lf() && unit == 0x0a {
-                continue;
-            }
-            match unit {
-                0x0d => {
-                    if buffer.get(idx + 1).copied() != Some(0x0a) {
-                        set_windows_console_drop_next_lf();
-                    }
-                    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
-                    bytes.push(b'\n');
-                    return Some(StdioLineRead {
-                        bytes,
-                        interrupted: false,
-                    });
-                }
-                0x0a => {
-                    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
-                    bytes.push(b'\n');
-                    return Some(StdioLineRead {
-                        bytes,
-                        interrupted: false,
-                    });
-                }
-                _ => units.push(unit),
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn take_windows_console_drop_next_lf() -> bool {
-    let mut guard = WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap();
-    let drop = *guard;
-    *guard = false;
-    drop
-}
-
-#[cfg(windows)]
-fn set_windows_console_drop_next_lf() {
-    *WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap() = true;
-}
-
-#[cfg(windows)]
-fn clear_windows_console_drop_next_lf() {
-    *WINDOWS_CONSOLE_DROP_NEXT_LF.lock().unwrap() = false;
-}
-
-#[cfg(windows)]
-fn windows_stdin_is_console() -> bool {
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return false;
-    }
-    let mut mode = 0;
-    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
-}
-
-#[cfg(windows)]
-fn note_windows_prompted_stdin_line_read(_prompt: &str, bytes: &[u8]) {
-    if windows_stdin_is_console() {
-        note_stdin_line_read(bytes);
-        return;
-    }
-    if !bytes.is_empty() {
-        emit_readline_input_bytes(bytes);
-        mark_request_input_delivered();
-        note_active_stdin_line_read(bytes);
-    }
-}
-
-#[cfg(windows)]
-fn note_windows_raw_stdin_bytes_read(bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    emit_readline_input_bytes(bytes);
-    mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
-}
-
-#[cfg(not(any(target_family = "unix", windows)))]
+#[cfg(not(target_family = "unix"))]
 fn read_raw_stdin_bytes(_size: usize) -> Vec<u8> {
     Vec::new()
 }
@@ -2137,20 +1920,50 @@ fn read_fd_bytes(fd: libc::c_int, size: usize) -> Vec<u8> {
     }
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn note_stdin_bytes_read(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    emit_readline_input_bytes(bytes);
+    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
+    emit_readline_input_bytes(&protocol_bytes);
     mark_request_input_delivered();
-    note_active_stdin_line_read(bytes);
+    note_active_stdin_line_read(&protocol_bytes);
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
+fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
+    let Some(state) = SESSION_STATE.get() else {
+        return runtime_bytes.to_vec();
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if guard.protocol_stdin_bytes.is_empty() {
+        return runtime_bytes.to_vec();
+    }
+
+    let mut protocol_bytes = Vec::with_capacity(runtime_bytes.len());
+    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
+        return runtime_bytes.to_vec();
+    }
+
+    for (&original_byte, &runtime_byte) in guard.protocol_stdin_bytes.iter().zip(runtime_bytes) {
+        protocol_bytes.push(original_byte);
+        if !protocol_stdin_byte_matches_runtime(original_byte, runtime_byte) {
+            return runtime_bytes.to_vec();
+        }
+    }
+    guard.protocol_stdin_bytes.drain(..protocol_bytes.len());
+    protocol_bytes
+}
+
+#[cfg(target_family = "unix")]
+fn protocol_stdin_byte_matches_runtime(protocol_byte: u8, runtime_byte: u8) -> bool {
+    protocol_byte == runtime_byte || (protocol_byte == b'\r' && runtime_byte == b'\n')
+}
+
+#[cfg(target_family = "unix")]
 fn note_active_stdin_line_read(bytes: &[u8]) {
-    let consumed_lines = consumed_stdin_line_count(bytes);
-    if consumed_lines == 0 {
+    if bytes.is_empty() {
         return;
     }
     let Some(state) = SESSION_STATE.get() else {
@@ -2158,21 +1971,16 @@ fn note_active_stdin_line_read(bytes: &[u8]) {
     };
     let mut guard = state.inner.lock().unwrap();
     if let Some(active) = guard.active_request.as_mut() {
-        active.consumed_lines = active.consumed_lines.saturating_add(consumed_lines);
+        active.consumed_lines = active.consumed_lines.saturating_add(1);
     }
 }
 
-#[cfg(any(target_family = "unix", windows))]
-fn consumed_stdin_line_count(bytes: &[u8]) -> usize {
-    bytes.iter().filter(|byte| **byte == b'\n').count()
-}
-
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn note_stdin_line_read(bytes: &[u8]) {
     note_stdin_bytes_read(bytes);
 }
 
-#[cfg(any(target_family = "unix", windows))]
+#[cfg(target_family = "unix")]
 fn emit_readline_input_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -2180,15 +1988,7 @@ fn emit_readline_input_bytes(bytes: &[u8]) {
     ipc::emit_readline_input_bytes(bytes);
 }
 
-#[cfg(any(target_family = "unix", windows))]
-fn emit_readline_discard_bytes(bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    ipc::emit_readline_discard_bytes(bytes);
-}
-
-#[cfg(not(any(target_family = "unix", windows)))]
+#[cfg(not(target_family = "unix"))]
 fn note_stdin_line_read(_bytes: &[u8]) {}
 
 fn plot_capable() -> bool {
@@ -2306,16 +2106,19 @@ struct SessionStateInner {
     session_end_emitted: bool,
     plot_reset_pending: bool,
     interrupt_requested: bool,
+    #[cfg(target_family = "unix")]
+    protocol_stdin_bytes: VecDeque<u8>,
 }
 
 #[allow(dead_code)]
 struct ActiveRequest {
+    reply: mpsc::Sender<RequestCompleted>,
     byte_len: usize,
     line_count: usize,
     fallback_prompt: Option<String>,
     consumed_lines: usize,
     skip_next_hook: bool,
-    stdin_input_complete: bool,
+    stdin_write_complete: bool,
     repl_turn_finished: bool,
     started_after_continuation_prompt: bool,
 }
@@ -2340,6 +2143,8 @@ impl SessionState {
                 session_end_emitted: false,
                 plot_reset_pending: false,
                 interrupt_requested: false,
+                #[cfg(target_family = "unix")]
+                protocol_stdin_bytes: VecDeque::new(),
             }),
             cvar: Condvar::new(),
         }
@@ -2357,7 +2162,8 @@ fn complete_active_request_with_options(
     active: Option<ActiveRequest>,
     emit_session_end: bool,
 ) {
-    if active.is_some() {
+    if let Some(active) = active {
+        let _ = active.reply.send(RequestCompleted);
         state.cvar.notify_all();
     }
     if emit_session_end {
@@ -2442,8 +2248,8 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
             function: py_request_exit,
         },
         ModuleMethod {
-            name: "emit_output_image",
-            function: py_emit_output_image,
+            name: "emit_plot_image",
+            function: py_emit_plot_image,
         },
         ModuleMethod {
             name: "set_python_prompts",
@@ -2574,13 +2380,13 @@ unsafe extern "C" fn py_request_exit(_self: *mut PyObject, args: *mut PyObject) 
     api.none()
 }
 
-unsafe extern "C" fn py_emit_output_image(
+unsafe extern "C" fn py_emit_plot_image(
     _self: *mut PyObject,
     args: *mut PyObject,
 ) -> *mut PyObject {
     let api = PythonApi::global();
     if api.tuple_size(args) != 4 {
-        set_callback_error("emit_output_image expects exactly four arguments");
+        set_callback_error("emit_plot_image expects exactly four arguments");
         return ptr::null_mut();
     }
     let Some(mime_type) = api.unicode_arg(args, 0) else {
@@ -2600,7 +2406,7 @@ unsafe extern "C" fn py_emit_output_image(
     let Some(source) = api.unicode_arg(args, 3) else {
         return ptr::null_mut();
     };
-    ipc::emit_output_image(&source, &mime_type, &data, is_update == 1);
+    ipc::emit_plot_image(&mime_type, &data, is_update == 1, Some(&source));
     api.none()
 }
 
@@ -2658,10 +2464,6 @@ static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut()
 static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 #[cfg(target_family = "unix")]
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
-#[cfg(windows)]
-static WINDOWS_CONSOLE_DROP_NEXT_LF: Mutex<bool> = Mutex::new(false);
-#[cfg(windows)]
-static WINDOWS_CONSOLE_STDIN_BYTES: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 
 #[cfg(test)]
 mod tests {
@@ -2706,13 +2508,15 @@ mod tests {
         consumed_lines: usize,
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
+        let (reply, _rx) = std::sync::mpsc::channel();
         ActiveRequest {
+            reply,
             byte_len: 1,
             line_count,
             fallback_prompt: fallback_prompt.map(str::to_string),
             consumed_lines,
             skip_next_hook: false,
-            stdin_input_complete: true,
+            stdin_write_complete: true,
             repl_turn_finished: false,
             started_after_continuation_prompt: false,
         }
@@ -2757,6 +2561,15 @@ mod tests {
             &active,
             Some(PythonReadlineState::Primary)
         ));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn unix_protocol_stdin_matching_accepts_pty_normalized_and_raw_cr() {
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\n'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\r'));
+        assert!(protocol_stdin_byte_matches_runtime(b'\n', b'\n'));
+        assert!(!protocol_stdin_byte_matches_runtime(b'\n', b'\r'));
     }
 
     #[test]
@@ -2862,82 +2675,5 @@ mod tests {
         let probe = runtime_probe_for(&python.to_string_lossy());
 
         assert_eq!(resolve_libpython_path(&probe), Some(dll));
-    }
-
-    #[cfg(any(target_family = "unix", windows))]
-    #[test]
-    fn active_stdin_accounting_counts_completed_lines() {
-        assert_eq!(consumed_stdin_line_count(b"partial"), 0);
-        assert_eq!(consumed_stdin_line_count(b"line\n"), 1);
-        assert_eq!(consumed_stdin_line_count(b"first\nsecond\n"), 2);
-    }
-
-    #[cfg(any(target_family = "unix", windows))]
-    #[test]
-    fn delivered_input_reopens_request_after_stdin_wait_completion() {
-        let state = SessionState::new();
-        let mut guard = state.inner.lock().unwrap();
-        guard.request_active = false;
-        guard.request_completed_at_stdin_wait = true;
-        guard.plot_reset_pending = false;
-        guard.waiting_for_input = true;
-
-        mark_request_input_delivered_locked(&mut guard);
-
-        assert!(guard.request_active);
-        assert_eq!(guard.request_generation, 1);
-        assert!(!guard.request_completed_at_stdin_wait);
-        assert!(guard.plot_reset_pending);
-        assert!(!guard.waiting_for_input);
-    }
-
-    #[test]
-    fn late_interrupt_cleanup_does_not_cross_request_boundary() {
-        let state = SessionState::new();
-        let mut guard = state.inner.lock().unwrap();
-
-        guard.request_active = true;
-        guard.request_completed_at_stdin_wait = false;
-        guard.request_generation = 7;
-        assert!(interrupt_cleanup_belongs_to_current_request_locked(
-            &guard, None
-        ));
-        assert!(interrupt_cleanup_belongs_to_current_request_locked(
-            &guard,
-            Some(7)
-        ));
-        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
-            &guard,
-            Some(6)
-        ));
-
-        guard.request_completed_at_stdin_wait = true;
-        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
-            &guard,
-            Some(7)
-        ));
-
-        guard.request_active = false;
-        guard.request_completed_at_stdin_wait = false;
-        assert!(!interrupt_cleanup_belongs_to_current_request_locked(
-            &guard,
-            Some(7)
-        ));
-    }
-
-    #[test]
-    fn delivered_input_records_background_plots_before_reopening_gate() {
-        let state = SessionState::new();
-        let mut guard = state.inner.lock().unwrap();
-
-        guard.request_active = false;
-        guard.request_completed_at_stdin_wait = false;
-        assert!(request_input_should_record_background_plots_locked(&guard));
-
-        guard.request_active = true;
-        assert!(!request_input_should_record_background_plots_locked(&guard));
-
-        guard.request_completed_at_stdin_wait = true;
-        assert!(request_input_should_record_background_plots_locked(&guard));
     }
 }

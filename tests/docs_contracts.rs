@@ -101,41 +101,42 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
-fn worker_sideband_protocol_documents_internal_boundary() {
-    let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
-
-    for required in [
-        "The sideband protocol is an internal contract between the server and the bundled worker implementations.",
-        "It is not a supported extension interface for external workers.",
-        "The protocol version is a server/worker compatibility gate for this repository, not a public stability promise.",
-    ] {
-        assert!(
-            protocol.contains(required),
-            "missing {required} in docs/worker_sideband_protocol.md"
-        );
-    }
-}
-
-#[test]
-fn worker_sideband_protocol_keeps_output_images_one_way() {
+fn worker_sideband_protocol_keeps_plot_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
-        r#"{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }"#,
-        "There is no image acknowledgement message.",
+        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 3 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "turn_start", "turn_id": <integer>, "input": <string> }"#,
+        r#"{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }"#,
+        r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "interrupt", "turn_id": <integer> }"#,
+        "This document defines worker protocol version 3.",
+        "The server rejects other",
+        "The sideband protocol is an internal contract between the server and the",
+        "The protocol version is a server/worker compatibility gate",
+        "There is no plot-image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
+        "Submitted input must not be emitted as `output_text`.",
+        "The server may reconstruct `prompt + text` from ordered `input_line` events",
     ] {
         assert!(
             protocol.contains(required),
             "missing {required} in docs/worker_sideband_protocol.md"
         );
     }
+    assert_contains_wrapped_text(
+        &protocol,
+        "It is not a supported extension interface for external workers.",
+        "docs/worker_sideband_protocol.md",
+    );
 
     for forbidden in [
-        "`plot_image`",
-        "`output_image_ack`",
+        "`plot_image_ack`",
         r#""sequence": <integer|null>"#,
+        "version 2 from built-in and migrating workers",
+        "Legacy v2 image event retained for built-in workers during migration.",
     ] {
         assert!(
             !protocol.contains(forbidden),

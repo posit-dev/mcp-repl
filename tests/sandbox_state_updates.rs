@@ -68,23 +68,33 @@ fn home_env_vars(home_dir: &Path) -> Vec<(String, String)> {
     env_vars
 }
 
-fn linux_sandbox_exe_value() -> Value {
+fn linux_sandbox_exe_value(use_legacy_landlock: bool) -> Value {
     #[cfg(target_os = "linux")]
     {
-        Value::String("/tmp/codex-linux-sandbox".to_string())
+        if use_legacy_landlock {
+            Value::Null
+        } else {
+            Value::String("/tmp/codex-linux-sandbox".to_string())
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = use_legacy_landlock;
         Value::Null
     }
 }
 
-fn codex_sandbox_state_meta(sandbox_policy: Value, sandbox_cwd: &Path) -> Value {
+fn codex_sandbox_state_meta(
+    sandbox_policy: Value,
+    sandbox_cwd: &Path,
+    use_legacy_landlock: bool,
+) -> Value {
     json!({
         SANDBOX_STATE_META_CAPABILITY: {
             "sandboxPolicy": sandbox_policy,
             "sandboxCwd": sandbox_cwd,
-            "codexLinuxSandboxExe": linux_sandbox_exe_value(),
+            "useLegacyLandlock": use_legacy_landlock,
+            "codexLinuxSandboxExe": linux_sandbox_exe_value(use_legacy_landlock),
         }
     })
 }
@@ -99,6 +109,7 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
             "exclude_slash_tmp": false,
         }),
         sandbox_cwd,
+        /*use_legacy_landlock*/ false,
     )
 }
 
@@ -115,11 +126,12 @@ fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
             },
         }),
         sandbox_cwd,
+        /*use_legacy_landlock*/ false,
     )
 }
 
 fn read_only_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd)
+    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
 }
 
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
@@ -131,6 +143,7 @@ fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
             },
         }),
         sandbox_cwd,
+        false,
     )
 }
 
@@ -141,11 +154,12 @@ fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
             "network_access": true,
         }),
         sandbox_cwd,
+        false,
     )
 }
 
 fn full_access_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd)
+    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd, false)
 }
 
 fn encode_path(path: &Path) -> TestResult<String> {
@@ -2733,26 +2747,17 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
     }
-    let mut visible_text = text.clone();
-    for _ in 0..20 {
-        if visible_text.contains("WRITE_OK") || !text.contains("--More--") {
-            break;
-        }
-        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
-        visible_text.push_str(&text);
-    }
     let file_text = std::fs::read_to_string(&target).ok();
     let _ = std::fs::remove_file(&target);
     session.cancel().await?;
 
     assert!(
-        visible_text.contains("WRITE_OK")
-            || file_text.as_deref().map(str::trim_end) == Some("allowed"),
-        "expected pager ctrl-c tail to execute under the updated full-access sandbox, got output: {visible_text}; file: {file_text:?}"
+        text.contains("WRITE_OK"),
+        "expected pager ctrl-c tail to execute under the updated full-access sandbox, got: {text}"
     );
     assert!(
-        !visible_text.contains("WRITE_ERROR:"),
-        "did not expect pager ctrl-c tail to keep the previous sandbox permissions, got: {visible_text}"
+        !text.contains("WRITE_ERROR:"),
+        "did not expect pager ctrl-c tail to keep the previous sandbox permissions, got: {text}"
     );
     assert_eq!(
         file_text.as_deref().map(str::trim_end),

@@ -36,15 +36,13 @@ expression: snapshot
           "codex/sandbox-state-meta": {
             "sandboxPolicy": {
               "type": "workspace-write",
-              "writable_roots": [
-                "<CODEX_HOME>/memories"
-              ],
               "network_access": false,
               "exclude_tmpdir_env_var": false,
               "exclude_slash_tmp": false
             },
             "codexLinuxSandboxExe": "<CODEX_LINUX_SANDBOX_EXE>",
-            "sandboxCwd": "<WORKSPACE>"
+            "sandboxCwd": "<WORKSPACE>",
+            "useLegacyLandlock": false
           }
         },
         "name": "repl",

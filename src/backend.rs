@@ -39,9 +39,7 @@ impl WorkerLaunch {
 
     pub fn stdin_transport(&self) -> WorkerStdinTransport {
         match self {
-            Self::Builtin(Backend::Python)
-                if cfg!(any(target_family = "unix", target_os = "windows")) =>
-            {
+            Self::Builtin(Backend::Python) if cfg!(target_family = "unix") => {
                 WorkerStdinTransport::Pty
             }
             Self::Builtin(_) => WorkerStdinTransport::Pipe,
@@ -200,12 +198,12 @@ mod tests {
             WorkerLaunch::Builtin(Backend::R).stdin_transport(),
             WorkerStdinTransport::Pipe
         );
-        #[cfg(not(any(target_family = "unix", target_os = "windows")))]
+        #[cfg(not(target_family = "unix"))]
         assert_eq!(
             WorkerLaunch::Builtin(Backend::Python).stdin_transport(),
             WorkerStdinTransport::Pipe
         );
-        #[cfg(any(target_family = "unix", target_os = "windows"))]
+        #[cfg(target_family = "unix")]
         assert_eq!(
             WorkerLaunch::Builtin(Backend::Python).stdin_transport(),
             WorkerStdinTransport::Pty

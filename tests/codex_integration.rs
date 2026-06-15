@@ -2035,17 +2035,25 @@ tryCatch({
                         {
                             continue;
                         }
-                        if path_matches(path, &["_meta", "codex/sandbox-state-meta"])
-                            && !matches!(
-                                normalized_key.as_str(),
-                                "sandboxPolicy" | "sandboxCwd" | "codexLinuxSandboxExe"
+                        path.push(normalized_key.clone());
+                        normalize_inner(&mut child, path, workspace, codex_home);
+                        path.pop();
+                        if path_matches(path, &["sandboxPolicy"])
+                            && normalized_key == "writable_roots"
+                            && matches!(
+                                &child,
+                                Value::Array(items)
+                                    if items.iter().all(|item| {
+                                        matches!(
+                                            item.as_str(),
+                                            Some("<CODEX_HOME>/memories")
+                                                | Some("<CODEX_HOME>\\memories")
+                                        )
+                                    })
                             )
                         {
                             continue;
                         }
-                        path.push(normalized_key.clone());
-                        normalize_inner(&mut child, path, workspace, codex_home);
-                        path.pop();
                         map.insert(normalized_key, child);
                     }
                     if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
@@ -2194,6 +2202,59 @@ tryCatch({
                 }
             }),
             "wire snapshots should normalize Codex elicitation capability shape"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_default_codex_memories_writable_root() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let memories = codex_home.join("memories");
+        let mut value = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [memories],
+                "network_access": false
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sandboxPolicy": {
+                    "type": "workspace-write",
+                    "network_access": false
+                }
+            }),
+            "wire snapshots should not retain Codex's default memories writable root"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": ["<CODEX_HOME>\\memories"],
+                "network_access": false
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sandboxPolicy": {
+                    "type": "workspace-write",
+                    "network_access": false
+                }
+            }),
+            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
         );
     }
 
@@ -2778,8 +2839,8 @@ tryCatch({
         item
     }
 
-    fn resolve_tool_call_spec(request: &Value, flat_tool_name: &str) -> Option<MockToolCallSpec> {
-        let (namespace, name) = split_flat_tool_name(flat_tool_name)?;
+    fn resolve_tool_call_spec(request: &Value, legacy_tool_name: &str) -> Option<MockToolCallSpec> {
+        let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
         let tools = request.get("tools")?.as_array()?;
         let namespaced_tool_present = tools.iter().any(|tool| {
             tool.get("type").and_then(Value::as_str) == Some("namespace")
@@ -2800,15 +2861,11 @@ tryCatch({
         })
     }
 
-    fn split_flat_tool_name(flat_tool_name: &str) -> Option<(&str, &str)> {
-        let split = flat_tool_name.rfind("__")?;
-        let namespace_end = split + 2;
-        (namespace_end < flat_tool_name.len()).then(|| {
-            (
-                &flat_tool_name[..namespace_end],
-                &flat_tool_name[namespace_end..],
-            )
-        })
+    fn split_legacy_tool_name(legacy_tool_name: &str) -> Option<(&str, &str)> {
+        let split = legacy_tool_name.rfind("__")?;
+        let name_start = split + 2;
+        (split > 0 && name_start < legacy_tool_name.len())
+            .then(|| (&legacy_tool_name[..split], &legacy_tool_name[name_start..]))
     }
 
     fn message_item(text: &str) -> Value {
@@ -2938,7 +2995,7 @@ tryCatch({
         let request = serde_json::json!({
             "tools": [{
                 "type": "namespace",
-                "name": "mcp__r__",
+                "name": "mcp__r",
                 "tools": [{
                     "type": "function",
                     "name": "repl",
@@ -2949,7 +3006,7 @@ tryCatch({
             resolve_tool_call_spec(&request, "mcp__r__repl"),
             Some(MockToolCallSpec {
                 name: "repl".to_string(),
-                namespace: Some("mcp__r__".to_string()),
+                namespace: Some("mcp__r".to_string()),
             })
         );
     }

@@ -55,6 +55,12 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
             with patch.object(self.module.sys, "platform", "win32"):
                 self.assertEqual(exe_binary, self.module.resolve_binary_path(binary))
 
+    def test_server_process_env_uses_plain_pagers_by_default(self):
+        env = self.module.server_process_env(())
+
+        self.assertEqual("cat", env["PAGER"])
+        self.assertEqual("cat", env["MANPAGER"])
+
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(
             self.module.text(
@@ -130,28 +136,19 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         )
         test_case = self
         self_module = self.module
-        restart_output = self_module.r_repl_output(
-            'print(exists("x"))\n',
-            "[1] FALSE\n",
-        )
-        restart_response = self_module.tool_result(
-            self_module.text("[repl] new session started\n"),
-            *([self_module.text(restart_output)] if restart_output else []),
-            self_module.text("> "),
-        )
 
         class FakeClient:
             def __init__(self):
                 self.responses = [
-                    (
-                        "x <- 1\n",
-                        30000,
-                        self_module.r_repl_result("x <- 1\n"),
-                    ),
+                    ("x <- 1\n", 30000, self_module.tool_result(self_module.text("> "))),
                     (
                         '\u0004print(exists("x"))\n',
                         30000,
-                        restart_response,
+                        self_module.tool_result(
+                            self_module.text("[repl] new session started\n"),
+                            self_module.text("[1] FALSE\n"),
+                            self_module.text("> "),
+                        ),
                     ),
                     (None, 1000, initial_busy),
                     ('\u0003cat("AFTER_INTERRUPT\\n")', 5000, interrupt_busy),

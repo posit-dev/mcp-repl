@@ -4,8 +4,8 @@ mcp-repl-startup.log
 .Rhistory
 .Rproj.user
 .venv
-__pycache__/
 /eval
 .agents
 tools/drain-*
 prompts/*
+WORKPAD.md

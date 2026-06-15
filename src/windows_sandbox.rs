@@ -3,8 +3,6 @@
 #[cfg(test)]
 #[path = "windows_sandbox_test_support.rs"]
 mod test_support;
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -30,7 +28,6 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
-use crate::windows_pty_filter::WindowsPtyOutputFilter;
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(test)]
 use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
@@ -95,13 +92,8 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
-use windows_sys::Win32::System::Console::COORD;
 use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
-use windows_sys::Win32::System::Console::ClosePseudoConsole;
-use windows_sys::Win32::System::Console::CreatePseudoConsole;
-use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 use windows_sys::Win32::System::Console::GetStdHandle;
-use windows_sys::Win32::System::Console::HPCON;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
@@ -115,24 +107,17 @@ use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 #[cfg(test)]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
-use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
-use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::System::Threading::InitializeProcThreadAttributeList;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
-use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
-use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
-use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 #[cfg(test)]
@@ -165,19 +150,6 @@ const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
 const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
-pub(crate) const WINDOWS_SANDBOX_CONPTY_ENV: &str = "MCP_REPL_WINDOWS_SANDBOX_CONPTY";
-static WRAPPER_CTRL_BREAK_TARGET: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-thread_local! {
-    static TEST_CONSOLE_CTRL_EVENT_RECORDER: RefCell<Option<TestConsoleCtrlEventRecorder>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-struct TestConsoleCtrlEventRecorder {
-    result: i32,
-    events: Vec<(u32, u32)>,
-}
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -274,30 +246,6 @@ struct WrapperChildStdio {
     child_stderr: File,
 }
 
-struct WrapperChildConPtyStdio {
-    stdin_write: File,
-    stdout_read: File,
-    conpty: WrapperConPty,
-}
-
-struct WrapperConPty {
-    hpc: HPCON,
-    input_read: HANDLE,
-    output_write: HANDLE,
-}
-
-unsafe impl Send for WrapperConPty {}
-
-impl Drop for WrapperConPty {
-    fn drop(&mut self) {
-        unsafe {
-            ClosePseudoConsole(self.hpc);
-            CloseHandle(self.input_read);
-            CloseHandle(self.output_write);
-        }
-    }
-}
-
 struct WrapperStdioForwarders {
     stdin_forwarder: thread::JoinHandle<()>,
     stdout_forwarder: thread::JoinHandle<()>,
@@ -337,8 +285,6 @@ struct ConsoleCtrlHandlerGuard {
     handler: unsafe extern "system" fn(u32) -> i32,
 }
 
-struct WrapperCtrlBreakForwardTarget;
-
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
@@ -350,19 +296,6 @@ impl Drop for ConsoleCtrlHandlerGuard {
         unsafe {
             let _ = SetConsoleCtrlHandler(Some(self.handler), 0);
         }
-    }
-}
-
-impl WrapperCtrlBreakForwardTarget {
-    fn set(process_group_id: u32) -> Self {
-        WRAPPER_CTRL_BREAK_TARGET.store(process_group_id as u64, Ordering::Release);
-        Self
-    }
-}
-
-impl Drop for WrapperCtrlBreakForwardTarget {
-    fn drop(&mut self) {
-        WRAPPER_CTRL_BREAK_TARGET.store(0, Ordering::Release);
     }
 }
 
@@ -389,16 +322,7 @@ fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
 }
 
 unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
-    if event != CTRL_BREAK_EVENT {
-        return 0;
-    }
-    let target = WRAPPER_CTRL_BREAK_TARGET.load(Ordering::Acquire);
-    if let Ok(process_group_id) = u32::try_from(target)
-        && process_group_id != 0
-    {
-        let _ = raw_generate_console_ctrl_event(CTRL_BREAK_EVENT, process_group_id);
-    }
-    1
+    if event == CTRL_BREAK_EVENT { 1 } else { 0 }
 }
 
 fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, String> {
@@ -412,21 +336,6 @@ fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, Strin
     Ok(ConsoleCtrlHandlerGuard {
         handler: ignore_wrapper_ctrl_break,
     })
-}
-
-fn raw_generate_console_ctrl_event(ctrl_event: u32, process_group_id: u32) -> i32 {
-    #[cfg(test)]
-    if let Ok(Some(result)) = TEST_CONSOLE_CTRL_EVENT_RECORDER.try_with(|recorder| {
-        let mut recorder = recorder.borrow_mut();
-        recorder.as_mut().map(|recorder| {
-            recorder.events.push((ctrl_event, process_group_id));
-            recorder.result
-        })
-    }) {
-        return result;
-    }
-
-    unsafe { GenerateConsoleCtrlEvent(ctrl_event, process_group_id) }
 }
 
 fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -1568,15 +1477,12 @@ fn run_sandboxed_command_with_env_map(
                 return Err(err);
             }
         };
-        crate::diagnostics::startup_log("windows-sandbox: restricted token created");
 
         let null_device_ace_applied = allow_null_device(psid_launch);
-        crate::diagnostics::startup_log("windows-sandbox: null device prepared");
 
         let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
         let live_marker = {
             let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
-            crate::diagnostics::startup_log("windows-sandbox: acl lock acquired");
             let has_other_live_session =
                 prepared_launch_live_marker_count(prepared_capability_sid) > 0;
             let (workspace_root_scope, extra_root_scope) =
@@ -1590,7 +1496,6 @@ fn run_sandboxed_command_with_env_map(
                 workspace_root_scope,
                 extra_root_scope,
             );
-            crate::diagnostics::startup_log("windows-sandbox: runtime acl refresh returned");
             let prepared_launch = match refresh_result {
                 Ok(launch) => launch,
                 Err(err) => {
@@ -1608,7 +1513,6 @@ fn run_sandboxed_command_with_env_map(
                 prepared_capability_sid,
                 &capability_sids.launch_sid,
             );
-            crate::diagnostics::startup_log("windows-sandbox: live marker returned");
             let marker = match marker_result {
                 Ok(marker) => marker,
                 Err(err) => {
@@ -1624,7 +1528,6 @@ fn run_sandboxed_command_with_env_map(
 
             let launch_acl_result =
                 apply_runtime_launch_acl_state_unlocked(&prepared_launch, psid_launch);
-            crate::diagnostics::startup_log("windows-sandbox: launch acl returned");
             match launch_acl_result {
                 Ok(mut launch_acl_guards) => {
                     acl_guards.append(&mut launch_acl_guards);
@@ -1658,88 +1561,45 @@ fn run_sandboxed_command_with_env_map(
             }
         }
 
-        let use_conpty = env_get_case_insensitive(&env_map, WINDOWS_SANDBOX_CONPTY_ENV)
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let (proc_info, stdio_forwarders) = if use_conpty {
-            let conpty_stdio = match create_wrapper_child_conpty_stdio() {
-                Ok(stdio) => stdio,
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
+        let stdio_pipes = match create_wrapper_child_stdio() {
+            Ok(pipes) => pipes,
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
                 }
-            };
-            crate::diagnostics::startup_log("windows-sandbox: child ConPTY created");
-            let spawn_result = create_process_as_user_conpty(
-                restricted_token,
-                command,
-                sandbox_policy_cwd,
-                &env_map,
-                conpty_stdio.conpty.hpc,
-            );
-            let proc_info = match spawn_result {
-                Ok(value) => value,
-                Err(err) => {
-                    drop(conpty_stdio);
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
-                }
-            };
-            crate::diagnostics::startup_log("windows-sandbox: ConPTY child spawned");
-            (proc_info, spawn_wrapper_conpty_forwarders(conpty_stdio))
-        } else {
-            let stdio_pipes = match create_wrapper_child_stdio() {
-                Ok(pipes) => pipes,
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
-                }
-            };
-            crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
-            let spawn_result = create_process_as_user(
-                restricted_token,
-                command,
-                sandbox_policy_cwd,
-                &env_map,
-                Some((
-                    stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
-                    stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
-                    stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
-                )),
-            );
-            let (proc_info, _startup_info) = match spawn_result {
-                Ok(value) => value,
-                Err(err) => {
-                    drop(stdio_pipes);
-                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                    CloseHandle(restricted_token);
-                    if launch_sid_is_distinct {
-                        LocalFree(psid_launch as HLOCAL);
-                    }
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(err);
-                }
-            };
-            crate::diagnostics::startup_log("windows-sandbox: child spawned");
-            (proc_info, spawn_wrapper_stdio_forwarders(stdio_pipes))
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
         };
-        let _ctrl_break_forward_target =
-            use_conpty.then(|| WrapperCtrlBreakForwardTarget::set(proc_info.dwProcessId));
+        crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
+        let spawn_result = create_process_as_user(
+            restricted_token,
+            command,
+            sandbox_policy_cwd,
+            &env_map,
+            Some((
+                stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
+            )),
+        );
+        let (proc_info, _startup_info) = match spawn_result {
+            Ok(value) => value,
+            Err(err) => {
+                drop(stdio_pipes);
+                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                if launch_sid_is_distinct {
+                    LocalFree(psid_launch as HLOCAL);
+                }
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+        };
+        crate::diagnostics::startup_log("windows-sandbox: child spawned");
+        let stdio_forwarders = spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -2120,81 +1980,6 @@ unsafe fn create_process_as_user(
     Ok((proc_info, startup_info))
 }
 
-unsafe fn create_process_as_user_conpty(
-    token: HANDLE,
-    argv: &[String],
-    cwd: &Path,
-    env_map: &HashMap<String, String>,
-    hpc: HPCON,
-) -> Result<PROCESS_INFORMATION, String> {
-    let cmdline_str = argv
-        .iter()
-        .map(|arg| quote_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut cmdline = to_wide(&cmdline_str);
-    let env_block = make_env_block(env_map);
-
-    let mut startup_info = STARTUPINFOEXW::default();
-    startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-
-    let mut attribute_list_size = 0usize;
-    InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_list_size);
-    let mut attribute_list = vec![0u8; attribute_list_size];
-    let attribute_list_ptr = attribute_list.as_mut_ptr().cast();
-    if InitializeProcThreadAttributeList(attribute_list_ptr, 1, 0, &mut attribute_list_size) == 0 {
-        return Err(format!(
-            "InitializeProcThreadAttributeList failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    startup_info.lpAttributeList = attribute_list_ptr;
-
-    if UpdateProcThreadAttribute(
-        startup_info.lpAttributeList,
-        0,
-        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-        hpc as *const c_void,
-        std::mem::size_of::<HPCON>(),
-        std::ptr::null_mut(),
-        std::ptr::null(),
-    ) == 0
-    {
-        DeleteProcThreadAttributeList(startup_info.lpAttributeList);
-        return Err(format!(
-            "UpdateProcThreadAttribute pseudoconsole failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
-    let ok = CreateProcessAsUserW(
-        token,
-        std::ptr::null(),
-        cmdline.as_mut_ptr(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        0,
-        CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP,
-        env_block.as_ptr() as *mut c_void,
-        to_wide(cwd).as_ptr(),
-        &startup_info.StartupInfo,
-        &mut proc_info,
-    );
-    DeleteProcThreadAttributeList(startup_info.lpAttributeList);
-    if ok == 0 {
-        return Err(format!(
-            "CreateProcessAsUserW ConPTY failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(proc_info)
-}
-
 unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
     let mut child_stdin: HANDLE = std::ptr::null_mut();
     let mut stdin_write: HANDLE = std::ptr::null_mut();
@@ -2254,54 +2039,6 @@ unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
     })
 }
 
-unsafe fn create_wrapper_child_conpty_stdio() -> Result<WrapperChildConPtyStdio, String> {
-    let mut input_read: HANDLE = std::ptr::null_mut();
-    let mut input_write: HANDLE = std::ptr::null_mut();
-    let mut output_read: HANDLE = std::ptr::null_mut();
-    let mut output_write: HANDLE = std::ptr::null_mut();
-
-    if CreatePipe(&mut input_read, &mut input_write, std::ptr::null_mut(), 0) == 0 {
-        return Err(format!(
-            "CreatePipe ConPTY input failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if CreatePipe(&mut output_read, &mut output_write, std::ptr::null_mut(), 0) == 0 {
-        CloseHandle(input_read);
-        CloseHandle(input_write);
-        return Err(format!(
-            "CreatePipe ConPTY output failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut hpc: HPCON = 0;
-    let hr = CreatePseudoConsole(
-        COORD { X: 4096, Y: 24 },
-        input_read,
-        output_write,
-        0,
-        &mut hpc,
-    );
-    if hr != 0 {
-        CloseHandle(input_read);
-        CloseHandle(input_write);
-        CloseHandle(output_read);
-        CloseHandle(output_write);
-        return Err(format!("CreatePseudoConsole failed: HRESULT {hr}"));
-    }
-
-    Ok(WrapperChildConPtyStdio {
-        stdin_write: File::from_raw_handle(input_write as _),
-        stdout_read: File::from_raw_handle(output_read as _),
-        conpty: WrapperConPty {
-            hpc,
-            input_read,
-            output_write,
-        },
-    })
-}
-
 fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwarders {
     let WrapperChildStdio {
         stdin_write,
@@ -2338,114 +2075,21 @@ fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwa
     }
 }
 
-fn spawn_wrapper_conpty_forwarders(stdio: WrapperChildConPtyStdio) -> WrapperStdioForwarders {
-    let WrapperChildConPtyStdio {
-        stdin_write,
-        stdout_read,
-        conpty,
-    } = stdio;
-
-    let stdin_forwarder = thread::spawn(move || {
-        let mut wrapper_stdin = io::stdin();
-        let mut child_stdin = stdin_write;
-        copy_wrapper_input_to_conpty(&mut wrapper_stdin, &mut child_stdin);
-        let _ = child_stdin.flush();
-    });
-    let stdout_state = Arc::new(WrapperForwarderState::new());
-    let stdout_state_thread = Arc::clone(&stdout_state);
-    let stdout_forwarder = thread::spawn(move || {
-        let _keep_conpty_alive = conpty;
-        copy_wrapper_conpty_output(stdout_read, io::stdout(), &stdout_state_thread);
-    });
-    let stderr_state = Arc::new(WrapperForwarderState::new());
-    stderr_state.done.store(true, Ordering::Release);
-    let stderr_forwarder = thread::spawn(|| {});
-
-    WrapperStdioForwarders {
-        stdin_forwarder,
-        stdout_forwarder,
-        stderr_forwarder,
-        stdout_state,
-        stderr_state,
-    }
-}
-
-fn copy_wrapper_input_to_conpty(mut wrapper_input: impl Read, mut child_input: impl Write) {
-    let mut buffer = [0u8; 8192];
-    let mut pending_cr = false;
-    loop {
-        let count = match wrapper_input.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(_) => break,
-        };
-        let mut translated = Vec::with_capacity(count);
-        for byte in &buffer[..count] {
-            if pending_cr {
-                pending_cr = false;
-                if *byte == b'\n' {
-                    continue;
-                }
-            }
-            match *byte {
-                b'\r' => {
-                    translated.push(b'\r');
-                    pending_cr = true;
-                }
-                b'\n' => translated.push(b'\r'),
-                byte => translated.push(byte),
-            }
-        }
-        if child_input
-            .write_all(&translated)
-            .and_then(|_| child_input.flush())
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
 fn copy_wrapper_output(
-    child_output: File,
-    wrapper_output: impl Write,
-    state: &WrapperForwarderState,
-) {
-    copy_wrapper_output_filtered(child_output, wrapper_output, state, |bytes| bytes.to_vec());
-}
-
-fn copy_wrapper_conpty_output(
-    child_output: File,
-    wrapper_output: impl Write,
-    state: &WrapperForwarderState,
-) {
-    let mut filter = WindowsPtyOutputFilter::default();
-    copy_wrapper_output_filtered(child_output, wrapper_output, state, |bytes| {
-        filter.filter(bytes)
-    });
-}
-
-fn copy_wrapper_output_filtered(
     mut child_output: File,
     mut wrapper_output: impl Write,
     state: &WrapperForwarderState,
-    mut transform: impl FnMut(&[u8]) -> Vec<u8>,
 ) {
     let mut buffer = [0u8; 8192];
     loop {
         match child_output.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                let output = transform(&buffer[..count]);
                 let write_result = {
                     let _write_guard = state.begin_write();
-                    let result = if output.is_empty() {
-                        wrapper_output.flush()
-                    } else {
-                        wrapper_output
-                            .write_all(&output)
-                            .and_then(|_| wrapper_output.flush())
-                    };
+                    let result = wrapper_output
+                        .write_all(&buffer[..count])
+                        .and_then(|_| wrapper_output.flush());
                     if result.is_ok() {
                         state
                             .bytes_copied
@@ -3701,58 +3345,6 @@ mod tests {
         }
     }
 
-    fn capture_recorded_ctrl_events<F, R>(f: F) -> (R, Vec<(u32, u32)>)
-    where
-        F: FnOnce() -> R,
-    {
-        TEST_CONSOLE_CTRL_EVENT_RECORDER.with(|recorder| {
-            assert!(
-                recorder.borrow().is_none(),
-                "did not expect nested console ctrl-event recorder"
-            );
-            *recorder.borrow_mut() = Some(TestConsoleCtrlEventRecorder {
-                result: 1,
-                events: Vec::new(),
-            });
-        });
-        let result = f();
-        let events = TEST_CONSOLE_CTRL_EVENT_RECORDER.with(|recorder| {
-            recorder
-                .borrow_mut()
-                .take()
-                .expect("recorded console ctrl events")
-                .events
-        });
-        (result, events)
-    }
-
-    #[test]
-    fn wrapper_ctrl_break_handler_forwards_to_conpty_child_process_group() {
-        let _guard = prepare_sandbox_launch_test_mutex()
-            .lock()
-            .expect("windows sandbox test mutex");
-        let target = WrapperCtrlBreakForwardTarget::set(4242);
-
-        let (handled, events) =
-            capture_recorded_ctrl_events(|| unsafe { ignore_wrapper_ctrl_break(CTRL_BREAK_EVENT) });
-
-        assert_eq!(handled, 1);
-        assert_eq!(
-            events,
-            vec![(CTRL_BREAK_EVENT, 4242)],
-            "expected wrapper Ctrl-Break handler to forward to the ConPTY child process group"
-        );
-
-        drop(target);
-        let (handled_after_drop, events_after_drop) =
-            capture_recorded_ctrl_events(|| unsafe { ignore_wrapper_ctrl_break(CTRL_BREAK_EVENT) });
-        assert_eq!(handled_after_drop, 1);
-        assert!(
-            events_after_drop.is_empty(),
-            "did not expect Ctrl-Break forwarding after the target guard is dropped"
-        );
-    }
-
     #[cfg(target_os = "windows")]
     fn remove_junction(path: &Path) {
         if !path.exists() {
@@ -4027,40 +3619,6 @@ mod tests {
             recorded.flush_count >= 2,
             "forwarded output should flush each chunk as well as the final stream flush"
         );
-    }
-
-    #[test]
-    fn copy_wrapper_conpty_output_filters_terminal_control_sequences() {
-        let tmp = tempdir().expect("tempdir");
-        let payload_path = tmp.path().join("payload.bin");
-        let payload = b"\r\nmcp-repl\n\x1b[?25l\x1b[15;1H\x1b[?25h\x1b]0;title\x07>>> ";
-        std::fs::write(&payload_path, payload).expect("write payload");
-
-        let state = WrapperForwarderState::new();
-        let writer_state = Arc::new(Mutex::new(RecordingWriterState::default()));
-        let writer = RecordingWriter {
-            state: Arc::clone(&writer_state),
-        };
-
-        let input = File::open(&payload_path).expect("open payload");
-        copy_wrapper_conpty_output(input, writer, &state);
-
-        let recorded = writer_state.lock().expect("recording writer state mutex");
-        assert_eq!(recorded.bytes, b"\r\nmcp-repl\n>>> ");
-        assert_eq!(
-            state.bytes_copied.load(Ordering::Relaxed),
-            payload.len() as u64,
-            "filtered control-only bytes should still count as drain progress"
-        );
-    }
-
-    #[test]
-    fn copy_wrapper_input_to_conpty_translates_line_endings() {
-        let mut output = Vec::new();
-
-        copy_wrapper_input_to_conpty(&b"a\r\nb\nc\rd"[..], &mut output);
-
-        assert_eq!(output, b"a\rb\rc\rd");
     }
 
     #[test]

@@ -2,7 +2,11 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use std::time::Duration;
+
+const REPL_STARTUP_TIMEOUT_SECS: f64 = 30.0;
+const RETICULATE_INIT_TIMEOUT_SECS: f64 = 30.0;
+const PY_HELP_TIMEOUT_SECS: f64 = 5.0;
+const RETICULATE_READY_MARKER: &str = "[repl] reticulate python ready";
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -22,16 +26,11 @@ fn should_skip_reticulate_py_help_output(text: &str) -> bool {
         || text.trim() == ">"
 }
 
-fn reticulate_py_help_initial_timeout_secs() -> f64 {
-    if cfg!(windows) { 20.0 } else { 60.0 }
-}
-
-fn reticulate_py_help_wait_budget() -> Duration {
-    if cfg!(windows) {
-        Duration::from_secs(10)
-    } else {
-        Duration::from_secs(180)
+fn assert_not_busy(label: &str, text: &str) -> TestResult<()> {
+    if common::is_busy_response(text) {
+        return Err(format!("{label} exceeded its timeout budget: {text:?}").into());
     }
+    Ok(())
 }
 
 #[test]
@@ -41,9 +40,24 @@ fn prompt_only_reticulate_output_is_skipped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered() -> TestResult<()> {
-    let mut session = common::spawn_server_with_files().await?;
+    let session = common::spawn_server_with_files().await?;
 
-    let initial = session
+    let startup = session
+        .write_stdin_raw_with("1+1", Some(REPL_STARTUP_TIMEOUT_SECS))
+        .await?;
+    let startup_text = result_text(&startup);
+    if common::backend_unavailable(&startup_text) {
+        eprintln!("reticulate_py_help backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_not_busy("R startup", &startup_text)?;
+    assert!(
+        startup_text.contains("[1] 2"),
+        "expected R startup smoke output, got: {startup_text:?}"
+    );
+
+    let setup = session
         .write_stdin_raw_with(
             r#"
 {
@@ -52,38 +66,56 @@ async fn reticulate_py_help_is_rendered() -> TestResult<()> {
     invisible(NULL)
   } else {
     ok <- TRUE
-    tryCatch({ reticulate::py_config() }, error = function(e) { ok <<- FALSE })
+    tryCatch({
+      reticulate::py_config()
+      assign(
+        ".mcp_repl_reticulate_builtins",
+        reticulate::import_builtins(),
+        envir = .GlobalEnv
+      )
+    }, error = function(e) { ok <<- FALSE })
     if (!ok) {
       cat("[repl] reticulate python unavailable\n")
       invisible(NULL)
     } else {
-      builtins <- reticulate::import_builtins()
-      reticulate::py_help(builtins$len)
+      cat("[repl] reticulate python ready\n")
       invisible(NULL)
     }
   }
 }
 "#,
-            Some(reticulate_py_help_initial_timeout_secs()),
+            Some(RETICULATE_INIT_TIMEOUT_SECS),
         )
         .await?;
-    let result = match common::wait_until_not_busy(
-        &mut session,
-        initial,
-        Duration::from_millis(500),
-        reticulate_py_help_wait_budget(),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(err) if cfg!(windows) && err.to_string().contains("worker remained busy") => {
-            eprintln!("reticulate::py_help() remained busy on Windows; skipping");
-            session.cancel().await?;
+    let setup_text = result_text(&setup);
+    assert_not_busy("reticulate Python initialization", &setup_text)?;
+    if should_skip_reticulate_py_help_output(&setup_text) {
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        setup_text.contains(RETICULATE_READY_MARKER),
+        "expected reticulate Python initialization marker, got: {setup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            "reticulate::py_help(.mcp_repl_reticulate_builtins$len); invisible(NULL)",
+            Some(PY_HELP_TIMEOUT_SECS),
+        )
+        .await?;
+    let text = result_text(&result);
+    if common::is_busy_response(&text) {
+        session.cancel().await?;
+        if cfg!(windows) {
+            eprintln!("reticulate::py_help() exceeded its short Windows budget; skipping");
             return Ok(());
         }
-        Err(err) => return Err(err),
-    };
-    let text = result_text(&result);
+        return Err(format!(
+            "reticulate::py_help() exceeded its {PY_HELP_TIMEOUT_SECS}s timeout budget: {text:?}"
+        )
+        .into());
+    }
 
     if should_skip_reticulate_py_help_output(&text) {
         session.cancel().await?;

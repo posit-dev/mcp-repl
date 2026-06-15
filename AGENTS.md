@@ -48,7 +48,7 @@ Keep this file short. It is a table of contents, not the full manual.
 - Sandbox metadata: Codex per-tool-call `_meta["codex/sandbox-state-meta"]` used by `--sandbox inherit` to choose the effective worker sandbox for that call.
 - Writable root: An absolute path that a `workspace-write` worker may write, subject to forced read-only subpaths like `.git`, `.codex`, and `.agents`.
 - Session temp directory: The server-allocated per-session temp path exposed to the worker as `TMPDIR` and `MCP_REPL_R_SESSION_TMPDIR`.
-- Sideband IPC: The JSON-lines server/worker pipe for structural facts such as `readline_start`, `readline_input_bytes`, `readline_discard_bytes`, `output_text`, `output_image`, and `session_end`.
+- Sideband IPC: The JSON-lines server/worker pipe for structural facts such as `readline_start`, `readline_input`, `readline_discard`, `output_text`, `plot_image`, and `session_end`.
 - Raw output capture: The stdout/stderr pipes or PTY stream captured by the server for unowned visible text. Sideband carries worker-owned text and structural facts.
 - Output timeline: The server-side reconstruction of visible output order from captured stdout/stderr plus sideband facts.
 - Server-owned: State, files, or notices created and retained by the main server process, not by the runtime or the worker. Use this for output bundles, response finalization, debug logs, and server temp roots.

@@ -7,6 +7,7 @@ use common::McpSnapshot;
 use common::TestResult;
 #[cfg(not(windows))]
 use serde_json::json;
+use std::fs;
 use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -307,7 +308,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
         return Ok(());
     }
     if text.contains("<<repl status: busy") {
-        eprintln!("write_stdin_batch error recovery still busy; skipping");
+        eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -315,6 +316,116 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
     assert!(
         text.contains("after"),
         "expected follow-up output after error, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
+    let session = common::spawn_server().await?;
+
+    let input = (1..=2_000)
+        .map(|idx| format!("x{idx} <- {idx}\n"))
+        .collect::<String>();
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_batch huge echo-only input still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+    assert!(
+        !text.contains("--More--"),
+        "did not expect pager activation for echo-only input, got: {text:?}"
+    );
+    assert!(
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
+    );
+    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
+    let session = common::spawn_server_with_files().await?;
+
+    let mut input = String::new();
+    for idx in 1..=1_000 {
+        input.push_str(&format!("x{idx} <- {idx}\n"));
+    }
+    input.push_str("cat(\"ok\\n\")\n");
+    for idx in 1..=1_000 {
+        input.push_str(&format!("y{idx} <- {idx}\n"));
+    }
+    input.push_str("cat(\"done\\n\")\n");
+
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<repl status: busy") {
+        eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text);
+    let spill_text = transcript_path
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()?;
+    session.cancel().await?;
+    assert!(
+        text.contains("transcript.txt") || (text.contains("ok") && text.contains("y500 <- 500")),
+        "expected either an inline transcript or a spill path, got: {text:?}"
+    );
+    if let Some(spill_text) = spill_text {
+        assert!(
+            !spill_text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("ok") && spill_text.contains("done"),
+            "expected output from both cat() calls in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            text.contains("done"),
+            "expected the inline tail to keep the final output, got: {text:?}"
+        );
+    } else {
+        assert!(
+            text.contains("ok") && text.contains("done"),
+            "expected output from both cat() calls inline, got: {text:?}"
+        );
+        assert!(
+            !text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix inline, got: {text:?}"
+        );
+        assert!(
+            text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {text:?}"
+        );
+    }
+    assert!(
+        !text.contains("echoed input elided"),
+        "did not expect echo elision marker, got: {text:?}"
+    );
+    assert!(
+        !text.contains("--More--"),
+        "did not expect pager activation for huge echo with small output, got: {text:?}"
     );
     Ok(())
 }

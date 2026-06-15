@@ -989,8 +989,7 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let runtime_line = normalize_console_input_for_r(&line_text);
-            let head = runtime_line.as_bytes();
+            let head = line_text.as_bytes();
             if !buf.is_null() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
@@ -998,16 +997,19 @@ pub extern "C-unwind" fn r_read_console(
                 }
             }
             ipc::emit_readline_input_bytes(line_text.as_bytes());
+            let mut echoed = String::with_capacity(prompt.len() + line_text.len());
+            echoed.push_str(prompt);
+            echoed.push_str(&line_text);
+            ipc::emit_readline_result(prompt, &line_text);
+            if !echoed.is_empty() {
+                emit_output_text(TextStream::Stdout, echoed.as_bytes());
+            }
 
             return 1;
         }
 
         guard = state.cvar.wait(guard).unwrap();
     }
-}
-
-fn normalize_console_input_for_r(line: &str) -> String {
-    line.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub(crate) fn push_plot_image(
@@ -1037,7 +1039,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_output_image(&plot_id, &mime_type, &data, !is_new);
+    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
 }

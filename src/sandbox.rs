@@ -431,6 +431,8 @@ pub struct SandboxStateUpdate {
     pub sandbox_cwd: Option<PathBuf>,
     #[serde(default)]
     pub use_linux_sandbox_bwrap: Option<bool>,
+    #[serde(default)]
+    pub use_legacy_landlock: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -440,6 +442,8 @@ pub struct CodexSandboxStateMeta {
     #[serde(default)]
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub sandbox_cwd: PathBuf,
+    #[serde(default)]
+    pub use_legacy_landlock: bool,
 }
 
 pub fn sandbox_state_update_from_codex_meta(
@@ -474,6 +478,7 @@ pub fn sandbox_state_update_from_codex_meta(
         // Codex reports how its own Linux helper is configured, but mcp-repl's
         // optional bwrap stage is a separate local best-effort knob.
         use_linux_sandbox_bwrap: None,
+        use_legacy_landlock: None,
     })
 }
 
@@ -502,6 +507,8 @@ impl SandboxState {
         }
         if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
             next.use_linux_sandbox_bwrap = use_bwrap;
+        } else if let Some(use_legacy_landlock) = update.use_legacy_landlock {
+            next.use_linux_sandbox_bwrap = !use_legacy_landlock;
         }
         let changed = next != *self;
         *self = next;
@@ -2828,6 +2835,7 @@ mod tests {
                 "type": "danger-full-access"
             },
             "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
                 serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
             } else {
@@ -2854,6 +2862,7 @@ mod tests {
                 "exclude_slash_tmp": false
             },
             "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
             "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
                 serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
             } else {

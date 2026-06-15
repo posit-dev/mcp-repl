@@ -110,22 +110,6 @@ fn python_backend_unavailable(text: &str) -> bool {
         || text.contains("failed to locate a shared libpython")
 }
 
-#[cfg(windows)]
-fn windows_sandbox_backend_unavailable(text: &str) -> bool {
-    text.contains("CreateRestrictedToken failed: 87")
-}
-
-#[cfg(windows)]
-async fn start_windows_read_only_python_session() -> TestResult<common::McpTestSession> {
-    common::spawn_server_with_args(vec![
-        "--interpreter".to_string(),
-        "python".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
-    ])
-    .await
-}
-
 fn is_busy_response(text: &str) -> bool {
     text.contains("<<repl status: busy")
         || text.contains("worker is busy")
@@ -685,7 +669,7 @@ async fn python_smoke() -> TestResult<()> {
 
 #[cfg(not(target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_input_prompt_is_not_duplicated_on_pipe_stdio() -> TestResult<()> {
+async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -720,7 +704,7 @@ async fn python_input_prompt_is_not_duplicated_on_pipe_stdio() -> TestResult<()>
 
 #[cfg(not(unix))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_show_during_timeout_emits_on_pipe_stdin() -> TestResult<()> {
+async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
@@ -795,10 +779,6 @@ else:
         )
         .await?;
     let text = result_text(&result);
-    assert!(
-        !text.contains('\x1b'),
-        "did not expect terminal control sequences in a simple Python reply, got: {text:?}"
-    );
     assert!(
         text.lines().any(|line| line.trim() == "mcp-repl"),
         "expected Python worker process image to be mcp-repl, got: {text:?}"
@@ -1234,7 +1214,7 @@ print("INPUT", input())
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -1266,13 +1246,9 @@ print("PTY_INPUT", value)
         text.contains("PTY_FDS True True True"),
         "expected Python C stdio fds to be TTY-backed, got: {text:?}"
     );
-    #[cfg(unix)]
-    let expected_input_impl = "INPUT_IMPL builtins input";
-    #[cfg(windows)]
-    let expected_input_impl = "INPUT_IMPL __main__ _input";
     assert!(
-        text.contains(expected_input_impl),
-        "expected input() to use the platform prompt-aware implementation, got: {text:?}"
+        text.contains("INPUT_IMPL builtins input"),
+        "expected input() to use CPython's builtin implementation, got: {text:?}"
     );
     assert!(
         text.contains("PTY_INPUT hello"),
@@ -1281,9 +1257,9 @@ print("PTY_INPUT", value)
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_stdin_surface_matches_platform_accounting_path() -> TestResult<()> {
+async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1307,20 +1283,13 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
 
     session.cancel().await?;
 
-    #[cfg(unix)]
-    let expected_stdin_surface = "STDIN_SURFACE _io TextIOWrapper 0 True";
-    #[cfg(windows)]
-    let expected_stdin_surface = "STDIN_SURFACE __main__ McpInputStream 0 True";
     assert!(
-        text.contains(expected_stdin_surface),
-        "expected sys.stdin to expose the platform PTY stdin surface, got: {text:?}"
+        text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
+        "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
     );
     let direct_fd_modules = text
         .lines()
-        .find_map(|line| {
-            line.find("DIRECT_FD_SHIMS ")
-                .map(|index| &line[index + "DIRECT_FD_SHIMS ".len()..])
-        })
+        .find_map(|line| line.strip_prefix("DIRECT_FD_SHIMS "))
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         .unwrap_or_else(|| {
             panic!("expected direct fd stdin API module line, got: {text:?}");
@@ -1330,599 +1299,19 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         6,
         "expected six direct fd stdin API module names, got: {text:?}"
     );
-    #[cfg(unix)]
-    {
-        for (label, module) in [
-            ("builtins.open", direct_fd_modules[0]),
-            ("io.open", direct_fd_modules[1]),
-        ] {
-            assert!(
-                matches!(module, "io" | "_io"),
-                "expected {label} to come from io or _io, got: {text:?}"
-            );
-        }
-        let expected_fd_modules = ["_io", "_io", "posix", "posix"];
-        assert_eq!(
-            &direct_fd_modules[2..],
-            expected_fd_modules,
-            "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+    for (label, module) in [
+        ("builtins.open", direct_fd_modules[0]),
+        ("io.open", direct_fd_modules[1]),
+    ] {
+        assert!(
+            matches!(module, "io" | "_io"),
+            "expected {label} to come from io or _io, got: {text:?}"
         );
     }
-    #[cfg(windows)]
-    assert!(
-        direct_fd_modules.iter().all(|module| *module == "__main__"),
-        "expected Windows fd stdin APIs to use sideband-aware bridges, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_direct_stdin_reads_account_buffered_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os, sys
-line = sys.stdin.readline()
-buffered-line
-data = os.read(0, 9)
-raw-line
-print("READLINE", line.strip())
-print("OSREAD", data.decode().strip())
-print("AFTER_DIRECT_READS")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows direct stdin read accounting test remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("READLINE buffered-line"),
-        "expected sys.stdin.readline() to consume buffered input, got: {text:?}"
-    );
-    assert!(
-        text.contains("OSREAD raw-line"),
-        "expected os.read(0, ...) to consume buffered input, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_DIRECT_READS"),
-        "expected follow-up REPL input after direct reads to execute, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin"),
-        "direct stdin reads desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_os_read_subprocess_pipe_does_not_consume_stdin() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os, subprocess, sys
-proc = subprocess.Popen(
-    [sys.executable, "-c", "import sys; sys.stdout.write('PIPE_OK')"],
-    stdout=subprocess.PIPE,
-)
-data = os.read(proc.stdout.fileno(), 7)
-proc.wait()
-print("SUBPROCESS_PIPE", data.decode())
-print("AFTER_SUBPROCESS_PIPE")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows subprocess pipe os.read request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("SUBPROCESS_PIPE PIPE_OK"),
-        "expected os.read() on subprocess pipe to read pipe output, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_SUBPROCESS_PIPE"),
-        "expected REPL input after subprocess pipe read to execute, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_os_read_dup_stdin_uses_bridge_accounting() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os
-fd = os.dup(0)
-data = os.read(fd, 9)
-dup-line
-os.close(fd)
-print("DUP_STDIN", data.decode().strip())
-print("AFTER_DUP_STDIN")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows duplicated stdin fd os.read request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("DUP_STDIN dup-line"),
-        "expected os.read() on duplicated stdin fd to consume buffered input, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_DUP_STDIN"),
-        "expected REPL input after duplicated stdin fd read to execute, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin"),
-        "duplicated stdin fd read desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_accepts_crlf_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with("print('A')\r\nprint('B')", Some(10.0))
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows CRLF input test remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("A"),
-        "expected first CRLF line to run, got: {text:?}"
-    );
-    assert!(
-        text.contains("B"),
-        "expected second CRLF line to run, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin"),
-        "CRLF input desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_raw_small_reads_coalesce_crlf() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os
-parts = [os.read(0, 1) for _ in range(3)]
-ab
-print("RAW_PARTS", parts)
-print("AFTER_RAW_SMALL_READS")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows raw small-read CRLF test remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains(r#"RAW_PARTS [b'a', b'b', b'\n']"#),
-        "expected split CRLF to produce one newline byte, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_RAW_SMALL_READS"),
-        "expected REPL input after split raw reads to execute, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin"),
-        "split raw-read CRLF desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_raw_small_reads_skip_dropped_lf() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os
-parts = [os.read(0, 1) for _ in range(4)]
-ab
-c
-print("RAW_SPLIT_PARTS", parts)
-print("AFTER_RAW_SPLIT_READS")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows raw split-CRLF read test remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains(r#"RAW_SPLIT_PARTS [b'a', b'b', b'\n', b'c']"#),
-        "expected raw reads to skip the dropped LF and continue reading, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_RAW_SPLIT_READS"),
-        "expected REPL input after split CRLF reads to execute, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin"),
-        "split CRLF raw reads desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_raw_split_utf8_then_prompt_accounts_bytes() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import os
-data = os.read(0, 1)
-é
-print("RAW_SPLIT_UTF8_FIRST", data)
-print("AFTER_RAW_SPLIT_UTF8")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows split UTF-8 raw-read request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("RAW_SPLIT_UTF8_FIRST"),
-        "expected raw split UTF-8 read to return, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_RAW_SPLIT_UTF8"),
-        "expected REPL input after split UTF-8 raw read to execute, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes bytes does not match active stdin")
-            && !text.contains("reported input with no active turn"),
-        "split UTF-8 raw read desynchronized active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_fd0_replacement_bypasses_stdin_bridge() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"exec("""
-import os, tempfile
-path = tempfile.mktemp()
-with open(path, "wb") as f:
-    _ = f.write(b"from-file")
-saved_fd = os.dup(0)
-file_fd = os.open(path, os.O_RDONLY)
-try:
-    os.dup2(file_fd, 0)
-    data = os.read(0, 9)
-finally:
-    os.dup2(saved_fd, 0)
-    os.close(saved_fd)
-    os.close(file_fd)
-    os.unlink(path)
-print("FD0_REPLACED", data.decode())
-print("AFTER_FD0_RESTORE")
-""")
-"#,
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows fd0 replacement test remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("FD0_REPLACED from-file"),
-        "expected os.read(0, ...) to read the replacement fd, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_FD0_RESTORE"),
-        "expected REPL input to continue after restoring fd 0, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_read_only_sandbox_executes_basic_request() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = start_windows_read_only_python_session().await?;
-
-    let result = session
-        .write_stdin_raw_with("print('SANDBOX_A')\nprint('SANDBOX_B')", Some(10.0))
-        .await?;
-    let text = result_text(&result);
-    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
-        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows read-only sandbox request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("SANDBOX_A") && text.contains("SANDBOX_B"),
-        "expected sandboxed Python multiline request to execute, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_read_only_sandbox_accounts_input_roundtrip() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = start_windows_read_only_python_session().await?;
-
-    let result = session
-        .write_stdin_raw_with("print(input('p> '))\nhello", Some(10.0))
-        .await?;
-    let text = result_text(&result);
-    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
-        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows read-only sandbox input request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("p> ") && text.contains("hello"),
-        "expected sandboxed Python input() prompt and answer, got: {text:?}"
-    );
-    assert!(
-        !text.contains("readline_input_bytes reported input with no active turn"),
-        "sandboxed Python wrapper ConPTY lost active stdin accounting: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_read_only_sandbox_normalizes_console_read_bytes() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = start_windows_read_only_python_session().await?;
-
-    let result = session
-        .write_stdin_raw_with(
-            "import os\nparts = [os.read(0, 1) for _ in range(3)]\nab\r\nprint('RAW_CONSOLE_PARTS', parts)\nprint('AFTER_RAW_CONSOLE')",
-            Some(10.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if python_backend_unavailable(&text) || windows_sandbox_backend_unavailable(&text) {
-        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows read-only sandbox console read remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("RAW_CONSOLE_PARTS [b'a', b'b', b'\\n']"),
-        "expected os.read(0, ...) through wrapper ConPTY to observe console-normalized newline bytes, got: {text:?}"
-    );
-    assert!(
-        text.contains("AFTER_RAW_CONSOLE"),
-        "expected REPL input after console read to execute, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_read_only_sandbox_interrupt_finishes_drained_stdin() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = start_windows_read_only_python_session().await?;
-
-    let first = session
-        .write_stdin_raw_with(
-            "import time\ntime.sleep(5)\nprint('SHOULD_NOT_RUN_AFTER_SANDBOX_INTERRUPT')",
-            Some(0.2),
-        )
-        .await?;
-    let first_text = result_text(&first);
-    if python_backend_unavailable(&first_text) || windows_sandbox_backend_unavailable(&first_text) {
-        eprintln!("python Windows read-only sandbox backend unavailable; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        is_busy_response(&first_text),
-        "expected sandboxed Python sleep request to time out before interrupt, got: {first_text:?}"
-    );
-
-    let interrupt = session
-        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
-        .await?;
-    let interrupt_text = result_text(&interrupt);
-    if is_busy_response(&interrupt_text) {
-        session.cancel().await?;
-        return Err(format!(
-            "sandboxed Python interrupt stayed busy after draining pipe stdin: {interrupt_text:?}"
-        )
-        .into());
-    }
-
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_SANDBOX_INTERRUPT')", Some(10.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
-    session.cancel().await?;
-
-    assert!(
-        follow_up_text.contains("AFTER_SANDBOX_INTERRUPT"),
-        "expected follow-up after sandboxed Python interrupt to run, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
-    );
-    assert!(
-        !follow_up_text.contains("SHOULD_NOT_RUN_AFTER_SANDBOX_INTERRUPT"),
-        "drained stdin tail should not execute after interrupt, got follow-up: {follow_up_text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_preserves_unicode_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let value = char::from_u32(0x00e9).expect("valid test char").to_string();
-    let code = format!("print('{value}')\nprint(input('u> '))\n{value}");
-    let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows Unicode PTY input request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.matches(&value).count() >= 2,
-        "expected Unicode source and input data to survive the PTY path, got: {text:?}"
-    );
-    assert!(
-        !text.contains("?"),
-        "Unicode input should not be replaced with '?', got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_windows_pty_buffered_input_then_plot_emits_image() -> TestResult<()> {
-    if !python_plot_tests_enabled() {
-        return Ok(());
-    }
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session
-        .write_stdin_raw_with(
-            r#"import matplotlib
-matplotlib.use("agg", force=True)
-import matplotlib.pyplot as plt
-value = input('plot-input> ')
-hello
-plt.figure(301); plt.clf(); plt.plot([1, 2, 3]); plt.show()
-print("BUFFERED_INPUT_VALUE", value)
-"#,
-            Some(30.0),
-        )
-        .await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python Windows buffered input plot request remained busy".into());
-    }
-
-    session.cancel().await?;
-
-    assert!(
-        text.contains("BUFFERED_INPUT_VALUE hello"),
-        "expected buffered input answer before plot, got: {text:?}"
-    );
-    assert!(
-        image_count(&result) > 0,
-        "expected plot after buffered input to emit an image, got: {text:?}"
+    assert_eq!(
+        &direct_fd_modules[2..],
+        ["_io", "_io", "posix", "posix"],
+        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
     );
     Ok(())
 }
@@ -3026,6 +2415,66 @@ async fn python_input_roundtrip() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_accepts_crlf_buffered_line() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut prompt_text = result_text(
+        &session
+            .write_stdin_raw_with("x = input('p> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&prompt_text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&prompt_text) {
+            sleep(Duration::from_millis(50)).await;
+            prompt_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&prompt_text) {
+        eprintln!("python_input_accepts_crlf_buffered_line remained busy before prompt; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        prompt_text.contains("p> "),
+        "expected input prompt before CRLF answer, got: {prompt_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with("hello\r\nprint('got', x)\r\n", Some(5.0))
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("got hello") {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        eprintln!("python_input_accepts_crlf_buffered_line remained busy after answer; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("worker protocol error"),
+        "expected CRLF input to be accounted without protocol errors, got: {text:?}"
+    );
+    assert!(
+        text.contains("got hello"),
+        "expected input() to consume buffered CRLF line, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_original_stdout_flushes_before_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -3629,23 +3078,15 @@ else:
         reset_text.contains("new session started"),
         "expected repl_reset to start a new session, got: {reset_text:?}"
     );
-    #[cfg(windows)]
-    let observed = marker_path
-        .exists()
-        .then(|| fs::read_to_string(&marker_path))
-        .transpose()?;
-    #[cfg(not(windows))]
-    let observed = Some(fs::read_to_string(&marker_path)?);
-    if let Some(observed) = observed {
-        assert!(
-            observed == "EOFError" || observed == "VALUE:",
-            "reset should expose EOF or an empty line to input(), got: {observed:?}"
-        );
-        assert!(
-            !observed.contains("exit()") && !observed.contains("quit("),
-            "reset must not send shutdown text consumed by input(), got: {observed:?}"
-        );
-    }
+    let observed = fs::read_to_string(&marker_path)?;
+    assert!(
+        observed == "EOFError" || observed == "VALUE:",
+        "reset should expose EOF or an empty line to input(), got: {observed:?}"
+    );
+    assert!(
+        !observed.contains("exit()") && !observed.contains("quit("),
+        "reset must not send shutdown text consumed by input(), got: {observed:?}"
+    );
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
@@ -4443,7 +3884,6 @@ print("parent ready")
 
     session.cancel().await?;
 
-    #[cfg(unix)]
     assert!(
         follow_up_text.contains("\\xA9"),
         "expected new request continuation byte to stay split, got: {follow_up_text:?}"
@@ -4460,7 +3900,6 @@ print("parent ready")
         transcript.contains("IDLE_000"),
         "expected detached idle output in transcript, got: {transcript:?}"
     );
-    #[cfg(unix)]
     assert!(
         transcript.contains("\\xC3"),
         "expected detached lead byte to stay with detached transcript, got: {transcript:?}"

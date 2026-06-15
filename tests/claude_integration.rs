@@ -95,6 +95,8 @@ struct ClaudeMcpServerSnapshot {
 
 #[derive(Debug, Serialize)]
 struct ClaudeToolCallSnapshot {
+    #[serde(skip_serializing)]
+    id: String,
     name: String,
     input: String,
 }
@@ -197,8 +199,6 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
     cmd.arg(CLAUDE_PERMISSION_MODE);
     cmd.arg("--output-format");
     cmd.arg("json");
-    cmd.arg("--tools");
-    cmd.arg("");
 
     let output = run_command_with_timeout(cmd, CLAUDE_PROMPT, CLAUDE_TIMEOUT)?;
     let stdout = String::from_utf8(output.stdout)
@@ -214,7 +214,8 @@ fn run_claude_snapshot(staged: &StagedClaudeEnv) -> TestResult<ClaudeSnapshot> {
         .into());
     }
 
-    parse_snapshot(stdout.trim(), &staged.workspace)?
+    parse_snapshot(stdout.trim(), &staged.workspace)
+        .map_err(|err| format!("{err}\nstdout:\n{stdout}\nstderr:\n{stderr}"))?
         .ok_or_else(|| "Claude snapshot unexpectedly missing".into())
 }
 
@@ -667,6 +668,125 @@ fn assert_arg_pair(args: &[String], flag: &str, expected: &str) -> TestResult<()
     Err(format!("missing argument pair {flag} {expected} in {:?}", args).into())
 }
 
+#[test]
+fn extract_tool_call_rejects_unexpected_mcp_tools() {
+    let events = vec![serde_json::json!({
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_search",
+                    "name": "ToolSearch",
+                    "input": { "query": "mcp__r__repl" }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_reset",
+                    "name": "mcp__r__repl_reset",
+                    "input": {}
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_repl",
+                    "name": "mcp__r__repl",
+                    "input": { "input": TOOL_INPUT }
+                }
+            ]
+        }
+    })];
+
+    let err = extract_tool_call(&events)
+        .expect_err("expected unexpected MCP tool uses to fail the Claude contract");
+
+    assert!(
+        err.to_string()
+            .contains("unexpected Claude tool call: mcp__r__repl_reset"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parse_snapshot_skips_tool_search_tool_results() -> TestResult<()> {
+    let events = serde_json::json!([
+        {
+            "type": "system",
+            "cwd": "/tmp/claude-workspace",
+            "tools": ["ToolSearch", "mcp__r__repl"],
+            "mcp_servers": [
+                { "name": "r", "status": "connected" }
+            ],
+            "model": CLAUDE_MODEL,
+            "permissionMode": CLAUDE_PERMISSION_MODE
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_search",
+                        "name": "ToolSearch",
+                        "input": { "query": "mcp__r__repl" }
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_repl",
+                        "name": "mcp__r__repl",
+                        "input": { "input": TOOL_INPUT }
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_search",
+                        "content": [
+                            { "type": "text", "text": "ToolSearch found mcp__r__repl\n" }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_repl",
+                        "content": [
+                            { "type": "text", "text": "CLAUDE_MCP_OK\n" }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    { "type": "text", "text": FINAL_RESULT }
+                ]
+            }
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": FINAL_RESULT,
+            "stop_reason": "end_turn",
+            "permission_denials": []
+        }
+    ]);
+    let stdout = serde_json::to_string(&events)?;
+
+    let snapshot = parse_snapshot(&stdout, Path::new("/tmp/claude-workspace"))?
+        .expect("expected Claude snapshot");
+
+    assert_eq!(snapshot.tool_result, "CLAUDE_MCP_OK\n");
+    Ok(())
+}
+
 fn stage_bedrock_env(
     temp_home: &Path,
     host_settings_env: &std::collections::BTreeMap<String, String>,
@@ -751,6 +871,7 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
         .ok_or_else(|| "Claude init event missing tools".to_string())?
         .iter()
         .filter_map(JsonValue::as_str)
+        .filter(|tool| tool.starts_with("mcp__r__") || *tool == "ToolSearch")
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     tools.sort();
@@ -794,7 +915,7 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
     };
 
     let tool_call = extract_tool_call(&events)?;
-    let tool_result = extract_tool_result(&events)?;
+    let tool_result = extract_tool_result(&events, &tool_call.id)?;
     let final_text = normalize_done_text(&extract_final_text(&events)?);
     let result = extract_result(&events)?;
 
@@ -844,6 +965,17 @@ fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot>
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "Claude tool_use missing name".to_string())?
                 .to_string();
+            if name == "ToolSearch" {
+                continue;
+            }
+            if name != "mcp__r__repl" {
+                return Err(format!("unexpected Claude tool call: {name}").into());
+            }
+            let id = content
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "Claude mcp__r__repl tool_use missing id".to_string())?
+                .to_string();
             let input = content
                 .get("input")
                 .and_then(JsonValue::as_object)
@@ -851,7 +983,7 @@ fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot>
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "Claude tool_use missing input.input".to_string())?
                 .to_string();
-            calls.push(ClaudeToolCallSnapshot { name, input });
+            calls.push(ClaudeToolCallSnapshot { id, name, input });
         }
     }
 
@@ -862,42 +994,77 @@ fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot>
     }
 }
 
-fn extract_tool_result(events: &[JsonValue]) -> TestResult<String> {
+fn extract_tool_result(events: &[JsonValue], tool_use_id: &str) -> TestResult<String> {
     for event in events {
-        if let Some(contents) = event
-            .get("tool_use_result")
-            .and_then(JsonValue::as_array)
-            .or_else(|| {
-                event
-                    .get("message")
-                    .and_then(JsonValue::as_object)
-                    .and_then(|message| message.get("content"))
-                    .and_then(JsonValue::as_array)
-                    .and_then(|contents| {
-                        contents.iter().find_map(|content| {
-                            content
-                                .get("content")
-                                .and_then(JsonValue::as_array)
-                                .filter(|_| {
-                                    content.get("type").and_then(JsonValue::as_str)
-                                        == Some("tool_result")
-                                })
-                        })
-                    })
-            })
+        if event_tool_use_result_matches(event, tool_use_id)
+            && let Some(contents) = event.get("tool_use_result").and_then(JsonValue::as_array)
+            && let Some(text) = tool_result_text(contents)
         {
-            let text = contents
-                .iter()
-                .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
-                .filter(|text| *text != "> ")
-                .collect::<String>();
-            if !text.is_empty() {
+            return Ok(text);
+        }
+
+        let Some(contents) = event
+            .get("message")
+            .and_then(JsonValue::as_object)
+            .and_then(|message| message.get("content"))
+            .and_then(JsonValue::as_array)
+        else {
+            continue;
+        };
+
+        for content in contents {
+            if content.get("type").and_then(JsonValue::as_str) != Some("tool_result") {
+                continue;
+            }
+            if content.get("tool_use_id").and_then(JsonValue::as_str) != Some(tool_use_id) {
+                continue;
+            }
+            let result_contents = content
+                .get("content")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| "Claude mcp__r__repl tool_result missing content".to_string())?;
+            if let Some(text) = tool_result_text(result_contents) {
                 return Ok(text);
             }
         }
     }
 
-    Err("Claude output did not contain a tool result".into())
+    Err("Claude output did not contain an mcp__r__repl tool result".into())
+}
+
+fn event_tool_use_result_matches(event: &JsonValue, tool_use_id: &str) -> bool {
+    if event
+        .get("tool_use_result")
+        .and_then(JsonValue::as_array)
+        .is_none()
+    {
+        return false;
+    }
+    if event.get("tool_use_id").and_then(JsonValue::as_str) == Some(tool_use_id) {
+        return true;
+    }
+
+    event
+        .get("message")
+        .and_then(JsonValue::as_object)
+        .and_then(|message| message.get("content"))
+        .and_then(JsonValue::as_array)
+        .is_some_and(|contents| {
+            contents.iter().any(|content| {
+                content.get("type").and_then(JsonValue::as_str) == Some("tool_use")
+                    && content.get("id").and_then(JsonValue::as_str) == Some(tool_use_id)
+            })
+        })
+}
+
+fn tool_result_text(contents: &[JsonValue]) -> Option<String> {
+    let text = contents
+        .iter()
+        .filter_map(|item| item.get("text").and_then(JsonValue::as_str))
+        .filter(|text| *text != "> ")
+        .collect::<String>();
+
+    (!text.is_empty()).then_some(text)
 }
 
 fn extract_final_text(events: &[JsonValue]) -> TestResult<String> {
@@ -1006,7 +1173,7 @@ fn render_transcript(snapshot: &ClaudeSnapshot) -> String {
 }
 
 fn snapshot_command() -> String {
-    "$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json --tools \"\"".to_string()
+    "$ HOME=<HOME> claude --disable-slash-commands --setting-sources local --settings <SETTINGS_JSON> --mcp-config <MCP_JSON> --strict-mcp-config -p --verbose --model haiku --no-session-persistence --permission-mode dontAsk --output-format json".to_string()
 }
 
 fn normalize_workspace_path(path: &str, workspace: &Path) -> String {

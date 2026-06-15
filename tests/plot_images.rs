@@ -1536,10 +1536,6 @@ cat("TAIL_ONLY\n")
         !final_text.contains("<<repl status: busy"),
         "expected timeout text-only follow-up poll to finish, got: {final_text:?}"
     );
-    assert!(
-        events_log_path(&final_text).is_some(),
-        "expected output bundle disclosure in final timeout poll, got: {final_text:?}"
-    );
     let events_log = events_log_path(&bundled_text)
         .or_else(|| events_log_path(&final_text))
         .unwrap_or_else(|| {
