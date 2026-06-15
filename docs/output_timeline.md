@@ -14,8 +14,8 @@ The worker emits different kinds of information on different channels:
 - PTY-backed workers expose raw terminal output through the PTY master, which
   may merge stdout/stderr identity and apply terminal behavior such as CRLF
   translation, echo, and width-dependent formatting.
-- Sideband IPC carries structural events such as `readline_start`,
-  `readline_result`, `plot_image`, and `session_end`.
+- Sideband IPC carries structural events such as `input_line`, `idle`,
+  `output_image`, and `session_end`.
 
 Raw pipes and IPC do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
@@ -34,7 +34,7 @@ changes what must stay buffered between tool calls.
 - Worker-owned `output_text` frames and raw stdout/stderr bytes are buffered as
   `TextFragment` events.
 - Sideband events are stored alongside text so later formatting can suppress
-  echoed input and respect request boundaries.
+  synthetic input echoes and respect request boundaries.
 - When a reply is sealed, `PendingOutputSnapshot::format_contents()` converts the
   tape into `WorkerContent`.
 
@@ -72,10 +72,9 @@ only as a later presentation step.
 
 Echo matching must be driven by the sideband facts themselves:
 
-- `readline_start` supplies prompt text; the server derives whether it is
-  unsatisfied from active-turn stdin accounting
-- `readline_result` is emitted by the worker, but it describes the exact
-  prompt text and input line that `readline` consumed and echoed
+- `input_line` describes the exact prompt text and input line the worker
+  delivered to the runtime
+- `idle` supplies the final prompt text for a completed turn
 - the server should match and collapse those exact sideband facts
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`
@@ -91,11 +90,9 @@ That matching is only opportunistic:
 - if exact sideband-to-stdout matching fails or becomes ambiguous, the server
   should degrade softly to raw captured stdout/stderr for that region, without
   eliding echo or inventing a cleaned-up transcript
-- sideband-first carryover is source-aware: the backend records whether a
-  `readline_result` echo should arrive as raw stdout or as `output_text`, and
-  carryover only trims later text from that same source. Prompt spelling only
-  decides whether a prompt shape is eligible for carryover; it does not decide
-  the source.
+- sideband-first carryover is source-aware: when a backend adapter records an
+  echo source, carryover only trims later text from that same source. Prompt
+  spelling must not decide the source.
 
 ## Ownership split
 

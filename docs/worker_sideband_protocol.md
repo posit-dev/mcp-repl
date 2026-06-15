@@ -4,9 +4,8 @@ This document describes the sideband protocol between the server and a worker
 process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
-This document defines worker protocol version 3. The server still accepts
-version 2 from built-in and migrating workers, but version 2 request-boundary
-frames are legacy compatibility surfaces rather than the current contract.
+This document defines worker protocol version 3. The server rejects other
+protocol versions before sending user input.
 
 The protocol is shaped around one race-free invariant:
 
@@ -215,7 +214,7 @@ invalid base64, and unknown message types are protocol errors.
 
 `plot_image`
 - `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
-- Legacy v2 image event retained for built-in workers during migration.
+- Built-in adapters use this event for plot output.
 - There is no plot-image acknowledgement message.
 - Workers must not delay stdout/stderr output waiting for sideband responses.
 

@@ -429,7 +429,7 @@ fn driver_refresh_backend_info(
         Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
             {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
@@ -467,7 +467,7 @@ fn driver_refresh_worker_ready(
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
+                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
             {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
@@ -499,10 +499,7 @@ fn driver_refresh_custom_worker_ready(
     match ipc.wait_for_backend_info(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker"
-                || !matches!(
-                    protocol.version,
-                    crate::ipc::WORKER_PROTOCOL_VERSION | crate::ipc::WORKER_PROTOCOL_V3_VERSION
-                )
+                || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
             {
                 return Err(WorkerError::Protocol(format!(
                     "unsupported worker protocol {} version {}",
@@ -971,7 +968,7 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
-            protocol_version: Some(crate::ipc::WORKER_PROTOCOL_VERSION),
+            protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
             next_turn_id: 1,
             active_turn_id: None,
         }
@@ -985,7 +982,18 @@ impl ProtocolBackendDriver {
     }
 
     fn is_v3(&self) -> bool {
-        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_V3_VERSION)
+        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_VERSION)
+    }
+
+    fn uses_builtin_stdin_adapter(&self) -> bool {
+        #[cfg(target_family = "unix")]
+        {
+            self.python_request_generation.is_some()
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            false
+        }
     }
 
     fn next_turn_id(&mut self) -> u64 {
@@ -1027,6 +1035,12 @@ impl BackendDriver for ProtocolBackendDriver {
                 return Err(WorkerError::Protocol(message));
             }
             return Ok(());
+        }
+
+        if !self.uses_builtin_stdin_adapter() {
+            return Err(WorkerError::Protocol(
+                "custom workers must speak worker protocol version 3".to_string(),
+            ));
         }
 
         ipc.begin_request_with_stdin(payload);
