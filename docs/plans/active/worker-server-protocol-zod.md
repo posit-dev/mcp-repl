@@ -844,9 +844,12 @@ worker implementation task, not a server request-handling task.
 - 2026-06-15: Legacy stdin/readline completion state moved out of
   `ServerIpcInbox` into `src/legacy_request_state.rs`. IPC still owns
   legacy acknowledgement queues and protocol-version branching.
-- Next safe slice: isolate the legacy acknowledgement queues
-  (`stdin_write_ack` and Python interrupt ack), then delete compatibility
-  branches once R, Python, and Zod exercise the same public protocol path.
+- 2026-06-15: Legacy `stdin_write_ack` and Python interrupt ack queues moved
+  out of the general IPC message queue into `src/legacy_ack_state.rs`. IPC
+  still owns protocol-version branching.
+- Next safe slice: map the remaining IPC protocol-version branches, then delete
+  the smallest compatibility branch that is already covered by public R,
+  Python, and Zod behavior.
 
 ## Acceptance Criteria Before Unblocking Embedded Python
 
