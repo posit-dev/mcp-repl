@@ -18,7 +18,6 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 #[cfg(target_family = "unix")]
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-#[cfg(target_family = "windows")]
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -305,6 +304,39 @@ impl OutputCriticalIpcWriter {
             .lock()
             .map_err(|_| io::Error::other("ipc writer mutex poisoned"))?;
         write_ipc_message(&mut **writer, &message)
+    }
+
+    pub fn send_with_timeout<T>(&self, message: T, timeout: Duration) -> io::Result<()>
+    where
+        T: Serialize + Send + 'static,
+    {
+        if timeout.is_zero() {
+            return Err(ipc_send_timeout_error());
+        }
+
+        let writer = self.writer.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = {
+                let mut writer = match writer.lock() {
+                    Ok(writer) => writer,
+                    Err(_) => {
+                        let _ = tx.send(Err(io::Error::other("ipc writer mutex poisoned")));
+                        return;
+                    }
+                };
+                write_ipc_message(&mut **writer, &message)
+            };
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ipc_send_timeout_error()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("ipc writer thread exited unexpectedly"))
+            }
+        }
     }
 }
 
@@ -705,6 +737,14 @@ impl ServerIpcConnection {
 
     pub fn send(&self, message: ServerToWorkerIpcMessage) -> io::Result<()> {
         self.writer.send(message)
+    }
+
+    pub fn send_with_timeout(
+        &self,
+        message: ServerToWorkerIpcMessage,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.writer.send_with_timeout(message, timeout)
     }
 
     pub fn join_reader_thread(&self) -> io::Result<()> {
@@ -1111,6 +1151,13 @@ fn write_ipc_message<T: Serialize>(writer: &mut dyn Write, message: &T) -> io::R
     writer.write_all(payload.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+fn ipc_send_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out sending IPC message to worker",
+    )
 }
 
 #[derive(Debug)]

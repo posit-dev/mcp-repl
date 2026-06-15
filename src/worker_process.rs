@@ -1009,11 +1009,19 @@ impl BackendDriver for ProtocolBackendDriver {
             }
             let turn_id = self.next_turn_id();
             ipc.begin_turn(turn_id);
-            ipc.send(ServerToWorkerIpcMessage::TurnStart {
-                turn_id,
-                input: text.to_string(),
-            })
-            .map_err(WorkerError::Io)?;
+            match ipc.send_with_timeout(
+                ServerToWorkerIpcMessage::TurnStart {
+                    turn_id,
+                    input: text.to_string(),
+                },
+                timeout,
+            ) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(WorkerError::Timeout(timeout));
+                }
+                Err(err) => return Err(WorkerError::Io(err)),
+            }
             self.active_turn_id = Some(turn_id);
             if let Some(message) = ipc.take_protocol_error() {
                 return Err(WorkerError::Protocol(message));

@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static ZOD_WORKER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -201,6 +202,21 @@ async fn spawn_zod_v3_server_with_extra_args(
     .await
 }
 
+async fn spawn_zod_v3_stalled_control_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    let control_log_text = control_log.display().to_string();
+    spawn_zod_server_with_env_and_extra_args(
+        vec![
+            ("MCP_REPL_ZOD_PROTOCOL_VERSION", "3"),
+            ("MCP_REPL_ZOD_CONTROL_LOG", control_log_text.as_str()),
+            ("MCP_REPL_ZOD_STALL_CONTROL_READER", "1"),
+        ],
+        Vec::new(),
+    )
+    .await
+}
+
 fn latest_debug_events(debug_dir: &std::path::Path) -> TestResult<Vec<Value>> {
     let mut sessions = fs::read_dir(debug_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -276,6 +292,42 @@ async fn zod_worker_v3_receives_turn_start_without_raw_stdin() -> TestResult<()>
     assert!(
         !log.contains("stdin:"),
         "v3 server path must not write request text to raw stdin, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v3_turn_start_write_respects_timeout_when_control_reader_stalls()
+-> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_v3_stalled_control_server(&control_log).await?;
+    let input = "x".repeat(2 * 1024 * 1024);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 100
+            }),
+        ),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!("v3 turn_start write did not respect timeout_ms");
+        }
+    };
+    let text = result_text(&result);
+    assert!(
+        text.contains("worker response timed out"),
+        "expected bounded turn_start write timeout, got: {text:?}"
     );
 
     session.cancel().await?;

@@ -27,6 +27,7 @@ const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const SHUTDOWN_LOG_ENV: &str = "MCP_REPL_ZOD_SHUTDOWN_LOG";
 const PROTOCOL_VERSION_ENV: &str = "MCP_REPL_ZOD_PROTOCOL_VERSION";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
+const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const INVALID_SESSION_END_REASON: &str =
@@ -157,14 +158,6 @@ fn run_v3_worker(
     let (tx, rx) = mpsc::channel();
 
     start_v3_stdin_observer(control_log_path.clone());
-    start_v3_control_reader(
-        sideband_reader,
-        tx,
-        sideband_interrupted.clone(),
-        control_session_end.clone(),
-        control_log_path.clone(),
-        shutdown_log_path.clone(),
-    );
 
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
@@ -180,6 +173,22 @@ fn run_v3_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
+    if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
+        let _sideband_reader = sideband_reader;
+        let _turn_tx = tx;
+        loop {
+            thread::park();
+        }
+    }
+
+    start_v3_control_reader(
+        sideband_reader,
+        tx,
+        sideband_interrupted.clone(),
+        control_session_end.clone(),
+        control_log_path.clone(),
+        shutdown_log_path.clone(),
+    );
 
     let mut state = V3CommandState {
         next_prompt: "v3> ".to_string(),
