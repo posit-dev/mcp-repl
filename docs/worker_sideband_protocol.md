@@ -4,6 +4,10 @@ This document describes the sideband protocol between the server and a worker
 process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
+This document defines worker protocol version 3. The server still accepts
+version 2 from built-in and migrating workers, but version 2 request-boundary
+frames are legacy compatibility surfaces rather than the current contract.
+
 The protocol is shaped around one race-free invariant:
 
 > The server does not infer that a worker is idle from stdin writes, PTY state,
@@ -161,7 +165,7 @@ Worker-to-server messages are strict: unknown fields, invalid enum values,
 invalid base64, and unknown message types are protocol errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 2 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 3 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Must be the first worker-to-server message for protocol workers.
 - The server rejects unsupported protocol names or versions before sending user
   input.
@@ -177,6 +181,15 @@ invalid base64, and unknown message types are protocol errors.
   prompt.
 - Prompt rendering is derived from this structured event, not from raw
   stdout/stderr parsing.
+
+`input_line`
+- `{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }`
+- Records that the worker delivered a logical input line to the runtime at this
+  point in the ordered sideband stream.
+- `turn_id` must match the active turn.
+- `prompt` and `text` are structural input facts, not runtime output.
+  Submitted input must not be emitted as `output_text`.
+- The final MCP reply elides synthetic input echoes by default. The server may reconstruct `prompt + text` from ordered `input_line` events for transcript finalization, echo trimming, debugging views, or other surfaces that need an interactive transcript.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
@@ -199,6 +212,12 @@ invalid base64, and unknown message types are protocol errors.
 - Carries worker-owned image bytes on the ordered sideband stream.
 - `image_id` is worker-local source identity for update grouping. The server
   owns MCP response image IDs.
+
+`plot_image`
+- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
+- Legacy v2 image event retained for built-in workers during migration.
+- There is no plot-image acknowledgement message.
+- Workers must not delay stdout/stderr output waiting for sideband responses.
 
 `session_end`
 - `{ "type": "session_end", "reason": <string>, "message_b64": <base64, optional>, "turn_id": <integer, optional> }`

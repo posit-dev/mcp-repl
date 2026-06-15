@@ -107,8 +107,17 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
         r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 3 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "turn_start", "turn_id": <integer>, "input": <string> }"#,
+        r#"{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }"#,
+        r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "interrupt", "turn_id": <integer> }"#,
+        "This document defines worker protocol version 3.",
+        "version 2 from built-in and migrating workers",
         "There is no plot-image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
+        "Submitted input must not be emitted as `output_text`.",
+        "The server may reconstruct `prompt + text` from ordered `input_line` events",
     ] {
         assert!(
             protocol.contains(required),
