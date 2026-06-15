@@ -115,7 +115,6 @@ fn python_sandbox_unavailable(text: &str) -> bool {
     python_backend_unavailable(text)
         || text.contains("worker sandbox error")
         || text.contains("prepared capability SID requires an unrestricted base token")
-        || text.contains("worker exited before IPC named pipe connection")
 }
 
 fn is_busy_response(text: &str) -> bool {
@@ -1372,7 +1371,7 @@ async fn python_windows_pty_bridges_stdin_surfaces() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             r#"exec("""
-import os, sys
+import os, sys, tempfile
 print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 print("STDIN_BRIDGE", type(sys.stdin).__module__, type(sys.stdin).__name__, sys.stdin.isatty())
 first = input("win> ")
@@ -1382,7 +1381,16 @@ try:
     third = os.read(dup_fd, 5).decode("utf-8")
 finally:
     os.close(dup_fd)
+saved_fd = os.dup(0)
+try:
+    with tempfile.TemporaryFile() as replacement:
+        os.dup2(replacement.fileno(), 0)
+        replaced_stdin_isatty = os.isatty(0)
+finally:
+    os.dup2(saved_fd, 0)
+    os.close(saved_fd)
 print("WIN_STDIN_VALUES", first, second, third)
+print("REPLACED_STDIN_ISATTY", replaced_stdin_isatty)
 """)
 alpha
 beta
@@ -1420,6 +1428,70 @@ gamma
     assert!(
         text.contains("WIN_STDIN_VALUES alpha beta gamma"),
         "expected input/sys.stdin/dup fd reads to consume buffered turn input, got: {text:?}"
+    );
+    assert!(
+        text.contains("REPLACED_STDIN_ISATTY False"),
+        "expected replaced stdin fd to fall back to real isatty state, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_raw_stdin_read_waits_for_next_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import os
+print("RAW_STDIN_WAITING")
+data = os.read(0, 6)
+print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !is_busy_response(&first_text),
+        "expected raw stdin read to complete the turn at an input boundary, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("RAW_STDIN_WAITING"),
+        "expected code before raw stdin wait to run, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("RAW_STDIN_RESULT"),
+        "raw stdin read should wait for a later turn instead of returning EOF, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("delta", Some(5.0)).await?;
+    let mut text = result_text(&second);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("RAW_STDIN_RESULT delta")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected raw stdin follow-up turn to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("RAW_STDIN_RESULT delta"),
+        "expected raw stdin read to consume next turn input, got: {text:?}"
     );
     Ok(())
 }

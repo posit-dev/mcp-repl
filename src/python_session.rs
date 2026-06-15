@@ -2221,79 +2221,150 @@ fn fork_child_stdin_eof(prompt: &str) -> CStdinLine {
 }
 
 #[cfg(target_family = "unix")]
-fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
+fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     if ipc::worker_ipc_disabled_for_process() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let _allow_threads = PythonThreadsAllowed::new();
     let bytes = read_fd_bytes(libc::STDIN_FILENO, size);
     note_stdin_bytes_read(&bytes);
-    bytes
+    Ok(bytes)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+enum RawStdinReadError {
+    Interrupted,
+    Runtime(String),
 }
 
 #[cfg(windows)]
-fn read_raw_stdin_bytes(size: usize) -> Vec<u8> {
+fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     if size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let result = {
-        let _allow_threads = PythonThreadsAllowed::new();
-        take_raw_turn_input_bytes(size)
-    };
-    match result {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            set_callback_error(&err);
-            Vec::new()
-        }
-    }
+    take_raw_turn_input_bytes(size)
 }
 
 #[cfg(windows)]
-fn take_raw_turn_input_bytes(size: usize) -> Result<Vec<u8>, String> {
+enum RawTurnInputEvent {
+    InputLine {
+        turn_id: u64,
+        prompt: String,
+        text: String,
+    },
+    Idle {
+        turn_id: u64,
+        prompt: String,
+    },
+    Consumed,
+}
+
+#[cfg(windows)]
+fn take_raw_turn_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+    let state = SESSION_STATE.get().ok_or_else(|| {
+        RawStdinReadError::Runtime("Python session state is not initialized".to_string())
+    })?;
     let mut output = Vec::new();
     while output.len() < size {
         let event = {
-            let Some(state) = SESSION_STATE.get() else {
-                return Ok(output);
-            };
             let mut guard = state.inner.lock().unwrap();
-            let prompt = input_hook_prompt(&guard, None);
-            let Some(active) = guard.active_request.as_mut() else {
+            guard.waiting_for_input = true;
+            state.cvar.notify_all();
+
+            if guard.shutdown || guard.exit_requested {
                 return Ok(output);
-            };
-            let Some(turn_id) = active.turn_id else {
-                return Ok(output);
-            };
-            let Some(line) = active.queued_lines.front_mut() else {
-                return Ok(output);
-            };
-            let emit_line = if line.input_line_emitted {
-                None
-            } else {
-                line.input_line_emitted = true;
-                Some((turn_id, prompt, line.text.clone()))
-            };
-            let available = &line.bytes[line.offset..];
-            let take = available.len().min(size - output.len());
-            output.extend_from_slice(&available[..take]);
-            line.offset += take;
-            if line.offset >= line.bytes.len() {
-                active.queued_lines.pop_front();
             }
-            emit_line
+
+            if guard.interrupt_requested {
+                guard.interrupt_requested = false;
+                return Err(RawStdinReadError::Interrupted);
+            }
+
+            if guard.turn_cleanup_uncertain {
+                let allow_threads = PythonThreadsAllowed::new();
+                guard = state.cvar.wait(guard).unwrap();
+                drop(guard);
+                drop(allow_threads);
+                continue;
+            }
+
+            let prompt = input_hook_prompt(&guard, None);
+            let Some(turn_id) = guard
+                .active_request
+                .as_ref()
+                .and_then(|active| active.turn_id)
+            else {
+                if !output.is_empty() {
+                    return Ok(output);
+                }
+                if guard.active_request.is_some() {
+                    return Ok(output);
+                }
+                let allow_threads = PythonThreadsAllowed::new();
+                guard = state.cvar.wait(guard).unwrap();
+                drop(guard);
+                drop(allow_threads);
+                continue;
+            };
+
+            if guard
+                .active_request
+                .as_ref()
+                .is_some_and(|active| active.queued_lines.is_empty())
+            {
+                if !output.is_empty() {
+                    return Ok(output);
+                }
+                guard.active_request.take();
+                RawTurnInputEvent::Idle { turn_id, prompt }
+            } else {
+                let active = guard.active_request.as_mut().expect("active turn exists");
+                let line = active
+                    .queued_lines
+                    .front_mut()
+                    .expect("active turn has queued input");
+                let event = if line.input_line_emitted {
+                    RawTurnInputEvent::Consumed
+                } else {
+                    line.input_line_emitted = true;
+                    RawTurnInputEvent::InputLine {
+                        turn_id,
+                        prompt,
+                        text: line.text.clone(),
+                    }
+                };
+                let available = &line.bytes[line.offset..];
+                let take = available.len().min(size - output.len());
+                output.extend_from_slice(&available[..take]);
+                line.offset += take;
+                if line.offset >= line.bytes.len() {
+                    active.queued_lines.pop_front();
+                }
+                event
+            }
         };
-        if let Some((turn_id, prompt, text)) = event {
-            ipc::emit_input_line(turn_id, &prompt, &text);
+        match event {
+            RawTurnInputEvent::InputLine {
+                turn_id,
+                prompt,
+                text,
+            } => ipc::emit_input_line(turn_id, &prompt, &text),
+            RawTurnInputEvent::Idle { turn_id, prompt } => {
+                emit_plots();
+                mark_stdin_wait_prompt_completed_request();
+                remember_emitted_prompt(&prompt);
+                ipc::emit_idle(turn_id, &prompt);
+            }
+            RawTurnInputEvent::Consumed => {}
         }
     }
     Ok(output)
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
-fn read_raw_stdin_bytes(_size: usize) -> Vec<u8> {
-    Vec::new()
+fn read_raw_stdin_bytes(_size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+    Ok(Vec::new())
 }
 
 #[cfg(target_family = "unix")]
@@ -2763,7 +2834,17 @@ unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject
         set_callback_error("raw_stdin_read size must be non-negative");
         return ptr::null_mut();
     };
-    let bytes = read_raw_stdin_bytes(size);
+    let bytes = match read_raw_stdin_bytes(size) {
+        Ok(bytes) => bytes,
+        Err(RawStdinReadError::Interrupted) => {
+            api.set_interrupt();
+            return ptr::null_mut();
+        }
+        Err(RawStdinReadError::Runtime(message)) => {
+            set_callback_error(&message);
+            return ptr::null_mut();
+        }
+    };
     match api.bytes(&bytes) {
         Ok(value) => value.into_raw(),
         Err(_) => ptr::null_mut(),
