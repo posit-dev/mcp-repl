@@ -1,0 +1,13 @@
+---
+source: tests/python_snapshots.rs
+expression: transcript
+---
+== session: input_prompt_matching_ps1 ==
+1) py_repl timeout_ms=5000
+>>> import sys
+>>> sys.ps1 = "same> "
+>>> value = input("same> ")
+>>> buffered
+>>> print("MATCHED_PROMPT_VALUE", value)
+<<< same> MATCHED_PROMPT_VALUE buffered
+<<< same>

@@ -1943,13 +1943,22 @@ unsafe extern "C" fn mcp_repl_readline(
     if ipc::worker_ipc_disabled_for_process() {
         return allocate_readline_result(&[]);
     }
+    #[cfg(any(target_family = "unix", windows))]
+    let readline_state = set_current_repl_readline_prompt(&prompt_text);
+    #[cfg(not(any(target_family = "unix", windows)))]
     set_current_repl_readline_prompt(&prompt_text);
-    #[cfg(target_family = "unix")]
-    let prompt_matches_repl = prompt_matches_python_repl_prompt(&prompt_text);
+    #[cfg(any(target_family = "unix", windows))]
+    // This uses CPython's current readline callback and tracked turn state, not
+    // rendered output parsing. Suppress only actual REPL prompts; client-input
+    // prompts can intentionally equal sys.ps1/sys.ps2 and must stay visible.
+    let suppress_repl_prompt_echo = matches!(
+        readline_state,
+        PythonReadlineState::Primary | PythonReadlineState::Continuation
+    ) && prompt_matches_python_repl_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
     flush_original_stdio();
     #[cfg(target_family = "unix")]
-    if !prompt_text.is_empty() && !prompt_matches_repl {
+    if !prompt_text.is_empty() && !suppress_repl_prompt_echo {
         emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
     }
     #[cfg(target_family = "unix")]
@@ -1962,7 +1971,7 @@ unsafe extern "C" fn mcp_repl_readline(
     #[cfg(windows)]
     let read = match read_windows_turn_line(
         &prompt_text,
-        !prompt_text.is_empty() && !prompt_matches_python_repl_prompt(&prompt_text),
+        !prompt_text.is_empty() && !suppress_repl_prompt_echo,
         false,
     ) {
         Ok(read) => read,
@@ -2140,9 +2149,9 @@ fn begin_repl_turn() {
     guard.repl_readline_count = 0;
 }
 
-fn set_current_repl_readline_prompt(prompt: &str) {
+fn set_current_repl_readline_prompt(prompt: &str) -> PythonReadlineState {
     let Some(state) = SESSION_STATE.get() else {
-        return;
+        return PythonReadlineState::Primary;
     };
     let mut guard = state.inner.lock().unwrap();
     let started_after_continuation_prompt = guard
@@ -2165,6 +2174,7 @@ fn set_current_repl_readline_prompt(prompt: &str) {
         Some(prompt.to_string())
     };
     guard.current_readline_state = Some(readline_state);
+    readline_state
 }
 
 fn remember_emitted_prompt(prompt: &str) {
