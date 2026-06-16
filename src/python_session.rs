@@ -8,7 +8,7 @@ use std::ptr;
 #[cfg(target_family = "unix")]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::Deserialize;
 
@@ -87,14 +87,13 @@ struct PythonRuntimeProbe {
     pythonframeworkinstalldir: String,
 }
 
-#[derive(Debug)]
-pub struct RequestCompleted;
-
 pub struct PythonSession {
+    #[cfg(windows)]
     init: Arc<SessionInit>,
 }
 
 impl PythonSession {
+    #[cfg(windows)]
     pub fn global() -> Result<&'static PythonSession, String> {
         SESSION
             .get()
@@ -103,27 +102,19 @@ impl PythonSession {
 
     pub fn start_on_current_thread() -> Result<(), String> {
         let init = Arc::new(SessionInit::new());
-        let session = PythonSession { init: init.clone() };
+        let session = PythonSession {
+            #[cfg(windows)]
+            init: init.clone(),
+        };
         if SESSION.set(session).is_err() {
             return Err("Python session already initialized".to_string());
         }
         run_session_on_current_thread(init)
     }
 
+    #[cfg(windows)]
     pub fn wait_until_ready(&self) -> Result<(), String> {
         self.init.wait_ready()
-    }
-
-    pub fn begin_request(
-        &self,
-        byte_len: usize,
-        line_count: usize,
-        fallback_prompt: Option<String>,
-    ) -> Result<mpsc::Receiver<RequestCompleted>, String> {
-        self.wait_until_ready()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        begin_tracked_request(byte_len, line_count, fallback_prompt, reply_tx)?;
-        Ok(reply_rx)
     }
 
     #[cfg(windows)]
@@ -133,6 +124,7 @@ impl PythonSession {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug)]
 enum InitState {
     Pending,
@@ -166,6 +158,7 @@ impl SessionInit {
         self.cvar.notify_all();
     }
 
+    #[cfg(windows)]
     fn wait_ready(&self) -> Result<(), String> {
         let mut guard = self.state.lock().unwrap();
         loop {
@@ -274,78 +267,6 @@ fn take_interrupt_requested() -> bool {
     let requested = guard.interrupt_requested;
     guard.interrupt_requested = false;
     requested
-}
-
-pub(crate) fn mark_stdin_write_complete() {
-    #[cfg(target_family = "unix")]
-    let protocol_input_exhausted = protocol_request_input_exhausted();
-
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let mut completed = None;
-    let mut prompt = None;
-    {
-        let mut guard = state.inner.lock().unwrap();
-        let current_prompt_from_state = guard.current_prompt.clone();
-        let current_readline_state = guard.current_readline_state;
-        let primary_prompt = guard.python_primary_prompt.clone();
-        let continuation_prompt = guard.python_continuation_prompt.clone();
-        let waiting_for_input = guard.waiting_for_input;
-        #[cfg(target_family = "unix")]
-        if protocol_input_exhausted && guard.active_request.is_none() && waiting_for_input {
-            // Unix protocol-mode Python can reach the next prompt before the IPC
-            // thread observes StdinWriteComplete. In that case the prompt hook
-            // deliberately left the plot gate open because stdin was not yet
-            // accounted; close it here once the explicit write-complete signal
-            // proves the already-emitted prompt is the request boundary.
-            guard.request_active = false;
-        }
-        if let Some(active) = guard.active_request.as_mut() {
-            active.stdin_write_complete = true;
-            let continuation_write_complete =
-                windows_continuation_prompt_write_should_complete(active, current_readline_state);
-            let should_complete = if active.repl_turn_finished {
-                request_repl_turn_should_complete(active)
-            } else {
-                request_prompt_wait_should_complete(active, current_readline_state)
-                    || continuation_write_complete
-            };
-            if (waiting_for_input || continuation_write_complete) && should_complete {
-                let fallback_prompt = if active.repl_turn_finished {
-                    None
-                } else {
-                    active
-                        .fallback_prompt
-                        .as_deref()
-                        .or_else(|| active.started_after_continuation_prompt.then_some(""))
-                };
-                prompt = Some(repl_prompt_for(
-                    current_prompt_from_state.clone(),
-                    fallback_prompt,
-                    current_readline_state,
-                    &primary_prompt,
-                    &continuation_prompt,
-                ));
-                completed = guard.active_request.take();
-            }
-        }
-    }
-
-    if let Some(active) = completed {
-        emit_plots();
-        #[cfg(not(target_family = "unix"))]
-        mark_stdin_wait_prompt_completed_request();
-        // Python object flushes run from handle_input_hook on the Python thread.
-        let prompt = prompt.as_deref().unwrap_or(">>> ");
-        remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt);
-        complete_active_request(state, Some(active), false);
-    }
-}
-
-pub(crate) fn mark_request_started() {
-    mark_request_started_with_stdin(Vec::new());
 }
 
 pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
@@ -467,57 +388,6 @@ fn begin_or_append_turn_input(turn_id: u64, payload: Vec<u8>) {
     if let Some(demand) = demand {
         emit_readline_demand(demand);
     }
-}
-
-fn mark_request_started_with_stdin(stdin_bytes: Vec<u8>) {
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let should_record_background_plots = {
-        let guard = state.inner.lock().unwrap();
-        !guard.request_active || guard.request_completed_at_stdin_wait
-    };
-    if should_record_background_plots {
-        // A stdin-wait prompt closes the MCP request while Python threads can
-        // still mutate matplotlib state. Snapshot those inactive plots before
-        // reopening the gate so a later stdin answer does not flush stale
-        // background figures into its reply. A later explicit plot/show in the
-        // new request still forces a fresh image.
-        record_background_plots();
-    }
-    let mut guard = state.inner.lock().unwrap();
-    guard.interrupt_requested = false;
-    guard.request_completed_at_stdin_wait = false;
-    guard.request_active = true;
-    #[cfg(target_family = "unix")]
-    {
-        guard.active_turn_id = None;
-        guard.next_pty_feed_seq = 1;
-        guard.pty_feed_in_flight = None;
-        guard.discard_untracked_stdin_after_interrupt = false;
-        guard.protocol_stdin_bytes = stdin_bytes.into();
-    }
-    #[cfg(not(target_family = "unix"))]
-    {
-        let _ = stdin_bytes;
-    }
-    guard.plot_reset_pending = true;
-}
-
-#[cfg(windows)]
-fn windows_continuation_prompt_write_should_complete(
-    active: &ActiveRequest,
-    _current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    active.started_after_continuation_prompt && active.line_count == 1
-}
-
-#[cfg(not(windows))]
-fn windows_continuation_prompt_write_should_complete(
-    _active: &ActiveRequest,
-    _current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    false
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -1475,52 +1345,6 @@ fn finalize_python(
     }
 }
 
-fn begin_tracked_request(
-    byte_len: usize,
-    line_count: usize,
-    fallback_prompt: Option<String>,
-    reply: mpsc::Sender<RequestCompleted>,
-) -> Result<(), String> {
-    let state = session_state();
-    if line_count == 0 {
-        let _ = reply.send(RequestCompleted);
-        return Ok(());
-    }
-
-    let mut guard = state.inner.lock().unwrap();
-    while guard.active_request.is_some() && !guard.shutdown {
-        guard = state.cvar.wait(guard).unwrap();
-    }
-    if guard.shutdown {
-        return Err("Python session is shutting down".to_string());
-    }
-
-    let skip_next_hook = !guard.waiting_for_input;
-    let started_after_continuation_prompt = guard.last_prompt_was_continuation;
-    guard.waiting_for_input = false;
-    guard.request_completed_at_stdin_wait = false;
-    guard.active_request = Some(ActiveRequest {
-        reply: Some(reply),
-        turn_id: None,
-        byte_len,
-        line_count,
-        fallback_prompt,
-        queued_lines: VecDeque::new(),
-        consumed_lines: 0,
-        skip_next_hook,
-        stdin_write_complete: false,
-        repl_turn_finished: false,
-        started_after_continuation_prompt,
-    });
-    #[cfg(not(target_family = "unix"))]
-    {
-        guard.request_active = true;
-    }
-    guard.plot_reset_pending = true;
-    state.cvar.notify_all();
-    Ok(())
-}
-
 #[cfg(windows)]
 fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     let state = session_state();
@@ -1545,7 +1369,6 @@ fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     guard.turn_cleanup_uncertain = false;
     let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.active_request = Some(ActiveRequest {
-        reply: None,
         turn_id: Some(turn_id),
         byte_len,
         line_count,
@@ -1593,7 +1416,6 @@ fn append_tracked_turn_input(turn_id: u64, input: String) -> Result<(), String> 
         guard.turn_cleanup_uncertain = false;
         let started_after_continuation_prompt = guard.last_prompt_was_continuation;
         guard.active_request = Some(ActiveRequest {
-            reply: None,
             turn_id: Some(turn_id),
             byte_len,
             line_count,
@@ -1961,30 +1783,16 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
     }
 }
 
+#[cfg(not(any(target_family = "unix", windows)))]
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
+    _current_readline_state: Option<PythonReadlineState>,
 ) -> bool {
-    #[cfg(target_family = "unix")]
-    {
-        let input_drained = request_input_drained(active);
-        (prompt_wait_can_complete(active, current_readline_state)
-            && (single_line_client_input_prompt(active, current_readline_state) || input_drained))
-            || (active.started_after_continuation_prompt && input_drained)
-    }
-    #[cfg(windows)]
-    {
-        prompt_can_complete_before_repl_turn(active, current_readline_state)
-            && active.byte_len > 0
-            && stdin_pending_byte_count() == Some(0)
-    }
-    #[cfg(not(any(target_family = "unix", windows)))]
-    {
-        active.consumed_lines >= active.line_count
-    }
+    active.consumed_lines >= active.line_count
 }
 
 #[cfg(target_family = "unix")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn prompt_wait_can_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1995,18 +1803,6 @@ fn prompt_wait_can_complete(
             Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
         )
         || active.fallback_prompt.is_some()
-}
-
-#[cfg(target_family = "unix")]
-fn single_line_client_input_prompt(
-    active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    active.line_count == 1
-        && matches!(
-            current_readline_state,
-            Some(PythonReadlineState::ClientInput)
-        )
 }
 
 fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
@@ -2022,17 +1818,6 @@ fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
     {
         active.consumed_lines >= active.line_count
     }
-}
-
-#[cfg(windows)]
-fn prompt_can_complete_before_repl_turn(
-    active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    matches!(
-        current_readline_state,
-        Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
-    ) || active.fallback_prompt.is_some()
 }
 
 #[cfg(target_family = "unix")]
@@ -2067,8 +1852,9 @@ fn finish_repl_turn_request() {
             guard.waiting_for_input = true;
         } else {
             // Protocol-style Unix Python has no worker-local ActiveRequest; the
-            // server owns completion, so RequestStart keeps plot state active
-            // across all PyRun_InteractiveOne turns in one MCP request.
+            // server owns completion, so request-start metadata keeps plot
+            // state active across all PyRun_InteractiveOne turns in one MCP
+            // request.
             #[cfg(not(target_family = "unix"))]
             {
                 guard.request_active = false;
@@ -2888,6 +2674,7 @@ fn emit_plots() {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn record_background_plots() {
     let _gil = GilGuard::acquire();
     let api = PythonApi::global();
@@ -2982,7 +2769,6 @@ struct SessionStateInner {
 
 #[allow(dead_code)]
 struct ActiveRequest {
-    reply: Option<mpsc::Sender<RequestCompleted>>,
     turn_id: Option<u64>,
     byte_len: usize,
     line_count: usize,
@@ -3056,10 +2842,7 @@ fn complete_active_request_with_options(
     active: Option<ActiveRequest>,
     emit_session_end: bool,
 ) {
-    if let Some(active) = active
-        && let Some(reply) = active.reply
-    {
-        let _ = reply.send(RequestCompleted);
+    if active.is_some() {
         state.cvar.notify_all();
     }
     if emit_session_end {
@@ -3414,9 +3197,7 @@ mod tests {
         consumed_lines: usize,
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
-        let (reply, _rx) = std::sync::mpsc::channel();
         ActiveRequest {
-            reply: Some(reply),
             turn_id: None,
             byte_len: 1,
             line_count,

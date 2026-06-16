@@ -146,8 +146,9 @@ mod unix {
 
         let input = "if (TRUE) {\ncat(\"RAW_STDIN_OK\\n\")\n}\n";
         let request = json!({
-            "type": "stdin_write",
-            "byte_len": input.len()
+            "type": "turn_start",
+            "turn_id": 1,
+            "input": input
         });
         ipc_writer.write_all(request.to_string().as_bytes()).await?;
         ipc_writer.write_all(b"\n").await?;
