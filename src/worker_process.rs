@@ -328,7 +328,10 @@ impl RBackendDriver {
     }
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.begin_request();
     if let Some(message) = ipc.take_protocol_error() {
@@ -337,7 +340,10 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) -> Result<(), W
     Ok(())
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_announce_stdin_write(
     byte_len: usize,
     line_count: usize,
@@ -352,11 +358,13 @@ fn driver_announce_stdin_write(
     .map_err(WorkerError::Io)
 }
 
+#[cfg_attr(target_family = "windows", allow(dead_code))]
 fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
         .map_err(WorkerError::Io)
 }
 
+#[cfg_attr(target_family = "windows", allow(dead_code))]
 fn driver_wait_for_stdin_write_ack(
     ipc: &ServerIpcConnection,
     timeout: Duration,
@@ -419,7 +427,10 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
-#[cfg_attr(target_family = "unix", allow(dead_code))]
+#[cfg_attr(
+    any(target_family = "unix", target_family = "windows"),
+    allow(dead_code)
+)]
 fn driver_refresh_backend_info(
     ipc: ServerIpcConnection,
     timeout: Duration,
@@ -580,17 +591,17 @@ impl BackendDriver for RBackendDriver {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 struct PythonBackendDriver;
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl PythonBackendDriver {
     fn new() -> Self {
         Self
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_final_prompt_hint(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -616,7 +627,7 @@ fn python_final_prompt_hint(text: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_has_open_block_suite(text: &str) -> bool {
     let mut block_indents = Vec::new();
     let mut scan_state = PythonLineScanState::default();
@@ -643,7 +654,7 @@ fn python_has_open_block_suite(text: &str) -> bool {
     !block_indents.is_empty()
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 #[derive(Default)]
 struct PythonLineScanState {
     quote: Option<(char, bool)>,
@@ -651,14 +662,14 @@ struct PythonLineScanState {
     groups: Vec<char>,
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl PythonLineScanState {
     fn continuation_active(&self) -> bool {
         self.quote.is_some_and(|(_, triple)| triple) || !self.groups.is_empty()
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_code_before_comment_with_state(
     line: &str,
     state: &mut PythonLineScanState,
@@ -725,14 +736,14 @@ fn python_line_code_before_comment_with_state(
     code
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_indent(line: &str) -> usize {
     line.chars()
         .take_while(|ch| matches!(ch, ' ' | '\t'))
         .count()
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_line_code_before_comment(line: &str) -> &str {
     let mut chars = line.char_indices().peekable();
     let mut quote: Option<(char, bool)> = None;
@@ -774,12 +785,12 @@ fn python_line_code_before_comment(line: &str) -> &str {
     line
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn python_requires_continuation(text: &str) -> bool {
     has_unclosed_python_group_or_string(text) || final_line_continues_with_backslash(text)
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn final_line_continues_with_backslash(text: &str) -> bool {
     let Some(line) = text.lines().last() else {
         return false;
@@ -794,7 +805,7 @@ fn final_line_continues_with_backslash(text: &str) -> bool {
         == 1
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn has_unclosed_python_group_or_string(text: &str) -> bool {
     let mut stack = Vec::new();
     let mut chars = text.chars().peekable();
@@ -854,7 +865,7 @@ fn has_unclosed_python_group_or_string(text: &str) -> bool {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected: char) -> bool {
     let mut clone = chars.clone();
     if clone.next() != Some(expected) || clone.next() != Some(expected) {
@@ -865,7 +876,7 @@ fn take_next_two(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, expected:
     true
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_next_two_indexed(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     expected: char,
@@ -881,7 +892,7 @@ fn take_next_two_indexed(
     true
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn text_ends_with_blank_line(text: &str) -> bool {
     let Some(text) = strip_one_line_ending(text) else {
         return false;
@@ -889,14 +900,14 @@ fn text_ends_with_blank_line(text: &str) -> bool {
     text.ends_with('\n') || text.ends_with('\r')
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn strip_one_line_ending(text: &str) -> Option<&str> {
     text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .or_else(|| text.strip_suffix('\r'))
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 impl BackendDriver for PythonBackendDriver {
     fn on_input_start(
         &mut self,
@@ -948,6 +959,7 @@ impl BackendDriver for PythonBackendDriver {
 struct ProtocolBackendDriver {
     #[cfg(target_family = "unix")]
     python_request_generation: Option<u64>,
+    is_builtin_python: bool,
     protocol_version: Option<u32>,
     next_turn_id: u64,
     active_turn_id: Option<u64>,
@@ -958,9 +970,26 @@ impl ProtocolBackendDriver {
         Self {
             #[cfg(target_family = "unix")]
             python_request_generation: None,
+            is_builtin_python: false,
             protocol_version: None,
             next_turn_id: 1,
             active_turn_id: None,
+        }
+    }
+
+    fn builtin_python() -> Self {
+        #[cfg(target_family = "unix")]
+        {
+            Self::python()
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            Self {
+                is_builtin_python: true,
+                protocol_version: None,
+                next_turn_id: 1,
+                active_turn_id: None,
+            }
         }
     }
 
@@ -968,6 +997,7 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
+            is_builtin_python: true,
             protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
             next_turn_id: 1,
             active_turn_id: None,
@@ -1107,13 +1137,16 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if self.is_v3() {
-            if let Some(turn_id) = self.active_turn_id
-                && let Some(ipc) = process.ipc.get()
-            {
-                ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                    turn_id: Some(turn_id),
-                })
-                .map_err(WorkerError::Io)?;
+            if let Some(ipc) = process.ipc.get() {
+                if let Some(turn_id) = self.active_turn_id {
+                    ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                        turn_id: Some(turn_id),
+                    })
+                    .map_err(WorkerError::Io)?;
+                } else if self.is_builtin_python {
+                    ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
+                        .map_err(WorkerError::Io)?;
+                }
             }
             return process.send_interrupt();
         }
@@ -1484,14 +1517,7 @@ impl WorkerManager {
             driver: match worker_launch {
                 WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
                 WorkerLaunch::Builtin(Backend::Python) => {
-                    #[cfg(target_family = "unix")]
-                    {
-                        Box::new(ProtocolBackendDriver::python())
-                    }
-                    #[cfg(not(target_family = "unix"))]
-                    {
-                        Box::new(PythonBackendDriver::new())
-                    }
+                    Box::new(ProtocolBackendDriver::builtin_python())
                 }
                 WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
             },
@@ -6123,11 +6149,16 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        #[cfg(target_os = "windows")]
+        let spawn_stdin_transport =
+            windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
+        #[cfg(not(target_os = "windows"))]
+        let spawn_stdin_transport = stdin_transport;
         let child_result = spawn_command_with_transport(
             &mut command,
-            stdin_transport,
+            spawn_stdin_transport,
             !matches!(backend, Backend::Python),
         );
         #[cfg(target_family = "unix")]
@@ -6155,7 +6186,7 @@ impl WorkerProcess {
             stderr_reader,
         } = attach_spawned_worker_stdio(
             &mut child,
-            stdin_transport,
+            spawn_stdin_transport,
             #[cfg(target_family = "unix")]
             pty_stdio,
             live_output.clone(),
@@ -6246,9 +6277,14 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = spec.stdin.transport();
+        #[cfg(target_os = "windows")]
+        let spawn_stdin_transport =
+            windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
         #[cfg(target_family = "unix")]
         configure_command_process_group(&mut command, stdin_transport);
-        let child_result = spawn_command_with_transport(&mut command, stdin_transport, true);
+        #[cfg(not(target_os = "windows"))]
+        let spawn_stdin_transport = stdin_transport;
+        let child_result = spawn_command_with_transport(&mut command, spawn_stdin_transport, true);
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -6274,7 +6310,7 @@ impl WorkerProcess {
             stderr_reader,
         } = attach_spawned_worker_stdio(
             &mut child,
-            stdin_transport,
+            spawn_stdin_transport,
             #[cfg(target_family = "unix")]
             pty_stdio,
             live_output.clone(),
@@ -7035,6 +7071,26 @@ fn spawn_command_with_transport(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_spawn_transport(
+    command: &mut Command,
+    prepared_args: &[String],
+    stdin_transport: WorkerStdinTransport,
+) -> WorkerStdinTransport {
+    if !matches!(stdin_transport, WorkerStdinTransport::Pty) {
+        return stdin_transport;
+    }
+    if prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox")
+    {
+        command.env(crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV, "1");
+        WorkerStdinTransport::Pipe
+    } else {
+        stdin_transport
+    }
+}
+
 #[cfg(target_family = "unix")]
 fn spawn_command_with_pty(
     command: &mut Command,
@@ -7096,7 +7152,36 @@ fn spawn_command_with_pty(
     })
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(target_family = "windows")]
+fn spawn_command_with_pty(
+    command: &mut Command,
+    _echo: bool,
+) -> Result<SpawnedCommand, WorkerError> {
+    let mut wrapper = Command::new(std::env::current_exe()?);
+    wrapper.arg(crate::windows_conpty::WINDOWS_CONPTY_ARG);
+    wrapper.arg("--");
+    wrapper.arg(command.get_program());
+    wrapper.args(command.get_args());
+    if let Some(cwd) = command.get_current_dir() {
+        wrapper.current_dir(cwd);
+    }
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            wrapper.env(key, value);
+        } else {
+            wrapper.env_remove(key);
+        }
+    }
+    wrapper.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    let child = wrapper
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    Ok(SpawnedCommand { child })
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn spawn_command_with_pty(
     _command: &mut Command,
     _echo: bool,
@@ -7175,7 +7260,27 @@ fn attach_spawned_worker_stdio(
                     stderr_reader: None,
                 })
             }
-            #[cfg(not(target_family = "unix"))]
+            #[cfg(target_family = "windows")]
+            {
+                let stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
+                let stdin_tx = spawn_stdin_writer(stdin);
+                let stdout_reader = spawn_output_reader(
+                    child.stdout.take(),
+                    TextStream::Stdout,
+                    live_output.clone(),
+                )?;
+                let stderr_reader =
+                    spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output)?;
+                Ok(SpawnedWorkerStdio {
+                    stdin_tx,
+                    stdout_reader,
+                    stderr_reader,
+                })
+            }
+            #[cfg(not(any(target_family = "unix", target_family = "windows")))]
             {
                 let _ = child;
                 let _ = live_output;
