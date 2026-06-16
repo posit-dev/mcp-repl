@@ -2193,7 +2193,7 @@ unsafe extern "C" fn mcp_repl_readline(
         }
     };
     clear_current_readline_prompt();
-    if matches!(accounting, StdinReadAccounting::DiscardedAfterInterrupt) {
+    if accounting.discarded_after_interrupt() {
         return allocate_readline_result(b"\n");
     }
     if read.interrupted || take_interrupt_requested() {
@@ -2403,7 +2403,21 @@ enum CStdinLine {
 
 enum StdinReadAccounting {
     Accounted,
+    #[cfg(target_family = "unix")]
     DiscardedAfterInterrupt,
+}
+
+impl StdinReadAccounting {
+    fn discarded_after_interrupt(&self) -> bool {
+        #[cfg(target_family = "unix")]
+        {
+            matches!(self, Self::DiscardedAfterInterrupt)
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            false
+        }
+    }
 }
 
 fn read_c_stdin_line(prompt: &str) -> CStdinLine {
@@ -2475,7 +2489,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
             }
         };
     clear_current_readline_prompt();
-    if matches!(accounting, StdinReadAccounting::DiscardedAfterInterrupt) {
+    if accounting.discarded_after_interrupt() {
         return CStdinLine::Line("\n".to_string());
     }
     if read.interrupted || take_interrupt_requested() {

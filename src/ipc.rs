@@ -1925,6 +1925,7 @@ pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
     }
 }
 
+#[cfg(target_family = "unix")]
 pub fn emit_pty_feed(turn_id: u64, seq: u64, bytes: &[u8]) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::PtyFeed {
@@ -1935,6 +1936,7 @@ pub fn emit_pty_feed(turn_id: u64, seq: u64, bytes: &[u8]) {
     }
 }
 
+#[cfg(target_family = "unix")]
 pub fn emit_stdin_wait(turn_id: u64, prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::StdinWait {

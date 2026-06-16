@@ -402,7 +402,7 @@ fn driver_wait_for_completion(
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     if let Some(ipc) = process.ipc.get() {
         let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
