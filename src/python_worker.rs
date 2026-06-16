@@ -3,11 +3,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use base64::Engine as _;
-
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_python_interrupt_ack, emit_session_end,
-    emit_stdin_write_ack, set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_stdin_write_ack,
+    set_global_ipc,
 };
 use crate::python_session::{self, PythonSession};
 
@@ -90,25 +88,11 @@ fn init_ipc(
                         python_session::mark_request_started();
                         emit_stdin_write_ack();
                     }
-                    Some(ServerToWorkerIpcMessage::TurnStart { .. }) => {}
-                    Some(ServerToWorkerIpcMessage::PythonRequestStart {
-                        request_generation,
-                        stdin_b64,
-                    }) => {
-                        let stdin_bytes =
-                            match base64::engine::general_purpose::STANDARD.decode(stdin_b64) {
-                                Ok(bytes) => bytes,
-                                Err(_) => {
-                                    emit_stderr_message("invalid python_request_start stdin_b64");
-                                    emit_session_end();
-                                    continue;
-                                }
-                            };
-                        python_session::mark_request_started_for_generation(
-                            request_generation,
-                            stdin_bytes,
-                        );
-                        emit_stdin_write_ack();
+                    Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
+                        python_session::begin_turn(turn_id, input);
+                    }
+                    Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
+                        python_session::append_turn_input(turn_id, input);
                     }
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
@@ -128,10 +112,6 @@ fn init_ipc(
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
                         python_session::interrupt();
-                    }
-                    Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
-                        python_session::interrupt_request_generation(request_generation);
-                        emit_python_interrupt_ack();
                     }
                     None => {
                         std::process::exit(0);

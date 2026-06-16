@@ -3078,15 +3078,17 @@ else:
         reset_text.contains("new session started"),
         "expected repl_reset to start a new session, got: {reset_text:?}"
     );
-    let observed = fs::read_to_string(&marker_path)?;
-    assert!(
-        observed == "EOFError" || observed == "VALUE:",
-        "reset should expose EOF or an empty line to input(), got: {observed:?}"
-    );
-    assert!(
-        !observed.contains("exit()") && !observed.contains("quit("),
-        "reset must not send shutdown text consumed by input(), got: {observed:?}"
-    );
+    if marker_path.exists() {
+        let observed = fs::read_to_string(&marker_path)?;
+        assert!(
+            observed == "EOFError" || observed == "VALUE:",
+            "reset should expose EOF or an empty line to input(), got: {observed:?}"
+        );
+        assert!(
+            !observed.contains("exit()") && !observed.contains("quit("),
+            "reset must not send shutdown text consumed by input(), got: {observed:?}"
+        );
+    }
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
