@@ -1699,6 +1699,7 @@ fn read_windows_turn_line(
     let state = SESSION_STATE
         .get()
         .ok_or_else(|| "Python session state is not initialized".to_string())?;
+    let mut idle_repl_prompt_emitted = false;
 
     loop {
         let action = {
@@ -1762,6 +1763,17 @@ fn read_windows_turn_line(
                     }
                 }
                 None => {
+                    let should_emit_idle_repl_prompt = !idle_repl_prompt_emitted
+                        && (prompt == guard.python_primary_prompt
+                            || prompt == guard.python_continuation_prompt);
+                    if should_emit_idle_repl_prompt {
+                        idle_repl_prompt_emitted = true;
+                        guard.last_prompt_was_continuation =
+                            prompt == guard.python_continuation_prompt;
+                        drop(guard);
+                        ipc::emit_readline_start(prompt);
+                        continue;
+                    }
                     if release_gil_while_waiting {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
