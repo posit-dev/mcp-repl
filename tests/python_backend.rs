@@ -4613,6 +4613,42 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_buffered_input_prompt_matching_primary_prompt_stays_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+sys.ps1 = "same> "
+value = input("same> ")
+buffered
+print("MATCHED_PROMPT_VALUE", value)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected buffered input request to complete, got: {text:?}"
+    );
+    assert!(
+        text.matches("same> ").count() >= 2,
+        "expected input() prompt matching sys.ps1 and final prompt to stay visible, got: {text:?}"
+    );
+    assert!(
+        text.contains("MATCHED_PROMPT_VALUE buffered"),
+        "expected input() to consume buffered line, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_releases_gil_while_waiting_for_line() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

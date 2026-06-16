@@ -1,0 +1,29 @@
+---
+source: tests/python_snapshots.rs
+expression: rendered
+---
+== session: input_prompt_matching_ps1 ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "import sys\nsys.ps1 = \"same> \"\nvalue = input(\"same> \")\nbuffered\nprint(\"MATCHED_PROMPT_VALUE\", value)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "same> MATCHED_PROMPT_VALUE buffered"
+    },
+    {
+      "type": "text",
+      "text": "same> "
+    }
+  ]
+}
