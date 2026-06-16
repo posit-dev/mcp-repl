@@ -110,6 +110,13 @@ fn python_backend_unavailable(text: &str) -> bool {
         || text.contains("failed to locate a shared libpython")
 }
 
+#[cfg(windows)]
+fn python_sandbox_unavailable(text: &str) -> bool {
+    python_backend_unavailable(text)
+        || text.contains("worker sandbox error")
+        || text.contains("prepared capability SID requires an unrestricted base token")
+}
+
 fn is_busy_response(text: &str) -> bool {
     text.contains("<<repl status: busy")
         || text.contains("worker is busy")
@@ -177,6 +184,43 @@ async fn start_python_session_with_env_vars(
 
 async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
+}
+
+#[cfg(windows)]
+async fn start_python_session_with_sandbox(
+    sandbox: &str,
+) -> TestResult<Option<common::McpTestSession>> {
+    if !require_python() {
+        return Ok(None);
+    }
+
+    let mut session = common::spawn_server_with_args(vec![
+        "--interpreter".to_string(),
+        "python".to_string(),
+        "--oversized-output".to_string(),
+        "files".to_string(),
+        "--sandbox".to_string(),
+        sandbox.to_string(),
+    ])
+    .await?;
+    let probe = session
+        .write_stdin_raw_with("print('mcp_repl_python_ready')", Some(2.0))
+        .await?;
+    let probe = common::wait_until_not_busy(
+        &mut session,
+        probe,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let probe_text = result_text(&probe);
+    if python_sandbox_unavailable(&probe_text) {
+        eprintln!("python sandbox backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(None);
+    }
+
+    Ok(Some(session))
 }
 
 async fn start_python_pager_session() -> TestResult<Option<common::McpTestSession>> {
@@ -1214,7 +1258,7 @@ print("INPUT", input())
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -1225,6 +1269,15 @@ async fn python_uses_pty_backed_c_stdio_for_input() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             r#"import builtins, os
+exec("""
+import ctypes, os
+if os.name == "nt":
+    try:
+        crt = ctypes.CDLL("ucrtbase")
+    except OSError:
+        crt = ctypes.CDLL("msvcrt")
+    print("CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
+""")
 print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 print("INPUT_IMPL", builtins.input.__module__, builtins.input.__name__)
 value = input("pty> ")
@@ -1245,6 +1298,11 @@ print("PTY_INPUT", value)
     assert!(
         text.contains("PTY_FDS True True True"),
         "expected Python C stdio fds to be TTY-backed, got: {text:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
     );
     assert!(
         text.contains("INPUT_IMPL builtins input"),
@@ -1312,6 +1370,151 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         &direct_fd_modules[2..],
         ["_io", "_io", "posix", "posix"],
         "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_pty_bridges_stdin_surfaces() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import ctypes, os, sys, tempfile
+try:
+    crt = ctypes.CDLL("ucrtbase")
+except OSError:
+    crt = ctypes.CDLL("msvcrt")
+print("CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
+print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
+print("STDIN_BRIDGE", type(sys.stdin).__module__, type(sys.stdin).__name__, sys.stdin.isatty())
+first = input("win> ")
+second = sys.stdin.readline().strip()
+dup_fd = os.dup(0)
+try:
+    third = os.read(dup_fd, 5).decode("utf-8")
+finally:
+    os.close(dup_fd)
+saved_fd = os.dup(0)
+try:
+    with tempfile.TemporaryFile() as replacement:
+        os.dup2(replacement.fileno(), 0)
+        replaced_stdin_isatty = os.isatty(0)
+finally:
+    os.dup2(saved_fd, 0)
+    os.close(saved_fd)
+print("WIN_STDIN_VALUES", first, second, third)
+print("REPLACED_STDIN_ISATTY", replaced_stdin_isatty)
+""")
+alpha
+beta
+gamma
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("WIN_STDIN_VALUES alpha beta gamma")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows PTY stdin bridge test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("PTY_FDS True True True"),
+        "expected Python fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
+        "expected Windows sys.stdin bridge to report TTY-backed stdin, got: {text:?}"
+    );
+    assert!(
+        text.contains("WIN_STDIN_VALUES alpha beta gamma"),
+        "expected input/sys.stdin/dup fd reads to consume buffered turn input, got: {text:?}"
+    );
+    assert!(
+        text.contains("REPLACED_STDIN_ISATTY False"),
+        "expected replaced stdin fd to fall back to real isatty state, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_raw_stdin_read_waits_for_next_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import os
+print("RAW_STDIN_WAITING")
+data = os.read(0, 6)
+print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !is_busy_response(&first_text),
+        "expected raw stdin read to complete the turn at an input boundary, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("RAW_STDIN_WAITING"),
+        "expected code before raw stdin wait to run, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("RAW_STDIN_RESULT"),
+        "raw stdin read should wait for a later turn instead of returning EOF, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("delta", Some(5.0)).await?;
+    let mut text = result_text(&second);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("RAW_STDIN_RESULT delta")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected raw stdin follow-up turn to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("RAW_STDIN_RESULT delta"),
+        "expected raw stdin read to consume next turn input, got: {text:?}"
     );
     Ok(())
 }
@@ -2394,12 +2597,15 @@ async fn python_input_roundtrip() -> TestResult<()> {
 
     let mut text = result_text(
         &session
-            .write_stdin_raw_with("hello\nprint(x)", Some(5.0))
+            .write_stdin_raw_with("hello\nprint('INPUT_VALUE', x)", Some(5.0))
             .await?,
     );
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("hello") {
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("INPUT_VALUE hello")
+        {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
@@ -2409,13 +2615,75 @@ async fn python_input_roundtrip() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    assert!(text.contains("hello"), "expected echo, got: {text:?}");
+    assert!(
+        text.contains("INPUT_VALUE hello"),
+        "expected queued tail after input() to run, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_sandbox_pty_bridges_stdin_surfaces() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session_with_sandbox("read-only").await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import ctypes, os
+try:
+    crt = ctypes.CDLL("ucrtbase")
+except OSError:
+    crt = ctypes.CDLL("msvcrt")
+print("SANDBOX_CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt._isatty(2)))
+""")
+print("SANDBOX_PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
+value = input("sandbox> ")
+inside
+print("SANDBOX_INPUT", value)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("SANDBOX_INPUT inside")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows sandbox PTY stdin bridge test remained busy".into());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SANDBOX_PTY_FDS True True True"),
+        "expected sandboxed Python stdio fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("SANDBOX_CRT_ISATTY True True True"),
+        "expected sandboxed Windows CRT fds to be TTY-backed, got: {text:?}"
+    );
+    assert!(
+        text.contains("SANDBOX_INPUT inside"),
+        "expected sandboxed input() to consume the buffered answer, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_input_accepts_crlf_buffered_line() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -3029,6 +3297,7 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -3809,6 +4078,7 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
     let _guard = lock_test_mutex();

@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_stdin_write_ack,
-    set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_session_end_with_reason,
+    emit_stdin_write_ack, set_global_ipc,
 };
 use crate::python_session::{self, PythonSession};
 
@@ -89,10 +89,22 @@ fn init_ipc(
                         emit_stdin_write_ack();
                     }
                     Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
-                        python_session::begin_turn(turn_id, input);
+                        match python_session::begin_turn(turn_id, input) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                emit_stderr_message(&err);
+                                emit_session_end_with_reason("protocol_error", Some(turn_id));
+                            }
+                        }
                     }
                     Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
-                        python_session::append_turn_input(turn_id, input);
+                        match python_session::append_turn_input(turn_id, input) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                emit_stderr_message(&err);
+                                emit_session_end_with_reason("protocol_error", Some(turn_id));
+                            }
+                        }
                     }
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
@@ -110,8 +122,20 @@ fn init_ipc(
                     Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {
                         python_session::mark_stdin_write_complete();
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
-                        python_session::interrupt();
+                    Some(ServerToWorkerIpcMessage::Interrupt { turn_id }) => {
+                        #[cfg(windows)]
+                        {
+                            if let Some(turn_id) = turn_id {
+                                python_session::interrupt_turn(turn_id);
+                            } else {
+                                python_session::interrupt();
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = turn_id;
+                            python_session::interrupt();
+                        }
                     }
                     None => {
                         std::process::exit(0);
