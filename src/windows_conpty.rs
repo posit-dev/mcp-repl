@@ -19,6 +19,11 @@ use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, HPCON,
     STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
@@ -183,6 +188,11 @@ pub fn run_conpty_command_with_env_map(
         let proc_info = spawn_conpty_process(command, cwd, &env_map, conpty.hpc)?;
         conpty.close_child_side_handles();
         crate::diagnostics::startup_log("windows-conpty: child spawned");
+        let _job_handle = JobHandle::kill_on_close()
+            .inspect(|job| {
+                let _ = AssignProcessToJobObject(job.raw(), proc_info.hProcess);
+            })
+            .ok();
 
         let wait_status = WaitForSingleObject(proc_info.hProcess, INFINITE);
         if wait_status == WAIT_FAILED {
@@ -208,6 +218,46 @@ pub fn run_conpty_command_with_env_map(
         drop(conpty);
         let _ = output_forwarder.join();
         Ok(exit_code as i32)
+    }
+}
+
+struct JobHandle(HANDLE);
+
+impl JobHandle {
+    unsafe fn kill_on_close() -> Result<Self, String> {
+        let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if handle.is_null() {
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            &mut limits as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(format!("SetInformationJobObject failed: {err}"));
+        }
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
     }
 }
 

@@ -959,6 +959,7 @@ impl BackendDriver for PythonBackendDriver {
 struct ProtocolBackendDriver {
     #[cfg(target_family = "unix")]
     python_request_generation: Option<u64>,
+    is_builtin_python: bool,
     protocol_version: Option<u32>,
     next_turn_id: u64,
     active_turn_id: Option<u64>,
@@ -969,6 +970,7 @@ impl ProtocolBackendDriver {
         Self {
             #[cfg(target_family = "unix")]
             python_request_generation: None,
+            is_builtin_python: false,
             protocol_version: None,
             next_turn_id: 1,
             active_turn_id: None,
@@ -982,7 +984,12 @@ impl ProtocolBackendDriver {
         }
         #[cfg(not(target_family = "unix"))]
         {
-            Self::new()
+            Self {
+                is_builtin_python: true,
+                protocol_version: None,
+                next_turn_id: 1,
+                active_turn_id: None,
+            }
         }
     }
 
@@ -990,6 +997,7 @@ impl ProtocolBackendDriver {
     fn python() -> Self {
         Self {
             python_request_generation: Some(0),
+            is_builtin_python: true,
             protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
             next_turn_id: 1,
             active_turn_id: None,
@@ -1129,13 +1137,16 @@ impl BackendDriver for ProtocolBackendDriver {
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if self.is_v3() {
-            if let Some(turn_id) = self.active_turn_id
-                && let Some(ipc) = process.ipc.get()
-            {
-                ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                    turn_id: Some(turn_id),
-                })
-                .map_err(WorkerError::Io)?;
+            if let Some(ipc) = process.ipc.get() {
+                if let Some(turn_id) = self.active_turn_id {
+                    ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                        turn_id: Some(turn_id),
+                    })
+                    .map_err(WorkerError::Io)?;
+                } else if self.is_builtin_python {
+                    ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
+                        .map_err(WorkerError::Io)?;
+                }
             }
             return process.send_interrupt();
         }
