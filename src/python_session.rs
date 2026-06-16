@@ -31,6 +31,10 @@ const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
+// Keep PTY feeds below conservative terminal input queues while still carrying
+// nearby complete lines for real sys.stdin/fd reads that do not enter _mcp_repl.
+#[cfg(target_family = "unix")]
+const PTY_FEED_TARGET_BYTES: usize = 128;
 const PYTHON_CONFIG_SNIPPET: &str = r#"
 import json
 import sys
@@ -695,7 +699,27 @@ fn emit_protocol_failure(_message: &str) {}
 
 #[cfg(target_family = "unix")]
 fn pending_protocol_stdin(bytes: &VecDeque<u8>) -> Vec<u8> {
-    bytes.iter().copied().collect()
+    let mut byte_count = 0;
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let line_end = idx.saturating_add(1);
+        if line_end > PTY_FEED_TARGET_BYTES && byte_count > 0 {
+            break;
+        }
+        byte_count = line_end;
+        if byte_count >= PTY_FEED_TARGET_BYTES {
+            break;
+        }
+    }
+    if byte_count == 0 {
+        byte_count = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |idx| idx.saturating_add(1));
+    }
+    bytes.iter().take(byte_count).copied().collect()
 }
 
 #[cfg(target_family = "unix")]
@@ -2486,6 +2510,7 @@ fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         return Ok(Vec::new());
     }
 
+    request_runtime_stdin_line("");
     let _allow_threads = PythonThreadsAllowed::new();
     let bytes = read_fd_bytes(libc::STDIN_FILENO, size);
     if let Err(err) = note_stdin_bytes_read(&bytes) {

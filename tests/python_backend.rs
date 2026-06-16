@@ -1169,6 +1169,52 @@ async fn python_long_physical_line_does_not_complete_before_execution() -> TestR
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session_with_env_vars(vec![(
+        "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS".to_string(),
+        "1000".to_string(),
+    )])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let tail = "x_tail_value = 1\n".repeat(200_000);
+    let input = format!("import time; time.sleep(8)\n{tail}print('TAIL_AFTER_SLEEP')");
+    let first = session.write_stdin_raw_with(input, Some(0.2)).await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected sleep call with large buffered tail to time out, got: {first_text:?}"
+    );
+
+    sleep(Duration::from_millis(1_500)).await;
+    let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        is_busy_response(&poll_text),
+        "expected request to remain busy instead of reporting a worker error, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("pty_feed write failed"),
+        "PTY backpressure should not become a protocol error, got: {poll_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    if is_busy_response(&interrupt_text) {
+        eprintln!("large-tail interrupt stayed busy; cancelling session");
+    }
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();

@@ -1011,6 +1011,8 @@ impl std::error::Error for WorkerError {
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_FEED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(debug_assertions)]
+const PTY_FEED_WRITE_TIMEOUT_ENV: &str = "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS";
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -1077,6 +1079,23 @@ impl From<std::io::Error> for WorkerError {
     fn from(err: std::io::Error) -> Self {
         WorkerError::Io(err)
     }
+}
+
+fn pty_feed_write_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var(PTY_FEED_WRITE_TIMEOUT_ENV) {
+        let millis = value
+            .trim()
+            .parse::<u64>()
+            .expect("MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be integer milliseconds");
+        assert!(
+            millis > 0,
+            "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be greater than zero"
+        );
+        return Duration::from_millis(millis);
+    }
+
+    PTY_FEED_WRITE_TIMEOUT
 }
 
 struct InputContext {
@@ -5882,8 +5901,12 @@ impl WorkerProcess {
                         );
                     }
                     let _ = (feed.turn_id, feed.seq);
-                    send_stdin_command(&pty_feed_stdin_tx, Some(feed.bytes), PTY_FEED_WRITE_TIMEOUT)
-                        .map_err(|err| err.to_string())
+                    send_stdin_command(
+                        &pty_feed_stdin_tx,
+                        Some(feed.bytes),
+                        pty_feed_write_timeout(),
+                    )
+                    .map_err(|err| err.to_string())
                 })),
                 on_session_end: {
                     let sideband_capture = live_output.clone();
