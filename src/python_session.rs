@@ -1786,25 +1786,9 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
 #[cfg(not(any(target_family = "unix", windows)))]
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
+    _current_readline_state: Option<PythonReadlineState>,
 ) -> bool {
-    #[cfg(target_family = "unix")]
-    {
-        let input_drained = request_input_drained(active);
-        (prompt_wait_can_complete(active, current_readline_state)
-            && (single_line_client_input_prompt(active, current_readline_state) || input_drained))
-            || (active.started_after_continuation_prompt && input_drained)
-    }
-    #[cfg(windows)]
-    {
-        prompt_can_complete_before_repl_turn(active, current_readline_state)
-            && active.byte_len > 0
-            && stdin_pending_byte_count() == Some(0)
-    }
-    #[cfg(not(any(target_family = "unix", windows)))]
-    {
-        active.consumed_lines >= active.line_count
-    }
+    active.consumed_lines >= active.line_count
 }
 
 #[cfg(target_family = "unix")]
@@ -1834,17 +1818,6 @@ fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
     {
         active.consumed_lines >= active.line_count
     }
-}
-
-#[cfg(windows)]
-fn prompt_can_complete_before_repl_turn(
-    active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    matches!(
-        current_readline_state,
-        Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
-    ) || active.fallback_prompt.is_some()
 }
 
 #[cfg(target_family = "unix")]
@@ -2701,6 +2674,7 @@ fn emit_plots() {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn record_background_plots() {
     let _gil = GilGuard::acquire();
     let api = PythonApi::global();
