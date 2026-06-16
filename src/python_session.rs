@@ -8,7 +8,7 @@ use std::ptr;
 #[cfg(target_family = "unix")]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::Deserialize;
 
@@ -81,9 +81,6 @@ struct PythonRuntimeProbe {
     pythonframeworkinstalldir: String,
 }
 
-#[derive(Debug)]
-pub struct RequestCompleted;
-
 pub struct PythonSession {
     init: Arc<SessionInit>,
 }
@@ -106,18 +103,6 @@ impl PythonSession {
 
     pub fn wait_until_ready(&self) -> Result<(), String> {
         self.init.wait_ready()
-    }
-
-    pub fn begin_request(
-        &self,
-        byte_len: usize,
-        line_count: usize,
-        fallback_prompt: Option<String>,
-    ) -> Result<mpsc::Receiver<RequestCompleted>, String> {
-        self.wait_until_ready()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        begin_tracked_request(byte_len, line_count, fallback_prompt, reply_tx)?;
-        Ok(reply_rx)
     }
 
     pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
@@ -360,10 +345,6 @@ pub(crate) fn mark_stdin_write_complete() {
         ipc::emit_readline_start(prompt);
         complete_active_request(state, Some(active), false);
     }
-}
-
-pub(crate) fn mark_request_started() {
-    mark_request_started_with_generation(None, Vec::new());
 }
 
 pub(crate) fn mark_request_started_for_generation(request_generation: u64, stdin_bytes: Vec<u8>) {
@@ -1189,53 +1170,6 @@ fn finalize_python(
     }
 }
 
-fn begin_tracked_request(
-    byte_len: usize,
-    line_count: usize,
-    fallback_prompt: Option<String>,
-    reply: mpsc::Sender<RequestCompleted>,
-) -> Result<(), String> {
-    let state = session_state();
-    if line_count == 0 {
-        let _ = reply.send(RequestCompleted);
-        return Ok(());
-    }
-
-    let mut guard = state.inner.lock().unwrap();
-    while guard.active_request.is_some() && !guard.shutdown {
-        guard = state.cvar.wait(guard).unwrap();
-    }
-    if guard.shutdown {
-        return Err("Python session is shutting down".to_string());
-    }
-
-    let skip_next_hook = !guard.waiting_for_input;
-    let started_after_continuation_prompt = guard.last_prompt_was_continuation;
-    guard.waiting_for_input = false;
-    guard.request_generation = guard.request_generation.wrapping_add(1);
-    guard.request_completed_at_stdin_wait = false;
-    guard.active_request = Some(ActiveRequest {
-        reply: Some(reply),
-        turn_id: None,
-        byte_len,
-        line_count,
-        fallback_prompt,
-        queued_lines: VecDeque::new(),
-        consumed_lines: 0,
-        skip_next_hook,
-        stdin_write_complete: false,
-        repl_turn_finished: false,
-        started_after_continuation_prompt,
-    });
-    #[cfg(not(target_family = "unix"))]
-    {
-        guard.request_active = true;
-    }
-    guard.plot_reset_pending = true;
-    state.cvar.notify_all();
-    Ok(())
-}
-
 fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     let state = session_state();
     let queued_lines = prepare_turn_input_lines(&input);
@@ -1260,7 +1194,6 @@ fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     guard.turn_cleanup_uncertain = false;
     let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.active_request = Some(ActiveRequest {
-        reply: None,
         turn_id: Some(turn_id),
         byte_len,
         line_count,
@@ -1720,8 +1653,9 @@ fn finish_repl_turn_request() {
             guard.waiting_for_input = true;
         } else {
             // Protocol-style Unix Python has no worker-local ActiveRequest; the
-            // server owns completion, so RequestStart keeps plot state active
-            // across all PyRun_InteractiveOne turns in one MCP request.
+            // server owns completion, so request-start metadata keeps plot
+            // state active across all PyRun_InteractiveOne turns in one MCP
+            // request.
             #[cfg(not(target_family = "unix"))]
             {
                 guard.request_active = false;
@@ -2501,7 +2435,6 @@ struct SessionStateInner {
 
 #[allow(dead_code)]
 struct ActiveRequest {
-    reply: Option<mpsc::Sender<RequestCompleted>>,
     turn_id: Option<u64>,
     byte_len: usize,
     line_count: usize,
@@ -2566,10 +2499,7 @@ fn complete_active_request_with_options(
     active: Option<ActiveRequest>,
     emit_session_end: bool,
 ) {
-    if let Some(active) = active
-        && let Some(reply) = active.reply
-    {
-        let _ = reply.send(RequestCompleted);
+    if active.is_some() {
         state.cvar.notify_all();
     }
     if emit_session_end {
@@ -2924,9 +2854,7 @@ mod tests {
         consumed_lines: usize,
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
-        let (reply, _rx) = std::sync::mpsc::channel();
         ActiveRequest {
-            reply: Some(reply),
             turn_id: None,
             byte_len: 1,
             line_count,
