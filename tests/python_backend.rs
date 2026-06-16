@@ -95,7 +95,6 @@ fn python_plot_tests_enabled() -> bool {
     python_plotting_available()
 }
 
-#[cfg(not(unix))]
 fn image_count(result: &rmcp::model::CallToolResult) -> usize {
     result
         .content
@@ -708,6 +707,58 @@ async fn python_smoke() -> TestResult<()> {
     assert!(text.contains("2"), "expected 2, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_plot_hook_flushes_before_stdin_wait_reply() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import _mcp_repl
+emit_at_wait = False
+def _mcp_repl_emit_plots():
+    if emit_at_wait:
+        _mcp_repl.emit_plot_image("image/png", "cGxvdA==", False, "forced")
+""")
+emit_at_wait = True; value = input("plot wait> ")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    let mut result = result;
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("plot wait> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            result = session.write_stdin_raw_with("", Some(1.0)).await?;
+            text = result_text(&result);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected stdin wait reply, got: {text:?}"
+    );
+    assert!(
+        text.contains("plot wait> "),
+        "expected stdin wait prompt, got: {text:?}"
+    );
+    assert_eq!(
+        image_count(&result),
+        1,
+        "expected plot hook to flush before stdin wait completed the request, got text: {text:?}"
+    );
     Ok(())
 }
 
@@ -2975,6 +3026,60 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     assert!(
         follow_up_text.contains("AFTER_INPUT_INTERRUPT"),
         "expected follow-up to run after input prompt interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('win interrupt> ')", Some(5.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("win interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        !is_busy_response(&text),
+        "expected input prompt before interrupt, got: {text:?}"
+    );
+    assert!(
+        text.contains("win interrupt> "),
+        "expected input prompt before interrupt, got: {text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected idle input interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_WINDOWS_STDIN_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_WINDOWS_STDIN_INTERRUPT"),
+        "expected follow-up to run after idle input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }

@@ -780,8 +780,6 @@ fn prepare_readline_demand_locked(guard: &mut SessionStateInner, prompt: &str) -
         guard.active_turn_id = None;
         ReadlineDemand::Idle { turn_id, prompt }
     } else {
-        guard.request_active = false;
-        guard.request_completed_at_stdin_wait = true;
         guard.active_turn_id = None;
         ReadlineDemand::StdinWait { turn_id, prompt }
     }
@@ -798,6 +796,7 @@ fn emit_readline_demand(demand: ReadlineDemand) {
         }
         ReadlineDemand::StdinWait { turn_id, prompt } => {
             emit_plots();
+            mark_stdin_wait_prompt_completed_request();
             ipc::emit_stdin_wait(turn_id, &prompt);
         }
         ReadlineDemand::ReadlineStart { prompt } => {
@@ -3051,7 +3050,6 @@ fn emit_output_text(stream: TextStream, bytes: &[u8]) {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
 fn mark_stdin_wait_prompt_completed_request() {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -3061,8 +3059,8 @@ fn mark_stdin_wait_prompt_completed_request() {
     // response boundary for the current MCP request. The Python read can then
     // block while background Python threads keep running. Clear the plot gate at
     // this boundary to prevent those background updates from being attributed to
-    // the request that already completed. On Unix this also happens before the
-    // prompt sideband is emitted because the server owns that completion path.
+    // the request that already completed. Callers flush prompt-time plots before
+    // closing this gate.
     guard.request_active = false;
     guard.request_completed_at_stdin_wait = true;
 }

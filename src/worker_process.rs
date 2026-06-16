@@ -866,6 +866,7 @@ impl BackendDriver for PythonBackendDriver {
 struct ProtocolBackendDriver {
     next_turn_id: u64,
     active_turn_id: Option<u64>,
+    is_builtin_python: bool,
 }
 
 impl ProtocolBackendDriver {
@@ -873,6 +874,15 @@ impl ProtocolBackendDriver {
         Self {
             next_turn_id: 1,
             active_turn_id: None,
+            is_builtin_python: false,
+        }
+    }
+
+    fn builtin_python() -> Self {
+        Self {
+            next_turn_id: 1,
+            active_turn_id: None,
+            is_builtin_python: true,
         }
     }
 
@@ -951,13 +961,16 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(turn_id) = self.active_turn_id
-            && let Some(ipc) = process.ipc.get()
-        {
-            ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                turn_id: Some(turn_id),
-            })
-            .map_err(WorkerError::Io)?;
+        if let Some(ipc) = process.ipc.get() {
+            if let Some(turn_id) = self.active_turn_id {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                    turn_id: Some(turn_id),
+                })
+                .map_err(WorkerError::Io)?;
+            } else if self.is_builtin_python {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
+                    .map_err(WorkerError::Io)?;
+            }
         }
         process.send_interrupt()
     }
@@ -1309,7 +1322,9 @@ impl WorkerManager {
             output_timeline,
             driver: match worker_launch {
                 WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
-                WorkerLaunch::Builtin(Backend::Python) => Box::new(ProtocolBackendDriver::new()),
+                WorkerLaunch::Builtin(Backend::Python) => {
+                    Box::new(ProtocolBackendDriver::builtin_python())
+                }
                 WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
             },
             pending_request: false,
