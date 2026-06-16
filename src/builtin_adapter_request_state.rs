@@ -2,14 +2,14 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub(crate) struct LegacyRequestState {
+pub(crate) struct BuiltinAdapterRequestState {
     active_stdin: Option<VecDeque<u8>>,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
 }
 
-impl LegacyRequestState {
+impl BuiltinAdapterRequestState {
     pub(crate) fn begin_with_stdin(&mut self, payload: &[u8]) {
         self.active_stdin = Some(payload.iter().copied().collect());
     }

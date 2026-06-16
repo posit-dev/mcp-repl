@@ -14,6 +14,8 @@ use serde::Deserialize;
 
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
+#[cfg(target_family = "unix")]
+use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -29,6 +31,10 @@ const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
+// Keep PTY feeds below conservative terminal input queues while still carrying
+// nearby complete lines for real sys.stdin/fd reads that do not enter _mcp_repl.
+#[cfg(target_family = "unix")]
+const PTY_FEED_TARGET_BYTES: usize = 128;
 const PYTHON_CONFIG_SNIPPET: &str = r#"
 import json
 import sys
@@ -82,10 +88,12 @@ struct PythonRuntimeProbe {
 }
 
 pub struct PythonSession {
+    #[cfg(windows)]
     init: Arc<SessionInit>,
 }
 
 impl PythonSession {
+    #[cfg(windows)]
     pub fn global() -> Result<&'static PythonSession, String> {
         SESSION
             .get()
@@ -94,23 +102,29 @@ impl PythonSession {
 
     pub fn start_on_current_thread() -> Result<(), String> {
         let init = Arc::new(SessionInit::new());
-        let session = PythonSession { init: init.clone() };
+        let session = PythonSession {
+            #[cfg(windows)]
+            init: init.clone(),
+        };
         if SESSION.set(session).is_err() {
             return Err("Python session already initialized".to_string());
         }
         run_session_on_current_thread(init)
     }
 
+    #[cfg(windows)]
     pub fn wait_until_ready(&self) -> Result<(), String> {
         self.init.wait_ready()
     }
 
+    #[cfg(windows)]
     pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
         begin_tracked_turn(turn_id, input)
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug)]
 enum InitState {
     Pending,
@@ -144,6 +158,7 @@ impl SessionInit {
         self.cvar.notify_all();
     }
 
+    #[cfg(windows)]
     fn wait_ready(&self) -> Result<(), String> {
         let mut guard = self.state.lock().unwrap();
         loop {
@@ -186,10 +201,7 @@ pub(crate) fn interrupt() {
     interrupt_for_request_generation(None);
 }
 
-pub(crate) fn interrupt_request_generation(request_generation: u64) {
-    interrupt_for_request_generation(Some(request_generation));
-}
-
+#[cfg(windows)]
 pub(crate) fn interrupt_turn(turn_id: u64) {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -215,9 +227,7 @@ pub(crate) fn interrupt_turn(turn_id: u64) {
 }
 
 fn interrupt_for_request_generation(request_generation: Option<u64>) {
-    if !interrupt_generation_is_current(request_generation) {
-        return;
-    }
+    let _ = request_generation;
     discard_pending_stdin();
     #[cfg(target_family = "unix")]
     flush_terminal_input();
@@ -230,26 +240,6 @@ fn interrupt_for_request_generation(request_generation: Option<u64>) {
 #[cfg(target_family = "unix")]
 fn flush_terminal_input() {
     let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
-}
-
-fn interrupt_generation_is_current(request_generation: Option<u64>) -> bool {
-    let Some(request_generation) = request_generation else {
-        return true;
-    };
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let guard = state.inner.lock().unwrap();
-    // Unix Python receives SIGINT out-of-band from the server and an IPC
-    // interrupt message on a separate thread. SIGINT can bring Python back to a
-    // prompt before the IPC thread handles that message; if the next MCP
-    // request has already started, draining fd 0 here would discard the new
-    // request's stdin. Generated Python interrupts are therefore allowed to
-    // clean up only while their original request generation is still current.
-    // The tradeoff is that a very late interrupt stops cleaning old tail bytes
-    // once a later request is accepted; preserving the new request boundary is
-    // the stricter REPL contract.
-    guard.request_generation == request_generation
 }
 
 fn mark_interrupt_requested() {
@@ -279,79 +269,68 @@ fn take_interrupt_requested() -> bool {
     requested
 }
 
-pub(crate) fn mark_stdin_write_complete() {
+pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
-    let protocol_input_exhausted = protocol_request_input_exhausted();
-
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let mut completed = None;
-    let mut prompt = None;
     {
-        let mut guard = state.inner.lock().unwrap();
-        let current_prompt_from_state = guard.current_prompt.clone();
-        let current_readline_state = guard.current_readline_state;
-        let primary_prompt = guard.python_primary_prompt.clone();
-        let continuation_prompt = guard.python_continuation_prompt.clone();
-        let waiting_for_input = guard.waiting_for_input;
-        #[cfg(target_family = "unix")]
-        if protocol_input_exhausted && guard.active_request.is_none() && waiting_for_input {
-            // Unix protocol-mode Python can reach the next prompt before the IPC
-            // thread observes StdinWriteComplete. In that case the prompt hook
-            // deliberately left the plot gate open because stdin was not yet
-            // accounted; close it here once the explicit write-complete signal
-            // proves the already-emitted prompt is the request boundary.
-            guard.request_active = false;
-        }
-        if let Some(active) = guard.active_request.as_mut() {
-            active.stdin_write_complete = true;
-            let continuation_write_complete =
-                windows_continuation_prompt_write_should_complete(active, current_readline_state);
-            let should_complete = if active.repl_turn_finished {
-                request_repl_turn_should_complete(active)
-            } else {
-                request_prompt_wait_should_complete(active, current_readline_state)
-                    || continuation_write_complete
-            };
-            if (waiting_for_input || continuation_write_complete) && should_complete {
-                let fallback_prompt = if active.repl_turn_finished {
-                    None
-                } else {
-                    active
-                        .fallback_prompt
-                        .as_deref()
-                        .or_else(|| active.started_after_continuation_prompt.then_some(""))
-                };
-                prompt = Some(repl_prompt_for(
-                    current_prompt_from_state.clone(),
-                    fallback_prompt,
-                    current_readline_state,
-                    &primary_prompt,
-                    &continuation_prompt,
-                ));
-                completed = guard.active_request.take();
+        let payload = normalize_pty_turn_payload(prepare_worker_stdin_payload(&input));
+        begin_or_append_turn_input(turn_id, payload);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        PythonSession::global()?.begin_turn(turn_id, input)
+    }
+
+    #[cfg(not(any(target_family = "unix", windows)))]
+    {
+        let _ = (turn_id, input);
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "unix")]
+pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
+    let payload = normalize_pty_turn_payload(prepare_worker_stdin_payload(&input));
+    begin_or_append_turn_input(turn_id, payload);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
+    append_tracked_turn_input(turn_id, input)
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
+pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
+    let _ = (turn_id, input);
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn normalize_pty_turn_payload(payload: Vec<u8>) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(payload.len());
+    let mut idx = 0;
+    while idx < payload.len() {
+        match payload[idx] {
+            b'\r' => {
+                normalized.push(b'\n');
+                idx += 1;
+                if payload.get(idx) == Some(&b'\n') {
+                    idx += 1;
+                }
+            }
+            byte => {
+                normalized.push(byte);
+                idx += 1;
             }
         }
     }
-
-    if let Some(active) = completed {
-        emit_plots();
-        #[cfg(not(target_family = "unix"))]
-        mark_stdin_wait_prompt_completed_request();
-        // Python object flushes run from handle_input_hook on the Python thread.
-        let prompt = prompt.as_deref().unwrap_or(">>> ");
-        remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt);
-        complete_active_request(state, Some(active), false);
-    }
+    normalized
 }
 
-pub(crate) fn mark_request_started_for_generation(request_generation: u64, stdin_bytes: Vec<u8>) {
-    mark_request_started_with_generation(Some(request_generation), stdin_bytes);
-}
-
-fn mark_request_started_with_generation(request_generation: Option<u64>, stdin_bytes: Vec<u8>) {
+#[cfg(target_family = "unix")]
+fn begin_or_append_turn_input(turn_id: u64, payload: Vec<u8>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
@@ -360,47 +339,55 @@ fn mark_request_started_with_generation(request_generation: Option<u64>, stdin_b
         !guard.request_active || guard.request_completed_at_stdin_wait
     };
     if should_record_background_plots {
-        // A stdin-wait prompt closes the MCP request while Python threads can
-        // still mutate matplotlib state. Snapshot those inactive plots before
-        // reopening the gate so a later stdin answer does not flush stale
-        // background figures into its reply. A later explicit plot/show in the
-        // new request still forces a fresh image.
         record_background_plots();
     }
-    let mut guard = state.inner.lock().unwrap();
-    if let Some(request_generation) = request_generation {
-        guard.request_generation = request_generation;
-    } else {
-        guard.request_generation = guard.request_generation.wrapping_add(1);
-    }
-    guard.interrupt_requested = false;
-    guard.request_completed_at_stdin_wait = false;
-    guard.request_active = true;
-    #[cfg(target_family = "unix")]
-    {
-        guard.protocol_stdin_bytes = stdin_bytes.into();
-    }
-    #[cfg(not(target_family = "unix"))]
-    {
-        let _ = stdin_bytes;
-    }
-    guard.plot_reset_pending = true;
-}
 
-#[cfg(windows)]
-fn windows_continuation_prompt_write_should_complete(
-    active: &ActiveRequest,
-    _current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    active.started_after_continuation_prompt && active.line_count == 1
-}
-
-#[cfg(not(windows))]
-fn windows_continuation_prompt_write_should_complete(
-    _active: &ActiveRequest,
-    _current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    false
+    let mut failure = None;
+    let demand = {
+        let mut guard = state.inner.lock().unwrap();
+        match guard.active_turn_id {
+            Some(active) if active != turn_id && !guard.protocol_stdin_bytes.is_empty() => {
+                let message =
+                    format!("turn_input turn_id {turn_id} does not match active turn_id {active}");
+                mark_protocol_failure_locked(&mut guard);
+                failure = Some(message);
+                None
+            }
+            Some(active) if active != turn_id && guard.pty_feed_in_flight.is_some() => {
+                let message = format!(
+                    "turn_input turn_id {turn_id} arrived while turn_id {active} has a feed in flight"
+                );
+                mark_protocol_failure_locked(&mut guard);
+                failure = Some(message);
+                None
+            }
+            _ => {
+                if guard.active_turn_id != Some(turn_id) {
+                    guard.next_pty_feed_seq = 1;
+                }
+                guard.active_turn_id = Some(turn_id);
+                guard.interrupt_requested = false;
+                guard.discard_untracked_stdin_after_interrupt = false;
+                guard.request_completed_at_stdin_wait = false;
+                guard.request_active = true;
+                guard.protocol_stdin_bytes.extend(payload);
+                guard.plot_reset_pending = true;
+                if guard.waiting_for_input {
+                    let prompt = guard.current_prompt.clone().unwrap_or_default();
+                    Some(prepare_readline_demand_locked(&mut guard, &prompt))
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    if let Some(message) = failure {
+        emit_protocol_failure(&message);
+        return;
+    }
+    if let Some(demand) = demand {
+        emit_readline_demand(demand);
+    }
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -421,11 +408,19 @@ fn finish_active_request_at_next_read() {
 fn discard_pending_stdin() {
     let mut discarded = Vec::new();
     discarded.extend(drain_process_stdin_pipe());
-    if discarded.is_empty() {
+    clear_protocol_stdin_after_interrupt(&discarded);
+}
+
+#[cfg(target_family = "unix")]
+fn clear_protocol_stdin_after_interrupt(runtime_discarded: &[u8]) {
+    let _ = take_protocol_stdin_bytes_for_runtime_read(runtime_discarded);
+    let Some(state) = SESSION_STATE.get() else {
         return;
-    }
-    let discarded = take_protocol_stdin_bytes_for_runtime_read(&discarded);
-    ipc::emit_readline_discard_bytes(&discarded);
+    };
+    let mut guard = state.inner.lock().unwrap();
+    guard.protocol_stdin_bytes.clear();
+    guard.pty_feed_in_flight = None;
+    guard.discard_untracked_stdin_after_interrupt = true;
 }
 
 #[cfg(target_family = "unix")]
@@ -500,7 +495,15 @@ impl Drop for NonBlockingFd {
 
 #[cfg(target_family = "unix")]
 fn request_runtime_stdin_line(prompt: &str) -> bool {
-    ipc::emit_readline_start(prompt);
+    let Some(state) = SESSION_STATE.get() else {
+        ipc::emit_readline_start(prompt);
+        return true;
+    };
+    let demand = {
+        let mut guard = state.inner.lock().unwrap();
+        prepare_readline_demand_locked(&mut guard, prompt)
+    };
+    emit_readline_demand(demand);
     true
 }
 
@@ -521,6 +524,181 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
         Some(count as usize)
     } else {
         None
+    }
+}
+
+#[cfg(target_family = "unix")]
+struct PendingPtyFeed {
+    turn_id: u64,
+    seq: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_family = "unix")]
+enum ReadlineDemand {
+    Feed(PendingPtyFeed),
+    Idle { turn_id: u64, prompt: String },
+    StdinWait { turn_id: u64, prompt: String },
+    ReadlineStart { prompt: String },
+    ProtocolFailure { message: String },
+}
+
+#[cfg(target_family = "unix")]
+fn mark_protocol_failure_locked(guard: &mut SessionStateInner) {
+    guard.session_end_emitted = true;
+    guard.shutdown = true;
+    guard.request_active = false;
+    guard.active_turn_id = None;
+    guard.protocol_stdin_bytes.clear();
+    guard.pty_feed_in_flight = None;
+    guard.discard_untracked_stdin_after_interrupt = false;
+}
+
+#[cfg(target_family = "unix")]
+fn emit_protocol_failure(message: &str) {
+    if let Some(state) = SESSION_STATE.get() {
+        let mut guard = state.inner.lock().unwrap();
+        mark_protocol_failure_locked(&mut guard);
+    }
+    emit_output_text(TextStream::Stderr, message.as_bytes());
+    ipc::emit_session_end();
+}
+
+#[cfg(not(target_family = "unix"))]
+fn emit_protocol_failure(_message: &str) {}
+
+#[cfg(target_family = "unix")]
+fn pending_protocol_stdin(bytes: &VecDeque<u8>) -> Vec<u8> {
+    let mut byte_count = 0;
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let line_end = idx.saturating_add(1);
+        if line_end > PTY_FEED_TARGET_BYTES && byte_count > 0 {
+            break;
+        }
+        byte_count = line_end;
+        if byte_count >= PTY_FEED_TARGET_BYTES {
+            break;
+        }
+    }
+    if byte_count == 0 {
+        byte_count = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |idx| idx.saturating_add(1));
+    }
+    bytes.iter().take(byte_count).copied().collect()
+}
+
+#[cfg(target_family = "unix")]
+fn reconcile_direct_pty_stdin_reads_locked(guard: &mut SessionStateInner) -> Result<(), String> {
+    // sys.stdin and os.read(0, ...) consume PTY bytes without entering
+    // _mcp_repl, so reconcile queued protocol bytes against the PTY backlog.
+    let Some(pending_byte_count) = runtime_stdin_pending_byte_count() else {
+        return Ok(());
+    };
+    let Some(in_flight) = guard.pty_feed_in_flight.as_mut() else {
+        return Ok(());
+    };
+    if pending_byte_count >= in_flight.len() {
+        return Ok(());
+    }
+
+    let consumed = in_flight.len() - pending_byte_count;
+    if consumed > guard.protocol_stdin_bytes.len() {
+        return Err(format!(
+            "runtime stdin consumed {consumed} bytes but only {} protocol stdin bytes remain",
+            guard.protocol_stdin_bytes.len()
+        ));
+    }
+    in_flight.drain(..consumed);
+    if in_flight.is_empty() {
+        guard.pty_feed_in_flight = None;
+    }
+    guard.protocol_stdin_bytes.drain(..consumed);
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn prepare_pending_pty_feed_locked(guard: &mut SessionStateInner) -> Option<PendingPtyFeed> {
+    if !guard.waiting_for_input || guard.pty_feed_in_flight.is_some() {
+        return None;
+    }
+    let turn_id = guard.active_turn_id?;
+    if guard.protocol_stdin_bytes.is_empty() {
+        return None;
+    }
+    let bytes = pending_protocol_stdin(&guard.protocol_stdin_bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+    let seq = guard.next_pty_feed_seq;
+    guard.next_pty_feed_seq = guard.next_pty_feed_seq.saturating_add(1);
+    guard.pty_feed_in_flight = Some(bytes.clone());
+    Some(PendingPtyFeed {
+        turn_id,
+        seq,
+        bytes,
+    })
+}
+
+#[cfg(target_family = "unix")]
+fn prepare_readline_demand_locked(guard: &mut SessionStateInner, prompt: &str) -> ReadlineDemand {
+    guard.waiting_for_input = true;
+    if let Err(message) = reconcile_direct_pty_stdin_reads_locked(guard) {
+        mark_protocol_failure_locked(guard);
+        return ReadlineDemand::ProtocolFailure { message };
+    }
+    if let Some(feed) = prepare_pending_pty_feed_locked(guard) {
+        return ReadlineDemand::Feed(feed);
+    }
+    if guard.pty_feed_in_flight.is_some() {
+        return ReadlineDemand::ReadlineStart {
+            prompt: prompt.to_string(),
+        };
+    }
+
+    let Some(turn_id) = guard.active_turn_id else {
+        return ReadlineDemand::ReadlineStart {
+            prompt: prompt.to_string(),
+        };
+    };
+    let prompt = prompt.to_string();
+    if matches!(
+        guard.current_readline_state,
+        Some(PythonReadlineState::Primary | PythonReadlineState::Continuation)
+    ) {
+        guard.request_active = false;
+        guard.active_turn_id = None;
+        ReadlineDemand::Idle { turn_id, prompt }
+    } else {
+        guard.active_turn_id = None;
+        ReadlineDemand::StdinWait { turn_id, prompt }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn emit_readline_demand(demand: ReadlineDemand) {
+    match demand {
+        ReadlineDemand::Feed(feed) => {
+            ipc::emit_pty_feed(feed.turn_id, feed.seq, &feed.bytes);
+        }
+        ReadlineDemand::Idle { turn_id, prompt } => {
+            ipc::emit_idle(turn_id, &prompt);
+        }
+        ReadlineDemand::StdinWait { turn_id, prompt } => {
+            emit_plots();
+            mark_stdin_wait_prompt_completed_request();
+            ipc::emit_stdin_wait(turn_id, &prompt);
+        }
+        ReadlineDemand::ReadlineStart { prompt } => {
+            ipc::emit_readline_start(&prompt);
+        }
+        ReadlineDemand::ProtocolFailure { message } => {
+            emit_protocol_failure(&message);
+        }
     }
 }
 
@@ -639,9 +817,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    #[cfg(windows)]
-    ipc::emit_worker_ready_v3("python", plot_capable());
-    #[cfg(not(windows))]
     ipc::emit_worker_ready("python", plot_capable());
 
     let result = run_repl(&runtime);
@@ -1170,6 +1345,7 @@ fn finalize_python(
     }
 }
 
+#[cfg(windows)]
 fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     let state = session_state();
     let queued_lines = prepare_turn_input_lines(&input);
@@ -1185,7 +1361,6 @@ fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     if guard.active_request.is_some() {
         return Err("Python session already has an active turn".to_string());
     }
-    guard.request_generation = turn_id;
     guard.interrupt_requested = false;
     guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
@@ -1209,6 +1384,56 @@ fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn append_tracked_turn_input(turn_id: u64, input: String) -> Result<(), String> {
+    let state = session_state();
+    let queued_lines = prepare_turn_input_lines(&input);
+    let byte_len = queued_lines
+        .iter()
+        .map(|line| line.bytes.len().saturating_sub(line.offset))
+        .sum();
+    let line_count = queued_lines.len();
+    let mut guard = state.inner.lock().unwrap();
+    if guard.shutdown {
+        return Err("Python session is shutting down".to_string());
+    }
+    if let Some(active) = guard.active_request.as_mut() {
+        if active.turn_id != Some(turn_id) {
+            return Err(format!(
+                "turn_input turn_id {turn_id} does not match active turn_id {:?}",
+                active.turn_id
+            ));
+        }
+        active.byte_len = active.byte_len.saturating_add(byte_len);
+        active.line_count = active.line_count.saturating_add(line_count);
+        active.queued_lines.extend(queued_lines);
+    } else {
+        guard.interrupt_requested = false;
+        guard.request_completed_at_stdin_wait = false;
+        guard.request_active = true;
+        guard.plot_reset_pending = true;
+        guard.turn_write_in_flight = false;
+        guard.turn_cleanup_uncertain = false;
+        let started_after_continuation_prompt = guard.last_prompt_was_continuation;
+        guard.active_request = Some(ActiveRequest {
+            reply: None,
+            turn_id: Some(turn_id),
+            byte_len,
+            line_count,
+            fallback_prompt: None,
+            queued_lines,
+            consumed_lines: 0,
+            skip_next_hook: false,
+            stdin_write_complete: true,
+            repl_turn_finished: false,
+            started_after_continuation_prompt,
+        });
+    }
+    state.cvar.notify_all();
+    Ok(())
+}
+
+#[cfg(windows)]
 fn prepare_turn_input_lines(input: &str) -> VecDeque<TurnInputLine> {
     if input.is_empty() {
         return VecDeque::new();
@@ -1297,6 +1522,7 @@ fn read_windows_turn_line(
     let state = SESSION_STATE
         .get()
         .ok_or_else(|| "Python session state is not initialized".to_string())?;
+    let mut idle_repl_prompt_emitted = false;
 
     loop {
         let action = {
@@ -1360,6 +1586,17 @@ fn read_windows_turn_line(
                     }
                 }
                 None => {
+                    let should_emit_idle_repl_prompt = !idle_repl_prompt_emitted
+                        && (prompt == guard.python_primary_prompt
+                            || prompt == guard.python_continuation_prompt);
+                    if should_emit_idle_repl_prompt {
+                        idle_repl_prompt_emitted = true;
+                        guard.last_prompt_was_continuation =
+                            prompt == guard.python_continuation_prompt;
+                        drop(guard);
+                        ipc::emit_readline_start(prompt);
+                        continue;
+                    }
                     if release_gil_while_waiting {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
@@ -1547,6 +1784,7 @@ fn note_input_hook_consumed_line(active: &mut ActiveRequest) {
     }
 }
 
+#[cfg(not(any(target_family = "unix", windows)))]
 fn request_prompt_wait_should_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1571,6 +1809,7 @@ fn request_prompt_wait_should_complete(
 }
 
 #[cfg(target_family = "unix")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn prompt_wait_can_complete(
     active: &ActiveRequest,
     current_readline_state: Option<PythonReadlineState>,
@@ -1581,18 +1820,6 @@ fn prompt_wait_can_complete(
             Some(PythonReadlineState::ClientInput | PythonReadlineState::Continuation)
         )
         || active.fallback_prompt.is_some()
-}
-
-#[cfg(target_family = "unix")]
-fn single_line_client_input_prompt(
-    active: &ActiveRequest,
-    current_readline_state: Option<PythonReadlineState>,
-) -> bool {
-    active.line_count == 1
-        && matches!(
-            current_readline_state,
-            Some(PythonReadlineState::ClientInput)
-        )
 }
 
 fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
@@ -1746,17 +1973,15 @@ unsafe extern "C" fn mcp_repl_readline(
     }
     set_current_repl_readline_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
-    let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
-    #[cfg(target_family = "unix")]
     let prompt_matches_repl = prompt_matches_python_repl_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
     flush_original_stdio();
     #[cfg(target_family = "unix")]
-    request_cpython_readline_stdin_line(&prompt_text);
-    #[cfg(target_family = "unix")]
-    if prompt_has_buffered_answer && !prompt_text.is_empty() && !prompt_matches_repl {
+    if !prompt_text.is_empty() && !prompt_matches_repl {
         emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
     }
+    #[cfg(target_family = "unix")]
+    request_cpython_readline_stdin_line(&prompt_text);
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     handle_input_hook();
 
@@ -1785,8 +2010,18 @@ unsafe extern "C" fn mcp_repl_readline(
         #[cfg(target_family = "unix")]
         flush_terminal_input();
     }
-    note_cpython_readline_bytes_read(&read.bytes);
+    let accounting = match note_cpython_readline_bytes_read(&prompt_text, &read.bytes) {
+        Ok(accounting) => accounting,
+        Err(err) => {
+            emit_protocol_failure(&err);
+            set_callback_error(&err);
+            return ptr::null_mut();
+        }
+    };
     clear_current_readline_prompt();
+    if accounting.discarded_after_interrupt() {
+        return allocate_readline_result(b"\n");
+    }
     if read.interrupted || take_interrupt_requested() {
         PythonApi::global().set_interrupt();
         return ptr::null_mut();
@@ -1810,7 +2045,15 @@ fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
 
 #[cfg(target_family = "unix")]
 fn request_cpython_readline_stdin_line(prompt: &str) {
-    ipc::emit_readline_start(prompt);
+    let Some(state) = SESSION_STATE.get() else {
+        ipc::emit_readline_start(prompt);
+        return;
+    };
+    let demand = {
+        let mut guard = state.inner.lock().unwrap();
+        prepare_readline_demand_locked(&mut guard, prompt)
+    };
+    emit_readline_demand(demand);
 }
 
 fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
@@ -1822,19 +2065,29 @@ fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
 }
 
 #[cfg(target_family = "unix")]
-fn note_cpython_readline_bytes_read(bytes: &[u8]) {
+fn note_cpython_readline_bytes_read(
+    prompt: &str,
+    bytes: &[u8],
+) -> Result<StdinReadAccounting, String> {
     if bytes.is_empty() {
-        return;
+        return Ok(StdinReadAccounting::Accounted);
     }
-    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
-    emit_readline_input_bytes(&protocol_bytes);
+    let Some((turn_id, protocol_bytes)) = consume_protocol_stdin_bytes_for_runtime_read(bytes)?
+    else {
+        return Ok(StdinReadAccounting::DiscardedAfterInterrupt);
+    };
     mark_request_input_delivered();
     note_active_stdin_line_read(&protocol_bytes);
+    ipc::emit_input_line(turn_id, prompt, &String::from_utf8_lossy(&protocol_bytes));
+    Ok(StdinReadAccounting::Accounted)
 }
 
 #[cfg(not(target_family = "unix"))]
-fn note_cpython_readline_bytes_read(bytes: &[u8]) {
-    note_stdin_line_read(bytes);
+fn note_cpython_readline_bytes_read(
+    _prompt: &str,
+    bytes: &[u8],
+) -> Result<StdinReadAccounting, String> {
+    note_stdin_line_read("", bytes)
 }
 
 struct StdioLineRead {
@@ -1974,6 +2227,25 @@ enum CStdinLine {
     Error,
 }
 
+enum StdinReadAccounting {
+    Accounted,
+    #[cfg(target_family = "unix")]
+    DiscardedAfterInterrupt,
+}
+
+impl StdinReadAccounting {
+    fn discarded_after_interrupt(&self) -> bool {
+        #[cfg(target_family = "unix")]
+        {
+            matches!(self, Self::DiscardedAfterInterrupt)
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            false
+        }
+    }
+}
+
 fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     #[cfg(target_family = "unix")]
     if ipc::worker_ipc_disabled_for_process() {
@@ -2001,19 +2273,11 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     #[cfg(target_family = "unix")]
     flush_original_stdio();
     #[cfg(target_family = "unix")]
-    let prompt_has_buffered_answer = stdin_pending_byte_count().is_some_and(|count| count > 0);
-    #[cfg(target_family = "unix")]
-    if !prompt_has_buffered_answer {
-        emit_plots();
-        mark_stdin_wait_prompt_completed_request();
-    }
-    #[cfg(target_family = "unix")]
-    let prompt_delivered_immediately =
-        request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
-    #[cfg(target_family = "unix")]
-    if !prompt.is_empty() && (prompt_delivered_immediately || prompt_has_buffered_answer) {
+    if !prompt.is_empty() {
         emit_output_text(TextStream::Stdout, prompt.as_bytes());
     }
+    #[cfg(target_family = "unix")]
+    request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     {
         flush_original_stdio();
@@ -2041,8 +2305,19 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         #[cfg(target_family = "unix")]
         flush_terminal_input();
     }
-    note_stdin_line_read(&read.bytes);
+    let accounting =
+        match note_stdin_line_read(prompt_for_sideband.to_str().unwrap_or(""), &read.bytes) {
+            Ok(accounting) => accounting,
+            Err(err) => {
+                emit_protocol_failure(&err);
+                set_callback_error(&err);
+                return CStdinLine::Error;
+            }
+        };
     clear_current_readline_prompt();
+    if accounting.discarded_after_interrupt() {
+        return CStdinLine::Line("\n".to_string());
+    }
     if read.interrupted || take_interrupt_requested() {
         PythonApi::global().set_interrupt();
         return CStdinLine::Error;
@@ -2075,9 +2350,13 @@ fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         return Ok(Vec::new());
     }
 
+    request_runtime_stdin_line("");
     let _allow_threads = PythonThreadsAllowed::new();
     let bytes = read_fd_bytes(libc::STDIN_FILENO, size);
-    note_stdin_bytes_read(&bytes);
+    if let Err(err) = note_stdin_bytes_read(&bytes) {
+        emit_protocol_failure(&err);
+        set_callback_error(&err);
+    }
     Ok(bytes)
 }
 
@@ -2240,14 +2519,16 @@ fn read_fd_bytes(fd: libc::c_int, size: usize) -> Vec<u8> {
 }
 
 #[cfg(target_family = "unix")]
-fn note_stdin_bytes_read(bytes: &[u8]) {
+fn note_stdin_bytes_read(bytes: &[u8]) -> Result<(), String> {
     if bytes.is_empty() {
-        return;
+        return Ok(());
     }
-    let protocol_bytes = take_protocol_stdin_bytes_for_runtime_read(bytes);
-    emit_readline_input_bytes(&protocol_bytes);
-    mark_request_input_delivered();
-    note_active_stdin_line_read(&protocol_bytes);
+    if let Some((_turn_id, protocol_bytes)) = consume_protocol_stdin_bytes_for_runtime_read(bytes)?
+    {
+        mark_request_input_delivered();
+        note_active_stdin_line_read(&protocol_bytes);
+    }
+    Ok(())
 }
 
 #[cfg(target_family = "unix")]
@@ -2276,6 +2557,73 @@ fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(target_family = "unix")]
+fn consume_protocol_stdin_bytes_for_runtime_read(
+    runtime_bytes: &[u8],
+) -> Result<Option<(u64, Vec<u8>)>, String> {
+    let Some(state) = SESSION_STATE.get() else {
+        return Err("Python session state is unavailable while consuming stdin".to_string());
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if guard.discard_untracked_stdin_after_interrupt && guard.protocol_stdin_bytes.is_empty() {
+        return Ok(None);
+    }
+    let turn_id = guard
+        .active_turn_id
+        .ok_or_else(|| "runtime stdin was read with no active turn".to_string())?;
+    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
+        return Err(format!(
+            "runtime stdin read {} bytes but only {} protocol stdin bytes remain",
+            runtime_bytes.len(),
+            guard.protocol_stdin_bytes.len()
+        ));
+    }
+
+    let Some(in_flight) = guard.pty_feed_in_flight.as_ref() else {
+        return Err("runtime stdin was read with no pty_feed in flight".to_string());
+    };
+    if runtime_bytes.len() > in_flight.len() {
+        return Err(format!(
+            "runtime stdin read {} bytes but pty_feed only had {} bytes in flight",
+            runtime_bytes.len(),
+            in_flight.len()
+        ));
+    }
+
+    let protocol_bytes = guard
+        .protocol_stdin_bytes
+        .iter()
+        .take(runtime_bytes.len())
+        .copied()
+        .collect::<Vec<_>>();
+    for (idx, ((&expected_feed, &expected_protocol), &actual)) in in_flight
+        .iter()
+        .zip(protocol_bytes.iter())
+        .zip(runtime_bytes)
+        .enumerate()
+    {
+        if !protocol_stdin_byte_matches_runtime(expected_feed, actual) {
+            return Err(format!(
+                "runtime stdin byte {idx} did not match pty_feed: expected {expected_feed:?}, got {actual:?}"
+            ));
+        }
+        if !protocol_stdin_byte_matches_runtime(expected_protocol, actual) {
+            return Err(format!(
+                "runtime stdin byte {idx} did not match queued protocol input: expected {expected_protocol:?}, got {actual:?}"
+            ));
+        }
+    }
+
+    if let Some(in_flight) = guard.pty_feed_in_flight.as_mut() {
+        in_flight.drain(..runtime_bytes.len());
+        if in_flight.is_empty() {
+            guard.pty_feed_in_flight = None;
+        }
+    }
+    guard.protocol_stdin_bytes.drain(..runtime_bytes.len());
+    Ok(Some((turn_id, protocol_bytes)))
+}
+
+#[cfg(target_family = "unix")]
 fn protocol_stdin_byte_matches_runtime(protocol_byte: u8, runtime_byte: u8) -> bool {
     protocol_byte == runtime_byte || (protocol_byte == b'\r' && runtime_byte == b'\n')
 }
@@ -2295,20 +2643,24 @@ fn note_active_stdin_line_read(bytes: &[u8]) {
 }
 
 #[cfg(target_family = "unix")]
-fn note_stdin_line_read(bytes: &[u8]) {
-    note_stdin_bytes_read(bytes);
-}
-
-#[cfg(target_family = "unix")]
-fn emit_readline_input_bytes(bytes: &[u8]) {
+fn note_stdin_line_read(prompt: &str, bytes: &[u8]) -> Result<StdinReadAccounting, String> {
     if bytes.is_empty() {
-        return;
+        return Ok(StdinReadAccounting::Accounted);
     }
-    ipc::emit_readline_input_bytes(bytes);
+    let Some((turn_id, protocol_bytes)) = consume_protocol_stdin_bytes_for_runtime_read(bytes)?
+    else {
+        return Ok(StdinReadAccounting::DiscardedAfterInterrupt);
+    };
+    mark_request_input_delivered();
+    note_active_stdin_line_read(&protocol_bytes);
+    ipc::emit_input_line(turn_id, prompt, &String::from_utf8_lossy(&protocol_bytes));
+    Ok(StdinReadAccounting::Accounted)
 }
 
 #[cfg(not(target_family = "unix"))]
-fn note_stdin_line_read(_bytes: &[u8]) {}
+fn note_stdin_line_read(_prompt: &str, _bytes: &[u8]) -> Result<StdinReadAccounting, String> {
+    Ok(StdinReadAccounting::Accounted)
+}
 
 fn plot_capable() -> bool {
     let _gil = GilGuard::acquire();
@@ -2410,7 +2762,6 @@ struct SessionState {
 
 struct SessionStateInner {
     active_request: Option<ActiveRequest>,
-    request_generation: u64,
     request_active: bool,
     request_completed_at_stdin_wait: bool,
     current_prompt: Option<String>,
@@ -2427,8 +2778,18 @@ struct SessionStateInner {
     session_end_emitted: bool,
     plot_reset_pending: bool,
     interrupt_requested: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
     turn_write_in_flight: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
     turn_cleanup_uncertain: bool,
+    #[cfg(target_family = "unix")]
+    active_turn_id: Option<u64>,
+    #[cfg(target_family = "unix")]
+    next_pty_feed_seq: u64,
+    #[cfg(target_family = "unix")]
+    pty_feed_in_flight: Option<Vec<u8>>,
+    #[cfg(target_family = "unix")]
+    discard_untracked_stdin_after_interrupt: bool,
     #[cfg(target_family = "unix")]
     protocol_stdin_bytes: VecDeque<u8>,
 }
@@ -2450,7 +2811,9 @@ struct ActiveRequest {
 struct TurnInputLine {
     #[cfg_attr(not(windows), allow(dead_code))]
     text: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
     bytes: Vec<u8>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     offset: usize,
     #[cfg_attr(not(windows), allow(dead_code))]
     input_line_emitted: bool,
@@ -2461,7 +2824,6 @@ impl SessionState {
         Self {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
-                request_generation: 0,
                 request_active: false,
                 request_completed_at_stdin_wait: false,
                 current_prompt: None,
@@ -2480,6 +2842,14 @@ impl SessionState {
                 interrupt_requested: false,
                 turn_write_in_flight: false,
                 turn_cleanup_uncertain: false,
+                #[cfg(target_family = "unix")]
+                active_turn_id: None,
+                #[cfg(target_family = "unix")]
+                next_pty_feed_seq: 1,
+                #[cfg(target_family = "unix")]
+                pty_feed_in_flight: None,
+                #[cfg(target_family = "unix")]
+                discard_untracked_stdin_after_interrupt: false,
                 #[cfg(target_family = "unix")]
                 protocol_stdin_bytes: VecDeque::new(),
             }),
@@ -2550,8 +2920,8 @@ fn mark_stdin_wait_prompt_completed_request() {
     // response boundary for the current MCP request. The Python read can then
     // block while background Python threads keep running. Clear the plot gate at
     // this boundary to prevent those background updates from being attributed to
-    // the request that already completed. On Unix this also happens before the
-    // prompt sideband is emitted because the server owns that completion path.
+    // the request that already completed. Callers flush prompt-time plots before
+    // closing this gate.
     guard.request_active = false;
     guard.request_completed_at_stdin_wait = true;
 }

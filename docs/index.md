@@ -45,6 +45,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
+- `docs/futurework/r-worker-turn-boundary-simplification.md`: deferred note on moving the built-in R adapter behind the v3 `turn_start` and `idle` boundary.
 - `docs/futurework/server-backend-boundary.md`: deferred note on removing backend-specific execution semantics from server-side request handling.
 - `docs/futurework/sidecar-viewer-observability.md`: deferred note on a local read-only sidecar viewer for transcripts, plots, and output bundles.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.

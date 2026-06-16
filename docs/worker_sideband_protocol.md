@@ -5,7 +5,11 @@ process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
 This document defines worker protocol version 3. The server rejects other
-protocol versions before sending user input.
+protocol versions before sending user input. Custom worker specs use the public
+v3 turn contract below. Built-in R and Python adapters also identify as protocol
+version 3, but may use private adapter messages to bridge raw-stdin transports
+until those adapters move behind `turn_start`; those messages are implementation
+details, not compatibility with older worker protocol versions.
 
 The protocol is shaped around one race-free invariant:
 
@@ -42,16 +46,16 @@ from the previous turn can satisfy that wait.
 
 ## Turn Model
 
-The server allows at most one active turn per worker session. Each non-empty
-`repl()` execution input becomes a sideband `turn_start` message with a fresh
-`turn_id`. The input is a JSON string, so ordinary request payloads remain plain
-UTF-8 text on the inspectable sideband stream. The worker owns newline
-normalization and runtime placement.
+The server allows at most one active turn per worker session. For protocol
+workers, each non-empty `repl()` execution input becomes a sideband `turn_start`
+message with a fresh `turn_id`. The input is a JSON string, so ordinary request
+payloads remain plain UTF-8 text on the inspectable sideband stream. The worker
+owns newline normalization and runtime placement.
 
-Runtime stdin transport is a worker implementation detail. A worker may write
-the turn text into an embedded queue, an ordinary pipe, a PTY master, or an
-interpreter callback. The server must not use transport observations from any
-of those mechanisms to decide request completion.
+Runtime stdin transport is a worker implementation detail. A protocol worker may
+write the turn text into an embedded queue, an ordinary pipe, a PTY master, or an
+interpreter callback. The server must not use transport observations from any of
+those mechanisms to decide request completion.
 
 The worker emits exactly one terminal turn-boundary fact for a successful
 same-session turn:
@@ -73,10 +77,14 @@ replace the worker, or report that the worker is still busy.
 
 ## PTY And Stdin Workers
 
-PTYs and ordinary stdin are worker-internal runtime transports. They may require
-worker-internal accounting, but they must not expose that accounting as the
-server's completion rule. The server sees only `turn_start`, output,
-`idle`, `session_end`, and failure.
+For protocol workers, PTYs and ordinary stdin are worker-internal runtime
+transports. They may require worker-internal accounting, but they must not expose
+that accounting as the server's completion rule. The server sees only
+`turn_start`, output, `idle`, `session_end`, and failure.
+
+Built-in adapters are still allowed to use private sideband facts for raw-stdin
+bridging. That adapter path is outside the public custom-worker protocol and
+should shrink as the built-in runtimes move behind `turn_start`.
 
 A PTY-backed worker must own the PTY master or an equivalent write endpoint. A
 typical turn works like this:

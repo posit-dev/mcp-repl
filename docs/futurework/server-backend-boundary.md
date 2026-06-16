@@ -87,12 +87,12 @@ semantics, not implementation language.
 
 Initial candidates:
 
-- `supports_images`: already present in `backend_info`; controls whether image
-  events are expected.
+- `supports_images`: already present in `worker_ready.capabilities`; controls
+  whether image events are expected.
 - `turn_input_transport`: whether accepted input is carried by `turn_start` or
   by a backend-internal adapter.
-- `backend_info_startup_timeout`: whether startup may continue after a short
-  backend-info timeout.
+- `worker_ready_startup_timeout`: whether startup may continue after a short
+  worker-ready timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional
   output-settle window before the server returns the timeout reply.
 

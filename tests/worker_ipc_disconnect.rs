@@ -146,9 +146,9 @@ mod unix {
 
         let input = "if (TRUE) {\ncat(\"RAW_STDIN_OK\\n\")\n}\n";
         let request = json!({
-            "type": "python_request_start",
-            "request_generation": 1,
-            "stdin_b64": base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
+            "type": "turn_start",
+            "turn_id": 1,
+            "input": input
         });
         ipc_writer.write_all(request.to_string().as_bytes()).await?;
         ipc_writer.write_all(b"\n").await?;

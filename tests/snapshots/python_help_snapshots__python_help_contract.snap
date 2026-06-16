@@ -63,7 +63,7 @@ response:
     },
     {
       "type": "text",
-      "text": "help> "
+      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }
@@ -83,11 +83,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container.\n\nhelp> "
     },
     {
       "type": "text",
-      "text": "help> "
+      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }

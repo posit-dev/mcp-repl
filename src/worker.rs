@@ -91,12 +91,8 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match conn.recv(None) {
                     Some(ServerToWorkerIpcMessage::TurnStart { .. }) => {}
-                    Some(ServerToWorkerIpcMessage::PythonRequestStart { .. }) => {}
-                    Some(ServerToWorkerIpcMessage::StdinWriteComplete) => {}
+                    Some(ServerToWorkerIpcMessage::TurnInput { .. }) => {}
                     Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
-                        crate::r_session::clear_pending_input();
-                    }
-                    Some(ServerToWorkerIpcMessage::PythonInterrupt { .. }) => {
                         crate::r_session::clear_pending_input();
                     }
                     None => {

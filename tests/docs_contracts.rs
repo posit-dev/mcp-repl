@@ -139,6 +139,31 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
 }
 
 #[test]
+fn futurework_does_not_revive_server_inferred_worker_completion() {
+    let note = read(&repo_root().join("docs/futurework/r-worker-turn-boundary-simplification.md"));
+
+    for required in [
+        "worker-emitted `idle` or `session_end`",
+        "Server-inferred completion is no longer the intended direction",
+    ] {
+        assert!(
+            note.contains(required),
+            "missing {required} in r-worker simplification futurework"
+        );
+    }
+
+    for forbidden in [
+        "request completion is now inferred by the\nserver from prompt/readline sideband facts",
+        "The server should infer more of the logical request timeline",
+    ] {
+        assert!(
+            !note.contains(forbidden),
+            "did not expect {forbidden} in r-worker simplification futurework"
+        );
+    }
+}
+
+#[test]
 fn plans_layout_exists() {
     let root = repo_root();
     for required in [

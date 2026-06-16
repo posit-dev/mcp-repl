@@ -1,4 +1,5 @@
 mod backend;
+mod builtin_adapter_request_state;
 mod debug_logs;
 mod debug_repl;
 mod diagnostics;
@@ -6,8 +7,6 @@ mod event_log;
 mod html_to_markdown;
 mod install;
 mod ipc;
-mod legacy_ack_state;
-mod legacy_request_state;
 mod managed_network;
 mod output_capture;
 mod output_stream;
