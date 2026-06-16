@@ -1519,6 +1519,51 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pty_direct_stdin_reads_consume_buffered_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os, sys
+line = sys.stdin.readline().strip()
+alpha
+data = os.read(0, 5).decode("utf-8")
+bravo
+print("DIRECT_STDIN_VALUES", line, data)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("DIRECT_STDIN_VALUES alpha bravo")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected direct stdin reads to consume queued turn input, got: {text:?}"
+    );
+    assert!(
+        text.contains("DIRECT_STDIN_VALUES alpha bravo"),
+        "expected sys.stdin.readline() and os.read() to consume queued input, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();

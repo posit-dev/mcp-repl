@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
+#[cfg(target_family = "unix")]
 use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 #[cfg(windows)]
@@ -343,7 +344,6 @@ pub(crate) fn mark_request_started() {
     mark_request_started_with_stdin(Vec::new());
 }
 
-#[cfg(target_family = "unix")]
 pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
@@ -666,6 +666,7 @@ enum ReadlineDemand {
     Idle { turn_id: u64, prompt: String },
     StdinWait { turn_id: u64, prompt: String },
     ReadlineStart { prompt: String },
+    ProtocolFailure { message: String },
 }
 
 #[cfg(target_family = "unix")]
@@ -693,12 +694,37 @@ fn emit_protocol_failure(message: &str) {
 fn emit_protocol_failure(_message: &str) {}
 
 #[cfg(target_family = "unix")]
-fn next_protocol_stdin_unit(bytes: &VecDeque<u8>) -> Vec<u8> {
-    let len = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(bytes.len(), |idx| idx.saturating_add(1));
-    bytes.iter().take(len).copied().collect()
+fn pending_protocol_stdin(bytes: &VecDeque<u8>) -> Vec<u8> {
+    bytes.iter().copied().collect()
+}
+
+#[cfg(target_family = "unix")]
+fn reconcile_direct_pty_stdin_reads_locked(guard: &mut SessionStateInner) -> Result<(), String> {
+    // sys.stdin and os.read(0, ...) consume PTY bytes without entering
+    // _mcp_repl, so reconcile queued protocol bytes against the PTY backlog.
+    let Some(pending_byte_count) = runtime_stdin_pending_byte_count() else {
+        return Ok(());
+    };
+    let Some(in_flight) = guard.pty_feed_in_flight.as_mut() else {
+        return Ok(());
+    };
+    if pending_byte_count >= in_flight.len() {
+        return Ok(());
+    }
+
+    let consumed = in_flight.len() - pending_byte_count;
+    if consumed > guard.protocol_stdin_bytes.len() {
+        return Err(format!(
+            "runtime stdin consumed {consumed} bytes but only {} protocol stdin bytes remain",
+            guard.protocol_stdin_bytes.len()
+        ));
+    }
+    in_flight.drain(..consumed);
+    if in_flight.is_empty() {
+        guard.pty_feed_in_flight = None;
+    }
+    guard.protocol_stdin_bytes.drain(..consumed);
+    Ok(())
 }
 
 #[cfg(target_family = "unix")]
@@ -710,7 +736,7 @@ fn prepare_pending_pty_feed_locked(guard: &mut SessionStateInner) -> Option<Pend
     if guard.protocol_stdin_bytes.is_empty() {
         return None;
     }
-    let bytes = next_protocol_stdin_unit(&guard.protocol_stdin_bytes);
+    let bytes = pending_protocol_stdin(&guard.protocol_stdin_bytes);
     if bytes.is_empty() {
         return None;
     }
@@ -727,8 +753,17 @@ fn prepare_pending_pty_feed_locked(guard: &mut SessionStateInner) -> Option<Pend
 #[cfg(target_family = "unix")]
 fn prepare_readline_demand_locked(guard: &mut SessionStateInner, prompt: &str) -> ReadlineDemand {
     guard.waiting_for_input = true;
+    if let Err(message) = reconcile_direct_pty_stdin_reads_locked(guard) {
+        mark_protocol_failure_locked(guard);
+        return ReadlineDemand::ProtocolFailure { message };
+    }
     if let Some(feed) = prepare_pending_pty_feed_locked(guard) {
         return ReadlineDemand::Feed(feed);
+    }
+    if guard.pty_feed_in_flight.is_some() {
+        return ReadlineDemand::ReadlineStart {
+            prompt: prompt.to_string(),
+        };
     }
 
     let Some(turn_id) = guard.active_turn_id else {
@@ -767,6 +802,9 @@ fn emit_readline_demand(demand: ReadlineDemand) {
         }
         ReadlineDemand::ReadlineStart { prompt } => {
             ipc::emit_readline_start(&prompt);
+        }
+        ReadlineDemand::ProtocolFailure { message } => {
+            emit_protocol_failure(&message);
         }
     }
 }
@@ -1524,7 +1562,6 @@ fn append_tracked_turn_input(turn_id: u64, input: String) -> Result<(), String> 
         active.line_count = active.line_count.saturating_add(line_count);
         active.queued_lines.extend(queued_lines);
     } else {
-        guard.request_generation = turn_id;
         guard.interrupt_requested = false;
         guard.request_completed_at_stdin_wait = false;
         guard.request_active = true;
