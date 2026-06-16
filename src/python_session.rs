@@ -1416,7 +1416,6 @@ fn append_tracked_turn_input(turn_id: u64, input: String) -> Result<(), String> 
         guard.turn_cleanup_uncertain = false;
         let started_after_continuation_prompt = guard.last_prompt_was_continuation;
         guard.active_request = Some(ActiveRequest {
-            reply: None,
             turn_id: Some(turn_id),
             byte_len,
             line_count,
