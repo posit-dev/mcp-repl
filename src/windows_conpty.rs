@@ -520,80 +520,30 @@ impl Drop for ProcThreadAttributeList {
 fn spawn_conpty_output_forwarder(mut output: File) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = io::stdout();
-        let mut filter = ConptyOutputFilter::default();
-        let mut buffer = [0u8; 8192];
-        loop {
-            match output.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let filtered = filter.filter(&buffer[..count]);
-                    if !filtered.is_empty()
-                        && stdout
-                            .write_all(&filtered)
-                            .and_then(|_| stdout.flush())
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        forward_conpty_output(&mut output, &mut stdout);
     })
 }
 
-#[derive(Default)]
-struct ConptyOutputFilter {
-    state: ConptyOutputFilterState,
-}
-
-#[derive(Default)]
-enum ConptyOutputFilterState {
-    #[default]
-    Normal,
-    Escape,
-    Csi,
-    Osc,
-    OscEscape,
-}
-
-impl ConptyOutputFilter {
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut output = Vec::with_capacity(bytes.len());
-        for byte in bytes {
-            match self.state {
-                ConptyOutputFilterState::Normal => {
-                    if *byte == 0x1b {
-                        self.state = ConptyOutputFilterState::Escape;
-                    } else if *byte != 0x07 {
-                        output.push(*byte);
-                    }
-                }
-                ConptyOutputFilterState::Escape => match *byte {
-                    b'[' => self.state = ConptyOutputFilterState::Csi,
-                    b']' => self.state = ConptyOutputFilterState::Osc,
-                    _ => self.state = ConptyOutputFilterState::Normal,
-                },
-                ConptyOutputFilterState::Csi => {
-                    if (0x40..=0x7e).contains(byte) {
-                        self.state = ConptyOutputFilterState::Normal;
-                    }
-                }
-                ConptyOutputFilterState::Osc => match *byte {
-                    0x07 => self.state = ConptyOutputFilterState::Normal,
-                    0x1b => self.state = ConptyOutputFilterState::OscEscape,
-                    _ => {}
-                },
-                ConptyOutputFilterState::OscEscape => {
-                    if *byte == b'\\' {
-                        self.state = ConptyOutputFilterState::Normal;
-                    } else {
-                        self.state = ConptyOutputFilterState::Osc;
-                    }
+fn forward_conpty_output<R, W>(output: &mut R, stdout: &mut W)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        match output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if stdout
+                    .write_all(&buffer[..count])
+                    .and_then(|_| stdout.flush())
+                    .is_err()
+                {
+                    break;
                 }
             }
+            Err(_) => break,
         }
-        output
     }
 }
 
@@ -681,4 +631,20 @@ pub fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &
         env_map.remove(&existing);
     }
     env_map.insert(key.to_string(), value.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conpty_forwarder_preserves_escape_sequences_and_bel() {
+        let input = b"plain\x1b[31mred\x1b[0m\x1b]0;title\x07bell\x07\n";
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+
+        forward_conpty_output(&mut reader, &mut output);
+
+        assert_eq!(output, input);
+    }
 }
