@@ -6680,6 +6680,8 @@ fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
         WorkerError::Protocol(message) => {
             message.contains("ipc disconnected while waiting for backend info")
                 || message.contains("worker session ended before backend info")
+                || message.contains("ipc disconnected while waiting for worker_ready")
+                || message.contains("worker session ended before worker_ready")
                 || message.contains("worker process exited immediately")
         }
         _ => false,
@@ -9327,6 +9329,20 @@ mod tests {
         }
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_matches_worker_ready_failures() {
+        for message in [
+            "ipc disconnected while waiting for worker_ready",
+            "worker session ended before worker_ready",
+        ] {
+            assert!(
+                linux_sandbox_startup_retryable(&WorkerError::Protocol(message.to_string())),
+                "expected worker_ready startup failure to be retryable: {message}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -3747,6 +3747,49 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_ctrl_c_prefix_preserves_followup_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with("import time; time.sleep(30)", Some(0.2))
+        .await?;
+    let timeout_text = result_text(&timeout_result);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with(
+                "\u{3}value = input('after> ')\nqueued-answer\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+                Some(5.0),
+            )
+            .await?,
+    );
+    let deadline = interrupt_recovery_deadline();
+    while is_busy_response(&text) {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            return Err(format!("ctrl-c follow-up turn stayed busy: {text:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("AFTER_STALE_INTERRUPT queued-answer"),
+        "expected follow-up turn input after ctrl-c prefix, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_wakes_time_sleep_signal_handler() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
