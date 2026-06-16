@@ -644,6 +644,14 @@ struct DetachedHolderProbe {
 }
 
 #[cfg(unix)]
+fn path_literal(path: &Path, description: &str) -> TestResult<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("{description} path must be valid utf-8"))?;
+    Ok(serde_json::to_string(path)?)
+}
+
+#[cfg(unix)]
 impl DetachedHolderProbe {
     fn new() -> TestResult<Self> {
         let dir = tempdir()?;
@@ -654,11 +662,7 @@ impl DetachedHolderProbe {
     }
 
     fn marker_literal(&self) -> TestResult<String> {
-        let marker = self
-            .marker_path
-            .to_str()
-            .ok_or("detached holder marker path must be valid utf-8")?;
-        Ok(serde_json::to_string(marker)?)
+        path_literal(&self.marker_path, "detached holder marker")
     }
 
     async fn wait_for_exit(&self) -> TestResult<()> {
@@ -667,6 +671,184 @@ impl DetachedHolderProbe {
 
     fn has_exited(&self) -> bool {
         self.marker_path.exists()
+    }
+}
+
+#[cfg(unix)]
+struct BackgroundIpcHolderProbe {
+    _dir: tempfile::TempDir,
+    ready_path: PathBuf,
+    release_path: PathBuf,
+    exited_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl BackgroundIpcHolderProbe {
+    fn new() -> TestResult<Self> {
+        let dir = tempdir()?;
+        Ok(Self {
+            ready_path: dir.path().join("holder-ready"),
+            release_path: dir.path().join("holder-release"),
+            exited_path: dir.path().join("holder-exited"),
+            _dir: dir,
+        })
+    }
+
+    fn ready_literal(&self) -> TestResult<String> {
+        path_literal(&self.ready_path, "background IPC holder ready marker")
+    }
+
+    fn release_literal(&self) -> TestResult<String> {
+        path_literal(&self.release_path, "background IPC holder release marker")
+    }
+
+    fn exited_literal(&self) -> TestResult<String> {
+        path_literal(&self.exited_path, "background IPC holder exited marker")
+    }
+
+    async fn wait_for_ready(&self) -> TestResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_ready_error = None;
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                return Err(format!(
+                    "background IPC holder exited before ready: {}",
+                    self.exited_path.display()
+                )
+                .into());
+            }
+            if self.ready_path.exists() {
+                match self.holder_pid() {
+                    Ok(pid) if process_is_alive(pid) => return Ok(()),
+                    Ok(pid) => {
+                        return Err(format!(
+                            "background IPC holder was killed before ready completed: pid {pid}, ready marker {}",
+                            self.ready_path.display()
+                        )
+                        .into());
+                    }
+                    Err(err) => {
+                        last_ready_error = Some(err.to_string());
+                    }
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let suffix = last_ready_error
+            .map(|err| format!("; last ready marker read error: {err}"))
+            .unwrap_or_default();
+        Err(format!(
+            "background IPC holder never started: {}{suffix}",
+            self.ready_path.display()
+        )
+        .into())
+    }
+
+    fn assert_running_before_release(&self, context: &str) -> TestResult<()> {
+        if !self.ready_path.exists() {
+            return Err(format!(
+                "{context}: background IPC holder never started: {}",
+                self.ready_path.display()
+            )
+            .into());
+        }
+        if self.exited_path.exists() {
+            return Err(format!(
+                "{context}: background IPC holder exited before release: {}",
+                self.exited_path.display()
+            )
+            .into());
+        }
+
+        let pid = self.holder_pid()?;
+        if !process_is_alive(pid) {
+            return Err(format!(
+                "{context}: background IPC holder was killed before release: pid {pid}, ready marker {}",
+                self.ready_path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn release_and_wait_for_exit(&self) -> TestResult<()> {
+        let was_alive_before_release = self.holder_alive().unwrap_or(false);
+        fs::write(&self.release_path, "go")?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                sleep(Duration::from_millis(250)).await;
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        if self.ready_path.exists() && !was_alive_before_release {
+            return Err(format!(
+                "background IPC holder was killed before release: ready marker {}, release marker {}, exited marker {}",
+                self.ready_path.display(),
+                self.release_path.display(),
+                self.exited_path.display()
+            )
+            .into());
+        }
+        Err(format!(
+            "background IPC holder failed to exit after release: release marker {}, exited marker {}",
+            self.release_path.display(),
+            self.exited_path.display()
+        )
+        .into())
+    }
+
+    fn holder_alive(&self) -> TestResult<bool> {
+        if !self.ready_path.exists() {
+            return Ok(false);
+        }
+        Ok(process_is_alive(self.holder_pid()?))
+    }
+
+    fn holder_pid(&self) -> TestResult<i32> {
+        let pid_text = fs::read_to_string(&self.ready_path)?;
+        let pid = pid_text.trim().parse::<i32>().map_err(|err| {
+            format!(
+                "background IPC holder ready marker did not contain a pid: {}: {err}",
+                self.ready_path.display()
+            )
+        })?;
+        Ok(pid)
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+async fn fail_background_ipc_test(
+    holder: &BackgroundIpcHolderProbe,
+    session: common::McpTestSession,
+    message: String,
+) -> TestResult<()> {
+    let holder_cleanup = holder.release_and_wait_for_exit().await;
+    let session_cleanup = session.cancel().await;
+    match (holder_cleanup, session_cleanup) {
+        (Ok(()), Ok(())) => Err(message.into()),
+        (Err(holder_err), Ok(())) => {
+            Err(format!("{message}; holder cleanup failed: {holder_err}").into())
+        }
+        (Ok(()), Err(session_err)) => {
+            Err(format!("{message}; session cleanup failed: {session_err}").into())
+        }
+        (Err(holder_err), Err(session_err)) => Err(format!(
+            "{message}; holder cleanup failed: {holder_err}; session cleanup failed: {session_err}"
+        )
+        .into()),
     }
 }
 
@@ -754,26 +936,49 @@ print("detached ready")
 #[cfg(unix)]
 async fn arm_background_ipc_holder(
     session: &mut common::McpTestSession,
-) -> TestResult<DetachedHolderProbe> {
-    let holder = DetachedHolderProbe::new()?;
-    let marker_literal = holder.marker_literal()?;
+) -> TestResult<BackgroundIpcHolderProbe> {
+    let holder = BackgroundIpcHolderProbe::new()?;
+    let ready_literal = holder.ready_literal()?;
+    let release_literal = holder.release_literal()?;
+    let exited_literal = holder.exited_literal()?;
     let setup = session
         .write_stdin_raw_with(
             format!(
                 r#"import subprocess, sys
-script = """import pathlib, time
-time.sleep({DETACHED_STDIO_HOLDER_SECS})
-pathlib.Path({marker_literal}).write_text('done')
-"""
+launcher_script = """import os, subprocess, sys
+holder_script = '''import os, pathlib, sys, time
+ready = pathlib.Path(sys.argv[1])
+release = pathlib.Path(sys.argv[2])
+exited = pathlib.Path(sys.argv[3])
+ready_tmp = ready.with_name(ready.name + ".tmp")
+ready_tmp.write_text(str(os.getpid()))
+os.replace(ready_tmp, ready)
+while not release.exists():
+    time.sleep(0.02)
+exited_tmp = exited.with_name(exited.name + ".tmp")
+exited_tmp.write_text("done")
+os.replace(exited_tmp, exited)
+'''
 subprocess.Popen(
-    [sys.executable, "-c", script],
+    [sys.executable, "-c", holder_script, sys.argv[1], sys.argv[2], sys.argv[3]],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=False,
     start_new_session=True,
 )
-print("ipc background ready")
+"""
+launcher = subprocess.Popen(
+    [sys.executable, "-c", launcher_script, {ready_literal}, {release_literal}, {exited_literal}],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=False,
+)
+launcher_status = launcher.wait()
+if launcher_status != 0:
+    raise SystemExit(launcher_status)
+print("ipc background launcher exited")
 "#
             ),
             Some(5.0),
@@ -781,12 +986,17 @@ print("ipc background ready")
         .await?;
     let setup_text = result_text(&setup);
     if is_busy_response(&setup_text) {
+        let _ = holder.release_and_wait_for_exit().await;
         return Err("background-ipc setup remained busy".into());
     }
-    assert!(
-        setup_text.contains("ipc background ready"),
-        "expected background-ipc setup reply, got: {setup_text:?}"
-    );
+    if !setup_text.contains("ipc background launcher exited") {
+        let _ = holder.release_and_wait_for_exit().await;
+        return Err(format!("expected background-ipc setup reply, got: {setup_text:?}").into());
+    }
+    if let Err(err) = holder.wait_for_ready().await {
+        let _ = holder.release_and_wait_for_exit().await;
+        return Err(err);
+    }
     Ok(holder)
 }
 
@@ -2996,32 +3206,59 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
     let elapsed = start.elapsed();
     let quit_text = result_text(&quit);
     if is_busy_response(&quit_text) {
-        eprintln!("python_quit_does_not_wait_for_background_ipc_holders remained busy on quit");
-        holder.wait_for_exit().await?;
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!("server waited or returned busy unexpectedly on quit(): {quit_text:?}"),
+        )
+        .await;
+    }
+    if elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!("server waited unexpectedly on quit(); elapsed {elapsed:?}: {quit_text:?}"),
+        )
+        .await;
     }
 
-    assert!(
-        !holder.has_exited(),
-        "expected quit() to finish before background IPC holder exit, got {elapsed:?}: {quit_text:?}"
-    );
+    if let Err(err) = holder.assert_running_before_release("after quit() returned") {
+        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    }
 
+    let follow_up_start = Instant::now();
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_IPC_QUIT')", Some(5.0))
         .await?;
+    let follow_up_elapsed = follow_up_start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        eprintln!(
-            "python_quit_does_not_wait_for_background_ipc_holders remained busy after respawn"
-        );
-        holder.wait_for_exit().await?;
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!(
+                "server waited or returned busy unexpectedly after quit() respawn: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if follow_up_elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!(
+                "server waited unexpectedly after quit() respawn; elapsed {follow_up_elapsed:?}: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if let Err(err) = holder.assert_running_before_release("after quit() respawn returned") {
+        return fail_background_ipc_test(&holder, session, err.to_string()).await;
     }
 
-    holder.wait_for_exit().await?;
+    let holder_cleanup = holder.release_and_wait_for_exit().await;
     session.cancel().await?;
+    holder_cleanup?;
 
     assert!(
         follow_up_text.contains("AFTER_IPC_QUIT"),
@@ -3034,43 +3271,40 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
 #[tokio::test(flavor = "multi_thread")]
 async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
+    let holder = arm_background_ipc_holder(&mut session).await?;
+
     let arm = session
         .write_stdin_raw_with(
-            format!(
-                r#"import os, subprocess, sys, threading, time
-script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
-def leave_background_ipc_tail():
+            r#"import os, threading, time
+def exit_worker():
     time.sleep(0.2)
-    subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=False,
-        start_new_session=True,
-    )
     os._exit(0)
-threading.Thread(target=leave_background_ipc_tail, daemon=True).start()
+threading.Thread(target=exit_worker, daemon=True).start()
 print("ipc respawn armed")
-"#
-            ),
+"#,
             Some(5.0),
         )
         .await?;
     let arm_text = result_text(&arm);
     if is_busy_response(&arm_text) {
-        eprintln!("python_respawn_does_not_wait_for_background_ipc_holders remained busy");
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!("server returned busy while arming background IPC respawn: {arm_text:?}"),
+        )
+        .await;
     }
     assert!(
         arm_text.contains("ipc respawn armed"),
         "expected background-ipc respawn arming reply, got: {arm_text:?}"
     );
+    if let Err(err) = holder.assert_running_before_release("after respawn arming returned") {
+        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    }
 
     sleep(Duration::from_millis(500)).await;
     let start = Instant::now();
@@ -3080,19 +3314,34 @@ print("ipc respawn armed")
     let elapsed = start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        eprintln!(
-            "python_respawn_does_not_wait_for_background_ipc_holders remained busy after exit"
-        );
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!(
+                "server waited or returned busy unexpectedly after worker exit: {follow_up_text:?}"
+            ),
+        )
+        .await;
     }
 
-    session.cancel().await?;
+    if elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_test(
+            &holder,
+            session,
+            format!(
+                "server waited unexpectedly after worker exit; elapsed {elapsed:?}: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if let Err(err) = holder.assert_running_before_release("after respawn returned") {
+        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    }
 
-    assert!(
-        elapsed < shutdown_completion_budget(),
-        "expected respawn to finish before background IPC holder exit, got {elapsed:?}: {follow_up_text:?}"
-    );
+    let holder_cleanup = holder.release_and_wait_for_exit().await;
+    session.cancel().await?;
+    holder_cleanup?;
+
     assert!(
         follow_up_text.contains("AFTER_IPC_RESPAWN"),
         "expected prompt recovery after respawn, got: {follow_up_text:?}"
