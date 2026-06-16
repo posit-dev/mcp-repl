@@ -156,7 +156,7 @@ Before changing the graphics device, require:
 
 This is separate from:
 
-- `docs/futurework/r-worker-simplification-and-server-inferred-completion.md`
+- `docs/futurework/r-worker-turn-boundary-simplification.md`
 - `docs/futurework/r-embedding-minimal-callbacks.md`
 
 Those notes are about worker semantics and embedding complexity. This note is

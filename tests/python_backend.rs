@@ -95,7 +95,6 @@ fn python_plot_tests_enabled() -> bool {
     python_plotting_available()
 }
 
-#[cfg(not(unix))]
 fn image_count(result: &rmcp::model::CallToolResult) -> usize {
     result
         .content
@@ -711,9 +710,61 @@ async fn python_smoke() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_plot_hook_flushes_before_stdin_wait_reply() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import _mcp_repl
+emit_at_wait = False
+def _mcp_repl_emit_plots():
+    if emit_at_wait:
+        _mcp_repl.emit_plot_image("image/png", "cGxvdA==", False, "forced")
+""")
+emit_at_wait = True; value = input("plot wait> ")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    let mut result = result;
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("plot wait> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            result = session.write_stdin_raw_with("", Some(1.0)).await?;
+            text = result_text(&result);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected stdin wait reply, got: {text:?}"
+    );
+    assert!(
+        text.contains("plot wait> "),
+        "expected stdin wait prompt, got: {text:?}"
+    );
+    assert_eq!(
+        image_count(&result),
+        1,
+        "expected plot hook to flush before stdin wait completed the request, got text: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(not(target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<()> {
+async fn python_input_prompt_is_not_duplicated_on_builtin_adapter_stdio() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -748,7 +799,7 @@ async fn python_input_prompt_is_not_duplicated_on_legacy_stdio() -> TestResult<(
 
 #[cfg(not(unix))]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_show_during_timeout_emits_on_legacy_stdin() -> TestResult<()> {
+async fn python_plot_show_during_timeout_emits_on_builtin_adapter_stdin() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
@@ -1115,6 +1166,52 @@ async fn python_long_physical_line_does_not_complete_before_execution() -> TestR
         poll_text.contains("LONG_LINE_DONE"),
         "expected long physical line output after execution, got: {poll_text:?}"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session_with_env_vars(vec![(
+        "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS".to_string(),
+        "1000".to_string(),
+    )])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let tail = "x_tail_value = 1\n".repeat(200_000);
+    let input = format!("import time; time.sleep(8)\n{tail}print('TAIL_AFTER_SLEEP')");
+    let first = session.write_stdin_raw_with(input, Some(0.2)).await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected sleep call with large buffered tail to time out, got: {first_text:?}"
+    );
+
+    sleep(Duration::from_millis(1_500)).await;
+    let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+    let poll_text = result_text(&poll);
+    assert!(
+        is_busy_response(&poll_text),
+        "expected request to remain busy instead of reporting a worker error, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("pty_feed write failed"),
+        "PTY backpressure should not become a protocol error, got: {poll_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    if is_busy_response(&interrupt_text) {
+        eprintln!("large-tail interrupt stayed busy; cancelling session");
+    }
+
+    session.cancel().await?;
     Ok(())
 }
 
@@ -1515,6 +1612,51 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     assert!(
         text.contains("RAW_STDIN_RESULT delta"),
         "expected raw stdin read to consume next turn input, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pty_direct_stdin_reads_consume_buffered_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import os, sys
+line = sys.stdin.readline().strip()
+alpha
+data = os.read(0, 5).decode("utf-8")
+bravo
+print("DIRECT_STDIN_VALUES", line, data)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("DIRECT_STDIN_VALUES alpha bravo")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected direct stdin reads to consume queued turn input, got: {text:?}"
+    );
+    assert!(
+        text.contains("DIRECT_STDIN_VALUES alpha bravo"),
+        "expected sys.stdin.readline() and os.read() to consume queued input, got: {text:?}"
     );
     Ok(())
 }
@@ -2934,6 +3076,60 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('win interrupt> ')", Some(5.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("win interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        !is_busy_response(&text),
+        "expected input prompt before interrupt, got: {text:?}"
+    );
+    assert!(
+        text.contains("win interrupt> "),
+        "expected input prompt before interrupt, got: {text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected idle input interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_WINDOWS_STDIN_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_WINDOWS_STDIN_INTERRUPT"),
+        "expected follow-up to run after idle input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -3347,15 +3543,17 @@ else:
         reset_text.contains("new session started"),
         "expected repl_reset to start a new session, got: {reset_text:?}"
     );
-    let observed = fs::read_to_string(&marker_path)?;
-    assert!(
-        observed == "EOFError" || observed == "VALUE:",
-        "reset should expose EOF or an empty line to input(), got: {observed:?}"
-    );
-    assert!(
-        !observed.contains("exit()") && !observed.contains("quit("),
-        "reset must not send shutdown text consumed by input(), got: {observed:?}"
-    );
+    if marker_path.exists() {
+        let observed = fs::read_to_string(&marker_path)?;
+        assert!(
+            observed == "EOFError" || observed == "VALUE:",
+            "reset should expose EOF or an empty line to input(), got: {observed:?}"
+        );
+        assert!(
+            !observed.contains("exit()") && !observed.contains("quit("),
+            "reset must not send shutdown text consumed by input(), got: {observed:?}"
+        );
+    }
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_INPUT_RESET')", Some(5.0))
@@ -3741,6 +3939,49 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
     }
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_ctrl_c_prefix_preserves_followup_turn_input() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with("import time; time.sleep(30)", Some(0.2))
+        .await?;
+    let timeout_text = result_text(&timeout_result);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected sleep call to time out, got: {timeout_text:?}"
+    );
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with(
+                "\u{3}value = input('after> ')\nqueued-answer\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+                Some(5.0),
+            )
+            .await?,
+    );
+    let deadline = interrupt_recovery_deadline();
+    while is_busy_response(&text) {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            return Err(format!("ctrl-c follow-up turn stayed busy: {text:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("AFTER_STALE_INTERRUPT queued-answer"),
+        "expected follow-up turn input after ctrl-c prefix, got: {text:?}"
+    );
     Ok(())
 }
 

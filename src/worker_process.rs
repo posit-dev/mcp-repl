@@ -1,4 +1,4 @@
-#[cfg(any(target_family = "unix", test))]
+#[cfg(test)]
 use base64::Engine as _;
 #[cfg(all(test, target_family = "unix"))]
 use std::cell::RefCell;
@@ -26,7 +26,7 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcEchoEvent, IpcHandle, IpcPtyFeed, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -313,7 +313,7 @@ trait BackendDriver: Send {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
@@ -358,13 +358,13 @@ fn driver_announce_stdin_write(
     .map_err(WorkerError::Io)
 }
 
-#[cfg_attr(target_family = "windows", allow(dead_code))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn driver_announce_stdin_write_complete(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
     ipc.send(ServerToWorkerIpcMessage::StdinWriteComplete)
         .map_err(WorkerError::Io)
 }
 
-#[cfg_attr(target_family = "windows", allow(dead_code))]
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn driver_wait_for_stdin_write_ack(
     ipc: &ServerIpcConnection,
     timeout: Duration,
@@ -377,24 +377,6 @@ fn driver_wait_for_stdin_write_ack(
         )),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected before worker accepted stdin".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
-#[cfg(target_family = "unix")]
-fn driver_wait_for_python_interrupt_ack(
-    ipc: &ServerIpcConnection,
-    timeout: Duration,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_python_interrupt_ack(timeout) {
-        Ok(()) => Ok(()),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before cleaning up interrupt".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected before worker cleaned up interrupt".to_string(),
         )),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
@@ -420,6 +402,7 @@ fn driver_wait_for_completion(
     }
 }
 
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     if let Some(ipc) = process.ipc.get() {
         let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
@@ -427,87 +410,11 @@ fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     process.send_interrupt()
 }
 
-#[cfg_attr(
-    any(target_family = "unix", target_family = "windows"),
-    allow(dead_code)
-)]
-fn driver_refresh_backend_info(
-    ipc: ServerIpcConnection,
-    timeout: Duration,
-    timeout_is_ok: bool,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
-        Ok(WorkerToServerIpcMessage::BackendInfo { .. }) => Ok(()),
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
-            {
-                return Err(WorkerError::Protocol(format!(
-                    "unsupported worker protocol {} version {}",
-                    protocol.name, protocol.version
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(WorkerError::Protocol(
-            "unexpected ipc message while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::Timeout) => {
-            if timeout_is_ok {
-                Ok(())
-            } else {
-                Err(WorkerError::Protocol(
-                    "timed out waiting for backend info".to_string(),
-                ))
-            }
-        }
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for backend info".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before backend info".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
 fn driver_refresh_worker_ready(
     ipc: ServerIpcConnection,
     timeout: Duration,
-) -> Result<(), WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
-            if protocol.name != "mcp-repl-worker"
-                || protocol.version != crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION
-            {
-                return Err(WorkerError::Protocol(format!(
-                    "unsupported worker protocol {} version {}",
-                    protocol.name, protocol.version
-                )));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(WorkerError::Protocol(
-            "expected worker_ready before user input".to_string(),
-        )),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
-            "timed out waiting for worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before worker_ready".to_string(),
-        )),
-        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-    }
-}
-
-fn driver_refresh_custom_worker_ready(
-    ipc: ServerIpcConnection,
-    timeout: Duration,
 ) -> Result<u32, WorkerError> {
-    match ipc.wait_for_backend_info(timeout) {
+    match ipc.wait_for_worker_ready(timeout) {
         Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
             if protocol.name != "mcp-repl-worker"
                 || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
@@ -582,12 +489,12 @@ impl BackendDriver for RBackendDriver {
         process.send_r_interrupt()
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_worker_ready(ipc, timeout)
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
@@ -947,82 +854,35 @@ impl BackendDriver for PythonBackendDriver {
         driver_interrupt(process)
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        driver_refresh_backend_info(ipc, timeout, false)
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
 struct ProtocolBackendDriver {
-    #[cfg(target_family = "unix")]
-    python_request_generation: Option<u64>,
-    is_builtin_python: bool,
-    protocol_version: Option<u32>,
     next_turn_id: u64,
     active_turn_id: Option<u64>,
+    is_builtin_python: bool,
 }
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
         Self {
-            #[cfg(target_family = "unix")]
-            python_request_generation: None,
-            is_builtin_python: false,
-            protocol_version: None,
             next_turn_id: 1,
             active_turn_id: None,
+            is_builtin_python: false,
         }
     }
 
     fn builtin_python() -> Self {
-        #[cfg(target_family = "unix")]
-        {
-            Self::python()
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            Self {
-                is_builtin_python: true,
-                protocol_version: None,
-                next_turn_id: 1,
-                active_turn_id: None,
-            }
-        }
-    }
-
-    #[cfg(target_family = "unix")]
-    fn python() -> Self {
         Self {
-            python_request_generation: Some(0),
-            is_builtin_python: true,
-            protocol_version: Some(crate::ipc::BUILTIN_WORKER_PROTOCOL_VERSION),
             next_turn_id: 1,
             active_turn_id: None,
-        }
-    }
-
-    #[cfg(target_family = "unix")]
-    fn next_python_request_generation(&mut self) -> Option<u64> {
-        let generation = self.python_request_generation.as_mut()?;
-        *generation = generation.wrapping_add(1);
-        Some(*generation)
-    }
-
-    fn is_v3(&self) -> bool {
-        self.protocol_version == Some(crate::ipc::WORKER_PROTOCOL_VERSION)
-    }
-
-    fn uses_builtin_stdin_adapter(&self) -> bool {
-        #[cfg(target_family = "unix")]
-        {
-            self.python_request_generation.is_some()
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            false
+            is_builtin_python: true,
         }
     }
 
@@ -1041,56 +901,26 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        if self.is_v3() {
-            if let Some(message) = ipc.take_protocol_error() {
-                return Err(WorkerError::Protocol(message));
-            }
-            let turn_id = self.next_turn_id();
-            ipc.begin_turn(turn_id);
-            match ipc.send_with_timeout(
-                ServerToWorkerIpcMessage::TurnStart {
-                    turn_id,
-                    input: text.to_string(),
-                },
-                timeout,
-            ) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-                    return Err(WorkerError::Timeout(timeout));
-                }
-                Err(err) => return Err(WorkerError::Io(err)),
-            }
-            self.active_turn_id = Some(turn_id);
-            if let Some(message) = ipc.take_protocol_error() {
-                return Err(WorkerError::Protocol(message));
-            }
-            return Ok(());
+        let _ = payload;
+        if let Some(message) = ipc.take_protocol_error() {
+            return Err(WorkerError::Protocol(message));
         }
-
-        if !self.uses_builtin_stdin_adapter() {
-            return Err(WorkerError::Protocol(
-                "custom workers must speak worker protocol version 3".to_string(),
-            ));
+        let turn_id = self.next_turn_id();
+        ipc.begin_turn(turn_id);
+        match ipc.send_with_timeout(
+            ServerToWorkerIpcMessage::TurnStart {
+                turn_id,
+                input: text.to_string(),
+            },
+            timeout,
+        ) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(WorkerError::Timeout(timeout));
+            }
+            Err(err) => return Err(WorkerError::Io(err)),
         }
-
-        ipc.begin_request_with_stdin(payload);
-        #[cfg(not(target_family = "unix"))]
-        let _ = timeout;
-        #[cfg(target_family = "unix")]
-        if let Some(request_generation) = self.next_python_request_generation() {
-            // Built-in Unix Python reads request bytes through the worker stdin fd
-            // like a protocol worker, but its plot hooks still need a Python-side
-            // request boundary before follow-up stdin is consumed. The generation
-            // also lets a late interrupt avoid draining fd 0 after the next request
-            // has started. Custom protocol workers do not receive this private
-            // bridge message.
-            ipc.send(ServerToWorkerIpcMessage::PythonRequestStart {
-                request_generation,
-                stdin_b64: base64::engine::general_purpose::STANDARD.encode(payload),
-            })
-            .map_err(WorkerError::Io)?;
-            driver_wait_for_stdin_write_ack(ipc, timeout)?;
-        }
+        self.active_turn_id = Some(turn_id);
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -1098,11 +928,6 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
-        if self.python_request_generation.is_some() {
-            driver_announce_stdin_write_complete(ipc)?;
-        }
-        #[cfg(not(target_family = "unix"))]
         let _ = ipc;
         Ok(())
     }
@@ -1116,7 +941,7 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn should_write_stdin_payload(&self) -> bool {
-        !self.is_v3()
+        false
     }
 
     fn clear_active_turn(&mut self) {
@@ -1136,46 +961,26 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if self.is_v3() {
-            if let Some(ipc) = process.ipc.get() {
-                if let Some(turn_id) = self.active_turn_id {
-                    ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                        turn_id: Some(turn_id),
-                    })
+        if let Some(ipc) = process.ipc.get() {
+            if let Some(turn_id) = self.active_turn_id {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt {
+                    turn_id: Some(turn_id),
+                })
+                .map_err(WorkerError::Io)?;
+            } else if self.is_builtin_python {
+                ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
                     .map_err(WorkerError::Io)?;
-                } else if self.is_builtin_python {
-                    ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
-                        .map_err(WorkerError::Io)?;
-                }
             }
-            return process.send_interrupt();
         }
-
-        #[cfg(target_family = "unix")]
-        if let Some(request_generation) = self.python_request_generation {
-            if let Some(ipc) = process.ipc.get() {
-                ipc.send(ServerToWorkerIpcMessage::PythonInterrupt { request_generation })
-                    .map_err(WorkerError::Io)?;
-                driver_wait_for_python_interrupt_ack(&ipc, PYTHON_INTERRUPT_CLEANUP_TIMEOUT)?;
-            }
-            return process.send_interrupt();
-        }
-
-        driver_interrupt(process)
+        process.send_interrupt()
     }
 
-    fn refresh_backend_info(
+    fn refresh_worker_ready(
         &mut self,
         ipc: ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
-        if self.python_request_generation.is_some() {
-            return driver_refresh_worker_ready(ipc, timeout);
-        }
-
-        self.protocol_version = Some(driver_refresh_custom_worker_ready(ipc, timeout)?);
-        Ok(())
+        driver_refresh_worker_ready(ipc, timeout).map(|_| ())
     }
 }
 
@@ -1204,9 +1009,10 @@ impl std::error::Error for WorkerError {
     }
 }
 
-const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_family = "unix")]
-const PYTHON_INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_FEED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(debug_assertions)]
+const PTY_FEED_WRITE_TIMEOUT_ENV: &str = "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS";
 #[cfg(target_family = "windows")]
 const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
@@ -1275,6 +1081,23 @@ impl From<std::io::Error> for WorkerError {
     }
 }
 
+fn pty_feed_write_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var(PTY_FEED_WRITE_TIMEOUT_ENV) {
+        let millis = value
+            .trim()
+            .parse::<u64>()
+            .expect("MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be integer milliseconds");
+        assert!(
+            millis > 0,
+            "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be greater than zero"
+        );
+        return Duration::from_millis(millis);
+    }
+
+    PTY_FEED_WRITE_TIMEOUT
+}
+
 struct InputContext {
     detached_prefix_contents: Vec<WorkerContent>,
     reply_prefix_contents: Vec<WorkerContent>,
@@ -1322,6 +1145,7 @@ struct CompletionSnapshot {
 
 struct CompletionInfo {
     prompt: Option<String>,
+    stdin_wait_prompt: Option<String>,
     prompt_variants: Option<Vec<String>>,
     echo_events: Vec<IpcEchoEvent>,
     protocol_warnings: Vec<String>,
@@ -1347,6 +1171,7 @@ fn completion_info_from_ipc(
 
     CompletionInfo {
         prompt,
+        stdin_wait_prompt: ipc.take_stdin_wait_prompt(),
         prompt_variants,
         echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
@@ -2253,6 +2078,7 @@ impl WorkerManager {
         let mut consumed_completion = false;
         let mut completion = CompletionInfo {
             prompt: None,
+            stdin_wait_prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -2337,6 +2163,7 @@ impl WorkerManager {
             completion.prompt.clone()
         };
         if raw_prompt.as_deref() == Some("") {
+            append_stdin_wait_prompt(&mut contents, &completion);
             contents.push(stdin_wait_status_content());
         }
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
@@ -2413,6 +2240,7 @@ impl WorkerManager {
         let mut completed_request = false;
         let mut completion = CompletionInfo {
             prompt: None,
+            stdin_wait_prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -2525,6 +2353,7 @@ impl WorkerManager {
             completion.prompt.clone()
         };
         if raw_prompt.as_deref() == Some("") {
+            append_stdin_wait_prompt(&mut contents, &completion);
             contents.push(stdin_wait_status_content());
         }
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
@@ -2835,6 +2664,7 @@ impl WorkerManager {
                     completion.prompt.clone()
                 };
                 if raw_prompt.as_deref() == Some("") {
+                    append_stdin_wait_prompt(&mut contents, &completion);
                     contents.push(stdin_wait_status_content());
                 }
                 let resolved_prompt = normalize_prompt(raw_prompt.clone());
@@ -3002,6 +2832,7 @@ impl WorkerManager {
                     completion.prompt.clone()
                 };
                 if raw_prompt.as_deref() == Some("") {
+                    append_stdin_wait_prompt(&mut contents, &completion);
                     contents.push(stdin_wait_status_content());
                 }
                 let resolved_prompt = normalize_prompt(raw_prompt.clone());
@@ -3163,6 +2994,7 @@ impl WorkerManager {
             if worker_exited {
                 result = Ok(CompletionInfo {
                     prompt: None,
+                    stdin_wait_prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
                     protocol_warnings: ipc.take_protocol_warnings(),
@@ -4092,6 +3924,7 @@ impl WorkerManager {
         let prompt = self.last_prompt.clone();
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: prompt.clone(),
+            stdin_wait_prompt: None,
             prompt_variants: prompt.clone().map(|prompt| vec![prompt]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -4156,6 +3989,7 @@ impl WorkerManager {
         };
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: self.last_prompt.clone(),
+            stdin_wait_prompt: None,
             prompt_variants,
             echo_events,
             protocol_warnings: Vec::new(),
@@ -4388,7 +4222,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -4476,7 +4310,7 @@ impl WorkerManager {
             .ipc
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
+        if let Err(err) = self.driver.refresh_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             let _ = process.kill();
             crate::event_log::log(
                 "worker_spawn_error",
@@ -5560,6 +5394,10 @@ fn stdin_wait_status_content() -> WorkerContent {
     WorkerContent::server_stdout("<<repl status: waiting for stdin>>")
 }
 
+fn append_stdin_wait_prompt(contents: &mut Vec<WorkerContent>, completion: &CompletionInfo) {
+    append_prompt_if_missing(contents, completion.stdin_wait_prompt.clone());
+}
+
 fn append_protocol_warnings(contents: &mut Vec<WorkerContent>, warnings: &[String]) {
     for warning in warnings {
         contents.push(WorkerContent::server_stderr(format!("[repl] {warning}")));
@@ -5856,6 +5694,35 @@ enum StdinCommand {
     },
 }
 
+fn send_stdin_command(
+    stdin_tx: &mpsc::Sender<StdinCommand>,
+    payload: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<(), WorkerError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let command = match payload {
+        Some(payload) => StdinCommand::Write {
+            payload,
+            reply: reply_tx,
+        },
+        None => StdinCommand::Close { reply: reply_tx },
+    };
+    stdin_tx
+        .send(command)
+        .map_err(|_| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
+    if timeout.is_zero() {
+        return Err(WorkerError::Timeout(timeout));
+    }
+    match reply_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkerError::Protocol(
+            "worker stdin thread exited unexpectedly".to_string(),
+        )),
+    }
+}
+
 struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
@@ -6001,6 +5868,8 @@ impl WorkerProcess {
             let output_capture = live_output.clone();
             let image_capture = live_output.clone();
             let sideband_capture = live_output.clone();
+            let pty_feed_stdin_tx = stdin_tx.clone();
+            let allow_pty_feed = matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python));
             let handlers = IpcHandlers {
                 on_output_text: Some(Arc::new(move |text| {
                     output_capture.append_output_text(
@@ -6025,6 +5894,20 @@ impl WorkerProcess {
                         });
                     }))
                 },
+                on_pty_feed: Some(Arc::new(move |feed: IpcPtyFeed| {
+                    if !allow_pty_feed {
+                        return Err(
+                            "pty_feed is only supported by the built-in Python worker".to_string()
+                        );
+                    }
+                    let _ = (feed.turn_id, feed.seq);
+                    send_stdin_command(
+                        &pty_feed_stdin_tx,
+                        Some(feed.bytes),
+                        pty_feed_write_timeout(),
+                    )
+                    .map_err(|err| err.to_string())
+                })),
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
@@ -6351,28 +6234,7 @@ impl WorkerProcess {
         payload: Option<Vec<u8>>,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let command = match payload {
-            Some(payload) => StdinCommand::Write {
-                payload,
-                reply: reply_tx,
-            },
-            None => StdinCommand::Close { reply: reply_tx },
-        };
-        self.stdin_tx
-            .send(command)
-            .map_err(|_| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-        if timeout.is_zero() {
-            return Err(WorkerError::Timeout(timeout));
-        }
-        match reply_rx.recv_timeout(timeout) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(err),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkerError::Timeout(timeout)),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkerError::Protocol(
-                "worker stdin thread exited unexpectedly".to_string(),
-            )),
-        }
+        send_stdin_command(&self.stdin_tx, payload, timeout)
     }
 
     fn send_interrupt(&mut self) -> Result<(), WorkerError> {
@@ -6856,6 +6718,8 @@ fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
         WorkerError::Protocol(message) => {
             message.contains("ipc disconnected while waiting for backend info")
                 || message.contains("worker session ended before backend info")
+                || message.contains("ipc disconnected while waiting for worker_ready")
+                || message.contains("worker session ended before worker_ready")
                 || message.contains("worker process exited immediately")
         }
         _ => false,
@@ -8451,6 +8315,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -8488,6 +8353,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.07)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -8528,6 +8394,7 @@ mod tests {
         manager.process = Some(test_worker_process(sleeping_test_child()));
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
+            stdin_wait_prompt: None,
             prompt_variants: Some(vec!["> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -8580,6 +8447,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -9297,6 +9165,7 @@ mod tests {
                 session_capture.append_sideband(PendingSidebandKind::SessionEnd);
                 done_tx.send(()).expect("send session end marker");
             })),
+            ..IpcHandlers::default()
         })
         .expect("ipc pair");
 
@@ -9498,6 +9367,20 @@ mod tests {
         }
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_matches_worker_ready_failures() {
+        for message in [
+            "ipc disconnected while waiting for worker_ready",
+            "worker session ended before worker_ready",
+        ] {
+            assert!(
+                linux_sandbox_startup_retryable(&WorkerError::Protocol(message.to_string())),
+                "expected worker_ready startup failure to be retryable: {message}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

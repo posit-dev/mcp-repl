@@ -3,11 +3,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use base64::Engine as _;
-
 use crate::ipc::{
-    ServerToWorkerIpcMessage, connect_from_env, emit_python_interrupt_ack, emit_session_end,
-    emit_session_end_with_reason, emit_stdin_write_ack, set_global_ipc,
+    ServerToWorkerIpcMessage, connect_from_env, emit_session_end, emit_session_end_with_reason,
+    emit_stdin_write_ack, set_global_ipc,
 };
 use crate::python_session::{self, PythonSession};
 
@@ -91,9 +89,7 @@ fn init_ipc(
                         emit_stdin_write_ack();
                     }
                     Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
-                        match wait_for_python_session()
-                            .and_then(|session| session.begin_turn(turn_id, input))
-                        {
+                        match python_session::begin_turn(turn_id, input) {
                             Ok(()) => {}
                             Err(err) => {
                                 emit_stderr_message(&err);
@@ -101,24 +97,14 @@ fn init_ipc(
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::PythonRequestStart {
-                        request_generation,
-                        stdin_b64,
-                    }) => {
-                        let stdin_bytes =
-                            match base64::engine::general_purpose::STANDARD.decode(stdin_b64) {
-                                Ok(bytes) => bytes,
-                                Err(_) => {
-                                    emit_stderr_message("invalid python_request_start stdin_b64");
-                                    emit_session_end();
-                                    continue;
-                                }
-                            };
-                        python_session::mark_request_started_for_generation(
-                            request_generation,
-                            stdin_bytes,
-                        );
-                        emit_stdin_write_ack();
+                    Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
+                        match python_session::append_turn_input(turn_id, input) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                emit_stderr_message(&err);
+                                emit_session_end_with_reason("protocol_error", Some(turn_id));
+                            }
+                        }
                     }
                     Some(ServerToWorkerIpcMessage::StdinWrite {
                         byte_len,
@@ -137,15 +123,19 @@ fn init_ipc(
                         python_session::mark_stdin_write_complete();
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt { turn_id }) => {
-                        if let Some(turn_id) = turn_id {
-                            python_session::interrupt_turn(turn_id);
-                        } else {
+                        #[cfg(windows)]
+                        {
+                            if let Some(turn_id) = turn_id {
+                                python_session::interrupt_turn(turn_id);
+                            } else {
+                                python_session::interrupt();
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = turn_id;
                             python_session::interrupt();
                         }
-                    }
-                    Some(ServerToWorkerIpcMessage::PythonInterrupt { request_generation }) => {
-                        python_session::interrupt_request_generation(request_generation);
-                        emit_python_interrupt_ack();
                     }
                     None => {
                         std::process::exit(0);
