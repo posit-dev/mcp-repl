@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
-use super::{WorkerManager, output_echo_source_for_backend};
+use super::WorkerManager;
+use super::backend_driver::output_echo_source_for_backend;
 use crate::completion_reply::{CompletionInfo, InputContext};
 use crate::ipc::IpcEchoEvent;
 use crate::output_capture::{OutputBuffer, reset_last_reply_marker_offset, reset_output_ring};
