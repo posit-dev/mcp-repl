@@ -35,6 +35,7 @@ mod windows_sandbox;
 mod worker;
 mod worker_process;
 mod worker_protocol;
+mod worker_supervisor;
 
 use std::path::PathBuf;
 
