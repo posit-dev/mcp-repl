@@ -58,8 +58,10 @@ use crate::worker_supervisor::{
     WorkerSpawnContext, WorkerSupervisor,
 };
 
+mod control_prefix;
 mod output_state;
 
+use self::control_prefix::ControlPrefixInput;
 use self::output_state::PrefixCapture;
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -492,6 +494,12 @@ impl WriteStdinOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WriteStdinMode {
+    Files,
+    Pager,
+}
+
 pub(crate) fn worker_context_event_payload(
     worker_launch: &WorkerLaunch,
     backend: Backend,
@@ -832,6 +840,89 @@ impl WorkerManager {
         }
     }
 
+    fn write_stdin_control_prefix(
+        &mut self,
+        mode: WriteStdinMode,
+        text: &str,
+        worker_timeout: Duration,
+        server_timeout: Duration,
+        options: &WriteStdinOptions,
+    ) -> Result<Option<WorkerReply>, WorkerError> {
+        let Some(prefix) = ControlPrefixInput::split(text) else {
+            return Ok(None);
+        };
+
+        self.clear_guardrail_busy_event();
+        let control_requires_spawn = match prefix.action() {
+            WriteStdinControlAction::Interrupt => self.control_only_interrupt_requires_spawn()?,
+            WriteStdinControlAction::Restart => false,
+        };
+        let mut plan = prefix.plan(control_requires_spawn, options)?;
+        if plan.stage_before_control {
+            self.stage_deferred_sandbox_state_update(plan.staged_sandbox_state_update.take())?;
+        }
+
+        let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
+            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
+                self.interrupt_files(worker_timeout, None, true)
+            }
+            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => self
+                .interrupt_files(
+                    worker_timeout,
+                    plan.tail_sandbox_state_update.clone(),
+                    options.suppress_session_end_reset,
+                ),
+            (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
+                self.restart_files(worker_timeout)
+            }
+            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
+                self.interrupt_pager(worker_timeout, None, true)
+            }
+            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => self
+                .interrupt_pager(
+                    worker_timeout,
+                    plan.tail_sandbox_state_update.clone(),
+                    options.suppress_session_end_reset,
+                ),
+            (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
+                self.restart_pager(worker_timeout)
+            }
+        }?;
+
+        if plan.stage_interrupt_after_session_end
+            && self.session_end_seen
+            && !options.suppress_session_end_reset
+        {
+            self.stage_session_end_sandbox_state_update(
+                plan.tail_sandbox_state_update.take(),
+                options.pending_state_prechecked,
+            )?;
+            self.maybe_reset_after_session_end();
+        }
+        if plan.tail.is_empty() {
+            return Ok(Some(control_reply));
+        }
+
+        let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
+        let tail_options = options.control_tail(plan.tail_sandbox_state_update);
+        let remaining_reply = match mode {
+            WriteStdinMode::Files => self.write_stdin_files(
+                plan.tail.to_string(),
+                worker_timeout,
+                server_timeout,
+                tail_options,
+            ),
+            WriteStdinMode::Pager => self.write_stdin_pager(
+                plan.tail.to_string(),
+                worker_timeout,
+                server_timeout,
+                tail_options,
+            ),
+        }?;
+        self.last_detached_prefix_item_count += control_prefix_item_count;
+        Ok(Some(prefix_worker_reply(control_reply, remaining_reply)))
+    }
+
     pub fn detached_prefix_item_count(&self) -> usize {
         self.last_detached_prefix_item_count
     }
@@ -975,60 +1066,14 @@ impl WorkerManager {
         let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
-        if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
-            self.clear_guardrail_busy_event();
-            let control_requires_spawn = matches!(control, WriteStdinControlAction::Interrupt)
-                && self.control_only_interrupt_requires_spawn()?;
-            if pending_state_prechecked
-                && control_requires_spawn
-                && deferred_sandbox_state_update.is_none()
-                && !suppress_session_end_reset
-            {
-                return Err(prechecked_follow_up_requires_meta_error());
-            }
-            let stage_before_control =
-                control_requires_spawn || matches!(control, WriteStdinControlAction::Restart);
-            let stage_interrupt_after_session_end =
-                matches!(control, WriteStdinControlAction::Interrupt) && !stage_before_control;
-            let mut tail_sandbox_state_update = if stage_before_control {
-                self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update.clone())?;
-                None
-            } else {
-                deferred_sandbox_state_update
-            };
-            let control_reply = match control {
-                WriteStdinControlAction::Interrupt if stage_interrupt_after_session_end => {
-                    self.interrupt_files(worker_timeout, None, true)
-                }
-                WriteStdinControlAction::Interrupt => self.interrupt_files(
-                    worker_timeout,
-                    tail_sandbox_state_update.clone(),
-                    suppress_session_end_reset,
-                ),
-                WriteStdinControlAction::Restart => self.restart_files(worker_timeout),
-            }?;
-            if stage_interrupt_after_session_end
-                && self.session_end_seen
-                && !suppress_session_end_reset
-            {
-                self.stage_session_end_sandbox_state_update(
-                    tail_sandbox_state_update.take(),
-                    pending_state_prechecked,
-                )?;
-                self.maybe_reset_after_session_end();
-            }
-            if remaining.is_empty() {
-                return Ok(control_reply);
-            }
-            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
-            let remaining_reply = self.write_stdin_files(
-                remaining.to_string(),
-                worker_timeout,
-                server_timeout,
-                options.control_tail(tail_sandbox_state_update),
-            )?;
-            self.last_detached_prefix_item_count += control_prefix_item_count;
-            return Ok(prefix_worker_reply(control_reply, remaining_reply));
+        if let Some(reply) = self.write_stdin_control_prefix(
+            WriteStdinMode::Files,
+            &text,
+            worker_timeout,
+            server_timeout,
+            &options,
+        )? {
+            return Ok(reply);
         }
 
         if self.guardrail_busy_event_pending() {
@@ -1142,60 +1187,14 @@ impl WorkerManager {
         let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
         let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
-        if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
-            self.clear_guardrail_busy_event();
-            let control_requires_spawn = matches!(control, WriteStdinControlAction::Interrupt)
-                && self.control_only_interrupt_requires_spawn()?;
-            if pending_state_prechecked
-                && control_requires_spawn
-                && deferred_sandbox_state_update.is_none()
-                && !suppress_session_end_reset
-            {
-                return Err(prechecked_follow_up_requires_meta_error());
-            }
-            let stage_before_control =
-                control_requires_spawn || matches!(control, WriteStdinControlAction::Restart);
-            let stage_interrupt_after_session_end =
-                matches!(control, WriteStdinControlAction::Interrupt) && !stage_before_control;
-            let mut tail_sandbox_state_update = if stage_before_control {
-                self.stage_deferred_sandbox_state_update(deferred_sandbox_state_update.clone())?;
-                None
-            } else {
-                deferred_sandbox_state_update
-            };
-            let control_reply = match control {
-                WriteStdinControlAction::Interrupt if stage_interrupt_after_session_end => {
-                    self.interrupt_pager(worker_timeout, None, true)
-                }
-                WriteStdinControlAction::Interrupt => self.interrupt_pager(
-                    worker_timeout,
-                    tail_sandbox_state_update.clone(),
-                    suppress_session_end_reset,
-                ),
-                WriteStdinControlAction::Restart => self.restart_pager(worker_timeout),
-            }?;
-            if stage_interrupt_after_session_end
-                && self.session_end_seen
-                && !suppress_session_end_reset
-            {
-                self.stage_session_end_sandbox_state_update(
-                    tail_sandbox_state_update.take(),
-                    pending_state_prechecked,
-                )?;
-                self.maybe_reset_after_session_end();
-            }
-            if remaining.is_empty() {
-                return Ok(control_reply);
-            }
-            let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
-            let remaining_reply = self.write_stdin_pager(
-                remaining.to_string(),
-                worker_timeout,
-                server_timeout,
-                options.control_tail(tail_sandbox_state_update),
-            )?;
-            self.last_detached_prefix_item_count += control_prefix_item_count;
-            return Ok(prefix_worker_reply(control_reply, remaining_reply));
+        if let Some(reply) = self.write_stdin_control_prefix(
+            WriteStdinMode::Pager,
+            &text,
+            worker_timeout,
+            server_timeout,
+            &options,
+        )? {
+            return Ok(reply);
         }
 
         if self.guardrail_busy_event_pending() {
