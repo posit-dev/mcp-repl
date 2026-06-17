@@ -10,25 +10,28 @@ use std::time::Duration;
 
 use crate::backend::{Backend, WorkerLaunch};
 use crate::ipc::{IpcEchoEvent, IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
-#[cfg(test)]
-use crate::output_capture::OutputRange;
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputTextSource, OutputTextSpan,
-    OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
-    set_last_reply_marker_offset, update_last_reply_marker_offset_max,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTextSource, OutputTimeline, ensure_output_ring,
+    reset_last_reply_marker_offset, reset_output_ring, set_last_reply_marker_offset,
+    update_last_reply_marker_offset_max,
 };
+use crate::output_snapshot::{
+    SnapshotWithImages, snapshot_after_completion, snapshot_page_with_images,
+    take_range_from_ring_after_completion,
+};
+#[cfg(test)]
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
 use crate::reply_presentation::{
-    append_prompt_if_missing, append_protocol_warnings, build_input_transcript,
-    drop_echo_only_contents, echo_transcript_from_events, fallback_prompt_variants,
-    maybe_trim_echo_prefix, normalize_prompt, reconcile_completion_prompt,
-    reconcile_polled_completion_prompt, reconcile_trailing_completion_prompt,
-    should_drop_echo_only_contents, should_trim_echo_prefix, strip_trailing_prompt,
-    trim_echo_prefix_after_leading_nonstdout_contents, trim_echo_then_append_protocol_warnings,
-    trim_leading_input_echo_from_contents, trim_matching_echo_event_suffix_from_contents,
+    append_prompt_if_missing, build_input_transcript, drop_echo_only_contents,
+    echo_transcript_from_events, fallback_prompt_variants, maybe_trim_echo_prefix,
+    normalize_prompt, reconcile_completion_prompt, reconcile_polled_completion_prompt,
+    reconcile_trailing_completion_prompt, should_drop_echo_only_contents, should_trim_echo_prefix,
+    strip_trailing_prompt, trim_echo_prefix_after_leading_nonstdout_contents,
+    trim_echo_then_append_protocol_warnings, trim_leading_input_echo_from_contents,
+    trim_matching_echo_event_suffix_from_contents,
 };
 use crate::sandbox::{SandboxState, SandboxStateUpdate};
 use crate::sandbox_cli::{
@@ -452,18 +455,6 @@ struct ReplyWithOffset {
 struct RequestState {
     timeout: Duration,
     started_at: std::time::Instant,
-}
-
-struct SnapshotWithImages {
-    contents: Vec<WorkerContent>,
-    pages_left: u64,
-    buffer: Option<pager::PagerBuffer>,
-    last_range: Option<(u64, u64)>,
-}
-
-struct CompletionSnapshot {
-    snapshot: SnapshotWithImages,
-    saw_stderr: bool,
 }
 
 struct CompletionInfo {
@@ -1623,7 +1614,8 @@ impl WorkerManager {
                 start_offset,
                 end_offset,
                 page_bytes,
-                &completion,
+                &completion.echo_events,
+                completion.prompt_variants.as_deref(),
             );
             (completed.saw_stderr, completed.snapshot)
         } else {
@@ -1827,7 +1819,9 @@ impl WorkerManager {
                     &self.output,
                     pending_start,
                     pending_end,
-                    &completion,
+                    &completion.echo_events,
+                    completion.prompt_variants.as_deref(),
+                    &completion.protocol_warnings,
                 );
                 prefix_is_error = saw_stderr;
                 prefix_contents = contents;
@@ -2129,7 +2123,8 @@ impl WorkerManager {
                     context.start_offset,
                     end_offset,
                     first_page_budget,
-                    &completion,
+                    &completion.echo_events,
+                    completion.prompt_variants.as_deref(),
                 );
                 let saw_stderr = completion_snapshot.saw_stderr;
                 let is_error = context.prefix_is_error || saw_stderr;
@@ -3903,247 +3898,6 @@ impl WorkerManager {
     }
 }
 
-fn snapshot_page_with_images(
-    output: &OutputBuffer,
-    end_offset: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let start_offset = output.current_offset().unwrap_or(end_offset);
-    let image_groups = collect_image_groups(output, start_offset, end_offset);
-    let pager::SnapshotPage {
-        mut contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte,
-    } = pager::take_snapshot_page_from_ring(output, end_offset, target_bytes);
-    if pages_left == 0
-        && pager::MAX_IMAGES_PER_PAGE > 0
-        && contents
-            .iter()
-            .all(|content| !matches!(content, WorkerContent::ContentImage { .. }))
-        && !image_groups.is_empty()
-    {
-        let max = pager::MAX_IMAGES_PER_PAGE.min(image_groups.len());
-        for (_, image) in image_groups.into_iter().take(max) {
-            contents.push(image);
-        }
-        return SnapshotWithImages {
-            contents,
-            pages_left,
-            buffer,
-            last_range,
-        };
-    }
-    let page_end = page_end_offset(start_offset, end_offset, pages_left, last_range_end_byte);
-    let mut remaining_images = pager::MAX_IMAGES_PER_PAGE;
-    if remaining_images > 0 {
-        let already = contents
-            .iter()
-            .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
-            .count();
-        remaining_images = remaining_images.saturating_sub(already);
-    }
-    if remaining_images > 0 && page_end < end_offset {
-        append_image_groups_after_page(&mut contents, page_end, image_groups, remaining_images);
-    }
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-fn snapshot_page_with_images_from_collapsed(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<OutputTextSpan>,
-    source_end: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    let pager::SnapshotPage {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte: _,
-    } = pager::take_snapshot_page_from_buffer(buffer, target_bytes);
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-fn snapshot_after_completion(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    target_bytes: u64,
-    completion: &CompletionInfo,
-) -> CompletionSnapshot {
-    if !completion.echo_events.is_empty() {
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let collapsed = collapse_echo_with_attribution(
-            range,
-            &completion.echo_events,
-            0,
-            &prompt_variants,
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let snapshot = snapshot_page_with_images_from_collapsed(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end_offset,
-            target_bytes,
-        );
-        return CompletionSnapshot {
-            snapshot,
-            saw_stderr,
-        };
-    }
-
-    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-    let snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
-    CompletionSnapshot {
-        snapshot,
-        saw_stderr,
-    }
-}
-
-fn take_range_from_ring_after_completion(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    completion: &CompletionInfo,
-) -> FormattedPendingOutput {
-    if !completion.echo_events.is_empty() {
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let collapsed = collapse_echo_with_attribution(
-            range,
-            &completion.echo_events,
-            0,
-            &prompt_variants,
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let mut contents = pager::contents_from_collapsed_output(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end_offset,
-        );
-        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
-        return FormattedPendingOutput {
-            contents,
-            saw_stderr,
-        };
-    }
-
-    let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-    let mut contents = pager::take_range_from_ring(output, end_offset);
-    append_protocol_warnings(&mut contents, &completion.protocol_warnings);
-    FormattedPendingOutput {
-        contents,
-        saw_stderr,
-    }
-}
-
-fn page_end_offset(
-    start_offset: u64,
-    end_offset: u64,
-    pages_left: u64,
-    last_range_end_byte: Option<u64>,
-) -> u64 {
-    if pages_left == 0 {
-        return end_offset;
-    }
-    if let Some(end_byte) = last_range_end_byte {
-        return start_offset.saturating_add(end_byte);
-    }
-    start_offset
-}
-
-fn collect_image_groups(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-) -> Vec<(u64, WorkerContent)> {
-    let range = output.read_range(start_offset, end_offset);
-    let mut groups: Vec<(u64, WorkerContent)> = Vec::new();
-    let mut current: Option<(u64, WorkerContent)> = None;
-
-    for event in range.events.iter() {
-        let (is_new, content) = match &event.kind {
-            OutputEventKind::Image {
-                data,
-                mime_type,
-                id,
-                is_new,
-                ..
-            } => (
-                *is_new,
-                WorkerContent::ContentImage {
-                    data: data.clone(),
-                    mime_type: mime_type.clone(),
-                    id: id.clone(),
-                    is_new: *is_new,
-                },
-            ),
-            _ => continue,
-        };
-
-        if is_new || current.is_none() {
-            if let Some(prev) = current.take() {
-                groups.push(prev);
-            }
-            current = Some((event.offset, content));
-        } else {
-            current = Some((event.offset, content));
-        }
-    }
-    if let Some(prev) = current.take() {
-        groups.push(prev);
-    }
-
-    groups
-}
-
-fn append_image_groups_after_page(
-    contents: &mut Vec<WorkerContent>,
-    page_end_offset: u64,
-    groups: Vec<(u64, WorkerContent)>,
-    max_images: usize,
-) {
-    let mut appended = 0usize;
-    let mut last_offset = page_end_offset;
-    for (offset, content) in groups {
-        if offset <= page_end_offset {
-            continue;
-        }
-        if appended >= max_images {
-            break;
-        }
-        if offset > last_offset {
-            contents.push(WorkerContent::server_stderr(format!(
-                "[pager] elided output: @{last_offset}..{offset}\n"
-            )));
-        }
-        contents.push(content);
-        appended = appended.saturating_add(1);
-        last_offset = offset;
-    }
-}
-
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
@@ -4289,7 +4043,7 @@ mod tests {
     #[cfg(any(target_family = "unix", target_family = "windows"))]
     use crate::ipc::{IpcHandlers, IpcPlotImage};
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSpan,
+        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRange, OutputRing, OutputTextSpan,
         ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::pending_output_tape::PendingOutputEvent;
