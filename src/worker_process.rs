@@ -9,6 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use crate::backend::{Backend, WorkerLaunch};
+use crate::completion_reply::{
+    CompletionInfo, CompletionReplyMode, InputContext, InputFallback, ReplyWithOffset,
+    build_completed_reply, build_timeout_reply, idle_status_content, stdin_wait_status_content,
+    timeout_status_content,
+};
 use crate::ipc::{IpcEchoEvent, IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTextSource, OutputTimeline, ensure_output_ring,
@@ -24,12 +29,13 @@ use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
+#[cfg(test)]
+use crate::reply_presentation::trim_echo_prefix_after_leading_nonstdout_contents;
 use crate::reply_presentation::{
     append_prompt_if_missing, build_input_transcript, drop_echo_only_contents,
     echo_transcript_from_events, fallback_prompt_variants, maybe_trim_echo_prefix,
-    normalize_prompt, reconcile_completion_prompt, reconcile_polled_completion_prompt,
-    reconcile_trailing_completion_prompt, should_drop_echo_only_contents, should_trim_echo_prefix,
-    strip_trailing_prompt, trim_echo_prefix_after_leading_nonstdout_contents,
+    normalize_prompt, reconcile_polled_completion_prompt, reconcile_trailing_completion_prompt,
+    should_drop_echo_only_contents, should_trim_echo_prefix, strip_trailing_prompt,
     trim_echo_then_append_protocol_warnings, trim_leading_input_echo_from_contents,
     trim_matching_echo_event_suffix_from_contents,
 };
@@ -424,16 +430,6 @@ impl From<std::io::Error> for WorkerError {
     }
 }
 
-struct InputContext {
-    detached_prefix_contents: Vec<WorkerContent>,
-    reply_prefix_contents: Vec<WorkerContent>,
-    prefix_is_error: bool,
-    start_offset: u64,
-    prefix_bytes: u64,
-    input_echo: Option<String>,
-    input_transcript: Option<String>,
-}
-
 #[derive(Default)]
 struct PrefixCapture {
     contents: Vec<WorkerContent>,
@@ -441,29 +437,9 @@ struct PrefixCapture {
     bytes: u64,
 }
 
-#[derive(Default)]
-struct InputFallback {
-    transcript: Option<String>,
-    raw_input: Option<String>,
-}
-
-struct ReplyWithOffset {
-    reply: WorkerReply,
-    end_offset: u64,
-}
-
 struct RequestState {
     timeout: Duration,
     started_at: std::time::Instant,
-}
-
-struct CompletionInfo {
-    prompt: Option<String>,
-    stdin_wait_prompt: Option<String>,
-    prompt_variants: Option<Vec<String>>,
-    echo_events: Vec<IpcEchoEvent>,
-    protocol_warnings: Vec<String>,
-    session_end_seen: bool,
 }
 
 fn completion_info_from_ipc(
@@ -1390,14 +1366,7 @@ impl WorkerManager {
         let mut timed_out = false;
         let mut completed_request = false;
         let mut consumed_completion = false;
-        let mut completion = CompletionInfo {
-            prompt: None,
-            stdin_wait_prompt: None,
-            prompt_variants: None,
-            echo_events: Vec::new(),
-            protocol_warnings: Vec::new(),
-            session_end_seen: false,
-        };
+        let mut completion = CompletionInfo::empty();
 
         if let Some(err) = self.settled_pending_error.take() {
             let _ = self.reset_preserving_detached_prefix_item_count();
@@ -1447,7 +1416,6 @@ impl WorkerManager {
         } else {
             InputFallback::default()
         };
-        let fallback_input_transcript = fallback_input.transcript.clone();
         if !timed_out && consumed_completion {
             self.wait_for_late_files_output_after_settled_completion(timeout);
         }
@@ -1468,78 +1436,24 @@ impl WorkerManager {
                 .map(|start| start.elapsed())
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
+            return Ok(build_timeout_reply(contents, is_error, 0));
         }
 
         let session_end = completion.session_end_seen;
-        let raw_prompt = if session_end || timed_out {
-            None
-        } else {
-            completion.prompt.clone()
-        };
-        if raw_prompt.as_deref() == Some("") {
-            append_stdin_wait_prompt(&mut contents, &completion);
-            contents.push(stdin_wait_status_content());
-        }
-        let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
-        let has_fallback_input_transcript = fallback_input_transcript.is_some();
-        let trim_enabled = !timed_out
-            && if completion.echo_events.is_empty() {
-                has_fallback_input_transcript
-            } else {
-                should_trim_echo_prefix(&completion.echo_events)
-            };
-        let echo_transcript = (!timed_out)
-            .then(|| {
-                echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript.clone())
-            })
-            .flatten();
-        trim_echo_then_append_protocol_warnings(
-            &mut contents,
-            echo_transcript.as_deref(),
-            trim_enabled,
-            if !timed_out && completion.echo_events.is_empty() {
-                has_fallback_input_transcript
-            } else {
-                should_drop_echo_only_contents(&completion.echo_events)
+        let built = build_completed_reply(
+            contents,
+            is_error,
+            0,
+            &completion,
+            session_end,
+            CompletionReplyMode::Files {
+                fallback_input,
+                idle_status_if_empty: true,
             },
-            &completion.protocol_warnings,
+            self.backend,
         );
-        if !timed_out && !trim_enabled {
-            let _ = trim_matching_echo_event_suffix_from_contents(
-                &mut contents,
-                &completion.echo_events,
-            );
-        }
-        if !timed_out && completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
-            let prompt_variants = fallback_prompt_variants(
-                completion.prompt.as_deref(),
-                completion.prompt_variants.as_deref(),
-            );
-            let _ = trim_leading_input_echo_from_contents(
-                &mut contents,
-                fallback_input.raw_input.as_deref(),
-                &prompt_variants,
-            );
-        }
-        if !timed_out && !session_end && contents.is_empty() {
-            contents.push(idle_status_content());
-        }
-        if !timed_out && !session_end {
-            reconcile_completion_prompt(&mut contents, resolved_prompt.clone(), self.backend);
-        }
-
-        Ok(ReplyWithOffset {
-            reply: WorkerReply::Output {
-                contents,
-                is_error,
-                error_code: timed_out.then_some(WorkerErrorCode::Timeout),
-                prompt: (!session_end).then_some(()).and(resolved_prompt),
-                prompt_variants: completion.prompt_variants.clone(),
-            },
-            end_offset: 0,
-        })
+        self.remember_prompt(built.prompt_to_remember.clone());
+        Ok(built.reply)
     }
 
     fn poll_pending_output_pager(
@@ -1552,14 +1466,7 @@ impl WorkerManager {
         let mut end_offset = self.output.end_offset().unwrap_or(start_offset);
         let mut timed_out = false;
         let mut completed_request = false;
-        let mut completion = CompletionInfo {
-            prompt: None,
-            stdin_wait_prompt: None,
-            prompt_variants: None,
-            echo_events: Vec::new(),
-            protocol_warnings: Vec::new(),
-            session_end_seen: false,
-        };
+        let mut completion = CompletionInfo::empty();
 
         if let Some(err) = self.settled_pending_error.take() {
             let preserve_pager = self.pager.is_active();
@@ -1641,17 +1548,6 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
-        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
-        let echo_transcript = (!timed_out)
-            .then(|| echo_transcript_from_events(&completion.echo_events))
-            .flatten();
-        trim_echo_then_append_protocol_warnings(
-            &mut contents,
-            echo_transcript.as_deref(),
-            trim_enabled,
-            should_drop_echo_only_contents(&completion.echo_events),
-            &completion.protocol_warnings,
-        );
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
             &mut contents,
@@ -1661,37 +1557,28 @@ impl WorkerManager {
             last_range,
         );
 
-        let session_end = completion.session_end_seen;
-        let raw_prompt = if session_end || timed_out {
-            None
-        } else {
-            completion.prompt.clone()
-        };
-        if raw_prompt.as_deref() == Some("") {
-            append_stdin_wait_prompt(&mut contents, &completion);
-            contents.push(stdin_wait_status_content());
-        }
-        let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
-        if self.pager.is_active() && !session_end {
-            self.pager_prompt = resolved_prompt.clone();
-        }
-        if !timed_out && !session_end && !self.pager.is_active() {
-            reconcile_completion_prompt(&mut contents, resolved_prompt.clone(), self.backend);
+        if timed_out {
+            return Ok(build_timeout_reply(contents, is_error, end_offset));
         }
 
-        Ok(ReplyWithOffset {
-            reply: WorkerReply::Output {
-                contents,
-                is_error,
-                error_code: timed_out.then_some(WorkerErrorCode::Timeout),
-                prompt: (!self.pager.is_active() && !session_end)
-                    .then_some(())
-                    .and(resolved_prompt),
-                prompt_variants: completion.prompt_variants.clone(),
-            },
+        let session_end = completion.session_end_seen;
+        let built = build_completed_reply(
+            contents,
+            is_error,
             end_offset,
-        })
+            &completion,
+            session_end,
+            CompletionReplyMode::Pager {
+                pager_active: self.pager.is_active(),
+                fallback_input_transcript: None,
+            },
+            self.backend,
+        );
+        self.remember_prompt(built.prompt_to_remember.clone());
+        if let Some(pager_prompt) = built.pager_prompt {
+            self.pager_prompt = pager_prompt;
+        }
+        Ok(built.reply)
     }
 
     /// Drains detached output that arrived before the next accepted request so it can be prefixed
@@ -1975,73 +1862,22 @@ impl WorkerManager {
                 let formatted = self.drain_final_formatted_output();
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
-                let raw_prompt = if session_end {
-                    None
-                } else {
-                    completion.prompt.clone()
-                };
-                if raw_prompt.as_deref() == Some("") {
-                    append_stdin_wait_prompt(&mut contents, &completion);
-                    contents.push(stdin_wait_status_content());
-                }
-                let resolved_prompt = normalize_prompt(raw_prompt.clone());
-                self.remember_prompt(raw_prompt);
                 let fallback_input = self.take_input_fallback(&completion);
-                let fallback_input_transcript = fallback_input.transcript.clone();
-                let has_fallback_input_transcript = fallback_input_transcript.is_some();
-                let trim_enabled = if completion.echo_events.is_empty() {
-                    has_fallback_input_transcript
-                } else {
-                    should_trim_echo_prefix(&completion.echo_events)
-                };
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript.clone());
-                trim_echo_then_append_protocol_warnings(
-                    &mut contents,
-                    echo_transcript.as_deref(),
-                    trim_enabled,
-                    if completion.echo_events.is_empty() {
-                        has_fallback_input_transcript
-                    } else {
-                        should_drop_echo_only_contents(&completion.echo_events)
+                let built = build_completed_reply(
+                    contents,
+                    is_error,
+                    0,
+                    &completion,
+                    session_end,
+                    CompletionReplyMode::Files {
+                        fallback_input,
+                        idle_status_if_empty: false,
                     },
-                    &completion.protocol_warnings,
+                    self.backend,
                 );
-                if !trim_enabled {
-                    let _ = trim_matching_echo_event_suffix_from_contents(
-                        &mut contents,
-                        &completion.echo_events,
-                    );
-                }
-                if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
-                    let prompt_variants = fallback_prompt_variants(
-                        completion.prompt.as_deref(),
-                        completion.prompt_variants.as_deref(),
-                    );
-                    let _ = trim_leading_input_echo_from_contents(
-                        &mut contents,
-                        fallback_input.raw_input.as_deref(),
-                        &prompt_variants,
-                    );
-                }
-                if !session_end {
-                    reconcile_completion_prompt(
-                        &mut contents,
-                        resolved_prompt.clone(),
-                        self.backend,
-                    );
-                }
+                self.remember_prompt(built.prompt_to_remember.clone());
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                Ok(ReplyWithOffset {
-                    reply: WorkerReply::Output {
-                        contents,
-                        is_error,
-                        error_code: None,
-                        prompt: (!session_end).then_some(()).and(resolved_prompt),
-                        prompt_variants: completion.prompt_variants.clone(),
-                    },
-                    end_offset: 0,
-                })
+                Ok(built.reply)
             }
             Err(WorkerError::Timeout(_)) => {
                 if let Some(process) = self.process.as_mut() {
@@ -2072,16 +1908,7 @@ impl WorkerManager {
 
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
 
-                Ok(ReplyWithOffset {
-                    reply: WorkerReply::Output {
-                        contents,
-                        is_error,
-                        error_code: Some(WorkerErrorCode::Timeout),
-                        prompt: None,
-                        prompt_variants: None,
-                    },
-                    end_offset: 0,
-                })
+                Ok(build_timeout_reply(contents, is_error, 0))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_files(&err, context);
@@ -2144,65 +1971,24 @@ impl WorkerManager {
                     buffer,
                     last_range,
                 );
-                let raw_prompt = if session_end {
-                    None
-                } else {
-                    completion.prompt.clone()
-                };
-                if raw_prompt.as_deref() == Some("") {
-                    append_stdin_wait_prompt(&mut contents, &completion);
-                    contents.push(stdin_wait_status_content());
-                }
-                let resolved_prompt = normalize_prompt(raw_prompt.clone());
-                self.remember_prompt(raw_prompt);
-                if self.pager.is_active() && !session_end {
-                    self.pager_prompt = resolved_prompt.clone();
-                }
-                let has_fallback_input_transcript = fallback_input_transcript.is_some();
-                let trim_enabled = if completion.echo_events.is_empty() {
-                    has_fallback_input_transcript
-                } else {
-                    should_trim_echo_prefix(&completion.echo_events)
-                };
-                let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                    .or(fallback_input_transcript.clone());
-                trim_echo_then_append_protocol_warnings(
-                    &mut contents,
-                    echo_transcript.as_deref(),
-                    trim_enabled,
-                    if completion.echo_events.is_empty() {
-                        has_fallback_input_transcript
-                    } else {
-                        should_drop_echo_only_contents(&completion.echo_events)
+                let built = build_completed_reply(
+                    contents,
+                    is_error,
+                    end_offset,
+                    &completion,
+                    session_end,
+                    CompletionReplyMode::Pager {
+                        pager_active: self.pager.is_active(),
+                        fallback_input_transcript,
                     },
-                    &completion.protocol_warnings,
+                    self.backend,
                 );
-                if completion.echo_events.is_empty() {
-                    let _ = trim_echo_prefix_after_leading_nonstdout_contents(
-                        &mut contents,
-                        fallback_input_transcript.as_deref(),
-                    );
-                }
-                if !session_end && !self.pager.is_active() {
-                    reconcile_completion_prompt(
-                        &mut contents,
-                        resolved_prompt.clone(),
-                        self.backend,
-                    );
+                self.remember_prompt(built.prompt_to_remember.clone());
+                if let Some(pager_prompt) = built.pager_prompt {
+                    self.pager_prompt = pager_prompt;
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
-                Ok(ReplyWithOffset {
-                    reply: WorkerReply::Output {
-                        contents,
-                        is_error,
-                        error_code: None,
-                        prompt: (!self.pager.is_active() && !session_end)
-                            .then_some(())
-                            .and(resolved_prompt),
-                        prompt_variants: completion.prompt_variants.clone(),
-                    },
-                    end_offset,
-                })
+                Ok(built.reply)
             }
             Err(WorkerError::Timeout(_)) => {
                 let fallback_input_transcript = context.input_transcript.clone();
@@ -2257,16 +2043,7 @@ impl WorkerManager {
                     last_range,
                 );
 
-                Ok(ReplyWithOffset {
-                    reply: WorkerReply::Output {
-                        contents,
-                        is_error,
-                        error_code: Some(WorkerErrorCode::Timeout),
-                        prompt: None,
-                        prompt_variants: None,
-                    },
-                    end_offset,
-                })
+                Ok(build_timeout_reply(contents, is_error, end_offset))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_pager(&err, context, page_bytes);
@@ -3898,28 +3675,6 @@ impl WorkerManager {
     }
 }
 
-fn timeout_status_content(timeout: Duration) -> WorkerContent {
-    let elapsed_ms = duration_to_millis(timeout);
-    let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
-    WorkerContent::server_stdout(format!(
-        "<<repl status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
-    ))
-}
-
-fn idle_status_content() -> WorkerContent {
-    WorkerContent::server_stdout("<<repl status: idle>>")
-}
-
-fn stdin_wait_status_content() -> WorkerContent {
-    WorkerContent::server_stdout("<<repl status: waiting for stdin>>")
-}
-
-fn append_stdin_wait_prompt(contents: &mut Vec<WorkerContent>, completion: &CompletionInfo) {
-    append_prompt_if_missing(contents, completion.stdin_wait_prompt.clone());
-}
-
-const TIMEOUT_STATUS_GRANULARITY_MS: u64 = 100;
-
 fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply {
     let WorkerReply::Output {
         mut contents,
@@ -4015,15 +3770,6 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
             WorkerContent::ContentText { .. } | WorkerContent::ContentImage { .. } => 0,
         })
         .sum()
-}
-
-fn duration_to_millis(duration: Duration) -> u64 {
-    let millis = duration.as_millis();
-    if millis > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        millis as u64
-    }
 }
 
 fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {

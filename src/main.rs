@@ -1,5 +1,6 @@
 mod backend;
 mod builtin_adapter_request_state;
+mod completion_reply;
 mod debug_logs;
 mod debug_repl;
 mod diagnostics;
