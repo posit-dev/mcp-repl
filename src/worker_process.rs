@@ -60,10 +60,12 @@ use crate::worker_supervisor::{
 
 mod control_prefix;
 mod output_state;
+mod write_dispatch;
 mod write_preflight;
 
 use self::control_prefix::ControlPrefixInput;
 use self::output_state::PrefixCapture;
+use self::write_dispatch::WriteDispatchInput;
 use self::write_preflight::{WritePreflightInput, WritePreflightOutcome};
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1087,21 +1089,16 @@ impl WorkerManager {
             WritePreflightOutcome::Reply(reply) => return Ok(reply),
         }
 
-        let input_context = self.prepare_input_context_files();
-
-        let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
-            Ok(result) => result,
-            Err(err) => {
-                self.guardrail.busy.store(false, Ordering::Relaxed);
-                let reply = self.build_reply_from_worker_error_files(&err, input_context);
-                let _ = self.reset_preserving_detached_prefix_item_count();
-                return Ok(self.finalize_reply(reply));
-            }
-        };
-        let reply = self.build_reply_from_request_files(request, input_context)?;
-        let reply = self.finalize_reply(reply);
-        self.maybe_reset_after_session_end_with_options(None, false, false)?;
-        Ok(reply)
+        self.dispatch_write_request(WriteDispatchInput {
+            mode: WriteStdinMode::Files,
+            text,
+            worker_timeout,
+            server_timeout,
+            deferred_sandbox_state_update: options.deferred_sandbox_state_update,
+            page_bytes: 0,
+            echo_input: false,
+            process_prechecked: false,
+        })
     }
 
     fn write_stdin_pager(
@@ -1137,23 +1134,16 @@ impl WorkerManager {
             WritePreflightOutcome::Reply(reply) => return Ok(reply),
         }
 
-        let input_context = self.prepare_input_context_pager(&text, echo_input);
-
-        let request = match self.send_worker_request(text, worker_timeout, server_timeout) {
-            Ok(result) => result,
-            Err(err) => {
-                self.guardrail.busy.store(false, Ordering::Relaxed);
-                let reply =
-                    self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-                let preserve_pager = self.pager.is_active();
-                let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
-                return Ok(self.finalize_reply(reply));
-            }
-        };
-        let reply = self.build_reply_from_request_pager(request, input_context, page_bytes)?;
-        let reply = self.finalize_reply(reply);
-        self.maybe_reset_after_session_end_with_options(None, false, false)?;
-        Ok(reply)
+        self.dispatch_write_request(WriteDispatchInput {
+            mode: WriteStdinMode::Pager,
+            text,
+            worker_timeout,
+            server_timeout,
+            deferred_sandbox_state_update: options.deferred_sandbox_state_update,
+            page_bytes,
+            echo_input,
+            process_prechecked: true,
+        })
     }
 
     fn handle_pager_command(&mut self, text: &str) -> Option<ReplyWithOffset> {

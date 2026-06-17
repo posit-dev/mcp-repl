@@ -65,13 +65,6 @@ impl WorkerManager {
             return Ok(outcome);
         }
 
-        self.apply_deferred_sandbox_state_update(
-            input.options.deferred_sandbox_state_update.clone(),
-        )?;
-        if let Some(outcome) = self.ensure_process_or_error_reply(&input)? {
-            return Ok(outcome);
-        }
-
         Ok(WritePreflightOutcome::Continue)
     }
 
@@ -106,9 +99,6 @@ impl WorkerManager {
             return Ok(outcome);
         }
 
-        self.apply_deferred_sandbox_state_update(
-            input.options.deferred_sandbox_state_update.clone(),
-        )?;
         Ok(WritePreflightOutcome::Continue)
     }
 
