@@ -60,9 +60,11 @@ use crate::worker_supervisor::{
 
 mod control_prefix;
 mod output_state;
+mod write_preflight;
 
 use self::control_prefix::ControlPrefixInput;
 use self::output_state::PrefixCapture;
+use self::write_preflight::{WritePreflightInput, WritePreflightOutcome};
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -1062,9 +1064,6 @@ impl WorkerManager {
         server_timeout: Duration,
         options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
-        let pending_state_prechecked = options.pending_state_prechecked;
-        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
-        let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
         if let Some(reply) = self.write_stdin_control_prefix(
             WriteStdinMode::Files,
@@ -1076,85 +1075,16 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        if self.guardrail_busy_event_pending() {
-            // Don't execute new input; the previous request was aborted.
-            self.maybe_emit_guardrail_notice();
-            let event = self
-                .guardrail
-                .event
-                .lock()
-                .expect("guardrail event mutex poisoned")
-                .take()
-                .expect("guardrail event should be present");
-            self.guardrail.busy.store(false, Ordering::Relaxed);
-            let input_context = self.prepare_input_context_files();
-            let err = WorkerError::Guardrail(event.message);
-            let reply = self.build_reply_from_worker_error_files(&err, input_context);
-            let _ = self.reset_preserving_detached_prefix_item_count();
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
-        }
-
-        let empty_input = text.is_empty();
-        self.maybe_emit_guardrail_notice();
-        if !pending_state_prechecked {
-            self.resolve_timeout_marker();
-        }
-        if empty_input {
-            if self.pending_request
-                || self.pending_output_tape.has_pending()
-                || self.settled_pending_completion.is_some()
-            {
-                let reply = self.poll_pending_output_files(worker_timeout)?;
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end_with_options(
-                    deferred_sandbox_state_update,
-                    suppress_session_end_reset,
-                    pending_state_prechecked,
-                )?;
-                return Ok(reply);
-            }
-            if pending_state_prechecked && self.control_only_interrupt_requires_spawn()? {
-                return Err(prechecked_follow_up_requires_meta_error());
-            }
-            if let Err(err) = self.ensure_process() {
-                let input_context = self.prepare_input_context_files();
-                let reply = self.build_reply_from_worker_error_files(&err, input_context);
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end_with_options(None, false, false)?;
-                return Ok(reply);
-            }
-            let reply = self.build_idle_poll_reply_files();
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
-        }
-        if !pending_state_prechecked && self.pending_request {
-            self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
-        }
-        if self.pending_request {
-            let mut reply = self.poll_pending_output_files(worker_timeout)?;
-            let detached_prefix_item_count = match &reply.reply {
-                WorkerReply::Output { contents, .. } => contents.len(),
-            };
-            self.last_detached_prefix_item_count = detached_prefix_item_count;
-            mark_busy_follow_up_reply(&mut reply.reply);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(
-                deferred_sandbox_state_update,
-                suppress_session_end_reset,
-                pending_state_prechecked,
-            )?;
-            return Ok(reply);
-        }
-        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_files();
-            let reply = self.build_reply_from_worker_error_files(&err, input_context);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
+        match self.write_preflight(WritePreflightInput {
+            mode: WriteStdinMode::Files,
+            text: &text,
+            worker_timeout,
+            page_bytes: 0,
+            echo_input: false,
+            options: &options,
+        })? {
+            WritePreflightOutcome::Continue => {}
+            WritePreflightOutcome::Reply(reply) => return Ok(reply),
         }
 
         let input_context = self.prepare_input_context_files();
@@ -1183,9 +1113,6 @@ impl WorkerManager {
     ) -> Result<WorkerReply, WorkerError> {
         let page_bytes_override = options.page_bytes_override;
         let echo_input = options.echo_input;
-        let pending_state_prechecked = options.pending_state_prechecked;
-        let deferred_sandbox_state_update = options.deferred_sandbox_state_update.clone();
-        let suppress_session_end_reset = options.suppress_session_end_reset;
         self.last_detached_prefix_item_count = 0;
         if let Some(reply) = self.write_stdin_control_prefix(
             WriteStdinMode::Pager,
@@ -1197,113 +1124,18 @@ impl WorkerManager {
             return Ok(reply);
         }
 
-        if self.guardrail_busy_event_pending() {
-            self.maybe_emit_guardrail_notice();
-            let event = self
-                .guardrail
-                .event
-                .lock()
-                .expect("guardrail event mutex poisoned")
-                .take()
-                .expect("guardrail event should be present");
-            self.guardrail.busy.store(false, Ordering::Relaxed);
-            let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-            let input_context = self.prepare_input_context_pager(&text, echo_input);
-            let err = WorkerError::Guardrail(event.message);
-            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-            let preserve_pager = self.pager.is_active();
-            let _ = self.reset_with_pager_preserving_detached_prefix_item_count(preserve_pager);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
-        }
-
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-        let empty_input = text.is_empty();
-        if !empty_input && self.pager.is_active() {
-            let trimmed = text.trim();
-            if trimmed.is_empty() || trimmed.starts_with(':') {
-                if let Some(reply) = self.handle_pager_command(&text) {
-                    let reply = self.finalize_reply(reply);
-                    self.maybe_reset_after_session_end_with_options(None, true, false)?;
-                    return Ok(reply);
-                }
-            } else {
-                self.pager.dismiss();
-                self.pager_prompt = None;
-            }
+        match self.write_preflight(WritePreflightInput {
+            mode: WriteStdinMode::Pager,
+            text: &text,
+            worker_timeout,
+            page_bytes,
+            echo_input,
+            options: &options,
+        })? {
+            WritePreflightOutcome::Continue => {}
+            WritePreflightOutcome::Reply(reply) => return Ok(reply),
         }
-
-        if empty_input {
-            self.output.start_capture();
-            self.maybe_emit_guardrail_notice();
-            if !pending_state_prechecked {
-                self.resolve_timeout_marker();
-            }
-            if self.pending_request
-                || self.output.has_pending_output()
-                || self.settled_pending_completion.is_some()
-            {
-                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end_with_options(
-                    deferred_sandbox_state_update,
-                    suppress_session_end_reset,
-                    pending_state_prechecked,
-                )?;
-                return Ok(reply);
-            }
-            if self.pager.is_active()
-                && let Some(reply) = self.handle_pager_command(&text)
-            {
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end_with_options(None, true, false)?;
-                return Ok(reply);
-            }
-            if pending_state_prechecked && self.control_only_interrupt_requires_spawn()? {
-                return Err(prechecked_follow_up_requires_meta_error());
-            }
-        }
-
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_pager(&text, echo_input);
-            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
-        }
-        if !empty_input {
-            self.output.start_capture();
-            self.maybe_emit_guardrail_notice();
-            if !pending_state_prechecked {
-                self.resolve_timeout_marker();
-            }
-        }
-        if empty_input {
-            let reply = self.build_idle_poll_reply_pager();
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(None, false, false)?;
-            return Ok(reply);
-        }
-        if !pending_state_prechecked && self.pending_request {
-            self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
-        }
-        if self.pending_request {
-            let mut reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
-            let detached_prefix_item_count = match &reply.reply {
-                WorkerReply::Output { contents, .. } => contents.len(),
-            };
-            self.last_detached_prefix_item_count = detached_prefix_item_count;
-            mark_busy_follow_up_reply(&mut reply.reply);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end_with_options(
-                deferred_sandbox_state_update,
-                suppress_session_end_reset,
-                pending_state_prechecked,
-            )?;
-            return Ok(reply);
-        }
-        self.apply_deferred_sandbox_state_update(deferred_sandbox_state_update)?;
 
         let input_context = self.prepare_input_context_pager(&text, echo_input);
 
