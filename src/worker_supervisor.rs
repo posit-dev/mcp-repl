@@ -1261,7 +1261,7 @@ impl WorkerProcess {
         self.child.wait()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_family = "unix"))]
     pub(crate) fn set_ipc_for_test(&mut self, ipc: ServerIpcConnection) {
         self.ipc.set(ipc);
     }
