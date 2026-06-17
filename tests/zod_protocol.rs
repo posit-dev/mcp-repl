@@ -185,6 +185,67 @@ async fn spawn_zod_stalled_control_server(
     .await
 }
 
+#[cfg(target_family = "unix")]
+async fn spawn_zod_fail_once_ready_server(
+    control_log: &std::path::Path,
+    marker_path: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = common::checkout_test_temp_parent("zod-ready-failure")?.join(nanos.to_string());
+    std::fs::create_dir_all(&root)?;
+    let wrapper_path = root.join("zod-fail-once.sh");
+    std::fs::write(
+        &wrapper_path,
+        r#"#!/bin/sh
+if [ ! -e "$MCP_REPL_ZOD_FAIL_ONCE_MARKER" ]; then
+  printf first > "$MCP_REPL_ZOD_FAIL_ONCE_MARKER"
+  exit 0
+fi
+exec "$MCP_REPL_ZOD_REAL_WORKER"
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&wrapper_path)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper_path, permissions)?;
+
+    let spec_path = root.join("zod-worker.json");
+    let mut env = Map::new();
+    env.insert(
+        "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
+        Value::String(control_log.display().to_string()),
+    );
+    env.insert(
+        "MCP_REPL_ZOD_REAL_WORKER".to_string(),
+        Value::String(zod_worker_path()?.display().to_string()),
+    );
+    env.insert(
+        "MCP_REPL_ZOD_FAIL_ONCE_MARKER".to_string(),
+        Value::String(marker_path.display().to_string()),
+    );
+    let spec = json!({
+        "executable": wrapper_path,
+        "args": [],
+        "working_dir": "inherit",
+        "env": env,
+        "stdin": "pipe",
+        "sandbox": "server"
+    });
+    std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+    common::spawn_server_with_args(vec![
+        "--worker-spec".to_string(),
+        spec_path.display().to_string(),
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+        "--oversized-output".to_string(),
+        "files".to_string(),
+    ])
+    .await
+}
+
 fn latest_debug_events(debug_dir: &std::path::Path) -> TestResult<Vec<Value>> {
     let mut sessions = fs::read_dir(debug_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -232,6 +293,58 @@ async fn zod_worker_v3_receives_turn_start_without_raw_stdin() -> TestResult<()>
     assert!(
         !log.contains("stdin:"),
         "v3 server path must not write request text to raw stdin, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let marker_path = tempdir.path().join("failed-once");
+    let session = spawn_zod_fail_once_ready_server(&control_log, &marker_path).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "second launch works",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if first_text.contains("v3-output: second launch works\n") {
+        assert!(
+            marker_path.is_file(),
+            "expected the wrapper to exercise the ready-failure launch"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("worker error: worker protocol error")
+            && first_text.contains("worker_ready"),
+        "expected first launch to fail while waiting for worker_ready, got: {first_text:?}"
+    );
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "second launch works",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v3-output: second launch works\n"),
+        "expected second launch to use a fresh IPC connection, got: {second_text:?}"
     );
 
     session.cancel().await?;
