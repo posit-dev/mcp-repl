@@ -61,6 +61,7 @@ mod control_prefix;
 mod interrupt;
 mod output_state;
 mod pending_poll;
+mod restart;
 mod write_dispatch;
 mod write_preflight;
 
@@ -1832,94 +1833,6 @@ impl WorkerManager {
                 suppress_session_end_reset,
             ),
         }
-    }
-
-    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        match self.oversized_output {
-            OversizedOutputMode::Files => self.restart_files(timeout),
-            OversizedOutputMode::Pager => self.restart_pager(timeout),
-        }
-    }
-
-    fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        crate::event_log::log(
-            "worker_restart_begin",
-            serde_json::json!({
-                "timeout_ms": timeout.as_millis(),
-            }),
-        );
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
-        self.maybe_emit_pending_server_notice();
-        let pre_shutdown_output = self
-            .process
-            .is_some()
-            .then(|| self.drain_sealed_formatted_output());
-        if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
-            self.pending_output_tape.clear();
-        }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-
-        let reply = match pre_shutdown_output {
-            Some(output) => {
-                self.build_session_reset_reply_files_from_formatted("new session started", output)
-            }
-            None => self.build_session_reset_reply_files("new session started"),
-        };
-        self.clear_preserved_prefixes();
-        self.reset_output_state_files(true);
-        self.note_respawn_during_write();
-        crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
-        Ok(self.finalize_reply(reply))
-    }
-
-    fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        crate::event_log::log(
-            "worker_restart_begin",
-            serde_json::json!({
-                "timeout_ms": timeout.as_millis(),
-            }),
-        );
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
-        self.maybe_emit_pending_server_notice();
-        let pre_shutdown_end_offset = self
-            .process
-            .is_some()
-            .then(|| self.output.end_offset().unwrap_or(0));
-        if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
-        }
-        let post_shutdown_end_offset = self.output.end_offset();
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-
-        let page_bytes = pager::resolve_page_bytes(None);
-        let reply = match pre_shutdown_end_offset {
-            Some(end_offset) => {
-                let reply = self.build_session_reset_reply_pager_to_offset(
-                    page_bytes,
-                    "new session started",
-                    end_offset,
-                );
-                if let Some(end_offset) = post_shutdown_end_offset {
-                    self.output.advance_offset_to(end_offset);
-                }
-                reply
-            }
-            None => self.build_session_reset_reply_pager(page_bytes, "new session started"),
-        };
-        self.clear_preserved_prefixes();
-        self.reset_output_state_pager(true, false);
-        self.note_respawn_during_write();
-        crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
-        Ok(self.finalize_reply(reply))
     }
 
     pub fn shutdown(&mut self) {
