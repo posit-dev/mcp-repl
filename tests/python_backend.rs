@@ -1661,6 +1661,49 @@ print("DIRECT_STDIN_VALUES", line, data)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdin_buffer_read_leaves_followup_turn_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import sys
+buffer_value = sys.stdin.buffer.readline().decode("utf-8").strip()
+buffered
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let mut text = result_text(&result);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        !is_busy_response(&text),
+        "expected sys.stdin.buffer read to consume the queued line, got: {text:?}"
+    );
+
+    let followup = session
+        .write_stdin_raw_with("print('BUFFER_FOLLOWUP', buffer_value)", Some(5.0))
+        .await?;
+    let followup_text = result_text(&followup);
+    session.cancel().await?;
+
+    assert!(
+        followup_text.contains("BUFFER_FOLLOWUP buffered"),
+        "expected follow-up REPL input to run after sys.stdin.buffer read, got: {followup_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();

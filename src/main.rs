@@ -16,6 +16,7 @@ mod pager;
 mod pending_output_tape;
 mod python_ffi;
 mod python_session;
+mod python_turn_input;
 mod python_worker;
 mod r_controls;
 mod r_graphics;

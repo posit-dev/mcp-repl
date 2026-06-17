@@ -15,6 +15,8 @@ use serde::Deserialize;
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
 #[cfg(target_family = "unix")]
+use crate::python_turn_input::{PythonTurnInput, normalize_pty_turn_payload};
+#[cfg(target_family = "unix")]
 use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 #[cfg(windows)]
@@ -31,10 +33,6 @@ const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 const PYTHON_EOF: c_int = 11;
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
-// Keep PTY feeds below conservative terminal input queues while still carrying
-// nearby complete lines for real sys.stdin/fd reads that do not enter _mcp_repl.
-#[cfg(target_family = "unix")]
-const PTY_FEED_TARGET_BYTES: usize = 128;
 const PYTHON_CONFIG_SNIPPET: &str = r#"
 import json
 import sys
@@ -308,28 +306,6 @@ pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), Strin
 }
 
 #[cfg(target_family = "unix")]
-fn normalize_pty_turn_payload(payload: Vec<u8>) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(payload.len());
-    let mut idx = 0;
-    while idx < payload.len() {
-        match payload[idx] {
-            b'\r' => {
-                normalized.push(b'\n');
-                idx += 1;
-                if payload.get(idx) == Some(&b'\n') {
-                    idx += 1;
-                }
-            }
-            byte => {
-                normalized.push(byte);
-                idx += 1;
-            }
-        }
-    }
-    normalized
-}
-
-#[cfg(target_family = "unix")]
 fn begin_or_append_turn_input(turn_id: u64, payload: Vec<u8>) {
     let Some(state) = SESSION_STATE.get() else {
         return;
@@ -345,32 +321,16 @@ fn begin_or_append_turn_input(turn_id: u64, payload: Vec<u8>) {
     let mut failure = None;
     let demand = {
         let mut guard = state.inner.lock().unwrap();
-        match guard.active_turn_id {
-            Some(active) if active != turn_id && !guard.protocol_stdin_bytes.is_empty() => {
-                let message =
-                    format!("turn_input turn_id {turn_id} does not match active turn_id {active}");
+        match guard.turn_input.begin_or_append(turn_id, payload) {
+            Err(message) => {
                 mark_protocol_failure_locked(&mut guard);
                 failure = Some(message);
                 None
             }
-            Some(active) if active != turn_id && guard.pty_feed_in_flight.is_some() => {
-                let message = format!(
-                    "turn_input turn_id {turn_id} arrived while turn_id {active} has a feed in flight"
-                );
-                mark_protocol_failure_locked(&mut guard);
-                failure = Some(message);
-                None
-            }
-            _ => {
-                if guard.active_turn_id != Some(turn_id) {
-                    guard.next_pty_feed_seq = 1;
-                }
-                guard.active_turn_id = Some(turn_id);
+            Ok(()) => {
                 guard.interrupt_requested = false;
-                guard.discard_untracked_stdin_after_interrupt = false;
                 guard.request_completed_at_stdin_wait = false;
                 guard.request_active = true;
-                guard.protocol_stdin_bytes.extend(payload);
                 guard.plot_reset_pending = true;
                 if guard.waiting_for_input {
                     let prompt = guard.current_prompt.clone().unwrap_or_default();
@@ -413,14 +373,11 @@ fn discard_pending_stdin() {
 
 #[cfg(target_family = "unix")]
 fn clear_protocol_stdin_after_interrupt(runtime_discarded: &[u8]) {
-    let _ = take_protocol_stdin_bytes_for_runtime_read(runtime_discarded);
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
-    guard.protocol_stdin_bytes.clear();
-    guard.pty_feed_in_flight = None;
-    guard.discard_untracked_stdin_after_interrupt = true;
+    guard.turn_input.clear_after_interrupt(runtime_discarded);
 }
 
 #[cfg(target_family = "unix")]
@@ -528,15 +485,8 @@ fn runtime_stdin_pending_byte_count() -> Option<usize> {
 }
 
 #[cfg(target_family = "unix")]
-struct PendingPtyFeed {
-    turn_id: u64,
-    seq: u64,
-    bytes: Vec<u8>,
-}
-
-#[cfg(target_family = "unix")]
 enum ReadlineDemand {
-    Feed(PendingPtyFeed),
+    Feed(crate::python_turn_input::PtyFeed),
     Idle { turn_id: u64, prompt: String },
     StdinWait { turn_id: u64, prompt: String },
     ReadlineStart { prompt: String },
@@ -548,10 +498,7 @@ fn mark_protocol_failure_locked(guard: &mut SessionStateInner) {
     guard.session_end_emitted = true;
     guard.shutdown = true;
     guard.request_active = false;
-    guard.active_turn_id = None;
-    guard.protocol_stdin_bytes.clear();
-    guard.pty_feed_in_flight = None;
-    guard.discard_untracked_stdin_after_interrupt = false;
+    guard.turn_input.clear_for_protocol_failure();
 }
 
 #[cfg(target_family = "unix")]
@@ -568,99 +515,28 @@ fn emit_protocol_failure(message: &str) {
 fn emit_protocol_failure(_message: &str) {}
 
 #[cfg(target_family = "unix")]
-fn pending_protocol_stdin(bytes: &VecDeque<u8>) -> Vec<u8> {
-    let mut byte_count = 0;
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte != b'\n' {
-            continue;
-        }
-        let line_end = idx.saturating_add(1);
-        if line_end > PTY_FEED_TARGET_BYTES && byte_count > 0 {
-            break;
-        }
-        byte_count = line_end;
-        if byte_count >= PTY_FEED_TARGET_BYTES {
-            break;
-        }
-    }
-    if byte_count == 0 {
-        byte_count = bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(bytes.len(), |idx| idx.saturating_add(1));
-    }
-    bytes.iter().take(byte_count).copied().collect()
-}
-
-#[cfg(target_family = "unix")]
-fn reconcile_direct_pty_stdin_reads_locked(guard: &mut SessionStateInner) -> Result<(), String> {
-    // sys.stdin and os.read(0, ...) consume PTY bytes without entering
-    // _mcp_repl, so reconcile queued protocol bytes against the PTY backlog.
-    let Some(pending_byte_count) = runtime_stdin_pending_byte_count() else {
-        return Ok(());
-    };
-    let Some(in_flight) = guard.pty_feed_in_flight.as_mut() else {
-        return Ok(());
-    };
-    if pending_byte_count >= in_flight.len() {
-        return Ok(());
-    }
-
-    let consumed = in_flight.len() - pending_byte_count;
-    if consumed > guard.protocol_stdin_bytes.len() {
-        return Err(format!(
-            "runtime stdin consumed {consumed} bytes but only {} protocol stdin bytes remain",
-            guard.protocol_stdin_bytes.len()
-        ));
-    }
-    in_flight.drain(..consumed);
-    if in_flight.is_empty() {
-        guard.pty_feed_in_flight = None;
-    }
-    guard.protocol_stdin_bytes.drain(..consumed);
-    Ok(())
-}
-
-#[cfg(target_family = "unix")]
-fn prepare_pending_pty_feed_locked(guard: &mut SessionStateInner) -> Option<PendingPtyFeed> {
-    if !guard.waiting_for_input || guard.pty_feed_in_flight.is_some() {
-        return None;
-    }
-    let turn_id = guard.active_turn_id?;
-    if guard.protocol_stdin_bytes.is_empty() {
-        return None;
-    }
-    let bytes = pending_protocol_stdin(&guard.protocol_stdin_bytes);
-    if bytes.is_empty() {
-        return None;
-    }
-    let seq = guard.next_pty_feed_seq;
-    guard.next_pty_feed_seq = guard.next_pty_feed_seq.saturating_add(1);
-    guard.pty_feed_in_flight = Some(bytes.clone());
-    Some(PendingPtyFeed {
-        turn_id,
-        seq,
-        bytes,
-    })
-}
-
-#[cfg(target_family = "unix")]
 fn prepare_readline_demand_locked(guard: &mut SessionStateInner, prompt: &str) -> ReadlineDemand {
     guard.waiting_for_input = true;
-    if let Err(message) = reconcile_direct_pty_stdin_reads_locked(guard) {
-        mark_protocol_failure_locked(guard);
-        return ReadlineDemand::ProtocolFailure { message };
-    }
-    if let Some(feed) = prepare_pending_pty_feed_locked(guard) {
+    let feed = match guard
+        .turn_input
+        .prepare_pty_feed(runtime_stdin_pending_byte_count())
+    {
+        Ok(feed) => feed,
+        Err(message) => {
+            mark_protocol_failure_locked(guard);
+            return ReadlineDemand::ProtocolFailure { message };
+        }
+    };
+    if let Some(feed) = feed {
         return ReadlineDemand::Feed(feed);
     }
-    if guard.pty_feed_in_flight.is_some() {
+    if guard.turn_input.pty_feed_in_flight() {
         return ReadlineDemand::ReadlineStart {
             prompt: prompt.to_string(),
         };
     }
 
-    let Some(turn_id) = guard.active_turn_id else {
+    let Some(turn_id) = guard.turn_input.take_consumed_turn() else {
         return ReadlineDemand::ReadlineStart {
             prompt: prompt.to_string(),
         };
@@ -671,10 +547,8 @@ fn prepare_readline_demand_locked(guard: &mut SessionStateInner, prompt: &str) -
         Some(PythonReadlineState::Primary | PythonReadlineState::Continuation)
     ) {
         guard.request_active = false;
-        guard.active_turn_id = None;
         ReadlineDemand::Idle { turn_id, prompt }
     } else {
-        guard.active_turn_id = None;
         ReadlineDemand::StdinWait { turn_id, prompt }
     }
 }
@@ -708,7 +582,7 @@ fn protocol_request_input_exhausted() -> bool {
         return stdin_pending_byte_count() == Some(0);
     };
     let guard = state.inner.lock().unwrap();
-    guard.protocol_stdin_bytes.is_empty()
+    guard.turn_input.queued_input_exhausted()
 }
 
 #[cfg(windows)]
@@ -2514,31 +2388,6 @@ fn note_stdin_bytes_read(bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_family = "unix")]
-fn take_protocol_stdin_bytes_for_runtime_read(runtime_bytes: &[u8]) -> Vec<u8> {
-    let Some(state) = SESSION_STATE.get() else {
-        return runtime_bytes.to_vec();
-    };
-    let mut guard = state.inner.lock().unwrap();
-    if guard.protocol_stdin_bytes.is_empty() {
-        return runtime_bytes.to_vec();
-    }
-
-    let mut protocol_bytes = Vec::with_capacity(runtime_bytes.len());
-    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
-        return runtime_bytes.to_vec();
-    }
-
-    for (&original_byte, &runtime_byte) in guard.protocol_stdin_bytes.iter().zip(runtime_bytes) {
-        protocol_bytes.push(original_byte);
-        if !protocol_stdin_byte_matches_runtime(original_byte, runtime_byte) {
-            return runtime_bytes.to_vec();
-        }
-    }
-    guard.protocol_stdin_bytes.drain(..protocol_bytes.len());
-    protocol_bytes
-}
-
-#[cfg(target_family = "unix")]
 fn consume_protocol_stdin_bytes_for_runtime_read(
     runtime_bytes: &[u8],
 ) -> Result<Option<(u64, Vec<u8>)>, String> {
@@ -2546,68 +2395,10 @@ fn consume_protocol_stdin_bytes_for_runtime_read(
         return Err("Python session state is unavailable while consuming stdin".to_string());
     };
     let mut guard = state.inner.lock().unwrap();
-    if guard.discard_untracked_stdin_after_interrupt && guard.protocol_stdin_bytes.is_empty() {
-        return Ok(None);
-    }
-    let turn_id = guard
-        .active_turn_id
-        .ok_or_else(|| "runtime stdin was read with no active turn".to_string())?;
-    if guard.protocol_stdin_bytes.len() < runtime_bytes.len() {
-        return Err(format!(
-            "runtime stdin read {} bytes but only {} protocol stdin bytes remain",
-            runtime_bytes.len(),
-            guard.protocol_stdin_bytes.len()
-        ));
-    }
-
-    let Some(in_flight) = guard.pty_feed_in_flight.as_ref() else {
-        return Err("runtime stdin was read with no pty_feed in flight".to_string());
-    };
-    if runtime_bytes.len() > in_flight.len() {
-        return Err(format!(
-            "runtime stdin read {} bytes but pty_feed only had {} bytes in flight",
-            runtime_bytes.len(),
-            in_flight.len()
-        ));
-    }
-
-    let protocol_bytes = guard
-        .protocol_stdin_bytes
-        .iter()
-        .take(runtime_bytes.len())
-        .copied()
-        .collect::<Vec<_>>();
-    for (idx, ((&expected_feed, &expected_protocol), &actual)) in in_flight
-        .iter()
-        .zip(protocol_bytes.iter())
-        .zip(runtime_bytes)
-        .enumerate()
-    {
-        if !protocol_stdin_byte_matches_runtime(expected_feed, actual) {
-            return Err(format!(
-                "runtime stdin byte {idx} did not match pty_feed: expected {expected_feed:?}, got {actual:?}"
-            ));
-        }
-        if !protocol_stdin_byte_matches_runtime(expected_protocol, actual) {
-            return Err(format!(
-                "runtime stdin byte {idx} did not match queued protocol input: expected {expected_protocol:?}, got {actual:?}"
-            ));
-        }
-    }
-
-    if let Some(in_flight) = guard.pty_feed_in_flight.as_mut() {
-        in_flight.drain(..runtime_bytes.len());
-        if in_flight.is_empty() {
-            guard.pty_feed_in_flight = None;
-        }
-    }
-    guard.protocol_stdin_bytes.drain(..runtime_bytes.len());
-    Ok(Some((turn_id, protocol_bytes)))
-}
-
-#[cfg(target_family = "unix")]
-fn protocol_stdin_byte_matches_runtime(protocol_byte: u8, runtime_byte: u8) -> bool {
-    protocol_byte == runtime_byte || (protocol_byte == b'\r' && runtime_byte == b'\n')
+    Ok(guard
+        .turn_input
+        .consume_runtime_read(runtime_bytes)?
+        .map(|read| (read.turn_id, read.protocol_bytes)))
 }
 
 #[cfg(target_family = "unix")]
@@ -2766,15 +2557,7 @@ struct SessionStateInner {
     #[cfg_attr(not(windows), allow(dead_code))]
     turn_cleanup_uncertain: bool,
     #[cfg(target_family = "unix")]
-    active_turn_id: Option<u64>,
-    #[cfg(target_family = "unix")]
-    next_pty_feed_seq: u64,
-    #[cfg(target_family = "unix")]
-    pty_feed_in_flight: Option<Vec<u8>>,
-    #[cfg(target_family = "unix")]
-    discard_untracked_stdin_after_interrupt: bool,
-    #[cfg(target_family = "unix")]
-    protocol_stdin_bytes: VecDeque<u8>,
+    turn_input: PythonTurnInput,
 }
 
 #[allow(dead_code)]
@@ -2826,15 +2609,7 @@ impl SessionState {
                 turn_write_in_flight: false,
                 turn_cleanup_uncertain: false,
                 #[cfg(target_family = "unix")]
-                active_turn_id: None,
-                #[cfg(target_family = "unix")]
-                next_pty_feed_seq: 1,
-                #[cfg(target_family = "unix")]
-                pty_feed_in_flight: None,
-                #[cfg(target_family = "unix")]
-                discard_untracked_stdin_after_interrupt: false,
-                #[cfg(target_family = "unix")]
-                protocol_stdin_bytes: VecDeque::new(),
+                turn_input: PythonTurnInput::new(),
             }),
             cvar: Condvar::new(),
         }
@@ -3260,15 +3035,6 @@ mod tests {
             &active,
             Some(PythonReadlineState::Primary)
         ));
-    }
-
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn unix_protocol_stdin_matching_accepts_pty_normalized_and_raw_cr() {
-        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\n'));
-        assert!(protocol_stdin_byte_matches_runtime(b'\r', b'\r'));
-        assert!(protocol_stdin_byte_matches_runtime(b'\n', b'\n'));
-        assert!(!protocol_stdin_byte_matches_runtime(b'\n', b'\r'));
     }
 
     #[test]
