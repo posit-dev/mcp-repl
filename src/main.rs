@@ -22,6 +22,7 @@ mod r_controls;
 mod r_graphics;
 mod r_htmd;
 mod r_session;
+mod reply_presentation;
 mod sandbox;
 mod sandbox_cli;
 mod server;
