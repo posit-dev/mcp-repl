@@ -5,10 +5,14 @@ use crate::python_turn_input::{PtyFeed, normalize_pty_turn_payload};
 use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 
+use super::state::{
+    PythonReadlineState, RawStdinReadError, SESSION_STATE, SessionStateInner, StdinReadAccounting,
+    mark_stdin_wait_prompt_completed_request,
+};
+use super::stdio::PythonThreadsAllowed;
 use super::{
-    CStdinLine, PythonReadlineState, PythonThreadsAllowed, RawStdinReadError, SESSION_STATE,
-    SessionStateInner, StdinReadAccounting, emit_output_text, emit_plots, flush_original_stdio,
-    mark_stdin_wait_prompt_completed_request, record_background_plots, set_callback_error,
+    CStdinLine, emit_output_text, emit_plots, flush_original_stdio, record_background_plots,
+    set_callback_error,
 };
 
 static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
@@ -461,7 +465,7 @@ fn mark_request_input_delivered() {
     guard.waiting_for_input = false;
 }
 
-fn stdin_pending_byte_count() -> Option<usize> {
+pub(super) fn stdin_pending_byte_count() -> Option<usize> {
     let mut count: libc::c_int = 0;
     let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut count) };
     if rc == 0 && count >= 0 {
