@@ -724,10 +724,10 @@ impl WorkerProcess {
         );
         if matches!(backend, Backend::Python)
             && let Some(python_executable) =
-                std::env::var_os(crate::python_session::PYTHON_EXECUTABLE_ENV)
+                std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV)
         {
             command.env(
-                crate::python_session::PYTHON_EXECUTABLE_ENV,
+                crate::python_runtime::PYTHON_EXECUTABLE_ENV,
                 python_executable,
             );
         }
