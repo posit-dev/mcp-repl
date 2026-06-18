@@ -17,6 +17,7 @@ mod oversized_output;
 mod pager;
 mod pending_output_tape;
 mod python_ffi;
+mod python_runtime;
 mod python_session;
 mod python_turn_input;
 mod python_worker;
