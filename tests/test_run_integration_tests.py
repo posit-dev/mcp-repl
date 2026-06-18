@@ -39,6 +39,26 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         self.assertLess(index + 1, len(case.server_args))
         self.assertEqual(case.server_args[index + 1], "python")
 
+    def test_python_console_basic_rejects_startup_failure_text(self):
+        startup_failure = self.module.tool_result(
+            self.module.text(
+                "failed to start Python backend: No such file or directory (os error 2)"
+            )
+        )
+        test_case = self
+
+        class FakeClient:
+            def repl(self, input_text, *, timeout_ms=None):
+                test_case.assertEqual("1+1", input_text)
+                test_case.assertEqual(2000, timeout_ms)
+                return startup_failure
+
+        with self.assertRaisesRegex(
+            self.module.SuiteFailure,
+            "python console repl response mismatch",
+        ):
+            self.module.python_console_basic(FakeClient())
+
     def test_tool_result_builder_matches_mcp_response_shape(self):
         self.assertEqual(
             self.module.tool_result(

@@ -633,9 +633,12 @@ def python_console_basic(client: McpStdioClient) -> None:
         "python console repl",
         deadline_seconds=python_startup_deadline_seconds(),
     )
-    received_text = require_success(received, "python console repl")
-    if "2" not in received_text:
-        raise SuiteFailure(f"expected Python repl output to contain 2, got: {received_text!r}")
+    expected = tool_result(
+        text("2\n"),
+        text(">>> "),
+    )
+
+    assert_identical(expected, normalize_response(received), "python console repl")
 
 
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
