@@ -440,9 +440,10 @@ mod tests {
     use crate::sandbox::{SandboxPolicy, SandboxStateUpdate};
     use crate::sandbox_cli::SandboxCliPlan;
     use crate::worker_process::is_prechecked_follow_up_requires_meta;
+    #[cfg(target_family = "unix")]
+    use crate::worker_process::test_support::worker_process_test_temp_parent;
     use crate::worker_process::test_support::{
         contents_text, cwd_test_mutex, successful_test_child, test_worker_process,
-        worker_process_test_temp_parent,
     };
     use crate::worker_protocol::ContentOrigin;
     use std::path::PathBuf;
