@@ -5,7 +5,7 @@ This file is the entrypoint for deciding how to verify a change.
 
 ## Core Test Surface
 
-- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, and `repl_reset` state clearing.
+- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, `repl_reset` state clearing, and public sandbox policy behavior.
 - `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
 - `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`/`repl_reset` behavior, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
@@ -38,8 +38,9 @@ python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 ```
 
 The runner starts the real server over MCP stdio and calls public tools only. It
-uses `--sandbox danger-full-access` by default so the suite stays focused on
-client protocol behavior rather than sandbox policy.
+uses `--sandbox danger-full-access` by default so most cases stay focused on
+client protocol behavior rather than sandbox policy. Individual sandbox cases
+override that default in their case-specific server args.
 
 Use `--case <name>` to run one public API case while iterating.
 

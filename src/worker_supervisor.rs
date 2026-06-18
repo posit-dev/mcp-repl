@@ -1483,7 +1483,6 @@ fn maybe_report_sandbox_exec_failure(
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 pub(crate) fn linux_sandbox_startup_retryable(err: &WorkerError) -> bool {
     match err {
         WorkerError::Protocol(message) => {

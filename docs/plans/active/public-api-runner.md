@@ -8,7 +8,7 @@
 ## Status
 
 - State: active
-- Last updated: 2026-05-18
+- Last updated: 2026-06-18
 - Current phase: implementation
 
 ## Current Direction
@@ -30,7 +30,7 @@
 - Phase 0: completed - add the runner shell and first R console smoke case.
 - Phase 1: completed - migrate another small real-client scenario with timeout or busy-worker behavior.
 - Phase 2: completed - run the external suite in CI after the debug binary is built.
-- Phase 3: pending - reintroduce sandbox scenarios in the Python runner and continue migrating duplicate real-binary Rust integration coverage case by case.
+- Phase 3: active - reintroduced `workspace-write` sandbox behavior in the Python runner; continue migrating duplicate real-binary Rust integration coverage case by case.
 
 ## Locked Decisions
 
@@ -46,8 +46,8 @@
 
 ## Next Safe Slice
 
-- Add a Python-runner sandbox case that starts the binary under `workspace-write`, proves an in-workspace write succeeds, and proves an out-of-policy write is blocked through the public `repl` tool.
-- In the same or next small slice, migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
+- Add a second public sandbox-policy contrast in the Python runner only if it replaces matching Rust public behavior cleanly, for example a focused read-only write denial or full-access outside-write case.
+- Otherwise, migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
 
 ## Stop Conditions
 
@@ -65,3 +65,4 @@
 - 2026-05-17: Removed obsolete serial scheduling after verifying the remaining Rust REPL binaries pass under normal Cargo test scheduling.
 - 2026-05-18: Reaffirmed that unmigrated Rust scenarios must remain discoverable by `cargo test`; migrations should replace Rust coverage with equivalent Python coverage in the same change, not disable tests ahead of time.
 - 2026-05-18: Clarified that the external runner itself is not sandboxed, but the spawned `mcp-repl` binary still owns the sandbox contract; the next slice should restore sandbox coverage in the Python runner starting with `workspace-write`.
+- 2026-06-18: Added an external `workspace-write` sandbox case that verifies public `repl` behavior for writes inside the server cwd and blocked writes outside it.

@@ -53,13 +53,46 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
             exe_binary.write_text("", encoding="utf-8")
 
             with patch.object(self.module.sys, "platform", "win32"):
-                self.assertEqual(exe_binary, self.module.resolve_binary_path(binary))
+                self.assertEqual(
+                    exe_binary.resolve(),
+                    self.module.resolve_binary_path(binary),
+                )
+
+    def test_resolve_binary_path_returns_absolute_existing_path(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            temp_path = Path(temp_dir)
+            binary = temp_path / "mcp-repl"
+            binary.write_text("", encoding="utf-8")
+
+            relative_binary = binary.relative_to(Path.cwd())
+
+            self.assertEqual(
+                binary.resolve(),
+                self.module.resolve_binary_path(relative_binary),
+            )
 
     def test_server_process_env_uses_plain_pagers_by_default(self):
         env = self.module.server_process_env(())
 
         self.assertEqual("cat", env["PAGER"])
         self.assertEqual("cat", env["MANPAGER"])
+
+    def test_workspace_write_case_overrides_default_sandbox(self):
+        case = self.module.CASES["r-workspace-write-sandbox"]
+
+        sandbox_args = [
+            (arg, case.server_args[index + 1])
+            for index, arg in enumerate(case.server_args[:-1])
+            if arg == "--sandbox"
+        ]
+        self.assertEqual([("--sandbox", "workspace-write")], sandbox_args)
+
+    def test_workspace_write_case_uses_scratch_cwd(self):
+        case = self.module.CASES["r-workspace-write-sandbox"]
+
+        self.assertIsNotNone(case.server_cwd)
+        self.assertIn("target", case.server_cwd.parts)
+        self.assertIn("test-scratch", case.server_cwd.parts)
 
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(

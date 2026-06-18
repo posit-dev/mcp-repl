@@ -63,12 +63,14 @@ class McpStdioClient:
         binary: Path,
         server_args: Sequence[str],
         server_env: Sequence[tuple[str, str]],
+        server_cwd: Path | None,
         timeout_seconds: float,
     ) -> None:
         assert timeout_seconds > 0
         self.binary = binary
         self.server_args = list(server_args)
         self.server_env = dict(server_env)
+        self.server_cwd = server_cwd
         self.timeout_seconds = timeout_seconds
         self.next_request_id = 1
         self.stderr_lines: list[str] = []
@@ -88,6 +90,7 @@ class McpStdioClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=server_process_env(tuple(self.server_env.items())),
+            cwd=self.server_cwd,
         )
         assert self.process.stdout is not None
         assert self.process.stderr is not None
@@ -452,6 +455,20 @@ def r_large_text_input(label: str, lines: int = 80, width: int = 120) -> str:
     )
 
 
+def r_write_file_input(path: Path, value: str) -> str:
+    return dedent(
+        f"""
+        tryCatch(
+          {{
+            writeLines({r_string_literal(value)}, {r_string_literal(str(path))})
+            cat("WRITE_OK\\n")
+          }},
+          error = function(e) cat("WRITE_ERROR:", conditionMessage(e), "\\n", sep = "")
+        )
+        """
+    )
+
+
 def repeated_text_line(label: str, index: int, width: int = 120) -> str:
     return f"{label}{index:03d} {label * width}\n"
 
@@ -569,6 +586,52 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
         after_reset,
         "after reset repl",
     )
+
+
+def r_workspace_write_sandbox(client: McpStdioClient) -> None:
+    stamp = f"{os.getpid()}-{time.time_ns()}"
+    workspace_cwd = client.server_cwd or Path.cwd()
+    workspace_target = workspace_cwd / f".mcp-repl-workspace-write-{stamp}.txt"
+    outside_target = (
+        workspace_cwd.resolve().parent
+        / f".mcp-repl-workspace-write-outside-{stamp}.txt"
+    )
+    for target in [workspace_target, outside_target]:
+        target.unlink(missing_ok=True)
+
+    try:
+        workspace_result = client.repl(
+            r_write_file_input(workspace_target, "allowed"),
+            timeout_ms=30000,
+        )
+        workspace_text = require_success(workspace_result, "workspace-write cwd repl")
+        if "WRITE_OK" not in workspace_text or "WRITE_ERROR:" in workspace_text:
+            raise SuiteFailure(
+                "expected workspace-write to allow writing in cwd, "
+                f"got: {workspace_text!r}"
+            )
+        if workspace_target.read_text(encoding="utf-8").strip() != "allowed":
+            raise SuiteFailure(
+                f"workspace-write cwd file did not contain expected text: {workspace_target}"
+            )
+
+        outside_result = client.repl(
+            r_write_file_input(outside_target, "blocked"),
+            timeout_ms=30000,
+        )
+        outside_text = require_success(outside_result, "workspace-write outside repl")
+        if "WRITE_ERROR:" not in outside_text or "WRITE_OK" in outside_text:
+            raise SuiteFailure(
+                "expected workspace-write to block writing outside cwd, "
+                f"got: {outside_text!r}"
+            )
+        if outside_target.exists():
+            raise SuiteFailure(
+                f"workspace-write unexpectedly created outside file: {outside_target}"
+            )
+    finally:
+        workspace_target.unlink(missing_ok=True)
+        outside_target.unlink(missing_ok=True)
 
 
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
@@ -810,6 +873,7 @@ class SuiteCase:
     run: Callable[[McpStdioClient], None]
     server_args: tuple[str, ...] = ()
     server_env: tuple[tuple[str, str], ...] = ()
+    server_cwd: Path | None = None
 
 
 def r_suite_case(
@@ -817,11 +881,13 @@ def r_suite_case(
     *,
     server_args: tuple[str, ...] = (),
     server_env: tuple[tuple[str, str], ...] = (),
+    server_cwd: Path | None = None,
 ) -> SuiteCase:
     return SuiteCase(
         run,
         server_args=("--interpreter", "r", *server_args),
         server_env=server_env,
+        server_cwd=server_cwd,
     )
 
 
@@ -853,6 +919,11 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
+    "r-workspace-write-sandbox": r_suite_case(
+        r_workspace_write_sandbox,
+        server_args=("--sandbox", "workspace-write"),
+        server_cwd=Path("target/test-scratch/run-integration-tests/r-workspace-write-sandbox"),
+    ),
 }
 
 
@@ -888,11 +959,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def resolve_binary_path(path: Path) -> Path:
     if path.is_file():
-        return path
+        return path.resolve()
     if sys.platform == "win32" and path.suffix == "":
         exe_path = path.with_name(f"{path.name}.exe")
         if exe_path.is_file():
-            return exe_path
+            return exe_path.resolve()
     return path
 
 
@@ -907,11 +978,18 @@ def main(argv: Sequence[str]) -> int:
     failures = 0
     for case_name in selected:
         case = CASES[case_name]
+        server_cwd = None
+        if case.server_cwd is not None:
+            server_cwd = case.server_cwd
+            if not server_cwd.is_absolute():
+                server_cwd = Path.cwd() / server_cwd
+            server_cwd.mkdir(parents=True, exist_ok=True)
         try:
             with McpStdioClient(
                 binary,
                 ["--sandbox", args.sandbox, *case.server_args],
                 case.server_env,
+                server_cwd,
                 args.timeout,
             ) as client:
                 case.run(client)
