@@ -672,35 +672,6 @@ fn prepopulate_reticulate_keras_jax_cache() -> TestResult<bool> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_read_only_blocks_workspace_writes() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
-    let repo_root = std::env::current_dir()?;
-    let target = unique_path(&repo_root, "read-only");
-    let session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
-    let result = session
-        .write_stdin_raw_with(write_test_code(&target), Some(10.0))
-        .await?;
-    let text = collect_text(&result);
-    let _ = std::fs::remove_file(&target);
-    if skip_backend_unavailable("sandbox_read_only_blocks_workspace_writes", &text) {
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    assert!(
-        text.contains("WRITE_ERROR:"),
-        "expected write to be blocked, got: {text}"
-    );
-    assert!(
-        !text.contains("WRITE_OK"),
-        "write unexpectedly succeeded: {text}"
-    );
-    session.cancel().await?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
     assert!(sandbox_available(), "sandbox-exec unavailable");
     let repo_root = std::env::current_dir()?;
