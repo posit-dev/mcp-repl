@@ -1579,6 +1579,8 @@ cat("TAIL_ONLY\n")
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path() -> TestResult<()> {
     let temp = tempdir()?;
+    let release_path = temp.path().join("release");
+    let release_literal = serde_json::to_string(&release_path.to_string_lossy().to_string())?;
     let session = spawn_server_with_files_env_vars(vec![
         ("TMPDIR".to_string(), temp.path().display().to_string()),
         (
@@ -1588,43 +1590,46 @@ async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path()
     ])
     .await?;
 
-    let input = r#"
-Sys.sleep(0.25)
-for (i in 1:6) {
+    let input = format!(
+        r#"
+for (i in 1:6) {{
   plot(1:10, main = sprintf("plot%03d", i))
-}
+}}
 flush.console()
-Sys.sleep(1)
-"#;
-    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+while (!file.exists({release_literal})) Sys.sleep(0.05)
+"#
+    );
+    let first = session.write_stdin_raw_with(input, Some(10.0)).await?;
     if any_backend_unavailable(&[&first]) {
         eprintln!("plot_images backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-
-    sleep(Duration::from_millis(600)).await;
-    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
-    let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
-        eprintln!("plot_images timeout omission poll did not flush bundle state yet; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+    let first_text = result_text(&first);
 
     assert_ne!(
-        bundled.is_error,
+        first.is_error,
         Some(true),
-        "image-only timeout omission poll reported an error: {}",
-        bundled_text
+        "image-only timeout omission reply reported an error: {}",
+        first_text
     );
     assert!(
-        bundled_text.contains("later content omitted"),
-        "expected omission notice in image-only timeout poll, got: {bundled_text:?}"
+        first_text.contains("later content omitted"),
+        "expected omission notice in image-only timeout reply, got: {first_text:?}"
     );
     assert!(
-        bundled_text.contains("output-0001"),
-        "expected omission reply to disclose a bundle path, got: {bundled_text:?}"
+        first_text.contains("output-0001"),
+        "expected omission reply to disclose a bundle path, got: {first_text:?}"
+    );
+
+    fs::write(&release_path, "go")?;
+    let settled = session.write_stdin_raw_with("", Some(60.0)).await?;
+    let settled_text = result_text(&settled);
+    assert_ne!(
+        settled.is_error,
+        Some(true),
+        "image-only timeout settle poll reported an error: {}",
+        settled_text
     );
 
     session.cancel().await?;

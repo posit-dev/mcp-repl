@@ -9,7 +9,8 @@ use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::PendingSidebandKind;
 use crate::reply_presentation::build_input_transcript;
 
-use super::{WorkerError, WorkerManager, output_echo_source_for_backend};
+use super::backend_driver::output_echo_source_for_backend;
+use super::{WorkerError, WorkerManager};
 
 pub(super) const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
