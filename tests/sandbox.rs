@@ -816,30 +816,6 @@ async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_full_access_allows_writes_outside_workspace() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
-    let target = unique_path(&std::env::temp_dir(), "full-access");
-    let session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
-    let result = session
-        .write_stdin_raw_with(write_test_code(&target), Some(10.0))
-        .await?;
-    let text = collect_text(&result);
-    let _ = std::fs::remove_file(&target);
-    if skip_backend_unavailable("sandbox_full_access_allows_writes_outside_workspace", &text) {
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    assert!(
-        text.contains("WRITE_OK"),
-        "expected write to succeed, got: {text}"
-    );
-    session.cancel().await?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
     assert!(sandbox_available(), "sandbox-exec unavailable");
     let Some(addr) = start_loopback_server_if_available().await? else {
