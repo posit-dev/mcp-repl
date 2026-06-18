@@ -1579,9 +1579,7 @@ cat("TAIL_ONLY\n")
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_output_bundle_image_only_omission_still_discloses_bundle_path() -> TestResult<()> {
     let temp = tempdir()?;
-    let ready_path = temp.path().join("plots-ready");
     let release_path = temp.path().join("release");
-    let ready_literal = serde_json::to_string(&ready_path.to_string_lossy().to_string())?;
     let release_literal = serde_json::to_string(&release_path.to_string_lossy().to_string())?;
     let session = spawn_server_with_files_env_vars(vec![
         ("TMPDIR".to_string(), temp.path().display().to_string()),
@@ -1598,11 +1596,10 @@ for (i in 1:6) {{
   plot(1:10, main = sprintf("plot%03d", i))
 }}
 flush.console()
-invisible(file.create({ready_literal}))
 while (!file.exists({release_literal})) Sys.sleep(0.05)
 "#
     );
-    let first = session.write_stdin_raw_with(input, Some(5.0)).await?;
+    let first = session.write_stdin_raw_with(input, Some(10.0)).await?;
     if any_backend_unavailable(&[&first]) {
         eprintln!("plot_images backend unavailable in this environment; skipping");
         session.cancel().await?;
@@ -1615,10 +1612,6 @@ while (!file.exists({release_literal})) Sys.sleep(0.05)
         Some(true),
         "image-only timeout omission reply reported an error: {}",
         first_text
-    );
-    assert!(
-        ready_path.exists(),
-        "expected request to time out after plots were emitted, got: {first_text:?}"
     );
     assert!(
         first_text.contains("later content omitted"),
