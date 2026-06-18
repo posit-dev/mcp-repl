@@ -341,3 +341,57 @@ impl WorkerManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::completion_reply::CompletionInfo;
+    use crate::oversized_output::OversizedOutputMode;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::test_support::contents_text;
+
+    #[test]
+    fn interrupt_files_drains_settled_completion_without_leaking_echo() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.07)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.07)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let WorkerReply::Output { contents, .. } = manager
+            .interrupt(Duration::from_millis(10), None, false)
+            .expect("interrupt reply");
+        let text = contents_text(&contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected the settled completion output to be preserved, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.07)"),
+            "did not expect the settled completion echo to leak through interrupt handling, got: {text:?}"
+        );
+        assert!(
+            text.contains(">>> "),
+            "expected the settled completion to keep the prompt on the interrupt reply, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected the settled completion to be consumed by the interrupt follow-up"
+        );
+    }
+}

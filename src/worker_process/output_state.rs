@@ -380,3 +380,316 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, ensure_output_ring, reset_last_reply_marker_offset,
+        reset_output_ring,
+    };
+    use crate::pending_output_tape::{PendingSidebandKind, PendingTextSource};
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::test_support::{contents_text, output_ring_test_guard};
+
+    #[test]
+    fn files_prepare_input_context_trims_echo_from_prompt_fallback_when_echo_events_missing() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected the settled files-mode output to survive trimming, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the Python prompt echo to leak into the next files-mode reply, got: {text:?}"
+        );
+        assert!(
+            manager.settled_pending_completion.is_none(),
+            "expected settled completion metadata to be consumed with the detached prefix"
+        );
+    }
+
+    #[test]
+    fn files_reset_preserving_detached_output_keeps_pending_request_input_for_trim() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some(">>> ".to_string()),
+            stdin_wait_prompt: None,
+            prompt_variants: Some(vec![">>> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        manager.reset_output_state_files_preserving_detached_output();
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected detached files-mode output to survive the preserved reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the preserved reset to leak the original Python input echo, got: {text:?}"
+        );
+        assert!(
+            manager.pending_request_input.is_none(),
+            "expected preserved pending input to be consumed once the detached prefix is prepared"
+        );
+    }
+
+    #[test]
+    fn files_respawned_pending_request_trims_echo_without_settled_completion() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_request = true;
+        manager.last_prompt = Some(">>> ".to_string());
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b">>> import time; time.sleep(0.2)\nDETACHED_OK\n");
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+
+        manager.reset_output_state_files_preserving_detached_output();
+
+        let context = manager.prepare_input_context_files();
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected aborted pending output to survive the respawned reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the aborted request echo to leak across the respawn boundary, got: {text:?}"
+        );
+        assert!(
+            manager.pending_request_input.is_none(),
+            "expected the aborted request input fallback to be consumed once the detached prefix is prepared"
+        );
+    }
+
+    #[test]
+    fn pager_respawned_pending_request_trims_echo_without_echo_events() {
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.pending_request = true;
+        manager.last_prompt = Some(">>> ".to_string());
+        manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
+        manager.output.start_capture();
+        manager.output_timeline.append_ipc_text_with_continuation(
+            b">>> import time; time.sleep(0.2)\nDETACHED_OK\n",
+            false,
+            ContentOrigin::Worker,
+            false,
+        );
+
+        manager.reset_output_state_pager_preserving_detached_output(false);
+
+        let context = manager.prepare_input_context_pager("1+1", false);
+        let text = contents_text(&context.detached_prefix_contents);
+
+        assert!(
+            text.contains("DETACHED_OK\n"),
+            "expected aborted pager output to survive the respawned reset, got: {text:?}"
+        );
+        assert!(
+            !text.contains("import time; time.sleep(0.2)"),
+            "did not expect the aborted pager echo to leak across the respawn boundary, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_seals_split_utf8_at_request_boundary() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let first = manager.prepare_input_context_files();
+        assert_eq!(
+            contents_text(&first.detached_prefix_contents),
+            "\\xC3",
+            "expected an accepted request to seal the detached utf-8 lead byte into the prefix"
+        );
+
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(&[0xA9, b'\n']);
+        let second = manager.prepare_input_context_files();
+
+        assert_eq!(
+            contents_text(&second.detached_prefix_contents),
+            "\\xA9\n",
+            "expected the next request output to stay split after the detached prefix was sealed"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_preserves_echo_only_input() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected an in-flight files-mode drain to keep the echoed command visible"
+        );
+    }
+
+    #[test]
+    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
+        let manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+        manager.pending_output_tape.append_stdout_bytes(b"start\n");
+
+        let formatted = manager.drain_formatted_output();
+
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::stdout("start\n")],
+            "expected worker output to hide the leading timed-out REPL echo again"
+        );
+    }
+
+    #[test]
+    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager
+            .pending_output_tape
+            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+        manager
+            .pending_output_tape
+            .append_sideband(PendingSidebandKind::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "Sys.sleep(5)\n".to_string(),
+                echo_source: PendingTextSource::Ipc,
+            });
+
+        let context = manager.prepare_input_context_files();
+
+        assert_eq!(
+            context.detached_prefix_contents,
+            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
+            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
+        );
+    }
+
+    #[test]
+    fn files_preserved_detached_prefix_stays_separate_from_new_session_startup_output() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"OLD_TAIL\n");
+
+        manager.reset_output_state_files_preserving_detached_output();
+        manager.next_live_prefix_belongs_to_reply = true;
+        manager
+            .pending_output_tape
+            .append_stdout_bytes(b"NEW_SESSION_STARTUP\n");
+
+        let context = manager.prepare_input_context_files();
+
+        assert_eq!(
+            contents_text(&context.detached_prefix_contents),
+            "OLD_TAIL\n",
+            "expected preserved detached output to stay isolated from the replacement session"
+        );
+        assert_eq!(
+            contents_text(&context.reply_prefix_contents),
+            "NEW_SESSION_STARTUP\n",
+            "expected fresh-session startup output to stay with the new reply prefix"
+        );
+    }
+}

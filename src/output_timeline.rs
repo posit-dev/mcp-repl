@@ -614,6 +614,17 @@ mod tests {
         }
     }
 
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     #[test]
     fn anchored_image_moves_before_later_echoed_line_output() {
         let bytes = b"> plot(1:10)\n> cat('done\\n')\ndone\n".to_vec();
@@ -760,6 +771,131 @@ mod tests {
         );
 
         assert_eq!(contents, vec![WorkerContent::stdout("> Sys.sleep(5)\n")]);
+    }
+
+    #[test]
+    fn collapse_echo_with_attribution_drops_leading_multi_expression_echo_prefix() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 27,
+            bytes: b"> x <- 1\n> y <- 2\n[1] 2\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 27,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+
+        assert_eq!(
+            String::from_utf8(collapsed.bytes).expect("utf8"),
+            "[1] 2\n> "
+        );
+        assert!(
+            collapsed.events.is_empty(),
+            "did not expect sideband events"
+        );
+        assert_eq!(
+            collapsed.text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(collapsed.text_spans[0].start_byte, 0);
+        assert_eq!(collapsed.text_spans[0].end_byte, 8);
+        assert!(!collapsed.text_spans[0].is_stderr);
+    }
+
+    #[test]
+    fn collapse_echo_with_attribution_drops_leading_echo_prefix_without_separator_newline() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 42,
+            bytes: b"> xstderr: Error: object 'x' not found\n> ".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 42,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "x\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+
+        assert_eq!(
+            String::from_utf8(collapsed.bytes).expect("utf8"),
+            "stderr: Error: object 'x' not found\n> "
+        );
+        assert!(
+            collapsed.events.is_empty(),
+            "did not expect sideband events"
+        );
+        assert_eq!(
+            collapsed.text_spans.len(),
+            1,
+            "expected collapsed output to stay in one stdout span"
+        );
+        assert_eq!(collapsed.text_spans[0].start_byte, 0);
+        assert_eq!(collapsed.text_spans[0].end_byte, 38);
+        assert!(!collapsed.text_spans[0].is_stderr);
+    }
+
+    #[test]
+    fn pager_collapsed_settled_completion_trims_echo_and_keeps_output() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 25,
+            bytes: b"> Sys.sleep(0.2); 1+1\n[1] 2\n".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: 25,
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Ipc,
+            }],
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            25,
+        );
+        let text = contents_text(&contents);
+
+        assert!(
+            text.contains("[1] 2\n"),
+            "expected settled pager output to be preserved, got: {text:?}"
+        );
+        assert!(
+            !text.contains("Sys.sleep(0.2); 1+1"),
+            "did not expect settled pager echo to leak into the next input context, got: {text:?}"
+        );
     }
 
     #[test]

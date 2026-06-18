@@ -165,3 +165,91 @@ impl WorkerManager {
         self.note_respawn_during_write();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::WriteStdinOptions;
+    use crate::worker_process::output_state::PrefixCapture;
+    use crate::worker_process::test_support::contents_text;
+    use crate::worker_protocol::WorkerContent;
+
+    #[test]
+    fn bare_restart_flushes_queued_sandbox_change_notice() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.stage_sandbox_change_restart_notice(true);
+
+        let reply = manager
+            .write_stdin_files(
+                "\u{4}".to_string(),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                WriteStdinOptions::default(),
+            )
+            .expect("restart reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        assert!(
+            text.contains("sandbox policy changed; new session started"),
+            "expected bare restart to flush the queued sandbox notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("[repl] new session started"),
+            "expected the explicit restart notice to remain visible, got: {text:?}"
+        );
+        assert!(
+            manager.pending_server_notice.is_none(),
+            "expected the queued sandbox notice to be consumed by the restart reply"
+        );
+    }
+
+    #[test]
+    fn bare_restart_clears_preserved_detached_prefixes() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.preserved_detached_prefix = PrefixCapture {
+            contents: vec![WorkerContent::worker_stdout("OLD_DETACHED\n")],
+            is_error: false,
+            bytes: "OLD_DETACHED\n".len() as u64,
+        };
+        manager.reply_owned_prefix = PrefixCapture {
+            contents: vec![WorkerContent::worker_stdout("OLD_REPLY\n")],
+            is_error: false,
+            bytes: "OLD_REPLY\n".len() as u64,
+        };
+        manager.next_live_prefix_belongs_to_reply = true;
+
+        let reply = manager
+            .write_stdin_files(
+                "\u{4}".to_string(),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                WriteStdinOptions::default(),
+            )
+            .expect("restart reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let reply_text = contents_text(&contents);
+        assert!(
+            !reply_text.contains("OLD_DETACHED") && !reply_text.contains("OLD_REPLY"),
+            "did not expect preserved detached prefixes in restart reply, got: {reply_text:?}"
+        );
+
+        let context = manager.prepare_input_context_files();
+        assert!(
+            context.detached_prefix_contents.is_empty() && context.reply_prefix_contents.is_empty(),
+            "did not expect explicit restart to leak old prefixes into the next input"
+        );
+    }
+}

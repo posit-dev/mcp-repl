@@ -240,3 +240,84 @@ pub(super) fn mark_busy_follow_up_reply(reply: &mut WorkerReply) {
         *error_code = Some(WorkerErrorCode::Busy);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contents_text(contents: Vec<WorkerContent>) -> String {
+        contents
+            .into_iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn busy_follow_up_reply_sets_busy_error_code_when_missing() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::worker_stdout("tail\n")],
+            is_error: false,
+            error_code: None,
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents_text(contents);
+
+        assert!(
+            is_error,
+            "expected busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(error_code, Some(WorkerErrorCode::Busy));
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn busy_follow_up_reply_preserves_timeout_error_code() {
+        let mut reply = WorkerReply::Output {
+            contents: vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
+            is_error: false,
+            error_code: Some(WorkerErrorCode::Timeout),
+            prompt: None,
+            prompt_variants: None,
+        };
+
+        mark_busy_follow_up_reply(&mut reply);
+
+        let WorkerReply::Output {
+            contents,
+            is_error,
+            error_code,
+            ..
+        } = reply;
+        let text = contents_text(contents);
+
+        assert!(
+            is_error,
+            "expected timed-out busy follow-up replies to be marked as errors"
+        );
+        assert_eq!(
+            error_code,
+            Some(WorkerErrorCode::Timeout),
+            "expected timed-out busy follow-up replies to preserve Timeout"
+        );
+        assert!(
+            text.contains("[repl] input discarded while worker busy"),
+            "expected busy follow-up marker, got: {text:?}"
+        );
+    }
+}

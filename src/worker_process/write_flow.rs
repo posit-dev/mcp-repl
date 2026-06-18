@@ -431,3 +431,326 @@ fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
         contents.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
+    use crate::sandbox::{SandboxPolicy, SandboxStateUpdate};
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::is_prechecked_follow_up_requires_meta;
+    #[cfg(target_family = "unix")]
+    use crate::worker_process::test_support::{
+        contents_text, cwd_test_mutex, worker_process_test_temp_parent,
+    };
+    use crate::worker_process::test_support::{successful_test_child, test_worker_process};
+    use crate::worker_protocol::ContentOrigin;
+    #[cfg(target_family = "unix")]
+    use std::path::PathBuf;
+
+    #[test]
+    fn exact_interrupt_remains_local_when_worker_would_respawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+
+        assert!(
+            manager
+                .nonexecuting_follow_up_uses_existing_state("\u{3}")
+                .expect("interrupt follow-up classification"),
+            "a bare Ctrl-C should stay a local follow-up even when it would otherwise respawn"
+        );
+    }
+
+    #[test]
+    fn interrupt_pager_tail_requires_current_sandbox_when_worker_would_respawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Pager)
+            .expect("worker manager");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .wait_child_for_test()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        manager.output.start_capture();
+        manager.output_timeline.append_text(
+            b"line0001\nline0002\nline0003\nline0004\n",
+            false,
+            ContentOrigin::Worker,
+        );
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        assert!(
+            !manager
+                .nonexecuting_follow_up_uses_existing_state("\u{3}:q")
+                .expect("interrupt follow-up classification"),
+            "a pager ctrl-c tail should require current per-call sandbox metadata when it would respawn"
+        );
+    }
+
+    #[test]
+    fn empty_input_with_busy_guardrail_uses_existing_state() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(crate::worker_supervisor::GuardrailEvent {
+                message: "[repl] previous request aborted; retry your last input\n".to_string(),
+                was_busy: true,
+                is_error: true,
+            });
+        }
+
+        assert!(
+            !manager
+                .empty_input_requires_spawn()
+                .expect("empty-input classification"),
+            "empty polls should keep pending busy-guardrail recovery local"
+        );
+    }
+
+    #[test]
+    fn nonempty_input_with_busy_guardrail_requires_current_state() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(crate::worker_supervisor::GuardrailEvent {
+                message: "[repl] previous request aborted; retry your last input\n".to_string(),
+                was_busy: true,
+                is_error: true,
+            });
+        }
+
+        assert!(
+            !manager
+                .nonexecuting_follow_up_uses_existing_state("1+1")
+                .expect("follow-up classification"),
+            "busy-guardrail retries should require current per-call sandbox metadata"
+        );
+    }
+
+    #[test]
+    fn empty_input_with_idle_guardrail_requires_spawn() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(crate::worker_supervisor::GuardrailEvent {
+                message: "[repl] worker was idle; new session started\n".to_string(),
+                was_busy: false,
+                is_error: false,
+            });
+        }
+
+        assert!(
+            manager
+                .empty_input_requires_spawn()
+                .expect("empty-input classification"),
+            "idle guardrail notices should still require current per-call sandbox metadata when a poll would respawn"
+        );
+    }
+
+    #[test]
+    fn prechecked_empty_input_requires_current_sandbox_when_worker_exited() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: None,
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .wait_child_for_test()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        let result = manager.write_stdin(
+            String::new(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            WriteStdinOptions {
+                pending_state_prechecked: true,
+                ..WriteStdinOptions::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ref err) if is_prechecked_follow_up_requires_meta(err)),
+            "expected prechecked empty input to require current sandbox metadata once the worker has exited, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn prechecked_bare_interrupt_requires_current_sandbox_when_worker_exited() {
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: None,
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .wait_child_for_test()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+
+        let result = manager.write_stdin(
+            "\u{3}".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            WriteStdinOptions {
+                pending_state_prechecked: true,
+                ..WriteStdinOptions::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ref err) if is_prechecked_follow_up_requires_meta(err)),
+            "expected prechecked bare ctrl-c to require current sandbox metadata once the worker has exited, got: {result:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn interrupt_tail_uses_current_sandbox_for_the_respawn() {
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let temp = tempfile::Builder::new()
+            .prefix(".tmp-interrupt-tail-current-sandbox-")
+            .tempdir_in(worker_process_test_temp_parent("worker-process"))
+            .expect("tempdir");
+        let sandbox_cwd = temp.path().to_path_buf();
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::R, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_cwd: Some(sandbox_cwd.clone()),
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("initial inherited read-only state");
+        let mut process = test_worker_process(successful_test_child());
+        process
+            .wait_child_for_test()
+            .expect("wait for the stub worker process to exit");
+        manager.process = Some(process);
+        manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
+
+        let result = manager.write_stdin(
+            "\u{3}1+1".to_string(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            WriteStdinOptions {
+                deferred_sandbox_state_update: Some(SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                        writable_roots: Vec::new(),
+                        network_access: false,
+                        exclude_tmpdir_env_var: false,
+                        exclude_slash_tmp: false,
+                    },
+                    sandbox_cwd: Some(sandbox_cwd.clone()),
+                    use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
+                }),
+                ..WriteStdinOptions::default()
+            },
+        );
+        match result {
+            Ok(WorkerReply::Output {
+                contents, is_error, ..
+            }) => {
+                let text = contents_text(&contents);
+                assert!(
+                    is_error,
+                    "expected the failed interrupt-tail respawn attempt to surface as an error reply"
+                );
+                assert!(
+                    text.contains("worker error:"),
+                    "expected the failed interrupt-tail respawn attempt to report a worker error, got: {text:?}"
+                );
+            }
+            Err(WorkerError::Protocol(message)) => {
+                assert!(
+                    message.contains("backend info") || message.contains("ipc disconnected"),
+                    "expected the failed interrupt-tail respawn attempt to fail during worker startup, got: {message:?}"
+                );
+            }
+            Err(err) => panic!("unexpected interrupt-tail respawn error: {err}"),
+        }
+        assert!(
+            matches!(
+                manager.sandbox_state.sandbox_policy,
+                SandboxPolicy::WorkspaceWrite { .. }
+            ),
+            "expected deferred metadata to stage before interrupt attempts the respawn"
+        );
+        assert_eq!(
+            manager.sandbox_state.sandbox_cwd, sandbox_cwd,
+            "expected deferred metadata to update the effective sandbox cwd before the respawn path"
+        );
+    }
+}
