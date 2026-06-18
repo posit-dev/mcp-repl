@@ -78,6 +78,14 @@ pub(super) fn sleeping_test_child() -> Child {
         .expect("spawn sleeping test child")
 }
 
+#[cfg(target_family = "windows")]
+pub(super) fn sleeping_test_child() -> Child {
+    Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+        .spawn()
+        .expect("spawn sleeping test child")
+}
+
 #[cfg(target_family = "unix")]
 pub(super) fn successful_test_child() -> Child {
     Command::new("sh")
