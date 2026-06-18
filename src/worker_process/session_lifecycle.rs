@@ -212,3 +212,131 @@ impl WorkerManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::ipc::WorkerToServerIpcMessage;
+    use crate::oversized_output::OversizedOutputMode;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::test_support::{
+        contents_text, env_test_mutex, failing_test_status, sleeping_test_child,
+        successful_test_child, test_worker_process,
+    };
+
+    #[test]
+    fn session_end_reset_preserves_detached_prefix_count() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.last_detached_prefix_item_count = 2;
+        manager.session_end_seen = true;
+
+        manager.maybe_reset_after_session_end();
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert_eq!(
+            manager.detached_prefix_item_count(),
+            2,
+            "session-end cleanup must preserve detached-prefix metadata until server finalization"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn failing_session_end_notice_flushes_partial_stdout_in_files_mode() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let mut process = test_worker_process(sleeping_test_child());
+        process.set_exit_status_for_test(failing_test_status());
+        manager.process = Some(process);
+
+        manager.note_session_end(true);
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            text.contains("\\xC3"),
+            "expected the partial stdout tail to survive the exit-status notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("worker exited with status 7"),
+            "expected the exit-status notice to stay visible, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn timed_out_prompt_completion_with_exited_worker_reports_session_end_immediately() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let mut process = test_worker_process(successful_test_child());
+        let status = process.wait_child_for_test().expect("wait test child");
+        process.set_exit_status_for_test(status);
+        process.set_ipc_for_test(server);
+        manager.process = Some(process);
+        manager.pending_request = true;
+        manager.pending_request_started_at = Some(std::time::Instant::now());
+        manager.pending_request_input = Some("quit()\n".to_string());
+
+        let prompt = ">>> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt,
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: ">>> ".to_string(),
+        });
+        drop(worker);
+        manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        assert!(
+            manager.session_end_seen,
+            "expected timed-out completion resolution to notice the exited session"
+        );
+        assert!(
+            manager
+                .settled_pending_completion
+                .as_ref()
+                .is_some_and(|completion| completion.session_end_seen),
+            "expected queued completion metadata to be marked as session-ended"
+        );
+        assert!(
+            text.contains("[repl] session ended"),
+            "expected timed-out completion resolution to record the session-end notice, got: {text:?}"
+        );
+        assert!(
+            !text.contains(">>> "),
+            "did not expect the exited session to keep advertising its prompt, got: {text:?}"
+        );
+    }
+}

@@ -229,3 +229,328 @@ impl WorkerManager {
         Ok(self.windows_sandbox_launch.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(any(target_os = "linux", target_family = "windows"))]
+    use crate::oversized_output::OversizedOutputMode;
+    #[cfg(target_os = "linux")]
+    use crate::sandbox::{SandboxPolicy, SandboxState, SandboxStateUpdate};
+    #[cfg(any(target_os = "linux", target_family = "windows"))]
+    use crate::sandbox_cli::SandboxCliPlan;
+    #[cfg(target_os = "linux")]
+    use crate::sandbox_cli::resolve_effective_sandbox_state_with_defaults;
+    #[cfg(target_os = "linux")]
+    use crate::worker_process::test_support::contents_text;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+
+    #[test]
+    fn python_backend_prepares_windows_sandbox_launch() {
+        assert!(
+            backend_prepares_windows_sandbox_launch(Backend::Python),
+            "Python uses the embedded worker wrapper and needs the prepared Windows capability SID"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_disables_bwrap_and_announces_fallback() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.sandbox_state.use_linux_sandbox_bwrap = true;
+        manager.sandbox_defaults.use_linux_sandbox_bwrap = true;
+        manager.inherited_sandbox_state = Some(SandboxState {
+            use_linux_sandbox_bwrap: true,
+            ..manager.sandbox_state.clone()
+        });
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+
+        assert!(
+            retry,
+            "expected backend-info disconnect to trigger bwrap fallback"
+        );
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "expected effective sandbox state to disable bwrap after fallback"
+        );
+        assert!(
+            !manager.sandbox_defaults.use_linux_sandbox_bwrap,
+            "expected sandbox defaults to disable bwrap after fallback"
+        );
+        assert!(
+            manager
+                .inherited_sandbox_state
+                .as_ref()
+                .is_some_and(|state| !state.use_linux_sandbox_bwrap),
+            "expected inherited sandbox state to disable bwrap after fallback"
+        );
+
+        let snapshot = manager.pending_output_tape.drain_final_snapshot();
+        let text = contents_text(&snapshot.format_contents().contents);
+        assert!(
+            text.contains("continuing without bwrap"),
+            "expected fallback notice in visible output, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_stays_disabled_after_followup_codex_meta_update() {
+        use crate::sandbox::sandbox_state_update_from_codex_meta;
+        use serde_json::json;
+
+        let plan = SandboxCliPlan {
+            operations: vec![crate::sandbox_cli::SandboxCliOperation::SetMode(
+                crate::sandbox_cli::SandboxModeArg::Inherit,
+            )],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        let mut inherited_state = manager.sandbox_defaults.clone();
+        inherited_state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: Some(std::env::temp_dir()),
+            use_linux_sandbox_bwrap: Some(true),
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_state.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_state),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial sandbox state");
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "test setup should start with bwrap enabled"
+        );
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+        assert!(retry, "expected startup failure to disable bwrap");
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            },
+            "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
+        }))
+        .expect("Codex sandbox metadata");
+        manager
+            .update_sandbox_state(update, Duration::from_millis(1))
+            .expect("follow-up sandbox state");
+
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "follow-up Codex metadata should preserve the local no-bwrap fallback"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_stays_disabled_after_followup_plan_bwrap_override() {
+        use crate::sandbox::sandbox_state_update_from_codex_meta;
+        use serde_json::json;
+
+        let plan = SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::Config(
+                    crate::sandbox_cli::SandboxConfigOperation::SetUseLinuxSandboxBwrap(true),
+                ),
+            ],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        let mut inherited_state = manager.sandbox_defaults.clone();
+        inherited_state.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: Some(std::env::temp_dir()),
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_state.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_state),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial sandbox state");
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "test setup should start with the plan-level bwrap override enabled"
+        );
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+        assert!(retry, "expected startup failure to disable bwrap");
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            },
+            "sandboxCwd": std::env::temp_dir(),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
+        }))
+        .expect("Codex sandbox metadata");
+        manager
+            .update_sandbox_state(update, Duration::from_millis(1))
+            .expect("follow-up sandbox state");
+
+        assert!(
+            !manager.sandbox_state.use_linux_sandbox_bwrap,
+            "plan-level bwrap overrides should not re-enable bwrap after the local fallback"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_prepare_access_denied_fails_fast() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(Some(
+            "failed to prepare writable ACL on 'C:\\workspace': SetNamedSecurityInfoW failed: 5"
+                .to_string(),
+        ));
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let result = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkerError::Sandbox(ref message))
+                    if message.contains("SetNamedSecurityInfoW failed: 5")
+            ),
+            "access-denied prepare failures should abort launch preparation, got: {result:?}"
+        );
+        assert!(
+            manager.windows_sandbox_launch.is_none(),
+            "failed launch preparation should not cache a prepared launch"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_python_sandbox_prepare_access_denied_fails_fast() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(Some(
+            "failed to prepare writable ACL on 'C:\\workspace': SetNamedSecurityInfoW failed: 5"
+                .to_string(),
+        ));
+
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let result = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkerError::Sandbox(ref message))
+                    if message.contains("SetNamedSecurityInfoW failed: 5")
+            ),
+            "Python access-denied prepare failures should abort launch preparation, got: {result:?}"
+        );
+        assert!(
+            manager.windows_sandbox_launch.is_none(),
+            "failed Python launch preparation should not cache a prepared launch"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_sandbox_cache_hit_refreshes_prepared_launch_acl_state_before_reuse() {
+        let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        let first = manager
+            .ensure_windows_sandbox_launch()
+            .expect("initial launch preparation should succeed");
+        assert!(
+            first.is_some(),
+            "initial launch preparation should populate the prepared-launch cache"
+        );
+
+        crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(Some(
+            "cache hit should refresh ACL state".to_string(),
+        ));
+
+        let second = manager.ensure_windows_sandbox_launch();
+
+        crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(None);
+
+        assert!(
+            matches!(
+                second,
+                Err(WorkerError::Sandbox(ref err))
+                    if err.contains("cache hit should refresh ACL state")
+            ),
+            "cache hits should refresh ACL state before reusing the prepared launch, got: {second:?}"
+        );
+        assert_eq!(
+            manager.windows_sandbox_launch, first,
+            "cache-hit refresh failures should preserve the cached launch for later retries"
+        );
+    }
+}

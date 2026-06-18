@@ -634,3 +634,186 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_capture::OutputTextSource;
+
+    fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+        IpcEchoEvent {
+            prompt: prompt.to_string(),
+            line: line.to_string(),
+            source: OutputTextSource::Ipc,
+        }
+    }
+
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn trims_echo_prefix_across_text_chunks() {
+        let mut contents = vec![
+            WorkerContent::stdout("> x <- 1\n"),
+            WorkerContent::stdout("> y <- 2\n[1] 2\n"),
+        ];
+        maybe_trim_echo_prefix(&mut contents, Some("> x <- 1\n> y <- 2\n"), true);
+        let text = match &contents[0] {
+            WorkerContent::ContentText { text, .. } => text.as_str(),
+            WorkerContent::ContentImage { .. } => "",
+        };
+        assert_eq!(text, "[1] 2\n");
+    }
+
+    #[test]
+    fn does_not_trim_on_mismatch() {
+        let mut contents = vec![WorkerContent::stdout("> x <- 1\n[1] 1\n")];
+        maybe_trim_echo_prefix(&mut contents, Some("> y <- 2\n"), true);
+        let text = match &contents[0] {
+            WorkerContent::ContentText { text, .. } => text.as_str(),
+            WorkerContent::ContentImage { .. } => "",
+        };
+        assert_eq!(text, "> x <- 1\n[1] 1\n");
+    }
+
+    #[test]
+    fn does_not_trim_when_leading_stderr() {
+        let mut contents = vec![
+            WorkerContent::stderr("stderr: boom\n"),
+            WorkerContent::stdout("> x <- 1\n[1] 1\n"),
+        ];
+        maybe_trim_echo_prefix(&mut contents, Some("> x <- 1\n"), true);
+        let text = match &contents[0] {
+            WorkerContent::ContentText { text, .. } => text.as_str(),
+            WorkerContent::ContentImage { .. } => "",
+        };
+        assert_eq!(text, "stderr: boom\n");
+    }
+
+    #[test]
+    fn trim_echo_then_append_protocol_warnings_drops_echo_only_multiline_input() {
+        let warning = "late readline result".to_string();
+        let echo = "> x <- 1\n> y <- 2\n";
+        let mut contents = vec![WorkerContent::stdout(echo)];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some(echo),
+            false,
+            true,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![WorkerContent::server_stderr(format!("[repl] {warning}"))]
+        );
+    }
+
+    #[test]
+    fn trim_echo_then_append_protocol_warnings_keeps_output_before_warning() {
+        let warning = "late readline result".to_string();
+        let mut contents = vec![WorkerContent::stdout("> x <- 1\n[1] 1\n")];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some("> x <- 1\n"),
+            true,
+            true,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stdout("[1] 1\n"),
+                WorkerContent::server_stderr(format!("[repl] {warning}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_echo_prefix_after_leading_nonstdout_contents_removes_prompt_fallback_echo() {
+        let mut contents = vec![
+            WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+            WorkerContent::stdout("> x\n"),
+            WorkerContent::stdout("> "),
+        ];
+
+        let trimmed =
+            trim_echo_prefix_after_leading_nonstdout_contents(&mut contents, Some("> x\n"));
+
+        assert!(trimmed, "expected prompt fallback echo to be trimmed");
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stderr("stderr: Error: object 'x' not found\n"),
+                WorkerContent::stdout("> "),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_decision_applies_to_any_sideband_echo() {
+        let single = vec![echo_event("> ", "1+1\n")];
+        assert!(should_trim_echo_prefix(&single));
+
+        let continuation = vec![echo_event("> ", "1+\n"), echo_event("+ ", "1\n")];
+        assert!(should_trim_echo_prefix(&continuation));
+
+        let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
+        assert!(should_trim_echo_prefix(&multi));
+
+        let browser = vec![echo_event("Browse[1]> ", "n\n")];
+        assert!(should_trim_echo_prefix(&browser));
+
+        let readline = vec![echo_event("FIRST> ", "alpha\n")];
+        assert!(should_trim_echo_prefix(&readline));
+    }
+
+    #[test]
+    fn trim_matching_echo_event_suffix_from_contents_trims_late_top_level_echo() {
+        let mut contents = vec![WorkerContent::worker_stdout(
+            "> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY\n> ",
+        )];
+
+        let trimmed = trim_matching_echo_event_suffix_from_contents(
+            &mut contents,
+            &[
+                echo_event("> ", "cat(\"HEAD_ONLY\\n\")\n"),
+                echo_event("> ", "flush.console()\n"),
+                echo_event("> ", "cat(\"TAIL_ONLY\\n\")\n"),
+            ],
+        );
+
+        assert!(trimmed, "expected late top-level echo to be trimmed");
+        assert_eq!(contents_text(&contents), "TAIL_ONLY\n> ");
+    }
+
+    #[test]
+    fn trim_matching_echo_event_suffix_from_contents_keeps_unmatched_prompt_tail() {
+        let mut contents = vec![WorkerContent::worker_stdout("FIRST> alpha\nSECOND> ")];
+
+        let trimmed = trim_matching_echo_event_suffix_from_contents(
+            &mut contents,
+            &[
+                echo_event("FIRST> ", "alpha\n"),
+                echo_event("SECOND> ", "beta\n"),
+            ],
+        );
+
+        assert!(
+            !trimmed,
+            "did not expect partial prompt transcript to be trimmed without an exact match"
+        );
+        assert_eq!(contents_text(&contents), "FIRST> alpha\nSECOND> ");
+    }
+}

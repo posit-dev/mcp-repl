@@ -231,3 +231,143 @@ impl WorkerManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::oversized_output::OversizedOutputMode;
+    use crate::sandbox::SandboxPolicy;
+    use crate::sandbox_cli::{
+        SandboxCliOperation, SandboxConfigOperation, SandboxModeArg,
+        resolve_effective_sandbox_state_with_defaults,
+    };
+    use crate::worker_process::test_support::cwd_test_mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn inherit_ending_invalid_plan_fails_during_startup_validation() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::ReadOnly),
+                SandboxCliOperation::AddWritableRoot(std::env::temp_dir()),
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+            ],
+        };
+
+        let err = match WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files) {
+            Ok(_) => panic!("invalid inherit-ending plan should fail during startup"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, WorkerError::Sandbox(ref message) if message.contains("--add-writable-root can only be used while sandbox mode is workspace-write")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn inherit_workspace_write_refinements_wait_for_client_state() {
+        let writable_root = std::env::temp_dir();
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::AddWritableRoot(writable_root.clone()),
+                SandboxCliOperation::Config(SandboxConfigOperation::SetWorkspaceNetworkAccess(
+                    true,
+                )),
+            ],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+
+        manager
+            .stage_sandbox_state_update(SandboxStateUpdate {
+                sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                    writable_roots: Vec::new(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                },
+                sandbox_cwd: Some(writable_root.clone()),
+                use_linux_sandbox_bwrap: None,
+                use_legacy_landlock: None,
+            })
+            .expect("workspace-write Codex metadata should satisfy deferred refinements");
+
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            ..
+        } = &manager.sandbox_state.sandbox_policy
+        else {
+            panic!(
+                "expected staged inherit refinements to resolve to workspace-write, got {:?}",
+                manager.sandbox_state.sandbox_policy
+            );
+        };
+        assert!(
+            *network_access,
+            "expected deferred workspace network setting to apply after client metadata"
+        );
+        assert!(
+            writable_roots.iter().any(|path| path == &writable_root),
+            "expected deferred writable root to apply after client metadata"
+        );
+    }
+
+    #[test]
+    fn failed_sandbox_update_does_not_commit_inherited_state() {
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::Config(SandboxConfigOperation::SetWorkspaceNetworkAccess(
+                    true,
+                )),
+            ],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan, OversizedOutputMode::Files)
+            .expect("worker manager");
+        let mut inherited_before = manager.sandbox_defaults.clone();
+        inherited_before.apply_update(SandboxStateUpdate {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            sandbox_cwd: None,
+            use_linux_sandbox_bwrap: None,
+            use_legacy_landlock: None,
+        });
+        manager.inherited_sandbox_state = Some(inherited_before.clone());
+        manager.sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &manager.sandbox_plan,
+            Some(&inherited_before),
+            &manager.sandbox_defaults,
+        )
+        .expect("resolved initial inherited sandbox state");
+
+        let err = manager
+            .update_sandbox_state(
+                SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::DangerFullAccess,
+                    sandbox_cwd: None,
+                    use_linux_sandbox_bwrap: None,
+                    use_legacy_landlock: None,
+                },
+                Duration::from_millis(1),
+            )
+            .expect_err("danger-full-access should fail workspace-write-only config");
+        assert!(
+            matches!(err, WorkerError::Sandbox(ref msg) if msg.contains("requires workspace-write mode")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            manager.inherited_sandbox_state,
+            Some(inherited_before),
+            "failed updates must not mutate inherited sandbox baseline"
+        );
+    }
+}

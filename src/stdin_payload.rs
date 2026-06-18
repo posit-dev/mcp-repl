@@ -43,3 +43,24 @@ pub(crate) fn timeout_bundle_reuse_for_input(input: &str) -> TimeoutBundleReuse 
         None => TimeoutBundleReuse::FollowUpInput,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_prefix_accepts_immediate_tail_without_newline() {
+        let (action, remaining) =
+            split_write_stdin_control_prefix("\u{3}1+1").expect("expected control prefix");
+        assert!(matches!(action, WriteStdinControlAction::Interrupt));
+        assert_eq!(remaining, "1+1");
+    }
+
+    #[test]
+    fn control_prefix_preserves_immediate_newline_tail() {
+        let (action, remaining) =
+            split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
+        assert!(matches!(action, WriteStdinControlAction::Restart));
+        assert_eq!(remaining, "\nprint(1)");
+    }
+}

@@ -2045,3 +2045,593 @@ fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
         None => "[repl] worker exited with unknown status".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSource,
+    };
+    use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
+    use crate::pending_output_tape::{PendingOutputEvent, PendingOutputTape};
+    use crate::worker_protocol::WorkerContent;
+    use base64::Engine as _;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+        IpcEchoEvent {
+            prompt: prompt.to_string(),
+            line: line.to_string(),
+            source: OutputTextSource::Ipc,
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn successful_test_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn exiting test child")
+    }
+
+    #[cfg(target_family = "windows")]
+    fn sleeping_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn finish_exited_does_not_signal_reaped_root_pid() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let child = successful_test_child();
+        let (result, kills) =
+            capture_recorded_unix_kills(|| WorkerProcess::new_for_test(child).finish_exited());
+
+        assert!(
+            result.is_ok(),
+            "expected finish_exited to succeed: {result:?}"
+        );
+        assert!(
+            kills.is_empty(),
+            "did not expect finish_exited to signal an already reaped root pid, got: {kills:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_matches_worker_ready_failures() {
+        for message in [
+            "ipc disconnected while waiting for worker_ready",
+            "worker session ended before worker_ready",
+        ] {
+            assert!(
+                linux_sandbox_startup_retryable(&WorkerError::Protocol(message.to_string())),
+                "expected worker_ready startup failure to be retryable: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_debug_startup_env_uses_mcp_repl_vars() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+        let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        unsafe {
+            std::env::set_var(
+                crate::debug_logs::DEBUG_SESSION_DIR_ENV,
+                "/tmp/mcp-repl-debug-session",
+            );
+            std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        }
+
+        let mut command = Command::new("env");
+        apply_debug_startup_env(&mut command, None);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+            },
+        }
+        match original_startup_path {
+            Some(value) => unsafe {
+                std::env::set_var(crate::diagnostics::STARTUP_LOG_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+            },
+        }
+
+        assert_eq!(
+            envs.get(crate::debug_logs::DEBUG_SESSION_DIR_ENV),
+            Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
+        );
+        assert_eq!(envs.get(crate::diagnostics::STARTUP_LOG_PATH_ENV), None);
+    }
+
+    #[test]
+    fn apply_debug_startup_env_uses_session_tmpdir_for_worker_log() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let original = std::env::var_os(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+        let original_startup_path = std::env::var_os(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        unsafe {
+            std::env::set_var(
+                crate::debug_logs::DEBUG_SESSION_DIR_ENV,
+                "/tmp/mcp-repl-debug-session",
+            );
+            std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+        }
+
+        let mut command = Command::new("env");
+        let session_tmpdir = PathBuf::from("/tmp/mcp-repl-session-tmp");
+        apply_debug_startup_env(&mut command, Some(&session_tmpdir));
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::debug_logs::DEBUG_SESSION_DIR_ENV);
+            },
+        }
+        match original_startup_path {
+            Some(value) => unsafe {
+                std::env::set_var(crate::diagnostics::STARTUP_LOG_PATH_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::diagnostics::STARTUP_LOG_PATH_ENV);
+            },
+        }
+
+        assert_eq!(
+            envs.get(crate::debug_logs::DEBUG_SESSION_DIR_ENV),
+            Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
+        );
+        assert_eq!(
+            envs.get(crate::diagnostics::STARTUP_LOG_PATH_ENV),
+            Some(&Some(
+                session_tmpdir
+                    .join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME)
+                    .display()
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn persist_worker_startup_log_copies_into_debug_session_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        let debug_session_dir = temp.path().join("debug-session");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::create_dir_all(&debug_session_dir).expect("create debug session dir");
+
+        let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        let destination = debug_session_dir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        std::fs::write(&source, "worker startup log\n").expect("write source log");
+
+        persist_worker_startup_log(&session_tmpdir, Some(destination.clone()));
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read destination log"),
+            "worker startup log\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_worker_session_tmpdir_persists_log_when_keep_tmpdir_is_set() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        let debug_session_dir = temp.path().join("debug-session");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::create_dir_all(&debug_session_dir).expect("create debug session dir");
+
+        let source = session_tmpdir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        let destination = debug_session_dir.join(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME);
+        std::fs::write(&source, "worker startup log\n").expect("write source log");
+
+        let original_keep = std::env::var_os("MCP_REPL_KEEP_SESSION_TMPDIR");
+        unsafe {
+            std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", "1");
+        }
+
+        cleanup_worker_session_tmpdir(&session_tmpdir, Some(destination.clone()));
+
+        match original_keep {
+            Some(value) => unsafe {
+                std::env::set_var("MCP_REPL_KEEP_SESSION_TMPDIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("MCP_REPL_KEEP_SESSION_TMPDIR");
+            },
+        }
+
+        assert!(
+            session_tmpdir.is_dir(),
+            "session tmpdir should be preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read destination log"),
+            "worker startup log\n"
+        );
+    }
+
+    #[test]
+    fn pager_output_capture_skips_pending_output_tape() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Pager,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: false,
+            readline_results_seen: 0,
+        });
+        capture.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        assert!(
+            tape.drain_final_snapshot().events.is_empty(),
+            "pager mode should not mirror text, images, or sideband events into the pending tape"
+        );
+        let output_end = output_ring.end_offset();
+        let output_range = output_ring.read_range(0, output_end);
+        assert!(
+            output_end > 0,
+            "pager mode should still append text to the output timeline"
+        );
+        assert_eq!(
+            output_range.bytes, b"pager output\n",
+            "pager mode should keep stdout text in the output timeline"
+        );
+        assert!(
+            output_range.events.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    OutputEventKind::Image { id, mime_type, .. }
+                    if id == "img-1" && mime_type == "image/png"
+                )
+            }),
+            "pager mode should keep image events in the output timeline"
+        );
+    }
+
+    #[test]
+    fn files_output_capture_anchors_update_notice_before_late_echo() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring),
+        );
+
+        capture.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "lines(4:8, 4:8)\n".to_string(),
+            echo_source: PendingTextSource::Ipc,
+        });
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: true,
+            readline_results_seen: 1,
+        });
+        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+
+        let contents = tape
+            .drain_final_snapshot()
+            .format_contents_for_reply()
+            .contents;
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Files,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let output_capture = capture.clone();
+        let start_capture = capture.clone();
+        let result_capture = capture.clone();
+        let image_capture = capture.clone();
+        let session_capture = capture.clone();
+        let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
+            on_output_text: Some(Arc::new(move |text| {
+                output_capture.append_output_text(&text.bytes, text.stream, text.is_continuation);
+            })),
+            on_readline_start: Some(Arc::new(move |prompt| {
+                start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+            })),
+            on_readline_result: Some(Arc::new(move |event| {
+                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                    prompt: event.prompt,
+                    line: event.line,
+                    echo_source: PendingTextSource::Ipc,
+                });
+            })),
+            on_plot_image: Some(Arc::new(move |image| {
+                image_capture.append_image(image);
+            })),
+            on_session_end: Some(Arc::new(move || {
+                session_capture.append_sideband(PendingSidebandKind::SessionEnd);
+                done_tx.send(()).expect("send session end marker");
+            })),
+            ..IpcHandlers::default()
+        })
+        .expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: "> ".to_string(),
+            })
+            .expect("send readline_start");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stdout,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"before\n"),
+                is_continuation: false,
+            })
+            .expect("send stdout output_text");
+        worker
+            .send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: "> ".to_string(),
+                line: "plot(1)\n".to_string(),
+            })
+            .expect("send readline_result");
+        worker
+            .send(WorkerToServerIpcMessage::PlotImage {
+                mime_type: "image/png".to_string(),
+                data: "AA==".to_string(),
+                is_update: false,
+                source: None,
+            })
+            .expect("send plot_image");
+        worker
+            .send(WorkerToServerIpcMessage::OutputText {
+                stream: TextStream::Stderr,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"err\n"),
+                is_continuation: false,
+            })
+            .expect("send stderr output_text");
+        worker
+            .send(WorkerToServerIpcMessage::SessionEnd {
+                reason: None,
+                message_b64: None,
+                turn_id: None,
+            })
+            .expect("send session_end");
+
+        done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("server IPC consumed session_end");
+
+        let snapshot = tape.drain_final_snapshot();
+        assert_eq!(snapshot.events.len(), 6);
+        assert!(matches!(
+            &snapshot.events[0],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineStart { prompt },
+                ..
+            } if prompt == "> "
+        ));
+        assert!(matches!(
+            &snapshot.events[1],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stdout,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"before\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[2],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
+                ..
+            } if prompt == "> " && line == "plot(1)\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[3],
+            PendingOutputEvent::Image {
+                id,
+                mime_type,
+                readline_results_seen: 1,
+                ..
+            } if id.starts_with("image-") && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &snapshot.events[4],
+            PendingOutputEvent::TextFragment {
+                stream: TextStream::Stderr,
+                origin: ContentOrigin::Worker,
+                bytes,
+                ..
+            } if bytes == b"err\n"
+        ));
+        assert!(matches!(
+            &snapshot.events[5],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::SessionEnd,
+                ..
+            }
+        ));
+
+        let end = output_ring.end_offset();
+        let range = output_ring.read_range(0, end);
+        assert_eq!(range.bytes, b"before\n\nstderr: err\n");
+        let image_event = range
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                OutputEventKind::Image {
+                    id,
+                    mime_type,
+                    readline_results_seen,
+                    ..
+                } => Some((event.offset, id, mime_type, readline_results_seen)),
+                _ => None,
+            })
+            .expect("timeline image event");
+        assert_eq!(image_event.0, b"before\n".len() as u64);
+        assert!(image_event.1.starts_with("image-"));
+        assert_eq!(image_event.2, "image/png");
+        assert_eq!(*image_event.3, 1);
+    }
+
+    #[test]
+    fn pager_output_capture_anchors_update_notice_before_late_echo() {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Pager,
+            PendingOutputTape::new(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+            updates_previous_image: true,
+            readline_results_seen: 1,
+        });
+        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+
+        let end = output_ring.end_offset();
+        let collapsed = collapse_echo_with_attribution(
+            output_ring.read_range(0, end),
+            &[echo_event("> ", "lines(4:8, 4:8)\n")],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = crate::pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            end,
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_error_reaps_wrapper_process() {
+        let mut child = sleeping_test_child();
+
+        let result = handle_windows_ipc_connect_result(
+            Err(std::io::Error::other("ipc connect failed")),
+            &mut child,
+        );
+        assert!(matches!(result, Err(WorkerError::Io(_))));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = child.try_wait().expect("query child status");
+            if status.is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("connect-error handler should reap child wrapper");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_soft_termination_does_not_kill_child() {
+        let mut child = sleeping_test_child();
+
+        request_soft_termination(&mut child).expect("soft terminate call should succeed");
+
+        let status = child.try_wait().expect("query child status");
+        assert!(
+            status.is_none(),
+            "child should still be running after soft termination request"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_timeout_is_bounded() {
+        assert!(
+            WINDOWS_IPC_CONNECT_MAX_WAIT <= Duration::from_secs(10),
+            "windows IPC connect max wait should fail fast, got {:?}",
+            WINDOWS_IPC_CONNECT_MAX_WAIT
+        );
+    }
+}

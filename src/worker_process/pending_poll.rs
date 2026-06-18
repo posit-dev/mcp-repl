@@ -259,3 +259,66 @@ impl WorkerManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::oversized_output::OversizedOutputMode;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_process::WriteStdinOptions;
+    use crate::worker_process::test_support::{
+        contents_text, sleeping_test_child, test_worker_process,
+    };
+    use crate::worker_protocol::WorkerReply;
+
+    #[test]
+    fn files_empty_poll_waits_for_late_stdout_after_settled_completion() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        manager.settled_pending_completion = Some(CompletionInfo {
+            prompt: Some("> ".to_string()),
+            stdin_wait_prompt: None,
+            prompt_variants: Some(vec!["> ".to_string()]),
+            echo_events: Vec::new(),
+            protocol_warnings: Vec::new(),
+            session_end_seen: false,
+        });
+
+        let tape = manager.pending_output_tape.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tape.append_stdout_bytes(b"[1] 2\n");
+        });
+
+        let reply = manager
+            .write_stdin_files(
+                String::new(),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                WriteStdinOptions::default(),
+            )
+            .expect("empty poll reply");
+
+        writer.join().expect("late stdout writer");
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+        assert!(
+            text.contains("[1] 2\n"),
+            "expected the empty poll to wait for late settled stdout, got: {text:?}"
+        );
+        assert!(
+            !text.contains("<<repl status: idle>>"),
+            "did not expect an idle marker before late settled stdout, got: {text:?}"
+        );
+    }
+}
