@@ -6,7 +6,6 @@ use crate::completion_reply::ReplyWithOffset;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
-use crate::sandbox_cli::MISSING_INHERITED_SANDBOX_STATE_MESSAGE;
 use crate::worker_protocol::WorkerReply;
 
 #[derive(Clone, Copy)]
@@ -47,7 +46,7 @@ impl WorkerManager {
         timeout: Duration,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_restart(timeout);
-        self.require_inherited_sandbox_for_restart()?;
+        self.require_inherited_sandbox_state()?;
         self.maybe_emit_pending_server_notice();
         let snapshot = self.shutdown_existing_worker_for_restart(mode, timeout);
         self.clear_restart_busy_guardrail();
@@ -68,15 +67,6 @@ impl WorkerManager {
 
     fn end_restart_ok() {
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
-    }
-
-    fn require_inherited_sandbox_for_restart(&self) -> Result<(), WorkerError> {
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
-        Ok(())
     }
 
     fn shutdown_existing_worker_for_restart(
