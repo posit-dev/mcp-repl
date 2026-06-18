@@ -66,3 +66,4 @@
 - 2026-05-18: Reaffirmed that unmigrated Rust scenarios must remain discoverable by `cargo test`; migrations should replace Rust coverage with equivalent Python coverage in the same change, not disable tests ahead of time.
 - 2026-05-18: Clarified that the external runner itself is not sandboxed, but the spawned `mcp-repl` binary still owns the sandbox contract; the next slice should restore sandbox coverage in the Python runner starting with `workspace-write`.
 - 2026-06-18: Added an external `workspace-write` sandbox case that verifies public `repl` behavior for writes inside the server cwd and blocked writes outside it.
+- 2026-06-18: Migrated the public read-only workspace write denial check into the external runner and removed the duplicate Rust integration case.

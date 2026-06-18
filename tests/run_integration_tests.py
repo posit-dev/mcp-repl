@@ -634,6 +634,29 @@ def r_workspace_write_sandbox(client: McpStdioClient) -> None:
         outside_target.unlink(missing_ok=True)
 
 
+def r_read_only_sandbox(client: McpStdioClient) -> None:
+    stamp = f"{os.getpid()}-{time.time_ns()}"
+    workspace_cwd = client.server_cwd or Path.cwd()
+    target = workspace_cwd / f".mcp-repl-read-only-{stamp}.txt"
+    target.unlink(missing_ok=True)
+
+    try:
+        received = client.repl(
+            r_write_file_input(target, "blocked"),
+            timeout_ms=30000,
+        )
+        received_text = require_success(received, "read-only cwd repl")
+        if "WRITE_ERROR:" not in received_text or "WRITE_OK" in received_text:
+            raise SuiteFailure(
+                "expected read-only to block writing in cwd, "
+                f"got: {received_text!r}"
+            )
+        if target.exists():
+            raise SuiteFailure(f"read-only unexpectedly created file: {target}")
+    finally:
+        target.unlink(missing_ok=True)
+
+
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
@@ -916,6 +939,11 @@ CASES: dict[str, SuiteCase] = {
         r_pager_command_smoke,
         server_args=("--oversized-output", "pager"),
         server_env=(("MCP_REPL_PAGER_PAGE_CHARS", "80"),),
+    ),
+    "r-read-only-sandbox": r_suite_case(
+        r_read_only_sandbox,
+        server_args=("--sandbox", "read-only"),
+        server_cwd=Path("target/test-scratch/run-integration-tests/r-read-only-sandbox"),
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
