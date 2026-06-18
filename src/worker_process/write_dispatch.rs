@@ -5,7 +5,8 @@ use crate::completion_reply::{InputContext, ReplyWithOffset};
 use crate::sandbox::SandboxStateUpdate;
 use crate::worker_protocol::WorkerReply;
 
-use super::{WorkerError, WorkerManager, WriteStdinMode};
+use super::write_flow::WriteStdinMode;
+use super::{WorkerError, WorkerManager};
 
 pub(super) struct WriteDispatchInput {
     pub(super) mode: WriteStdinMode,

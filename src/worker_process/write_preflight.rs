@@ -4,10 +4,9 @@ use std::time::Duration;
 use crate::completion_reply::ReplyWithOffset;
 use crate::worker_protocol::WorkerReply;
 
-use super::{
-    WorkerError, WorkerManager, WriteStdinMode, WriteStdinOptions, mark_busy_follow_up_reply,
-    prechecked_follow_up_requires_meta_error,
-};
+use super::reply_state::mark_busy_follow_up_reply;
+use super::write_flow::{WriteStdinMode, WriteStdinOptions};
+use super::{WorkerError, WorkerManager, prechecked_follow_up_requires_meta_error};
 
 pub(super) struct WritePreflightInput<'a> {
     pub(super) mode: WriteStdinMode,

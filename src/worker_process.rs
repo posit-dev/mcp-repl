@@ -1,38 +1,34 @@
 use std::path::PathBuf;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 #[cfg(test)]
 use std::thread;
 use std::time::Duration;
 
 use crate::backend::{Backend, WorkerLaunch};
-use crate::completion_reply::{
-    CompletionInfo, ReplyWithOffset, idle_status_content, stdin_wait_status_content,
-};
+use crate::completion_reply::CompletionInfo;
 #[cfg(test)]
 use crate::ipc::IpcEchoEvent;
 #[cfg(test)]
 use crate::output_capture::OutputTextSource;
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring,
-    reset_last_reply_marker_offset, reset_output_ring, set_last_reply_marker_offset,
+    reset_last_reply_marker_offset, reset_output_ring,
 };
 #[cfg(test)]
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 #[cfg(test)]
 use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
 use crate::oversized_output::OversizedOutputMode;
-use crate::pager::{self, Pager};
+#[cfg(test)]
+use crate::pager;
+use crate::pager::Pager;
+use crate::pending_output_tape::PendingOutputTape;
 #[cfg(test)]
 use crate::pending_output_tape::PendingSidebandKind;
-use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape};
 #[cfg(test)]
 use crate::reply_presentation::trim_echo_prefix_after_leading_nonstdout_contents;
-use crate::reply_presentation::{
-    append_prompt_if_missing, normalize_prompt, strip_trailing_prompt,
-};
 #[cfg(test)]
 use crate::reply_presentation::{
     maybe_trim_echo_prefix, should_trim_echo_prefix, trim_echo_then_append_protocol_warnings,
@@ -41,7 +37,9 @@ use crate::reply_presentation::{
 use crate::sandbox::{SandboxState, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
-use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::WorkerReply;
+#[cfg(test)]
+use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode};
 use crate::worker_supervisor::{GuardrailEvent, GuardrailShared, WorkerProcess};
 
 mod backend_driver;
@@ -49,21 +47,24 @@ mod control_prefix;
 mod interrupt;
 mod output_state;
 mod pending_poll;
+mod reply_state;
 mod request_lifecycle;
 mod request_reply;
 mod restart;
 mod sandbox_state;
+mod session_lifecycle;
 mod session_reset_reply;
 mod worker_launch;
 mod write_dispatch;
+mod write_flow;
 mod write_preflight;
 
 use self::backend_driver::{BackendDriver, new_backend_driver};
-use self::control_prefix::ControlPrefixInput;
 use self::output_state::PrefixCapture;
+#[cfg(test)]
+use self::reply_state::mark_busy_follow_up_reply;
 use self::request_lifecycle::RequestState;
-use self::write_dispatch::WriteDispatchInput;
-use self::write_preflight::{WritePreflightInput, WritePreflightOutcome};
+pub(crate) use self::write_flow::WriteStdinOptions;
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
@@ -117,35 +118,6 @@ impl From<std::io::Error> for WorkerError {
     fn from(err: std::io::Error) -> Self {
         WorkerError::Io(err)
     }
-}
-
-const DEFERRED_SANDBOX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct WriteStdinOptions {
-    pub page_bytes_override: Option<u64>,
-    pub echo_input: bool,
-    pub pending_state_prechecked: bool,
-    pub deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-    pub suppress_session_end_reset: bool,
-}
-
-impl WriteStdinOptions {
-    fn control_tail(&self, deferred_sandbox_state_update: Option<SandboxStateUpdate>) -> Self {
-        Self {
-            page_bytes_override: self.page_bytes_override,
-            echo_input: self.echo_input,
-            pending_state_prechecked: false,
-            deferred_sandbox_state_update,
-            suppress_session_end_reset: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WriteStdinMode {
-    Files,
-    Pager,
 }
 
 pub(crate) fn worker_context_event_payload(
@@ -346,158 +318,8 @@ impl WorkerManager {
         self.resolve_timeout_marker_with_wait(wait);
     }
 
-    pub fn empty_input_requires_spawn(&mut self) -> Result<bool, WorkerError> {
-        if self.empty_input_uses_existing_state() {
-            return Ok(false);
-        }
-        let needs_spawn = match self.process.as_mut() {
-            Some(process) => !process.is_running()?,
-            None => true,
-        };
-        Ok(needs_spawn)
-    }
-
-    pub fn empty_input_polls_existing_output(&self) -> bool {
-        match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.pending_request
-                    || self.pending_output_tape.has_pending()
-                    || self.settled_pending_completion.is_some()
-            }
-            OversizedOutputMode::Pager => {
-                self.pending_request
-                    || self.output.has_pending_output()
-                    || self.settled_pending_completion.is_some()
-            }
-        }
-    }
-
-    pub fn empty_input_uses_local_pager_state(&self) -> bool {
-        matches!(self.oversized_output, OversizedOutputMode::Pager)
-            && self.pager.is_active()
-            && !self.empty_input_polls_existing_output()
-    }
-
-    pub fn empty_input_may_auto_reset_after_poll(&self) -> bool {
-        self.empty_input_polls_existing_output()
-            && (self.pending_request
-                || self.settled_pending_completion.is_some()
-                || self.session_end_seen)
-    }
-
     pub fn missing_inherited_state_without_worker(&self) -> bool {
         self.missing_inherited_sandbox_state() && self.process.is_none()
-    }
-
-    pub fn nonexecuting_follow_up_uses_existing_state(
-        &mut self,
-        text: &str,
-    ) -> Result<bool, WorkerError> {
-        if let Some((control, remaining)) = split_write_stdin_control_prefix(text) {
-            return match control {
-                WriteStdinControlAction::Interrupt => {
-                    if remaining.is_empty() {
-                        Ok(true)
-                    } else {
-                        Ok(self.local_pager_follow_up_uses_existing_state(remaining)
-                            && !self.control_only_interrupt_requires_spawn()?)
-                    }
-                }
-                WriteStdinControlAction::Restart => Ok(false),
-            };
-        }
-
-        Ok(self.local_pager_follow_up_uses_existing_state(text))
-    }
-
-    fn control_only_interrupt_requires_spawn(&mut self) -> Result<bool, WorkerError> {
-        match self.process.as_mut() {
-            Some(process) => Ok(!process.is_running()?),
-            None => Ok(true),
-        }
-    }
-
-    fn write_stdin_control_prefix(
-        &mut self,
-        mode: WriteStdinMode,
-        text: &str,
-        worker_timeout: Duration,
-        server_timeout: Duration,
-        options: &WriteStdinOptions,
-    ) -> Result<Option<WorkerReply>, WorkerError> {
-        let Some(prefix) = ControlPrefixInput::split(text) else {
-            return Ok(None);
-        };
-
-        self.clear_guardrail_busy_event();
-        let control_requires_spawn = match prefix.action() {
-            WriteStdinControlAction::Interrupt => self.control_only_interrupt_requires_spawn()?,
-            WriteStdinControlAction::Restart => false,
-        };
-        let mut plan = prefix.plan(control_requires_spawn, options)?;
-        if plan.stage_before_control {
-            self.stage_deferred_sandbox_state_update(plan.staged_sandbox_state_update.take())?;
-        }
-
-        let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
-            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_files(worker_timeout, None, true)
-            }
-            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => self
-                .interrupt_files(
-                    worker_timeout,
-                    plan.tail_sandbox_state_update.clone(),
-                    options.suppress_session_end_reset,
-                ),
-            (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
-                self.restart_files(worker_timeout)
-            }
-            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_pager(worker_timeout, None, true)
-            }
-            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => self
-                .interrupt_pager(
-                    worker_timeout,
-                    plan.tail_sandbox_state_update.clone(),
-                    options.suppress_session_end_reset,
-                ),
-            (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
-                self.restart_pager(worker_timeout)
-            }
-        }?;
-
-        if plan.stage_interrupt_after_session_end
-            && self.session_end_seen
-            && !options.suppress_session_end_reset
-        {
-            self.stage_session_end_sandbox_state_update(
-                plan.tail_sandbox_state_update.take(),
-                options.pending_state_prechecked,
-            )?;
-            self.maybe_reset_after_session_end();
-        }
-        if plan.tail.is_empty() {
-            return Ok(Some(control_reply));
-        }
-
-        let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
-        let tail_options = options.control_tail(plan.tail_sandbox_state_update);
-        let remaining_reply = match mode {
-            WriteStdinMode::Files => self.write_stdin_files(
-                plan.tail.to_string(),
-                worker_timeout,
-                server_timeout,
-                tail_options,
-            ),
-            WriteStdinMode::Pager => self.write_stdin_pager(
-                plan.tail.to_string(),
-                worker_timeout,
-                server_timeout,
-                tail_options,
-            ),
-        }?;
-        self.last_detached_prefix_item_count += control_prefix_item_count;
-        Ok(Some(prefix_worker_reply(control_reply, remaining_reply)))
     }
 
     pub fn detached_prefix_item_count(&self) -> usize {
@@ -511,378 +333,6 @@ impl WorkerManager {
     fn note_respawn_during_write(&mut self) {
         if self.write_in_progress {
             self.last_write_respawned = true;
-        }
-    }
-
-    fn stage_deferred_sandbox_state_update(
-        &mut self,
-        update: Option<SandboxStateUpdate>,
-    ) -> Result<(), WorkerError> {
-        let Some(update) = update else {
-            return Ok(());
-        };
-        self.stage_sandbox_state_update(update)
-    }
-
-    fn stage_session_end_sandbox_state_update(
-        &mut self,
-        update: Option<SandboxStateUpdate>,
-        pending_state_prechecked: bool,
-    ) -> Result<(), WorkerError> {
-        if pending_state_prechecked && update.is_none() && self.requests_inherited_sandbox_state() {
-            return Err(prechecked_follow_up_requires_meta_error());
-        }
-
-        self.stage_deferred_sandbox_state_update(update)
-    }
-
-    fn maybe_reset_after_session_end_with_options(
-        &mut self,
-        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-        suppress_session_end_reset: bool,
-        pending_state_prechecked: bool,
-    ) -> Result<(), WorkerError> {
-        if self.session_end_seen && !suppress_session_end_reset {
-            self.stage_session_end_sandbox_state_update(
-                deferred_sandbox_state_update,
-                pending_state_prechecked,
-            )?;
-        }
-        if !suppress_session_end_reset {
-            self.maybe_reset_after_session_end();
-        }
-        Ok(())
-    }
-
-    fn apply_deferred_sandbox_state_update(
-        &mut self,
-        update: Option<SandboxStateUpdate>,
-    ) -> Result<(), WorkerError> {
-        let Some(update) = update else {
-            return Ok(());
-        };
-        self.update_sandbox_state(update, DEFERRED_SANDBOX_UPDATE_TIMEOUT)?;
-        Ok(())
-    }
-
-    fn empty_input_uses_existing_state(&self) -> bool {
-        match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.pending_request
-                    || self.pending_output_tape.has_pending()
-                    || self.settled_pending_completion.is_some()
-                    || self.guardrail_busy_event_pending()
-            }
-            OversizedOutputMode::Pager => {
-                self.pending_request
-                    || self.output.has_pending_output()
-                    || self.settled_pending_completion.is_some()
-                    || self.pager.is_active()
-                    || self.guardrail_busy_event_pending()
-            }
-        }
-    }
-
-    pub(crate) fn local_pager_follow_up_uses_existing_state(&self, text: &str) -> bool {
-        matches!(self.oversized_output, OversizedOutputMode::Pager) && self.pager.is_active() && {
-            let trimmed = text.trim();
-            trimmed.is_empty() || trimmed.starts_with(':')
-        }
-    }
-
-    fn reset_preserving_detached_prefix_item_count(&mut self) -> Result<(), WorkerError> {
-        let detached_prefix_item_count = self.last_detached_prefix_item_count;
-        let result = self.reset();
-        self.last_detached_prefix_item_count = detached_prefix_item_count;
-        result
-    }
-
-    fn reset_with_pager_preserving_detached_prefix_item_count(
-        &mut self,
-        preserve_pager: bool,
-    ) -> Result<(), WorkerError> {
-        let detached_prefix_item_count = self.last_detached_prefix_item_count;
-        let result = self.reset_with_pager(preserve_pager);
-        self.last_detached_prefix_item_count = detached_prefix_item_count;
-        result
-    }
-
-    pub fn write_stdin(
-        &mut self,
-        text: String,
-        worker_timeout: Duration,
-        server_timeout: Duration,
-        options: WriteStdinOptions,
-    ) -> Result<WorkerReply, WorkerError> {
-        self.write_in_progress = true;
-        self.last_write_respawned = false;
-        let result = match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.write_stdin_files(text, worker_timeout, server_timeout, options)
-            }
-            OversizedOutputMode::Pager => {
-                self.write_stdin_pager(text, worker_timeout, server_timeout, options)
-            }
-        };
-        self.write_in_progress = false;
-        result
-    }
-
-    /// Entry point for the public `repl` tool in default files mode.
-    fn write_stdin_files(
-        &mut self,
-        text: String,
-        worker_timeout: Duration,
-        server_timeout: Duration,
-        options: WriteStdinOptions,
-    ) -> Result<WorkerReply, WorkerError> {
-        self.last_detached_prefix_item_count = 0;
-        if let Some(reply) = self.write_stdin_control_prefix(
-            WriteStdinMode::Files,
-            &text,
-            worker_timeout,
-            server_timeout,
-            &options,
-        )? {
-            return Ok(reply);
-        }
-
-        match self.write_preflight(WritePreflightInput {
-            mode: WriteStdinMode::Files,
-            text: &text,
-            worker_timeout,
-            page_bytes: 0,
-            echo_input: false,
-            options: &options,
-        })? {
-            WritePreflightOutcome::Continue => {}
-            WritePreflightOutcome::Reply(reply) => return Ok(reply),
-        }
-
-        self.dispatch_write_request(WriteDispatchInput {
-            mode: WriteStdinMode::Files,
-            text,
-            worker_timeout,
-            server_timeout,
-            deferred_sandbox_state_update: options.deferred_sandbox_state_update,
-            page_bytes: 0,
-            echo_input: false,
-            process_prechecked: false,
-        })
-    }
-
-    fn write_stdin_pager(
-        &mut self,
-        text: String,
-        worker_timeout: Duration,
-        server_timeout: Duration,
-        options: WriteStdinOptions,
-    ) -> Result<WorkerReply, WorkerError> {
-        let page_bytes_override = options.page_bytes_override;
-        let echo_input = options.echo_input;
-        self.last_detached_prefix_item_count = 0;
-        if let Some(reply) = self.write_stdin_control_prefix(
-            WriteStdinMode::Pager,
-            &text,
-            worker_timeout,
-            server_timeout,
-            &options,
-        )? {
-            return Ok(reply);
-        }
-
-        let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-        match self.write_preflight(WritePreflightInput {
-            mode: WriteStdinMode::Pager,
-            text: &text,
-            worker_timeout,
-            page_bytes,
-            echo_input,
-            options: &options,
-        })? {
-            WritePreflightOutcome::Continue => {}
-            WritePreflightOutcome::Reply(reply) => return Ok(reply),
-        }
-
-        self.dispatch_write_request(WriteDispatchInput {
-            mode: WriteStdinMode::Pager,
-            text,
-            worker_timeout,
-            server_timeout,
-            deferred_sandbox_state_update: options.deferred_sandbox_state_update,
-            page_bytes,
-            echo_input,
-            process_prechecked: true,
-        })
-    }
-
-    fn handle_pager_command(&mut self, text: &str) -> Option<ReplyWithOffset> {
-        if !self.pager.is_active() {
-            return None;
-        }
-        self.pager.refresh_from_output(&self.output);
-        let mut reply = self.pager.handle_command(text);
-        let pager_active = self.pager.is_active();
-        let WorkerReply::Output {
-            contents, prompt, ..
-        } = &mut reply;
-        let resolved_prompt = if pager_active {
-            None
-        } else {
-            self.pager_prompt.take()
-        };
-        if pager_active {
-            *prompt = None;
-        } else {
-            self.remember_prompt(resolved_prompt.clone());
-            if resolved_prompt.is_none() {
-                contents.push(WorkerContent::server_stderr(
-                    "[repl] protocol error: missing prompt after pager dismiss",
-                ));
-            }
-            append_prompt_if_missing(contents, resolved_prompt.clone());
-            *prompt = resolved_prompt;
-        }
-        let end_offset = self.output.end_offset().unwrap_or(0);
-        Some(ReplyWithOffset { reply, end_offset })
-    }
-
-    fn guardrail_event_pending(&self) -> bool {
-        self.guardrail
-            .event
-            .lock()
-            .expect("guardrail event mutex poisoned")
-            .is_some()
-    }
-
-    fn guardrail_busy_event_pending(&self) -> bool {
-        self.guardrail
-            .event
-            .lock()
-            .expect("guardrail event mutex poisoned")
-            .as_ref()
-            .is_some_and(|event| event.was_busy)
-    }
-
-    fn clear_guardrail_busy_event(&mut self) {
-        let mut slot = self
-            .guardrail
-            .event
-            .lock()
-            .expect("guardrail event mutex poisoned");
-        if slot.as_ref().is_some_and(|event| event.was_busy) {
-            *slot = None;
-            self.guardrail.busy.store(false, Ordering::Relaxed);
-        }
-    }
-
-    fn maybe_emit_guardrail_notice(&mut self) {
-        self.maybe_emit_pending_server_notice();
-        let event = {
-            let mut slot = self
-                .guardrail
-                .event
-                .lock()
-                .expect("guardrail event mutex poisoned");
-            if slot.as_ref().is_some_and(|event| event.was_busy) {
-                return;
-            }
-            slot.take()
-        };
-        let Some(event) = event else {
-            return;
-        };
-        self.append_server_notice(event);
-    }
-
-    fn maybe_emit_pending_server_notice(&mut self) {
-        let Some(event) = self.pending_server_notice.take() else {
-            return;
-        };
-        self.append_server_notice(event);
-    }
-
-    fn append_server_notice(&mut self, event: GuardrailEvent) {
-        match self.oversized_output {
-            OversizedOutputMode::Files => {
-                if event.is_error {
-                    self.pending_output_tape
-                        .append_server_stderr_bytes(event.message.as_bytes());
-                } else {
-                    self.pending_output_tape
-                        .append_stdout_status_line(event.message.as_bytes());
-                }
-            }
-            OversizedOutputMode::Pager => {
-                self.output_timeline.append_text(
-                    event.message.as_bytes(),
-                    event.is_error,
-                    ContentOrigin::Server,
-                );
-            }
-        }
-    }
-
-    fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
-            set_last_reply_marker_offset(reply.end_offset);
-        }
-        reply.reply
-    }
-
-    fn note_session_end(&mut self, include_notice: bool) {
-        self.session_end_seen = true;
-        self.stdin_waiting = false;
-        if let Some(process) = self.process.as_mut() {
-            process.note_expected_exit();
-            if include_notice {
-                let status_message = process.exit_status_message().ok().flatten();
-                if let Some(mut message) = status_message {
-                    if !message.ends_with('\n') {
-                        message.push('\n');
-                    }
-                    match self.oversized_output {
-                        OversizedOutputMode::Files => self
-                            .pending_output_tape
-                            .append_server_stderr_status_line(message.as_bytes()),
-                        OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(
-                                message.as_bytes(),
-                                true,
-                                ContentOrigin::Server,
-                            );
-                        }
-                    }
-                } else {
-                    let message = "[repl] session ended\n".to_string();
-                    match self.oversized_output {
-                        OversizedOutputMode::Files => self
-                            .pending_output_tape
-                            .append_stdout_status_line(message.as_bytes()),
-                        OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(
-                                message.as_bytes(),
-                                false,
-                                ContentOrigin::Server,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn maybe_reset_after_session_end(&mut self) {
-        if self.session_end_seen {
-            let result = match self.oversized_output {
-                OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
-                OversizedOutputMode::Pager => self
-                    .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
-            };
-            if result.is_ok() {
-                self.note_respawn_during_write();
-            }
-            self.session_end_seen = false;
         }
     }
 
@@ -904,299 +354,6 @@ impl WorkerManager {
                 suppress_session_end_reset,
             ),
         }
-    }
-
-    pub fn shutdown(&mut self) {
-        crate::event_log::log("worker_shutdown", serde_json::json!({}));
-        if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(WORKER_SHUTDOWN_TIMEOUT);
-        }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-    }
-
-    fn ensure_process(&mut self) -> Result<(), WorkerError> {
-        self.require_inherited_sandbox_state()?;
-        let needs_spawn = match self.process.as_mut() {
-            Some(process) => !process.is_running()?,
-            None => true,
-        };
-
-        if needs_spawn {
-            if let Some(process) = self.process.take() {
-                process.finish_exited()?;
-            }
-            match self.oversized_output {
-                OversizedOutputMode::Files => self.reset_output_state_files(false),
-                OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
-            }
-            self.process = Some(match self.oversized_output {
-                OversizedOutputMode::Files => self.spawn_process_files()?,
-                OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
-            });
-        }
-
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<(), WorkerError> {
-        crate::event_log::log("worker_reset_begin", serde_json::json!({}));
-        if let Some(process) = self.process.take() {
-            let _ = process.kill();
-        }
-        self.require_inherited_sandbox_state()?;
-        match self.oversized_output {
-            OversizedOutputMode::Files => self.reset_output_state_files(true),
-            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
-        }
-        self.process = Some(match self.oversized_output {
-            OversizedOutputMode::Files => self.spawn_process_files()?,
-            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
-        });
-        crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
-        Ok(())
-    }
-
-    fn reset_with_pager(&mut self, preserve_pager: bool) -> Result<(), WorkerError> {
-        crate::event_log::log(
-            "worker_reset_with_pager_begin",
-            serde_json::json!({
-                "preserve_pager": preserve_pager,
-            }),
-        );
-        if let Some(process) = self.process.take() {
-            let _ = process.kill();
-        }
-        self.require_inherited_sandbox_state()?;
-        self.reset_output_state_pager(true, preserve_pager);
-        self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
-        crate::event_log::log(
-            "worker_reset_with_pager_end",
-            serde_json::json!({
-                "status": "ok",
-                "preserve_pager": preserve_pager,
-            }),
-        );
-        Ok(())
-    }
-
-    fn spawn_worker_after_initial_sandbox_state(&mut self) -> Result<(), WorkerError> {
-        match self.oversized_output {
-            OversizedOutputMode::Files => self.reset_output_state_files(true),
-            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
-        }
-        self.process = Some(match self.oversized_output {
-            OversizedOutputMode::Files => self.spawn_process_files()?,
-            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
-        });
-        self.note_respawn_during_write();
-        Ok(())
-    }
-
-    fn restart_worker_after_sandbox_state_change(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
-        }
-        match self.oversized_output {
-            OversizedOutputMode::Files if self.has_detached_output_to_preserve() => {
-                self.reset_output_state_files_preserving_detached_output()
-            }
-            OversizedOutputMode::Files => self.reset_output_state_files(true),
-            OversizedOutputMode::Pager if self.has_detached_output_to_preserve() => {
-                self.reset_output_state_pager_preserving_detached_output(self.pager.is_active())
-            }
-            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
-        }
-        self.process = Some(match self.oversized_output {
-            OversizedOutputMode::Files => self.spawn_process_files()?,
-            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
-        });
-        self.note_respawn_during_write();
-        Ok(())
-    }
-
-    fn remember_prompt(&mut self, prompt: Option<String>) {
-        if prompt.as_deref() == Some("") {
-            self.stdin_waiting = true;
-            return;
-        }
-        let prompt = normalize_prompt(prompt);
-        if let Some(prompt) = prompt {
-            self.stdin_waiting = false;
-            self.last_prompt = Some(prompt);
-        }
-    }
-
-    fn current_prompt_hint(&self) -> Option<String> {
-        if self.stdin_waiting {
-            return None;
-        }
-        let prompt = self
-            .process
-            .as_ref()
-            .and_then(|process| process.ipc_connection())
-            .and_then(|ipc| ipc.try_take_prompt())
-            .and_then(|prompt| normalize_prompt(Some(prompt)));
-        prompt.or_else(|| self.last_prompt.clone())
-    }
-
-    fn drain_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape.drain_snapshot().format_contents()
-    }
-
-    fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
-    }
-
-    fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_sealed_snapshot()
-            .format_contents()
-    }
-
-    fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
-        if self.stdin_waiting {
-            return ReplyWithOffset {
-                reply: WorkerReply::Output {
-                    contents: vec![stdin_wait_status_content()],
-                    is_error: false,
-                    error_code: None,
-                    prompt: None,
-                    prompt_variants: None,
-                },
-                end_offset: 0,
-            };
-        }
-        let prompt = self.current_prompt_hint();
-        self.remember_prompt(prompt.clone());
-        let mut contents = vec![idle_status_content()];
-        append_prompt_if_missing(&mut contents, prompt.clone());
-        ReplyWithOffset {
-            reply: WorkerReply::Output {
-                contents,
-                is_error: false,
-                error_code: None,
-                prompt,
-                prompt_variants: None,
-            },
-            end_offset: 0,
-        }
-    }
-
-    fn build_idle_poll_reply_pager(&mut self) -> ReplyWithOffset {
-        if self.stdin_waiting {
-            return ReplyWithOffset {
-                reply: WorkerReply::Output {
-                    contents: vec![stdin_wait_status_content()],
-                    is_error: false,
-                    error_code: None,
-                    prompt: None,
-                    prompt_variants: None,
-                },
-                end_offset: self.output.end_offset().unwrap_or(0),
-            };
-        }
-        let prompt = self.current_prompt_hint();
-        self.remember_prompt(prompt.clone());
-        let mut contents = vec![idle_status_content()];
-        append_prompt_if_missing(&mut contents, prompt.clone());
-        ReplyWithOffset {
-            reply: WorkerReply::Output {
-                contents,
-                is_error: false,
-                error_code: None,
-                prompt,
-                prompt_variants: None,
-            },
-            end_offset: self.output.end_offset().unwrap_or(0),
-        }
-    }
-}
-
-fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply {
-    let WorkerReply::Output {
-        mut contents,
-        is_error,
-        error_code,
-        prompt,
-        prompt_variants,
-    } = prefix;
-    let WorkerReply::Output {
-        contents: suffix_contents,
-        is_error: suffix_is_error,
-        error_code: suffix_error_code,
-        prompt: suffix_prompt,
-        prompt_variants: suffix_prompt_variants,
-    } = suffix;
-    if let Some(prompt_text) = prompt.as_deref() {
-        strip_trailing_prompt(&mut contents, prompt_text);
-    }
-    if let Some(WorkerContent::ContentText {
-        text: prefix_text, ..
-    }) = contents.last_mut()
-        && let Some(WorkerContent::ContentText {
-            text: suffix_text, ..
-        }) = suffix_contents.first()
-        && !prefix_text.is_empty()
-        && !suffix_text.is_empty()
-        && !prefix_text.ends_with('\n')
-        && !suffix_text.starts_with('\n')
-    {
-        prefix_text.push('\n');
-    }
-    contents.extend(suffix_contents);
-    WorkerReply::Output {
-        contents,
-        is_error: is_error || suffix_is_error,
-        error_code: suffix_error_code.or(error_code),
-        prompt: suffix_prompt.or(prompt),
-        prompt_variants: suffix_prompt_variants.or(prompt_variants),
-    }
-}
-
-fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
-    let WorkerReply::Output {
-        contents, prompt, ..
-    } = prefix;
-    let Some(prompt_text) = prompt.as_deref() else {
-        return contents.len();
-    };
-    if prompt_text.is_empty() {
-        return contents.len();
-    }
-    let Some(idx) = contents
-        .iter()
-        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }))
-    else {
-        return contents.len();
-    };
-    let WorkerContent::ContentText { text, .. } = &contents[idx] else {
-        return contents.len();
-    };
-    if matches!(text.strip_suffix(prompt_text), Some("")) {
-        contents.len().saturating_sub(1)
-    } else {
-        contents.len()
-    }
-}
-
-fn mark_busy_follow_up_reply(reply: &mut WorkerReply) {
-    let WorkerReply::Output {
-        contents,
-        is_error,
-        error_code,
-        ..
-    } = reply;
-    contents.push(WorkerContent::server_stderr(
-        "[repl] input discarded while worker busy",
-    ));
-    *is_error = true;
-    if error_code.is_none() {
-        *error_code = Some(WorkerErrorCode::Busy);
     }
 }
 

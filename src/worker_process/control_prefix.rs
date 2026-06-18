@@ -1,7 +1,8 @@
 use crate::sandbox::SandboxStateUpdate;
 use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
 
-use super::{WorkerError, WriteStdinOptions, prechecked_follow_up_requires_meta_error};
+use super::write_flow::WriteStdinOptions;
+use super::{WorkerError, prechecked_follow_up_requires_meta_error};
 
 pub(super) struct ControlPrefixInput<'a> {
     action: WriteStdinControlAction,
