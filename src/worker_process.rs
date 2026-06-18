@@ -42,11 +42,7 @@ use crate::reply_presentation::{
     trim_matching_echo_event_suffix_from_contents,
 };
 use crate::sandbox::{SandboxState, SandboxStateUpdate};
-use crate::sandbox_cli::{
-    MISSING_INHERITED_SANDBOX_STATE_MESSAGE, SandboxCliPlan,
-    resolve_effective_sandbox_state_with_defaults, sandbox_plan_requests_inherited_state,
-    validate_sandbox_plan_with_defaults,
-};
+use crate::sandbox_cli::SandboxCliPlan;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
 use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode, WorkerReply};
 #[cfg(target_os = "linux")]
@@ -63,6 +59,7 @@ mod output_state;
 mod pending_poll;
 mod request_lifecycle;
 mod restart;
+mod sandbox_state;
 mod session_reset_reply;
 mod write_dispatch;
 mod write_preflight;
@@ -228,12 +225,6 @@ pub struct WorkerManager {
     linux_bwrap_fallback_disabled: bool,
 }
 
-struct PreparedSandboxStateUpdate {
-    update_for_log: serde_json::Value,
-    changed: bool,
-    missing_before: bool,
-}
-
 impl WorkerManager {
     pub fn new(
         backend: Backend,
@@ -255,16 +246,10 @@ impl WorkerManager {
         let exe_path = std::env::current_exe()?;
         let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
-        let plan_requests_inherited_state = sandbox_plan_requests_inherited_state(&sandbox_plan);
-        let sandbox_state = if plan_requests_inherited_state {
-            validate_sandbox_plan_with_defaults(&sandbox_plan, &sandbox_defaults)
-                .map_err(WorkerError::Sandbox)?;
-            sandbox_defaults.clone()
-        } else {
-            resolve_effective_sandbox_state_with_defaults(&sandbox_plan, None, &sandbox_defaults)
-                .map_err(WorkerError::Sandbox)?
-        };
-        if plan_requests_inherited_state {
+        let initial_sandbox =
+            sandbox_state::prepare_initial_sandbox_state(&sandbox_plan, &sandbox_defaults)?;
+        let sandbox_state = initial_sandbox.state;
+        if initial_sandbox.awaiting_inherited_state {
             crate::event_log::log(
                 "worker_manager_created",
                 serde_json::json!({
@@ -337,7 +322,8 @@ impl WorkerManager {
     }
 
     fn ensure_managed_network_proxy(&mut self) -> Result<(), WorkerError> {
-        let Some(config) = Self::managed_network_proxy_config_for_state(&self.sandbox_state)?
+        let Some(config) =
+            sandbox_state::managed_network_proxy_config_for_state(&self.sandbox_state)?
         else {
             self.managed_network_proxy = None;
             return Ok(());
@@ -362,60 +348,6 @@ impl WorkerManager {
         );
         self.managed_network_proxy = Some(proxy);
         Ok(())
-    }
-
-    fn managed_network_proxy_config_for_state(
-        state: &SandboxState,
-    ) -> Result<Option<crate::managed_network::ManagedProxyConfig>, WorkerError> {
-        if !state.managed_network_policy.has_domain_restrictions() {
-            return Ok(None);
-        }
-        if !state.sandbox_policy.has_full_network_access() {
-            return Ok(None);
-        }
-        if !state.sandbox_policy.requires_sandbox() {
-            return Err(WorkerError::Sandbox(
-                "managed network domain restrictions require built-in sandbox enforcement"
-                    .to_string(),
-            ));
-        }
-        if !cfg!(target_os = "macos") {
-            return Err(WorkerError::Sandbox(
-                "managed network domain restrictions are currently supported only on macOS"
-                    .to_string(),
-            ));
-        }
-        crate::managed_network::ManagedProxyConfig::from_policy(&state.managed_network_policy)
-            .map(Some)
-            .map_err(|err| WorkerError::Sandbox(err.to_string()))
-    }
-
-    pub fn bootstrap_local_inherited_sandbox_state(&mut self) -> Result<bool, WorkerError> {
-        if !self.missing_inherited_sandbox_state() {
-            return Ok(false);
-        }
-
-        let update = SandboxStateUpdate {
-            sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
-            sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
-            use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
-            use_legacy_landlock: None,
-        };
-        crate::event_log::log(
-            "worker_local_inherit_bootstrap",
-            serde_json::json!({
-                "sandbox_policy": update.sandbox_policy.clone(),
-                "sandbox_cwd": update.sandbox_cwd.clone(),
-                "use_linux_sandbox_bwrap": update.use_linux_sandbox_bwrap,
-            }),
-        );
-        self.stage_sandbox_state_update(update)?;
-        Ok(true)
-    }
-
-    fn missing_inherited_sandbox_state(&self) -> bool {
-        sandbox_plan_requests_inherited_state(&self.sandbox_plan)
-            && self.inherited_sandbox_state.is_none()
     }
 
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
@@ -610,10 +542,7 @@ impl WorkerManager {
         update: Option<SandboxStateUpdate>,
         pending_state_prechecked: bool,
     ) -> Result<(), WorkerError> {
-        if pending_state_prechecked
-            && update.is_none()
-            && sandbox_plan_requests_inherited_state(&self.sandbox_plan)
-        {
+        if pending_state_prechecked && update.is_none() && self.requests_inherited_sandbox_state() {
             return Err(prechecked_follow_up_requires_meta_error());
         }
 
@@ -1279,11 +1208,7 @@ impl WorkerManager {
     }
 
     fn ensure_process(&mut self) -> Result<(), WorkerError> {
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
+        self.require_inherited_sandbox_state()?;
         let needs_spawn = match self.process.as_mut() {
             Some(process) => !process.is_running()?,
             None => true,
@@ -1311,11 +1236,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
+        self.require_inherited_sandbox_state()?;
         match self.oversized_output {
             OversizedOutputMode::Files => self.reset_output_state_files(true),
             OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
@@ -1338,11 +1259,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        if self.missing_inherited_sandbox_state() {
-            return Err(WorkerError::Sandbox(
-                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
-            ));
-        }
+        self.require_inherited_sandbox_state()?;
         self.reset_output_state_pager(true, preserve_pager);
         self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
         crate::event_log::log(
@@ -1355,110 +1272,23 @@ impl WorkerManager {
         Ok(())
     }
 
-    // Replaces the inherited sandbox snapshot for this tool call. The new
-    // policy becomes effective in the worker only after the current process is
-    // recycled and a replacement worker is spawned. Session temp handling is
-    // separate: the server-owned temp dir is reset before each spawn, and
-    // today that reset reuses the same configured path in place.
-    fn prepare_sandbox_state_update(
-        &mut self,
-        update: SandboxStateUpdate,
-    ) -> Result<PreparedSandboxStateUpdate, WorkerError> {
-        let update_for_log = serde_json::to_value(&update)
-            .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
-        crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
-        let mut inherited_state = self.sandbox_defaults.clone();
-        inherited_state.apply_update(update);
-        #[cfg(target_os = "linux")]
-        self.apply_linux_bwrap_fallback_override(&mut inherited_state);
-        let resolved_state = resolve_effective_sandbox_state_with_defaults(
-            &self.sandbox_plan,
-            Some(&inherited_state),
-            &self.sandbox_defaults,
-        )
-        .map_err(WorkerError::Sandbox)?;
-        #[cfg(target_os = "linux")]
-        let resolved_state = {
-            let mut resolved_state = resolved_state;
-            self.apply_linux_bwrap_fallback_override(&mut resolved_state);
-            resolved_state
-        };
-        let missing_before = self.missing_inherited_sandbox_state();
-        self.inherited_sandbox_state = Some(inherited_state);
-        let changed = self.sandbox_state != resolved_state;
-        self.sandbox_state = resolved_state;
-        #[cfg(target_os = "windows")]
-        if changed {
-            // Prepared Windows launch state is keyed to the effective worker
-            // sandbox configuration. Drop it before respawn so the next worker
-            // picks up the updated sandbox state.
-            self.windows_sandbox_launch = None;
+    fn spawn_worker_after_initial_sandbox_state(&mut self) -> Result<(), WorkerError> {
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
         }
-        Ok(PreparedSandboxStateUpdate {
-            update_for_log,
-            changed,
-            missing_before,
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    fn apply_linux_bwrap_fallback_override(&self, state: &mut SandboxState) {
-        if self.linux_bwrap_fallback_disabled {
-            state.use_linux_sandbox_bwrap = false;
-        }
-    }
-
-    fn log_sandbox_state_update(
-        prepared: &PreparedSandboxStateUpdate,
-        timeout: Option<Duration>,
-        respawned: bool,
-    ) {
-        crate::event_log::log(
-            "worker_sandbox_state_update",
-            serde_json::json!({
-                "changed": prepared.changed,
-                "timeout_ms": timeout.map(|timeout| timeout.as_millis()),
-                "respawned": respawned,
-                "update": prepared.update_for_log,
-            }),
-        );
-    }
-
-    pub fn stage_sandbox_state_update(
-        &mut self,
-        update: SandboxStateUpdate,
-    ) -> Result<(), WorkerError> {
-        let prepared = self.prepare_sandbox_state_update(update)?;
-        Self::log_sandbox_state_update(&prepared, None, false);
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
+        self.note_respawn_during_write();
         Ok(())
     }
 
-    pub fn update_sandbox_state(
+    fn restart_worker_after_sandbox_state_change(
         &mut self,
-        update: SandboxStateUpdate,
         timeout: Duration,
-    ) -> Result<bool, WorkerError> {
-        let prepared = self.prepare_sandbox_state_update(update)?;
-        let mut respawned = false;
-        if !prepared.changed {
-            if prepared.missing_before && self.process.is_none() {
-                match self.oversized_output {
-                    OversizedOutputMode::Files => self.reset_output_state_files(true),
-                    OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
-                }
-                self.process = Some(match self.oversized_output {
-                    OversizedOutputMode::Files => self.spawn_process_files()?,
-                    OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
-                });
-                respawned = true;
-                self.note_respawn_during_write();
-            }
-            Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
-            return Ok(respawned);
-        }
-
-        let aborted_request = self.pending_request;
-        let had_prior_session = self.last_spawn.is_some();
+    ) -> Result<(), WorkerError> {
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
@@ -1476,33 +1306,8 @@ impl WorkerManager {
             OversizedOutputMode::Files => self.spawn_process_files()?,
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
-        respawned = true;
         self.note_respawn_during_write();
-        if had_prior_session {
-            self.stage_sandbox_change_restart_notice(aborted_request);
-            self.next_live_prefix_belongs_to_reply = true;
-        }
-        Self::log_sandbox_state_update(&prepared, Some(timeout), respawned);
-        Ok(respawned)
-    }
-
-    fn stage_sandbox_change_restart_notice(&mut self, aborted_request: bool) {
-        let policy = serde_json::to_string(&self.sandbox_state.sandbox_policy)
-            .unwrap_or_else(|err| format!("{{\"serialize_error\":\"{}\"}}", err));
-        let mut message = String::from("[repl] sandbox policy changed; new session started\n");
-        if aborted_request {
-            message.push_str("[repl] previous request aborted because sandbox policy changed\n");
-        }
-        message.push_str(&format!("[repl] new sandbox policy: {policy}\n"));
-        let event = GuardrailEvent {
-            message,
-            was_busy: false,
-            is_error: false,
-        };
-        match &mut self.pending_server_notice {
-            Some(pending) => pending.message.push_str(&event.message),
-            None => self.pending_server_notice = Some(event),
-        }
+        Ok(())
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
@@ -1917,6 +1722,7 @@ mod tests {
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
     use crate::sandbox::sandbox_state_update_from_codex_meta;
+    use crate::sandbox_cli::resolve_effective_sandbox_state_with_defaults;
     use crate::worker_protocol::TextStream;
     #[cfg(target_family = "unix")]
     use crate::worker_supervisor::capture_recorded_unix_kills;
