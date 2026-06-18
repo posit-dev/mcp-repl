@@ -334,6 +334,7 @@ impl WorkerManager {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_family = "unix")]
     use super::test_support::{cwd_test_mutex, env_test_mutex};
     use super::*;
 

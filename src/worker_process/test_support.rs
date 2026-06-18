@@ -1,3 +1,4 @@
+#[cfg(target_family = "unix")]
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -11,6 +12,7 @@ pub(super) fn cwd_test_mutex() -> &'static Mutex<()> {
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(target_family = "unix")]
 pub(super) fn env_test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
@@ -72,14 +74,6 @@ pub(super) fn pager_buffer_from_worker_text_with_source_end(
 pub(super) fn sleeping_test_child() -> Child {
     Command::new("sh")
         .args(["-c", "sleep 30"])
-        .spawn()
-        .expect("spawn sleeping test child")
-}
-
-#[cfg(target_family = "windows")]
-pub(super) fn sleeping_test_child() -> Child {
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
         .spawn()
         .expect("spawn sleeping test child")
 }

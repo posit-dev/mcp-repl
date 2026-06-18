@@ -217,15 +217,8 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::ipc::WorkerToServerIpcMessage;
     use crate::oversized_output::OversizedOutputMode;
     use crate::sandbox_cli::SandboxCliPlan;
-    #[cfg(target_family = "unix")]
-    use crate::worker_process::test_support::failing_test_status;
-    use crate::worker_process::test_support::{
-        contents_text, env_test_mutex, sleeping_test_child, successful_test_child,
-        test_worker_process,
-    };
 
     #[test]
     fn session_end_reset_preserves_detached_prefix_count() {
@@ -254,6 +247,11 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn failing_session_end_notice_flushes_partial_stdout_in_files_mode() {
+        use crate::worker_process::test_support::{
+            contents_text, env_test_mutex, failing_test_status, sleeping_test_child,
+            test_worker_process,
+        };
+
         let _guard = env_test_mutex().lock().expect("env mutex");
         let mut manager = WorkerManager::new(
             Backend::R,
@@ -288,6 +286,11 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn timed_out_prompt_completion_with_exited_worker_reports_session_end_immediately() {
+        use crate::ipc::WorkerToServerIpcMessage;
+        use crate::worker_process::test_support::{
+            contents_text, env_test_mutex, successful_test_child, test_worker_process,
+        };
+
         let _guard = env_test_mutex().lock().expect("env mutex");
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut manager = WorkerManager::new(
