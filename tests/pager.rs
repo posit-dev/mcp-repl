@@ -3,6 +3,7 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
+#[cfg(windows)]
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -31,6 +32,7 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains("[repl] protocol error: missing prompt after pager dismiss")
 }
 
+#[cfg(windows)]
 async fn wait_until_not_busy(
     session: &mut common::McpTestSession,
     initial: rmcp::model::CallToolResult,
