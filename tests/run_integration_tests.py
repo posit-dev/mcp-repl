@@ -641,6 +641,48 @@ def python_console_basic(client: McpStdioClient) -> None:
     assert_identical(expected, normalize_response(received), "python console repl")
 
 
+def python_busy_discards_input(client: McpStdioClient) -> None:
+    warmup = client.repl("print('PYTHON_BUSY_READY')", timeout_ms=2000)
+    warmup = wait_until_not_busy(
+        client,
+        warmup,
+        "python busy warmup repl",
+        deadline_seconds=python_startup_deadline_seconds(),
+    )
+    warmup_text = require_success(warmup, "python busy warmup repl")
+    if "PYTHON_BUSY_READY" not in warmup_text:
+        raise SuiteFailure(f"expected Python warmup output, got: {warmup_text!r}")
+
+    timed_out = client.repl("import time; time.sleep(2)", timeout_ms=100)
+    timed_out_text = require_success(timed_out, "python busy timeout repl")
+    if not is_busy_response(timed_out):
+        raise SuiteFailure(
+            f"expected sleeping Python request to remain busy, got: {timed_out_text!r}"
+        )
+
+    busy_follow_up = client.repl("1+1", timeout_ms=200)
+    busy_follow_up_text = require_success(busy_follow_up, "python busy follow-up repl")
+    if "input discarded while worker busy" not in busy_follow_up_text:
+        raise SuiteFailure(
+            "expected busy Python worker to discard follow-up input, "
+            f"got: {busy_follow_up_text!r}"
+        )
+
+    wait_until_not_busy(
+        client,
+        client.repl("", timeout_ms=500),
+        "python busy settle repl",
+        deadline_seconds=5.0,
+    )
+
+    recovered = client.repl("1+1", timeout_ms=5000)
+    assert_identical(
+        tool_result(text("2\n"), text(">>> ")),
+        normalize_response(recovered),
+        "python busy recovery repl",
+    )
+
+
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
@@ -1106,6 +1148,7 @@ def python_suite_case(
 
 
 CASES: dict[str, SuiteCase] = {
+    "python-busy-discards-input": python_suite_case(python_busy_discards_input),
     "python-console-basic": python_suite_case(python_console_basic),
     "r-console-basic": r_suite_case(r_console_basic),
     "r-full-access-sandbox": r_suite_case(

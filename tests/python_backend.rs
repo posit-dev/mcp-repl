@@ -3805,29 +3805,6 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_busy_discards_input() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let _ = session
-        .write_stdin_raw_with("import time; time.sleep(2)", Some(0.1))
-        .await?;
-
-    let result = session.write_stdin_raw_with("1+1", Some(0.2)).await?;
-    let text = result_text(&result);
-    assert!(
-        text.contains("input discarded while worker busy"),
-        "expected busy discard message, got: {text:?}"
-    );
-    assert_ne!(result.is_error, Some(true));
-
-    session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn python_stderr_merged_into_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
