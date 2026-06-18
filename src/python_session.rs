@@ -2577,6 +2577,7 @@ static PYTHON_RUNTIME_STDIN_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_family = "unix")]
     use super::*;
 
     #[cfg(target_family = "unix")]
