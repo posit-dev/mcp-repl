@@ -1,6 +1,5 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
 use std::path::PathBuf;
@@ -65,7 +64,6 @@ async fn real_server_startup_stderr_omits_routine_notice() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sends_input_to_r_console_snapshot() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();

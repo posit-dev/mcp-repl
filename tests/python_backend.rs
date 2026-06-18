@@ -3516,7 +3516,6 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_repl_reset_unblocks_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -4340,7 +4339,10 @@ async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> 
     Ok(())
 }
 
-#[cfg(not(windows))]
+// This asserts raw split-byte ownership across detached child output and the
+// next request. Windows routes Python through ConPTY, where console code-page
+// rendering is the public boundary rather than raw UTF-8 byte preservation.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
     let _guard = lock_test_mutex();

@@ -1,10 +1,8 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -43,20 +41,26 @@ async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_interrupt_handler_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
-    let long_sleep =
-        r#"tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat("interrupt received\n"))"#;
+    let long_sleep = r#"cat("INTERRUPT_READY\n")
+flush.console()
+tryCatch(
+  {
+    repeat Sys.sleep(0.5)
+  },
+  interrupt = function(e) cat("interrupt received\n")
+)
+"#;
 
     snapshot
         .session(
             "interrupt_handler",
             mcp_session!(|session| {
                 session.write_stdin_raw_with("1+1", Some(10.0)).await?;
-                session.write_stdin_with(long_sleep, Some(0.2)).await;
+                session.write_stdin_with(long_sleep, Some(1.0)).await;
                 session.write_stdin_with("\u{3}", Some(5.0)).await;
                 session.write_stdin_with("1+1", Some(10.0)).await;
                 Ok(())
@@ -78,7 +82,6 @@ async fn snapshots_interrupt_handler_output() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_tempdir_session_restart() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();

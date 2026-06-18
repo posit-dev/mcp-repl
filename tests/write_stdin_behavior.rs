@@ -1334,7 +1334,6 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> TestResult<()> {
     let _guard = lock_test_mutex();

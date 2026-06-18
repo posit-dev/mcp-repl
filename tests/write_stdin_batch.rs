@@ -2,25 +2,19 @@
 
 mod common;
 
-#[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
-#[cfg(not(windows))]
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
-#[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
-#[cfg(not(windows))]
 use tokio::time::Duration;
 
-#[cfg(not(windows))]
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
-#[cfg(not(windows))]
 fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -28,7 +22,6 @@ fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     }
 }
 
-#[cfg(not(windows))]
 fn lock_test_mutex() -> MutexGuard<'static, ()> {
     lock_mutex(test_mutex())
 }
@@ -45,7 +38,6 @@ fn collect_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-#[cfg(not(windows))]
 fn count_images(result: &rmcp::model::CallToolResult) -> usize {
     result
         .content
@@ -91,7 +83,6 @@ fn disclosed_path_parses_windows_paths() {
     );
 }
 
-#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
     let rendered = snapshot.render();
     let transcript = snapshot.render_transcript();
@@ -107,7 +98,6 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_accepts_multiple_calls() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -125,7 +115,6 @@ async fn write_stdin_accepts_multiple_calls() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_accepts_multiple_calls", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -181,7 +170,6 @@ async fn write_stdin_files_multidrain_plot_then_later_stdout_snapshot() -> TestR
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
@@ -237,7 +225,6 @@ async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> 
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_drives_browser() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -258,7 +245,6 @@ async fn write_stdin_drives_browser() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_drives_browser", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_search() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -275,7 +261,6 @@ async fn write_stdin_pager_search() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_pager_search", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_pager_hits() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();

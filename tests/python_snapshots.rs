@@ -1,9 +1,7 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::{McpSnapshot, TestResult};
 
-#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
     let rendered = snapshot.render();
     let transcript = snapshot.render_transcript();
@@ -19,7 +17,6 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_buffered_input_prompt_matching_primary_prompt() -> TestResult<()> {
     if !common::python_available() {
