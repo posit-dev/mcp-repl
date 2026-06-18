@@ -31,6 +31,14 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                 self.assertLess(index + 1, len(case.server_args))
                 self.assertEqual(case.server_args[index + 1], "r")
 
+    def test_python_console_basic_case_pins_python_interpreter(self):
+        case = self.module.CASES["python-console-basic"]
+
+        self.assertIn("--interpreter", case.server_args)
+        index = case.server_args.index("--interpreter")
+        self.assertLess(index + 1, len(case.server_args))
+        self.assertEqual(case.server_args[index + 1], "python")
+
     def test_tool_result_builder_matches_mcp_response_shape(self):
         self.assertEqual(
             self.module.tool_result(
