@@ -774,7 +774,7 @@ impl BackgroundIpcHolderProbe {
 
     async fn release_and_wait_for_exit(&self) -> TestResult<()> {
         let was_alive_before_release = self.holder_alive().unwrap_or(false);
-        fs::write(&self.release_path, "go")?;
+        self.write_release_marker()?;
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -802,6 +802,23 @@ impl BackgroundIpcHolderProbe {
         .into())
     }
 
+    fn write_release_marker(&self) -> TestResult<()> {
+        fs::write(&self.release_path, "go")?;
+        Ok(())
+    }
+
+    fn wait_for_exit_sync(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                std::thread::sleep(Duration::from_millis(250));
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn holder_alive(&self) -> TestResult<bool> {
         if !self.ready_path.exists() {
             return Ok(false);
@@ -818,6 +835,18 @@ impl BackgroundIpcHolderProbe {
             )
         })?;
         Ok(pid)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BackgroundIpcHolderProbe {
+    fn drop(&mut self) {
+        if self.exited_path.exists() {
+            return;
+        }
+
+        let _ = self.write_release_marker();
+        let _ = self.wait_for_exit_sync(Duration::from_secs(5));
     }
 }
 
