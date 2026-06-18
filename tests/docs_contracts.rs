@@ -363,6 +363,11 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "Set `MCP_REPL_CODEX_BACKEND=live` or `MCP_REPL_CODEX_BACKEND=mock` to force one path.",
         "docs/testing.md",
     );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "If `auto` selects live Spark but the local model completes without emitting the expected `r.repl` MCP tool call, the smoke test reports a skip for unsupported live tool-selection behavior. Forced `live` mode still requires the MCP tool call and final marker.",
+        "docs/testing.md",
+    );
     assert!(
         testing_docs.contains("MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1"),
         "docs/testing.md should show the forced mock Codex backend check"
