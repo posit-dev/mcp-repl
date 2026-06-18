@@ -45,8 +45,7 @@ async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
 async fn snapshots_interrupt_handler_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
 
-    let long_sleep = r#"
-cat("INTERRUPT_READY\n")
+    let long_sleep = r#"cat("INTERRUPT_READY\n")
 flush.console()
 tryCatch(
   {
