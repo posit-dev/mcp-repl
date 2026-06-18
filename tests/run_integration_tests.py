@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,8 +27,68 @@ class SuiteFailure(Exception):
     pass
 
 
+class SuiteSkip(Exception):
+    pass
+
+
 class McpProtocolError(SuiteFailure):
     pass
+
+
+class LoopbackServer:
+    def __init__(self) -> None:
+        self.listener: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.address: tuple[str, int] | None = None
+
+    def __enter__(self) -> LoopbackServer:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(0.1)
+        except PermissionError as exc:
+            listener.close()
+            raise SuiteSkip(f"loopback unavailable in this environment: {exc}") from exc
+        self.listener = listener
+        host, port = listener.getsockname()
+        self.address = (host, port)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.stop_event.set()
+        if self.listener is not None:
+            self.listener.close()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+    @property
+    def host(self) -> str:
+        assert self.address is not None
+        return self.address[0]
+
+    @property
+    def port(self) -> int:
+        assert self.address is not None
+        return self.address[1]
+
+    def _serve(self) -> None:
+        listener = self.listener
+        assert listener is not None
+        while not self.stop_event.is_set():
+            try:
+                conn, _addr = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.sendall(b"ok")
+                return
 
 
 def collect_stderr(stream: Any, sink: list[str]) -> None:
@@ -469,6 +530,27 @@ def r_write_file_input(path: Path, value: str) -> str:
     )
 
 
+def r_network_input(host: str, port: int) -> str:
+    return dedent(
+        f"""
+        tryCatch(
+          {{
+            con <- socketConnection(
+              {r_string_literal(host)},
+              {port},
+              blocking = TRUE,
+              open = "r+",
+              timeout = 1
+            )
+            on.exit(close(con))
+            cat("NETWORK_OK\\n")
+          }},
+          error = function(e) cat("NETWORK_ERROR:", conditionMessage(e), "\\n", sep = "")
+        )
+        """
+    )
+
+
 def repeated_text_line(label: str, index: int, width: int = 120) -> str:
     return f"{label}{index:03d} {label * width}\n"
 
@@ -680,6 +762,34 @@ def r_full_access_sandbox(client: McpStdioClient) -> None:
             )
     finally:
         target.unlink(missing_ok=True)
+
+
+def r_workspace_write_network_blocked(client: McpStdioClient) -> None:
+    with LoopbackServer() as server:
+        received = client.repl(
+            r_network_input(server.host, server.port),
+            timeout_ms=30000,
+        )
+    received_text = require_success(received, "workspace-write network blocked repl")
+    if "NETWORK_ERROR:" not in received_text or "NETWORK_OK" in received_text:
+        raise SuiteFailure(
+            "expected workspace-write to block network access, "
+            f"got: {received_text!r}"
+        )
+
+
+def r_workspace_write_network_allowed(client: McpStdioClient) -> None:
+    with LoopbackServer() as server:
+        received = client.repl(
+            r_network_input(server.host, server.port),
+            timeout_ms=30000,
+        )
+    received_text = require_success(received, "workspace-write network allowed repl")
+    if "NETWORK_OK" not in received_text or "NETWORK_ERROR:" in received_text:
+        raise SuiteFailure(
+            "expected workspace-write network_access=true to allow network access, "
+            f"got: {received_text!r}"
+        )
 
 
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
@@ -922,6 +1032,7 @@ class SuiteCase:
     server_args: tuple[str, ...] = ()
     server_env: tuple[tuple[str, str], ...] = ()
     server_cwd: Path | None = None
+    platforms: tuple[str, ...] = ()
 
 
 def r_suite_case(
@@ -930,12 +1041,14 @@ def r_suite_case(
     server_args: tuple[str, ...] = (),
     server_env: tuple[tuple[str, str], ...] = (),
     server_cwd: Path | None = None,
+    platforms: tuple[str, ...] = (),
 ) -> SuiteCase:
     return SuiteCase(
         run,
         server_args=("--interpreter", "r", *server_args),
         server_env=server_env,
         server_cwd=server_cwd,
+        platforms=platforms,
     )
 
 
@@ -981,6 +1094,21 @@ CASES: dict[str, SuiteCase] = {
         r_workspace_write_sandbox,
         server_args=("--sandbox", "workspace-write"),
         server_cwd=Path("target/test-scratch/run-integration-tests/r-workspace-write-sandbox"),
+    ),
+    "r-workspace-write-network-allowed": r_suite_case(
+        r_workspace_write_network_allowed,
+        server_args=(
+            "--sandbox",
+            "workspace-write",
+            "--config",
+            "sandbox_workspace_write.network_access=true",
+        ),
+        platforms=("darwin", "linux"),
+    ),
+    "r-workspace-write-network-blocked": r_suite_case(
+        r_workspace_write_network_blocked,
+        server_args=("--sandbox", "workspace-write"),
+        platforms=("darwin", "linux"),
     ),
 }
 
@@ -1036,6 +1164,9 @@ def main(argv: Sequence[str]) -> int:
     failures = 0
     for case_name in selected:
         case = CASES[case_name]
+        if case.platforms and sys.platform not in case.platforms:
+            print(f"ok {case_name} # skip unsupported platform {sys.platform}")
+            continue
         server_cwd = None
         if case.server_cwd is not None:
             server_cwd = case.server_cwd
@@ -1051,6 +1182,8 @@ def main(argv: Sequence[str]) -> int:
                 args.timeout,
             ) as client:
                 case.run(client)
+        except SuiteSkip as exc:
+            print(f"ok {case_name} # skip {exc}")
         except SuiteFailure as exc:
             failures += 1
             print(f"not ok {case_name}: {exc}", file=sys.stderr)

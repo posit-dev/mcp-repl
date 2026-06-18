@@ -894,34 +894,6 @@ async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_workspace_write_blocks_network_access() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
-    let Some(addr) = start_loopback_server_if_available().await? else {
-        return Ok(());
-    };
-    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
-    let result = session
-        .write_stdin_raw_with(network_test_code(addr), Some(10.0))
-        .await?;
-    let text = collect_text(&result);
-    if skip_backend_unavailable("sandbox_workspace_write_blocks_network_access", &text) {
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        text.contains("NETWORK_ERROR:"),
-        "expected network to be blocked, got: {text}"
-    );
-    assert!(
-        !text.contains("NETWORK_OK"),
-        "network request unexpectedly succeeded: {text}"
-    );
-    session.cancel().await?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
     assert!(sandbox_available(), "sandbox-exec unavailable");
     let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
@@ -1007,30 +979,6 @@ cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
     assert_eq!(
         tmpdir, mcp_tmpdir,
         "expected TMPDIR to match MCP_TMPDIR, got: {text}"
-    );
-    session.cancel().await?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_workspace_write_allows_network_access() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
-    let Some(addr) = start_loopback_server_if_available().await? else {
-        return Ok(());
-    };
-    let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(true)).await?;
-    let result = session
-        .write_stdin_raw_with(network_test_code(addr), Some(10.0))
-        .await?;
-    let text = collect_text(&result);
-    if skip_backend_unavailable("sandbox_workspace_write_allows_network_access", &text) {
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        text.contains("NETWORK_OK"),
-        "expected network to succeed, got: {text}"
     );
     session.cancel().await?;
     Ok(())

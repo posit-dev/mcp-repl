@@ -30,7 +30,7 @@
 - Phase 0: completed - add the runner shell and first R console smoke case.
 - Phase 1: completed - migrate another small real-client scenario with timeout or busy-worker behavior.
 - Phase 2: completed - run the external suite in CI after the debug binary is built.
-- Phase 3: active - reintroduced `workspace-write` sandbox behavior in the Python runner; continue migrating duplicate real-binary Rust integration coverage case by case.
+- Phase 3: active - reintroduced `workspace-write` sandbox behavior in the Python runner, including write policy and network-access policy; continue migrating duplicate real-binary Rust integration coverage case by case.
 
 ## Locked Decisions
 
@@ -46,7 +46,7 @@
 
 ## Next Safe Slice
 
-- The basic sandbox write-policy contrasts now live in the Python runner.
+- The basic sandbox write-policy contrasts and workspace-write network policy contrasts now live in the Python runner.
 - Migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
 - Keep additional sandbox migrations focused on public behavior that does not require internal server or launch-state inspection.
 
@@ -69,3 +69,4 @@
 - 2026-06-18: Added an external `workspace-write` sandbox case that verifies public `repl` behavior for writes inside the server cwd and blocked writes outside it.
 - 2026-06-18: Migrated the public read-only workspace write denial check into the external runner and removed the duplicate Rust integration case.
 - 2026-06-18: Migrated the public full-access outside-write check into the external runner and removed the duplicate Rust integration case.
+- 2026-06-18: Migrated workspace-write network block/allow coverage into the external runner and removed the duplicate Unix Rust integration cases.
