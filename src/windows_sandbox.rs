@@ -4116,6 +4116,9 @@ mod tests {
 
     #[test]
     fn prepared_launch_does_not_share_session_temp_dir_access() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4544,6 +4547,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4609,6 +4615,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn sandboxed_cmd_exe_can_start_with_prepared_launch() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -4834,6 +4843,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn runtime_launch_acl_state_blocks_same_sid_until_release() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -5472,6 +5484,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_refresh_reapplies_allow_acl_to_recreated_writable_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -5521,6 +5536,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_prepare_applies_allow_acl_to_missing_writable_root() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -5567,6 +5585,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_prepare_does_not_grant_delete_on_writable_roots() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -5626,6 +5647,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_refresh_reapplies_allow_acl_to_late_created_workspace_root_child() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
@@ -5746,6 +5770,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
         let cwd = workspace.path().join("workspace");
