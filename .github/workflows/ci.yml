@@ -112,16 +112,9 @@ jobs:
           & (Join-Path $npmPrefix "codex.cmd") --version
 
       - name: cargo test
-        if: matrix.os != 'windows-2022'
         env:
           MCP_REPL_CODEX_BACKEND: mock
         run: cargo test --quiet
-
-      - name: cargo test (windows serial)
-        if: matrix.os == 'windows-2022'
-        env:
-          MCP_REPL_CODEX_BACKEND: mock
-        run: cargo test -j 1 --quiet -- --test-threads=1
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

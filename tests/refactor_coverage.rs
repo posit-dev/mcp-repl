@@ -1,10 +1,8 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_restart_and_interrupt_with_plots() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -35,7 +33,6 @@ cat("plots_done\n")
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -56,7 +53,6 @@ async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_truncation_notice_tail() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -82,7 +78,6 @@ cat("\nEND\n")
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_pager_hits_with_images() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -119,7 +114,6 @@ fn initial_plot_command_completed(text: &str) -> bool {
     text.contains("plots_done") || common::is_busy_response(text) || text.contains("--More-- (")
 }
 
-#[cfg(not(windows))]
 fn normalize_pager_footer_page_counts(text: &str) -> String {
     let marker = "--More-- (";
     let mut out = String::with_capacity(text.len());
@@ -149,7 +143,6 @@ fn normalize_pager_footer_page_counts(text: &str) -> String {
     out
 }
 
-#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
     let rendered = if name == "snapshots_pager_hits_with_images" {
         normalize_pager_footer_page_counts(&snapshot.render())

@@ -200,7 +200,7 @@ fn home_scratch_dir(label: &str) -> TestResult<TempDir> {
 fn repo_scratch_dir(label: &str) -> TestResult<TempDir> {
     Ok(Builder::new()
         .prefix(&format!(".tmp-{label}-"))
-        .tempdir_in(common::checkout_test_temp_parent("sandbox-state-updates")?)?)
+        .tempdir_in(common::checkout_test_temp_parent("sandbox-state-meta")?)?)
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn repo_scratch_dir_uses_non_temp_checkout_scratch_parent() -> TestResult<()> {
     assert!(
         scratch
             .path()
-            .starts_with(common::checkout_test_temp_parent("sandbox-state-updates")?),
+            .starts_with(common::checkout_test_temp_parent("sandbox-state-meta")?),
         "sandbox cwd scratch dirs should stay under target/test-scratch"
     );
     assert!(
@@ -591,7 +591,7 @@ async fn sandbox_state_meta_capability_hidden_after_later_workspace_write_overri
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -611,7 +611,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestRe
     let result = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -651,7 +651,7 @@ async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() ->
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -688,7 +688,7 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -729,7 +729,7 @@ async fn sandbox_inherit_empty_repl_after_reset_uses_staged_state_meta() -> Test
     session.cancel().await?;
 
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     assert!(
@@ -755,7 +755,7 @@ async fn sandbox_inherit_empty_poll_with_existing_worker_ignores_bad_state_meta(
         .await?;
     let initial_text = collect_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -794,7 +794,7 @@ async fn sandbox_inherit_empty_repl_without_state_meta_sets_is_error() -> TestRe
     let result = session.write_stdin_raw_with("", Some(2.0)).await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -822,7 +822,7 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
         .await?;
     let initial_text = common::result_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -868,7 +868,7 @@ async fn sandbox_inherit_pending_bare_interrupt_ignores_missing_state_meta() -> 
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -914,7 +914,7 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -983,7 +983,7 @@ async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> Te
         .await?;
     let initial_text = common::result_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1028,7 +1028,7 @@ async fn sandbox_inherit_active_pager_command_ignores_state_meta_changes() -> Te
         .await?;
     let initial_text = common::result_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1086,7 +1086,7 @@ async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes(
         .await?;
     let timed_out_text = common::result_text(&timed_out);
     if backend_unavailable(&timed_out_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1134,7 +1134,7 @@ async fn sandbox_inherit_pending_pager_command_ignores_missing_state_meta() -> T
         .await?;
     let timed_out_text = common::result_text(&timed_out);
     if backend_unavailable(&timed_out_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1186,7 +1186,7 @@ async fn sandbox_inherit_active_pager_empty_input_ignores_missing_state_meta() -
         .await?;
     let initial_text = common::result_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1230,7 +1230,7 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1308,7 +1308,7 @@ async fn sandbox_inherit_pending_restart_tail_with_bad_meta_fails_closed() -> Te
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1374,7 +1374,7 @@ async fn sandbox_inherit_pending_interrupt_tail_restarts_on_state_change() -> Te
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1419,7 +1419,7 @@ async fn sandbox_inherit_pending_follow_up_restarts_on_new_state_meta() -> TestR
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1474,7 +1474,7 @@ async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_r
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1521,7 +1521,7 @@ async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResu
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1553,7 +1553,7 @@ async fn sandbox_inherit_pending_empty_poll_ignores_missing_state_meta() -> Test
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1605,7 +1605,7 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1654,7 +1654,7 @@ async fn sandbox_inherit_empty_poll_respawn_retires_disclosed_timeout_bundle() -
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1761,7 +1761,7 @@ async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_resp
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1834,7 +1834,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_met
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1896,7 +1896,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_doe
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1950,7 +1950,7 @@ async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles(
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -1990,7 +1990,7 @@ async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestR
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2034,7 +2034,7 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2092,7 +2092,7 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2149,7 +2149,7 @@ async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2231,7 +2231,7 @@ async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> 
             .await?;
         let first_text = collect_text(&first);
         if backend_unavailable(&first_text) {
-            eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+            eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
             session.cancel().await?;
             return Ok(());
         }
@@ -2275,7 +2275,7 @@ async fn sandbox_inherit_restart_follow_up_applies_current_state_meta() -> TestR
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2320,7 +2320,7 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         .await?;
     let first_text = common::result_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2387,7 +2387,7 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         .await?;
     let initial_text = common::result_text(&initial);
     if backend_unavailable(&initial_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2440,7 +2440,7 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2472,7 +2472,7 @@ async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestR
     session.cancel().await?;
 
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     assert_eq!(
@@ -2507,7 +2507,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
     session.cancel().await?;
 
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     assert_eq!(
@@ -2542,7 +2542,7 @@ async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<(
     session.cancel().await?;
 
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     assert_eq!(
@@ -2576,7 +2576,7 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2608,7 +2608,7 @@ async fn sandbox_inherit_full_access_meta_allows_write_outside_cwd() -> TestResu
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2638,7 +2638,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2652,7 +2652,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         .await?;
     let timed_out_text = collect_text(&timed_out);
     if backend_unavailable(&timed_out_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2709,7 +2709,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2723,7 +2723,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         .await?;
     let timed_out_text = collect_text(&timed_out);
     if backend_unavailable(&timed_out_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2788,7 +2788,7 @@ async fn explicit_workspace_write_mode_ignores_codex_sandbox_state_meta() -> Tes
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2819,7 +2819,7 @@ async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2852,7 +2852,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
     let result = session.call_tool_raw("repl_reset", json!({})).await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2884,7 +2884,7 @@ async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
         .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -2996,7 +2996,7 @@ async fn sandbox_inherit_first_ctrl_d_tail_stages_current_meta_before_restart() 
     session.cancel().await?;
 
     if backend_unavailable(&text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     assert!(
@@ -3039,7 +3039,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3059,7 +3059,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_
     session.cancel().await?;
 
     if backend_unavailable(&tail_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
     if tail_text.contains("<<repl status: busy") {
@@ -3114,7 +3114,7 @@ async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3172,7 +3172,7 @@ async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3247,7 +3247,7 @@ async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3293,7 +3293,7 @@ async fn sandbox_inherit_empty_poll_without_meta_defers_session_end_respawn() ->
         .await?;
     let timeout_text = collect_text(&timeout);
     if backend_unavailable(&timeout_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3346,7 +3346,7 @@ async fn sandbox_inherit_idle_ctrl_d_without_state_meta_does_not_restart() -> Te
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3396,7 +3396,7 @@ async fn sandbox_inherit_idle_ctrl_d_with_bad_meta_does_not_restart() -> TestRes
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -3450,7 +3450,7 @@ async fn sandbox_inherit_idle_ctrl_d_tail_with_bad_meta_does_not_run_tail() -> T
         .await?;
     let first_text = collect_text(&first);
     if backend_unavailable(&first_text) {
-        eprintln!("sandbox_state_updates backend unavailable in this environment; skipping");
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }

@@ -1,10 +1,8 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
-#[cfg(windows)]
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -19,18 +17,20 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-#[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
         || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
         || text.contains("unable to initialize the JIT")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+        || text.contains("options(\"defaultPackages\") was not found")
+        || text.contains("worker io error: Broken pipe")
+        || text.contains("[repl] protocol error: missing prompt after pager dismiss")
 }
 
-#[cfg(windows)]
 async fn wait_until_not_busy(
     session: &mut common::McpTestSession,
     initial: rmcp::model::CallToolResult,
@@ -57,22 +57,6 @@ async fn wait_until_not_busy(
     Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
-#[cfg(not(windows))]
-fn backend_unavailable(text: &str) -> bool {
-    text.contains("Fatal error: cannot create 'R_TempDir'")
-        || text.contains("failed to start R session")
-        || text.contains("worker exited with status")
-        || text.contains("worker exited with signal")
-        || text.contains("unable to initialize the JIT")
-        || text.contains(
-            "worker protocol error: ipc disconnected while waiting for request completion",
-        )
-        || text.contains("options(\"defaultPackages\") was not found")
-        || text.contains("worker io error: Broken pipe")
-        || text.contains("[repl] protocol error: missing prompt after pager dismiss")
-}
-
-#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
     let rendered = snapshot.render();
     let transcript = snapshot.render_transcript();
@@ -87,7 +71,6 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_commands_are_handled_server_side() -> TestResult<()> {
     let session = common::spawn_server_with_pager_page_chars(120).await?;
@@ -148,7 +131,6 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
     let session = common::spawn_server_with_pager_page_chars(120).await?;
@@ -193,7 +175,6 @@ async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn paginates_large_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -211,7 +192,6 @@ async fn paginates_large_output() -> TestResult<()> {
     assert_snapshot_or_skip("paginates_large_output", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_and_counts() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -229,7 +209,6 @@ async fn pager_search_and_counts() -> TestResult<()> {
     assert_snapshot_or_skip("pager_search_and_counts", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_preserves_whitespace() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -247,7 +226,6 @@ async fn pager_search_preserves_whitespace() -> TestResult<()> {
     assert_snapshot_or_skip("pager_search_preserves_whitespace", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -264,7 +242,6 @@ async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
     assert_snapshot_or_skip("pager_search_case_insensitive_prefix_parsing", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_with_headings() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -280,7 +257,6 @@ async fn pager_matches_with_headings() -> TestResult<()> {
     assert_snapshot_or_skip("pager_matches_with_headings", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_hits_mode() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -296,7 +272,6 @@ async fn pager_hits_mode() -> TestResult<()> {
     assert_snapshot_or_skip("pager_hits_mode", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -311,7 +286,6 @@ async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
     assert_snapshot_or_skip("pager_whitespace_only_input_advances_page", &snapshot)
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_dedup_on_seek() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -413,7 +387,7 @@ async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
+async fn windows_blank_pager_whitespace_input_advances_page_smoke() -> TestResult<()> {
     assert_blank_pager_input_advances_page("   ").await
 }
 

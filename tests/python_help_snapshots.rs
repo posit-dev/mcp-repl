@@ -1,18 +1,14 @@
 mod common;
 
-#[cfg(not(windows))]
 use common::{McpSnapshot, TestResult};
-#[cfg(not(windows))]
 use regex_lite::Regex;
 
-#[cfg(not(windows))]
 fn python_backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
         || text.contains("worker io error: Permission denied")
         || text.contains("failed to locate a shared libpython")
 }
 
-#[cfg(not(windows))]
 fn normalize_python_help_banner(text: String) -> String {
     let version_re =
         Regex::new(r"Welcome to Python \d+\.\d+'s help utility!").expect("python version regex");
@@ -48,7 +44,6 @@ fn normalize_python_help_banner(text: String) -> String {
         .join("\n")
 }
 
-#[cfg(not(windows))]
 fn is_transcript_echo_line(line: &str) -> bool {
     matches!(
         line,
@@ -67,7 +62,6 @@ fn is_transcript_echo_line(line: &str) -> bool {
     )
 }
 
-#[cfg(not(windows))]
 fn normalize_python_help_intro(text: String) -> String {
     let mut out = Vec::new();
     let mut skipping_transcript_intro = false;
@@ -129,7 +123,6 @@ fn normalize_python_help_intro(text: String) -> String {
     out.join("\n")
 }
 
-#[cfg(not(windows))]
 #[test]
 fn normalizes_help_banner_after_whitespace_only_transcript_line() {
     let transcript = normalize_python_help_banner(
@@ -142,7 +135,6 @@ fn normalizes_help_banner_after_whitespace_only_transcript_line() {
     );
 }
 
-#[cfg(not(windows))]
 #[test]
 fn normalizes_rendered_help_banner_after_leading_newline() {
     let rendered = normalize_python_help_banner(
@@ -153,7 +145,6 @@ fn normalizes_rendered_help_banner_after_leading_newline() {
     assert_eq!(rendered, r#"      "text": "<PYTHON HELP BANNER>""#);
 }
 
-#[cfg(not(windows))]
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
     let rendered = normalize_python_help_banner(snapshot.render());
     let transcript = normalize_python_help_banner(snapshot.render_transcript());
@@ -162,14 +153,22 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
         return Ok(());
     }
 
-    insta::assert_snapshot!(name, rendered);
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!(name, transcript);
-    });
+    if cfg!(windows) {
+        insta::with_settings!({ snapshot_suffix => "windows" }, {
+            insta::assert_snapshot!(name, rendered);
+        });
+        insta::with_settings!({ snapshot_suffix => "windows-transcript" }, {
+            insta::assert_snapshot!(name, transcript);
+        });
+    } else {
+        insta::assert_snapshot!(name, rendered);
+        insta::with_settings!({ snapshot_suffix => "transcript" }, {
+            insta::assert_snapshot!(name, transcript);
+        });
+    }
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_help_contract_snapshot() -> TestResult<()> {
     if !common::python_available() {

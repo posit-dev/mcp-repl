@@ -8,8 +8,8 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat(\"interrupt received\\n\"))\n",
-    "timeout_ms": 200
+    "input": "\ncat(\"INTERRUPT_READY\\n\")\nflush.console()\ntryCatch(\n  {\n    repeat Sys.sleep(0.5)\n  },\n  interrupt = function(e) cat(\"interrupt received\\n\")\n)\n",
+    "timeout_ms": 1000
   }
 }
 response:
@@ -17,6 +17,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> \n> cat(\"INTERRUPT_READY\\n\")\nINTERRUPT_READY\n> flush.console()\n> tryCatch(\n+   {\n+     repeat Sys.sleep(0.5)\n+   },\n+   interrupt = function(e) cat(\"interrupt received\\n\")\n+ )"
+    },
     {
       "type": "text",
       "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"

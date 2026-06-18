@@ -1080,7 +1080,7 @@ fn normalize_snapshot_response(
             let mut content = result
                 .content
                 .iter()
-                .map(normalize_snapshot_content)
+                .filter_map(normalize_snapshot_content)
                 .collect::<Vec<_>>();
             maybe_drop_settled_prompt_echo(&mut content, call);
             SnapshotResponse::ToolResult(SnapshotCallToolResult {
@@ -1153,31 +1153,50 @@ fn prompt_echo_matches_input(text: &str, input_line: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn normalize_snapshot_content(content: &SnapshotContent) -> SnapshotContent {
+fn normalize_snapshot_content(content: &SnapshotContent) -> Option<SnapshotContent> {
     match content {
-        SnapshotContent::Text { text } => SnapshotContent::Text {
-            text: normalize_snapshot_text(text),
-        },
+        SnapshotContent::Text { text } => {
+            let text = normalize_snapshot_text(text);
+            if terminal_mode_toggle_only(&text) {
+                return None;
+            }
+            Some(SnapshotContent::Text { text })
+        }
         SnapshotContent::Image {
             mime_type,
             data_len: _,
-        } => SnapshotContent::Image {
+        } => Some(SnapshotContent::Image {
             mime_type: mime_type.clone(),
             data_len: 0,
-        },
+        }),
         SnapshotContent::Audio {
             mime_type,
             data_len: _,
-        } => SnapshotContent::Audio {
+        } => Some(SnapshotContent::Audio {
             mime_type: mime_type.clone(),
             data_len: 0,
-        },
-        SnapshotContent::Resource { resource } => SnapshotContent::Resource {
+        }),
+        SnapshotContent::Resource { resource } => Some(SnapshotContent::Resource {
             resource: resource.clone(),
-        },
-        SnapshotContent::ResourceLink { resource } => SnapshotContent::ResourceLink {
+        }),
+        SnapshotContent::ResourceLink { resource } => Some(SnapshotContent::ResourceLink {
             resource: resource.clone(),
-        },
+        }),
+    }
+}
+
+fn terminal_mode_toggle_only(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        if let Some(next) = rest.strip_prefix("\u{1b}[?9001h") {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("\u{1b}[?1004h") {
+            rest = next;
+            continue;
+        }
+        return rest.trim_matches(['\r', '\n']).is_empty() && rest.len() != text.len();
     }
 }
 

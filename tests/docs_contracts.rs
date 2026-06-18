@@ -239,8 +239,6 @@ fn ci_workflow_defines_dev_release_contract() {
         "npm config get prefix",
         "name: cargo test",
         "run: cargo test --quiet",
-        "name: cargo test (windows serial)",
-        "run: cargo test -j 1 --quiet -- --test-threads=1",
         "MCP_REPL_CODEX_BACKEND: mock",
         "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
@@ -278,6 +276,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "cargo nextest",
         "profile ci",
         ".config/nextest.toml",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -300,8 +300,6 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "npm install -g @openai/codex",
         "name: cargo test",
         "run: cargo test --quiet",
-        "name: cargo test (windows serial)",
-        "run: cargo test -j 1 --quiet -- --test-threads=1",
         "MCP_REPL_CODEX_BACKEND: mock",
     ] {
         assert!(
@@ -315,6 +313,8 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "cargo nextest",
         "name: cargo test (real codex integrations)",
         "run: cargo test -j 1 --test codex_integration -- --test-threads=1",
+        "name: cargo test (windows serial)",
+        "run: cargo test -j 1 --quiet -- --test-threads=1",
         "tests/run_rust_tests.py",
     ] {
         assert!(
