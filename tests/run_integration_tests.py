@@ -657,6 +657,31 @@ def r_read_only_sandbox(client: McpStdioClient) -> None:
         target.unlink(missing_ok=True)
 
 
+def r_full_access_sandbox(client: McpStdioClient) -> None:
+    stamp = f"{os.getpid()}-{time.time_ns()}"
+    workspace_cwd = client.server_cwd or Path.cwd()
+    target = workspace_cwd.resolve().parent / f".mcp-repl-full-access-{stamp}.txt"
+    target.unlink(missing_ok=True)
+
+    try:
+        received = client.repl(
+            r_write_file_input(target, "allowed"),
+            timeout_ms=30000,
+        )
+        received_text = require_success(received, "full-access outside repl")
+        if "WRITE_OK" not in received_text or "WRITE_ERROR:" in received_text:
+            raise SuiteFailure(
+                "expected full access to allow writing outside cwd, "
+                f"got: {received_text!r}"
+            )
+        if target.read_text(encoding="utf-8").strip() != "allowed":
+            raise SuiteFailure(
+                f"full-access outside file did not contain expected text: {target}"
+            )
+    finally:
+        target.unlink(missing_ok=True)
+
+
 def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
@@ -916,6 +941,11 @@ def r_suite_case(
 
 CASES: dict[str, SuiteCase] = {
     "r-console-basic": r_suite_case(r_console_basic),
+    "r-full-access-sandbox": r_suite_case(
+        r_full_access_sandbox,
+        server_args=("--sandbox", "danger-full-access"),
+        server_cwd=Path("target/test-scratch/run-integration-tests/r-full-access-sandbox"),
+    ),
     "r-interrupt-restart-prefixes": r_suite_case(r_interrupt_restart_prefixes),
     "r-output-bundle-files": r_suite_case(
         r_output_bundle_files,

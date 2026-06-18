@@ -46,8 +46,9 @@
 
 ## Next Safe Slice
 
-- Add a second public sandbox-policy contrast in the Python runner only if it replaces matching Rust public behavior cleanly, for example a focused read-only write denial or full-access outside-write case.
-- Otherwise, migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
+- The basic sandbox write-policy contrasts now live in the Python runner.
+- Migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
+- Keep additional sandbox migrations focused on public behavior that does not require internal server or launch-state inspection.
 
 ## Stop Conditions
 
@@ -67,3 +68,4 @@
 - 2026-05-18: Clarified that the external runner itself is not sandboxed, but the spawned `mcp-repl` binary still owns the sandbox contract; the next slice should restore sandbox coverage in the Python runner starting with `workspace-write`.
 - 2026-06-18: Added an external `workspace-write` sandbox case that verifies public `repl` behavior for writes inside the server cwd and blocked writes outside it.
 - 2026-06-18: Migrated the public read-only workspace write denial check into the external runner and removed the duplicate Rust integration case.
+- 2026-06-18: Migrated the public full-access outside-write check into the external runner and removed the duplicate Rust integration case.

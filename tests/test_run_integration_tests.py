@@ -94,6 +94,23 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         self.assertIn("target", case.server_cwd.parts)
         self.assertIn("test-scratch", case.server_cwd.parts)
 
+    def test_full_access_case_overrides_default_sandbox(self):
+        case = self.module.CASES["r-full-access-sandbox"]
+
+        sandbox_args = [
+            (arg, case.server_args[index + 1])
+            for index, arg in enumerate(case.server_args[:-1])
+            if arg == "--sandbox"
+        ]
+        self.assertEqual([("--sandbox", "danger-full-access")], sandbox_args)
+
+    def test_full_access_case_uses_scratch_cwd(self):
+        case = self.module.CASES["r-full-access-sandbox"]
+
+        self.assertIsNotNone(case.server_cwd)
+        self.assertIn("target", case.server_cwd.parts)
+        self.assertIn("test-scratch", case.server_cwd.parts)
+
     def test_wait_for_busy_response_text_polls_until_marker(self):
         initial = self.module.tool_result(
             self.module.text(
