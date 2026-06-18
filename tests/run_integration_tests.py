@@ -959,11 +959,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def resolve_binary_path(path: Path) -> Path:
     if path.is_file():
-        return path
+        return path.resolve()
     if sys.platform == "win32" and path.suffix == "":
         exe_path = path.with_name(f"{path.name}.exe")
         if exe_path.is_file():
-            return exe_path
+            return exe_path.resolve()
     return path
 
 
