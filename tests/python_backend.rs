@@ -690,26 +690,6 @@ print("ipc background ready")
     Ok(holder)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn python_smoke() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-
-    let result = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
-    let text = result_text(&result);
-    if is_busy_response(&text) {
-        eprintln!("python_smoke remained busy; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(text.contains("2"), "expected 2, got: {text:?}");
-
-    session.cancel().await?;
-    Ok(())
-}
-
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_plot_hook_flushes_before_stdin_wait_reply() -> TestResult<()> {

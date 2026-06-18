@@ -387,6 +387,22 @@ def wait_for_response(
     raise SuiteFailure(f"{context} remained busy after polling: {last_received!r}")
 
 
+def wait_until_not_busy(
+    client: McpStdioClient,
+    received: dict[str, Any],
+    context: str,
+    deadline_seconds: float = 5.0,
+) -> dict[str, Any]:
+    assert deadline_seconds > 0
+    deadline = time.monotonic() + deadline_seconds
+    last_received = received
+    while is_busy_response(last_received):
+        if time.monotonic() >= deadline:
+            raise SuiteFailure(f"{context} remained busy after polling: {last_received!r}")
+        last_received = client.repl("", timeout_ms=500)
+    return last_received
+
+
 def wait_for_busy_response_text(
     client: McpStdioClient,
     received: dict[str, Any],
@@ -603,6 +619,26 @@ def r_console_basic(client: McpStdioClient) -> None:
     )
 
     assert_identical(expected, received, "repl")
+
+
+def python_startup_deadline_seconds() -> float:
+    return 90.0 if sys.platform == "darwin" else 20.0
+
+
+def python_console_basic(client: McpStdioClient) -> None:
+    received = client.repl("1+1", timeout_ms=2000)
+    received = wait_until_not_busy(
+        client,
+        received,
+        "python console repl",
+        deadline_seconds=python_startup_deadline_seconds(),
+    )
+    expected = tool_result(
+        text("2\n"),
+        text(">>> "),
+    )
+
+    assert_identical(expected, normalize_response(received), "python console repl")
 
 
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
@@ -1052,7 +1088,25 @@ def r_suite_case(
     )
 
 
+def python_suite_case(
+    run: Callable[[McpStdioClient], None],
+    *,
+    server_args: tuple[str, ...] = (),
+    server_env: tuple[tuple[str, str], ...] = (),
+    server_cwd: Path | None = None,
+    platforms: tuple[str, ...] = (),
+) -> SuiteCase:
+    return SuiteCase(
+        run,
+        server_args=("--interpreter", "python", "--oversized-output", "files", *server_args),
+        server_env=server_env,
+        server_cwd=server_cwd,
+        platforms=platforms,
+    )
+
+
 CASES: dict[str, SuiteCase] = {
+    "python-console-basic": python_suite_case(python_console_basic),
     "r-console-basic": r_suite_case(r_console_basic),
     "r-full-access-sandbox": r_suite_case(
         r_full_access_sandbox,
