@@ -1594,37 +1594,37 @@ for (i in 1:6) {
   plot(1:10, main = sprintf("plot%03d", i))
 }
 flush.console()
-Sys.sleep(1)
 "#;
-    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first = session.write_stdin_raw_with(input, Some(0.001)).await?;
     if any_backend_unavailable(&[&first]) {
         eprintln!("plot_images backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-
-    sleep(Duration::from_millis(600)).await;
-    let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
-    let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
-        eprintln!("plot_images timeout omission poll did not flush bundle state yet; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+    let first_text = result_text(&first);
 
     assert_ne!(
-        bundled.is_error,
+        first.is_error,
         Some(true),
-        "image-only timeout omission poll reported an error: {}",
-        bundled_text
+        "image-only timeout omission reply reported an error: {}",
+        first_text
     );
     assert!(
-        bundled_text.contains("later content omitted"),
-        "expected omission notice in image-only timeout poll, got: {bundled_text:?}"
+        first_text.contains("later content omitted"),
+        "expected omission notice in image-only timeout reply, got: {first_text:?}"
     );
     assert!(
-        bundled_text.contains("output-0001"),
-        "expected omission reply to disclose a bundle path, got: {bundled_text:?}"
+        first_text.contains("output-0001"),
+        "expected omission reply to disclose a bundle path, got: {first_text:?}"
+    );
+
+    let settled = session.write_stdin_raw_with("", Some(60.0)).await?;
+    let settled_text = result_text(&settled);
+    assert_ne!(
+        settled.is_error,
+        Some(true),
+        "image-only timeout settle poll reported an error: {}",
+        settled_text
     );
 
     session.cancel().await?;
