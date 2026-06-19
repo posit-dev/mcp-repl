@@ -377,11 +377,13 @@ mod tests {
     fn worker_manager_new_does_not_panic_for_non_utf8_tmpdir_env() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
 
         let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
-        let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
+        let non_utf8_tmpdir = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec()));
+        std::fs::create_dir_all(&non_utf8_tmpdir).expect("create non-UTF-8 TMPDIR parent");
 
         unsafe {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
@@ -402,6 +404,7 @@ mod tests {
                 std::env::remove_var("TMPDIR");
             },
         }
+        let _ = std::fs::remove_dir(&non_utf8_tmpdir);
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
     }
