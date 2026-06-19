@@ -128,7 +128,6 @@ use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::System::Threading::LOGON_WITH_PROFILE;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
@@ -143,6 +142,7 @@ const SETUP_VERSION: u32 = 1;
 const SETUP_DIR_NAME: &str = "mcp-repl\\windows-sandbox";
 const SETUP_MARKER_FILE: &str = "setup_marker.json";
 const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const LOGON_WITHOUT_PROFILE: u32 = 0;
 const LOOPBACK_REMOTE_ADDRESSES: &str = "127.0.0.0/8,::/127";
 const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
 const OFFLINE_BLOCK_RULE_NAME: &str = "mcp_repl_sandbox_offline_block_outbound";
@@ -1239,7 +1239,7 @@ fn create_process_with_offline_logon(
             username.as_ptr(),
             domain.as_ptr(),
             password.as_ptr(),
-            LOGON_WITH_PROFILE,
+            LOGON_WITHOUT_PROFILE,
             app.as_ptr(),
             cmdline.as_mut_ptr(),
             CREATE_UNICODE_ENVIRONMENT,
