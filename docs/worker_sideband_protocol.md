@@ -29,9 +29,10 @@ raw stderr, PTY state, stdin writes, or timing.
 ## Transport
 
 - Logical sideband endpoints are named by direction: server-to-worker and
-  worker-to-server. The bootstrap environment variable names stay
+  worker-to-server. The bootstrap environment variable names intentionally stay
   transport-specific because Unix carries inherited file-descriptor numbers and
-  Windows carries named-pipe paths.
+  Windows carries named-pipe paths. This keeps source searches and diagnostics
+  tied to the platform primitive actually being bootstrapped.
 - Unix endpoints:
   - `MCP_REPL_IPC_READ_FD`: worker reads server-to-worker messages
   - `MCP_REPL_IPC_WRITE_FD`: worker writes worker-to-server messages
@@ -55,8 +56,10 @@ in forked children and closes inherited sideband file descriptors. Those
 children may still write inherited raw stdout/stderr, but they must not emit
 sideband messages or consume managed queued input. Managed stdin for
 sideband-disabled fork children should return EOF where the worker controls that
-stdin surface; Python fork children currently do this. Raw inherited fd0 that
-bypasses managed stdin remains outside the sideband contract.
+stdin surface; Python fork children currently do this. If R exposes a
+worker-controlled stdin surface to fork children, it should follow the same EOF
+policy. Raw inherited fd0 that bypasses managed stdin is unsupported by the
+worker protocol.
 
 PTY-backed Unix workers expose one raw terminal stream to the server, so raw PTY
 capture does not preserve separate stdout/stderr identity. Sideband
@@ -179,14 +182,32 @@ worker queues the batch and wakes its managed runtime input path. When the
 runtime consumes all queued input and asks the managed input boundary for more,
 the worker emits `input_wait`.
 
-Built-in R and Python use the same model: a worker-owned managed input queue
-feeds runtime input callbacks and managed stdin surfaces. In R this is the
-embedded `ReadConsole` callback. In Python this includes CPython readline plus
-managed `sys.stdin` and raw-stdin shims. Each delivered line or byte-oriented
-managed read emits `input_line`; when the queue is empty after an active batch,
-the worker emits `input_wait`. Python may still use PTY or ConPTY process stdio
-for terminal behavior, but accepted request input is sent over sideband IPC, not
-by server writes to runtime stdin.
+Built-in R and Python use the same ownership model: a worker-owned managed input
+queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
+reader runs independently from the runtime thread. It receives `input_batch`,
+`interrupt`, and `shutdown`, mutates worker-owned queue/session state, and wakes
+the runtime when needed. The runtime thread consumes queued input only when the
+runtime calls its managed input boundary.
+
+For R, the managed input boundary is R's embedded `ReadConsole` callback,
+installed through `Rstart.ReadConsole` on Windows and `ptr_R_ReadConsole` on
+Unix. `ReadConsole` runs on the R runtime thread. It removes queued lines or
+buffer-sized fragments, emits `input_line` for delivered text, and emits
+`input_wait` when the active batch has drained and R asks for more input.
+
+For Python, the primary REPL input boundary is CPython's
+`PyOS_ReadlineFunctionPointer`. It calls the worker's readline callback on the
+Python runtime thread. The Python bootstrap also installs managed `sys.stdin`
+wrappers and raw-stdin shims for code paths that read from `sys.stdin`, file
+objects, `os.read(0, ...)`, or equivalent fd-0 aliases. Those surfaces all draw
+from the same worker-owned queue and share the same accounting; they are bridges
+to the managed queue, not independent input sources. Each delivered line or
+byte-oriented managed read emits `input_line`; when the queue is empty after an
+active batch, the worker emits `input_wait`.
+
+Python may still use PTY or ConPTY process stdio for terminal behavior, but
+accepted request input is sent over sideband IPC, not by server writes to
+runtime stdin.
 
 Custom workers must implement the same readiness contract themselves. The test
 Zod worker exercises the custom-worker input/readiness path: it sends
@@ -196,11 +217,12 @@ again. It is not a full implementation of every optional protocol surface.
 
 ## Interrupts
 
-Interrupt is fail-closed. The server sends `interrupt` whenever the client asks
-for interrupt and a worker endpoint exists, and it must also send the platform
-interrupt when a worker process exists. The sideband `interrupt` message is the
-worker-owned cleanup signal; the platform interrupt is delivered to the runtime
-or process group, and the runtime handles it according to its own rules.
+Interrupt must not make a worker look ready by assumption. The server sends
+`interrupt` whenever the client asks for interrupt and a worker endpoint exists,
+and it must also send the platform interrupt when a worker process exists. The
+sideband `interrupt` message is the worker-owned cleanup signal; the platform
+interrupt is delivered to the runtime or process group, and the runtime handles
+it according to its own rules.
 
 When the worker receives sideband `interrupt`, it must discard managed input
 that is still queued and has not yet been consumed by the runtime. The discard
@@ -209,9 +231,12 @@ emit `input_wait` again until it is actually ready for input.
 
 Current built-in behavior:
 
-- R drops queued lines that have not yet reached `ReadConsole`.
-- Python clears or drains its managed input queue where that queue has not yet
-  reached the runtime.
+- R and Python both discard queued managed input that has not yet reached their
+  managed input boundary.
+- For R, that boundary is `ReadConsole`, so already-returned text is owned by R.
+- For Python, those boundaries are `PyOS_ReadlineFunctionPointer`, managed
+  `sys.stdin`, and raw-stdin shims, so already-returned bytes are owned by
+  CPython or the Python code that read them.
 - The server sends `SIGINT` on Unix and `CTRL_BREAK_EVENT` on Windows to the
   worker process group.
 
