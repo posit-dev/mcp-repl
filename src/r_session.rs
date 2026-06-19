@@ -1029,21 +1029,24 @@ pub(crate) fn push_plot_image(
     mime_type: String,
     is_new: bool,
 ) -> Result<(), String> {
-    let state = session_state();
-    let mut guard = state
-        .inner
-        .lock()
-        .map_err(|_| "session state lock poisoned".to_string())?;
-
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     let hash = hasher.finish();
 
-    if guard.plot_hashes.get(&plot_id) == Some(&hash) {
-        return Ok(());
+    {
+        let state = session_state();
+        let mut guard = state
+            .inner
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_string())?;
+
+        if guard.plot_hashes.get(&plot_id) == Some(&hash) {
+            return Ok(());
+        }
+
+        guard.plot_hashes.insert(plot_id.clone(), hash);
     }
 
-    guard.plot_hashes.insert(plot_id.clone(), hash);
     let mime_type = if mime_type.trim().is_empty() {
         "image/png".to_string()
     } else {
