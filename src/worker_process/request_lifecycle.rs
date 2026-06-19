@@ -129,7 +129,7 @@ impl WorkerManager {
         }
         let payload = self.driver.prepare_input_payload(&text);
         if let Some(process) = self.process.as_ref() {
-            process.note_input_starting();
+            process.note_accepted_input_starting();
         }
         self.driver
             .on_input_start(&text, &payload, &ipc, remaining)?;

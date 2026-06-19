@@ -128,7 +128,7 @@ pub(crate) struct LiveOutputCapture {
     pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
     #[cfg(any(test, target_os = "windows"))]
-    conpty_startup_filter: Option<Arc<ConptyStartupFilter>>,
+    drop_windows_conpty_startup_noise_before_input: Option<Arc<AtomicBool>>,
 }
 
 impl LiveOutputCapture {
@@ -142,13 +142,13 @@ impl LiveOutputCapture {
                 .then_some(pending_output_tape),
             output_timeline,
             #[cfg(any(test, target_os = "windows"))]
-            conpty_startup_filter: None,
+            drop_windows_conpty_startup_noise_before_input: None,
         }
     }
 
     #[cfg(any(test, target_os = "windows"))]
-    fn with_conpty_startup_filter(mut self) -> Self {
-        self.conpty_startup_filter = Some(Arc::new(ConptyStartupFilter::new()));
+    fn with_windows_conpty_startup_noise_filter(mut self) -> Self {
+        self.drop_windows_conpty_startup_noise_before_input = Some(Arc::new(AtomicBool::new(true)));
         self
     }
 
@@ -164,29 +164,40 @@ impl LiveOutputCapture {
     fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
         #[cfg(any(test, target_os = "windows"))]
         if matches!(stream, TextStream::Stdout)
-            && let Some(filter) = &self.conpty_startup_filter
+            && self.should_drop_windows_conpty_startup_noise(bytes)
         {
-            let Some(bytes) = filter.filter(bytes) else {
-                return;
-            };
-            self.append_text(&bytes, stream, false, false);
             return;
         }
         self.append_text(bytes, stream, false, false);
     }
 
     #[cfg(any(test, target_os = "windows"))]
-    fn note_input_starting(&self) {
-        let Some(filter) = &self.conpty_startup_filter else {
+    fn note_accepted_input_starting(&self) {
+        let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
             return;
         };
-        if let Some(bytes) = filter.disable() {
-            self.append_text(&bytes, TextStream::Stdout, false, false);
-        }
+        drop_startup_noise.store(false, Ordering::Relaxed);
     }
 
     #[cfg(not(any(test, target_os = "windows")))]
-    fn note_input_starting(&self) {}
+    fn note_accepted_input_starting(&self) {}
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn should_drop_windows_conpty_startup_noise(&self, bytes: &[u8]) -> bool {
+        let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
+            return false;
+        };
+        if !drop_startup_noise.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // Windows ConPTY emits these terminal-mode toggles on its raw output
+        // stream during startup. They are not Python output and do not come over
+        // sideband. We only drop this exact standalone pre-input noise; after an
+        // accepted input starts, raw output might be runtime/user output and is
+        // passed through unchanged.
+        windows_conpty_startup_noise_only(bytes)
+    }
 
     fn append_text(
         &self,
@@ -284,96 +295,12 @@ impl LiveOutputCapture {
 }
 
 #[cfg(any(test, target_os = "windows"))]
-struct ConptyStartupFilter {
-    state: Mutex<ConptyStartupFilterState>,
-}
-
-#[cfg(any(test, target_os = "windows"))]
-struct ConptyStartupFilterState {
-    active: bool,
-    buffered: Vec<u8>,
-}
-
-#[cfg(any(test, target_os = "windows"))]
-impl ConptyStartupFilter {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(ConptyStartupFilterState {
-                active: true,
-                buffered: Vec::new(),
-            }),
-        }
-    }
-
-    fn filter(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut state = self.state.lock().unwrap();
-        if !state.active {
-            if state.buffered.is_empty() {
-                return Some(bytes.to_vec());
-            }
-            state.buffered.extend_from_slice(bytes);
-            return Some(std::mem::take(&mut state.buffered));
-        }
-
-        if state.buffered.is_empty() {
-            match classify_conpty_startup_mode_toggles(bytes) {
-                ConptyStartupToggleMatch::Complete => None,
-                ConptyStartupToggleMatch::Prefix => {
-                    state.buffered.extend_from_slice(bytes);
-                    None
-                }
-                ConptyStartupToggleMatch::No => Some(bytes.to_vec()),
-            }
-        } else {
-            state.buffered.extend_from_slice(bytes);
-            match classify_conpty_startup_mode_toggles(&state.buffered) {
-                ConptyStartupToggleMatch::Complete => {
-                    state.buffered.clear();
-                    None
-                }
-                ConptyStartupToggleMatch::Prefix => None,
-                ConptyStartupToggleMatch::No => Some(std::mem::take(&mut state.buffered)),
-            }
-        }
-    }
-
-    fn disable(&self) -> Option<Vec<u8>> {
-        let mut state = self.state.lock().unwrap();
-        state.active = false;
-        (!state.buffered.is_empty()).then(|| std::mem::take(&mut state.buffered))
-    }
-}
-
-#[cfg(any(test, target_os = "windows"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConptyStartupToggleMatch {
-    Complete,
-    Prefix,
-    No,
-}
-
-#[cfg(any(test, target_os = "windows"))]
-fn classify_conpty_startup_mode_toggles(bytes: &[u8]) -> ConptyStartupToggleMatch {
-    const TOGGLES: [&[u8]; 2] = [b"\x1b[?9001h", b"\x1b[?1004h"];
-
-    let mut rest = bytes;
-    let mut saw_toggle = false;
-    'outer: loop {
-        if saw_toggle && rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')) {
-            return ConptyStartupToggleMatch::Complete;
-        }
-        for toggle in TOGGLES {
-            if rest.starts_with(toggle) {
-                rest = &rest[toggle.len()..];
-                saw_toggle = true;
-                continue 'outer;
-            }
-            if toggle.starts_with(rest) && !rest.is_empty() {
-                return ConptyStartupToggleMatch::Prefix;
-            }
-        }
-        return ConptyStartupToggleMatch::No;
-    }
+fn windows_conpty_startup_noise_only(bytes: &[u8]) -> bool {
+    const STARTUP_NOISE: &[u8] = b"\x1b[?9001h\x1b[?1004h";
+    let Some(rest) = bytes.strip_prefix(STARTUP_NOISE) else {
+        return false;
+    };
+    rest.iter().all(|byte| matches!(byte, b'\r' | b'\n'))
 }
 
 #[cfg(target_family = "unix")]
@@ -790,7 +717,7 @@ impl WorkerProcess {
         );
         #[cfg(target_os = "windows")]
         let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
-            live_output.with_conpty_startup_filter()
+            live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
         };
@@ -1189,8 +1116,8 @@ impl WorkerProcess {
         self.send_stdin_payload(Some(payload), timeout)
     }
 
-    pub(crate) fn note_input_starting(&self) {
-        self.live_output.note_input_starting();
+    pub(crate) fn note_accepted_input_starting(&self) {
+        self.live_output.note_accepted_input_starting();
     }
 
     fn close_stdin(&mut self, timeout: Duration) -> Result<(), WorkerError> {
@@ -2641,11 +2568,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_conpty_startup_toggles_are_dropped_before_input() {
+    fn raw_windows_conpty_startup_noise_is_dropped_before_input() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
-        let capture = capture.with_conpty_startup_filter();
+        let capture = capture.with_windows_conpty_startup_noise_filter();
 
-        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h\r\n", TextStream::Stdout);
 
         assert_eq!(ring_bytes(&output_ring), b"");
         assert!(
@@ -2658,29 +2585,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_conpty_startup_toggles_are_dropped_when_split_across_reads() {
-        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
-        let capture = capture.with_conpty_startup_filter();
-
-        capture.append_raw_text(b"\x1b[?900", TextStream::Stdout);
-        assert_eq!(ring_bytes(&output_ring), b"");
-
-        capture.append_raw_text(b"1h\x1b[?1004h\r\n", TextStream::Stdout);
-
-        assert_eq!(ring_bytes(&output_ring), b"");
-        assert!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents
-                .is_empty(),
-            "split raw ConPTY startup toggles should not enter output bundles"
-        );
-    }
-
-    #[test]
     fn sideband_terminal_mode_toggles_are_preserved() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
-        let capture = capture.with_conpty_startup_filter();
+        let capture = capture.with_windows_conpty_startup_noise_filter();
 
         capture.append_output_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout, false);
 
@@ -2696,9 +2603,9 @@ mod tests {
     #[test]
     fn raw_terminal_mode_toggles_are_preserved_after_input_starts() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
-        let capture = capture.with_conpty_startup_filter();
+        let capture = capture.with_windows_conpty_startup_noise_filter();
 
-        capture.note_input_starting();
+        capture.note_accepted_input_starting();
         capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
@@ -2711,9 +2618,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_conpty_startup_filter_preserves_mixed_output() {
+    fn raw_windows_conpty_startup_filter_preserves_mixed_output() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
-        let capture = capture.with_conpty_startup_filter();
+        let capture = capture.with_windows_conpty_startup_noise_filter();
 
         capture.append_raw_text(b"\x1b[?9001hvisible\n", TextStream::Stdout);
 
