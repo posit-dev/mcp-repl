@@ -35,7 +35,7 @@ jobs:
             artifact_name: release-x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust (stable)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -184,7 +184,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
@@ -326,7 +326,7 @@ jobs:
       RELEASE_TAG: ${{ github.ref_name }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0

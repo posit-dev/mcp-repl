@@ -223,6 +223,7 @@ fn ci_workflow_defines_dev_release_contract() {
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
+        "uses: actions/checkout@v5",
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
         "mcp-repl-x86_64-pc-windows-msvc.zip",
@@ -278,6 +279,7 @@ fn ci_workflow_defines_dev_release_contract() {
         ".config/nextest.toml",
         "name: cargo test (windows serial)",
         "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "actions/checkout@v4",
     ] {
         assert!(
             !workflow.contains(forbidden),
