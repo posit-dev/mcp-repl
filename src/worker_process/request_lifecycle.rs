@@ -128,6 +128,9 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
+        if let Some(process) = self.process.as_ref() {
+            process.note_input_starting();
+        }
         self.driver
             .on_input_start(&text, &payload, &ipc, remaining)?;
         self.settled_pending_completion = None;

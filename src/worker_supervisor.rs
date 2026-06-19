@@ -127,6 +127,7 @@ pub(crate) struct GuardrailShared {
 pub(crate) struct LiveOutputCapture {
     pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
+    conpty_startup_filter: Option<Arc<ConptyStartupFilter>>,
 }
 
 impl LiveOutputCapture {
@@ -139,7 +140,14 @@ impl LiveOutputCapture {
             pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
                 .then_some(pending_output_tape),
             output_timeline,
+            conpty_startup_filter: None,
         }
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn with_conpty_startup_filter(mut self) -> Self {
+        self.conpty_startup_filter = Some(Arc::new(ConptyStartupFilter::new()));
+        self
     }
 
     pub(crate) fn append_output_text(
@@ -152,7 +160,25 @@ impl LiveOutputCapture {
     }
 
     fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
+        if matches!(stream, TextStream::Stdout)
+            && let Some(filter) = &self.conpty_startup_filter
+        {
+            let Some(bytes) = filter.filter(bytes) else {
+                return;
+            };
+            self.append_text(&bytes, stream, false, false);
+            return;
+        }
         self.append_text(bytes, stream, false, false);
+    }
+
+    fn note_input_starting(&self) {
+        let Some(filter) = &self.conpty_startup_filter else {
+            return;
+        };
+        if let Some(bytes) = filter.disable() {
+            self.append_text(&bytes, TextStream::Stdout, false, false);
+        }
     }
 
     fn append_text(
@@ -247,6 +273,94 @@ impl LiveOutputCapture {
         if let Some(tape) = &self.pending_output_tape {
             tape.append_sideband(kind);
         }
+    }
+}
+
+struct ConptyStartupFilter {
+    state: Mutex<ConptyStartupFilterState>,
+}
+
+struct ConptyStartupFilterState {
+    active: bool,
+    buffered: Vec<u8>,
+}
+
+impl ConptyStartupFilter {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ConptyStartupFilterState {
+                active: true,
+                buffered: Vec::new(),
+            }),
+        }
+    }
+
+    fn filter(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        if !state.active {
+            if state.buffered.is_empty() {
+                return Some(bytes.to_vec());
+            }
+            state.buffered.extend_from_slice(bytes);
+            return Some(std::mem::take(&mut state.buffered));
+        }
+
+        if state.buffered.is_empty() {
+            match classify_conpty_startup_mode_toggles(bytes) {
+                ConptyStartupToggleMatch::Complete => None,
+                ConptyStartupToggleMatch::Prefix => {
+                    state.buffered.extend_from_slice(bytes);
+                    None
+                }
+                ConptyStartupToggleMatch::No => Some(bytes.to_vec()),
+            }
+        } else {
+            state.buffered.extend_from_slice(bytes);
+            match classify_conpty_startup_mode_toggles(&state.buffered) {
+                ConptyStartupToggleMatch::Complete => {
+                    state.buffered.clear();
+                    None
+                }
+                ConptyStartupToggleMatch::Prefix => None,
+                ConptyStartupToggleMatch::No => Some(std::mem::take(&mut state.buffered)),
+            }
+        }
+    }
+
+    fn disable(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        state.active = false;
+        (!state.buffered.is_empty()).then(|| std::mem::take(&mut state.buffered))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConptyStartupToggleMatch {
+    Complete,
+    Prefix,
+    No,
+}
+
+fn classify_conpty_startup_mode_toggles(bytes: &[u8]) -> ConptyStartupToggleMatch {
+    const TOGGLES: [&[u8]; 2] = [b"\x1b[?9001h", b"\x1b[?1004h"];
+
+    let mut rest = bytes;
+    let mut saw_toggle = false;
+    'outer: loop {
+        if saw_toggle && rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')) {
+            return ConptyStartupToggleMatch::Complete;
+        }
+        for toggle in TOGGLES {
+            if rest.starts_with(toggle) {
+                rest = &rest[toggle.len()..];
+                saw_toggle = true;
+                continue 'outer;
+            }
+            if toggle.starts_with(rest) && !rest.is_empty() {
+                return ConptyStartupToggleMatch::Prefix;
+            }
+        }
+        return ConptyStartupToggleMatch::No;
     }
 }
 
@@ -384,6 +498,7 @@ pub(crate) struct WorkerProcess {
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
+    live_output: LiveOutputCapture,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
     expected_exit: bool,
@@ -660,6 +775,12 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
+        #[cfg(target_os = "windows")]
+        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+            live_output.with_conpty_startup_filter()
+        } else {
+            live_output
+        };
         let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
@@ -765,6 +886,7 @@ impl WorkerProcess {
             stdin_tx,
             session_tmpdir,
             ipc,
+            live_output,
             stdout_reader,
             stderr_reader,
             expected_exit: false,
@@ -1052,6 +1174,10 @@ impl WorkerProcess {
         timeout: Duration,
     ) -> Result<(), WorkerError> {
         self.send_stdin_payload(Some(payload), timeout)
+    }
+
+    pub(crate) fn note_input_starting(&self) {
+        self.live_output.note_input_starting();
     }
 
     fn close_stdin(&mut self, timeout: Duration) -> Result<(), WorkerError> {
@@ -1358,6 +1484,13 @@ impl WorkerProcess {
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
+            live_output: LiveOutputCapture::new(
+                OversizedOutputMode::Files,
+                PendingOutputTape::new(),
+                OutputTimeline::new(Arc::new(crate::output_capture::OutputRing::with_capacity(
+                    crate::output_capture::OUTPUT_RING_CAPACITY_BYTES,
+                ))),
+            ),
             stdout_reader: None,
             stderr_reader: None,
             expected_exit: false,
@@ -2210,6 +2343,24 @@ mod tests {
         }
     }
 
+    fn capture_with_ring(
+        oversized_output: OversizedOutputMode,
+    ) -> (LiveOutputCapture, Arc<OutputRing>, PendingOutputTape) {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            oversized_output,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        (capture, output_ring, tape)
+    }
+
+    fn ring_bytes(output_ring: &OutputRing) -> Vec<u8> {
+        let output_end = output_ring.end_offset();
+        output_ring.read_range(0, output_end).bytes
+    }
+
     #[cfg(target_family = "unix")]
     fn successful_test_child() -> Child {
         Command::new("sh")
@@ -2467,6 +2618,92 @@ mod tests {
                 )
             }),
             "pager mode should keep image events in the output timeline"
+        );
+    }
+
+    #[test]
+    fn raw_conpty_startup_toggles_are_dropped_before_input() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_conpty_startup_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents
+                .is_empty(),
+            "raw ConPTY startup toggles should not enter output bundles"
+        );
+    }
+
+    #[test]
+    fn raw_conpty_startup_toggles_are_dropped_when_split_across_reads() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_conpty_startup_filter();
+
+        capture.append_raw_text(b"\x1b[?900", TextStream::Stdout);
+        assert_eq!(ring_bytes(&output_ring), b"");
+
+        capture.append_raw_text(b"1h\x1b[?1004h\r\n", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents
+                .is_empty(),
+            "split raw ConPTY startup toggles should not enter output bundles"
+        );
+    }
+
+    #[test]
+    fn sideband_terminal_mode_toggles_are_preserved() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_conpty_startup_filter();
+
+        capture.append_output_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout, false);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
+        );
+    }
+
+    #[test]
+    fn raw_terminal_mode_toggles_are_preserved_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_conpty_startup_filter();
+
+        capture.note_input_starting();
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
+        );
+    }
+
+    #[test]
+    fn raw_conpty_startup_filter_preserves_mixed_output() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_conpty_startup_filter();
+
+        capture.append_raw_text(b"\x1b[?9001hvisible\n", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001hvisible\n");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001hvisible\n")]
         );
     }
 

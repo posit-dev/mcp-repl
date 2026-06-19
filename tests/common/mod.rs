@@ -1157,9 +1157,6 @@ fn normalize_snapshot_content(content: &SnapshotContent) -> Option<SnapshotConte
     match content {
         SnapshotContent::Text { text } => {
             let text = normalize_snapshot_text(text);
-            if terminal_mode_toggle_only(&text) {
-                return None;
-            }
             Some(SnapshotContent::Text { text })
         }
         SnapshotContent::Image {
@@ -1182,21 +1179,6 @@ fn normalize_snapshot_content(content: &SnapshotContent) -> Option<SnapshotConte
         SnapshotContent::ResourceLink { resource } => Some(SnapshotContent::ResourceLink {
             resource: resource.clone(),
         }),
-    }
-}
-
-fn terminal_mode_toggle_only(text: &str) -> bool {
-    let mut rest = text;
-    loop {
-        if let Some(next) = rest.strip_prefix("\u{1b}[?9001h") {
-            rest = next;
-            continue;
-        }
-        if let Some(next) = rest.strip_prefix("\u{1b}[?1004h") {
-            rest = next;
-            continue;
-        }
-        return rest.trim_matches(['\r', '\n']).is_empty() && rest.len() != text.len();
     }
 }
 

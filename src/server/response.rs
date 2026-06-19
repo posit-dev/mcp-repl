@@ -1739,24 +1739,6 @@ fn omission_event_line_len() -> usize {
     build_events_log_server_line(OUTPUT_BUNDLE_OMITTED_NOTICE).len()
 }
 
-fn terminal_mode_toggle_only(text: &str) -> bool {
-    let mut rest = text;
-    let mut saw_toggle = false;
-    loop {
-        if let Some(next) = rest.strip_prefix("\u{1b}[?9001h") {
-            rest = next;
-            saw_toggle = true;
-            continue;
-        }
-        if let Some(next) = rest.strip_prefix("\u{1b}[?1004h") {
-            rest = next;
-            saw_toggle = true;
-            continue;
-        }
-        return saw_toggle && rest.trim_matches(['\r', '\n']).is_empty();
-    }
-}
-
 /// Normalizes one worker reply into renderable items while preserving the split between
 /// worker-originated transcript text and inline-only server notices.
 fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize) -> ReplyMaterial {
@@ -1790,13 +1772,6 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                 } else {
                     text
                 };
-                if matches!(
-                    (origin, stream),
-                    (ContentOrigin::Worker, TextStream::Stdout)
-                ) && terminal_mode_toggle_only(&text)
-                {
-                    continue;
-                }
                 if text.is_empty() {
                     continue;
                 }
@@ -2823,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_terminal_mode_toggles_are_dropped_from_inline_reply() {
+    fn standalone_terminal_mode_toggles_are_preserved_from_worker_content() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let result = state.finalize_worker_result(
             Ok(worker_reply(
@@ -2838,17 +2813,18 @@ mod tests {
             0,
         );
 
-        assert_eq!(result_text(&result), "2\n");
+        assert_eq!(result_text(&result), "\u{1b}[?9001h\u{1b}[?1004h2\n");
     }
 
     #[test]
-    fn standalone_terminal_mode_toggles_are_dropped_from_output_bundle() {
+    fn standalone_terminal_mode_toggles_are_preserved_in_output_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let visible = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let toggles = "\u{1b}[?9001h\u{1b}[?1004h";
         let result = state.finalize_worker_result(
             Ok(worker_reply(
                 vec![
-                    WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h"),
+                    WorkerContent::worker_stdout(toggles),
                     WorkerContent::worker_stdout(visible.clone()),
                 ],
                 None,
@@ -2863,10 +2839,10 @@ mod tests {
             .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
         let transcript = fs::read_to_string(&transcript_path)
             .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
-        assert_eq!(transcript, visible);
+        assert_eq!(transcript, format!("{toggles}{visible}"));
         assert!(
-            !text.contains("\u{1b}[?9001h") && !text.contains("\u{1b}[?1004h"),
-            "did not expect terminal mode toggles inline: {text:?}"
+            text.contains("\u{1b}[?9001h") && text.contains("\u{1b}[?1004h"),
+            "expected terminal mode toggles in inline preview: {text:?}"
         );
     }
 
