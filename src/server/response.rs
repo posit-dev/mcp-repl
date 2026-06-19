@@ -1739,6 +1739,24 @@ fn omission_event_line_len() -> usize {
     build_events_log_server_line(OUTPUT_BUNDLE_OMITTED_NOTICE).len()
 }
 
+fn terminal_mode_toggle_only(text: &str) -> bool {
+    let mut rest = text;
+    let mut saw_toggle = false;
+    loop {
+        if let Some(next) = rest.strip_prefix("\u{1b}[?9001h") {
+            rest = next;
+            saw_toggle = true;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("\u{1b}[?1004h") {
+            rest = next;
+            saw_toggle = true;
+            continue;
+        }
+        return saw_toggle && rest.trim_matches(['\r', '\n']).is_empty();
+    }
+}
+
 /// Normalizes one worker reply into renderable items while preserving the split between
 /// worker-originated transcript text and inline-only server notices.
 fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize) -> ReplyMaterial {
@@ -1772,6 +1790,13 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                 } else {
                     text
                 };
+                if matches!(
+                    (origin, stream),
+                    (ContentOrigin::Worker, TextStream::Stdout)
+                ) && terminal_mode_toggle_only(&text)
+                {
+                    continue;
+                }
                 if text.is_empty() {
                     continue;
                 }
@@ -2795,6 +2820,54 @@ mod tests {
     fn compact_search_cards_do_not_trigger_error_prompt_normalization() {
         let text = "[pager] search for `Error` @10\n[match] Error: boom\n".to_string();
         assert_eq!(normalize_error_prompt(text.clone(), true), text);
+    }
+
+    #[test]
+    fn standalone_terminal_mode_toggles_are_dropped_from_inline_reply() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h"),
+                    WorkerContent::worker_stdout("2\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        assert_eq!(result_text(&result), "2\n");
+    }
+
+    #[test]
+    fn standalone_terminal_mode_toggles_are_dropped_from_output_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let visible = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h"),
+                    WorkerContent::worker_stdout(visible.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+        assert_eq!(transcript, visible);
+        assert!(
+            !text.contains("\u{1b}[?9001h") && !text.contains("\u{1b}[?1004h"),
+            "did not expect terminal mode toggles inline: {text:?}"
+        );
     }
 
     #[test]

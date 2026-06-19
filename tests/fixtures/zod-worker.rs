@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 
 #[cfg(target_family = "unix")]
 const IPC_READ_FD_ENV: &str = "MCP_REPL_IPC_READ_FD";
@@ -29,12 +31,14 @@ const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_family = "unix")]
     install_signal_handler();
+    #[cfg(target_family = "windows")]
+    install_signal_handler()?;
 
     let transport = IpcTransport::connect_from_env()?;
     run_worker(transport.reader, IpcWriter::new(transport.writer))
@@ -569,7 +573,32 @@ fn take_os_interrupt() -> bool {
     INTERRUPTED_BY_OS.swap(false, Ordering::SeqCst)
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(target_family = "windows")]
+fn install_signal_handler() -> io::Result<()> {
+    let ok = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), 1) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "windows")]
+unsafe extern "system" fn handle_console_ctrl(event: u32) -> i32 {
+    if event == CTRL_BREAK_EVENT || event == CTRL_C_EVENT {
+        INTERRUPTED_BY_OS.store(true, Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn take_os_interrupt() -> bool {
+    INTERRUPTED_BY_OS.swap(false, Ordering::SeqCst)
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_os_interrupt() -> bool {
     false
 }

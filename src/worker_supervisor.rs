@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -13,8 +13,10 @@ use std::time::Duration;
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
+#[cfg(any(target_family = "unix", target_family = "windows"))]
+use std::fs::File;
 #[cfg(target_family = "unix")]
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 
 use crate::backend::{
     Backend, CustomWorkerSpec, CustomWorkerWorkingDir, CustomWorkerWorkingDirPolicy, WorkerLaunch,
@@ -51,16 +53,23 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::io::AsRawHandle;
 #[cfg(target_family = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::process::ExitStatusExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
+};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, GetExitCodeProcess, PROCESS_INFORMATION, TerminateProcess,
+    WaitForSingleObject,
+};
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
@@ -371,7 +380,7 @@ fn seed_initial_input_wait_from_process(
 }
 
 pub(crate) struct WorkerProcess {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
@@ -429,7 +438,7 @@ fn send_stdin_command(
 }
 
 struct SpawnedWorker {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
@@ -445,15 +454,141 @@ struct SpawnedWorkerStdio {
 }
 
 struct SpawnedCommand {
-    child: Child,
-    #[cfg(target_family = "unix")]
+    child: WorkerChild,
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     pty_stdio: Option<SpawnedPtyStdio>,
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 struct SpawnedPtyStdio {
     reader: File,
     writer: Box<dyn Write + Send>,
+}
+
+enum WorkerChild {
+    Standard(Child),
+    #[cfg(target_family = "windows")]
+    DirectWindows(WindowsProcess),
+}
+
+impl WorkerChild {
+    fn standard(child: Child) -> Self {
+        Self::Standard(child)
+    }
+
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.id(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Standard(child) => child.try_wait(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Standard(child) => child.wait(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.wait(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Standard(child) => child.kill(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.kill(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn standard_child(&self) -> &Child {
+        match self {
+            Self::Standard(child) => child,
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+struct WindowsProcess {
+    process: HANDLE,
+    thread: HANDLE,
+    process_id: u32,
+    _conpty: Option<crate::windows_conpty::Conpty>,
+}
+
+#[cfg(target_family = "windows")]
+unsafe impl Send for WindowsProcess {}
+
+#[cfg(target_family = "windows")]
+impl WindowsProcess {
+    unsafe fn from_process_information(
+        proc_info: PROCESS_INFORMATION,
+        conpty: Option<crate::windows_conpty::Conpty>,
+    ) -> Self {
+        Self {
+            process: proc_info.hProcess,
+            thread: proc_info.hThread,
+            process_id: proc_info.dwProcessId,
+            _conpty: conpty,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.process_id
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let wait = unsafe { WaitForSingleObject(self.process, 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if wait == WAIT_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.exit_status().map(Some)
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let wait = unsafe { WaitForSingleObject(self.process, u32::MAX) };
+        if wait == WAIT_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.exit_status()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if unsafe { TerminateProcess(self.process, 1) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn exit_status(&self) -> std::io::Result<ExitStatus> {
+        let mut exit_code = 0u32;
+        if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ExitStatus::from_raw(exit_code))
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl Drop for WindowsProcess {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.thread);
+            CloseHandle(self.process);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -614,7 +749,7 @@ impl WorkerProcess {
                 ipc_server.connect(
                     ipc.clone(),
                     handlers,
-                    &mut child,
+                    || child.try_wait().map(|status| status.is_some()),
                     WINDOWS_IPC_CONNECT_MAX_WAIT,
                 ),
                 &mut child,
@@ -743,7 +878,7 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
@@ -760,7 +895,7 @@ impl WorkerProcess {
         } = attach_spawned_worker_stdio(
             &mut child,
             spawn_stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -769,7 +904,7 @@ impl WorkerProcess {
         let mut denial_logger = prepared.denial_logger;
         #[cfg(target_os = "macos")]
         if let Some(logger) = denial_logger.as_mut() {
-            logger.on_child_spawn(&child);
+            logger.on_child_spawn(child.standard_child());
         }
 
         Ok(SpawnedWorker {
@@ -867,7 +1002,7 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
@@ -884,7 +1019,7 @@ impl WorkerProcess {
         } = attach_spawned_worker_stdio(
             &mut child,
             spawn_stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -893,7 +1028,7 @@ impl WorkerProcess {
         let mut denial_logger = prepared.denial_logger;
         #[cfg(target_os = "macos")]
         if let Some(logger) = denial_logger.as_mut() {
-            logger.on_child_spawn(&child);
+            logger.on_child_spawn(child.standard_child());
         }
 
         Ok(SpawnedWorker {
@@ -1219,7 +1354,7 @@ impl WorkerProcess {
     pub(crate) fn new_for_test(child: Child) -> Self {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         Self {
-            child,
+            child: WorkerChild::standard(child),
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
@@ -1685,8 +1820,8 @@ fn spawn_command_with_transport(
                 .stderr(Stdio::piped())
                 .spawn()?;
             Ok(SpawnedCommand {
-                child,
-                #[cfg(target_family = "unix")]
+                child: WorkerChild::standard(child),
+                #[cfg(any(target_family = "unix", target_family = "windows"))]
                 pty_stdio: None,
             })
         }
@@ -1770,7 +1905,7 @@ fn spawn_command_with_pty(
     let child = command.spawn()?;
 
     Ok(SpawnedCommand {
-        child,
+        child: WorkerChild::standard(child),
         pty_stdio: Some(SpawnedPtyStdio { reader, writer }),
     })
 }
@@ -1780,28 +1915,42 @@ fn spawn_command_with_pty(
     command: &mut Command,
     _echo: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
-    let mut wrapper = Command::new(std::env::current_exe()?);
-    wrapper.arg(crate::windows_conpty::WINDOWS_CONPTY_ARG);
-    wrapper.arg("--");
-    wrapper.arg(command.get_program());
-    wrapper.args(command.get_args());
-    if let Some(cwd) = command.get_current_dir() {
-        wrapper.current_dir(cwd);
-    }
+    let mut command_line = Vec::new();
+    command_line.push(command.get_program().to_string_lossy().to_string());
+    command_line.extend(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string()),
+    );
+    let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
     for (key, value) in command.get_envs() {
         if let Some(value) = value {
-            wrapper.env(key, value);
+            env_map.insert(
+                key.to_string_lossy().to_string(),
+                value.to_string_lossy().to_string(),
+            );
         } else {
-            wrapper.env_remove(key);
+            env_map.remove(&key.to_string_lossy().to_string());
         }
     }
-    wrapper.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    let child = wrapper
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(SpawnedCommand { child })
+    let (proc_info, mut conpty) = unsafe {
+        crate::windows_conpty::spawn_conpty_process_direct(
+            &command_line,
+            command.get_current_dir(),
+            &mut env_map,
+        )
+        .map_err(WorkerError::Protocol)?
+    };
+    let writer = conpty.take_input_writer().map_err(WorkerError::Protocol)?;
+    let reader = conpty.take_output_reader().map_err(WorkerError::Protocol)?;
+    let child = unsafe { WindowsProcess::from_process_information(proc_info, Some(conpty)) };
+    Ok(SpawnedCommand {
+        child: WorkerChild::DirectWindows(child),
+        pty_stdio: Some(SpawnedPtyStdio {
+            reader,
+            writer: Box::new(writer),
+        }),
+    })
 }
 
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -1844,15 +1993,22 @@ fn configure_pty_slave_echo(fd: libc::c_int, enabled: bool) -> Result<(), Worker
 }
 
 fn attach_spawned_worker_stdio(
-    child: &mut Child,
+    child: &mut WorkerChild,
     stdin_transport: WorkerStdinTransport,
-    #[cfg(target_family = "unix")] pty_stdio: Option<SpawnedPtyStdio>,
+    #[cfg(any(target_family = "unix", target_family = "windows"))] pty_stdio: Option<
+        SpawnedPtyStdio,
+    >,
     live_output: LiveOutputCapture,
 ) -> Result<SpawnedWorkerStdio, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             let _ = pty_stdio;
+            let WorkerChild::Standard(child) = child else {
+                return Err(WorkerError::Protocol(
+                    "pipe worker process does not expose pipe stdio".to_string(),
+                ));
+            };
             let stdin = child
                 .stdin
                 .take()
@@ -1885,22 +2041,16 @@ fn attach_spawned_worker_stdio(
             }
             #[cfg(target_family = "windows")]
             {
-                let stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-                let stdin_tx = spawn_stdin_writer(stdin);
-                let stdout_reader = spawn_output_reader(
-                    child.stdout.take(),
-                    TextStream::Stdout,
-                    live_output.clone(),
-                )?;
-                let stderr_reader =
-                    spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output)?;
+                let pty_stdio = pty_stdio.ok_or_else(|| {
+                    WorkerError::Protocol("worker ConPTY stdio unavailable".to_string())
+                })?;
+                let stdin_tx = spawn_stdin_writer(pty_stdio.writer);
+                let stdout_reader =
+                    spawn_output_reader(Some(pty_stdio.reader), TextStream::Stdout, live_output)?;
                 Ok(SpawnedWorkerStdio {
                     stdin_tx,
                     stdout_reader,
-                    stderr_reader,
+                    stderr_reader: None,
                 })
             }
             #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -1962,14 +2112,14 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
 }
 
 #[cfg(target_family = "windows")]
-pub(crate) fn handle_windows_ipc_connect_result(
+fn handle_windows_ipc_connect_result(
     connect_result: Result<(), std::io::Error>,
-    child: &mut Child,
+    child: &mut WorkerChild,
 ) -> Result<(), WorkerError> {
     match connect_result {
         Ok(()) => Ok(()),
-        // The child here is the sandbox wrapper process. Give it a short grace
-        // period to unwind ACL changes before forcing termination/reap.
+        // Give the worker a short grace period to unwind before forcing
+        // termination/reap after IPC startup failure.
         Err(err) => {
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
@@ -1997,9 +2147,9 @@ pub(crate) fn handle_windows_ipc_connect_result(
 }
 
 #[cfg(target_family = "windows")]
-pub(crate) fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
-    // The Windows child is the sandbox wrapper. Let it exit naturally so it can
-    // roll back temporary ACL state before process teardown.
+fn request_soft_termination(_child: &mut WorkerChild) -> Result<(), WorkerError> {
+    // Let Windows workers exit through sideband shutdown when possible. Hard
+    // termination remains the bounded fallback in the caller.
     Ok(())
 }
 
@@ -2587,8 +2737,8 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_ipc_connect_error_reaps_wrapper_process() {
-        let mut child = sleeping_test_child();
+    fn windows_ipc_connect_error_reaps_worker_process() {
+        let mut child = WorkerChild::standard(sleeping_test_child());
 
         let result = handle_windows_ipc_connect_result(
             Err(std::io::Error::other("ipc connect failed")),
@@ -2614,7 +2764,7 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_soft_termination_does_not_kill_child() {
-        let mut child = sleeping_test_child();
+        let mut child = WorkerChild::standard(sleeping_test_child());
 
         request_soft_termination(&mut child).expect("soft terminate call should succeed");
 

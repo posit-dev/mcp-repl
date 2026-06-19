@@ -179,10 +179,7 @@ pub fn run_conpty_command_with_env_map(
         upsert_env_case_insensitive(&mut env_map, WINDOWS_CONPTY_REQUEST_ENV, "1");
         upsert_env_case_insensitive(&mut env_map, WINDOWS_CONPTY_ATTACHED_ENV, "1");
         crate::diagnostics::startup_log("windows-conpty: conpty created");
-        let output_read = conpty
-            .output_read
-            .try_clone()
-            .map_err(|err| format!("failed to clone ConPTY output handle: {err}"))?;
+        let output_read = conpty.take_output_reader()?;
         let output_forwarder = spawn_conpty_output_forwarder(output_read);
         crate::diagnostics::startup_log("windows-conpty: spawning child");
         let proc_info = spawn_conpty_process(command, cwd, &env_map, conpty.hpc)?;
@@ -270,22 +267,31 @@ pub unsafe fn spawn_conpty_process_as_user(
     let mut conpty = Conpty::new()?;
     upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_REQUEST_ENV, "1");
     upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_ATTACHED_ENV, "1");
-    let output_read = conpty
-        .output_read
-        .try_clone()
-        .map_err(|err| format!("failed to clone ConPTY output handle: {err}"))?;
+    let output_read = conpty.take_output_reader()?;
     let output_forwarder = spawn_conpty_output_forwarder(output_read);
     let proc_info = spawn_conpty_process_with_token(token, command, cwd, env_map, conpty.hpc)?;
     conpty.close_child_side_handles();
     Ok((proc_info, conpty, output_forwarder))
 }
 
+pub unsafe fn spawn_conpty_process_direct(
+    command: &[String],
+    cwd: Option<&Path>,
+    env_map: &mut HashMap<String, String>,
+) -> Result<(PROCESS_INFORMATION, Conpty), String> {
+    let mut conpty = Conpty::new()?;
+    upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_REQUEST_ENV, "1");
+    upsert_env_case_insensitive(env_map, WINDOWS_CONPTY_ATTACHED_ENV, "1");
+    let proc_info = spawn_conpty_process(command, cwd, env_map, conpty.hpc)?;
+    conpty.close_child_side_handles();
+    Ok((proc_info, conpty))
+}
+
 pub struct Conpty {
     hpc: HPCON,
     input_read: Option<File>,
-    #[allow(dead_code)]
-    input_write: File,
-    output_read: File,
+    input_write: Option<File>,
+    output_read: Option<File>,
     output_write: Option<File>,
 }
 
@@ -342,10 +348,22 @@ impl Conpty {
         Ok(Self {
             hpc,
             input_read: Some(File::from_raw_handle(input_read as _)),
-            input_write: File::from_raw_handle(input_write as _),
-            output_read: File::from_raw_handle(output_read as _),
+            input_write: Some(File::from_raw_handle(input_write as _)),
+            output_read: Some(File::from_raw_handle(output_read as _)),
             output_write: Some(File::from_raw_handle(output_write as _)),
         })
+    }
+
+    pub fn take_input_writer(&mut self) -> Result<File, String> {
+        self.input_write
+            .take()
+            .ok_or_else(|| "ConPTY input writer already taken".to_string())
+    }
+
+    pub fn take_output_reader(&mut self) -> Result<File, String> {
+        self.output_read
+            .take()
+            .ok_or_else(|| "ConPTY output reader already taken".to_string())
     }
 
     fn close_child_side_handles(&mut self) {

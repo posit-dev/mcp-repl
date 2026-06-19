@@ -157,13 +157,16 @@ impl IpcServer {
     }
 
     #[cfg(target_family = "windows")]
-    pub fn connect(
+    pub fn connect<ChildExited>(
         self,
         handle: IpcHandle,
         handlers: IpcHandlers,
-        child: &mut std::process::Child,
+        child_exited: ChildExited,
         max_wait: Duration,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        ChildExited: FnMut() -> io::Result<bool>,
+    {
         let Some(server_pipe_to_worker) = self.server_pipe_to_worker else {
             return Err(io::Error::other(
                 "missing ipc named pipe handle (to-worker)",
@@ -175,9 +178,14 @@ impl IpcServer {
             ));
         };
         let start = Instant::now();
-        connect_named_pipe_with_process_retry(&server_pipe_to_worker, child, max_wait)?;
+        let mut child_exited = child_exited;
+        connect_named_pipe_with_process_retry(&server_pipe_to_worker, &mut child_exited, max_wait)?;
         let remaining = max_wait.saturating_sub(start.elapsed());
-        connect_named_pipe_with_process_retry(&server_pipe_from_worker, child, remaining)?;
+        connect_named_pipe_with_process_retry(
+            &server_pipe_from_worker,
+            &mut child_exited,
+            remaining,
+        )?;
         let conn = ServerIpcConnection::new(
             IpcTransport {
                 reader: Box::new(server_pipe_from_worker),
@@ -507,12 +515,12 @@ fn join_connector_with_grace(connector: thread::JoinHandle<()>, max_wait: Durati
 #[cfg(target_family = "windows")]
 fn connect_named_pipe_with_process_retry(
     server_pipe: &File,
-    child: &mut std::process::Child,
+    child_exited: &mut impl FnMut() -> io::Result<bool>,
     max_wait: Duration,
 ) -> io::Result<()> {
     connect_named_pipe_with_process_retry_impl(
         |timeout| connect_named_pipe(server_pipe, timeout),
-        || child.try_wait().map(|status| status.is_some()),
+        child_exited,
         max_wait,
     )
 }

@@ -203,6 +203,8 @@ fn finish_active_request_at_next_read() {
     let mut guard = state.inner.lock().unwrap();
     guard.waiting_for_input = false;
     if let Some(active) = guard.active_request.as_mut() {
+        #[cfg(windows)]
+        active.queued_lines.clear();
         active.line_count = active.consumed_lines.saturating_add(1);
         active.fallback_prompt = None;
         active.skip_next_hook = false;
