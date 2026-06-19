@@ -2388,7 +2388,7 @@ mod tests {
             })),
         })
         .expect("ipc pair");
-        server.begin_turn(1);
+        server.begin_input(1);
 
         worker
             .send(WorkerToServerIpcMessage::ReadlineStart {
@@ -2404,7 +2404,7 @@ mod tests {
             .expect("send stdout output_text");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                turn_id: 1,
+                input_id: 1,
                 prompt: "> ".to_string(),
                 text: "plot(1)\n".to_string(),
             })
@@ -2428,7 +2428,7 @@ mod tests {
             .send(WorkerToServerIpcMessage::SessionEnd {
                 reason: None,
                 message_b64: None,
-                turn_id: None,
+                input_id: None,
             })
             .expect("send session_end");
 

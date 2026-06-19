@@ -264,7 +264,7 @@ fn latest_debug_events(debug_dir: &std::path::Path) -> TestResult<Vec<Value>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_receives_turn_start_without_raw_stdin() -> TestResult<()> {
+async fn zod_worker_v4_receives_input_batch_without_raw_stdin() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -282,14 +282,14 @@ async fn zod_worker_v4_receives_turn_start_without_raw_stdin() -> TestResult<()>
 
     assert!(
         text.contains("v4-output: hello v4\n"),
-        "expected v4 worker to receive input through turn_start, got: {text:?}"
+        "expected v4 worker to receive input through input_batch, got: {text:?}"
     );
     assert!(
         !text.contains("v4> hello v4"),
         "default reply must elide synthetic input_line echo, got: {text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "turn_start turn_id=1 input=hello v4")?;
+    let log = wait_for_log_contains(&control_log, "input_batch input_id=1 input=hello v4")?;
     assert!(
         !log.contains("stdin:"),
         "v4 server path must not write request text to raw stdin, got log: {log:?}"
@@ -352,7 +352,7 @@ async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_turn_start_write_respects_timeout_when_control_reader_stalls()
+async fn zod_worker_v4_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
@@ -374,13 +374,13 @@ async fn zod_worker_v4_turn_start_write_respects_timeout_when_control_reader_sta
         Ok(result) => result?,
         Err(_) => {
             session.cancel().await?;
-            panic!("v4 turn_start write did not respect timeout_ms");
+            panic!("v4 input_batch write did not respect timeout_ms");
         }
     };
     let text = result_text(&result);
     assert!(
         text.contains("worker response timed out"),
-        "expected bounded turn_start write timeout, got: {text:?}"
+        "expected bounded input_batch write timeout, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -415,13 +415,13 @@ async fn zod_worker_v4_input_line_is_ordered_before_output_text_but_elided() -> 
 
     let log = wait_for_log_contains(
         &control_log,
-        "input_line turn_id=1 text=emit-output-after-input\\n",
+        "input_line input_id=1 text=emit-output-after-input\\n",
     )?;
     let input_line = log
-        .find("input_line turn_id=1")
+        .find("input_line input_id=1")
         .ok_or_else(|| "missing input_line log".to_string())?;
     let output_text = log
-        .find("output_text turn_id=1")
+        .find("output_text input_id=1")
         .ok_or_else(|| "missing output_text log".to_string())?;
     assert!(
         input_line < output_text,
@@ -433,7 +433,7 @@ async fn zod_worker_v4_input_line_is_ordered_before_output_text_but_elided() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_input_wait_turn_id_completes_without_readline_start() -> TestResult<()> {
+async fn zod_worker_v4_input_wait_input_id_completes_without_readline_start() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -451,20 +451,20 @@ async fn zod_worker_v4_input_wait_turn_id_completes_without_readline_start() -> 
 
     assert!(
         !text.contains("<<repl status: busy"),
-        "input_wait(turn_id) should complete the turn, got: {text:?}"
+        "input_wait(input_id) should complete the input batch, got: {text:?}"
     );
     assert!(
         text.contains("v4> "),
         "expected input_wait prompt from v4 worker, got: {text:?}"
     );
-    wait_for_log_contains(&control_log, "input_wait turn_id=1")?;
+    wait_for_log_contains(&control_log, "input_wait input_id=1")?;
 
     session.cancel().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_busy_follow_up_does_not_send_second_turn_start() -> TestResult<()> {
+async fn zod_worker_v4_busy_follow_up_does_not_send_second_input_batch() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -511,10 +511,10 @@ async fn zod_worker_v4_busy_follow_up_does_not_send_second_turn_start() -> TestR
     let interrupted_text = result_text(&interrupted);
     assert!(
         interrupted_text.contains("sideband interrupt: observed"),
-        "expected active turn to settle after interrupt, got: {interrupted_text:?}"
+        "expected active input to settle after interrupt, got: {interrupted_text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "input_wait turn_id=1")?;
+    let log = wait_for_log_contains(&control_log, "input_wait input_id=1")?;
     assert!(
         !log.contains("second v4 input"),
         "busy follow-up must not reach the active v4 worker, got log: {log:?}"
@@ -525,7 +525,7 @@ async fn zod_worker_v4_busy_follow_up_does_not_send_second_turn_start() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_interrupt_carries_active_turn_id() -> TestResult<()> {
+async fn zod_worker_v4_interrupt_carries_active_input_id() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -560,7 +560,7 @@ async fn zod_worker_v4_interrupt_carries_active_turn_id() -> TestResult<()> {
         "expected v4 worker to observe sideband interrupt, got: {interrupted_text:?}"
     );
 
-    wait_for_log_contains(&control_log, "interrupt turn_id=1")?;
+    wait_for_log_contains(&control_log, "interrupt input_id=1")?;
 
     session.cancel().await?;
     Ok(())
@@ -605,7 +605,7 @@ async fn zod_worker_v4_input_wait_interrupt_does_not_require_active_turn() -> Te
 
     let log = read_optional(&control_log);
     assert!(
-        !log.contains("interrupt turn_id="),
+        !log.contains("interrupt input_id="),
         "input-wait Ctrl-C must not send a turn-bound sideband interrupt, got log: {log:?}"
     );
 
@@ -629,7 +629,7 @@ async fn zod_worker_v4_input_line_after_input_wait_is_protocol_error() -> TestRe
         )
         .await?;
     let first_text = result_text(&first);
-    wait_for_log_contains(&control_log, "late_input_line turn_id=1")?;
+    wait_for_log_contains(&control_log, "late_input_line input_id=1")?;
     if !first_text.contains("input_line") {
         assert!(
             first_text.contains("v4> "),
@@ -657,7 +657,7 @@ async fn zod_worker_v4_input_line_after_input_wait_is_protocol_error() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v4_latched_protocol_error_blocks_next_turn_start() -> TestResult<()> {
+async fn zod_worker_v4_latched_protocol_error_blocks_next_input_batch() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let debug_dir = tempdir.path().join("debug");
@@ -705,7 +705,7 @@ async fn zod_worker_v4_latched_protocol_error_blocks_next_turn_start() -> TestRe
     let log = read_optional(&control_log);
     assert!(
         !log.contains("must not reach v4 worker"),
-        "latched protocol error must prevent the next turn_start, got log: {log:?}"
+        "latched protocol error must prevent the next input_batch, got log: {log:?}"
     );
 
     session.cancel().await?;

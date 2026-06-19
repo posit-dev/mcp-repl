@@ -84,20 +84,20 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
-pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
+pub fn emit_input_line(input_id: u64, prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
-            turn_id,
+            input_id,
             prompt: prompt.to_string(),
             text: text.to_string(),
         });
     }
 }
 
-pub fn emit_input_wait(turn_id: u64, prompt: &str) {
+pub fn emit_input_wait(input_id: u64, prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
-            turn_id,
+            input_id,
             prompt: prompt.to_string(),
         });
     }
@@ -130,17 +130,17 @@ pub fn emit_session_end() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
-            turn_id: None,
+            input_id: None,
         });
     }
 }
 
-pub fn emit_session_end_with_reason(reason: &str, turn_id: Option<u64>) {
+pub fn emit_session_end_with_reason(reason: &str, input_id: Option<u64>) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: Some(reason.to_string()),
             message_b64: None,
-            turn_id,
+            input_id,
         });
     }
 }

@@ -301,7 +301,7 @@ mod tests {
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
-        server.begin_turn(1);
+        server.begin_input(1);
         process.set_ipc_for_test(server);
         manager.process = Some(process);
         manager.pending_request = true;
@@ -313,7 +313,7 @@ mod tests {
             prompt: prompt.clone(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 1,
+            input_id: 1,
             prompt,
             text: "quit()\n".to_string(),
         });

@@ -10,13 +10,13 @@ pub const WORKER_PROTOCOL_VERSION: u32 = 4;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
-    TurnStart {
-        turn_id: u64,
+    InputBatch {
+        input_id: u64,
         input: String,
     },
     Interrupt {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<u64>,
+        input_id: Option<u64>,
     },
     Shutdown {},
 }
@@ -39,12 +39,12 @@ pub enum WorkerToServerIpcMessage {
         prompt: String,
     },
     InputLine {
-        turn_id: u64,
+        input_id: u64,
         prompt: String,
         text: String,
     },
     InputWait {
-        turn_id: u64,
+        input_id: u64,
         prompt: String,
     },
     PlotImage {
@@ -66,7 +66,7 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         message_b64: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<u64>,
+        input_id: Option<u64>,
     },
 }
 
@@ -335,14 +335,14 @@ mod tests {
     fn input_wait_message_is_worker_to_server_only() {
         let wait = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "input_wait",
-            "turn_id": 7,
+            "input_id": 7,
             "prompt": "debug> "
         }));
         assert!(
             matches!(
                 wait,
                 Ok(WorkerToServerIpcMessage::InputWait {
-                    turn_id: 7,
+                    input_id: 7,
                     ref prompt
                 }) if prompt == "debug> "
             ),
@@ -352,7 +352,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "input_wait",
-                "turn_id": 7,
+                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -365,7 +365,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "stdin_wait",
-                "turn_id": 7,
+                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -374,7 +374,7 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "stdin_wait",
-                "turn_id": 7,
+                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -383,7 +383,7 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "idle",
-                "turn_id": 7,
+                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -392,7 +392,7 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "turn_input",
-                "turn_id": 7,
+                "input_id": 7,
                 "input": "c\n"
             }))
             .is_err(),
@@ -401,11 +401,49 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "turn_input",
-                "turn_id": 7,
+                "input_id": 7,
                 "input": "c\n"
             }))
             .is_err(),
             "turn_input should not deserialize as a server-to-worker message"
+        );
+    }
+
+    #[test]
+    fn input_batch_is_server_to_worker_only() {
+        let batch = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "input_batch",
+            "input_id": 7,
+            "input": "x <- 1\n"
+        }));
+        assert!(
+            matches!(
+                batch,
+                Ok(ServerToWorkerIpcMessage::InputBatch {
+                    input_id: 7,
+                    ref input
+                }) if input == "x <- 1\n"
+            ),
+            "input_batch should deserialize as a server-to-worker message"
+        );
+
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "input_batch",
+                "input_id": 7,
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "input_batch should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "turn_start",
+                "turn_id": 7,
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "turn_start should not deserialize after v4 input_batch rename"
         );
     }
 
@@ -429,10 +467,10 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "shutdown",
-                "turn_id": 1
+                "input_id": 1
             }))
             .is_err(),
-            "shutdown should not carry turn payload"
+            "shutdown should not carry input payload"
         );
     }
 }

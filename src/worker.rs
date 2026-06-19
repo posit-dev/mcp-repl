@@ -53,16 +53,16 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
+                    Some(ServerToWorkerIpcMessage::InputBatch { input_id, input }) => {
                         match wait_for_r_session()
-                            .and_then(|session| session.begin_turn(turn_id, input))
+                            .and_then(|session| session.begin_input(input_id, input))
                         {
                             Ok(()) => {}
                             Err(err) => {
                                 crate::output_stream::write_stderr_bytes(err.as_bytes());
                                 crate::ipc::emit_session_end_with_reason(
                                     "protocol_error",
-                                    Some(turn_id),
+                                    Some(input_id),
                                 );
                             }
                         }
@@ -74,7 +74,7 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(0);
                     }
                     None => {
-                        // Without IPC, the worker cannot participate in turn accounting (prompt,
+                        // Without IPC, the worker cannot participate in input accounting (prompt,
                         // request boundaries, etc). Exit immediately so the server can respawn.
                         std::process::exit(0);
                     }

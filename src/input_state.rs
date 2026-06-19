@@ -1,14 +1,14 @@
 use std::time::Instant;
 
 #[derive(Default)]
-pub(crate) struct TurnState {
-    active: Option<ActiveTurn>,
+pub(crate) struct InputState {
+    active: Option<ActiveInput>,
     protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
     session_end_final: bool,
 }
 
-struct ActiveTurn {
+struct ActiveInput {
     id: u64,
     completed_observed_at: Option<Instant>,
 }
@@ -18,10 +18,10 @@ struct LatchedProtocolError {
     observed_at: Instant,
 }
 
-impl TurnState {
-    pub(crate) fn begin_turn(&mut self, turn_id: u64) {
-        self.active = Some(ActiveTurn {
-            id: turn_id,
+impl InputState {
+    pub(crate) fn begin_input(&mut self, input_id: u64) {
+        self.active = Some(ActiveInput {
+            id: input_id,
             completed_observed_at: None,
         });
     }
@@ -30,39 +30,39 @@ impl TurnState {
         self.active = None;
     }
 
-    pub(crate) fn has_active_turn(&self) -> bool {
+    pub(crate) fn has_active_input(&self) -> bool {
         self.active.is_some()
     }
 
-    pub(crate) fn validate_active_turn_id(
+    pub(crate) fn validate_active_input_id(
         &self,
-        turn_id: u64,
+        input_id: u64,
         event_type: &str,
     ) -> Result<(), String> {
         match self.active.as_ref().map(|turn| turn.id) {
-            Some(active) if active == turn_id => Ok(()),
+            Some(active) if active == input_id => Ok(()),
             Some(active) => Err(format!(
-                "{event_type} turn_id {turn_id} does not match active turn_id {active}"
+                "{event_type} input_id {input_id} does not match active input_id {active}"
             )),
             None => Err(format!(
-                "{event_type} reported turn_id {turn_id} with no active turn"
+                "{event_type} reported input_id {input_id} with no active input"
             )),
         }
     }
 
-    pub(crate) fn validate_open_active_turn_id(
+    pub(crate) fn validate_open_active_input_id(
         &self,
-        turn_id: u64,
+        input_id: u64,
         event_type: &str,
     ) -> Result<(), String> {
-        self.validate_active_turn_id(turn_id, event_type)?;
+        self.validate_active_input_id(input_id, event_type)?;
         if self
             .active
             .as_ref()
             .is_some_and(|turn| turn.completed_observed_at.is_some())
         {
             return Err(format!(
-                "{event_type} turn_id {turn_id} arrived after input_wait"
+                "{event_type} input_id {input_id} arrived after input_wait"
             ));
         }
         Ok(())
@@ -70,10 +70,10 @@ impl TurnState {
 
     pub(crate) fn record_input_wait(
         &mut self,
-        turn_id: u64,
+        input_id: u64,
         observed_at: Instant,
     ) -> Result<(), String> {
-        self.validate_open_active_turn_id(turn_id, "input_wait")?;
+        self.validate_open_active_input_id(input_id, "input_wait")?;
         if let Some(active) = self.active.as_mut() {
             active.completed_observed_at = Some(observed_at);
         }

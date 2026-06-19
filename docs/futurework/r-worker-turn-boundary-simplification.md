@@ -15,10 +15,10 @@ Historical baseline: Server-inferred completion is no longer the intended direct
 
 The current protocol contract is:
 
-- accepted input enters the worker through `turn_start`,
+- accepted input enters the worker through `input_batch`,
 - the worker owns the input queue and runtime placement,
 - successful same-worker reply boundaries are reported with `input_wait`,
-- `session_end` is terminal for any active turn,
+- `session_end` is terminal for any active input,
 - the server does not infer completion from prompt text, raw process stdin
   writes, PTY state, stdout/stderr, or timing.
 

@@ -61,9 +61,9 @@ impl PythonSession {
     }
 
     #[cfg(windows)]
-    pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input_id: u64, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
-        windows_stdin::begin_tracked_turn(turn_id, input)
+        windows_stdin::begin_tracked_input_batch(input_id, input)
     }
 }
 
@@ -140,8 +140,8 @@ pub(crate) fn interrupt() {
 }
 
 #[cfg(windows)]
-pub(crate) fn interrupt_turn(turn_id: u64) {
-    windows_stdin::interrupt_turn(turn_id);
+pub(crate) fn interrupt_input(input_id: u64) {
+    windows_stdin::interrupt_input(input_id);
 }
 
 fn interrupt_for_request_generation(request_generation: Option<u64>) {
@@ -182,20 +182,20 @@ fn take_interrupt_requested() -> bool {
     requested
 }
 
-pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
+pub(crate) fn begin_input(input_id: u64, input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
-        unix_stdin::begin_turn_input(turn_id, &input)
+        unix_stdin::begin_input_batch(input_id, &input)
     }
 
     #[cfg(windows)]
     {
-        PythonSession::global()?.begin_turn(turn_id, input)
+        PythonSession::global()?.begin_input(input_id, input)
     }
 
     #[cfg(not(any(target_family = "unix", windows)))]
     {
-        let _ = (turn_id, input);
+        let _ = (input_id, input);
         Ok(())
     }
 }
@@ -565,7 +565,7 @@ fn finish_repl_turn_request() {
         if guard
             .active_request
             .as_ref()
-            .is_some_and(|active| active.turn_id.is_some())
+            .is_some_and(|active| active.input_id.is_some())
         {
             return;
         }

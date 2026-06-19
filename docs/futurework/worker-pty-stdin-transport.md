@@ -31,7 +31,7 @@ steady-state request handling.
 
 ## Constraints
 
-- Server steady-state request handling remains generic: send fresh `turn_start`
+- Server steady-state request handling remains generic: send fresh `input_batch`
   messages over IPC, consume sideband facts, and deliver OS controls.
 - PTY use must not reintroduce prompt parsing, prompt stripping, or
   interpreter-specific completion logic in the server.

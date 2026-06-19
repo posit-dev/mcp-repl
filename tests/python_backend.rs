@@ -1515,7 +1515,7 @@ gamma
     );
     assert!(
         text.contains("WIN_STDIN_VALUES alpha beta gamma"),
-        "expected input/sys.stdin/dup fd reads to consume buffered turn input, got: {text:?}"
+        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {text:?}"
     );
     assert!(
         text.contains("REPLACED_STDIN_ISATTY False"),
@@ -1547,7 +1547,7 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     let first_text = result_text(&first);
     assert!(
         !is_busy_response(&first_text),
-        "expected raw stdin read to complete the turn at an input boundary, got: {first_text:?}"
+        "expected raw stdin read to complete the input batch at an input boundary, got: {first_text:?}"
     );
     assert!(
         first_text.contains("RAW_STDIN_WAITING"),
@@ -1579,14 +1579,14 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     );
     assert!(
         text.contains("RAW_STDIN_RESULT delta"),
-        "expected raw stdin read to consume next turn input, got: {text:?}"
+        "expected raw stdin read to consume next input batch, got: {text:?}"
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_direct_stdin_reads_consume_buffered_turn_start_input() -> TestResult<()> {
+async fn python_pty_direct_stdin_reads_consume_buffered_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1620,7 +1620,7 @@ print("DIRECT_STDIN_VALUES", line, data)
 
     assert!(
         !is_busy_response(&text),
-        "expected direct stdin reads to consume queued turn input, got: {text:?}"
+        "expected direct stdin reads to consume queued input batch, got: {text:?}"
     );
     assert!(
         text.contains("DIRECT_STDIN_VALUES alpha bravo"),
@@ -3089,7 +3089,7 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_windows_input_wait_interrupt_preserves_next_turn_start_input() -> TestResult<()> {
+async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3922,7 +3922,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_ctrl_c_prefix_preserves_followup_fresh_turn_input() -> TestResult<()> {
+async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3959,7 +3959,7 @@ async fn python_ctrl_c_prefix_preserves_followup_fresh_turn_input() -> TestResul
 
     assert!(
         text.contains("AFTER_STALE_INTERRUPT queued-answer"),
-        "expected follow-up turn input after ctrl-c prefix, got: {text:?}"
+        "expected follow-up input batch after ctrl-c prefix, got: {text:?}"
     );
     Ok(())
 }

@@ -59,17 +59,17 @@ impl RSession {
         self.init.wait_ready()
     }
 
-    pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input_id: u64, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
         let state = session_state();
         let mut guard = state.inner.lock().unwrap();
-        if let Some(active) = guard.active_turn_id {
+        if let Some(active) = guard.active_input_id {
             return Err(format!(
-                "turn_start turn_id {turn_id} arrived while turn_id {active} is active"
+                "input_batch input_id {input_id} arrived while input_id {active} is active"
             ));
         }
-        guard.active_turn_id = Some(turn_id);
-        queue_input(&mut guard.input_queue, turn_id, &input);
+        guard.active_input_id = Some(input_id);
+        queue_input(&mut guard.input_queue, input_id, &input);
         state.cvar.notify_all();
         Ok(())
     }
@@ -168,8 +168,8 @@ struct SessionState {
 }
 
 struct SessionStateInner {
-    active_turn_id: Option<u64>,
-    input_queue: VecDeque<TurnInputLine>,
+    active_input_id: Option<u64>,
+    input_queue: VecDeque<InputBatchLine>,
     plot_hashes: HashMap<String, u64>,
     last_prompt: Option<String>,
     shutdown: bool,
@@ -177,8 +177,8 @@ struct SessionStateInner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TurnInputLine {
-    turn_id: u64,
+struct InputBatchLine {
+    input_id: u64,
     text: String,
 }
 
@@ -186,7 +186,7 @@ impl SessionState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SessionStateInner {
-                active_turn_id: None,
+                active_input_id: None,
                 input_queue: VecDeque::new(),
                 plot_hashes: HashMap::new(),
                 last_prompt: None,
@@ -603,7 +603,7 @@ fn session_state() -> &'static Arc<SessionState> {
         .expect("R session state was not initialized")
 }
 
-fn queue_input(queue: &mut VecDeque<TurnInputLine>, turn_id: u64, input: &str) {
+fn queue_input(queue: &mut VecDeque<InputBatchLine>, input_id: u64, input: &str) {
     if input.is_empty() {
         return;
     }
@@ -618,11 +618,11 @@ fn queue_input(queue: &mut VecDeque<TurnInputLine>, turn_id: u64, input: &str) {
     queue.extend(
         lines
             .into_iter()
-            .map(|text| TurnInputLine { turn_id, text }),
+            .map(|text| InputBatchLine { input_id, text }),
     );
 }
 
-fn drain_input_queue(queue: &mut VecDeque<TurnInputLine>) -> String {
+fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     let mut drained = String::new();
     while let Some(line) = queue.pop_front() {
         drained.push_str(&line.text);
@@ -631,9 +631,9 @@ fn drain_input_queue(queue: &mut VecDeque<TurnInputLine>) -> String {
 }
 
 fn split_console_line(
-    mut line: TurnInputLine,
+    mut line: InputBatchLine,
     max: usize,
-) -> (TurnInputLine, Option<TurnInputLine>) {
+) -> (InputBatchLine, Option<InputBatchLine>) {
     if line.text.len() <= max {
         return (line, None);
     }
@@ -642,12 +642,12 @@ fn split_console_line(
         split -= 1;
     }
     assert!(split > 0, "R console buffer is too small for UTF-8 input");
-    let turn_id = line.turn_id;
+    let input_id = line.input_id;
     let tail = line.text.split_off(split);
     (
         line,
-        Some(TurnInputLine {
-            turn_id,
+        Some(InputBatchLine {
+            input_id,
             text: tail,
         }),
     )
@@ -950,7 +950,7 @@ pub extern "C-unwind" fn r_read_console(
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
-        if guard.input_queue.is_empty() && guard.active_turn_id.is_none() {
+        if guard.input_queue.is_empty() && guard.active_input_id.is_none() {
             guard.plot_hashes.clear();
         }
     }
@@ -1013,7 +1013,7 @@ pub extern "C-unwind" fn r_read_console(
             let mut echoed = String::with_capacity(prompt.len() + line_text.text.len());
             echoed.push_str(prompt);
             echoed.push_str(&line_text.text);
-            ipc::emit_input_line(line_text.turn_id, prompt, &line_text.text);
+            ipc::emit_input_line(line_text.input_id, prompt, &line_text.text);
             if !echoed.is_empty() {
                 emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
@@ -1021,11 +1021,11 @@ pub extern "C-unwind" fn r_read_console(
             return 1;
         }
 
-        if let Some(turn_id) = guard.active_turn_id.take() {
+        if let Some(input_id) = guard.active_input_id.take() {
             let prompt = prompt.to_string();
             guard.plot_hashes.clear();
             drop(guard);
-            ipc::emit_input_wait(turn_id, &prompt);
+            ipc::emit_input_wait(input_id, &prompt);
             continue;
         }
 
@@ -1070,10 +1070,10 @@ pub(crate) fn push_plot_image(
 mod input_queue_tests {
     use std::collections::VecDeque;
 
-    use super::{TurnInputLine, queue_input, split_console_line};
+    use super::{InputBatchLine, queue_input, split_console_line};
 
     #[test]
-    fn queue_input_attaches_turn_id_to_each_line() {
+    fn queue_input_attaches_input_id_to_each_line() {
         let mut queue = VecDeque::new();
 
         queue_input(&mut queue, 7, "alpha\nbeta");
@@ -1082,12 +1082,12 @@ mod input_queue_tests {
         assert_eq!(
             queued,
             vec![
-                TurnInputLine {
-                    turn_id: 7,
+                InputBatchLine {
+                    input_id: 7,
                     text: "alpha\n".to_string(),
                 },
-                TurnInputLine {
-                    turn_id: 7,
+                InputBatchLine {
+                    input_id: 7,
                     text: "beta\n".to_string(),
                 },
             ]
@@ -1095,9 +1095,9 @@ mod input_queue_tests {
     }
 
     #[test]
-    fn split_console_line_preserves_turn_id_on_remainder() {
-        let line = TurnInputLine {
-            turn_id: 11,
+    fn split_console_line_preserves_input_id_on_remainder() {
+        let line = InputBatchLine {
+            input_id: 11,
             text: "abcdef\n".to_string(),
         };
 
@@ -1105,15 +1105,15 @@ mod input_queue_tests {
 
         assert_eq!(
             head,
-            TurnInputLine {
-                turn_id: 11,
+            InputBatchLine {
+                input_id: 11,
                 text: "abc".to_string(),
             }
         );
         assert_eq!(
             tail,
-            Some(TurnInputLine {
-                turn_id: 11,
+            Some(InputBatchLine {
+                input_id: 11,
                 text: "def\n".to_string(),
             })
         );

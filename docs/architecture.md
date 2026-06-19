@@ -15,7 +15,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `src/server.rs` owns the MCP surface, request handling, timeout model, and worker lifecycle.
 - `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl`/`repl_reset` behavior stable.
 - During steady-state worker requests, the server treats the worker as an opaque
-  queued runtime endpoint: `turn_start` carries accepted input over IPC,
+  queued runtime endpoint: `input_batch` carries accepted input over IPC,
   `output_text` sideband frames carry worker-owned text, raw stdout/stderr carry
   unowned visible text, and other sideband events carry structural facts.
   Backend-specific runtime semantics belong in the worker or in explicitly
@@ -32,14 +32,14 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - Worker launch chooses the raw process stdio or PTY transport up front, but
   accepted `repl` input is queued through IPC during steady-state execution.
   Runtime stdin surfaces are worker-owned implementation details.
-- Workers receive request payloads through `turn_start` and complete a turn with
-  `input_wait` or `session_end`. Follow-up input after `input_wait` starts a
-  fresh `turn_start`; the runtime decides where it is consumed.
+- Workers receive request payloads through `input_batch` and complete an input
+  batch with `input_wait` or `session_end`. Follow-up input after `input_wait`
+  starts a fresh `input_batch`; the runtime decides where it is consumed.
 - Worker reset and teardown use the sideband `shutdown` lifecycle message first,
   with stdin close and process termination retained only as bounded fallbacks.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
-- Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On Unix, Python may still use PTY-backed process stdio for terminal behavior, but managed turn input is served from the worker queue; direct stdin consumers are not a server completion contract.
+- Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On Unix, Python may still use PTY-backed process stdio for terminal behavior, but managed input batches are served from the worker queue; direct stdin consumers are not a server completion contract.
 
 ### Sandbox and process isolation
 

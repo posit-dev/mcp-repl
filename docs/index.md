@@ -53,7 +53,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/worker-pty-stdin-transport.md`: historical design note for PTY launch configuration kept separate from IPC-queued request input.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
-- `docs/futurework/stdin-transport-single-owner.md`: historical and deferred design note for keeping managed turn input owned by the worker queue.
+- `docs/futurework/stdin-transport-single-owner.md`: historical and deferred design note for keeping managed input batches owned by the worker queue.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 
 ## Maintenance Rules

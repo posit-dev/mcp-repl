@@ -16,7 +16,7 @@ description selection.
 
 The intended contract is a narrow server/worker boundary:
 
-- `turn_start` carries user input to workers,
+- `input_batch` carries user input to workers,
 - `output_text` sideband frames carry worker-owned text back to the server,
 - raw stdout/stderr carry unowned visible text from child processes or direct
   file-descriptor writes,

@@ -2208,7 +2208,7 @@ async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -
         second_text.contains("FOLLOW_UP_START")
             || (second_transcript.contains("FOLLOW_UP_START")
                 && second_transcript.contains("FOLLOW_UP_END")),
-        "expected the respawned follow-up output to stay with the fresh turn, got reply {second_text:?} and transcript {second_transcript:?}"
+        "expected the respawned follow-up output to stay with the fresh input batch, got reply {second_text:?} and transcript {second_transcript:?}"
     );
     Ok(())
 }

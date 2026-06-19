@@ -49,7 +49,7 @@ pub(super) trait BackendDriver: Send {
         true
     }
 
-    fn clear_active_turn(&mut self) {}
+    fn clear_active_input(&mut self) {}
 
     fn wait_for_completion(
         &mut self,
@@ -69,22 +69,22 @@ pub(super) fn new_backend_driver(worker_launch: &WorkerLaunch) -> Box<dyn Backen
 }
 
 struct RBackendDriver {
-    next_turn_id: u64,
-    active_turn_id: Option<u64>,
+    next_input_id: u64,
+    active_input_id: Option<u64>,
 }
 
 impl RBackendDriver {
     fn new() -> Self {
         Self {
-            next_turn_id: 1,
-            active_turn_id: None,
+            next_input_id: 1,
+            active_input_id: None,
         }
     }
 
-    fn next_turn_id(&mut self) -> u64 {
-        let turn_id = self.next_turn_id;
-        self.next_turn_id = self.next_turn_id.wrapping_add(1).max(1);
-        turn_id
+    fn next_input_id(&mut self) -> u64 {
+        let input_id = self.next_input_id;
+        self.next_input_id = self.next_input_id.wrapping_add(1).max(1);
+        input_id
     }
 }
 
@@ -110,7 +110,7 @@ fn driver_wait_for_completion(
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
     if let Some(ipc) = process.ipc_connection() {
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None });
+        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt { input_id: None });
     }
     process.send_interrupt()
 }
@@ -148,17 +148,17 @@ impl BackendDriver for RBackendDriver {
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
-        let turn_id = self.next_turn_id();
-        ipc.begin_turn(turn_id);
+        let input_id = self.next_input_id();
+        ipc.begin_input(input_id);
         send_worker_ipc_with_timeout(
             ipc,
-            ServerToWorkerIpcMessage::TurnStart {
-                turn_id,
+            ServerToWorkerIpcMessage::InputBatch {
+                input_id,
                 input: text.to_string(),
             },
             timeout,
         )?;
-        self.active_turn_id = Some(turn_id);
+        self.active_input_id = Some(input_id);
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -169,8 +169,8 @@ impl BackendDriver for RBackendDriver {
         false
     }
 
-    fn clear_active_turn(&mut self) {
-        self.active_turn_id = None;
+    fn clear_active_input(&mut self) {
+        self.active_input_id = None;
     }
 
     fn should_settle_output_after_timeout(
@@ -193,7 +193,7 @@ impl BackendDriver for RBackendDriver {
     ) -> Result<CompletionInfo, WorkerError> {
         let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
         if result.is_ok() || matches!(result, Err(WorkerError::Protocol(_))) {
-            self.active_turn_id = None;
+            self.active_input_id = None;
         }
         result
     }
@@ -201,44 +201,44 @@ impl BackendDriver for RBackendDriver {
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc_connection() {
             let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                turn_id: self.active_turn_id,
+                input_id: self.active_input_id,
             });
         }
         let result = process.send_r_interrupt();
         if result.is_ok() {
-            self.active_turn_id = None;
+            self.active_input_id = None;
         }
         result
     }
 }
 
 struct ProtocolBackendDriver {
-    next_turn_id: u64,
-    active_turn_id: Option<u64>,
+    next_input_id: u64,
+    active_input_id: Option<u64>,
     is_builtin_python: bool,
 }
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
         Self {
-            next_turn_id: 1,
-            active_turn_id: None,
+            next_input_id: 1,
+            active_input_id: None,
             is_builtin_python: false,
         }
     }
 
     fn builtin_python() -> Self {
         Self {
-            next_turn_id: 1,
-            active_turn_id: None,
+            next_input_id: 1,
+            active_input_id: None,
             is_builtin_python: true,
         }
     }
 
-    fn next_turn_id(&mut self) -> u64 {
-        let turn_id = self.next_turn_id;
-        self.next_turn_id = self.next_turn_id.wrapping_add(1).max(1);
-        turn_id
+    fn next_input_id(&mut self) -> u64 {
+        let input_id = self.next_input_id;
+        self.next_input_id = self.next_input_id.wrapping_add(1).max(1);
+        input_id
     }
 }
 
@@ -254,17 +254,17 @@ impl BackendDriver for ProtocolBackendDriver {
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
-        let turn_id = self.next_turn_id();
-        ipc.begin_turn(turn_id);
+        let input_id = self.next_input_id();
+        ipc.begin_input(input_id);
         send_worker_ipc_with_timeout(
             ipc,
-            ServerToWorkerIpcMessage::TurnStart {
-                turn_id,
+            ServerToWorkerIpcMessage::InputBatch {
+                input_id,
                 input: text.to_string(),
             },
             timeout,
         )?;
-        self.active_turn_id = Some(turn_id);
+        self.active_input_id = Some(input_id);
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -288,8 +288,8 @@ impl BackendDriver for ProtocolBackendDriver {
         false
     }
 
-    fn clear_active_turn(&mut self) {
-        self.active_turn_id = None;
+    fn clear_active_input(&mut self) {
+        self.active_input_id = None;
     }
 
     fn wait_for_completion(
@@ -299,26 +299,26 @@ impl BackendDriver for ProtocolBackendDriver {
     ) -> Result<CompletionInfo, WorkerError> {
         let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
         if result.is_ok() || matches!(result, Err(WorkerError::Protocol(_))) {
-            self.active_turn_id = None;
+            self.active_input_id = None;
         }
         result
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc_connection() {
-            if let Some(turn_id) = self.active_turn_id {
+            if let Some(input_id) = self.active_input_id {
                 ipc.send(ServerToWorkerIpcMessage::Interrupt {
-                    turn_id: Some(turn_id),
+                    input_id: Some(input_id),
                 })
                 .map_err(WorkerError::Io)?;
             } else if self.is_builtin_python {
-                ipc.send(ServerToWorkerIpcMessage::Interrupt { turn_id: None })
+                ipc.send(ServerToWorkerIpcMessage::Interrupt { input_id: None })
                     .map_err(WorkerError::Io)?;
             }
         }
         let result = process.send_interrupt();
         if result.is_ok() {
-            self.active_turn_id = None;
+            self.active_input_id = None;
         }
         result
     }
@@ -334,13 +334,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn r_driver_sends_turn_start_without_stdin_payload_write() {
+    fn r_driver_sends_input_batch_without_stdin_payload_write() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
 
         driver
             .on_input_start("1+1", b"1+1\n", &server, Duration::from_millis(200))
-            .expect("R turn_start should send");
+            .expect("R input_batch should send");
 
         assert!(
             !driver.should_write_stdin_payload(),
@@ -348,7 +348,7 @@ mod tests {
         );
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 1, input })
+            Some(ServerToWorkerIpcMessage::InputBatch { input_id: 1, input })
                 if input == "1+1"
         ));
     }
@@ -356,14 +356,14 @@ mod tests {
     #[test]
     fn completion_uses_input_line_and_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_turn(1);
+        server.begin_input(1);
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
             text: "1+1\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
         });
 
@@ -380,9 +380,9 @@ mod tests {
     #[test]
     fn completion_uses_input_wait_prompt() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_turn(1);
+        server.begin_input(1);
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            turn_id: 1,
+            input_id: 1,
             prompt: "debug> ".to_string(),
         });
 
@@ -404,15 +404,15 @@ mod tests {
                 &server,
                 Duration::from_millis(200),
             )
-            .expect("turn_start should send");
+            .expect("input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 1, input })
+            Some(ServerToWorkerIpcMessage::InputBatch { input_id: 1, input })
                 if input == "answer = input('p> ')"
         ));
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                turn_id: 1,
+                input_id: 1,
                 prompt: "p> ".to_string(),
             })
             .expect("send input_wait");
@@ -423,10 +423,10 @@ mod tests {
 
         driver
             .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
-            .expect("next turn_start should send");
+            .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 2, input }) if input == "ok\n"
+            Some(ServerToWorkerIpcMessage::InputBatch { input_id: 2, input }) if input == "ok\n"
         ));
     }
 
@@ -442,15 +442,15 @@ mod tests {
                 &server,
                 Duration::from_millis(200),
             )
-            .expect("turn_start should send");
+            .expect("input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 1, input })
+            Some(ServerToWorkerIpcMessage::InputBatch { input_id: 1, input })
                 if input == "answer <- readline('p> ')"
         ));
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                turn_id: 1,
+                input_id: 1,
                 prompt: "p> ".to_string(),
             })
             .expect("send input_wait");
@@ -461,10 +461,10 @@ mod tests {
 
         driver
             .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
-            .expect("next turn_start should send");
+            .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 2, input }) if input == "ok\n"
+            Some(ServerToWorkerIpcMessage::InputBatch { input_id: 2, input }) if input == "ok\n"
         ));
     }
 
@@ -472,9 +472,9 @@ mod tests {
     fn next_request_result_is_retained_after_explicit_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        server.begin_turn(1);
+        server.begin_input(1);
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
         });
         let first = driver_wait_for_completion(
@@ -485,14 +485,14 @@ mod tests {
         .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
-        server.begin_turn(2);
+        server.begin_input(2);
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 2,
+            input_id: 2,
             prompt: "> ".to_string(),
             text: "second()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            turn_id: 2,
+            input_id: 2,
             prompt: "> ".to_string(),
         });
 
@@ -510,14 +510,14 @@ mod tests {
     fn completion_preserves_echo_events_before_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        server.begin_turn(1);
+        server.begin_input(1);
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
             text: "first()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
         });
 
@@ -535,17 +535,17 @@ mod tests {
     #[test]
     fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_turn(1);
+        server.begin_input(1);
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
             text: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
-            turn_id: None,
+            input_id: None,
         });
 
         let completion =
@@ -561,17 +561,17 @@ mod tests {
     #[test]
     fn completion_reports_session_end_when_prompt_is_also_stable() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        server.begin_turn(1);
+        server.begin_input(1);
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            turn_id: 1,
+            input_id: 1,
             prompt: "> ".to_string(),
             text: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
-            turn_id: None,
+            input_id: None,
         });
 
         let completion =

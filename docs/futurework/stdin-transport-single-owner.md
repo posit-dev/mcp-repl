@@ -3,7 +3,7 @@
 ## Summary
 
 A Windows bug exposed a broader design issue in the embedded worker model:
-managed turn input should have a single owner inside the worker process.
+managed input batch should have a single owner inside the worker process.
 
 This repo has already pulled forward a narrow mitigation from that future work: on Windows, pause the worker's background stdin reader while a request is active so another runtime is not competing with a blocked reader on fd `0`.
 
@@ -18,19 +18,19 @@ future interpreters on that same single-owner path.
 - The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
 - Future embedded interpreters can run into similar issues if managed input
   ownership drifts back toward shared raw process stdin.
-- The current worker protocol carries accepted input in fresh `turn_start`
+- The current worker protocol carries accepted input in fresh `input_batch`
   messages and lets the worker own the runtime boundary.
 
 ## Current Scope
 
-Built-in and custom workers should keep managed turn input in a worker-owned
+Built-in and custom workers should keep managed input batch in a worker-owned
 queue. The worker may expose that queue through `ReadConsole`, `PyOS_Readline`,
 a managed `sys.stdin`, direct fd shims, a PTY writer, or another runtime bridge,
 but the server-side request path should stay opaque.
 
 ## Intended Transport Model
 
-- Treat the v4 `turn_start` payload as the managed input transport.
+- Treat the v4 `input_batch` payload as the managed input transport.
 - Do not add framing headers or other synthetic protocol markers to raw process
   stdin.
 - Keep request metadata and queued input on sideband IPC.

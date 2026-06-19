@@ -281,7 +281,7 @@ impl WorkerManager {
         if !preserve_detached_output {
             self.pending_request_input = None;
         }
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -312,7 +312,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;

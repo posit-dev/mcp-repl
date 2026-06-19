@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[cfg(target_family = "unix")]
-use crate::python_turn_input::PythonTurnInput;
+use crate::python_input_queue::PythonInputQueue;
 
 pub(super) static SESSION_STATE: OnceLock<Arc<SessionState>> = OnceLock::new();
 
@@ -33,16 +33,16 @@ pub(super) struct SessionStateInner {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(super) turn_cleanup_uncertain: bool,
     #[cfg(target_family = "unix")]
-    pub(super) turn_input: PythonTurnInput,
+    pub(super) input_queue: PythonInputQueue,
 }
 
 #[allow(dead_code)]
 pub(super) struct ActiveRequest {
-    pub(super) turn_id: Option<u64>,
+    pub(super) input_id: Option<u64>,
     pub(super) byte_len: usize,
     pub(super) line_count: usize,
     pub(super) fallback_prompt: Option<String>,
-    pub(super) queued_lines: VecDeque<TurnInputLine>,
+    pub(super) queued_lines: VecDeque<InputBatchLine>,
     pub(super) consumed_lines: usize,
     pub(super) skip_next_hook: bool,
     pub(super) stdin_write_complete: bool,
@@ -50,7 +50,7 @@ pub(super) struct ActiveRequest {
     pub(super) started_after_continuation_prompt: bool,
 }
 
-pub(super) struct TurnInputLine {
+pub(super) struct InputBatchLine {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(super) text: String,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -107,7 +107,7 @@ impl SessionState {
                 turn_write_in_flight: false,
                 turn_cleanup_uncertain: false,
                 #[cfg(target_family = "unix")]
-                turn_input: PythonTurnInput::new(),
+                input_queue: PythonInputQueue::new(),
             }),
             cvar: Condvar::new(),
         }
@@ -261,7 +261,7 @@ mod tests {
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
         ActiveRequest {
-            turn_id: None,
+            input_id: None,
             byte_len: 1,
             line_count,
             fallback_prompt: fallback_prompt.map(str::to_string),

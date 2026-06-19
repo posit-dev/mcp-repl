@@ -379,7 +379,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
-                self.driver.clear_active_turn();
+                self.driver.clear_active_input();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
@@ -414,7 +414,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         if !preserve {
-            self.driver.clear_active_turn();
+            self.driver.clear_active_input();
         }
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
