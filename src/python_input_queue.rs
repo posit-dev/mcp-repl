@@ -4,14 +4,13 @@ use std::collections::VecDeque;
 #[cfg(target_family = "unix")]
 #[derive(Debug)]
 pub(crate) struct PythonInputQueue {
-    active_input_id: Option<u64>,
+    active_input: bool,
     queued_bytes: VecDeque<u8>,
 }
 
 #[cfg(target_family = "unix")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeStdinRead {
-    pub(crate) input_id: u64,
     pub(crate) protocol_bytes: Vec<u8>,
 }
 
@@ -19,24 +18,22 @@ pub(crate) struct RuntimeStdinRead {
 impl PythonInputQueue {
     pub(crate) fn new() -> Self {
         Self {
-            active_input_id: None,
+            active_input: false,
             queued_bytes: VecDeque::new(),
         }
     }
 
-    pub(crate) fn begin_input(&mut self, input_id: u64, payload: Vec<u8>) -> Result<(), String> {
-        if let Some(active) = self.active_input_id {
-            return Err(format!(
-                "input_batch input_id {input_id} arrived while input_id {active} is active"
-            ));
+    pub(crate) fn begin_input(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        if self.active_input {
+            return Err("input_batch arrived while input is active".to_string());
         }
-        self.active_input_id = Some(input_id);
+        self.active_input = true;
         self.queued_bytes.extend(payload);
         Ok(())
     }
 
     pub(crate) fn clear_for_protocol_failure(&mut self) {
-        self.active_input_id = None;
+        self.active_input = false;
         self.queued_bytes.clear();
     }
 
@@ -45,14 +42,15 @@ impl PythonInputQueue {
     }
 
     pub(crate) fn has_active_input(&self) -> bool {
-        self.active_input_id.is_some()
+        self.active_input
     }
 
-    pub(crate) fn take_completed_input(&mut self) -> Option<u64> {
-        if self.queued_bytes.is_empty() {
-            self.active_input_id.take()
+    pub(crate) fn take_completed_input(&mut self) -> bool {
+        if self.queued_bytes.is_empty() && self.active_input {
+            self.active_input = false;
+            true
         } else {
-            None
+            false
         }
     }
 
@@ -72,17 +70,14 @@ impl PythonInputQueue {
         if byte_count == 0 || self.queued_bytes.is_empty() {
             return Ok(None);
         }
-        let input_id = self
-            .active_input_id
-            .ok_or_else(|| "runtime stdin was read with no active input".to_string())?;
+        if !self.active_input {
+            return Err("runtime stdin was read with no active input".to_string());
+        }
         let protocol_bytes = self
             .queued_bytes
             .drain(..byte_count.min(self.queued_bytes.len()))
             .collect::<Vec<_>>();
-        Ok(Some(RuntimeStdinRead {
-            input_id,
-            protocol_bytes,
-        }))
+        Ok(Some(RuntimeStdinRead { protocol_bytes }))
     }
 }
 

@@ -16,7 +16,7 @@ pub(super) fn flush_terminal_input() {
     let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
 }
 
-pub(super) fn begin_input_batch(input_id: u64, input: &str) -> Result<(), String> {
+pub(super) fn begin_input_batch(input: &str) -> Result<(), String> {
     let payload = normalize_pty_input_payload(prepare_worker_stdin_payload(input));
     let Some(state) = SESSION_STATE.get() else {
         return Ok(());
@@ -30,7 +30,7 @@ pub(super) fn begin_input_batch(input_id: u64, input: &str) -> Result<(), String
     }
 
     let mut guard = state.inner.lock().unwrap();
-    guard.input_queue.begin_input(input_id, payload)?;
+    guard.input_queue.begin_input(payload)?;
     guard.interrupt_requested = false;
     guard.request_active = true;
     guard.plot_reset_pending = true;
@@ -49,15 +49,13 @@ pub(super) fn discard_pending_stdin() {
 
 enum ReadlineAction {
     Line {
-        input_id: u64,
         bytes: Vec<u8>,
         prompt_already_visible: bool,
     },
     InputWait {
-        input_id: u64,
         prompt: String,
     },
-    ReadlineStart {
+    IdleWait {
         prompt: String,
     },
     Interrupted,
@@ -98,18 +96,17 @@ fn next_readline_action_locked(
         guard.waiting_for_input = false;
         guard.request_active = true;
         return Ok(ReadlineAction::Line {
-            input_id: read.input_id,
             bytes: read.protocol_bytes,
             prompt_already_visible: false,
         });
     }
 
-    if let Some(input_id) = guard.input_queue.take_completed_input() {
+    if guard.input_queue.take_completed_input() {
         let prompt = prompt.to_string();
-        return Ok(ReadlineAction::InputWait { input_id, prompt });
+        return Ok(ReadlineAction::InputWait { prompt });
     }
 
-    Ok(ReadlineAction::ReadlineStart {
+    Ok(ReadlineAction::IdleWait {
         prompt: prompt.to_string(),
     })
 }
@@ -128,11 +125,11 @@ fn wait_for_turn_line(
         let action = {
             let mut guard = state.inner.lock().unwrap();
             match next_readline_action_locked(&mut guard, prompt) {
-                Ok(ReadlineAction::ReadlineStart { prompt }) => {
+                Ok(ReadlineAction::IdleWait { prompt }) => {
                     if !idle_prompt_emitted {
                         idle_prompt_emitted = true;
                         drop(guard);
-                        ipc::emit_readline_start(&prompt);
+                        ipc::emit_input_wait(&prompt);
                     } else if release_gil_while_waiting {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
@@ -154,12 +151,11 @@ fn wait_for_turn_line(
 
         match action {
             ReadlineAction::Line {
-                input_id,
                 bytes,
                 prompt_already_visible,
             } => {
                 let text = String::from_utf8_lossy(&bytes);
-                ipc::emit_input_line(input_id, prompt, &text);
+                ipc::emit_input_line(prompt, &text);
                 if emit_prompt_to_stdout && !prompt.is_empty() && !prompt_already_visible {
                     emit_output_text(TextStream::Stdout, prompt.as_bytes());
                 }
@@ -168,11 +164,11 @@ fn wait_for_turn_line(
                     interrupted: false,
                 });
             }
-            ReadlineAction::InputWait { input_id, prompt } => {
+            ReadlineAction::InputWait { prompt } => {
                 emit_plots();
                 remember_emitted_prompt(&prompt);
                 mark_input_wait_completed_request();
-                ipc::emit_input_wait(input_id, &prompt);
+                ipc::emit_input_wait(&prompt);
                 idle_prompt_emitted = true;
             }
             ReadlineAction::Interrupted => {
@@ -187,7 +183,7 @@ fn wait_for_turn_line(
                     interrupted: false,
                 });
             }
-            ReadlineAction::ReadlineStart { .. } => unreachable!(),
+            ReadlineAction::IdleWait { .. } => unreachable!(),
         }
     }
 }
@@ -251,15 +247,14 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
                     guard.waiting_for_input = false;
                     guard.request_active = true;
                     ReadlineAction::Line {
-                        input_id: read.input_id,
                         bytes: read.protocol_bytes,
                         prompt_already_visible: true,
                     }
                 }
                 Ok(None) => {
-                    if let Some(input_id) = guard.input_queue.take_completed_input() {
+                    if guard.input_queue.take_completed_input() {
                         let prompt = String::new();
-                        ReadlineAction::InputWait { input_id, prompt }
+                        ReadlineAction::InputWait { prompt }
                     } else if output.is_empty() {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
@@ -278,17 +273,15 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
         };
 
         match action {
-            ReadlineAction::Line {
-                input_id, bytes, ..
-            } => {
-                ipc::emit_input_line(input_id, "", &String::from_utf8_lossy(&bytes));
+            ReadlineAction::Line { bytes, .. } => {
+                ipc::emit_input_line("", &String::from_utf8_lossy(&bytes));
                 output.extend(bytes);
             }
-            ReadlineAction::InputWait { input_id, prompt } => {
+            ReadlineAction::InputWait { prompt } => {
                 emit_plots();
                 remember_emitted_prompt(&prompt);
                 mark_input_wait_completed_request();
-                ipc::emit_input_wait(input_id, &prompt);
+                ipc::emit_input_wait(&prompt);
                 if !output.is_empty() {
                     return Ok(output);
                 }

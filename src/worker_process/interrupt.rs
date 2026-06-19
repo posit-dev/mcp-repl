@@ -200,7 +200,7 @@ impl WorkerManager {
             if timeout.is_zero() {
                 timed_out = true;
             } else {
-                match ipc.wait_for_prompt(timeout) {
+                match ipc.wait_for_input_wait(timeout) {
                     Ok(value) => {
                         prompt = Some(value);
                     }

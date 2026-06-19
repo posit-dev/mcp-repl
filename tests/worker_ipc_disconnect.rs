@@ -113,7 +113,7 @@ mod unix {
     }
 
     #[tokio::test]
-    async fn worker_reads_raw_stdin_with_ipc_request_boundary() -> TestResult<()> {
+    async fn worker_runs_ipc_input_batch_without_raw_stdin() -> TestResult<()> {
         let exe = resolve_exe()?;
         let (server_read_fd, child_write_fd) = pipe_pair()?;
         let (child_read_fd, server_write_fd) = pipe_pair()?;
@@ -144,20 +144,30 @@ mod unix {
         let mut ipc_writer = tokio::fs::File::from_std(server_write);
         let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
 
-        let input = "if (TRUE) {\ncat(\"RAW_STDIN_OK\\n\")\n}\n";
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if ipc_reader.read_line(&mut line).await? == 0 {
+                return Err("worker exited before initial input_wait".into());
+            }
+            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            if value["type"] == "input_wait" {
+                break;
+            }
+        }
+
+        let input = "if (TRUE) {\ncat(\"IPC_INPUT_OK\\n\")\n}\n";
         let request = json!({
             "type": "input_batch",
-            "input_id": 1,
             "input": input
         });
         ipc_writer.write_all(request.to_string().as_bytes()).await?;
         ipc_writer.write_all(b"\n").await?;
         ipc_writer.flush().await?;
-        stdin.write_all(input.as_bytes()).await?;
+        stdin.write_all(b"cat(\"RAW_STDIN_WRONG\\n\")\n").await?;
         stdin.flush().await?;
 
         let mut seen = String::new();
-        let mut line = String::new();
         let read_result = time::timeout(Duration::from_secs(10), async {
             loop {
                 line.clear();
@@ -173,17 +183,20 @@ mod unix {
                 };
                 let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
                 seen.push_str(&String::from_utf8_lossy(&bytes));
-                if seen.contains("RAW_STDIN_OK") {
+                if seen.contains("RAW_STDIN_WRONG") {
+                    return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                        "raw stdin was consumed as managed input".into(),
+                    );
+                }
+                if seen.contains("IPC_INPUT_OK") {
                     break Ok(());
                 }
             }
         })
         .await;
 
-        let session_end = json!({ "type": "session_end" });
-        let _ = ipc_writer
-            .write_all(session_end.to_string().as_bytes())
-            .await;
+        let shutdown = json!({ "type": "shutdown" });
+        let _ = ipc_writer.write_all(shutdown.to_string().as_bytes()).await;
         let _ = ipc_writer.write_all(b"\n").await;
         let _ = ipc_writer.flush().await;
         let _ = time::timeout(Duration::from_secs(10), child.wait()).await;
@@ -193,14 +206,18 @@ mod unix {
             Ok(Err(err)) => return Err(err),
             Err(_) => {
                 return Err(format!(
-                    "worker did not execute raw stdin request before timeout; saw {seen:?}"
+                    "worker did not execute IPC input before timeout; saw {seen:?}"
                 )
                 .into());
             }
         }
         assert!(
-            seen.contains("RAW_STDIN_OK"),
-            "expected raw stdin output, saw {seen:?}"
+            seen.contains("IPC_INPUT_OK"),
+            "expected IPC input output, saw {seen:?}"
+        );
+        assert!(
+            !seen.contains("RAW_STDIN_WRONG"),
+            "managed request path must not consume raw stdin, saw {seen:?}"
         );
 
         Ok(())

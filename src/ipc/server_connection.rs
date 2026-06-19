@@ -76,7 +76,7 @@ impl ServerIpcConnection {
         let reader_cvar = cvar.clone();
         let output_text_handler = handlers.on_output_text.clone();
         let plot_handler = handlers.on_plot_image.clone();
-        let readline_start_handler = handlers.on_readline_start.clone();
+        let input_wait_handler = handlers.on_input_wait.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
@@ -142,32 +142,14 @@ impl ServerIpcConnection {
                     }
                 }
                 match message {
-                    WorkerToServerIpcMessage::ReadlineStart { prompt } => {
-                        let prompt_for_handler = prompt.clone();
-                        let mut guard = reader_inbox.lock().unwrap();
-                        push_prompt_history(&mut guard, prompt.clone());
-                        guard.last_prompt = Some(prompt);
-                        reader_cvar.notify_all();
-                        drop(guard);
-                        if let Some(handler) = readline_start_handler.as_ref() {
-                            handler(prompt_for_handler);
-                        }
-                    }
-                    WorkerToServerIpcMessage::InputLine {
-                        input_id,
-                        prompt,
-                        text,
-                    } => {
+                    WorkerToServerIpcMessage::InputLine { prompt, text } => {
                         let echo_event = IpcEchoEvent {
                             prompt: prompt.clone(),
                             line: text.clone(),
                             source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) = guard
-                            .input_state
-                            .validate_open_active_input_id(input_id, "input_line")
-                        {
+                        if let Err(err) = guard.input_state.validate_active_input("input_line") {
                             guard.input_state.latch_protocol_error(err);
                             reader_cvar.notify_all();
                             break;
@@ -181,24 +163,20 @@ impl ServerIpcConnection {
                             handler(echo_event);
                         }
                     }
-                    WorkerToServerIpcMessage::InputWait { input_id, prompt } => {
+                    WorkerToServerIpcMessage::InputWait { prompt } => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) = guard
-                            .input_state
-                            .record_input_wait(input_id, Instant::now())
-                        {
-                            guard.input_state.latch_protocol_error(err);
-                            reader_cvar.notify_all();
-                            break;
-                        }
+                        guard.input_state.record_input_wait(Instant::now());
                         push_prompt_history(&mut guard, prompt.clone());
-                        guard.last_prompt = Some(prompt);
+                        guard.last_prompt = Some(prompt.clone());
                         reader_cvar.notify_all();
+                        drop(guard);
+                        if let Some(handler) = input_wait_handler.as_ref() {
+                            handler(prompt);
+                        }
                     }
                     WorkerToServerIpcMessage::SessionEnd {
                         reason,
                         message_b64,
-                        input_id,
                     } => {
                         if let Err(err) =
                             validate_session_end(reason.as_deref(), message_b64.as_deref())
@@ -209,20 +187,10 @@ impl ServerIpcConnection {
                             break;
                         }
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Some(input_id) = input_id
-                            && let Err(err) = guard
-                                .input_state
-                                .validate_open_active_input_id(input_id, "session_end")
-                        {
-                            guard.input_state.latch_protocol_error(err);
-                            reader_cvar.notify_all();
-                            break;
-                        }
                         guard.input_state.note_session_end();
                         guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
                             reason,
                             message_b64,
-                            input_id,
                         });
                         reader_cvar.notify_all();
                         drop(guard);
@@ -403,13 +371,19 @@ impl ServerIpcConnection {
         guard.protocol_warnings.clear();
     }
 
-    pub fn begin_input(&self, input_id: u64) {
+    pub fn begin_input(&self) -> Result<(), String> {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.input_state.begin_input(input_id);
+        guard.input_state.begin_input()?;
         guard.echo_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
+        Ok(())
+    }
+
+    pub fn note_interrupt_sent(&self) {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.input_state.note_interrupt_sent();
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {
@@ -506,7 +480,7 @@ impl ServerIpcConnection {
         }
     }
 
-    pub fn wait_for_prompt(&self, timeout: Duration) -> Result<String, IpcWaitError> {
+    pub fn wait_for_input_wait(&self, timeout: Duration) -> Result<String, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
@@ -776,6 +750,19 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn wait_for_protocol_error(server: &ServerIpcConnection) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if let Some(message) = server.take_protocol_error() {
+                return Some(message);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn invalid_worker_message_disconnects_server_ipc() {
         let (server_read, mut worker_write) = std::io::pipe().expect("server pipe");
@@ -814,17 +801,23 @@ mod tests {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
-        server.begin_input(1);
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "zod> ".to_string(),
+            })
+            .expect("send initial input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes initial input_wait");
+        server.begin_input().expect("begin input");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                input_id: 1,
                 prompt: "zod> ".to_string(),
                 text: "done\n".to_string(),
             })
             .expect("send input_line");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                input_id: 1,
                 prompt: "zod> ".to_string(),
             })
             .expect("send input_wait");
@@ -845,6 +838,66 @@ mod tests {
         );
         let latched = server.take_protocol_error();
         assert_eq!(latched.as_deref(), Some("invalid output_text base64"));
+    }
+
+    #[test]
+    fn begin_input_requires_input_wait_availability() {
+        let (server, _worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        let err = server
+            .begin_input()
+            .expect_err("input cannot start before input_wait");
+
+        assert_eq!(
+            err,
+            "input_batch sent while worker is not waiting for input"
+        );
+    }
+
+    #[test]
+    fn input_wait_without_active_input_updates_availability_and_prompt() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "ready> ".to_string(),
+            })
+            .expect("send input_wait");
+
+        let prompt = server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes input_wait");
+        assert_eq!(prompt, "ready> ");
+        server
+            .begin_input()
+            .expect("input_wait should make worker available");
+    }
+
+    #[test]
+    fn input_line_without_active_input_is_protocol_error() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "> ".to_string(),
+            })
+            .expect("send input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes input_wait");
+
+        worker
+            .send(WorkerToServerIpcMessage::InputLine {
+                prompt: "> ".to_string(),
+                text: "orphan\n".to_string(),
+            })
+            .expect("send input_line");
+
+        let err = wait_for_protocol_error(&server)
+            .expect("server should latch input_line protocol error");
+        assert_eq!(err, "input_line reported with no active input");
     }
     #[test]
     fn plot_image_updates_reuse_current_server_image_id() {

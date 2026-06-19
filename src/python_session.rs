@@ -61,9 +61,9 @@ impl PythonSession {
     }
 
     #[cfg(windows)]
-    pub fn begin_input(&self, input_id: u64, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
-        windows_stdin::begin_tracked_input_batch(input_id, input)
+        windows_stdin::begin_tracked_input_batch(input)
     }
 }
 
@@ -139,11 +139,6 @@ pub(crate) fn interrupt() {
     interrupt_for_request_generation(None);
 }
 
-#[cfg(windows)]
-pub(crate) fn interrupt_input(input_id: u64) {
-    windows_stdin::interrupt_input(input_id);
-}
-
 fn interrupt_for_request_generation(request_generation: Option<u64>) {
     let _ = request_generation;
     discard_pending_stdin();
@@ -182,20 +177,20 @@ fn take_interrupt_requested() -> bool {
     requested
 }
 
-pub(crate) fn begin_input(input_id: u64, input: String) -> Result<(), String> {
+pub(crate) fn begin_input(input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
-        unix_stdin::begin_input_batch(input_id, &input)
+        unix_stdin::begin_input_batch(&input)
     }
 
     #[cfg(windows)]
     {
-        PythonSession::global()?.begin_input(input_id, input)
+        PythonSession::global()?.begin_input(input)
     }
 
     #[cfg(not(any(target_family = "unix", windows)))]
     {
-        let _ = (input_id, input);
+        let _ = input;
         Ok(())
     }
 }
@@ -485,12 +480,12 @@ fn handle_input_hook() {
             flush_original_stdio();
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
-            ipc::emit_readline_start(prompt);
+            ipc::emit_input_wait(prompt);
             complete_active_request(state, Some(active), false);
         } else if emit_readline_prompt {
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
-            ipc::emit_readline_start(prompt);
+            ipc::emit_input_wait(prompt);
         }
     }
 }
@@ -562,11 +557,8 @@ fn finish_repl_turn_request() {
         let primary_prompt = guard.python_primary_prompt.clone();
         let continuation_prompt = guard.python_continuation_prompt.clone();
         guard.interrupt_requested = false;
-        if guard
-            .active_request
-            .as_ref()
-            .is_some_and(|active| active.input_id.is_some())
-        {
+        #[cfg(windows)]
+        if guard.active_request.is_some() {
             return;
         }
         if guard.active_request.is_some() {
@@ -604,7 +596,7 @@ fn finish_repl_turn_request() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt);
+        ipc::emit_input_wait(prompt);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -664,7 +656,7 @@ unsafe extern "C" fn mcp_repl_readline(
         Ok(read) => read,
         Err(err) => {
             emit_output_text(TextStream::Stderr, err.as_bytes());
-            ipc::emit_session_end_with_reason("protocol_error", None);
+            ipc::emit_session_end_with_reason("protocol_error");
             request_exit();
             StdioLineRead {
                 bytes: Vec::new(),

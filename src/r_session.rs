@@ -59,17 +59,15 @@ impl RSession {
         self.init.wait_ready()
     }
 
-    pub fn begin_input(&self, input_id: u64, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
         let state = session_state();
         let mut guard = state.inner.lock().unwrap();
-        if let Some(active) = guard.active_input_id {
-            return Err(format!(
-                "input_batch input_id {input_id} arrived while input_id {active} is active"
-            ));
+        if guard.active_input {
+            return Err("input_batch arrived while input is active".to_string());
         }
-        guard.active_input_id = Some(input_id);
-        queue_input(&mut guard.input_queue, input_id, &input);
+        guard.active_input = true;
+        queue_input(&mut guard.input_queue, &input);
         state.cvar.notify_all();
         Ok(())
     }
@@ -168,7 +166,7 @@ struct SessionState {
 }
 
 struct SessionStateInner {
-    active_input_id: Option<u64>,
+    active_input: bool,
     input_queue: VecDeque<InputBatchLine>,
     plot_hashes: HashMap<String, u64>,
     last_prompt: Option<String>,
@@ -178,7 +176,6 @@ struct SessionStateInner {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InputBatchLine {
-    input_id: u64,
     text: String,
 }
 
@@ -186,7 +183,7 @@ impl SessionState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SessionStateInner {
-                active_input_id: None,
+                active_input: false,
                 input_queue: VecDeque::new(),
                 plot_hashes: HashMap::new(),
                 last_prompt: None,
@@ -603,7 +600,7 @@ fn session_state() -> &'static Arc<SessionState> {
         .expect("R session state was not initialized")
 }
 
-fn queue_input(queue: &mut VecDeque<InputBatchLine>, input_id: u64, input: &str) {
+fn queue_input(queue: &mut VecDeque<InputBatchLine>, input: &str) {
     if input.is_empty() {
         return;
     }
@@ -615,11 +612,7 @@ fn queue_input(queue: &mut VecDeque<InputBatchLine>, input_id: u64, input: &str)
             lines.push("\n".to_string());
         }
     }
-    queue.extend(
-        lines
-            .into_iter()
-            .map(|text| InputBatchLine { input_id, text }),
-    );
+    queue.extend(lines.into_iter().map(|text| InputBatchLine { text }));
 }
 
 fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
@@ -642,15 +635,8 @@ fn split_console_line(
         split -= 1;
     }
     assert!(split > 0, "R console buffer is too small for UTF-8 input");
-    let input_id = line.input_id;
     let tail = line.text.split_off(split);
-    (
-        line,
-        Some(InputBatchLine {
-            input_id,
-            text: tail,
-        }),
-    )
+    (line, Some(InputBatchLine { text: tail }))
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
@@ -946,11 +932,10 @@ pub extern "C-unwind" fn r_read_console(
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
         .unwrap_or(false);
     let state = session_state();
-    ipc::emit_readline_start(prompt);
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
-        if guard.input_queue.is_empty() && guard.active_input_id.is_none() {
+        if guard.input_queue.is_empty() && !guard.active_input {
             guard.plot_hashes.clear();
         }
     }
@@ -1013,7 +998,7 @@ pub extern "C-unwind" fn r_read_console(
             let mut echoed = String::with_capacity(prompt.len() + line_text.text.len());
             echoed.push_str(prompt);
             echoed.push_str(&line_text.text);
-            ipc::emit_input_line(line_text.input_id, prompt, &line_text.text);
+            ipc::emit_input_line(prompt, &line_text.text);
             if !echoed.is_empty() {
                 emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
@@ -1021,13 +1006,24 @@ pub extern "C-unwind" fn r_read_console(
             return 1;
         }
 
-        if let Some(input_id) = guard.active_input_id.take() {
+        if guard.active_input {
+            guard.active_input = false;
             let prompt = prompt.to_string();
             guard.plot_hashes.clear();
             drop(guard);
-            ipc::emit_input_wait(input_id, &prompt);
+            ipc::emit_input_wait(&prompt);
+            let mut guard = state.inner.lock().unwrap();
+            if guard.input_queue.is_empty() && !guard.shutdown {
+                guard = state.cvar.wait(guard).unwrap();
+            }
+            drop(guard);
             continue;
         }
+
+        let prompt = prompt.to_string();
+        drop(guard);
+        ipc::emit_input_wait(&prompt);
+        let mut guard = state.inner.lock().unwrap();
 
         guard = state.cvar.wait(guard).unwrap();
         drop(guard);
@@ -1073,21 +1069,19 @@ mod input_queue_tests {
     use super::{InputBatchLine, queue_input, split_console_line};
 
     #[test]
-    fn queue_input_attaches_input_id_to_each_line() {
+    fn queue_input_splits_input_into_console_lines() {
         let mut queue = VecDeque::new();
 
-        queue_input(&mut queue, 7, "alpha\nbeta");
+        queue_input(&mut queue, "alpha\nbeta");
 
         let queued = queue.into_iter().collect::<Vec<_>>();
         assert_eq!(
             queued,
             vec![
                 InputBatchLine {
-                    input_id: 7,
                     text: "alpha\n".to_string(),
                 },
                 InputBatchLine {
-                    input_id: 7,
                     text: "beta\n".to_string(),
                 },
             ]
@@ -1095,9 +1089,8 @@ mod input_queue_tests {
     }
 
     #[test]
-    fn split_console_line_preserves_input_id_on_remainder() {
+    fn split_console_line_preserves_text_remainder() {
         let line = InputBatchLine {
-            input_id: 11,
             text: "abcdef\n".to_string(),
         };
 
@@ -1106,14 +1099,12 @@ mod input_queue_tests {
         assert_eq!(
             head,
             InputBatchLine {
-                input_id: 11,
                 text: "abc".to_string(),
             }
         );
         assert_eq!(
             tail,
             Some(InputBatchLine {
-                input_id: 11,
                 text: "def\n".to_string(),
             })
         );

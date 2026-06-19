@@ -53,7 +53,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 4,
+            version: 5,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -64,6 +64,10 @@ fn run_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
+    writer.send(&WorkerToServer::InputWait {
+        prompt: "v5> ".to_string(),
+    })?;
+    append_control_log(control_log_path.as_deref(), "input_wait")?;
     if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
@@ -80,20 +84,19 @@ fn run_worker(
     );
 
     let mut state = CommandState {
-        next_prompt: "v4> ".to_string(),
+        next_prompt: "v5> ".to_string(),
         previous_line_empty: false,
-        input_line_after_idle: false,
-        session_end_after_idle: false,
-        bad_output_after_idle: None,
+        input_line_after_input_wait: false,
+        session_end_after_input_wait: false,
+        bad_output_after_input_wait: None,
     };
     while let Ok(message) = rx.recv() {
         match message {
-            ControlMessage::InputBatch { input_id, input } => {
+            ControlMessage::InputBatch { input } => {
                 if run_turn(
                     &writer,
                     &sideband_interrupted,
                     &control_log_path,
-                    input_id,
                     &input,
                     &mut state,
                 )? {
@@ -102,7 +105,7 @@ fn run_worker(
             }
             ControlMessage::Interrupt => {}
             ControlMessage::Shutdown => {
-                send_session_end(&writer, None, "shutdown")?;
+                send_session_end(&writer, "shutdown")?;
                 return Ok(());
             }
         }
@@ -115,30 +118,24 @@ fn run_turn(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     control_log_path: &Option<PathBuf>,
-    input_id: u64,
     input: &str,
     state: &mut CommandState,
 ) -> io::Result<bool> {
     for raw_line in runtime_lines(input) {
         let prompt = state.next_prompt.clone();
         writer.send(&WorkerToServer::InputLine {
-            input_id,
             prompt,
             text: raw_line.clone(),
         })?;
         append_control_log(
             control_log_path.as_deref(),
-            &format!(
-                "input_line input_id={input_id} text={}",
-                escape_bytes(raw_line.as_bytes())
-            ),
+            &format!("input_line text={}", escape_bytes(raw_line.as_bytes())),
         )?;
         let command = raw_line.trim_end_matches(['\r', '\n']);
         if run_command(
             writer,
             sideband_interrupted,
             control_log_path,
-            input_id,
             command,
             state,
         )? {
@@ -147,13 +144,10 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v4> ".to_string());
-    writer.send(&WorkerToServer::InputWait { input_id, prompt })?;
-    append_control_log(
-        control_log_path.as_deref(),
-        &format!("input_wait input_id={input_id}"),
-    )?;
-    emit_deferred_protocol_faults(writer, control_log_path, input_id, state)?;
+    let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
+    writer.send(&WorkerToServer::InputWait { prompt })?;
+    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    emit_deferred_protocol_faults(writer, control_log_path, state)?;
     Ok(false)
 }
 
@@ -161,7 +155,6 @@ fn run_command(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     control_log_path: &Option<PathBuf>,
-    input_id: u64,
     command: &str,
     state: &mut CommandState,
 ) -> io::Result<bool> {
@@ -181,10 +174,7 @@ fn run_command(
 
     if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
         sleep_for(parse_millis(millis)?, sideband_interrupted, false);
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("bad_output_after_sleep input_id={input_id}"),
-        )?;
+        append_control_log(control_log_path.as_deref(), "bad_output_after_sleep")?;
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         sleep_for(5_000, sideband_interrupted, false);
         return Ok(false);
@@ -201,75 +191,64 @@ fn run_command(
             },
             if report.os { "observed" } else { "missing" },
         );
-        output_text(writer, control_log_path, input_id, text.as_bytes())?;
+        output_text(writer, control_log_path, text.as_bytes())?;
         return Ok(false);
     }
 
     if command == "emit-output-after-input" {
-        output_text(writer, control_log_path, input_id, b"after input_line\n")?;
+        output_text(writer, control_log_path, b"after input_line\n")?;
         return Ok(false);
     }
 
     if command == "late-input-line-after-input-wait" {
-        state.input_line_after_idle = true;
+        state.input_line_after_input_wait = true;
         return Ok(false);
     }
 
     if command == "session-end-after-input-wait" {
-        state.session_end_after_idle = true;
+        state.session_end_after_input_wait = true;
         return Ok(false);
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-after-input-wait ") {
-        state.bad_output_after_idle = Some(Duration::from_millis(parse_millis(millis)?));
+        state.bad_output_after_input_wait = Some(Duration::from_millis(parse_millis(millis)?));
         return Ok(false);
     }
 
     if command == "exit" {
-        send_session_end(writer, Some(input_id), "runtime_exit")?;
+        send_session_end(writer, "runtime_exit")?;
         return Ok(true);
     }
 
-    let text = format!("v4-output: {command}\n");
-    output_text(writer, control_log_path, input_id, text.as_bytes())?;
+    let text = format!("v5-output: {command}\n");
+    output_text(writer, control_log_path, text.as_bytes())?;
     Ok(false)
 }
 
 fn emit_deferred_protocol_faults(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
-    input_id: u64,
     state: &mut CommandState,
 ) -> io::Result<()> {
-    if state.input_line_after_idle {
-        state.input_line_after_idle = false;
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("late_input_line input_id={input_id}"),
-        )?;
+    if state.input_line_after_input_wait {
+        state.input_line_after_input_wait = false;
+        append_control_log(control_log_path.as_deref(), "late_input_line")?;
         writer.send(&WorkerToServer::InputLine {
-            input_id,
-            prompt: "v4> ".to_string(),
+            prompt: "v5> ".to_string(),
             text: "late\n".to_string(),
         })?;
     }
-    if state.session_end_after_idle {
-        state.session_end_after_idle = false;
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("late_session_end input_id={input_id}"),
-        )?;
-        send_session_end(writer, Some(input_id), "runtime_exit")?;
+    if state.session_end_after_input_wait {
+        state.session_end_after_input_wait = false;
+        append_control_log(control_log_path.as_deref(), "late_session_end")?;
+        send_session_end(writer, "runtime_exit")?;
     }
-    if let Some(delay) = state.bad_output_after_idle.take() {
+    if let Some(delay) = state.bad_output_after_input_wait.take() {
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
         thread::spawn(move || {
             thread::sleep(delay);
-            let _ = append_control_log(
-                control_log_path.as_deref(),
-                &format!("late_bad_output input_id={input_id}"),
-            );
+            let _ = append_control_log(control_log_path.as_deref(), "late_bad_output");
             let _ = writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64);
         });
     }
@@ -279,21 +258,16 @@ fn emit_deferred_protocol_faults(
 fn output_text(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
-    input_id: u64,
     bytes: &[u8],
 ) -> io::Result<()> {
-    append_control_log(
-        control_log_path.as_deref(),
-        &format!("output_text input_id={input_id}"),
-    )?;
+    append_control_log(control_log_path.as_deref(), "output_text")?;
     writer.output_text("stdout", bytes)
 }
 
-fn send_session_end(writer: &IpcWriter, input_id: Option<u64>, reason: &str) -> io::Result<()> {
+fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
         message_b64: None,
-        input_id,
     })
 }
 
@@ -319,9 +293,9 @@ fn runtime_lines(input: &str) -> Vec<String> {
 struct CommandState {
     next_prompt: String,
     previous_line_empty: bool,
-    input_line_after_idle: bool,
-    session_end_after_idle: bool,
-    bad_output_after_idle: Option<Duration>,
+    input_line_after_input_wait: bool,
+    session_end_after_input_wait: bool,
+    bad_output_after_input_wait: Option<Duration>,
 }
 
 fn start_control_reader(
@@ -344,22 +318,16 @@ fn start_control_reader(
             }
             let message = serde_json::from_str::<ServerToWorker>(line.trim_end());
             match message {
-                Ok(ServerToWorker::InputBatch { input_id, input }) => {
+                Ok(ServerToWorker::InputBatch { input }) => {
                     let _ = append_control_log(
                         control_log_path.as_deref(),
-                        &format!(
-                            "input_batch input_id={input_id} input={}",
-                            escape_bytes(input.as_bytes())
-                        ),
+                        &format!("input_batch input={}", escape_bytes(input.as_bytes())),
                     );
-                    let _ = turn_tx.send(ControlMessage::InputBatch { input_id, input });
+                    let _ = turn_tx.send(ControlMessage::InputBatch { input });
                 }
-                Ok(ServerToWorker::Interrupt { input_id }) => {
+                Ok(ServerToWorker::Interrupt {}) => {
                     interrupted.store(true, Ordering::SeqCst);
-                    let _ = append_control_log(
-                        control_log_path.as_deref(),
-                        &format!("interrupt input_id={}", input_id.unwrap_or(0)),
-                    );
+                    let _ = append_control_log(control_log_path.as_deref(), "interrupt");
                     let _ = turn_tx.send(ControlMessage::Interrupt);
                 }
                 Err(_) => {}
@@ -390,7 +358,7 @@ fn start_stdin_observer(control_log_path: Option<PathBuf>) {
 
 #[derive(Debug)]
 enum ControlMessage {
-    InputBatch { input_id: u64, input: String },
+    InputBatch { input: String },
     Interrupt,
     Shutdown,
 }
@@ -398,8 +366,8 @@ enum ControlMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerToWorker {
-    InputBatch { input_id: u64, input: String },
-    Interrupt { input_id: Option<u64> },
+    InputBatch { input: String },
+    Interrupt {},
 }
 
 #[derive(Serialize)]
@@ -415,18 +383,15 @@ enum WorkerToServer {
         data_b64: String,
     },
     InputLine {
-        input_id: u64,
         prompt: String,
         text: String,
     },
     InputWait {
-        input_id: u64,
         prompt: String,
     },
     SessionEnd {
         reason: String,
         message_b64: Option<String>,
-        input_id: Option<u64>,
     },
 }
 

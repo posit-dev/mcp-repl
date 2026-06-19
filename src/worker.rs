@@ -53,21 +53,16 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::InputBatch { input_id, input }) => {
-                        match wait_for_r_session()
-                            .and_then(|session| session.begin_input(input_id, input))
-                        {
+                    Some(ServerToWorkerIpcMessage::InputBatch { input }) => {
+                        match wait_for_r_session().and_then(|session| session.begin_input(input)) {
                             Ok(()) => {}
                             Err(err) => {
                                 crate::output_stream::write_stderr_bytes(err.as_bytes());
-                                crate::ipc::emit_session_end_with_reason(
-                                    "protocol_error",
-                                    Some(input_id),
-                                );
+                                crate::ipc::emit_session_end_with_reason("protocol_error");
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
+                    Some(ServerToWorkerIpcMessage::Interrupt {}) => {
                         crate::r_session::clear_pending_input();
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {

@@ -2,15 +2,12 @@ use std::time::Instant;
 
 #[derive(Default)]
 pub(crate) struct InputState {
-    active: Option<ActiveInput>,
+    active: bool,
+    available: bool,
+    completed_observed_at: Option<Instant>,
     protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
     session_end_final: bool,
-}
-
-struct ActiveInput {
-    id: u64,
-    completed_observed_at: Option<Instant>,
 }
 
 struct LatchedProtocolError {
@@ -19,71 +16,48 @@ struct LatchedProtocolError {
 }
 
 impl InputState {
-    pub(crate) fn begin_input(&mut self, input_id: u64) {
-        self.active = Some(ActiveInput {
-            id: input_id,
-            completed_observed_at: None,
-        });
+    pub(crate) fn begin_input(&mut self) -> Result<(), String> {
+        if !self.available {
+            return Err("input_batch sent while worker is not waiting for input".to_string());
+        }
+        self.active = true;
+        self.available = false;
+        self.completed_observed_at = None;
+        Ok(())
     }
 
     pub(crate) fn clear_request_progress(&mut self) {
-        self.active = None;
+        self.active = false;
+        self.completed_observed_at = None;
     }
 
     pub(crate) fn has_active_input(&self) -> bool {
-        self.active.is_some()
+        self.active
     }
 
-    pub(crate) fn validate_active_input_id(
-        &self,
-        input_id: u64,
-        event_type: &str,
-    ) -> Result<(), String> {
-        match self.active.as_ref().map(|turn| turn.id) {
-            Some(active) if active == input_id => Ok(()),
-            Some(active) => Err(format!(
-                "{event_type} input_id {input_id} does not match active input_id {active}"
-            )),
-            None => Err(format!(
-                "{event_type} reported input_id {input_id} with no active input"
-            )),
+    pub(crate) fn validate_active_input(&self, event_type: &str) -> Result<(), String> {
+        if !self.active {
+            return Err(format!("{event_type} reported with no active input"));
         }
-    }
-
-    pub(crate) fn validate_open_active_input_id(
-        &self,
-        input_id: u64,
-        event_type: &str,
-    ) -> Result<(), String> {
-        self.validate_active_input_id(input_id, event_type)?;
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|turn| turn.completed_observed_at.is_some())
-        {
-            return Err(format!(
-                "{event_type} input_id {input_id} arrived after input_wait"
-            ));
+        if self.completed_observed_at.is_some() {
+            return Err(format!("{event_type} arrived after input_wait"));
         }
         Ok(())
     }
 
-    pub(crate) fn record_input_wait(
-        &mut self,
-        input_id: u64,
-        observed_at: Instant,
-    ) -> Result<(), String> {
-        self.validate_open_active_input_id(input_id, "input_wait")?;
-        if let Some(active) = self.active.as_mut() {
-            active.completed_observed_at = Some(observed_at);
+    pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
+        self.available = true;
+        if self.active {
+            self.completed_observed_at = Some(observed_at);
         }
-        Ok(())
+    }
+
+    pub(crate) fn note_interrupt_sent(&mut self) {
+        self.available = false;
     }
 
     pub(crate) fn request_completion_ready(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|turn| turn.completed_observed_at.is_some())
+        self.active && self.completed_observed_at.is_some()
     }
 
     pub(crate) fn request_completion_precedes_protocol_error(&self) -> bool {
@@ -91,16 +65,16 @@ impl InputState {
             return false;
         };
         self.active
-            .as_ref()
-            .and_then(|turn| turn.completed_observed_at)
-            .is_some_and(|observed_at| observed_at <= error.observed_at)
+            && self
+                .completed_observed_at
+                .is_some_and(|observed_at| observed_at <= error.observed_at)
     }
 
     pub(crate) fn request_completion_observed_before(&self, deadline: Instant) -> bool {
         self.active
-            .as_ref()
-            .and_then(|turn| turn.completed_observed_at)
-            .is_some_and(|observed_at| observed_at <= deadline)
+            && self
+                .completed_observed_at
+                .is_some_and(|observed_at| observed_at <= deadline)
     }
 
     pub(crate) fn latch_protocol_error(&mut self, message: impl Into<String>) {

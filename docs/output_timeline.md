@@ -74,7 +74,8 @@ Echo matching must be driven by the sideband facts themselves:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
-- `input_wait` supplies the prompt text for a completed turn
+- `input_wait` supplies the prompt text for worker readiness and completed
+  input batches
 - the server should match and collapse those exact sideband facts
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`

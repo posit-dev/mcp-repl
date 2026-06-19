@@ -79,7 +79,7 @@ impl PendingOutputEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingSidebandKind {
-    ReadlineStart {
+    InputWait {
         prompt: String,
     },
     ReadlineResult {
@@ -661,7 +661,7 @@ impl PendingOutputSnapshot {
                     last_rendered_text = None;
                 }
                 PendingOutputEvent::Sideband { kind, .. } => match kind {
-                    PendingSidebandKind::ReadlineStart { prompt } => {
+                    PendingSidebandKind::InputWait { prompt } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                     }
                     PendingSidebandKind::ReadlineResult {
@@ -1887,7 +1887,7 @@ mod tests {
             line: "alpha\n".to_string(),
             echo_source: PendingTextSource::Raw,
         });
-        tape.append_sideband(PendingSidebandKind::ReadlineStart {
+        tape.append_sideband(PendingSidebandKind::InputWait {
             prompt: "SECOND> ".to_string(),
         });
 

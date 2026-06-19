@@ -31,27 +31,22 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::InputBatch { input_id, input }) => {
-                        match python_session::begin_input(input_id, input) {
+                    Some(ServerToWorkerIpcMessage::InputBatch { input }) => {
+                        match python_session::begin_input(input) {
                             Ok(()) => {}
                             Err(err) => {
                                 emit_stderr_message(&err);
-                                emit_session_end_with_reason("protocol_error", Some(input_id));
+                                emit_session_end_with_reason("protocol_error");
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt { input_id }) => {
+                    Some(ServerToWorkerIpcMessage::Interrupt {}) => {
                         #[cfg(windows)]
                         {
-                            if let Some(input_id) = input_id {
-                                python_session::interrupt_input(input_id);
-                            } else {
-                                python_session::interrupt();
-                            }
+                            python_session::interrupt();
                         }
                         #[cfg(not(windows))]
                         {
-                            let _ = input_id;
                             python_session::interrupt();
                         }
                     }

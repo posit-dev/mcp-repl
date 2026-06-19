@@ -290,7 +290,7 @@ impl WorkerSupervisor {
         if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             return Err(Self::terminate_spawn_error(process, backend, err));
         }
-        let initial_prompt = match seed_initial_prompt_from_process(&process) {
+        let initial_prompt = match seed_initial_input_wait_from_process(&process) {
             Ok(prompt) => prompt,
             Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
         };
@@ -346,7 +346,7 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
     }
 }
 
-fn seed_initial_prompt_from_process(
+fn seed_initial_input_wait_from_process(
     process: &WorkerProcess,
 ) -> Result<Option<InitialWorkerPrompt>, WorkerError> {
     let Some(ipc) = process.ipc_connection() else {
@@ -355,12 +355,18 @@ fn seed_initial_prompt_from_process(
     if let Some(raw_prompt) = ipc.try_take_prompt() {
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
-    match ipc.wait_for_prompt(Duration::from_millis(200)) {
+    match ipc.wait_for_input_wait(WORKER_READY_TIMEOUT) {
         Ok(prompt) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-        Err(IpcWaitError::Timeout | IpcWaitError::SessionEnd | IpcWaitError::Disconnected) => {
-            Ok(None)
-        }
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
+            "timed out waiting for worker input_wait".to_string(),
+        )),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before input_wait".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker input_wait".to_string(),
+        )),
     }
 }
 
@@ -579,8 +585,8 @@ impl WorkerProcess {
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
                     image_capture.append_image(image);
                 })),
-                on_readline_start: Some(Arc::new(move |prompt: String| {
-                    sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+                on_input_wait: Some(Arc::new(move |prompt: String| {
+                    sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
                 on_readline_result: {
                     let sideband_capture = live_output.clone();
@@ -2361,7 +2367,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
 
         let output_capture = capture.clone();
-        let start_capture = capture.clone();
+        let wait_capture = capture.clone();
         let result_capture = capture.clone();
         let image_capture = capture.clone();
         let session_capture = capture.clone();
@@ -2369,8 +2375,8 @@ mod tests {
             on_output_text: Some(Arc::new(move |text| {
                 output_capture.append_output_text(&text.bytes, text.stream, text.is_continuation);
             })),
-            on_readline_start: Some(Arc::new(move |prompt| {
-                start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+            on_input_wait: Some(Arc::new(move |prompt| {
+                wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
             on_readline_result: Some(Arc::new(move |event| {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
@@ -2388,13 +2394,16 @@ mod tests {
             })),
         })
         .expect("ipc pair");
-        server.begin_input(1);
 
         worker
-            .send(WorkerToServerIpcMessage::ReadlineStart {
+            .send(WorkerToServerIpcMessage::InputWait {
                 prompt: "> ".to_string(),
             })
-            .expect("send readline_start");
+            .expect("send initial input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observed initial input_wait");
+        server.begin_input().expect("server starts input");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
@@ -2404,7 +2413,6 @@ mod tests {
             .expect("send stdout output_text");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                input_id: 1,
                 prompt: "> ".to_string(),
                 text: "plot(1)\n".to_string(),
             })
@@ -2425,10 +2433,14 @@ mod tests {
             })
             .expect("send stderr output_text");
         worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "> ".to_string(),
+            })
+            .expect("send completion input_wait");
+        worker
             .send(WorkerToServerIpcMessage::SessionEnd {
                 reason: None,
                 message_b64: None,
-                input_id: None,
             })
             .expect("send session_end");
 
@@ -2437,11 +2449,11 @@ mod tests {
             .expect("server IPC consumed session_end");
 
         let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 6);
+        assert_eq!(snapshot.events.len(), 7);
         assert!(matches!(
             &snapshot.events[0],
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineStart { prompt },
+                kind: PendingSidebandKind::InputWait { prompt },
                 ..
             } if prompt == "> "
         ));
@@ -2481,6 +2493,13 @@ mod tests {
         ));
         assert!(matches!(
             &snapshot.events[5],
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::InputWait { prompt },
+                ..
+            } if prompt == "> "
+        ));
+        assert!(matches!(
+            &snapshot.events[6],
             PendingOutputEvent::Sideband {
                 kind: PendingSidebandKind::SessionEnd,
                 ..

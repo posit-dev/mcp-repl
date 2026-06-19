@@ -10,8 +10,8 @@ This note is superseded by the IPC-queued opaque worker protocol documented in
 Status: superseded.
 
 Historical baseline: Server-inferred completion is no longer the intended direction. The old simplification target was worker-emitted `idle` or
-`session_end`; that was superseded by protocol v4's single worker-emitted
-`input_wait` boundary. The current success boundary is worker-emitted `input_wait` or `session_end`.
+`session_end`; that was superseded by protocol v5's worker-emitted
+`input_wait` readiness boundary. The current success boundary is worker-emitted `input_wait` or `session_end`.
 
 The current protocol contract is:
 

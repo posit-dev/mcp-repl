@@ -15,33 +15,9 @@ use super::state::{
     mark_input_wait_completed_request, remember_emitted_prompt, session_state,
 };
 use super::stdio::{PYTHON_STDIN_FILE, PythonThreadsAllowed, StdioLineRead};
-use super::{emit_output_text, emit_plots, request_platform_interrupt};
+use super::{emit_output_text, emit_plots};
 
-pub(super) fn interrupt_input(input_id: u64) {
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    {
-        let mut guard = state.inner.lock().unwrap();
-        let write_in_flight = guard.turn_write_in_flight;
-        let Some(active) = guard.active_request.as_mut() else {
-            return;
-        };
-        if active.input_id != Some(input_id) {
-            return;
-        }
-        active.queued_lines.clear();
-        if write_in_flight {
-            guard.turn_cleanup_uncertain = true;
-        }
-        guard.interrupt_requested = true;
-        guard.waiting_for_input = false;
-        state.cvar.notify_all();
-    }
-    request_platform_interrupt();
-}
-
-pub(super) fn begin_tracked_input_batch(input_id: u64, input: String) -> Result<(), String> {
+pub(super) fn begin_tracked_input_batch(input: String) -> Result<(), String> {
     let state = session_state();
     let queued_lines = prepare_input_batch_lines(&input);
     let byte_len = queued_lines
@@ -63,7 +39,6 @@ pub(super) fn begin_tracked_input_batch(input_id: u64, input: String) -> Result<
     guard.turn_cleanup_uncertain = false;
     let started_after_continuation_prompt = guard.last_prompt_was_continuation;
     guard.active_request = Some(ActiveRequest {
-        input_id: Some(input_id),
         byte_len,
         line_count,
         fallback_prompt: None,
@@ -97,11 +72,11 @@ fn prepare_input_batch_lines(input: &str) -> VecDeque<InputBatchLine> {
         .collect()
 }
 
-fn emit_input_batch_line(input_id: u64, prompt: &str, line: &mut InputBatchLine) {
+fn emit_input_batch_line(prompt: &str, line: &mut InputBatchLine) {
     if line.input_line_emitted {
         return;
     }
-    ipc::emit_input_line(input_id, prompt, &line.text);
+    ipc::emit_input_line(prompt, &line.text);
     line.input_line_emitted = true;
 }
 
@@ -149,12 +124,8 @@ pub(super) fn read_windows_turn_line(
                 continue;
             }
 
-            match guard
-                .active_request
-                .as_mut()
-                .and_then(|active| active.input_id)
-            {
-                Some(input_id) => {
+            match guard.active_request.as_mut() {
+                Some(_) => {
                     let line = {
                         let active = guard.active_request.as_mut().expect("active input exists");
                         let line = active.queued_lines.pop_front();
@@ -169,11 +140,11 @@ pub(super) fn read_windows_turn_line(
                         guard.visible_input_prompt = None;
                         guard.waiting_for_input = false;
                         guard.request_active = true;
-                        Some((input_id, Some(line), prompt_already_visible))
+                        Some((Some(line), prompt_already_visible))
                     } else {
                         guard.active_request.take();
                         guard.visible_input_prompt = Some(prompt.to_string());
-                        Some((input_id, None, false))
+                        Some((None, false))
                     }
                 }
                 None => {
@@ -185,7 +156,7 @@ pub(super) fn read_windows_turn_line(
                         guard.last_prompt_was_continuation =
                             prompt == guard.python_continuation_prompt;
                         drop(guard);
-                        ipc::emit_readline_start(prompt);
+                        ipc::emit_input_wait(prompt);
                         continue;
                     }
                     if release_gil_while_waiting {
@@ -202,8 +173,8 @@ pub(super) fn read_windows_turn_line(
             }
         };
 
-        if let Some((input_id, Some(mut line), prompt_already_visible)) = action {
-            emit_input_batch_line(input_id, prompt, &mut line);
+        if let Some((Some(mut line), prompt_already_visible)) = action {
+            emit_input_batch_line(prompt, &mut line);
             if emit_prompt_to_stdout && !prompt.is_empty() && !prompt_already_visible {
                 emit_output_text(TextStream::Stdout, prompt.as_bytes());
             }
@@ -213,11 +184,11 @@ pub(super) fn read_windows_turn_line(
             });
         }
 
-        if let Some((input_id, None, _)) = action {
+        if let Some((None, _)) = action {
             emit_plots();
             mark_input_wait_completed_request();
             remember_emitted_prompt(prompt);
-            ipc::emit_input_wait(input_id, prompt);
+            ipc::emit_input_wait(prompt);
         }
     }
 }
@@ -300,15 +271,8 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
 }
 
 enum RawInputEvent {
-    InputLine {
-        input_id: u64,
-        prompt: String,
-        text: String,
-    },
-    InputWait {
-        input_id: u64,
-        prompt: String,
-    },
+    InputLine { prompt: String, text: String },
+    InputWait { prompt: String },
     Consumed,
 }
 
@@ -341,15 +305,8 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
             }
 
             let prompt = input_hook_prompt(&guard, None);
-            let Some(input_id) = guard
-                .active_request
-                .as_ref()
-                .and_then(|active| active.input_id)
-            else {
+            if guard.active_request.is_none() {
                 if !output.is_empty() {
-                    return Ok(output);
-                }
-                if guard.active_request.is_some() {
                     return Ok(output);
                 }
                 let allow_threads = PythonThreadsAllowed::new();
@@ -368,7 +325,7 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     return Ok(output);
                 }
                 guard.active_request.take();
-                RawInputEvent::InputWait { input_id, prompt }
+                RawInputEvent::InputWait { prompt }
             } else {
                 let active = guard.active_request.as_mut().expect("active input exists");
                 let line = active
@@ -380,7 +337,6 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 } else {
                     line.input_line_emitted = true;
                     RawInputEvent::InputLine {
-                        input_id,
                         prompt,
                         text: line.text.clone(),
                     }
@@ -396,16 +352,12 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
             }
         };
         match event {
-            RawInputEvent::InputLine {
-                input_id,
-                prompt,
-                text,
-            } => ipc::emit_input_line(input_id, &prompt, &text),
-            RawInputEvent::InputWait { input_id, prompt } => {
+            RawInputEvent::InputLine { prompt, text } => ipc::emit_input_line(&prompt, &text),
+            RawInputEvent::InputWait { prompt } => {
                 emit_plots();
                 mark_input_wait_completed_request();
                 remember_emitted_prompt(&prompt);
-                ipc::emit_input_wait(input_id, &prompt);
+                ipc::emit_input_wait(&prompt);
             }
             RawInputEvent::Consumed => {}
         }

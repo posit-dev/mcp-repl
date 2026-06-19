@@ -76,28 +76,18 @@ pub(crate) fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd)
     Ok(())
 }
 
-pub fn emit_readline_start(prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: prompt.to_string(),
-        });
-    }
-}
-
-pub fn emit_input_line(input_id: u64, prompt: &str, text: &str) {
+pub fn emit_input_line(prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
-            input_id,
             prompt: prompt.to_string(),
             text: text.to_string(),
         });
     }
 }
 
-pub fn emit_input_wait(input_id: u64, prompt: &str) {
+pub fn emit_input_wait(prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
-            input_id,
             prompt: prompt.to_string(),
         });
     }
@@ -130,17 +120,15 @@ pub fn emit_session_end() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
             message_b64: None,
-            input_id: None,
         });
     }
 }
 
-pub fn emit_session_end_with_reason(reason: &str, input_id: Option<u64>) {
+pub fn emit_session_end_with_reason(reason: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: Some(reason.to_string()),
             message_b64: None,
-            input_id,
         });
     }
 }

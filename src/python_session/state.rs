@@ -38,7 +38,6 @@ pub(super) struct SessionStateInner {
 
 #[allow(dead_code)]
 pub(super) struct ActiveRequest {
-    pub(super) input_id: Option<u64>,
     pub(super) byte_len: usize,
     pub(super) line_count: usize,
     pub(super) fallback_prompt: Option<String>,
@@ -261,7 +260,6 @@ mod tests {
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
         ActiveRequest {
-            input_id: None,
             byte_len: 1,
             line_count,
             fallback_prompt: fallback_prompt.map(str::to_string),

@@ -5,19 +5,13 @@ use serde::{Deserialize, Serialize};
 use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 4;
+pub const WORKER_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
-    InputBatch {
-        input_id: u64,
-        input: String,
-    },
-    Interrupt {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        input_id: Option<u64>,
-    },
+    InputBatch { input: String },
+    Interrupt {},
     Shutdown {},
 }
 
@@ -35,16 +29,11 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default, skip_serializing_if = "is_false")]
         is_continuation: bool,
     },
-    ReadlineStart {
-        prompt: String,
-    },
     InputLine {
-        input_id: u64,
         prompt: String,
         text: String,
     },
     InputWait {
-        input_id: u64,
         prompt: String,
     },
     PlotImage {
@@ -65,8 +54,6 @@ pub enum WorkerToServerIpcMessage {
         reason: Option<String>,
         #[serde(default)]
         message_b64: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        input_id: Option<u64>,
     },
 }
 
@@ -119,7 +106,7 @@ pub struct IpcPlotImage {
 pub struct IpcHandlers {
     pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
-    pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub on_input_wait: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -227,19 +214,13 @@ mod tests {
         assert!(parsed.is_err(), "output_text should require data_b64");
     }
     #[test]
-    fn readline_start_protocol_only_carries_prompt() {
-        let value = serde_json::to_value(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: "zod> ".to_string(),
-        })
-        .expect("serialize readline_start");
+    fn readline_start_is_not_protocol() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "readline_start",
+            "prompt": "zod> "
+        }));
 
-        assert_eq!(
-            value,
-            json!({
-                "type": "readline_start",
-                "prompt": "zod> "
-            })
-        );
+        assert!(parsed.is_err(), "readline_start should not deserialize");
     }
     #[test]
     fn plot_image_protocol_rejects_sequence_ack_handshake() {
@@ -335,14 +316,12 @@ mod tests {
     fn input_wait_message_is_worker_to_server_only() {
         let wait = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "input_wait",
-            "input_id": 7,
             "prompt": "debug> "
         }));
         assert!(
             matches!(
                 wait,
                 Ok(WorkerToServerIpcMessage::InputWait {
-                    input_id: 7,
                     ref prompt
                 }) if prompt == "debug> "
             ),
@@ -352,11 +331,19 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "input_wait",
-                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
             "input_wait should not deserialize as a server-to-worker message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "input_wait",
+                "input_id": 7,
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "input_wait should reject input_id under v5"
         );
     }
 
@@ -365,7 +352,6 @@ mod tests {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "stdin_wait",
-                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -374,7 +360,6 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "stdin_wait",
-                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -383,7 +368,6 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "idle",
-                "input_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -413,14 +397,12 @@ mod tests {
     fn input_batch_is_server_to_worker_only() {
         let batch = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
             "type": "input_batch",
-            "input_id": 7,
             "input": "x <- 1\n"
         }));
         assert!(
             matches!(
                 batch,
                 Ok(ServerToWorkerIpcMessage::InputBatch {
-                    input_id: 7,
                     ref input
                 }) if input == "x <- 1\n"
             ),
@@ -430,11 +412,19 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "input_batch",
-                "input_id": 7,
                 "input": "x <- 1\n"
             }))
             .is_err(),
             "input_batch should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "input_batch",
+                "input_id": 7,
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "input_batch should reject input_id under v5"
         );
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
@@ -471,6 +461,33 @@ mod tests {
             }))
             .is_err(),
             "shutdown should not carry input payload"
+        );
+    }
+
+    #[test]
+    fn interrupt_is_payload_free_server_to_worker_control() {
+        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "interrupt"
+        }));
+        assert!(
+            matches!(interrupt, Ok(ServerToWorkerIpcMessage::Interrupt {})),
+            "interrupt should deserialize without payload"
+        );
+
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "interrupt",
+                "input_id": 7
+            }))
+            .is_err(),
+            "interrupt should reject input_id under v5"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "interrupt"
+            }))
+            .is_err(),
+            "interrupt should not deserialize as a worker-to-server message"
         );
     }
 }
