@@ -90,18 +90,7 @@ jobs:
       - name: Python public API suite (windows)
         if: matrix.os == 'windows-2022'
         shell: pwsh
-        env:
-          MCP_REPL_DEBUG_DIR: ${{ runner.temp }}\mcp-repl-debug
-          MCP_REPL_KEEP_SESSION_TMPDIR: "1"
         run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe
-
-      - name: Upload Windows public API debug logs
-        if: failure() && matrix.os == 'windows-2022'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-public-api-debug-logs
-          path: ${{ runner.temp }}\mcp-repl-debug
-          if-no-files-found: ignore
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
