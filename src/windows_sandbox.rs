@@ -1549,10 +1549,6 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
 
     let mut read_paths = write_paths.clone();
     read_paths.extend(offline_identity_read_execute_paths(launch));
-    #[cfg(debug_assertions)]
-    if let Some(cargo_home) = cargo_home_for_debug_assets() {
-        read_paths.insert(cargo_home);
-    }
 
     let mut traverse_paths = HashSet::new();
     for path in read_paths.iter().chain(write_paths.iter()) {
@@ -1664,6 +1660,9 @@ fn existing_ancestor_dirs(path: &Path) -> Vec<PathBuf> {
         if ancestor.as_os_str().is_empty() {
             continue;
         }
+        if ancestor.parent().is_none() {
+            continue;
+        }
         if ancestor.is_dir() {
             ancestors.push(canonicalize_or_identity(ancestor));
         }
@@ -1674,20 +1673,6 @@ fn existing_ancestor_dirs(path: &Path) -> Vec<PathBuf> {
 fn is_acl_access_denied(err: &str) -> bool {
     err.contains("GetNamedSecurityInfoW failed: 5")
         || err.contains("SetNamedSecurityInfoW failed: 5")
-}
-
-#[cfg(debug_assertions)]
-fn cargo_home_for_debug_assets() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-    {
-        return Some(canonicalize_or_identity(&path));
-    }
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)?;
-    Some(canonicalize_or_identity(&home.join(".cargo")))
 }
 
 #[repr(C)]
@@ -4060,6 +4045,21 @@ mod tests {
         assert!(read_paths.contains(&canonicalize_or_identity(&python_lib)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_a)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_b)));
+    }
+
+    #[test]
+    fn existing_ancestor_dirs_skips_filesystem_roots() {
+        let tmp = tempdir().expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        let ancestors = existing_ancestor_dirs(&nested);
+
+        assert!(!ancestors.is_empty());
+        assert!(
+            ancestors.iter().all(|path| path.parent().is_some()),
+            "filesystem roots should not receive traversal ACLs: {ancestors:?}"
+        );
     }
 
     #[derive(Default)]
