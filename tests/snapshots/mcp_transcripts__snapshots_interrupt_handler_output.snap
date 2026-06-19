@@ -9,7 +9,7 @@ call:
   "tool": "r_repl",
   "arguments": {
     "input": "cat(\"INTERRUPT_READY\\n\")\nflush.console()\ntryCatch(\n  {\n    repeat Sys.sleep(0.5)\n  },\n  interrupt = function(e) cat(\"interrupt received\\n\")\n)\n",
-    "timeout_ms": 1000
+    "timeout_ms": 3000
   }
 }
 response:

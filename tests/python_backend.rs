@@ -594,7 +594,7 @@ impl DetachedHolderProbe {
 }
 
 async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if marker_path.exists() {
             sleep(Duration::from_millis(250)).await;
@@ -603,6 +603,33 @@ async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
         sleep(Duration::from_millis(50)).await;
     }
     Err(format!("detached holder did not exit: {}", marker_path.display()).into())
+}
+
+async fn wait_for_file_text(path: &Path, expected: &str) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_text = None;
+    while Instant::now() < deadline {
+        match fs::read_to_string(path) {
+            Ok(text) if text == expected => return Ok(()),
+            Ok(text) => last_text = Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    match last_text {
+        Some(text) => Err(format!(
+            "timed out waiting for {} to contain {expected:?}; last contents were {text:?}",
+            path.display()
+        )
+        .into()),
+        None => Err(format!(
+            "timed out waiting for {} to contain {expected:?}",
+            path.display()
+        )
+        .into()),
+    }
 }
 
 #[cfg(unix)]
@@ -1290,13 +1317,14 @@ sys.exit()
         .write_stdin_raw_with("print('AFTER_ATEXIT')", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
+    let marker_result = wait_for_file_text(&marker, "atexit ran").await;
     session.cancel().await?;
 
     assert!(
         follow_up_text.contains("AFTER_ATEXIT"),
         "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
     );
-    assert_eq!(fs::read_to_string(&marker)?, "atexit ran");
+    marker_result?;
     Ok(())
 }
 

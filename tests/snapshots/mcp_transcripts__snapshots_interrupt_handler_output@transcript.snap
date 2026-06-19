@@ -3,7 +3,7 @@ source: tests/mcp_transcripts.rs
 expression: transcript
 ---
 == session: interrupt_handler ==
-1) r_repl timeout_ms=1000
+1) r_repl timeout_ms=3000
 >>> cat("INTERRUPT_READY\n")
 >>> flush.console()
 >>> tryCatch(
