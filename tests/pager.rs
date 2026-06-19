@@ -3,8 +3,31 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
+use tokio::sync::{Mutex, MutexGuard};
 #[cfg(windows)]
 use tokio::time::{Duration, Instant, sleep};
+
+#[cfg(target_os = "macos")]
+fn macos_pager_test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(target_os = "macos")]
+async fn lock_macos_pager_test_mutex() -> MutexGuard<'static, ()> {
+    macos_pager_test_mutex().lock().await
+}
+
+#[cfg(not(target_os = "macos"))]
+struct MacosPagerTestGuard;
+
+#[cfg(not(target_os = "macos"))]
+async fn lock_macos_pager_test_mutex() -> MacosPagerTestGuard {
+    MacosPagerTestGuard
+}
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -75,6 +98,7 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_commands_are_handled_server_side() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
@@ -135,6 +159,7 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
@@ -179,6 +204,7 @@ async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn paginates_large_output() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -196,6 +222,7 @@ async fn paginates_large_output() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_and_counts() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -213,6 +240,7 @@ async fn pager_search_and_counts() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_preserves_whitespace() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -230,6 +258,7 @@ async fn pager_search_preserves_whitespace() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -246,6 +275,7 @@ async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_with_headings() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -261,6 +291,7 @@ async fn pager_matches_with_headings() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_hits_mode() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -276,6 +307,7 @@ async fn pager_hits_mode() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -290,6 +322,7 @@ async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_dedup_on_seek() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut snapshot = McpSnapshot::new();
     snapshot
         .pager_session("default", 300, mcp_script! {
@@ -306,6 +339,7 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let session = common::spawn_server_with_args_env_and_pager_page_chars(
         vec!["--sandbox".to_string(), "inherit".to_string()],
         Vec::new(),
@@ -342,6 +376,7 @@ async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> Test
 
 #[cfg(windows)]
 async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let result = session
@@ -402,6 +437,7 @@ async fn pager_empty_input_advances_page() -> TestResult<()> {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
+    let _guard = lock_macos_pager_test_mutex().await;
     let session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let initial = session
@@ -445,6 +481,7 @@ async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_until_not_busy_does_not_return_while_pager_request_is_still_running() -> TestResult<()>
 {
+    let _guard = lock_macos_pager_test_mutex().await;
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
 
     let initial = session
