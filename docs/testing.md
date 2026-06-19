@@ -83,10 +83,7 @@ By default, the Codex integration uses `MCP_REPL_CODEX_BACKEND=auto`: it checks
 whether Codex is logged in, checks whether `gpt-5.3-codex-spark` is available,
 and uses that live backend when both checks pass. Otherwise it uses the mocked
 provider. Set `MCP_REPL_CODEX_BACKEND=live` or `MCP_REPL_CODEX_BACKEND=mock`
-to force one path. If `auto` selects live Spark but the local model completes
-without emitting the expected `r.repl` MCP tool call, the smoke test reports a
-skip for unsupported live tool-selection behavior. Forced `live` mode still
-requires the MCP tool call and final marker.
+to force one path.
 
 When changing Codex backend selection or CI real-client wiring, run the forced
 mock path explicitly:
