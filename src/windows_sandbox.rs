@@ -739,6 +739,10 @@ fn create_prepared_launch_live_marker(
 
 fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaunchAclLock, String> {
     unsafe {
+        crate::event_log::log(
+            "windows_prepared_acl_lock_wait_begin",
+            serde_json::json!({"capability_sid": capability_sid}),
+        );
         let name = to_wide(prepared_launch_acl_lock_name(capability_sid));
         let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if handle.is_null() {
@@ -756,6 +760,10 @@ fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaun
             ));
         }
 
+        crate::event_log::log(
+            "windows_prepared_acl_lock_wait_end",
+            serde_json::json!({"capability_sid": capability_sid, "wait_status": wait}),
+        );
         Ok(PreparedLaunchAclLock { handle })
     }
 }
@@ -1443,11 +1451,25 @@ pub fn prepare_sandbox_launch_with_network_identity(
         &cap_sid,
         network_identity,
     );
+    crate::event_log::log(
+        "windows_sandbox_prepare_acl_begin",
+        serde_json::json!({
+            "capability_sid": launch.capability_sid(),
+            "network_identity": match launch.network_identity() {
+                WindowsSandboxNetworkIdentity::CurrentUser => "current-user",
+                WindowsSandboxNetworkIdentity::OfflineProxy(_) => "offline-proxy",
+            },
+        }),
+    );
     let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
 
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        crate::event_log::log(
+            "windows_sandbox_prepare_workspace_acl_begin",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
         let apply_result = apply_prepared_workspace_acl_state(
             &launch,
             psid_capability,
@@ -1459,9 +1481,21 @@ pub fn prepare_sandbox_launch_with_network_identity(
             LocalFree(psid_capability as HLOCAL);
             return Err(err);
         }
+        crate::event_log::log(
+            "windows_sandbox_prepare_workspace_acl_end",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
+        crate::event_log::log(
+            "windows_sandbox_prepare_offline_acl_begin",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
         let offline_result = apply_offline_identity_acl_state(&launch, "prepare");
         LocalFree(psid_capability as HLOCAL);
         offline_result?;
+        crate::event_log::log(
+            "windows_sandbox_prepare_offline_acl_end",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
     }
 
     Ok(launch)
@@ -1526,10 +1560,33 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
             traverse_paths.insert(ancestor);
         }
     }
+    crate::event_log::log(
+        "windows_offline_acl_paths",
+        serde_json::json!({
+            "action": action,
+            "read": canonicalized_paths(&read_paths)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "write": canonicalized_paths(&write_paths)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "traverse_count": traverse_paths.len(),
+        }),
+    );
     for path in traverse_paths {
         if path.as_os_str().is_empty() {
             continue;
         }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "traverse",
+                "path": path.display().to_string(),
+            }),
+        );
         if let Err(err) = add_read_execute_ace(&path, sid, false) {
             if is_acl_access_denied(&err) {
                 continue;
@@ -1544,6 +1601,14 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
         if path.as_os_str().is_empty() {
             continue;
         }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "read",
+                "path": path.display().to_string(),
+            }),
+        );
         add_read_execute_ace(&path, sid, true).map_err(|err| {
             format!(
                 "failed to {action} offline sandbox user read ACL on '{}': {err}",
@@ -1556,6 +1621,14 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
         if path.as_os_str().is_empty() {
             continue;
         }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "write",
+                "path": path.display().to_string(),
+            }),
+        );
         add_allow_ace(&path, sid).map_err(|err| {
             format!(
                 "failed to {action} offline sandbox user ACL on '{}': {err}",
@@ -1567,6 +1640,14 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
         if path.as_os_str().is_empty() {
             continue;
         }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "write-dac",
+                "path": path.display().to_string(),
+            }),
+        );
         add_write_dac_ace(&path, sid).map_err(|err| {
             format!(
                 "failed to {action} offline sandbox user DACL permission on '{}': {err}",
