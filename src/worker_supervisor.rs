@@ -127,6 +127,7 @@ pub(crate) struct GuardrailShared {
 pub(crate) struct LiveOutputCapture {
     pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
+    #[cfg(any(test, target_os = "windows"))]
     conpty_startup_filter: Option<Arc<ConptyStartupFilter>>,
 }
 
@@ -140,6 +141,7 @@ impl LiveOutputCapture {
             pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
                 .then_some(pending_output_tape),
             output_timeline,
+            #[cfg(any(test, target_os = "windows"))]
             conpty_startup_filter: None,
         }
     }
@@ -160,6 +162,7 @@ impl LiveOutputCapture {
     }
 
     fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
+        #[cfg(any(test, target_os = "windows"))]
         if matches!(stream, TextStream::Stdout)
             && let Some(filter) = &self.conpty_startup_filter
         {
@@ -172,6 +175,7 @@ impl LiveOutputCapture {
         self.append_text(bytes, stream, false, false);
     }
 
+    #[cfg(any(test, target_os = "windows"))]
     fn note_input_starting(&self) {
         let Some(filter) = &self.conpty_startup_filter else {
             return;
@@ -180,6 +184,9 @@ impl LiveOutputCapture {
             self.append_text(&bytes, TextStream::Stdout, false, false);
         }
     }
+
+    #[cfg(not(any(test, target_os = "windows")))]
+    fn note_input_starting(&self) {}
 
     fn append_text(
         &self,
@@ -276,15 +283,18 @@ impl LiveOutputCapture {
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
 struct ConptyStartupFilter {
     state: Mutex<ConptyStartupFilterState>,
 }
 
+#[cfg(any(test, target_os = "windows"))]
 struct ConptyStartupFilterState {
     active: bool,
     buffered: Vec<u8>,
 }
 
+#[cfg(any(test, target_os = "windows"))]
 impl ConptyStartupFilter {
     fn new() -> Self {
         Self {
@@ -334,6 +344,7 @@ impl ConptyStartupFilter {
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConptyStartupToggleMatch {
     Complete,
@@ -341,6 +352,7 @@ enum ConptyStartupToggleMatch {
     No,
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn classify_conpty_startup_mode_toggles(bytes: &[u8]) -> ConptyStartupToggleMatch {
     const TOGGLES: [&[u8]; 2] = [b"\x1b[?9001h", b"\x1b[?1004h"];
 
@@ -615,6 +627,7 @@ impl WorkerChild {
         }
     }
 
+    #[cfg(not(target_family = "unix"))]
     fn kill(&mut self) -> std::io::Result<()> {
         match self {
             Self::Standard(child) => child.kill(),
@@ -2137,11 +2150,17 @@ fn attach_spawned_worker_stdio(
         WorkerStdinTransport::Pipe => {
             #[cfg(any(target_family = "unix", target_family = "windows"))]
             let _ = pty_stdio;
-            let WorkerChild::Standard(child) = child else {
-                return Err(WorkerError::Protocol(
-                    "pipe worker process does not expose pipe stdio".to_string(),
-                ));
+            #[cfg(target_family = "windows")]
+            let child = match child {
+                WorkerChild::Standard(child) => child,
+                WorkerChild::DirectWindows(_) => {
+                    return Err(WorkerError::Protocol(
+                        "pipe worker process does not expose pipe stdio".to_string(),
+                    ));
+                }
             };
+            #[cfg(not(target_family = "windows"))]
+            let WorkerChild::Standard(child) = child;
             let stdin = child
                 .stdin
                 .take()
