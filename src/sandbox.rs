@@ -780,8 +780,7 @@ pub fn prepare_worker_command_with_managed_network(
     #[cfg(target_os = "windows")]
     {
         let command = build_command_vec(program, &args);
-        let use_offline_identity =
-            !state.sandbox_policy.has_full_network_access() || managed_network_proxy.is_some();
+        let use_offline_identity = managed_network_proxy.is_some();
         let sandbox_args = create_windows_sandbox_command_args(
             command,
             &state.sandbox_policy,
@@ -2711,6 +2710,41 @@ mod tests {
             Some("0"),
             "managed network marker must be explicitly disabled when no domain restrictions exist"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn read_only_windows_command_keeps_current_user_wrapper_without_managed_proxy() {
+        let session_temp_dir = std::env::temp_dir().join(format!(
+            "mcp-repl-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("worker.exe"), vec!["worker".to_string()], &state)
+                .expect("read-only Windows worker command should prepare");
+
+        assert!(
+            prepared.args.contains(&"--windows-sandbox".to_string()),
+            "read-only Windows workers should still use the Windows sandbox wrapper"
+        );
+        assert!(
+            !prepared
+                .args
+                .contains(&"--windows-sandbox-logon-offline".to_string()),
+            "read-only without managed proxy should stay on the current-user launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(session_temp_dir);
     }
 
     #[cfg(target_os = "windows")]

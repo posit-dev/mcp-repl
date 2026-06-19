@@ -50,8 +50,11 @@
 [target.'cfg(target_os = "windows")'.dependencies]
   windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Rpc",
   ] }
   windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

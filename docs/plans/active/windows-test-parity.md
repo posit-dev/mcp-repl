@@ -18,7 +18,8 @@
 - Use normal Windows `cargo test` failures to identify real shared-state, host-dependency, or Windows launcher issues instead of preserving CI serialization as a workaround.
 - Keep Windows-specific compatibility tests when they assert Windows-only process, console, sandbox, or path behavior.
 - Windows public network-policy cases now require `mcp-repl windows-sandbox setup`
-  before the suite so the offline account and firewall rules are present.
+  before the suite so the offline account, firewall rules, and loopback WFP
+  filters are present.
 
 ## Long-Term Direction
 

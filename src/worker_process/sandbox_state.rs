@@ -45,7 +45,13 @@ pub(super) fn managed_network_proxy_config_for_state(
     state: &SandboxState,
 ) -> Result<Option<ManagedProxyConfig>, WorkerError> {
     #[cfg(target_os = "windows")]
-    if state.sandbox_policy.requires_sandbox() && !state.sandbox_policy.has_full_network_access() {
+    if matches!(
+        state.sandbox_policy,
+        crate::sandbox::SandboxPolicy::WorkspaceWrite {
+            network_access: false,
+            ..
+        }
+    ) {
         return Ok(Some(ManagedProxyConfig {
             allowed_domains: Vec::new(),
             denied_domains: Vec::new(),

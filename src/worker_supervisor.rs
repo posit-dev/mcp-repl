@@ -283,6 +283,13 @@ impl WorkerSupervisor {
         // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = context.prepared_windows_launch.as_ref() {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                prepared_windows_launch,
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(&worker_launch, backend, sandbox_state)
         });

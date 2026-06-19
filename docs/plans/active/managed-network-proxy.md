@@ -5,7 +5,9 @@
 - Add a macOS-first managed network proxy for workers.
 - Keep existing full-network sandbox behavior unchanged when no managed domain rules are configured.
 - Keep Linux as an explicit follow-up phase with clear unsupported errors for managed domain enforcement.
-- Windows uses a setup-backed offline account plus account-scoped firewall rules to route managed-domain traffic through the server-owned proxy.
+- Windows uses a setup-backed offline account plus account-scoped firewall rules
+  and loopback WFP filters to route managed-domain traffic through the
+  server-owned proxy.
 
 ## Status
 
@@ -22,7 +24,8 @@
 ## Long-Term Direction
 
 - Linux should route worker traffic through a server-owned proxy from inside the Linux sandbox without allowing direct egress.
-- Windows uses the same policy surface after `mcp-repl windows-sandbox setup` installs the offline account and firewall rules.
+- Windows uses the same policy surface after `mcp-repl windows-sandbox setup`
+  installs the offline account, firewall rules, and loopback WFP filters.
 - A future UI or approval flow can amend allow/deny rules, but this phase only supports static CLI/config rules.
 - A future HTTP policy layer may support method restrictions such as "allow
   GET but deny POST", but that is separate from the current host/domain
@@ -40,7 +43,8 @@
 
 - macOS enforcement uses Seatbelt loopback-only egress to the managed proxy ports.
 - Windows enforcement uses a dedicated `McpReplOffline` local account,
-  account-scoped firewall block rules, and fixed managed proxy ports from setup.
+  account-scoped firewall block rules, loopback WFP filters, and fixed managed
+  proxy ports from setup.
 - Domain policy is deny-first and allowlist-based.
 - Supported patterns are exact hosts, `*.example.com`, and `**.example.com`.
 - Exact URLs are rejected instead of being silently reduced to hosts.
@@ -76,4 +80,4 @@
 - 2026-04-30: Scoped matching to host/domain patterns after deciding exact HTTPS URL filtering would require a separate MITM design.
 - 2026-04-30: Implemented the macOS slice with a small in-process HTTP/SOCKS proxy in `src/managed_network.rs`, CLI/config validation for host patterns, and worker launch wiring that injects proxy env vars before Seatbelt policy rendering.
 - 2026-05-01: Documented managed-network follow-up scenarios and tradeoffs for package, database, Shiny, local-service, and hardening workflows.
-- 2026-06-19: Implemented the Windows slice with explicit elevated setup, DPAPI-protected offline account credentials, fixed proxy ports, firewall rules scoped to the offline account SID, and offline-wrapper launch for no-network or managed-domain sandbox policies.
+- 2026-06-19: Implemented the Windows slice with explicit elevated setup, DPAPI-protected offline account credentials, fixed proxy ports, firewall rules scoped to the offline account SID, loopback WFP filters for direct local socket blocking, and offline-wrapper launch for workspace-write no-network or managed-domain sandbox policies.

@@ -245,13 +245,25 @@ impl WorkerManager {
 fn windows_sandbox_network_identity_for_state(
     state: &crate::sandbox::SandboxState,
 ) -> Result<crate::windows_sandbox::WindowsSandboxNetworkIdentity, WorkerError> {
-    if state.sandbox_policy.has_full_network_access()
-        && !state.managed_network_policy.has_domain_restrictions()
-    {
+    if !windows_sandbox_requires_offline_proxy_identity(state) {
         return Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::CurrentUser);
     }
     let setup = crate::windows_sandbox_setup::load_offline_setup().map_err(WorkerError::Sandbox)?;
     Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::OfflineProxy(setup))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sandbox_requires_offline_proxy_identity(state: &crate::sandbox::SandboxState) -> bool {
+    if state.managed_network_policy.has_domain_restrictions() {
+        return true;
+    }
+    matches!(
+        state.sandbox_policy,
+        crate::sandbox::SandboxPolicy::WorkspaceWrite {
+            network_access: false,
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -259,6 +271,8 @@ mod tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::oversized_output::OversizedOutputMode;
+    #[cfg(target_family = "windows")]
+    use crate::sandbox::ManagedNetworkPolicy;
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
@@ -279,6 +293,55 @@ mod tests {
         {
             *network_access = true;
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn windows_workspace_write_state(network_access: bool) -> crate::sandbox::SandboxState {
+        crate::sandbox::SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_network_identity_selection_scopes_offline_proxy_cases() {
+        let read_only = crate::sandbox::SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            ..Default::default()
+        };
+        assert!(
+            !windows_sandbox_requires_offline_proxy_identity(&read_only),
+            "read-only should keep the current-user sandbox launch path"
+        );
+
+        let workspace_no_network = windows_workspace_write_state(false);
+        assert!(
+            windows_sandbox_requires_offline_proxy_identity(&workspace_no_network),
+            "workspace-write without full network should use the offline proxy identity"
+        );
+
+        let workspace_full_network = windows_workspace_write_state(true);
+        assert!(
+            !windows_sandbox_requires_offline_proxy_identity(&workspace_full_network),
+            "full-network workspace-write without domain rules should stay current-user"
+        );
+
+        let mut managed_domains = windows_workspace_write_state(true);
+        managed_domains.managed_network_policy = ManagedNetworkPolicy {
+            allowed_domains: vec!["example.com".to_string()],
+            denied_domains: Vec::new(),
+            allow_local_binding: false,
+        };
+        assert!(
+            windows_sandbox_requires_offline_proxy_identity(&managed_domains),
+            "managed domain rules should use the offline proxy identity"
+        );
     }
 
     #[test]
