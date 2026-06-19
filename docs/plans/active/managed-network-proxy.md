@@ -39,7 +39,7 @@
 ## Locked Decisions
 
 - macOS enforcement uses Seatbelt loopback-only egress to the managed proxy ports.
-- Windows enforcement uses a dedicated `McpReplSandboxOffline` local account,
+- Windows enforcement uses a dedicated `McpReplOffline` local account,
   account-scoped firewall block rules, and fixed managed proxy ports from setup.
 - Domain policy is deny-first and allowlist-based.
 - Supported patterns are exact hosts, `*.example.com`, and `**.example.com`.

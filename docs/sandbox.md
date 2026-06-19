@@ -172,7 +172,7 @@ Optional `bwrap` stage:
   mcp-repl windows-sandbox setup --http-proxy-port 39080 --socks-proxy-port 39081
   ```
 
-  Setup creates or refreshes the local non-admin `McpReplSandboxOffline`
+  Setup creates or refreshes the local non-admin `McpReplOffline`
   account, stores its password with current-user DPAPI protection under
   `%LOCALAPPDATA%\mcp-repl\windows-sandbox\`, and installs outbound firewall
   block rules scoped to that account SID.

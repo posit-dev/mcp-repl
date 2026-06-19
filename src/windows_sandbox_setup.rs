@@ -73,7 +73,7 @@ use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-pub const OFFLINE_USERNAME: &str = "McpReplSandboxOffline";
+pub const OFFLINE_USERNAME: &str = "McpReplOffline";
 pub const DEFAULT_HTTP_PROXY_PORT: u16 = 39080;
 pub const DEFAULT_SOCKS_PROXY_PORT: u16 = 39081;
 
@@ -893,6 +893,14 @@ fn quote_windows_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_username_fits_windows_local_account_limit() {
+        assert!(
+            OFFLINE_USERNAME.chars().count() <= 20,
+            "Windows local account names must be 20 characters or fewer"
+        );
+    }
 
     #[test]
     fn blocked_loopback_tcp_remote_ports_excludes_proxy_ports() {
