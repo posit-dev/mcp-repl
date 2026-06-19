@@ -17,7 +17,7 @@ worker/server contract. The earlier v4 design with `input_id` fields and
 - the worker owns the input queue and runtime placement,
 - runtime stdin, PTY, `ReadConsole`, `PyOS_Readline`, `sys.stdin`, and direct
   fd bridge details are worker-internal,
-- worker availability and successful same-worker input-batch reply boundaries
+- worker readiness for input and successful same-worker input-batch reply boundaries
   are reported by `input_wait`,
 - `input_id`, `readline_start`, `idle`, `stdin_wait`, `turn_start`, and
   `turn_input` are not protocol messages,

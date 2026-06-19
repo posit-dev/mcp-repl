@@ -14,8 +14,8 @@ The protocol is shaped around one invariant:
 
 > The server may send `input_batch` only after the worker has emitted
 > `input_wait`. The worker emits `input_wait` only when the runtime is waiting
-> on the managed input boundary and the worker is available for the next
-> `input_batch`.
+> on the managed input boundary and the worker is ready for input, meaning it can
+> receive the next `input_batch`.
 
 ## Ownership
 
@@ -50,18 +50,18 @@ prompt-looking output, raw stdout/stderr, or timing.
 An input batch is one accepted non-empty client payload. Empty polls only drain
 output or report current state; they never create input batches.
 
-The worker starts unavailable. After `worker_ready`, the server waits for the
-first `input_wait`. That initial `input_wait` marks the worker available and
-caches its prompt. Every later `input_wait` also marks the worker available
-and refreshes the cached prompt.
+The worker starts not ready for input. After `worker_ready`, the server waits
+for the first `input_wait`. That initial `input_wait` marks the worker ready
+for input and caches its prompt. Every later `input_wait` also marks the
+worker ready for input and refreshes the cached prompt.
 
-When the server sends `input_batch`, the worker becomes unavailable. While
-unavailable, the server must not send another non-empty payload to the same
-worker. The worker queues the input and wakes the managed runtime input path.
-When the runtime consumes all queued bytes or lines and asks the managed input
-boundary for more input, the worker emits `input_wait`. If a request is
-active, that `input_wait` completes it; if no request is active, it only
-refreshes availability and prompt cache.
+When the server sends `input_batch`, the worker is no longer ready for input.
+While not ready for input, the server must not send another non-empty payload
+to the same worker. The worker queues the input and wakes the managed runtime
+input path. When the runtime consumes all queued bytes or lines and asks the
+managed input boundary for more input, the worker emits `input_wait`. If a
+request is active, that `input_wait` completes it; if no request is active, it
+only refreshes readiness and prompt cache.
 
 The worker emits `input_line` whenever it returns accounted runtime input from
 the accepted batch. `input_line` is valid only while an input batch is in
@@ -73,8 +73,8 @@ without `session_end` is handled by the server as worker failure with captured
 partial output.
 
 Timeouts do not complete an input batch. On timeout, the server returns
-captured partial output and keeps the worker unavailable. Later empty polls
-continue draining output until the worker emits `input_wait`, emits
+captured partial output and keeps the worker not ready for input. Later empty
+polls continue draining output until the worker emits `input_wait`, emits
 `session_end`, exits, or times out again.
 
 ## IPC Queue And Runtime Stdin
@@ -108,8 +108,8 @@ truthfully emit `input_wait`.
 A PTY-backed worker must control buffering well enough for its checks to mean
 what they claim. If the worker cannot know that queued or buffered active
 input has been consumed, it must not emit `input_wait`. It should keep the
-worker unavailable, emit `session_end`, or rely on server-side replacement
-after timeout/reset.
+worker not ready for input, emit `session_end`, or rely on server-side
+replacement after timeout/reset.
 
 Unsupported direct fd0 readers remain unsupported unless they are routed
 through the managed worker input path. If a child process has sideband IPC
@@ -121,8 +121,8 @@ should see EOF or whatever explicit worker policy applies.
 `input_batch`
 - `{ "type": "input_batch", "input": <string> }`
 - Sends one accepted non-empty client payload.
-- The server may send this only while the worker is available from
-  `input_wait`; sending it marks the worker unavailable.
+- The server may send this only after `input_wait` has made the worker ready
+  for input; sending it marks the worker not ready for input.
 - `input` is the decoded MCP `repl()` text. The worker owns appending a final
   newline when its runtime requires line-oriented input.
 
@@ -134,8 +134,8 @@ should see EOF or whatever explicit worker policy applies.
   process group.
 - This message is for worker-owned cleanup and state transition only. It does
   not carry user input and does not complete an input batch.
-- After sending interrupt, the server marks the worker unavailable and waits
-  for the next `input_wait` or `session_end`.
+- After sending interrupt, the server marks the worker not ready for input and
+  waits for the next `input_wait` or `session_end`.
 - If no worker exists, the server keeps the existing no-endpoint behavior and
   does not spawn a worker only to interrupt nothing.
 
@@ -166,10 +166,10 @@ invalid base64, and unknown message types are protocol errors.
 `input_wait`
 - `{ "type": "input_wait", "prompt": <string> }`
 - Emitted when the runtime is waiting for more input through the managed input
-  boundary and the worker is available for the next `input_batch`.
+  boundary and the worker is ready for input.
 - If an input batch is active, this is the successful same-worker completion
   signal for that batch.
-- If no input batch is active, this only refreshes availability and prompt
+- If no input batch is active, this only refreshes readiness and prompt
   cache.
 - The prompt string is required; use an empty string if the runtime supplied no
   prompt.
@@ -228,7 +228,7 @@ Removed worker-to-server messages
 
 Interrupt recovery is worker-owned and fail-closed. The server sends
 `interrupt` whenever a client asks for interrupt and a worker endpoint exists.
-The server then marks the worker unavailable and waits for `input_wait`,
+The server then marks the worker not ready for input and waits for `input_wait`,
 `session_end`, process exit, or timeout.
 
 An interrupt for a queued worker works like this:
@@ -247,7 +247,7 @@ An interrupt for a queued worker works like this:
    `{ "type": "input_wait", "prompt": <string> }`.
 8. If the runtime exits, worker sends `session_end`.
 9. If cleanup is uncertain, worker sends no `input_wait`. The worker remains
-   unavailable until timeout, later recovery, `session_end`, or server
+   not ready for input until timeout, later recovery, `session_end`, or server
    replacement.
 
 The worker may use runtime-specific cleanup mechanisms internally. Those

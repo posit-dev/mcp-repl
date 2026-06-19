@@ -35,9 +35,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - Workers receive request payloads through `input_batch` and complete an input
   batch with `input_wait` or `session_end`. Follow-up input after `input_wait`
   starts a fresh `input_batch`; the runtime decides where it is consumed.
-- After `worker_ready`, the worker is unavailable until its first `input_wait`.
-  The server treats `input_wait` as the single readiness gate, not as prompt
-  classification.
+- After `worker_ready`, the worker is not ready for input until its first
+  `input_wait`. The server treats `input_wait` as the single readiness gate,
+  not as prompt classification.
 - Worker reset and teardown use the sideband `shutdown` lifecycle message first,
   with stdin close and process termination retained only as bounded fallbacks.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.

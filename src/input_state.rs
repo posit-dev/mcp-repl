@@ -3,7 +3,7 @@ use std::time::Instant;
 #[derive(Default)]
 pub(crate) struct InputState {
     active: bool,
-    available: bool,
+    ready_for_input: bool,
     completed_observed_at: Option<Instant>,
     protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
@@ -17,11 +17,11 @@ struct LatchedProtocolError {
 
 impl InputState {
     pub(crate) fn begin_input(&mut self) -> Result<(), String> {
-        if !self.available {
-            return Err("input_batch sent while worker is not waiting for input".to_string());
+        if !self.ready_for_input {
+            return Err("input_batch sent while worker is not ready for input".to_string());
         }
         self.active = true;
-        self.available = false;
+        self.ready_for_input = false;
         self.completed_observed_at = None;
         Ok(())
     }
@@ -46,14 +46,14 @@ impl InputState {
     }
 
     pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
-        self.available = true;
+        self.ready_for_input = true;
         if self.active {
             self.completed_observed_at = Some(observed_at);
         }
     }
 
     pub(crate) fn note_interrupt_sent(&mut self) {
-        self.available = false;
+        self.ready_for_input = false;
     }
 
     pub(crate) fn request_completion_ready(&self) -> bool {

@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_input_requires_input_wait_availability() {
+    fn begin_input_requires_input_wait_readiness() {
         let (server, _worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
@@ -849,14 +849,11 @@ mod tests {
             .begin_input()
             .expect_err("input cannot start before input_wait");
 
-        assert_eq!(
-            err,
-            "input_batch sent while worker is not waiting for input"
-        );
+        assert_eq!(err, "input_batch sent while worker is not ready for input");
     }
 
     #[test]
-    fn input_wait_without_active_input_updates_availability_and_prompt() {
+    fn input_wait_without_active_input_updates_readiness_and_prompt() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
@@ -872,7 +869,7 @@ mod tests {
         assert_eq!(prompt, "ready> ");
         server
             .begin_input()
-            .expect("input_wait should make worker available");
+            .expect("input_wait should make worker ready for input");
     }
 
     #[test]

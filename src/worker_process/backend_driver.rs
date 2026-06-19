@@ -271,7 +271,7 @@ mod tests {
 
     use super::*;
 
-    fn make_available(
+    fn make_ready_for_input(
         server: &ServerIpcConnection,
         worker: &crate::ipc::WorkerIpcConnection,
         prompt: &str,
@@ -290,7 +290,7 @@ mod tests {
     fn r_driver_sends_input_batch_without_stdin_payload_write() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
 
         driver
             .on_input_start("1+1", b"1+1\n", &server, Duration::from_millis(200))
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn completion_uses_input_line_and_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
             prompt: "> ".to_string(),
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn completion_uses_input_wait_prompt() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             prompt: "debug> ".to_string(),
@@ -348,7 +348,7 @@ mod tests {
     fn protocol_driver_sends_fresh_turn_after_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = ProtocolBackendDriver::new();
-        make_available(&server, &worker, ">>> ");
+        make_ready_for_input(&server, &worker, ">>> ");
 
         driver
             .on_input_start(
@@ -385,7 +385,7 @@ mod tests {
     fn r_driver_sends_fresh_turn_after_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
 
         driver
             .on_input_start(
@@ -422,7 +422,7 @@ mod tests {
     fn next_request_result_is_retained_after_explicit_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin first input");
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             prompt: "> ".to_string(),
@@ -458,7 +458,7 @@ mod tests {
     fn completion_preserves_echo_events_before_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
             prompt: "> ".to_string(),
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn completion_reports_session_end_when_prompt_is_also_stable() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        make_available(&server, &worker, "> ");
+        make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
