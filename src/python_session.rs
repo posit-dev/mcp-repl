@@ -673,7 +673,7 @@ unsafe extern "C" fn mcp_repl_readline(
         Ok(read) => read,
         Err(err) => {
             emit_output_text(TextStream::Stderr, err.as_bytes());
-            ipc::emit_session_end_with_reason("protocol_error", None);
+            ipc::emit_session_end_with_reason("protocol_error");
             request_exit();
             StdioLineRead {
                 bytes: Vec::new(),
