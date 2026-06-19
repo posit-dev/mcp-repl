@@ -33,6 +33,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - Worker launch chooses the raw process stdio or PTY transport up front, but
   accepted `repl` input is queued through IPC during steady-state execution.
   Runtime stdin surfaces are worker-owned implementation details.
+- On Windows, Python workers may use ConPTY as their raw terminal envelope.
+  Sideband named pipes still carry accepted input, readiness, and worker-owned
+  output facts separately from ConPTY traffic.
 - Workers receive request payloads through `input_batch` and complete an input
   batch with `input_wait` or `session_end`. Follow-up input after `input_wait`
   starts a fresh `input_batch`; the runtime decides where it is consumed.
