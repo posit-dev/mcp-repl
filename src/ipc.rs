@@ -13,12 +13,12 @@ mod transport;
 mod worker_connection;
 
 pub use emit::{
-    emit_input_line, emit_input_wait, emit_output_text, emit_plot_image, emit_session_end,
+    emit_input_line, emit_input_wait, emit_output_image, emit_output_text, emit_session_end,
     emit_session_end_with_reason, emit_worker_ready, global_ipc, set_global_ipc,
     worker_ipc_disabled_for_process,
 };
 pub use protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputText, IpcPlotImage, ServerToWorkerIpcMessage,
+    IpcEchoEvent, IpcHandlers, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
     WORKER_PROTOCOL_VERSION, WorkerCapabilities, WorkerIdentity, WorkerProtocol,
     WorkerToServerIpcMessage,
 };

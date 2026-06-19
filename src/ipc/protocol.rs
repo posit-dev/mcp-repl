@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 5;
+pub const WORKER_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -36,18 +36,12 @@ pub enum WorkerToServerIpcMessage {
     InputWait {
         prompt: String,
     },
-    PlotImage {
+    OutputImage {
         mime_type: String,
-        data: String,
+        data_b64: String,
         is_update: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-    },
-    OutputImage {
-        image_id: String,
-        mime_type: String,
-        data_b64: String,
-        update: bool,
     },
     SessionEnd {
         #[serde(default)]
@@ -93,7 +87,7 @@ pub struct IpcOutputText {
 }
 
 #[derive(Clone)]
-pub struct IpcPlotImage {
+pub struct IpcOutputImage {
     pub id: String,
     pub mime_type: String,
     pub data: String,
@@ -105,7 +99,7 @@ pub struct IpcPlotImage {
 #[derive(Default, Clone)]
 pub struct IpcHandlers {
     pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
-    pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
+    pub on_output_image: Option<Arc<dyn Fn(IpcOutputImage) + Send + Sync>>,
     pub on_input_wait: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -138,7 +132,6 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::{ServerToWorkerIpcMessage, WorkerToServerIpcMessage};
     use crate::worker_protocol::TextStream;
-    use base64::Engine as _;
     use serde_json::json;
 
     #[test]
@@ -151,34 +144,65 @@ mod tests {
         assert_eq!(protocol.version, super::WORKER_PROTOCOL_VERSION);
     }
     #[test]
-    fn plot_image_protocol_uses_update_flag_without_worker_id() {
+    fn output_image_protocol_uses_update_flag_without_worker_id() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "abc",
-            "is_update": true
+            "data_b64": "YWJj",
+            "is_update": true,
+            "source": "plot-1"
         }));
 
-        assert!(
-            parsed.is_ok(),
-            "plot_image should not require worker image id"
-        );
+        let Ok(WorkerToServerIpcMessage::OutputImage {
+            mime_type,
+            data_b64,
+            is_update,
+            source,
+        }) = parsed
+        else {
+            panic!("output_image should deserialize");
+        };
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(data_b64, "YWJj");
+        assert!(is_update);
+        assert_eq!(source.as_deref(), Some("plot-1"));
     }
     #[test]
-    fn plot_image_protocol_rejects_worker_id_and_is_new() {
+    fn output_image_protocol_rejects_old_worker_id_and_update_fields() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
-            "id": "plot-1",
+            "type": "output_image",
+            "image_id": "plot-1",
             "mime_type": "image/png",
-            "data": "abc",
-            "is_new": true,
-            "is_update": false
+            "data_b64": "YWJj",
+            "update": false
         }));
 
         assert!(
             parsed.is_err(),
-            "plot_image should reject old worker-owned image fields"
+            "output_image should reject old worker-owned image fields"
         );
+    }
+    #[test]
+    fn plot_image_is_not_protocol() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": false
+        }));
+
+        assert!(parsed.is_err(), "plot_image should not deserialize");
+    }
+    #[test]
+    fn output_image_protocol_rejects_plain_data_payload() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "output_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": false
+        }));
+
+        assert!(parsed.is_err(), "output_image should require data_b64");
     }
     #[test]
     fn output_text_protocol_uses_stream_and_base64_payload() {
@@ -225,15 +249,15 @@ mod tests {
     #[test]
     fn plot_image_protocol_rejects_sequence_ack_handshake() {
         let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "abc",
+            "data_b64": "YWJj",
             "is_update": false,
             "sequence": 1
         }));
         assert!(
             worker_to_server.is_err(),
-            "plot_image should not expose worker-side ack sequencing"
+            "output_image should not expose worker-side ack sequencing"
         );
 
         let server_to_worker = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({

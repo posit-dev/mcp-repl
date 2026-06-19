@@ -57,7 +57,7 @@ screen” signal. That means server-side timeline fixes can only help after the
 image exists; they cannot make an image arrive earlier than the worker emits it.
 
 That limitation is separate from ordinary plot/stdout ordering across separate
-input lines. The server timeline can already place an emitted `plot_image`
+input lines. The server timeline can already place an emitted `output_image`
 before later stdout when the sideband facts contain that ordering.
 
 ## Investigation Outcome

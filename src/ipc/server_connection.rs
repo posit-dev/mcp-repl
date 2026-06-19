@@ -11,7 +11,7 @@ use crate::input_state::InputState;
 use crate::output_capture::OutputTextSource;
 
 use super::protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputText, IpcPlotImage, ServerToWorkerIpcMessage,
+    IpcEchoEvent, IpcHandlers, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
     WorkerToServerIpcMessage,
 };
 use super::transport::IpcTransport;
@@ -31,8 +31,8 @@ struct ServerIpcInbox {
     readline_result_count: usize,
     current_image_id: Option<String>,
     request_image_id: Option<String>,
-    plot_source_image_ids: HashMap<String, String>,
-    request_plot_source_image_ids: HashMap<String, String>,
+    output_source_image_ids: HashMap<String, String>,
+    request_output_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
     disconnected: bool,
 }
@@ -75,7 +75,7 @@ impl ServerIpcConnection {
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
         let output_text_handler = handlers.on_output_text.clone();
-        let plot_handler = handlers.on_plot_image.clone();
+        let output_image_handler = handlers.on_output_image.clone();
         let input_wait_handler = handlers.on_input_wait.clone();
         let readline_result_handler = handlers.on_readline_result.clone();
         let session_end_handler = handlers.on_session_end.clone();
@@ -231,48 +231,11 @@ impl ServerIpcConnection {
                             reader_cvar.notify_all();
                         }
                     }
-                    WorkerToServerIpcMessage::PlotImage {
-                        mime_type,
-                        data,
-                        is_update,
-                        source,
-                    } => {
-                        let (id, is_new, updates_previous_image, readline_results_seen) = {
-                            let mut guard = reader_inbox.lock().unwrap();
-                            let (id, is_new, updates_previous_image) =
-                                assign_plot_image_id(&mut guard, source.as_deref(), is_update);
-                            (
-                                id,
-                                is_new,
-                                updates_previous_image,
-                                guard.readline_result_count,
-                            )
-                        };
-                        if let Some(handler) = plot_handler.as_ref() {
-                            handler(IpcPlotImage {
-                                id,
-                                mime_type,
-                                data,
-                                is_new,
-                                updates_previous_image,
-                                readline_results_seen,
-                            });
-                        } else {
-                            let mut guard = reader_inbox.lock().unwrap();
-                            guard.queue.push_back(WorkerToServerIpcMessage::PlotImage {
-                                mime_type,
-                                data,
-                                is_update,
-                                source,
-                            });
-                            reader_cvar.notify_all();
-                        }
-                    }
                     WorkerToServerIpcMessage::OutputImage {
-                        image_id,
                         mime_type,
                         data_b64,
-                        update,
+                        is_update,
+                        source,
                     } => {
                         if base64::engine::general_purpose::STANDARD
                             .decode(&data_b64)
@@ -288,7 +251,7 @@ impl ServerIpcConnection {
                         let (id, is_new, updates_previous_image, readline_results_seen) = {
                             let mut guard = reader_inbox.lock().unwrap();
                             let (id, is_new, updates_previous_image) =
-                                assign_plot_image_id(&mut guard, Some(&image_id), update);
+                                assign_output_image_id(&mut guard, source.as_deref(), is_update);
                             (
                                 id,
                                 is_new,
@@ -296,8 +259,8 @@ impl ServerIpcConnection {
                                 guard.readline_result_count,
                             )
                         };
-                        if let Some(handler) = plot_handler.as_ref() {
-                            handler(IpcPlotImage {
+                        if let Some(handler) = output_image_handler.as_ref() {
+                            handler(IpcOutputImage {
                                 id,
                                 mime_type,
                                 data: data_b64,
@@ -310,10 +273,10 @@ impl ServerIpcConnection {
                             guard
                                 .queue
                                 .push_back(WorkerToServerIpcMessage::OutputImage {
-                                    image_id,
                                     mime_type,
                                     data_b64,
-                                    update,
+                                    is_update,
+                                    source,
                                 });
                             reader_cvar.notify_all();
                         }
@@ -661,31 +624,32 @@ fn completion_wait_duration(
     until_deadline
 }
 
-fn allocate_plot_image_id() -> String {
+fn allocate_output_image_id() -> String {
     let id = NEXT_SERVER_IMAGE_ID
         .fetch_add(1, AtomicOrdering::Relaxed)
         .saturating_add(1);
     format!("image-{id}")
 }
 
-fn assign_plot_image_id(
+fn assign_output_image_id(
     guard: &mut ServerIpcInbox,
     source: Option<&str>,
     is_update: bool,
 ) -> (String, bool, bool) {
     if let Some(source) = source {
-        if is_update && let Some(id) = guard.request_plot_source_image_ids.get(source) {
+        if is_update && let Some(id) = guard.request_output_source_image_ids.get(source) {
             guard.current_image_id = Some(id.clone());
             return (id.clone(), false, false);
         }
 
-        let updates_previous_image = is_update && guard.plot_source_image_ids.contains_key(source);
-        let id = allocate_plot_image_id();
+        let updates_previous_image =
+            is_update && guard.output_source_image_ids.contains_key(source);
+        let id = allocate_output_image_id();
         guard
-            .plot_source_image_ids
+            .output_source_image_ids
             .insert(source.to_string(), id.clone());
         guard
-            .request_plot_source_image_ids
+            .request_output_source_image_ids
             .insert(source.to_string(), id.clone());
         guard.current_image_id = Some(id.clone());
         return (id, true, updates_previous_image);
@@ -695,7 +659,7 @@ fn assign_plot_image_id(
         is_update && guard.current_image_id.is_some() && guard.request_image_id.is_none();
     let is_new = !is_update || guard.current_image_id.is_none() || updates_previous_image;
     let id = if is_new {
-        let id = allocate_plot_image_id();
+        let id = allocate_output_image_id();
         guard.request_image_id = Some(id.clone());
         guard.current_image_id = Some(id.clone());
         id
@@ -717,7 +681,7 @@ fn reset_request_progress(guard: &mut ServerIpcInbox) {
 fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     reset_request_progress(guard);
     guard.request_image_id = None;
-    guard.request_plot_source_image_ids.clear();
+    guard.request_output_source_image_ids.clear();
     guard.last_prompt = None;
 }
 
@@ -841,6 +805,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_output_image_base64_latches_protocol_error() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::OutputImage {
+                mime_type: "image/png".to_string(),
+                data_b64: "***".to_string(),
+                is_update: false,
+                source: None,
+            })
+            .expect("send invalid output_image");
+
+        let err = wait_for_protocol_error(&server).expect("server should latch output_image error");
+        assert_eq!(err, "invalid output_image base64");
+    }
+
+    #[test]
     fn begin_input_requires_input_wait_readiness() {
         let (server, _worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
@@ -897,28 +879,30 @@ mod tests {
         assert_eq!(err, "input_line reported with no active input");
     }
     #[test]
-    fn plot_image_updates_reuse_current_server_image_id() {
+    fn output_image_updates_reuse_current_server_image_id() {
         let images = Arc::new(Mutex::new(Vec::new()));
         let handler_images = images.clone();
         let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
-            on_plot_image: Some(Arc::new(move |image| {
+            on_output_image: Some(Arc::new(move |image| {
                 handler_images.lock().expect("image mutex").push(image);
             })),
             ..IpcHandlers::default()
         })
         .expect("ipc pair");
         let first = json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "first",
-            "is_update": false
+            "data_b64": "Zmlyc3Q=",
+            "is_update": false,
+            "source": "plot-1"
         })
         .to_string();
         let second = json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "second",
-            "is_update": true
+            "data_b64": "c2Vjb25k",
+            "is_update": true,
+            "source": "plot-1"
         })
         .to_string();
 
@@ -941,25 +925,25 @@ mod tests {
         assert_eq!(images[0].id, images[1].id);
         assert!(images[0].is_new);
         assert!(!images[1].is_new);
-        assert_eq!(images[0].data, "first");
-        assert_eq!(images[1].data, "second");
+        assert_eq!(images[0].data, "Zmlyc3Q=");
+        assert_eq!(images[1].data, "c2Vjb25k");
     }
     #[test]
-    fn plot_image_ids_do_not_repeat_across_server_connections() {
+    fn output_image_ids_do_not_repeat_across_server_connections() {
         fn next_connection_image_id() -> String {
             let images = Arc::new(Mutex::new(Vec::new()));
             let handler_images = images.clone();
             let (_server, worker) = test_connection_pair_with_handlers(IpcHandlers {
-                on_plot_image: Some(Arc::new(move |image| {
+                on_output_image: Some(Arc::new(move |image| {
                     handler_images.lock().expect("image mutex").push(image);
                 })),
                 ..IpcHandlers::default()
             })
             .expect("ipc pair");
             let image = json!({
-                "type": "plot_image",
+                "type": "output_image",
                 "mime_type": "image/png",
-                "data": "image",
+                "data_b64": "aW1hZ2U=",
                 "is_update": false
             })
             .to_string();

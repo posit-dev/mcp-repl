@@ -101,20 +101,20 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
-fn worker_sideband_protocol_keeps_plot_images_one_way() {
+fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
-        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 5 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
         r#"{ "type": "input_batch", "input": <string> }"#,
         r#"{ "type": "input_line", "prompt": <string>, "text": <string> }"#,
         r#"{ "type": "input_wait", "prompt": <string> }"#,
         r#"{ "type": "interrupt" }"#,
-        "This document defines worker protocol version 5.",
+        "This document defines worker protocol version 6.",
         "The server rejects unsupported",
-        "There is no plot-image acknowledgement message.",
+        "There is no image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
         "Submitted input must not be emitted as `output_text`.",
         "The server may reconstruct `prompt + text` from ordered `input_line` events",
@@ -126,6 +126,8 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
     }
 
     for forbidden in [
+        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }"#,
         "`plot_image_ack`",
         r#""sequence": <integer|null>"#,
         r#"{ "type": "readline_start", "prompt": <string> }"#,

@@ -98,11 +98,11 @@ pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
     ipc.send_output_text(stream, bytes)
 }
 
-pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
+pub fn emit_output_image(mime_type: &str, data_b64: &str, is_update: bool, source: Option<&str>) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
+        let _ = ipc.send(WorkerToServerIpcMessage::OutputImage {
             mime_type: mime_type.to_string(),
-            data: data.to_string(),
+            data_b64: data_b64.to_string(),
             is_update,
             source: source.map(ToString::to_string),
         });

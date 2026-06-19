@@ -4,7 +4,7 @@ This document describes the sideband protocol between the server and a
 worker process. The channel is a UTF-8 JSON-lines stream, one JSON object
 per line, carried over an IPC pipe.
 
-This document defines worker protocol version 5. The server rejects
+This document defines worker protocol version 6. The server rejects
 unsupported protocol versions before sending user input. Built-in R,
 built-in Python, and custom workers share the same public contract: workers
 are opaque runtimes, accepted input is sent over IPC with `input_batch`, and
@@ -148,7 +148,7 @@ should see EOF or whatever explicit worker policy applies.
 
 Removed server-to-worker messages
 - `turn_start`, `turn_input`, and identity-bearing `input_batch` are not part
-  of protocol v5.
+  of protocol v6.
 
 ## Direction: worker -> server
 
@@ -156,7 +156,7 @@ Worker-to-server messages are strict: unknown fields, invalid enum values,
 invalid base64, and unknown message types are protocol errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 5 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Must be the first worker-to-server message for protocol workers.
 - The server rejects unsupported protocol names or versions before sending
   user input.
@@ -185,7 +185,7 @@ invalid base64, and unknown message types are protocol errors.
 
 Removed worker-to-server messages
 - `readline_start`, `idle`, `stdin_wait`, and identity-bearing `input_wait`,
-  `input_line`, or `session_end` are not part of protocol v5.
+  `input_line`, or `session_end` are not part of protocol v6.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
@@ -205,16 +205,18 @@ Removed worker-to-server messages
   this worker-owned path and may continue to use inherited raw output streams.
 
 `output_image`
-- `{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }`
+- `{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }`
 - Carries worker-owned image bytes on the ordered sideband stream.
-- `image_id` is worker-local source identity for update grouping. The server
-  owns MCP response image IDs.
-
-`plot_image`
-- `{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }`
-- Built-in adapters use this event for plot output.
-- There is no plot-image acknowledgement message.
+- `source` is optional worker-local identity for update grouping. It is not a
+  server-visible image ID. The server owns MCP response image IDs.
+- Built-in plot adapters use this event for plot output. Plotting remains
+  runtime behavior, not a separate protocol category.
+- There is no image acknowledgement message.
 - Workers must not delay stdout/stderr output waiting for sideband responses.
+
+Removed worker-to-server image messages
+- `plot_image` and old `output_image` messages with `image_id` or `update`
+  fields are not part of protocol v6.
 
 `session_end`
 - `{ "type": "session_end", "reason": <string>, "message_b64": <base64, optional> }`

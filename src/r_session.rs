@@ -1057,7 +1057,7 @@ pub(crate) fn push_plot_image(
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
+    ipc::emit_output_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
 }

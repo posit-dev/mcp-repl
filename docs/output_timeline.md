@@ -55,7 +55,7 @@ The important design split is not "files mode vs pager mode". It is:
   input, append protocol warnings, and restore the final prompt
 
 Timeline resolution must not depend on request completion. For example, the
-server does not need to wait for completion to know that a `plot_image` event
+server does not need to wait for completion to know that an `output_image` event
 belongs before a later `input_line` echo. That ordering fact is already
 present in the mixed timeline.
 
@@ -116,7 +116,7 @@ resolution, not in the wire protocol.
   order observed on that terminal stream.
 - Sideband `input_line` events define the order in which logical input was
   delivered to the runtime.
-- Sideband `plot_image` events define when plot updates happened relative to
+- Sideband `output_image` events define when image updates happened relative to
   other sideband events.
 - Visible replies must preserve evaluation order when that order is represented
   by sideband facts. They must not invent a strict order between unframed

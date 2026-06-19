@@ -16,8 +16,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl`/`repl_reset` behavior stable.
 - During steady-state worker requests, the server treats the worker as an opaque
   queued runtime endpoint: `input_batch` carries accepted input over IPC,
-  `output_text` sideband frames carry worker-owned text, raw stdout/stderr carry
-  unowned visible text, and other sideband events carry structural facts.
+  `output_text` and `output_image` sideband frames carry worker-owned output,
+  raw stdout/stderr carry unowned visible text, and other sideband events carry
+  structural facts.
   Backend-specific runtime semantics belong in the worker or in explicitly
   advertised worker metadata.
 - Control-only interrupts are routed to an existing worker process without

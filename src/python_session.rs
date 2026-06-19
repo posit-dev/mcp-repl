@@ -1024,7 +1024,7 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
         },
         ModuleMethod {
             name: "emit_plot_image",
-            function: py_emit_plot_image,
+            function: py_emit_output_image,
         },
         ModuleMethod {
             name: "set_python_prompts",
@@ -1165,7 +1165,7 @@ unsafe extern "C" fn py_request_exit(_self: *mut PyObject, args: *mut PyObject) 
     api.none()
 }
 
-unsafe extern "C" fn py_emit_plot_image(
+unsafe extern "C" fn py_emit_output_image(
     _self: *mut PyObject,
     args: *mut PyObject,
 ) -> *mut PyObject {
@@ -1191,7 +1191,7 @@ unsafe extern "C" fn py_emit_plot_image(
     let Some(source) = api.unicode_arg(args, 3) else {
         return ptr::null_mut();
     };
-    ipc::emit_plot_image(&mime_type, &data, is_update == 1, Some(&source));
+    ipc::emit_output_image(&mime_type, &data, is_update == 1, Some(&source));
     api.none()
 }
 

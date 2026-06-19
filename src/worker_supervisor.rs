@@ -29,7 +29,7 @@ use crate::ipc::{
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
-use crate::ipc::{IpcHandlers, IpcPlotImage};
+use crate::ipc::{IpcHandlers, IpcOutputImage};
 use crate::output_capture::OutputTimeline;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind, PendingTextSource};
@@ -201,7 +201,7 @@ impl LiveOutputCapture {
         }
     }
 
-    pub(crate) fn append_image(&self, image: IpcPlotImage) {
+    pub(crate) fn append_image(&self, image: IpcOutputImage) {
         if image.updates_previous_image {
             self.output_timeline.append_text_event(
                 PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
@@ -582,7 +582,7 @@ impl WorkerProcess {
                         text.is_continuation,
                     );
                 })),
-                on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
+                on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
                     image_capture.append_image(image);
                 })),
                 on_input_wait: Some(Arc::new(move |prompt: String| {
@@ -2275,7 +2275,7 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
@@ -2326,7 +2326,7 @@ mod tests {
             line: "lines(4:8, 4:8)\n".to_string(),
             echo_source: PendingTextSource::Ipc,
         });
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
@@ -2385,7 +2385,7 @@ mod tests {
                     echo_source: PendingTextSource::Ipc,
                 });
             })),
-            on_plot_image: Some(Arc::new(move |image| {
+            on_output_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
             })),
             on_session_end: Some(Arc::new(move || {
@@ -2418,13 +2418,13 @@ mod tests {
             })
             .expect("send input_line");
         worker
-            .send(WorkerToServerIpcMessage::PlotImage {
+            .send(WorkerToServerIpcMessage::OutputImage {
                 mime_type: "image/png".to_string(),
-                data: "AA==".to_string(),
+                data_b64: "AA==".to_string(),
                 is_update: false,
                 source: None,
             })
-            .expect("send plot_image");
+            .expect("send output_image");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
@@ -2537,7 +2537,7 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
 
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),

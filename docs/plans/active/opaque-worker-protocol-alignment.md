@@ -10,7 +10,7 @@
 
 The IPC-queued opaque worker protocol is now documented as the source-of-truth
 worker/server contract. The earlier v4 design with `input_id` fields and
-`readline_start` prompt advisory messages is superseded by protocol v5:
+`readline_start` prompt advisory messages is superseded by protocol v6:
 
 - accepted `repl` input is sent over IPC with `input_batch`,
 - follow-up input after a runtime input wait starts a fresh `input_batch`,
@@ -24,6 +24,8 @@ worker/server contract. The earlier v4 design with `input_id` fields and
 - client-requested interrupts are forwarded as payload-free `interrupt`
   messages whenever a worker endpoint exists,
 - `session_end` is terminal for any active input,
+- image output uses the generic `output_image` sideband event; `plot_image` is
+  superseded as a protocol category,
 - reset and teardown request worker exit with the server-to-worker `shutdown`
   lifecycle message,
 - raw stdout/stderr, prompt-shaped text, PTY state, and timing do not drive
