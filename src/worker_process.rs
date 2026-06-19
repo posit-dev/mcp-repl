@@ -383,6 +383,7 @@ mod tests {
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
         let non_utf8_tmpdir = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec()));
+        #[cfg(target_os = "linux")]
         std::fs::create_dir_all(&non_utf8_tmpdir).expect("create non-UTF-8 TMPDIR parent");
 
         unsafe {
@@ -404,6 +405,7 @@ mod tests {
                 std::env::remove_var("TMPDIR");
             },
         }
+        #[cfg(target_os = "linux")]
         let _ = std::fs::remove_dir(&non_utf8_tmpdir);
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");

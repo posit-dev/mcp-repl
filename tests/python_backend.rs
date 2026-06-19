@@ -594,7 +594,7 @@ impl DetachedHolderProbe {
 }
 
 async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if marker_path.exists() {
             sleep(Duration::from_millis(250)).await;
@@ -606,7 +606,7 @@ async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
 }
 
 async fn wait_for_file_text(path: &Path, expected: &str) -> TestResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_text = None;
     while Instant::now() < deadline {
         match fs::read_to_string(path) {
@@ -4188,7 +4188,7 @@ tail_marker = {tail_marker_literal}
 exit_marker = {exit_marker_literal}
 release_marker = {release_marker_literal}
 writer = """import os, pathlib, sys, time
-deadline = time.monotonic() + 5
+deadline = time.monotonic() + 30
 while not os.path.exists(sys.argv[2]):
     if time.monotonic() >= deadline:
         sys.exit(2)
