@@ -4,8 +4,8 @@ use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 
 use super::state::{
-    PythonReadlineState, RawStdinReadError, SESSION_STATE, SessionStateInner, StdinReadAccounting,
-    mark_stdin_wait_prompt_completed_request, remember_emitted_prompt,
+    RawStdinReadError, SESSION_STATE, SessionStateInner, StdinReadAccounting,
+    mark_input_wait_completed_request, remember_emitted_prompt,
 };
 use super::stdio::{PythonThreadsAllowed, StdioLineRead};
 use super::{CStdinLine, emit_output_text, emit_plots, record_background_plots};
@@ -16,23 +16,22 @@ pub(super) fn flush_terminal_input() {
     let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
 }
 
-pub(super) fn begin_or_append_turn_input(turn_id: u64, input: &str) -> Result<(), String> {
+pub(super) fn begin_turn_input(turn_id: u64, input: &str) -> Result<(), String> {
     let payload = normalize_pty_turn_payload(prepare_worker_stdin_payload(input));
     let Some(state) = SESSION_STATE.get() else {
         return Ok(());
     };
     let should_record_background_plots = {
         let guard = state.inner.lock().unwrap();
-        !guard.request_active || guard.request_completed_at_stdin_wait
+        !guard.request_active
     };
     if should_record_background_plots {
         record_background_plots();
     }
 
     let mut guard = state.inner.lock().unwrap();
-    guard.turn_input.begin_or_append(turn_id, payload)?;
+    guard.turn_input.begin_turn(turn_id, payload)?;
     guard.interrupt_requested = false;
-    guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
     guard.plot_reset_pending = true;
     state.cvar.notify_all();
@@ -45,8 +44,7 @@ pub(super) fn discard_pending_stdin() {
     };
     let mut guard = state.inner.lock().unwrap();
     guard.turn_input.clear_after_interrupt();
-    guard.request_completed_at_stdin_wait = false;
-    guard.request_active = true;
+    guard.request_active = guard.turn_input.has_active_turn();
 }
 
 enum ReadlineAction {
@@ -55,18 +53,13 @@ enum ReadlineAction {
         bytes: Vec<u8>,
         prompt_already_visible: bool,
     },
-    Idle {
-        turn_id: u64,
-        prompt: String,
-    },
-    StdinWait {
+    InputWait {
         turn_id: u64,
         prompt: String,
     },
     ReadlineStart {
         prompt: String,
     },
-    WaitForTurnInput,
     Interrupted,
     Shutdown,
 }
@@ -111,23 +104,9 @@ fn next_readline_action_locked(
         });
     }
 
-    if let Some(turn_id) = guard.turn_input.active_consumed_turn() {
-        if guard.request_completed_at_stdin_wait {
-            return Ok(ReadlineAction::WaitForTurnInput);
-        }
+    if let Some(turn_id) = guard.turn_input.take_completed_turn() {
         let prompt = prompt.to_string();
-        if matches!(
-            guard.current_readline_state,
-            Some(PythonReadlineState::Primary | PythonReadlineState::Continuation)
-        ) {
-            let turn_id = guard
-                .turn_input
-                .take_completed_turn()
-                .expect("active consumed turn should be completed");
-            guard.request_active = false;
-            return Ok(ReadlineAction::Idle { turn_id, prompt });
-        }
-        return Ok(ReadlineAction::StdinWait { turn_id, prompt });
+        return Ok(ReadlineAction::InputWait { turn_id, prompt });
     }
 
     Ok(ReadlineAction::ReadlineStart {
@@ -165,13 +144,6 @@ fn wait_for_turn_line(
                     }
                     continue;
                 }
-                Ok(ReadlineAction::WaitForTurnInput) => {
-                    let allow_threads = release_gil_while_waiting.then(PythonThreadsAllowed::new);
-                    guard = state.cvar.wait(guard).unwrap();
-                    drop(guard);
-                    drop(allow_threads);
-                    continue;
-                }
                 Ok(action) => action,
                 Err(message) => {
                     mark_protocol_failure_locked(&mut guard);
@@ -196,16 +168,12 @@ fn wait_for_turn_line(
                     interrupted: false,
                 });
             }
-            ReadlineAction::Idle { turn_id, prompt } => {
+            ReadlineAction::InputWait { turn_id, prompt } => {
                 emit_plots();
                 remember_emitted_prompt(&prompt);
-                ipc::emit_idle(turn_id, &prompt);
-            }
-            ReadlineAction::StdinWait { turn_id, prompt } => {
-                emit_plots();
-                mark_stdin_wait_prompt_completed_request();
-                remember_emitted_prompt(&prompt);
-                ipc::emit_stdin_wait(turn_id, &prompt);
+                mark_input_wait_completed_request();
+                ipc::emit_input_wait(turn_id, &prompt);
+                idle_prompt_emitted = true;
             }
             ReadlineAction::Interrupted => {
                 return Ok(StdioLineRead {
@@ -220,7 +188,6 @@ fn wait_for_turn_line(
                 });
             }
             ReadlineAction::ReadlineStart { .. } => unreachable!(),
-            ReadlineAction::WaitForTurnInput => unreachable!(),
         }
     }
 }
@@ -290,19 +257,9 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
                     }
                 }
                 Ok(None) => {
-                    if let Some(turn_id) = guard.turn_input.active_consumed_turn() {
-                        if guard.request_completed_at_stdin_wait {
-                            if output.is_empty() {
-                                let allow_threads = PythonThreadsAllowed::new();
-                                guard = state.cvar.wait(guard).unwrap();
-                                drop(guard);
-                                drop(allow_threads);
-                                continue;
-                            }
-                            return Ok(output);
-                        }
+                    if let Some(turn_id) = guard.turn_input.take_completed_turn() {
                         let prompt = String::new();
-                        ReadlineAction::StdinWait { turn_id, prompt }
+                        ReadlineAction::InputWait { turn_id, prompt }
                     } else if output.is_empty() {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
@@ -325,11 +282,14 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
                 ipc::emit_input_line(turn_id, "", &String::from_utf8_lossy(&bytes));
                 output.extend(bytes);
             }
-            ReadlineAction::StdinWait { turn_id, prompt } => {
+            ReadlineAction::InputWait { turn_id, prompt } => {
                 emit_plots();
-                mark_stdin_wait_prompt_completed_request();
                 remember_emitted_prompt(&prompt);
-                ipc::emit_stdin_wait(turn_id, &prompt);
+                mark_input_wait_completed_request();
+                ipc::emit_input_wait(turn_id, &prompt);
+                if !output.is_empty() {
+                    return Ok(output);
+                }
             }
             _ => {}
         }

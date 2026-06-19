@@ -64,10 +64,6 @@ response:
     {
       "type": "text",
       "text": "help> "
-    },
-    {
-      "type": "text",
-      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }
@@ -92,10 +88,6 @@ response:
     {
       "type": "text",
       "text": "help> "
-    },
-    {
-      "type": "text",
-      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }

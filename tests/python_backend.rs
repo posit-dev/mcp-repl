@@ -692,7 +692,7 @@ print("ipc background ready")
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_hook_flushes_before_stdin_wait_reply() -> TestResult<()> {
+async fn python_plot_hook_flushes_before_input_wait_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1586,7 +1586,7 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_direct_stdin_reads_consume_buffered_turn_input() -> TestResult<()> {
+async fn python_pty_direct_stdin_reads_consume_buffered_turn_start_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3089,7 +3089,7 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() -> TestResult<()> {
+async fn python_windows_input_wait_interrupt_preserves_next_turn_start_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3125,7 +3125,7 @@ async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() ->
     let interrupt_text = result_text(&interrupt);
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected idle input interrupt to complete, got: {interrupt_text:?}"
+        "expected input-wait interrupt to complete, got: {interrupt_text:?}"
     );
 
     let follow_up = session
@@ -3136,7 +3136,7 @@ async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() ->
 
     assert!(
         follow_up_text.contains("AFTER_WINDOWS_STDIN_INTERRUPT"),
-        "expected follow-up to run after idle input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        "expected follow-up to run after input-wait interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3429,8 +3429,8 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "expected Python backend to start before empty input prompt, got: {prompt_text:?}"
     );
     assert!(
-        prompt_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty input prompt to return a visible waiting status, got: {prompt_text:?}"
+        prompt_text.contains("<<repl status: waiting for input>>"),
+        "expected empty input prompt to return a visible generic waiting status, got: {prompt_text:?}"
     );
     assert!(
         !prompt_text.contains("stdin> "),
@@ -3465,7 +3465,7 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()> {
+async fn python_empty_poll_after_empty_input_prompt_uses_idle_poll_path() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3476,19 +3476,15 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
-        prompt_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty input prompt to return waiting status, got: {prompt_text:?}"
+        prompt_text.contains("<<repl status: waiting for input>>"),
+        "expected empty input prompt to return generic waiting status, got: {prompt_text:?}"
     );
 
     let poll = session.write_stdin_raw_with("", Some(1.0)).await?;
     let poll_text = result_text(&poll);
     assert!(
-        poll_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty poll to preserve stdin wait status, got: {poll_text:?}"
-    );
-    assert!(
-        !poll_text.contains("<<repl status: idle>>"),
-        "did not expect empty poll to report idle while input() is waiting, got: {poll_text:?}"
+        poll_text.contains("<<repl status: idle>>"),
+        "expected empty poll to use normal idle status, got: {poll_text:?}"
     );
 
     let answer = session
@@ -3601,12 +3597,8 @@ async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()
     let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
     let poll_text = result_text(&poll);
     assert!(
-        poll_text.contains("<<repl status: waiting for stdin>>"),
-        "expected poll to report empty input prompt, got: {poll_text:?}"
-    );
-    assert!(
-        !poll_text.contains("<<repl status: idle>>"),
-        "did not expect poll to report idle while input() is waiting, got: {poll_text:?}"
+        poll_text.contains("<<repl status: waiting for input>>"),
+        "expected poll to report generic input wait, got: {poll_text:?}"
     );
 
     let answer = session
@@ -3930,7 +3922,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_ctrl_c_prefix_preserves_followup_turn_input() -> TestResult<()> {
+async fn python_ctrl_c_prefix_preserves_followup_fresh_turn_input() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());

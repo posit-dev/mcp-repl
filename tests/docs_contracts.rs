@@ -107,13 +107,13 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
         r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 3 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 4 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
         r#"{ "type": "turn_start", "turn_id": <integer>, "input": <string> }"#,
         r#"{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }"#,
-        r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "input_wait", "turn_id": <integer>, "prompt": <string> }"#,
         r#"{ "type": "interrupt", "turn_id": <integer> }"#,
-        "This document defines worker protocol version 3.",
-        "The server rejects other",
+        "This document defines worker protocol version 4.",
+        "The server rejects unsupported",
         "There is no plot-image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
         "Submitted input must not be emitted as `output_text`.",
@@ -128,6 +128,9 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
     for forbidden in [
         "`plot_image_ack`",
         r#""sequence": <integer|null>"#,
+        r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "stdin_wait", "turn_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "turn_input", "turn_id": <integer>, "input": <string> }"#,
         "version 2 from built-in and migrating workers",
         "Legacy v2 image event retained for built-in workers during migration.",
     ] {
@@ -143,7 +146,7 @@ fn futurework_does_not_revive_server_inferred_worker_completion() {
     let note = read(&repo_root().join("docs/futurework/r-worker-turn-boundary-simplification.md"));
 
     for required in [
-        "worker-emitted `idle` or `session_end`",
+        "worker-emitted `input_wait` or `session_end`",
         "Server-inferred completion is no longer the intended direction",
     ] {
         assert!(

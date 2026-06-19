@@ -29,7 +29,6 @@ impl WorkerManager {
 
     pub(super) fn note_session_end(&mut self, include_notice: bool) {
         self.session_end_seen = true;
-        self.stdin_waiting = false;
         if let Some(process) = self.process.as_mut() {
             process.note_expected_exit();
             if include_notice {

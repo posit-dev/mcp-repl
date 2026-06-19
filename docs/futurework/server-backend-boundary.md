@@ -17,13 +17,11 @@ description selection.
 The intended contract is a narrow server/worker boundary:
 
 - `turn_start` carries user input to workers,
-- `turn_input` carries same-turn stdin follow-up input when the runtime is
-  waiting at a stdin-style boundary,
 - `output_text` sideband frames carry worker-owned text back to the server,
 - raw stdout/stderr carry unowned visible text from child processes or direct
   file-descriptor writes,
 - sideband IPC also carries structural facts such as input lines, images,
-  `idle`, `stdin_wait`, and session end,
+  `input_wait`, and session end,
 - the server formats replies from those streams without understanding the
   runtime's internal implementation.
 
@@ -91,8 +89,6 @@ Initial candidates:
 
 - `supports_images`: already present in `worker_ready.capabilities`; controls
   whether image events are expected.
-- `stdin_wait_followup`: whether a completed turn can leave the runtime waiting
-  for same-turn stdin continuation input.
 - `worker_ready_startup_timeout`: whether startup may continue after a short
   worker-ready timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional

@@ -9,18 +9,15 @@ This note is superseded by the IPC-queued opaque worker protocol documented in
 
 Status: superseded.
 
-Historical baseline: Server-inferred completion is no longer the intended direction.
-The old simplification target was worker-emitted `idle` or `session_end`; the
-current protocol keeps that fail-closed direction and adds `stdin_wait` for
-stdin-continuation reply boundaries.
+Historical baseline: Server-inferred completion is no longer the intended direction. The old simplification target was worker-emitted `idle` or
+`session_end`; that was superseded by protocol v4's single worker-emitted
+`input_wait` boundary. The current success boundary is worker-emitted `input_wait` or `session_end`.
 
 The current protocol contract is:
 
 - accepted input enters the worker through `turn_start`,
-- stdin-style continuation input uses `turn_input`,
 - the worker owns the input queue and runtime placement,
-- successful same-worker reply boundaries are reported with `idle` or
-  `stdin_wait`,
+- successful same-worker reply boundaries are reported with `input_wait`,
 - `session_end` is terminal for any active turn,
 - the server does not infer completion from prompt text, raw process stdin
   writes, PTY state, stdout/stderr, or timing.

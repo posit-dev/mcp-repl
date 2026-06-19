@@ -14,8 +14,8 @@ The worker emits different kinds of information on different channels:
 - PTY-backed workers expose raw terminal output through the PTY master, which
   may merge stdout/stderr identity and apply terminal behavior such as CRLF
   translation, echo, and width-dependent formatting.
-- Sideband IPC carries structural events such as `input_line`, `idle`,
-  `stdin_wait`, `output_image`, and `session_end`.
+- Sideband IPC carries structural events such as `input_line`, `input_wait`,
+  `output_image`, and `session_end`.
 
 Raw pipes and IPC do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
@@ -74,9 +74,7 @@ Echo matching must be driven by the sideband facts themselves:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
-- `idle` supplies the final REPL prompt text for a completed turn
-- `stdin_wait` supplies the prompt text for a completed reply that left the
-  runtime at a stdin-style wait
+- `input_wait` supplies the prompt text for a completed turn
 - the server should match and collapse those exact sideband facts
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`

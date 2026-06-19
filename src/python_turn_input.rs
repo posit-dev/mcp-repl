@@ -24,20 +24,15 @@ impl PythonTurnInput {
         }
     }
 
-    pub(crate) fn begin_or_append(&mut self, turn_id: u64, payload: Vec<u8>) -> Result<(), String> {
-        match self.active_turn_id {
-            Some(active) if active != turn_id && !self.queued_bytes.is_empty() => Err(format!(
-                "turn_input turn_id {turn_id} does not match active turn_id {active}"
-            )),
-            Some(active) if active != turn_id => Err(format!(
-                "turn_input turn_id {turn_id} does not match active turn_id {active}"
-            )),
-            _ => {
-                self.active_turn_id = Some(turn_id);
-                self.queued_bytes.extend(payload);
-                Ok(())
-            }
+    pub(crate) fn begin_turn(&mut self, turn_id: u64, payload: Vec<u8>) -> Result<(), String> {
+        if let Some(active) = self.active_turn_id {
+            return Err(format!(
+                "turn_start turn_id {turn_id} arrived while turn_id {active} is active"
+            ));
         }
+        self.active_turn_id = Some(turn_id);
+        self.queued_bytes.extend(payload);
+        Ok(())
     }
 
     pub(crate) fn clear_for_protocol_failure(&mut self) {
@@ -49,12 +44,8 @@ impl PythonTurnInput {
         self.queued_bytes.clear();
     }
 
-    pub(crate) fn active_consumed_turn(&self) -> Option<u64> {
-        if self.queued_bytes.is_empty() {
-            self.active_turn_id
-        } else {
-            None
-        }
+    pub(crate) fn has_active_turn(&self) -> bool {
+        self.active_turn_id.is_some()
     }
 
     pub(crate) fn take_completed_turn(&mut self) -> Option<u64> {

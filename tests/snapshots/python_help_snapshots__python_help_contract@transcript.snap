@@ -21,7 +21,6 @@ expression: transcript
 >>> help()
 <<< <PYTHON HELP BANNER>
 <<< help>
-<<< <<repl status: waiting for stdin>>
 
 4) py_repl timeout_ms=1000
 >>> len
@@ -30,7 +29,6 @@ expression: transcript
 <<< len(obj, /)
 <<<     Return the number of items in a container.
 <<< help>
-<<< <<repl status: waiting for stdin>>
 
 5) py_repl timeout_ms=1000
 >>> q

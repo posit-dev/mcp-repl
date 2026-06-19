@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use crate::completion_reply::{ReplyWithOffset, idle_status_content, stdin_wait_status_content};
+use crate::completion_reply::{ReplyWithOffset, idle_status_content};
 use crate::output_capture::set_last_reply_marker_offset;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -126,21 +126,13 @@ impl WorkerManager {
     }
 
     pub(super) fn remember_prompt(&mut self, prompt: Option<String>) {
-        if prompt.as_deref() == Some("") {
-            self.stdin_waiting = true;
-            return;
-        }
         let prompt = normalize_prompt(prompt);
         if let Some(prompt) = prompt {
-            self.stdin_waiting = false;
             self.last_prompt = Some(prompt);
         }
     }
 
     pub(super) fn current_prompt_hint(&self) -> Option<String> {
-        if self.stdin_waiting {
-            return None;
-        }
         let prompt = self
             .process
             .as_ref()
@@ -167,18 +159,6 @@ impl WorkerManager {
     }
 
     pub(super) fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
-        if self.stdin_waiting {
-            return ReplyWithOffset {
-                reply: WorkerReply::Output {
-                    contents: vec![stdin_wait_status_content()],
-                    is_error: false,
-                    error_code: None,
-                    prompt: None,
-                    prompt_variants: None,
-                },
-                end_offset: 0,
-            };
-        }
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];
@@ -196,18 +176,6 @@ impl WorkerManager {
     }
 
     pub(super) fn build_idle_poll_reply_pager(&mut self) -> ReplyWithOffset {
-        if self.stdin_waiting {
-            return ReplyWithOffset {
-                reply: WorkerReply::Output {
-                    contents: vec![stdin_wait_status_content()],
-                    is_error: false,
-                    error_code: None,
-                    prompt: None,
-                    prompt_variants: None,
-                },
-                end_offset: self.output.end_offset().unwrap_or(0),
-            };
-        }
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
         let mut contents = vec![idle_status_content()];

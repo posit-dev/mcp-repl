@@ -67,20 +67,6 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
-                        match wait_for_r_session()
-                            .and_then(|session| session.append_turn_input(turn_id, input))
-                        {
-                            Ok(()) => {}
-                            Err(err) => {
-                                crate::output_stream::write_stderr_bytes(err.as_bytes());
-                                crate::ipc::emit_session_end_with_reason(
-                                    "protocol_error",
-                                    Some(turn_id),
-                                );
-                            }
-                        }
-                    }
                     Some(ServerToWorkerIpcMessage::Interrupt { .. }) => {
                         crate::r_session::clear_pending_input();
                     }

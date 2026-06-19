@@ -25,7 +25,6 @@ struct ServerIpcInbox {
     queue: VecDeque<WorkerToServerIpcMessage>,
     startup_message_seen: bool,
     last_prompt: Option<String>,
-    stdin_wait_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
     turn_state: TurnState,
@@ -182,21 +181,11 @@ impl ServerIpcConnection {
                             handler(echo_event);
                         }
                     }
-                    WorkerToServerIpcMessage::StdinWait { turn_id, prompt } => {
+                    WorkerToServerIpcMessage::InputWait { turn_id, prompt } => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) = guard.turn_state.record_idle(turn_id, Instant::now()) {
-                            guard.turn_state.latch_protocol_error(err);
-                            reader_cvar.notify_all();
-                            break;
-                        }
-                        push_prompt_history(&mut guard, prompt.clone());
-                        guard.stdin_wait_prompt = Some(prompt);
-                        guard.last_prompt = Some(String::new());
-                        reader_cvar.notify_all();
-                    }
-                    WorkerToServerIpcMessage::Idle { turn_id, prompt } => {
-                        let mut guard = reader_inbox.lock().unwrap();
-                        if let Err(err) = guard.turn_state.record_idle(turn_id, Instant::now()) {
+                        if let Err(err) =
+                            guard.turn_state.record_input_wait(turn_id, Instant::now())
+                        {
                             guard.turn_state.latch_protocol_error(err);
                             reader_cvar.notify_all();
                             break;
@@ -551,11 +540,6 @@ impl ServerIpcConnection {
         guard.last_prompt.take()
     }
 
-    pub fn take_stdin_wait_prompt(&self) -> Option<String> {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.stdin_wait_prompt.take()
-    }
-
     pub fn wait_for_worker_ready(
         &self,
         timeout: Duration,
@@ -760,7 +744,6 @@ fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     guard.request_image_id = None;
     guard.request_plot_source_image_ids.clear();
     guard.last_prompt = None;
-    guard.stdin_wait_prompt = None;
 }
 
 fn take_worker_ready(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
@@ -839,11 +822,11 @@ mod tests {
             })
             .expect("send input_line");
         worker
-            .send(WorkerToServerIpcMessage::Idle {
+            .send(WorkerToServerIpcMessage::InputWait {
                 turn_id: 1,
                 prompt: "zod> ".to_string(),
             })
-            .expect("send idle");
+            .expect("send input_wait");
         thread::sleep(stable_wait + Duration::from_millis(5));
         worker
             .send(WorkerToServerIpcMessage::OutputText {

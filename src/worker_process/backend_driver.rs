@@ -35,14 +35,6 @@ pub(super) trait BackendDriver: Send {
         timeout: Duration,
     ) -> Result<(), WorkerError>;
 
-    fn on_turn_input(
-        &mut self,
-        text: &str,
-        payload: &[u8],
-        ipc: &ServerIpcConnection,
-        timeout: Duration,
-    ) -> Result<(), WorkerError>;
-
     fn on_input_written(&mut self, _ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
         Ok(())
     }
@@ -65,11 +57,7 @@ pub(super) trait BackendDriver: Send {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
 
-    fn interrupt(
-        &mut self,
-        process: &mut WorkerProcess,
-        reopen_completed_turn: bool,
-    ) -> Result<(), WorkerError>;
+    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
 }
 
 pub(super) fn new_backend_driver(worker_launch: &WorkerLaunch) -> Box<dyn BackendDriver> {
@@ -177,34 +165,6 @@ impl BackendDriver for RBackendDriver {
         Ok(())
     }
 
-    fn on_turn_input(
-        &mut self,
-        text: &str,
-        _payload: &[u8],
-        ipc: &ServerIpcConnection,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        if let Some(message) = ipc.take_protocol_error() {
-            return Err(WorkerError::Protocol(message));
-        }
-        let turn_id = self.active_turn_id.ok_or_else(|| {
-            WorkerError::Protocol("stdin continuation without active turn".to_string())
-        })?;
-        ipc.begin_turn(turn_id);
-        send_worker_ipc_with_timeout(
-            ipc,
-            ServerToWorkerIpcMessage::TurnInput {
-                turn_id,
-                input: text.to_string(),
-            },
-            timeout,
-        )?;
-        if let Some(message) = ipc.take_protocol_error() {
-            return Err(WorkerError::Protocol(message));
-        }
-        Ok(())
-    }
-
     fn should_write_stdin_payload(&self) -> bool {
         false
     }
@@ -232,25 +192,14 @@ impl BackendDriver for RBackendDriver {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
         let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
-        if matches!(
-            &result,
-            Ok(completion) if completion.stdin_wait_prompt.is_none()
-        ) || matches!(result, Err(WorkerError::Protocol(_)))
-        {
+        if result.is_ok() || matches!(result, Err(WorkerError::Protocol(_))) {
             self.active_turn_id = None;
         }
         result
     }
 
-    fn interrupt(
-        &mut self,
-        process: &mut WorkerProcess,
-        reopen_completed_turn: bool,
-    ) -> Result<(), WorkerError> {
+    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc_connection() {
-            if reopen_completed_turn && let Some(turn_id) = self.active_turn_id {
-                ipc.begin_turn(turn_id);
-            }
             let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {
                 turn_id: self.active_turn_id,
             });
@@ -322,35 +271,6 @@ impl BackendDriver for ProtocolBackendDriver {
         Ok(())
     }
 
-    fn on_turn_input(
-        &mut self,
-        text: &str,
-        payload: &[u8],
-        ipc: &ServerIpcConnection,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        let _ = payload;
-        if let Some(message) = ipc.take_protocol_error() {
-            return Err(WorkerError::Protocol(message));
-        }
-        let turn_id = self.active_turn_id.ok_or_else(|| {
-            WorkerError::Protocol("stdin continuation without active turn".to_string())
-        })?;
-        ipc.begin_turn(turn_id);
-        send_worker_ipc_with_timeout(
-            ipc,
-            ServerToWorkerIpcMessage::TurnInput {
-                turn_id,
-                input: text.to_string(),
-            },
-            timeout,
-        )?;
-        if let Some(message) = ipc.take_protocol_error() {
-            return Err(WorkerError::Protocol(message));
-        }
-        Ok(())
-    }
-
     fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
         let _ = ipc;
         Ok(())
@@ -378,26 +298,15 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
         let result = driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc);
-        if matches!(
-            &result,
-            Ok(completion) if completion.stdin_wait_prompt.is_none()
-        ) || matches!(result, Err(WorkerError::Protocol(_)))
-        {
+        if result.is_ok() || matches!(result, Err(WorkerError::Protocol(_))) {
             self.active_turn_id = None;
         }
         result
     }
 
-    fn interrupt(
-        &mut self,
-        process: &mut WorkerProcess,
-        reopen_completed_turn: bool,
-    ) -> Result<(), WorkerError> {
+    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
         if let Some(ipc) = process.ipc_connection() {
             if let Some(turn_id) = self.active_turn_id {
-                if reopen_completed_turn {
-                    ipc.begin_turn(turn_id);
-                }
                 ipc.send(ServerToWorkerIpcMessage::Interrupt {
                     turn_id: Some(turn_id),
                 })
@@ -445,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_uses_input_line_and_idle() {
+    fn completion_uses_input_line_and_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         server.begin_turn(1);
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
@@ -453,14 +362,14 @@ mod tests {
             prompt: "> ".to_string(),
             text: "1+1\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::Idle {
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             turn_id: 1,
             prompt: "> ".to_string(),
         });
 
         let completion =
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected explicit idle to complete request");
+                .expect("expected explicit input_wait to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
@@ -469,22 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn completion_uses_stdin_wait_prompt() {
+    fn completion_uses_input_wait_prompt() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         server.begin_turn(1);
-        let _ = worker.send(WorkerToServerIpcMessage::StdinWait {
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             turn_id: 1,
             prompt: "debug> ".to_string(),
         });
 
         let completion =
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected stdin_wait to complete request");
-        assert_eq!(completion.stdin_wait_prompt.as_deref(), Some("debug> "));
+                .expect("expected input_wait to complete request");
+        assert_eq!(completion.prompt.as_deref(), Some("debug> "));
     }
 
     #[test]
-    fn protocol_driver_sends_turn_input_after_stdin_wait() {
+    fn protocol_driver_sends_fresh_turn_after_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = ProtocolBackendDriver::new();
 
@@ -502,27 +411,27 @@ mod tests {
                 if input == "answer = input('p> ')"
         ));
         worker
-            .send(WorkerToServerIpcMessage::StdinWait {
+            .send(WorkerToServerIpcMessage::InputWait {
                 turn_id: 1,
                 prompt: "p> ".to_string(),
             })
-            .expect("send stdin_wait");
+            .expect("send input_wait");
         let completion = driver
             .wait_for_completion(Duration::from_millis(200), server.clone())
-            .expect("stdin_wait should complete reply");
-        assert_eq!(completion.stdin_wait_prompt.as_deref(), Some("p> "));
+            .expect("input_wait should complete reply");
+        assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_turn_input("ok\n", b"ok\n", &server, Duration::from_millis(200))
-            .expect("turn_input should send");
+            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .expect("next turn_start should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnInput { turn_id: 1, input }) if input == "ok\n"
+            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 2, input }) if input == "ok\n"
         ));
     }
 
     #[test]
-    fn r_driver_sends_turn_input_after_stdin_wait() {
+    fn r_driver_sends_fresh_turn_after_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
 
@@ -540,31 +449,31 @@ mod tests {
                 if input == "answer <- readline('p> ')"
         ));
         worker
-            .send(WorkerToServerIpcMessage::StdinWait {
+            .send(WorkerToServerIpcMessage::InputWait {
                 turn_id: 1,
                 prompt: "p> ".to_string(),
             })
-            .expect("send stdin_wait");
+            .expect("send input_wait");
         let completion = driver
             .wait_for_completion(Duration::from_millis(200), server.clone())
-            .expect("stdin_wait should complete reply");
-        assert_eq!(completion.stdin_wait_prompt.as_deref(), Some("p> "));
+            .expect("input_wait should complete reply");
+        assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_turn_input("ok\n", b"ok\n", &server, Duration::from_millis(200))
-            .expect("turn_input should send");
+            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .expect("next turn_start should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
-            Some(ServerToWorkerIpcMessage::TurnInput { turn_id: 1, input }) if input == "ok\n"
+            Some(ServerToWorkerIpcMessage::TurnStart { turn_id: 2, input }) if input == "ok\n"
         ));
     }
 
     #[test]
-    fn next_request_result_is_retained_after_explicit_idle() {
+    fn next_request_result_is_retained_after_explicit_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         server.begin_turn(1);
-        let _ = worker.send(WorkerToServerIpcMessage::Idle {
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             turn_id: 1,
             prompt: "> ".to_string(),
         });
@@ -582,7 +491,7 @@ mod tests {
             prompt: "> ".to_string(),
             text: "second()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::Idle {
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             turn_id: 2,
             prompt: "> ".to_string(),
         });
@@ -598,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_preserves_echo_events_before_idle() {
+    fn completion_preserves_echo_events_before_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         server.begin_turn(1);
@@ -607,14 +516,14 @@ mod tests {
             prompt: "> ".to_string(),
             text: "first()\n".to_string(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::Idle {
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             turn_id: 1,
             prompt: "> ".to_string(),
         });
 
         let completion =
             driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after idle");
+                .expect("expected completion after input_wait");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());

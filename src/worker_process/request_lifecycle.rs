@@ -95,7 +95,6 @@ pub(super) fn completion_info_from_ipc(
 
     CompletionInfo {
         prompt,
-        stdin_wait_prompt: ipc.take_stdin_wait_prompt(),
         prompt_variants,
         echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
@@ -112,7 +111,6 @@ impl WorkerManager {
     ) -> Result<RequestState, WorkerError> {
         let text = self.driver.prepare_input_text(text);
         let started_at = Instant::now();
-        let append_to_stdin_wait = self.stdin_waiting;
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt);
         self.pending_request_input = Some(text.clone());
@@ -130,14 +128,8 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
-        if append_to_stdin_wait {
-            self.driver
-                .on_turn_input(&text, &payload, &ipc, remaining)?;
-        } else {
-            self.driver
-                .on_input_start(&text, &payload, &ipc, remaining)?;
-        }
-        self.stdin_waiting = false;
+        self.driver
+            .on_input_start(&text, &payload, &ipc, remaining)?;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(Instant::now());
@@ -191,7 +183,6 @@ impl WorkerManager {
             if worker_exited {
                 result = Ok(CompletionInfo {
                     prompt: None,
-                    stdin_wait_prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
                     protocol_warnings: ipc.take_protocol_warnings(),
@@ -375,9 +366,7 @@ impl WorkerManager {
                     },
                     None => true,
                 };
-                let preserve_active_turn =
-                    !worker_exited && settled_completion.stdin_wait_prompt.is_some();
-                self.clear_pending_request_state_with_active_turn(preserve_active_turn);
+                self.clear_pending_request_state();
                 if worker_exited {
                     settled_completion.session_end_seen = true;
                     self.note_session_end(true);

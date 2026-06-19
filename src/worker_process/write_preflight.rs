@@ -399,17 +399,16 @@ mod tests {
 
     #[test]
     fn pager_empty_input_polls_pending_output_before_pager_commands() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
         manager.process = Some(test_worker_process(sleeping_test_child()));
 
         manager.pager.activate(
@@ -448,17 +447,16 @@ mod tests {
 
     #[test]
     fn pager_empty_input_advances_page_after_worker_exit() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
@@ -507,20 +505,18 @@ mod tests {
 
     #[test]
     fn pager_empty_input_preserves_idle_guardrail_notice() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-
         let mut last_text = String::new();
         for _ in 0..16 {
-            reset_output_ring();
-            reset_last_reply_marker_offset();
-
             let mut manager = WorkerManager::new(
                 Backend::R,
                 SandboxCliPlan::default(),
                 OversizedOutputMode::Pager,
             )
             .expect("worker manager");
+            let _guard = output_ring_test_guard();
+            let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+            reset_output_ring();
+            reset_last_reply_marker_offset();
             manager.process = Some(test_worker_process(sleeping_test_child()));
             {
                 let mut slot = manager

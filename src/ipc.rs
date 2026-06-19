@@ -12,10 +12,8 @@ pub(crate) mod test_support;
 mod transport;
 mod worker_connection;
 
-#[cfg(target_family = "unix")]
-pub use emit::emit_stdin_wait;
 pub use emit::{
-    emit_idle, emit_input_line, emit_output_text, emit_plot_image, emit_readline_start,
+    emit_input_line, emit_input_wait, emit_output_text, emit_plot_image, emit_readline_start,
     emit_session_end, emit_session_end_with_reason, emit_worker_ready, global_ipc, set_global_ipc,
     worker_ipc_disabled_for_process,
 };

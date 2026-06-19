@@ -480,7 +480,7 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_readline_reports_stdin_wait_then_consumes_follow_up() -> TestResult<()> {
+async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -502,8 +502,8 @@ async fn write_stdin_readline_reports_stdin_wait_then_consumes_follow_up() -> Te
         "expected readline prompt, got: {first_text:?}"
     );
     assert!(
-        first_text.contains("<<repl status: waiting for stdin>>"),
-        "expected stdin-wait status for nested R input, got: {first_text:?}"
+        !first_text.contains("<<repl status: waiting for stdin>>"),
+        "did not expect stale stdin-wait status for nested R input, got: {first_text:?}"
     );
 
     let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;

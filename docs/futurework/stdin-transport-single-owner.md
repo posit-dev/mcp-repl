@@ -18,8 +18,8 @@ future interpreters on that same single-owner path.
 - The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
 - Future embedded interpreters can run into similar issues if managed input
   ownership drifts back toward shared raw process stdin.
-- The current worker protocol carries accepted input in `turn_start` or
-  same-turn `turn_input` and lets the worker own the runtime boundary.
+- The current worker protocol carries accepted input in fresh `turn_start`
+  messages and lets the worker own the runtime boundary.
 
 ## Current Scope
 
@@ -30,8 +30,7 @@ but the server-side request path should stay opaque.
 
 ## Intended Transport Model
 
-- Treat the v3 `turn_start` and `turn_input` payloads as the managed input
-  transport.
+- Treat the v4 `turn_start` payload as the managed input transport.
 - Do not add framing headers or other synthetic protocol markers to raw process
   stdin.
 - Keep request metadata and queued input on sideband IPC.

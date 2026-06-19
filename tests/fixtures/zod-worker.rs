@@ -53,7 +53,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 3,
+            version: 4,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -80,7 +80,7 @@ fn run_worker(
     );
 
     let mut state = CommandState {
-        next_prompt: "v3> ".to_string(),
+        next_prompt: "v4> ".to_string(),
         previous_line_empty: false,
         input_line_after_idle: false,
         session_end_after_idle: false,
@@ -147,11 +147,11 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v3> ".to_string());
-    writer.send(&WorkerToServer::Idle { turn_id, prompt })?;
+    let prompt = std::mem::replace(&mut state.next_prompt, "v4> ".to_string());
+    writer.send(&WorkerToServer::InputWait { turn_id, prompt })?;
     append_control_log(
         control_log_path.as_deref(),
-        &format!("idle turn_id={turn_id}"),
+        &format!("input_wait turn_id={turn_id}"),
     )?;
     emit_deferred_protocol_faults(writer, control_log_path, turn_id, state)?;
     Ok(false)
@@ -165,7 +165,7 @@ fn run_command(
     command: &str,
     state: &mut CommandState,
 ) -> io::Result<bool> {
-    if command == "idle-only" {
+    if command == "input-wait-only" {
         return Ok(false);
     }
 
@@ -210,17 +210,17 @@ fn run_command(
         return Ok(false);
     }
 
-    if command == "late-input-line-after-idle" {
+    if command == "late-input-line-after-input-wait" {
         state.input_line_after_idle = true;
         return Ok(false);
     }
 
-    if command == "session-end-after-idle" {
+    if command == "session-end-after-input-wait" {
         state.session_end_after_idle = true;
         return Ok(false);
     }
 
-    if let Some(millis) = command.strip_prefix("bad-output-after-idle ") {
+    if let Some(millis) = command.strip_prefix("bad-output-after-input-wait ") {
         state.bad_output_after_idle = Some(Duration::from_millis(parse_millis(millis)?));
         return Ok(false);
     }
@@ -230,7 +230,7 @@ fn run_command(
         return Ok(true);
     }
 
-    let text = format!("v3-output: {command}\n");
+    let text = format!("v4-output: {command}\n");
     output_text(writer, control_log_path, turn_id, text.as_bytes())?;
     Ok(false)
 }
@@ -249,7 +249,7 @@ fn emit_deferred_protocol_faults(
         )?;
         writer.send(&WorkerToServer::InputLine {
             turn_id,
-            prompt: "v3> ".to_string(),
+            prompt: "v4> ".to_string(),
             text: "late\n".to_string(),
         })?;
     }
@@ -419,7 +419,7 @@ enum WorkerToServer {
         prompt: String,
         text: String,
     },
-    Idle {
+    InputWait {
         turn_id: u64,
         prompt: String,
     },

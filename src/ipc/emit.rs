@@ -94,19 +94,9 @@ pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
     }
 }
 
-#[cfg(target_family = "unix")]
-pub fn emit_stdin_wait(turn_id: u64, prompt: &str) {
+pub fn emit_input_wait(turn_id: u64, prompt: &str) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::StdinWait {
-            turn_id,
-            prompt: prompt.to_string(),
-        });
-    }
-}
-
-pub fn emit_idle(turn_id: u64, prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::Idle {
+        let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
             turn_id,
             prompt: prompt.to_string(),
         });

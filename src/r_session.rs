@@ -73,24 +73,6 @@ impl RSession {
         state.cvar.notify_all();
         Ok(())
     }
-
-    pub fn append_turn_input(&self, turn_id: u64, input: String) -> Result<(), String> {
-        self.wait_until_ready()?;
-        let state = session_state();
-        let mut guard = state.inner.lock().unwrap();
-        match guard.active_turn_id {
-            Some(active) if active == turn_id => {}
-            Some(active) => {
-                return Err(format!(
-                    "turn_input turn_id {turn_id} does not match active turn_id {active}"
-                ));
-            }
-            None => guard.active_turn_id = Some(turn_id),
-        }
-        queue_input(&mut guard.input_queue, turn_id, &input);
-        state.cvar.notify_all();
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -917,31 +899,7 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_busy(which: c_int) {
-    if which == 0 {
-        emit_idle_if_active_turn_finished();
-    }
-}
-
-fn emit_idle_if_active_turn_finished() {
-    let state = session_state();
-    let mut guard = state.inner.lock().unwrap();
-    if !guard.input_queue.is_empty() {
-        return;
-    }
-    let prompt = guard.last_prompt.clone().unwrap_or_default();
-    if r_prompt_is_continuation(&prompt) {
-        return;
-    }
-    let Some(turn_id) = guard.active_turn_id.take() else {
-        return;
-    };
-    guard.plot_hashes.clear();
-    drop(guard);
-    ipc::emit_idle(turn_id, &prompt);
-}
-
-fn r_prompt_is_continuation(prompt: &str) -> bool {
-    prompt.trim_end().ends_with('+')
+    let _ = which;
 }
 
 #[unsafe(no_mangle)]
@@ -969,6 +927,7 @@ pub extern "C-unwind" fn r_read_console(
     buflen: c_int,
     add_history: c_int,
 ) -> c_int {
+    let _ = add_history;
     if buflen <= 0 {
         return 0;
     }
@@ -1063,16 +1022,10 @@ pub extern "C-unwind" fn r_read_console(
         }
 
         if let Some(turn_id) = guard.active_turn_id.take() {
-            let is_top_level = add_history != 0 && !r_prompt_is_continuation(prompt);
             let prompt = prompt.to_string();
-            if is_top_level {
-                guard.plot_hashes.clear();
-                drop(guard);
-                ipc::emit_idle(turn_id, &prompt);
-            } else {
-                drop(guard);
-                ipc::emit_stdin_wait(turn_id, &prompt);
-            }
+            guard.plot_hashes.clear();
+            drop(guard);
+            ipc::emit_input_wait(turn_id, &prompt);
             continue;
         }
 

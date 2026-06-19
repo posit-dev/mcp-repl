@@ -61,13 +61,19 @@ impl TurnState {
             .as_ref()
             .is_some_and(|turn| turn.completed_observed_at.is_some())
         {
-            return Err(format!("{event_type} turn_id {turn_id} arrived after idle"));
+            return Err(format!(
+                "{event_type} turn_id {turn_id} arrived after input_wait"
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn record_idle(&mut self, turn_id: u64, observed_at: Instant) -> Result<(), String> {
-        self.validate_open_active_turn_id(turn_id, "idle")?;
+    pub(crate) fn record_input_wait(
+        &mut self,
+        turn_id: u64,
+        observed_at: Instant,
+    ) -> Result<(), String> {
+        self.validate_open_active_turn_id(turn_id, "input_wait")?;
         if let Some(active) = self.active.as_mut() {
             active.completed_observed_at = Some(observed_at);
         }

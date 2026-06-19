@@ -33,8 +33,8 @@ The repository is organized around a few concrete subsystems rather than deep pa
   accepted `repl` input is queued through IPC during steady-state execution.
   Runtime stdin surfaces are worker-owned implementation details.
 - Workers receive request payloads through `turn_start` and complete a turn with
-  `idle`, `stdin_wait`, or `session_end`. Same-turn stdin follow-up input uses
-  `turn_input` rather than starting a new turn.
+  `input_wait` or `session_end`. Follow-up input after `input_wait` starts a
+  fresh `turn_start`; the runtime decides where it is consumed.
 - Worker reset and teardown use the sideband `shutdown` lifecycle message first,
   with stdin close and process termination retained only as bounded fallbacks.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.

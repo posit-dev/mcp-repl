@@ -234,7 +234,6 @@ impl WorkerManager {
         let prompt = self.last_prompt.clone();
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: prompt.clone(),
-            stdin_wait_prompt: None,
             prompt_variants: prompt.clone().map(|prompt| vec![prompt]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -262,7 +261,6 @@ impl WorkerManager {
         };
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: self.last_prompt.clone(),
-            stdin_wait_prompt: None,
             prompt_variants,
             echo_events,
             protocol_warnings: Vec::new(),
@@ -291,7 +289,6 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -324,7 +321,6 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -407,7 +403,6 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -445,7 +440,6 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -507,17 +501,16 @@ mod tests {
 
     #[test]
     fn pager_respawned_pending_request_trims_echo_without_echo_events() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
         manager.pending_request = true;
         manager.last_prompt = Some(">>> ".to_string());
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());

@@ -40,15 +40,6 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
-                        match python_session::append_turn_input(turn_id, input) {
-                            Ok(()) => {}
-                            Err(err) => {
-                                emit_stderr_message(&err);
-                                emit_session_end_with_reason("protocol_error", Some(turn_id));
-                            }
-                        }
-                    }
                     Some(ServerToWorkerIpcMessage::Interrupt { turn_id }) => {
                         #[cfg(windows)]
                         {

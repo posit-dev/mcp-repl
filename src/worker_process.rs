@@ -148,7 +148,6 @@ pub struct WorkerManager {
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
-    stdin_waiting: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -197,6 +196,10 @@ impl WorkerManager {
             });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
+        #[cfg(test)]
+        let _output_ring_guard = crate::output_capture::output_ring_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -233,7 +236,6 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
-            stdin_waiting: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {

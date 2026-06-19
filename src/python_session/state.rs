@@ -14,7 +14,6 @@ pub(super) struct SessionState {
 pub(super) struct SessionStateInner {
     pub(super) active_request: Option<ActiveRequest>,
     pub(super) request_active: bool,
-    pub(super) request_completed_at_stdin_wait: bool,
     pub(super) current_prompt: Option<String>,
     pub(super) current_readline_state: Option<PythonReadlineState>,
     #[cfg(windows)]
@@ -91,7 +90,6 @@ impl SessionState {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
                 request_active: false,
-                request_completed_at_stdin_wait: false,
                 current_prompt: None,
                 current_readline_state: None,
                 #[cfg(windows)]
@@ -216,19 +214,17 @@ pub(super) fn remember_emitted_prompt(prompt: &str) {
     guard.last_prompt_was_continuation = prompt == guard.python_continuation_prompt;
 }
 
-pub(super) fn mark_stdin_wait_prompt_completed_request() {
+pub(super) fn mark_input_wait_completed_request() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
-    // An input()/sys.stdin.readline() prompt with no buffered answer is the
-    // response boundary for the current MCP request. The Python read can then
-    // block while background Python threads keep running. Clear the plot gate at
-    // this boundary to prevent those background updates from being attributed to
-    // the request that already completed. Callers flush prompt-time plots before
-    // closing this gate.
+    // A managed input callback with no queued bytes is the response boundary for
+    // the current MCP request. The Python read can then block while background
+    // Python threads keep running. Clear the plot gate at this boundary to
+    // prevent those background updates from being attributed to the request that
+    // already completed. Callers flush prompt-time plots before closing this gate.
     guard.request_active = false;
-    guard.request_completed_at_stdin_wait = true;
 }
 
 pub(super) fn request_active() -> bool {
@@ -236,7 +232,7 @@ pub(super) fn request_active() -> bool {
         return false;
     };
     let guard = state.inner.lock().unwrap();
-    guard.request_active && !guard.request_completed_at_stdin_wait
+    guard.request_active
 }
 
 #[cfg(target_family = "unix")]

@@ -15,7 +15,7 @@ use state::{
     set_current_repl_readline_prompt,
 };
 #[cfg(not(any(target_family = "unix", windows)))]
-use state::{input_hook_prompt, mark_stdin_wait_prompt_completed_request};
+use state::{input_hook_prompt, mark_input_wait_completed_request};
 use stdio::{PYTHON_STDIN_FILE, PythonRuntime, StdioLineRead, open_python_runtime};
 #[cfg(all(not(target_family = "unix"), not(windows)))]
 use stdio::{read_stdio_line_bytes, read_stdio_line_bytes_allowing_python_threads};
@@ -185,7 +185,7 @@ fn take_interrupt_requested() -> bool {
 pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
-        unix_stdin::begin_or_append_turn_input(turn_id, &input)
+        unix_stdin::begin_turn_input(turn_id, &input)
     }
 
     #[cfg(windows)]
@@ -198,22 +198,6 @@ pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
         let _ = (turn_id, input);
         Ok(())
     }
-}
-
-#[cfg(target_family = "unix")]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    unix_stdin::begin_or_append_turn_input(turn_id, &input)
-}
-
-#[cfg(windows)]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    windows_stdin::append_tracked_turn_input(turn_id, input)
-}
-
-#[cfg(not(any(target_family = "unix", windows)))]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    let _ = (turn_id, input);
-    Ok(())
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -440,7 +424,7 @@ fn handle_input_hook() {
         };
         let mut completed = None;
         let mut prompt = None;
-        let mut emit_idle = false;
+        let mut emit_readline_prompt = false;
         let mut flush_before_wait = false;
         {
             let mut guard = state.inner.lock().unwrap();
@@ -488,7 +472,7 @@ fn handle_input_hook() {
             } else if !guard.waiting_for_input {
                 guard.waiting_for_input = true;
                 prompt = Some(idle_prompt);
-                emit_idle = true;
+                emit_readline_prompt = true;
             }
         }
 
@@ -497,13 +481,13 @@ fn handle_input_hook() {
         } else if let Some(active) = completed {
             emit_plots();
             #[cfg(not(target_family = "unix"))]
-            mark_stdin_wait_prompt_completed_request();
+            mark_input_wait_completed_request();
             flush_original_stdio();
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
             ipc::emit_readline_start(prompt);
             complete_active_request(state, Some(active), false);
-        } else if emit_idle {
+        } else if emit_readline_prompt {
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
             ipc::emit_readline_start(prompt);

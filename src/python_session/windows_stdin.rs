@@ -12,7 +12,7 @@ use crate::worker_protocol::TextStream;
 
 use super::state::{
     ActiveRequest, RawStdinReadError, SESSION_STATE, TurnInputLine, input_hook_prompt,
-    mark_stdin_wait_prompt_completed_request, remember_emitted_prompt, session_state,
+    mark_input_wait_completed_request, remember_emitted_prompt, session_state,
 };
 use super::stdio::{PYTHON_STDIN_FILE, PythonThreadsAllowed, StdioLineRead};
 use super::{emit_output_text, emit_plots, request_platform_interrupt};
@@ -57,7 +57,6 @@ pub(super) fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), Stri
         return Err("Python session already has an active turn".to_string());
     }
     guard.interrupt_requested = false;
-    guard.request_completed_at_stdin_wait = false;
     guard.request_active = true;
     guard.plot_reset_pending = true;
     guard.turn_write_in_flight = false;
@@ -75,53 +74,6 @@ pub(super) fn begin_tracked_turn(turn_id: u64, input: String) -> Result<(), Stri
         repl_turn_finished: false,
         started_after_continuation_prompt,
     });
-    state.cvar.notify_all();
-    Ok(())
-}
-
-pub(super) fn append_tracked_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    let state = session_state();
-    let queued_lines = prepare_turn_input_lines(&input);
-    let byte_len = queued_lines
-        .iter()
-        .map(|line| line.bytes.len().saturating_sub(line.offset))
-        .sum();
-    let line_count = queued_lines.len();
-    let mut guard = state.inner.lock().unwrap();
-    if guard.shutdown {
-        return Err("Python session is shutting down".to_string());
-    }
-    if let Some(active) = guard.active_request.as_mut() {
-        if active.turn_id != Some(turn_id) {
-            return Err(format!(
-                "turn_input turn_id {turn_id} does not match active turn_id {:?}",
-                active.turn_id
-            ));
-        }
-        active.byte_len = active.byte_len.saturating_add(byte_len);
-        active.line_count = active.line_count.saturating_add(line_count);
-        active.queued_lines.extend(queued_lines);
-    } else {
-        guard.interrupt_requested = false;
-        guard.request_completed_at_stdin_wait = false;
-        guard.request_active = true;
-        guard.plot_reset_pending = true;
-        guard.turn_write_in_flight = false;
-        guard.turn_cleanup_uncertain = false;
-        let started_after_continuation_prompt = guard.last_prompt_was_continuation;
-        guard.active_request = Some(ActiveRequest {
-            turn_id: Some(turn_id),
-            byte_len,
-            line_count,
-            fallback_prompt: None,
-            queued_lines,
-            consumed_lines: 0,
-            skip_next_hook: false,
-            stdin_write_complete: true,
-            repl_turn_finished: false,
-            started_after_continuation_prompt,
-        });
-    }
     state.cvar.notify_all();
     Ok(())
 }
@@ -263,9 +215,9 @@ pub(super) fn read_windows_turn_line(
 
         if let Some((turn_id, None, _)) = action {
             emit_plots();
-            mark_stdin_wait_prompt_completed_request();
+            mark_input_wait_completed_request();
             remember_emitted_prompt(prompt);
-            ipc::emit_idle(turn_id, prompt);
+            ipc::emit_input_wait(turn_id, prompt);
         }
     }
 }
@@ -353,7 +305,7 @@ enum RawTurnInputEvent {
         prompt: String,
         text: String,
     },
-    Idle {
+    InputWait {
         turn_id: u64,
         prompt: String,
     },
@@ -416,7 +368,7 @@ fn take_raw_turn_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> 
                     return Ok(output);
                 }
                 guard.active_request.take();
-                RawTurnInputEvent::Idle { turn_id, prompt }
+                RawTurnInputEvent::InputWait { turn_id, prompt }
             } else {
                 let active = guard.active_request.as_mut().expect("active turn exists");
                 let line = active
@@ -449,11 +401,11 @@ fn take_raw_turn_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> 
                 prompt,
                 text,
             } => ipc::emit_input_line(turn_id, &prompt, &text),
-            RawTurnInputEvent::Idle { turn_id, prompt } => {
+            RawTurnInputEvent::InputWait { turn_id, prompt } => {
                 emit_plots();
-                mark_stdin_wait_prompt_completed_request();
+                mark_input_wait_completed_request();
                 remember_emitted_prompt(&prompt);
-                ipc::emit_idle(turn_id, &prompt);
+                ipc::emit_input_wait(turn_id, &prompt);
             }
             RawTurnInputEvent::Consumed => {}
         }

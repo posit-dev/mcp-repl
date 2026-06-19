@@ -219,8 +219,7 @@ impl WorkerManager {
         match self.wait_for_request_completion(timeout) {
             Ok(info) => {
                 let session_end = info.session_end_seen;
-                let preserve_active_turn = !session_end && info.stdin_wait_prompt.is_some();
-                self.clear_pending_request_state_with_active_turn(preserve_active_turn);
+                self.clear_pending_request_state();
                 if session_end {
                     self.note_session_end(true);
                 }
@@ -284,7 +283,6 @@ mod tests {
         manager.process = Some(test_worker_process(sleeping_test_child()));
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec!["> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),

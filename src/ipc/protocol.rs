@@ -5,16 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 3;
+pub const WORKER_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
     TurnStart {
-        turn_id: u64,
-        input: String,
-    },
-    TurnInput {
         turn_id: u64,
         input: String,
     },
@@ -47,11 +43,7 @@ pub enum WorkerToServerIpcMessage {
         prompt: String,
         text: String,
     },
-    StdinWait {
-        turn_id: u64,
-        prompt: String,
-    },
-    Idle {
+    InputWait {
         turn_id: u64,
         prompt: String,
     },
@@ -340,39 +332,36 @@ mod tests {
         );
     }
     #[test]
-    fn turn_input_and_stdin_wait_messages_are_directional() {
+    fn input_wait_message_is_worker_to_server_only() {
         let wait = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "stdin_wait",
+            "type": "input_wait",
             "turn_id": 7,
             "prompt": "debug> "
         }));
         assert!(
             matches!(
                 wait,
-                Ok(WorkerToServerIpcMessage::StdinWait {
+                Ok(WorkerToServerIpcMessage::InputWait {
                     turn_id: 7,
                     ref prompt
                 }) if prompt == "debug> "
             ),
-            "stdin_wait should deserialize as a worker-to-server message"
+            "input_wait should deserialize as a worker-to-server message"
         );
 
-        let append = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
-            "type": "turn_input",
-            "turn_id": 7,
-            "input": "c\n"
-        }));
         assert!(
-            matches!(
-                append,
-                Ok(ServerToWorkerIpcMessage::TurnInput {
-                    turn_id: 7,
-                    ref input
-                }) if input == "c\n"
-            ),
-            "turn_input should deserialize as a server-to-worker message"
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "input_wait",
+                "turn_id": 7,
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "input_wait should not deserialize as a server-to-worker message"
         );
+    }
 
+    #[test]
+    fn stale_turn_completion_messages_are_not_protocol() {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "stdin_wait",
@@ -384,12 +373,39 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "stdin_wait",
+                "turn_id": 7,
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "stdin_wait should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "idle",
+                "turn_id": 7,
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "idle should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "turn_input",
                 "turn_id": 7,
                 "input": "c\n"
             }))
             .is_err(),
             "turn_input should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "turn_input",
+                "turn_id": 7,
+                "input": "c\n"
+            }))
+            .is_err(),
+            "turn_input should not deserialize as a server-to-worker message"
         );
     }
 
