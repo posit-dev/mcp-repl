@@ -116,7 +116,7 @@ fn worker_sideband_protocol_keeps_images_one_way() {
         "The server rejects unsupported",
         "There is no image acknowledgement message.",
         "Workers must not delay stdout/stderr output waiting for sideband responses.",
-        "Submitted input must not be emitted as `output_text`.",
+        "Built-in R also mirrors console echo as `output_text` after `input_line`",
         "The server may reconstruct `prompt + text` from ordered `input_line` events",
     ] {
         assert!(
