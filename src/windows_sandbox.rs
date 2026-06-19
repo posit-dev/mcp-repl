@@ -1187,29 +1187,33 @@ fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSe
     let mut read_paths = HashSet::new();
     read_paths.insert(launch.sandbox_policy_cwd.clone());
     if let Ok(exe) = std::env::current_exe() {
-        read_paths.insert(canonicalize_or_identity(&exe));
-        if let Some(parent) = exe.parent() {
-            read_paths.insert(canonicalize_or_identity(parent));
-        }
+        insert_offline_read_path(&mut read_paths, exe);
     }
     for env_key in [
         crate::python_runtime::PYTHON_EXECUTABLE_ENV,
         "PYTHONHOME",
         "R_HOME",
+        "R_USER",
     ] {
         if let Some(value) = std::env::var_os(env_key) {
-            let path = PathBuf::from(value);
-            if !path.as_os_str().is_empty() {
-                read_paths.insert(canonicalize_or_identity(&path));
-                if path.is_file()
-                    && let Some(parent) = path.parent()
-                {
-                    read_paths.insert(canonicalize_or_identity(parent));
-                }
+            insert_offline_read_path(&mut read_paths, PathBuf::from(value));
+        }
+    }
+    for env_key in ["PYTHONPATH", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"] {
+        if let Some(value) = std::env::var_os(env_key) {
+            for path in std::env::split_paths(&value) {
+                insert_offline_read_path(&mut read_paths, path);
             }
         }
     }
     read_paths
+}
+
+fn insert_offline_read_path(read_paths: &mut HashSet<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    read_paths.insert(canonicalize_or_identity(&path));
 }
 
 fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
@@ -3845,6 +3849,14 @@ mod tests {
             }
             Self { key, original }
         }
+
+        fn set_os(key: &'static str, value: &OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
     }
 
     impl Drop for ScopedEnvVar {
@@ -3924,6 +3936,49 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn offline_identity_read_paths_include_runtime_path_lists() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        let python_lib = tmp.path().join("python-lib");
+        let r_lib_a = tmp.path().join("r-lib-a");
+        let r_lib_b = tmp.path().join("r-lib-b");
+        for path in [&cwd, &session_temp_dir, &python_lib, &r_lib_a, &r_lib_b] {
+            std::fs::create_dir_all(path).expect("create test dir");
+        }
+
+        let python_paths = std::env::join_paths([python_lib.as_path()]).expect("join python paths");
+        let r_paths =
+            std::env::join_paths([r_lib_a.as_path(), r_lib_b.as_path()]).expect("join R paths");
+        let _pythonpath = ScopedEnvVar::set_os("PYTHONPATH", python_paths.as_os_str());
+        let _r_libs_user = ScopedEnvVar::set_os("R_LIBS_USER", r_paths.as_os_str());
+        let policy = workspace_policy(Vec::new(), false, false);
+        let launch = PreparedSandboxLaunch {
+            capability_sid: stable_cap_sid_string(&policy, &cwd),
+            sandbox_policy_cwd: cwd.clone(),
+            session_temp_dir,
+            policy,
+            network_identity: WindowsSandboxNetworkIdentity::OfflineProxy(
+                WindowsSandboxOfflineSetup {
+                    username: "McpReplOffline".to_string(),
+                    user_sid: "S-1-5-21-1-2-3-1001".to_string(),
+                    http_proxy_port: 39080,
+                    socks_proxy_port: 39081,
+                },
+            ),
+        };
+
+        let read_paths = offline_identity_read_execute_paths(&launch);
+
+        assert!(read_paths.contains(&canonicalize_or_identity(&python_lib)));
+        assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_a)));
+        assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_b)));
     }
 
     #[derive(Default)]

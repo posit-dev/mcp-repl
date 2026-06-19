@@ -650,7 +650,7 @@ pub fn prepare_worker_command_with_managed_network(
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
-        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir);
+        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir.clone());
         #[cfg(target_os = "windows")]
         {
             // Ensure Windows sandbox policy and runtime temp resolution both target the
@@ -663,6 +663,11 @@ pub fn prepare_worker_command_with_managed_network(
                 "TMP".to_string(),
                 state.session_temp_dir.to_string_lossy().to_string(),
             );
+            if managed_network_proxy.is_some() {
+                env.insert("HOME".to_string(), temp_dir.clone());
+                env.insert("R_USER".to_string(), temp_dir.clone());
+                env.insert("USERPROFILE".to_string(), temp_dir);
+            }
         }
     }
 
@@ -2619,6 +2624,57 @@ mod tests {
         assert!(
             !policy.contains("(allow network-outbound)\n(allow network-inbound)\n"),
             "{policy}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_uses_session_temp_home() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-home-test-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = tmp.path().join("session");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+        let session_temp = session_temp_dir.to_string_lossy().to_string();
+
+        assert_eq!(
+            prepared.env.get("HOME").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("R_USER").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("USERPROFILE").map(String::as_str),
+            Some(session_temp.as_str())
         );
     }
 
