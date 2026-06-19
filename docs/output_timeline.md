@@ -33,8 +33,8 @@ changes what must stay buffered between tool calls.
   reply.
 - Worker-owned `output_text` frames and raw stdout/stderr bytes are buffered as
   `TextFragment` events.
-- Sideband events are stored alongside text so later formatting can suppress
-  synthetic input echoes and respect request boundaries.
+- Sideband events are stored alongside text so later formatting can respect
+  request boundaries and reconstruct interactive transcripts when needed.
 - When a reply is sealed, `PendingOutputSnapshot::format_contents()` converts the
   tape into `WorkerContent`.
 
@@ -56,16 +56,16 @@ The important design split is not "files mode vs pager mode". It is:
 
 Timeline resolution must not depend on request completion. For example, the
 server does not need to wait for completion to know that an `output_image` event
-belongs before a later `input_line` echo. That ordering fact is already
-present in the mixed timeline.
+belongs before later worker-owned output. That ordering fact is already present
+in the mixed timeline.
 
 Completion matters only for reply cleanup choices that are unsafe while a
 request is still in flight. In particular:
 
 - timed-out or otherwise non-final drains must preserve echoed input so the user
   can still see what is running
-- completed replies may trim or drop echo-only content once the server knows the
-  request is settled
+- completed replies may trim or drop echo-only raw terminal content once the
+  server knows the request is settled
 
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.

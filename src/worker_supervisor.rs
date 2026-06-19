@@ -945,14 +945,18 @@ impl WorkerProcess {
         {
             self.send_signal(libc::SIGINT)
         }
-        #[cfg(not(target_family = "unix"))]
+        #[cfg(target_family = "windows")]
+        {
+            self.send_windows_ctrl_break()
+        }
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
             Ok(())
         }
     }
 
     #[cfg(target_family = "windows")]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
@@ -965,6 +969,11 @@ impl WorkerProcess {
             Some(_) => Ok(()),
             None => Err(WorkerError::Io(std::io::Error::last_os_error())),
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        self.send_windows_ctrl_break()
     }
 
     #[cfg(not(target_family = "windows"))]
@@ -2440,7 +2449,7 @@ mod tests {
         worker
             .send(WorkerToServerIpcMessage::SessionEnd {
                 reason: None,
-                message_b64: None,
+                message: None,
             })
             .expect("send session_end");
 

@@ -47,7 +47,7 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         reason: Option<String>,
         #[serde(default)]
-        message_b64: Option<String>,
+        message: Option<String>,
     },
 }
 

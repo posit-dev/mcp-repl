@@ -28,30 +28,35 @@ raw stderr, PTY state, stdin writes, or timing.
 
 ## Transport
 
-- Unix: the worker inherits two file descriptors:
-  - `MCP_REPL_IPC_READ_FD`
-  - `MCP_REPL_IPC_WRITE_FD`
-- Windows: the worker connects to two server-created byte-mode named pipes:
-  - `MCP_REPL_IPC_PIPE_TO_WORKER`
-  - `MCP_REPL_IPC_PIPE_FROM_WORKER`
+- Logical sideband endpoints are named by direction: server-to-worker and
+  worker-to-server. The bootstrap environment variable names stay
+  transport-specific because Unix carries inherited file-descriptor numbers and
+  Windows carries named-pipe paths.
+- Unix endpoints:
+  - `MCP_REPL_IPC_READ_FD`: worker reads server-to-worker messages
+  - `MCP_REPL_IPC_WRITE_FD`: worker writes worker-to-server messages
+- Windows endpoints:
+  - `MCP_REPL_IPC_PIPE_TO_WORKER`: worker reads server-to-worker messages
+  - `MCP_REPL_IPC_PIPE_FROM_WORKER`: worker writes worker-to-server messages
 - Messages are serialized as one JSON object per line.
 - Worker-owned text, images, input facts, and lifecycle facts are ordered on the
   sideband stream.
 - Raw stdout/stderr or PTY capture remains active for output that bypasses the
   worker-owned sideband path.
-- Sideband IPC is implemented only for Unix-family systems and Windows.
+- Sideband IPC is implemented only for Unix-family systems and Windows. There
+  is no third transport family today.
 
-On Unix, the launch environment variables are bootstrap-only. The worker
-consumes them when connecting to IPC, and server launch code removes them from
-the user-code environment before runtime code runs. On Windows, the pipe-name
-environment variables are read during connection but are not currently removed
-afterward.
+For built-in workers on Unix and Windows, the launch environment variables are
+bootstrap-only. The worker consumes and removes them while connecting to IPC,
+before runtime user code runs.
 
 On Unix, built-in workers register an at-fork handler that disables sideband IPC
 in forked children and closes inherited sideband file descriptors. Those
 children may still write inherited raw stdout/stderr, but they must not emit
-sideband messages or consume managed queued input. Python fork children
-currently see EOF for managed stdin.
+sideband messages or consume managed queued input. Managed stdin for
+sideband-disabled fork children should return EOF where the worker controls that
+stdin surface; Python fork children currently do this. Raw inherited fd0 that
+bypasses managed stdin remains outside the sideband contract.
 
 PTY-backed Unix workers expose one raw terminal stream to the server, so raw PTY
 capture does not preserve separate stdout/stderr identity. Sideband
@@ -70,10 +75,14 @@ capture does not preserve separate stdout/stderr identity. Sideband
 `interrupt`
 - `{ "type": "interrupt" }`
 - Sent when the client requests interrupt and a worker IPC endpoint exists.
-- The server may also deliver a platform interrupt to the worker process or
-  process group.
-- The message carries no input and does not complete a batch. After sending it,
-  the server marks the worker not ready for input and waits for `input_wait`,
+- The server must also deliver a platform interrupt to the worker process or
+  process group when a worker process exists.
+- The IPC message carries no input and does not complete a batch. It tells the
+  worker to discard pending managed input that has not yet been consumed by the
+  runtime.
+- Sending `interrupt` does not change server-side readiness. Readiness changes
+  only when the server sends `input_batch` or receives `input_wait`.
+- While servicing an interrupt request, the server waits for `input_wait`,
   `session_end`, process exit, or timeout.
 
 `shutdown`
@@ -88,7 +97,8 @@ IPC loss and exit so the server can replace the worker.
 ## Worker To Server
 
 Worker-to-server messages are strict. Unknown fields, unknown message types,
-invalid enum values, and invalid base64 payloads are protocol errors.
+invalid enum values, and invalid base64 payloads in base64 fields are protocol
+errors.
 
 `worker_ready`
 - `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
@@ -116,21 +126,26 @@ invalid enum values, and invalid base64 payloads are protocol errors.
 - Valid only while an input batch is active and before that batch's
   `input_wait`.
 - `prompt` and `text` are structural input facts, not runtime output.
-- Built-in R also mirrors console echo as `output_text` after `input_line`, and
-  the server trims or reconstructs that echo for final presentation.
+- Submitted input must not be emitted as `output_text`.
 - The server may reconstruct `prompt + text` from ordered `input_line` events
-  for transcript finalization, echo trimming, debugging views, or other
-  surfaces that need an interactive transcript.
+  for transcript finalization, debugging views, or other surfaces that need an
+  interactive transcript.
 
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
 - Carries worker-owned output bytes on the ordered sideband stream.
-- `is_continuation` defaults to `false` and marks transport chunks that continue
-  the same worker-owned write.
+- Worker-owned runtime output must be emitted only on sideband IPC, not also to
+  raw stdout/stderr. Raw capture is only for output the worker cannot account
+  for, such as forked children, subprocesses, or direct file-descriptor writes
+  that bypass the worker-owned output path.
+- `is_continuation` defaults to `false`. It exists because one worker-owned
+  write may be split into bounded IPC frames; `true` marks frames that continue
+  the same logical write.
 - Prompt-looking bytes are ordinary output unless the worker reports them in
   `input_wait.prompt` or `input_line.prompt`.
 - Workers must write, newline-terminate, and flush sideband output frames before
-  returning from the emitting call. Workers must not delay stdout/stderr output waiting for sideband responses.
+  returning from the emitting call. Workers must not delay unowned raw
+  stdout/stderr output waiting for sideband responses.
 
 `output_image`
 - `{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }`
@@ -144,11 +159,11 @@ invalid enum values, and invalid base64 payloads are protocol errors.
 - There is no image acknowledgement message.
 
 `session_end`
-- `{ "type": "session_end", "reason": <string>, "message_b64": <base64, optional> }`
+- `{ "type": "session_end", "reason": <string>, "message": <string, optional> }`
 - Indicates the worker session is terminating.
 - `reason` is optional in the current implementation. If present, it must be one
   of `shutdown`, `reset`, `runtime_exit`, `crash`, or `protocol_error`.
-- `message_b64`, if present, must be valid base64.
+- `message`, if present, is UTF-8 JSON string text for diagnostics.
 - This is terminal for the whole worker session, including any active input.
   After `session_end`, any later worker-to-server message is a protocol error.
 
@@ -164,18 +179,14 @@ worker queues the batch and wakes its managed runtime input path. When the
 runtime consumes all queued input and asks the managed input boundary for more,
 the worker emits `input_wait`.
 
-R currently implements this with the embedded `ReadConsole` callback and a
-worker-owned queue of input lines. Each delivered line or buffer-sized fragment
-emits `input_line`; when the queue is empty after an active batch,
-`ReadConsole` emits `input_wait`.
-
-Python currently uses managed input queues as well. On Unix, the queue feeds
-CPython readline, managed `sys.stdin`, and raw-stdin shims; on Windows, the
-queue feeds tracked readline/stdin paths and checks pending bytes on the
-runtime stdin pipe. Python `input_line` can represent a line or a byte-oriented
-managed read. Python may still use PTY or ConPTY process stdio for terminal
-behavior, but accepted request input is sent over sideband IPC, not by server
-writes to runtime stdin.
+Built-in R and Python use the same model: a worker-owned managed input queue
+feeds runtime input callbacks and managed stdin surfaces. In R this is the
+embedded `ReadConsole` callback. In Python this includes CPython readline plus
+managed `sys.stdin` and raw-stdin shims. Each delivered line or byte-oriented
+managed read emits `input_line`; when the queue is empty after an active batch,
+the worker emits `input_wait`. Python may still use PTY or ConPTY process stdio
+for terminal behavior, but accepted request input is sent over sideband IPC, not
+by server writes to runtime stdin.
 
 Custom workers must implement the same readiness contract themselves. The test
 Zod worker exercises the custom-worker input/readiness path: it sends
@@ -186,20 +197,23 @@ again. It is not a full implementation of every optional protocol surface.
 ## Interrupts
 
 Interrupt is fail-closed. The server sends `interrupt` whenever the client asks
-for interrupt and a worker endpoint exists, and it may also send the platform
-interrupt. The worker must not emit `input_wait` again until it is actually
-ready for input.
+for interrupt and a worker endpoint exists, and it must also send the platform
+interrupt when a worker process exists. The sideband `interrupt` message is the
+worker-owned cleanup signal; the platform interrupt is delivered to the runtime
+or process group, and the runtime handles it according to its own rules.
+
+When the worker receives sideband `interrupt`, it must discard managed input
+that is still queued and has not yet been consumed by the runtime. The discard
+is triggered by the IPC message, not by the OS interrupt. The worker must not
+emit `input_wait` again until it is actually ready for input.
 
 Current built-in behavior:
 
-- R drops queued lines that have not yet reached `ReadConsole`; the server also
-  sends the R-specific process interrupt, such as `SIGINT` on Unix or
-  `CTRL_BREAK_EVENT` on Windows.
-- Python sets worker-side interrupt state and uses runtime/platform interrupt
-  paths. Unix Python also clears its managed input queue after interrupt; Windows
-  Python drains pending stdin pipe bytes when it can. On Windows, Python and
-  custom protocol workers rely on the sideband interrupt rather than an
-  additional server-delivered console control event.
+- R drops queued lines that have not yet reached `ReadConsole`.
+- Python clears or drains its managed input queue where that queue has not yet
+  reached the runtime.
+- The server sends `SIGINT` on Unix and `CTRL_BREAK_EVENT` on Windows to the
+  worker process group.
 
 If cleanup is uncertain because old input may still be buffered in PTY, libc,
 readline, or interpreter state, the worker must not emit `input_wait`. It should
@@ -222,6 +236,7 @@ The following older protocol concepts are not part of v6:
 - `idle` and `stdin_wait`
 - `plot_image`
 - old image fields `image_id` and `update`
+- old `session_end.message_b64`
 - image sequence or acknowledgement handshakes
 
 There is no compatibility path for older protocol versions.

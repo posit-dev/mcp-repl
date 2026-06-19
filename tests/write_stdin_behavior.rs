@@ -365,8 +365,8 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         "did not expect the leading echoed prefix to remain, got: {text:?}"
     );
     assert!(
-        text.contains("> 1+1"),
-        "expected later echoed expression to remain for attribution after output interleaving, got: {text:?}"
+        !text.contains("> 1+1"),
+        "did not expect submitted expression echo after output interleaving, got: {text:?}"
     );
 
     let result = session
@@ -382,12 +382,12 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         "expected all expression output, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('SECOND\\n')"),
-        "expected second submitted expression echo for attribution, got: {text:?}"
+        !text.contains("> cat('SECOND\\n')"),
+        "did not expect second submitted expression echo, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('THIRD\\n')"),
-        "expected third submitted expression echo for attribution, got: {text:?}"
+        !text.contains("> cat('THIRD\\n')"),
+        "did not expect third submitted expression echo, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -419,8 +419,8 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() >= 2,
-        "expected raw child stdout and later R echo to both remain visible, got: {text:?}"
+        text.matches("> 1+1").count() == 1,
+        "expected raw child stdout to remain visible without a submitted-input echo, got: {text:?}"
     );
     Ok(())
 }

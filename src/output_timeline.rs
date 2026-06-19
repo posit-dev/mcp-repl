@@ -43,14 +43,19 @@ pub(crate) fn collapse_echo_with_attribution(
     let mut anchored_events: BTreeMap<usize, Vec<OutputEventKind>> = BTreeMap::new();
     let saw_event_output = Cell::new(false);
     let anchor_idx_for_readline_count = |readline_results_seen: usize| {
+        let is_visible_raw_echo = |idx: usize| {
+            echo_events
+                .get(idx)
+                .is_some_and(|event| event.source == OutputTextSource::Raw)
+        };
         if echo_event_base > 0 && readline_results_seen <= echo_event_base {
             // If the matching echo was drained earlier, anchor before the
             // first remaining echo when there is one. Otherwise keep the event
             // at its rendered offset in the current snapshot.
-            return (!echo_events.is_empty()).then_some(0);
+            return is_visible_raw_echo(0).then_some(0);
         }
         let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
-        (!echo_events.is_empty() && anchor_idx < echo_events.len()).then_some(anchor_idx)
+        is_visible_raw_echo(anchor_idx).then_some(anchor_idx)
     };
 
     let mut events: Vec<(usize, OutputEventKind)> = range
@@ -614,6 +619,14 @@ mod tests {
         }
     }
 
+    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+        IpcEchoEvent {
+            prompt: prompt.to_string(),
+            line: line.to_string(),
+            source: OutputTextSource::Raw,
+        }
+    }
+
     fn contents_text(contents: &[WorkerContent]) -> String {
         contents
             .iter()
@@ -647,15 +660,15 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
             &[
-                echo_event("> ", "plot(1:10)\n"),
-                echo_event("> ", "cat('done\\n')\n"),
+                raw_echo_event("> ", "plot(1:10)\n"),
+                raw_echo_event("> ", "cat('done\\n')\n"),
             ],
             0,
             &["> ".to_string()],
@@ -704,15 +717,15 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
             &[
-                echo_event("> ", "plot(1:10)\n"),
-                echo_event("> ", "cat('done\\n')\n"),
+                raw_echo_event("> ", "plot(1:10)\n"),
+                raw_echo_event("> ", "cat('done\\n')\n"),
             ],
             0,
             &["> ".to_string()],
@@ -771,6 +784,82 @@ mod tests {
         );
 
         assert_eq!(contents, vec![WorkerContent::stdout("> Sys.sleep(5)\n")]);
+    }
+
+    #[test]
+    fn ipc_echo_events_do_not_reorder_sideband_image_updates_without_visible_echo() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 0,
+            bytes: Vec::new(),
+            events: vec![
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "first".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                        readline_results_seen: 1,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "second".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 2,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "third".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 3,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "final".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 4,
+                    },
+                },
+            ],
+            text_spans: Vec::new(),
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[
+                echo_event("> ", "plot(1:10)\n"),
+                echo_event("> ", "lines(2:9)\n"),
+                echo_event("> ", "lines(3:8)\n"),
+            ],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            0,
+        );
+
+        let final_image = contents.last().expect("expected final image content");
+        assert!(
+            matches!(final_image, WorkerContent::ContentImage { data, .. } if data == "final"),
+            "expected final image update to stay last, got: {contents:?}"
+        );
     }
 
     #[test]

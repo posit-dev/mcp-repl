@@ -53,7 +53,8 @@ impl InputState {
     }
 
     pub(crate) fn note_interrupt_sent(&mut self) {
-        self.ready_for_input = false;
+        // Readiness is a fact reported by input_wait and consumed by input_batch.
+        // Interrupt delivery does not change that state by itself.
     }
 
     pub(crate) fn request_completion_ready(&self) -> bool {

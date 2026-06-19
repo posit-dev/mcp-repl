@@ -640,6 +640,13 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC to-worker pipe missing"))?;
         let pipe_from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV)
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC from-worker pipe missing"))?;
+        // The main worker owns the live sideband pipe names. Once startup has consumed the
+        // bootstrap env vars, user code and descendants must not see or reuse them.
+        // SAFETY: worker startup consumes these env vars before any worker-managed threads exist.
+        unsafe {
+            std::env::remove_var(IPC_PIPE_TO_WORKER_ENV);
+            std::env::remove_var(IPC_PIPE_FROM_WORKER_ENV);
+        }
         let deadline = Instant::now() + timeout;
         let mut reader: Option<File> = None;
         let mut writer: Option<File> = None;

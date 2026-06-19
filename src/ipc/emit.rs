@@ -119,7 +119,7 @@ pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
-            message_b64: None,
+            message: None,
         });
     }
 }
@@ -128,7 +128,7 @@ pub fn emit_session_end_with_reason(reason: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: Some(reason.to_string()),
-            message_b64: None,
+            message: None,
         });
     }
 }

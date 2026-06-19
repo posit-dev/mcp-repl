@@ -995,23 +995,16 @@ pub extern "C-unwind" fn r_read_console(
                     *buf.add(head.len()) = 0;
                 }
             }
-            let mut echoed = String::with_capacity(prompt.len() + line_text.text.len());
-            echoed.push_str(prompt);
-            echoed.push_str(&line_text.text);
             ipc::emit_input_line(prompt, &line_text.text);
-            if !echoed.is_empty() {
-                emit_output_text(TextStream::Stdout, echoed.as_bytes());
-            }
 
             return 1;
         }
 
         if guard.active_input {
             guard.active_input = false;
-            let prompt = prompt.to_string();
             guard.plot_hashes.clear();
             drop(guard);
-            ipc::emit_input_wait(&prompt);
+            ipc::emit_input_wait(prompt);
             let mut guard = state.inner.lock().unwrap();
             if guard.input_queue.is_empty() && !guard.shutdown {
                 guard = state.cvar.wait(guard).unwrap();

@@ -174,13 +174,8 @@ impl ServerIpcConnection {
                             handler(prompt);
                         }
                     }
-                    WorkerToServerIpcMessage::SessionEnd {
-                        reason,
-                        message_b64,
-                    } => {
-                        if let Err(err) =
-                            validate_session_end(reason.as_deref(), message_b64.as_deref())
-                        {
+                    WorkerToServerIpcMessage::SessionEnd { reason, message } => {
+                        if let Err(err) = validate_session_end(reason.as_deref()) {
                             let mut guard = reader_inbox.lock().unwrap();
                             guard.input_state.latch_protocol_error(err);
                             reader_cvar.notify_all();
@@ -188,10 +183,9 @@ impl ServerIpcConnection {
                         }
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.input_state.note_session_end();
-                        guard.queue.push_back(WorkerToServerIpcMessage::SessionEnd {
-                            reason,
-                            message_b64,
-                        });
+                        guard
+                            .queue
+                            .push_back(WorkerToServerIpcMessage::SessionEnd { reason, message });
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
@@ -553,19 +547,12 @@ fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bo
     guard.input_state.has_active_input() && guard.input_state.request_completion_ready()
 }
 
-fn validate_session_end(reason: Option<&str>, message_b64: Option<&str>) -> Result<(), String> {
+fn validate_session_end(reason: Option<&str>) -> Result<(), String> {
     if let Some(reason) = reason {
         match reason {
             "shutdown" | "reset" | "runtime_exit" | "crash" | "protocol_error" => {}
             other => return Err(format!("invalid session_end reason: {other}")),
         }
-    }
-    if let Some(message_b64) = message_b64
-        && base64::engine::general_purpose::STANDARD
-            .decode(message_b64)
-            .is_err()
-    {
-        return Err("invalid session_end message_b64 base64".to_string());
     }
     Ok(())
 }
@@ -707,7 +694,6 @@ mod tests {
     use super::super::transport::IpcTransport;
     use super::{IpcWaitError, ServerIpcConnection};
     use crate::worker_protocol::TextStream;
-    use base64::Engine as _;
     use serde_json::json;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -759,6 +745,40 @@ mod tests {
             "invalid worker message should report a protocol error, got: {result:?}"
         );
     }
+
+    #[test]
+    fn session_end_accepts_plain_utf8_message() {
+        let (server_read, mut worker_write) = std::io::pipe().expect("server pipe");
+        let (_worker_read, server_write) = std::io::pipe().expect("worker pipe");
+        let server = ServerIpcConnection::new(
+            IpcTransport {
+                reader: Box::new(server_read),
+                writer: Box::new(server_write),
+            },
+            IpcHandlers::default(),
+        )
+        .expect("server connection");
+        server.mark_startup_message_seen_for_tests();
+
+        writeln!(
+            worker_write,
+            "{}",
+            json!({
+                "type": "session_end",
+                "reason": "runtime_exit",
+                "message": "runtime exited"
+            })
+        )
+        .expect("session_end message");
+
+        let result = server.wait_for_input_wait(Duration::from_millis(200));
+
+        assert!(
+            matches!(result, Err(super::IpcWaitError::SessionEnd)),
+            "session_end with plain message should be accepted as session end, got: {result:?}"
+        );
+    }
+
     #[test]
     fn request_completion_keeps_protocol_error_latched_after_stable_prompt() {
         let stable_wait = Duration::from_millis(20);
@@ -852,6 +872,27 @@ mod tests {
         server
             .begin_input()
             .expect("input_wait should make worker ready for input");
+    }
+
+    #[test]
+    fn interrupt_does_not_clear_input_wait_readiness() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "ready> ".to_string(),
+            })
+            .expect("send input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes input_wait");
+
+        server.note_interrupt_sent();
+
+        server
+            .begin_input()
+            .expect("interrupt must not change input_wait readiness");
     }
 
     #[test]

@@ -111,12 +111,14 @@ fn worker_sideband_protocol_keeps_images_one_way() {
         r#"{ "type": "input_batch", "input": <string> }"#,
         r#"{ "type": "input_line", "prompt": <string>, "text": <string> }"#,
         r#"{ "type": "input_wait", "prompt": <string> }"#,
+        r#"{ "type": "session_end", "reason": <string>, "message": <string, optional> }"#,
         r#"{ "type": "interrupt" }"#,
         "This document defines worker protocol version 6.",
         "The server rejects unsupported",
         "There is no image acknowledgement message.",
-        "Workers must not delay stdout/stderr output waiting for sideband responses.",
-        "Built-in R also mirrors console echo as `output_text` after `input_line`",
+        "Worker-owned runtime output must be emitted only on sideband IPC",
+        "Workers must not delay unowned raw",
+        "Submitted input must not be emitted as `output_text`.",
         "The server may reconstruct `prompt + text` from ordered `input_line` events",
     ] {
         assert!(

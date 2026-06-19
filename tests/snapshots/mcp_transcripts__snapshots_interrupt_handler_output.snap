@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> cat(\"INTERRUPT_READY\\n\")\nINTERRUPT_READY\n> flush.console()\n> tryCatch(\n+   {\n+     repeat Sys.sleep(0.5)\n+   },\n+   interrupt = function(e) cat(\"interrupt received\\n\")\n+ )"
+      "text": "INTERRUPT_READY"
     },
     {
       "type": "text",

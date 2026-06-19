@@ -267,7 +267,7 @@ fn output_text(
 fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
-        message_b64: None,
+        message: None,
     })
 }
 
@@ -391,7 +391,7 @@ enum WorkerToServer {
     },
     SessionEnd {
         reason: String,
-        message_b64: Option<String>,
+        message: Option<String>,
     },
 }
 

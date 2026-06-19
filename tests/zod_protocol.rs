@@ -556,6 +556,11 @@ async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
         interrupted_text.contains("sideband interrupt: observed"),
         "expected v5 worker to observe sideband interrupt, got: {interrupted_text:?}"
     );
+    #[cfg(target_family = "unix")]
+    assert!(
+        interrupted_text.contains("os interrupt: observed"),
+        "expected v5 worker to observe OS interrupt, got: {interrupted_text:?}"
+    );
 
     let log = wait_for_log_contains(&control_log, "interrupt")?;
     assert!(

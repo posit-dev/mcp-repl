@@ -491,7 +491,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
-            message_b64: None,
+            message: None,
         });
 
         let completion =
@@ -516,7 +516,7 @@ mod tests {
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
-            message_b64: None,
+            message: None,
         });
 
         let completion =
