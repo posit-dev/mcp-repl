@@ -16,10 +16,8 @@ use state::{
 };
 #[cfg(not(any(target_family = "unix", windows)))]
 use state::{input_hook_prompt, mark_stdin_wait_prompt_completed_request};
-#[cfg(windows)]
-use stdio::StdioLineRead;
-use stdio::{PYTHON_STDIN_FILE, PythonRuntime, open_python_runtime};
-#[cfg(not(windows))]
+use stdio::{PYTHON_STDIN_FILE, PythonRuntime, StdioLineRead, open_python_runtime};
+#[cfg(all(not(target_family = "unix"), not(windows)))]
 use stdio::{read_stdio_line_bytes, read_stdio_line_bytes_allowing_python_threads};
 
 mod state;
@@ -187,8 +185,7 @@ fn take_interrupt_requested() -> bool {
 pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
-        unix_stdin::begin_or_append_turn_input(turn_id, &input);
-        Ok(())
+        unix_stdin::begin_or_append_turn_input(turn_id, &input)
     }
 
     #[cfg(windows)]
@@ -205,8 +202,7 @@ pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
 
 #[cfg(target_family = "unix")]
 pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    unix_stdin::begin_or_append_turn_input(turn_id, &input);
-    Ok(())
+    unix_stdin::begin_or_append_turn_input(turn_id, &input)
 }
 
 #[cfg(windows)]
@@ -644,7 +640,7 @@ unsafe extern "C" fn mcp_repl_readline(
     _stdout: *mut libc::FILE,
     prompt: *const c_char,
 ) -> *mut c_char {
-    #[cfg(windows)]
+    #[cfg(any(target_family = "unix", windows))]
     let _ = stdin;
     let prompt_text = if prompt.is_null() {
         String::new()
@@ -671,17 +667,27 @@ unsafe extern "C" fn mcp_repl_readline(
     ) && prompt_matches_python_repl_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
     flush_original_stdio();
-    #[cfg(target_family = "unix")]
-    if !prompt_text.is_empty() && !suppress_repl_prompt_echo {
-        emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
-    }
-    #[cfg(target_family = "unix")]
-    request_cpython_readline_stdin_line(&prompt_text);
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     handle_input_hook();
 
     #[cfg(windows)]
     flush_original_stdio();
+    #[cfg(target_family = "unix")]
+    let read = match unix_stdin::read_cpython_readline_turn_line(
+        &prompt_text,
+        !prompt_text.is_empty() && !suppress_repl_prompt_echo,
+    ) {
+        Ok(read) => read,
+        Err(err) => {
+            emit_output_text(TextStream::Stderr, err.as_bytes());
+            ipc::emit_session_end_with_reason("protocol_error", None);
+            request_exit();
+            StdioLineRead {
+                bytes: Vec::new(),
+                interrupted: true,
+            }
+        }
+    };
     #[cfg(windows)]
     let read = match windows_stdin::read_windows_turn_line(
         &prompt_text,
@@ -699,7 +705,7 @@ unsafe extern "C" fn mcp_repl_readline(
             }
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(all(not(target_family = "unix"), not(windows)))]
     let read = read_stdio_line_bytes(stdin);
     if read.interrupted {
         #[cfg(target_family = "unix")]
@@ -736,11 +742,6 @@ fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
         *result.add(bytes.len()) = 0;
     }
     result
-}
-
-#[cfg(target_family = "unix")]
-fn request_cpython_readline_stdin_line(prompt: &str) {
-    unix_stdin::request_cpython_readline_stdin_line(prompt);
 }
 
 fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
@@ -799,12 +800,6 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     );
     #[cfg(target_family = "unix")]
     flush_original_stdio();
-    #[cfg(target_family = "unix")]
-    if !prompt.is_empty() {
-        emit_output_text(TextStream::Stdout, prompt.as_bytes());
-    }
-    #[cfg(target_family = "unix")]
-    unix_stdin::request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     {
         flush_original_stdio();
@@ -826,7 +821,17 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
             return CStdinLine::Error;
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(target_family = "unix")]
+    let read = match unix_stdin::read_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""))
+    {
+        Ok(read) => read,
+        Err(err) => {
+            set_callback_error(&err);
+            clear_current_readline_prompt();
+            return CStdinLine::Error;
+        }
+    };
+    #[cfg(all(not(target_family = "unix"), not(windows)))]
     let read = read_stdio_line_bytes_allowing_python_threads(stdin);
     if read.interrupted {
         #[cfg(target_family = "unix")]

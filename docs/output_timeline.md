@@ -15,7 +15,7 @@ The worker emits different kinds of information on different channels:
   may merge stdout/stderr identity and apply terminal behavior such as CRLF
   translation, echo, and width-dependent formatting.
 - Sideband IPC carries structural events such as `input_line`, `idle`,
-  `output_image`, and `session_end`.
+  `stdin_wait`, `output_image`, and `session_end`.
 
 Raw pipes and IPC do not arrive at the server in one globally ordered stream.
 The server therefore maintains its own output timeline and resolves it into the
@@ -56,7 +56,7 @@ The important design split is not "files mode vs pager mode". It is:
 
 Timeline resolution must not depend on request completion. For example, the
 server does not need to wait for completion to know that a `plot_image` event
-belongs before a later `readline_result` echo. That ordering fact is already
+belongs before a later `input_line` echo. That ordering fact is already
 present in the mixed timeline.
 
 Completion matters only for reply cleanup choices that are unsafe while a
@@ -74,7 +74,9 @@ Echo matching must be driven by the sideband facts themselves:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
-- `idle` supplies the final prompt text for a completed turn
+- `idle` supplies the final REPL prompt text for a completed turn
+- `stdin_wait` supplies the prompt text for a completed reply that left the
+  runtime at a stdin-style wait
 - the server should match and collapse those exact sideband facts
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`
@@ -113,8 +115,8 @@ resolution, not in the wire protocol.
 - Worker text must remain in the order observed on its stdout/stderr pipes.
 - For PTY-backed workers, worker text from the PTY master must remain in the
   order observed on that terminal stream.
-- Sideband `readline_result` events define the order in which input lines were
-  consumed.
+- Sideband `input_line` events define the order in which logical input was
+  delivered to the runtime.
 - Sideband `plot_image` events define when plot updates happened relative to
   other sideband events.
 - Visible replies must preserve evaluation order when that order is represented
@@ -136,5 +138,5 @@ the same thing as "execution order in the backend".
 ## Current limitation
 
 This document describes the current server contract, not future simplification
-work. Broader changes to worker dumbness, request completion inference, or R
-worker structure should be tracked in `docs/futurework/`.
+work. Broader changes to output storage, response presentation, or worker
+structure should be tracked in `docs/futurework/`.

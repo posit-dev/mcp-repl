@@ -14,8 +14,8 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 - `src/server.rs` owns the MCP surface, request handling, timeout model, and worker lifecycle.
 - `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl`/`repl_reset` behavior stable.
-- During steady-state protocol-worker requests, the server treats the worker as
-  a generic runtime endpoint: `turn_start` carries accepted input,
+- During steady-state worker requests, the server treats the worker as an opaque
+  queued runtime endpoint: `turn_start` carries accepted input over IPC,
   `output_text` sideband frames carry worker-owned text, raw stdout/stderr carry
   unowned visible text, and other sideband events carry structural facts.
   Backend-specific runtime semantics belong in the worker or in explicitly
@@ -29,16 +29,17 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `src/worker.rs`, `src/worker_process.rs`, and `src/worker_protocol.rs` manage the child runtime and the server-to-worker contract.
 - `src/backend.rs` selects between the R and Python implementations at launch
   and install/configuration boundaries.
-- Worker launch chooses the runtime stdin transport up front. R and the default
-  protocol-worker path use pipes; built-in Unix Python uses PTY-backed C
-  stdin/stdout/stderr so CPython takes its normal interactive readline path.
-- Protocol workers receive request payloads through `turn_start` and complete a
-  turn with `idle` or `session_end`. The built-in backends still use internal
-  adapters where the server writes to worker stdin and consumes structured
-  sideband facts, but those adapters are not the protocol-worker contract.
+- Worker launch chooses the raw process stdio or PTY transport up front, but
+  accepted `repl` input is queued through IPC during steady-state execution.
+  Runtime stdin surfaces are worker-owned implementation details.
+- Workers receive request payloads through `turn_start` and complete a turn with
+  `idle`, `stdin_wait`, or `session_end`. Same-turn stdin follow-up input uses
+  `turn_input` rather than starting a new turn.
+- Worker reset and teardown use the sideband `shutdown` lifecycle message first,
+  with stdin close and process termination retained only as bounded fallbacks.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
-- Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On the Unix PTY path, Python leaves CPython's fd-backed stdin surface intact; direct fd stdin consumers are not a request-completion contract.
+- Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On Unix, Python may still use PTY-backed process stdio for terminal behavior, but managed turn input is served from the worker queue; direct stdin consumers are not a server completion contract.
 
 ### Sandbox and process isolation
 
@@ -65,7 +66,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
   exercises public MCP tools over stdio. It covers representative real-binary
   behavior that should not depend on Rust internals.
 - `tests/` contains the Rust public API, snapshot, sandbox, backend, install,
-  protocol-worker, and client-integration suites. Most tests exercise behavior
+  custom worker protocol, and client-integration suites. Most tests exercise behavior
   through the exposed MCP interface using the shared harness in `tests/common/`.
 - CI uses Cargo's standard Rust test runner after installing the real Codex CLI,
   with the Codex backend forced to the mocked provider. The tests should not

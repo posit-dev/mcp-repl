@@ -1,30 +1,30 @@
-# Worker Sideband Protocol (JSON Lines)
+# Worker Sideband Protocol (IPC-Queued JSON Lines)
 
 This document describes the sideband protocol between the server and a worker
 process. The channel is a UTF-8 JSON-lines stream, one JSON object per line,
 carried over an IPC pipe.
 
 This document defines worker protocol version 3. The server rejects other
-protocol versions before sending user input. Custom worker specs use the public
-v3 turn contract below. Built-in R and Python adapters also identify as protocol
-version 3, but may use private adapter messages to bridge raw-stdin transports
-until those adapters move behind `turn_start`; those messages are implementation
-details, not compatibility with older worker protocol versions.
+protocol versions before sending user input. Built-in workers and custom
+workers use the public v3 turn contract below: accepted input is sent over IPC,
+the worker queues it, and the worker owns how queued text reaches the runtime.
+Private compatibility facts are listed separately. They are not a second public
+worker protocol.
 
 The protocol is shaped around one race-free invariant:
 
-> The server does not infer that a worker is idle from stdin writes, PTY state,
-> prompt-looking output, raw stdout/stderr, or timing. A same-worker turn is
-> complete only when the worker emits `idle` for that turn, or when the worker
-> session ends.
+> The server does not infer that a worker is waiting from stdin writes, PTY
+> state, prompt-looking output, raw stdout/stderr, or timing. A same-worker turn
+> is complete only when the worker emits `idle` or `stdin_wait` for that turn,
+> or when the worker session ends.
 
 ## Ownership
 
 The server owns the MCP reply. It captures output, enforces timeouts, detects
 worker exit or IPC loss, creates output bundles, and returns partial replies
-when a turn times out or the worker crashes. A worker crash before `idle` is a
-server-observed terminal condition for the current reply; it is not a protocol
-race.
+when a turn times out or the worker crashes. A worker crash before `idle`,
+`stdin_wait`, or `session_end` is a server-observed terminal condition for the
+current reply; it is not a protocol race.
 
 The worker owns the runtime input boundary. It may drive the runtime through a
 pipe, PTY, callback, embedded queue, or interpreter-specific API, but only the
@@ -44,102 +44,122 @@ from the previous turn can satisfy that wait.
 - Worker-owned output and structural facts are ordered on the sideband stream.
   Raw stdout/stderr capture remains active only as unowned fallback output.
 
-## Turn Model
+## Opaque Turn Model
 
-The server allows at most one active turn per worker session. For protocol
-workers, each non-empty `repl()` execution input becomes a sideband `turn_start`
-message with a fresh `turn_id`. The input is a JSON string, so ordinary request
-payloads remain plain UTF-8 text on the inspectable sideband stream. The worker
-owns newline normalization and runtime placement.
+The server allows at most one active turn or stdin-continuation episode per
+worker session. Each non-empty `repl()` execution input at an ordinary REPL
+prompt becomes a sideband `turn_start` message with a fresh `turn_id`. The input
+is a JSON string, so ordinary request payloads remain plain UTF-8 text on the
+inspectable sideband stream. The worker owns newline normalization, queueing,
+and runtime placement.
 
-Runtime stdin transport is a worker implementation detail. A protocol worker may
-write the turn text into an embedded queue, an ordinary pipe, a PTY master, or an
-interpreter callback. The server must not use transport observations from any of
-those mechanisms to decide request completion.
+The worker is opaque during steady-state execution. The server does not branch
+on whether the worker is R, Python, or a custom launch spec. It sends accepted
+input on IPC, consumes ordered sideband facts and raw fallback output, and
+finalizes the MCP reply.
 
-The worker emits exactly one terminal turn-boundary fact for a successful
-same-session turn:
+Runtime stdin transport is a worker implementation detail. A worker may satisfy
+runtime reads from an embedded queue, a callback, a pipe, a PTY master, a managed
+`sys.stdin` bridge, or another interpreter-specific API. The server must not use
+transport observations from any of those mechanisms to decide request
+completion.
+
+The worker emits one reply-boundary fact for a successful same-session request:
 
 - `idle(turn_id)`: the runtime is waiting for new input, and no bytes or text
-  from that turn can still satisfy that wait.
+  from that turn can still satisfy that wait. The turn is closed, and later
+  ordinary input may start a new `turn_start`.
+- `stdin_wait(turn_id)`: the runtime is blocked on a stdin-style read rather
+  than an interactive REPL prompt, and no bytes or text from that turn can still
+  satisfy that wait. The MCP reply can complete, but the same `turn_id` remains
+  the stdin-continuation id for later `turn_input`.
 
-`session_end` is also terminal for any active turn because the old runtime can
-no longer consume follow-up input. Worker exit, sideband EOF, or process crash
-without `session_end` is handled by the server as worker failure with captured
-partial output.
+`session_end` is terminal for any active turn or stdin-continuation episode
+because the old runtime can no longer consume follow-up input. Worker exit,
+sideband EOF, or process crash without `session_end` is handled by the server as
+worker failure with captured partial output.
 
 Timeouts do not complete a turn. On timeout, the server returns captured partial
 output and keeps the turn active. Later empty polls continue draining output
-until the worker emits `idle`, emits `session_end`, exits, or times out again.
-The server must not send ordinary follow-up input to the same worker while the
-turn remains active. It may send an interrupt for the active turn, reset or
-replace the worker, or report that the worker is still busy.
+until the worker emits `idle`, emits `stdin_wait`, emits `session_end`, exits,
+or times out again. The server must not send ordinary follow-up input to the
+same worker while the turn remains active. After `stdin_wait`, the only
+same-worker input that may target the blocked runtime read is `turn_input` with
+the same `turn_id`. The server may also send an interrupt for the active turn,
+reset or replace the worker, or report that the worker is still busy.
 
-## PTY And Stdin Workers
+## IPC Queue And Runtime Stdin
 
-For protocol workers, PTYs and ordinary stdin are worker-internal runtime
-transports. They may require worker-internal accounting, but they must not expose
-that accounting as the server's completion rule. The server sees only
-`turn_start`, output, `idle`, `session_end`, and failure.
+PTYs, ordinary stdin, language-level stdin wrappers, and runtime callbacks are
+worker-internal transports. They may require worker-internal accounting, but
+they must not expose that accounting as the server's completion rule. The server
+sees `turn_start`, optional same-turn `turn_input`, output, structural facts,
+`idle`, `stdin_wait`, `session_end`, and failure.
 
-Built-in adapters are still allowed to use private sideband facts for raw-stdin
-bridging. That adapter path is outside the public custom-worker protocol and
-should shrink as the built-in runtimes move behind `turn_start`.
+An IPC-queued worker must keep accepted input in worker-owned state until the
+runtime consumes it. The server must not write managed request payloads directly
+to the runtime's stdin as its steady-state execution path. If a child process has
+sideband IPC disabled, it must not be able to consume managed queued input by
+accident; it should see EOF or whatever explicit worker policy applies.
 
-A PTY-backed worker must own the PTY master or an equivalent write endpoint. A
-typical turn works like this:
+A typical queued turn works like this:
 
 1. Server sends `{ "type": "turn_start", "turn_id": 7, "input": "x <- 1" }`.
 2. Worker receives `turn_start`.
 3. Worker records active turn `7`.
 4. Worker normalizes input for its runtime. For a line-oriented runtime, this
-   usually means appending a final newline and splitting into worker-owned line
-   items.
+   usually means appending a final newline and splitting into queue items.
 5. Worker enqueues those line items in an active-turn input queue.
-6. Worker writer takes the next queued item and writes it to the PTY master.
-7. PTY/kernel/runtime code may transform or buffer what was written. This is
-   allowed, but it is no longer a server-visible accounting surface.
-8. Runtime consumes input through the PTY.
+6. Runtime asks for input through a worker-owned boundary such as `ReadConsole`,
+   `PyOS_ReadlineFunctionPointer`, `sys.stdin`, a direct fd read shim, a PTY, or
+   another runtime hook.
+7. Worker removes the next queued bytes or line from the queue and returns it to
+   that runtime boundary.
+8. Worker emits `input_line` for the logical input delivered to the runtime.
 9. Runtime reaches a worker-observed input wait, such as a readline callback,
    prompt hook, or equivalent interpreter event. Raw PTY output that looks like
    a prompt is not enough.
 10. Worker receives that input-wait event.
 11. Worker checks its active-turn state:
     - no queued line item remains for turn `7`;
-    - no writer task has unwritten or in-flight input for turn `7`;
-    - observable PTY input is empty, or the transport design gives an
-      equivalent guarantee;
+    - no worker writer or callback has unwritten or in-flight input for turn
+      `7`;
+    - any runtime stdin, PTY, libc, readline, or language-level buffer is empty,
+      or the worker design gives an equivalent guarantee;
     - no interrupt or reset cleanup for turn `7` is pending or uncertain.
 12. If all checks pass, worker sends
-    `{ "type": "idle", "turn_id": 7, "prompt": ">" }`.
-13. Server receives `idle(7)` and finalizes the turn reply from captured output.
+    `{ "type": "idle", "turn_id": 7, "prompt": ">" }` or
+    `{ "type": "stdin_wait", "turn_id": 7, "prompt": "name: " }`.
+13. Server receives the reply-boundary fact and finalizes the MCP reply from
+    captured output.
 
-If any check in step 11 fails, the worker does not emit `idle`. It lets the
-runtime consume the pending input as part of turn `7`, writes the next queued
-line item if needed, and repeats the check at the next worker-observed input
-wait.
+If any check in step 11 fails, the worker does not emit `idle` or
+`stdin_wait`. It lets the runtime consume the pending input as part of turn `7`,
+writes the next queued line item if needed, and repeats the check at the next
+worker-observed input wait.
 
-This model can use line accounting inside the worker. The worker may track
-"line 1 was written", "line 2 is still queued", or "the current line write is
-in flight." That line accounting remains private because it is only evidence
-for whether the worker can truthfully emit `idle`. The server does not need to
-know whether the worker proved `idle` with lines, bytes, callbacks, or a queue.
+This model can use line or byte accounting inside the worker. The worker may
+track "line 1 was delivered", "line 2 is still queued", or "a direct stdin read
+has consumed N bytes." That accounting remains private because it is only
+evidence for whether the worker can truthfully emit `idle` or `stdin_wait`. The
+server does not need to know whether the worker proved completion with lines,
+bytes, callbacks, a queue, or a PTY.
 
-Server-visible line accounting is not sufficient for a PTY-backed runtime. A
-line accepted by the PTY master is not necessarily a line consumed by the
-runtime. The PTY may transform newlines, buffer pasted input, split writes,
-merge multiple lines, flush input, or interact with runtime buffering. The
-worker is the only component that can combine the transport facts with the
-runtime input-wait event.
+Server-visible line accounting is not sufficient for any runtime stdin
+transport. A line accepted by a PTY master, pipe, or language wrapper is not
+necessarily a line consumed by the runtime. The transport may transform
+newlines, buffer pasted input, split writes, merge multiple lines, flush input,
+or interact with runtime buffering. The worker is the only component that can
+combine transport facts with the runtime input-wait event.
 
 A PTY-backed worker must control buffering well enough for its checks to mean
 what they claim. For example, if the runtime reads through a buffered `FILE*`,
 the worker must either disable read-ahead buffering or place the input-wait
 observation after those buffers are known not to contain active-turn input. If
 the worker cannot make that guarantee, it cannot safely emit same-session
-`idle` for that transport. It should use a queue or callback-backed runtime
-boundary, emit `session_end`, or rely on server-side replacement after
-timeout/reset.
+`idle` or `stdin_wait` for that transport. It should use a queue or
+callback-backed runtime boundary, emit `session_end`, or rely on server-side
+replacement after timeout/reset.
 
 ## Direction: server -> worker
 
@@ -147,24 +167,46 @@ timeout/reset.
 - `{ "type": "turn_start", "turn_id": <integer>, "input": <string> }`
 - Starts one runtime turn. The server must not send another `turn_start` for
   the same worker until the active turn reaches `idle`, reaches `session_end`,
-  or the worker session is replaced.
+  or the worker session is replaced. `stdin_wait` is not permission to start a
+  fresh turn; it opens same-turn stdin continuation.
 - `input` is the decoded MCP `repl()` text. The worker owns appending a final
   newline when its runtime requires line-oriented input.
 
+`turn_input`
+- `{ "type": "turn_input", "turn_id": <integer>, "input": <string> }`
+- Appends text to an already-open worker-owned input queue for the active turn
+  or stdin-continuation episode.
+- This is for stdin-style follow-up input to a runtime wait that has not
+  returned to an ordinary REPL prompt. It must not start a new turn.
+- `turn_id` must match the worker's active turn. If it does not match, the
+  worker must reject the message or end the session with a protocol error.
+
 `interrupt`
-- `{ "type": "interrupt", "turn_id": <integer> }`
+- `{ "type": "interrupt", "turn_id": <integer, optional> }`
+- Queued active-turn form: `{ "type": "interrupt", "turn_id": <integer> }`
 - Sent when the server is about to interrupt the active turn. The server may
   also deliver the platform interrupt to the worker process or process group.
 - This message is for worker-owned cleanup and state transition only. It does
   not carry user input and does not complete the turn.
-- `turn_id` must match the worker's active turn. It is a stale-control guard,
-  not a general request address. If it does not match, the worker must not apply
-  the interrupt to any newer turn. It should ignore the stale control or end the
-  session with a protocol error.
-- After interrupt, the worker must emit `idle` only if it can prove no input
-  from the interrupted turn can satisfy the next runtime input wait. If it
-  cannot prove that, it must fail closed by staying active, ending the session,
-  or relying on server reset/restart.
+- For an active queued turn, `turn_id` must match the worker's active turn. It
+  is a stale-control guard, not a general request address. If it does not match,
+  the worker must not apply the interrupt to any newer turn. It should ignore
+  the stale control or end the session with a protocol error.
+- A missing `turn_id` is reserved for built-in compatibility paths that do not
+  have a tracked active turn id at the routing point.
+- After interrupt, the worker must emit `idle` or `stdin_wait` only if it can
+  prove no input from the interrupted turn can satisfy the next runtime input
+  wait. If it cannot prove that, it must fail closed by staying active, ending
+  the session, or relying on server reset/restart.
+
+`shutdown`
+- `{ "type": "shutdown" }`
+- Requests worker process shutdown during reset, replacement, or server
+  teardown.
+- This is lifecycle control, not turn input. It must not carry `turn_id`,
+  payload text, or interpreter shutdown code.
+- The worker should exit promptly. If it does not, the server keeps using its
+  bounded process-control fallback.
 
 ## Direction: worker -> server
 
@@ -183,11 +225,21 @@ invalid base64, and unknown message types are protocol errors.
 - `{ "type": "idle", "turn_id": <integer>, "prompt": <string> }`
 - Emitted only after the runtime is waiting for more input and no input from
   `turn_id` can still satisfy that wait.
-- This is the only successful same-worker turn completion signal.
+- This is the ordinary successful same-worker REPL completion signal.
 - The prompt string is required; use an empty string if the runtime supplied no
   prompt.
 - Prompt rendering is derived from this structured event, not from raw
   stdout/stderr parsing.
+
+`stdin_wait`
+- `{ "type": "stdin_wait", "turn_id": <integer>, "prompt": <string> }`
+- Emitted when the runtime is waiting for stdin-style input outside the ordinary
+  REPL prompt boundary and no input from `turn_id` can still satisfy that wait.
+- This completes the current MCP reply but leaves the runtime positioned at a
+  stdin read. Follow-up text for that wait must be delivered with `turn_input`,
+  not a new `turn_start`.
+- The prompt string is required; use an empty string if the runtime supplied no
+  prompt.
 
 `input_line`
 - `{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }`
@@ -198,13 +250,27 @@ invalid base64, and unknown message types are protocol errors.
   Submitted input must not be emitted as `output_text`.
 - The final MCP reply elides synthetic input echoes by default. The server may reconstruct `prompt + text` from ordered `input_line` events for transcript finalization, echo trimming, debugging views, or other surfaces that need an interactive transcript.
 
+`readline_start`
+- `{ "type": "readline_start", "prompt": <string> }`
+- Reports that the worker observed a runtime prompt before it knows whether the
+  prompt will consume queued input, become `idle`, or become `stdin_wait`.
+- This is advisory prompt metadata only. It never completes a turn and it does
+  not carry input ownership.
+
+Removed built-in adapter facts
+- `readline_input_bytes`, `readline_discard_bytes`, `readline_result`, and
+  `pty_feed` are not protocol messages.
+- Built-in workers and custom workers use the same public turn contract:
+  `turn_start` or `turn_input` for accepted input, `input_line` for delivered
+  logical input, and `idle` or `stdin_wait` for successful completion.
+
 `output_text`
 - `{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }`
 - Carries worker-owned output bytes on the ordered sideband stream. The payload
   is base64 so workers can preserve bytes without depending on JSON string
   encoding.
 - Prompt-looking bytes are ordinary output unless the worker reports them in
-  `idle.prompt`.
+  `idle.prompt` or `stdin_wait.prompt`.
 - `is_continuation` marks bounded transport chunks that continue the same
   worker-owned output write. It defaults to `false`.
 - Workers send output-critical frames synchronously: each JSON line is written,
@@ -241,9 +307,9 @@ invalid base64, and unknown message types are protocol errors.
 Interrupt recovery is worker-owned and fail-closed. The server may send an
 interrupt while a turn is active and may return partial output if recovery times
 out. The server must not send interrupt-tail input to the same worker until the
-active turn reaches `idle` or `session_end`.
+active turn reaches `idle`, reaches `stdin_wait`, or reaches `session_end`.
 
-An interrupt for a PTY-backed worker works like this:
+An interrupt for a queued worker works like this:
 
 1. Server sends `{ "type": "interrupt", "turn_id": 7 }`.
 2. Server may also deliver the platform interrupt to the worker process or
@@ -260,7 +326,9 @@ An interrupt for a PTY-backed worker works like this:
 8. Runtime either reaches a worker-observed input wait, exits, or remains busy.
 9. If the runtime reaches input wait and the worker can prove no input from
    turn `7` remains queued, in flight, buffered, or cleanup-uncertain, worker
-   sends `{ "type": "idle", "turn_id": 7, "prompt": <string> }`.
+   sends `{ "type": "idle", "turn_id": 7, "prompt": <string> }` or
+   `{ "type": "stdin_wait", "turn_id": 7, "prompt": <string> }`, depending on
+   the runtime wait surface.
 10. If the runtime exits, worker sends `session_end`.
 11. If cleanup is uncertain, worker sends neither `idle` nor same-worker tail
     input. The active turn remains active until timeout, later recovery,
@@ -269,7 +337,7 @@ An interrupt for a PTY-backed worker works like this:
 The worker may use runtime-specific cleanup mechanisms internally. Those
 details are not protocol facts. If cleanup is only best-effort and old input may
 still be buffered in a PTY, libc, readline, or interpreter state, the worker
-must not emit `idle` for the interrupted turn.
+must not emit `idle` or `stdin_wait` for the interrupted turn.
 
 ## Notes
 

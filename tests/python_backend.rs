@@ -1153,12 +1153,7 @@ async fn python_long_physical_line_does_not_complete_before_execution() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session_with_env_vars(vec![(
-        "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS".to_string(),
-        "1000".to_string(),
-    )])
-    .await?
-    else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1179,8 +1174,8 @@ async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestRes
         "expected request to remain busy instead of reporting a worker error, got: {poll_text:?}"
     );
     assert!(
-        !poll_text.contains("pty_feed write failed"),
-        "PTY backpressure should not become a protocol error, got: {poll_text:?}"
+        !poll_text.contains("worker error:"),
+        "queued input tail should not become a worker error, got: {poll_text:?}"
     );
 
     let interrupt = session
@@ -1394,7 +1389,7 @@ print("PTY_INPUT", value)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
+async fn python_pty_routes_stdin_surfaces_through_queue() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1419,8 +1414,8 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
     session.cancel().await?;
 
     assert!(
-        text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
-        "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
+        text.contains("STDIN_SURFACE __main__ McpInputStream 0 True"),
+        "expected sys.stdin to be the managed stdin bridge, got: {text:?}"
     );
     let direct_fd_modules = text
         .lines()
@@ -1434,19 +1429,12 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         6,
         "expected six direct fd stdin API module names, got: {text:?}"
     );
-    for (label, module) in [
-        ("builtins.open", direct_fd_modules[0]),
-        ("io.open", direct_fd_modules[1]),
-    ] {
-        assert!(
-            matches!(module, "io" | "_io"),
-            "expected {label} to come from io or _io, got: {text:?}"
-        );
-    }
     assert_eq!(
-        &direct_fd_modules[2..],
-        ["_io", "_io", "posix", "posix"],
-        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+        direct_fd_modules,
+        [
+            "__main__", "__main__", "__main__", "__main__", "__main__", "__main__"
+        ],
+        "expected stdin fd APIs to be routed through the managed bridge, got: {text:?}"
     );
     Ok(())
 }

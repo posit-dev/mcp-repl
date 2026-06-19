@@ -59,11 +59,35 @@ impl RSession {
         self.init.wait_ready()
     }
 
-    pub fn enqueue_input(&self, input: String) -> Result<(), String> {
+    pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
         let state = session_state();
         let mut guard = state.inner.lock().unwrap();
-        queue_input(&mut guard.input_queue, &input);
+        if let Some(active) = guard.active_turn_id {
+            return Err(format!(
+                "turn_start turn_id {turn_id} arrived while turn_id {active} is active"
+            ));
+        }
+        guard.active_turn_id = Some(turn_id);
+        queue_input(&mut guard.input_queue, turn_id, &input);
+        state.cvar.notify_all();
+        Ok(())
+    }
+
+    pub fn append_turn_input(&self, turn_id: u64, input: String) -> Result<(), String> {
+        self.wait_until_ready()?;
+        let state = session_state();
+        let mut guard = state.inner.lock().unwrap();
+        match guard.active_turn_id {
+            Some(active) if active == turn_id => {}
+            Some(active) => {
+                return Err(format!(
+                    "turn_input turn_id {turn_id} does not match active turn_id {active}"
+                ));
+            }
+            None => guard.active_turn_id = Some(turn_id),
+        }
+        queue_input(&mut guard.input_queue, turn_id, &input);
         state.cvar.notify_all();
         Ok(())
     }
@@ -116,27 +140,13 @@ impl SessionInit {
     }
 }
 
-pub fn request_shutdown() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    guard.shutdown = true;
-    state.cvar.notify_all();
-    true
-}
-
 pub(crate) fn clear_pending_input() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
-    let discarded = drain_input_queue(&mut guard.input_queue);
-    drop(guard);
-    if !discarded.is_empty() {
-        ipc::emit_readline_discard_bytes(discarded.as_bytes());
-    }
+    drain_input_queue(&mut guard.input_queue);
     had_pending
 }
 
@@ -161,6 +171,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     ));
 
     init.mark_ready();
+    ipc::emit_worker_ready("r", true);
 
     unsafe {
         libr::run_Rmainloop();
@@ -175,17 +186,25 @@ struct SessionState {
 }
 
 struct SessionStateInner {
-    input_queue: VecDeque<String>,
+    active_turn_id: Option<u64>,
+    input_queue: VecDeque<TurnInputLine>,
     plot_hashes: HashMap<String, u64>,
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TurnInputLine {
+    turn_id: u64,
+    text: String,
+}
+
 impl SessionState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SessionStateInner {
+                active_turn_id: None,
                 input_queue: VecDeque::new(),
                 plot_hashes: HashMap::new(),
                 last_prompt: None,
@@ -602,7 +621,7 @@ fn session_state() -> &'static Arc<SessionState> {
         .expect("R session state was not initialized")
 }
 
-fn queue_input(queue: &mut VecDeque<String>, input: &str) {
+fn queue_input(queue: &mut VecDeque<TurnInputLine>, turn_id: u64, input: &str) {
     if input.is_empty() {
         return;
     }
@@ -614,28 +633,42 @@ fn queue_input(queue: &mut VecDeque<String>, input: &str) {
             lines.push("\n".to_string());
         }
     }
-    queue.extend(lines);
+    queue.extend(
+        lines
+            .into_iter()
+            .map(|text| TurnInputLine { turn_id, text }),
+    );
 }
 
-fn drain_input_queue(queue: &mut VecDeque<String>) -> String {
+fn drain_input_queue(queue: &mut VecDeque<TurnInputLine>) -> String {
     let mut drained = String::new();
     while let Some(line) = queue.pop_front() {
-        drained.push_str(&line);
+        drained.push_str(&line.text);
     }
     drained
 }
 
-fn split_console_line(mut line: String, max: usize) -> (String, Option<String>) {
-    if line.len() <= max {
+fn split_console_line(
+    mut line: TurnInputLine,
+    max: usize,
+) -> (TurnInputLine, Option<TurnInputLine>) {
+    if line.text.len() <= max {
         return (line, None);
     }
     let mut split = max;
-    while split > 0 && !line.is_char_boundary(split) {
+    while split > 0 && !line.text.is_char_boundary(split) {
         split -= 1;
     }
     assert!(split > 0, "R console buffer is too small for UTF-8 input");
-    let tail = line.split_off(split);
-    (line, Some(tail))
+    let turn_id = line.turn_id;
+    let tail = line.text.split_off(split);
+    (
+        line,
+        Some(TurnInputLine {
+            turn_id,
+            text: tail,
+        }),
+    )
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
@@ -884,7 +917,31 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_busy(which: c_int) {
-    let _ = which;
+    if which == 0 {
+        emit_idle_if_active_turn_finished();
+    }
+}
+
+fn emit_idle_if_active_turn_finished() {
+    let state = session_state();
+    let mut guard = state.inner.lock().unwrap();
+    if !guard.input_queue.is_empty() {
+        return;
+    }
+    let prompt = guard.last_prompt.clone().unwrap_or_default();
+    if r_prompt_is_continuation(&prompt) {
+        return;
+    }
+    let Some(turn_id) = guard.active_turn_id.take() else {
+        return;
+    };
+    guard.plot_hashes.clear();
+    drop(guard);
+    ipc::emit_idle(turn_id, &prompt);
+}
+
+fn r_prompt_is_continuation(prompt: &str) -> bool {
+    prompt.trim_end().ends_with('+')
 }
 
 #[unsafe(no_mangle)]
@@ -910,7 +967,7 @@ pub extern "C-unwind" fn r_read_console(
     prompt: *const c_char,
     buf: *mut c_uchar,
     buflen: c_int,
-    _add_history: c_int,
+    add_history: c_int,
 ) -> c_int {
     if buflen <= 0 {
         return 0;
@@ -931,12 +988,10 @@ pub extern "C-unwind" fn r_read_console(
         .unwrap_or(false);
     let state = session_state();
     ipc::emit_readline_start(prompt);
-    let emit_idle_start;
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
-        emit_idle_start = guard.input_queue.is_empty();
-        if emit_idle_start {
+        if guard.input_queue.is_empty() && guard.active_turn_id.is_none() {
             guard.plot_hashes.clear();
         }
     }
@@ -989,18 +1044,17 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let head = line_text.as_bytes();
+            let head = line_text.text.as_bytes();
             if !buf.is_null() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
                     *buf.add(head.len()) = 0;
                 }
             }
-            ipc::emit_readline_input_bytes(line_text.as_bytes());
-            let mut echoed = String::with_capacity(prompt.len() + line_text.len());
+            let mut echoed = String::with_capacity(prompt.len() + line_text.text.len());
             echoed.push_str(prompt);
-            echoed.push_str(&line_text);
-            ipc::emit_readline_result(prompt, &line_text);
+            echoed.push_str(&line_text.text);
+            ipc::emit_input_line(line_text.turn_id, prompt, &line_text.text);
             if !echoed.is_empty() {
                 emit_output_text(TextStream::Stdout, echoed.as_bytes());
             }
@@ -1008,7 +1062,22 @@ pub extern "C-unwind" fn r_read_console(
             return 1;
         }
 
+        if let Some(turn_id) = guard.active_turn_id.take() {
+            let is_top_level = add_history != 0 && !r_prompt_is_continuation(prompt);
+            let prompt = prompt.to_string();
+            if is_top_level {
+                guard.plot_hashes.clear();
+                drop(guard);
+                ipc::emit_idle(turn_id, &prompt);
+            } else {
+                drop(guard);
+                ipc::emit_stdin_wait(turn_id, &prompt);
+            }
+            continue;
+        }
+
         guard = state.cvar.wait(guard).unwrap();
+        drop(guard);
     }
 }
 
@@ -1042,6 +1111,60 @@ pub(crate) fn push_plot_image(
     ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use std::collections::VecDeque;
+
+    use super::{TurnInputLine, queue_input, split_console_line};
+
+    #[test]
+    fn queue_input_attaches_turn_id_to_each_line() {
+        let mut queue = VecDeque::new();
+
+        queue_input(&mut queue, 7, "alpha\nbeta");
+
+        let queued = queue.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                TurnInputLine {
+                    turn_id: 7,
+                    text: "alpha\n".to_string(),
+                },
+                TurnInputLine {
+                    turn_id: 7,
+                    text: "beta\n".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_console_line_preserves_turn_id_on_remainder() {
+        let line = TurnInputLine {
+            turn_id: 11,
+            text: "abcdef\n".to_string(),
+        };
+
+        let (head, tail) = split_console_line(line, 3);
+
+        assert_eq!(
+            head,
+            TurnInputLine {
+                turn_id: 11,
+                text: "abc".to_string(),
+            }
+        );
+        assert_eq!(
+            tail,
+            Some(TurnInputLine {
+                turn_id: 11,
+                text: "def\n".to_string(),
+            })
+        );
+    }
 }
 
 #[cfg(target_family = "windows")]

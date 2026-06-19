@@ -302,6 +302,7 @@ mod tests {
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
+        server.begin_turn(1);
         process.set_ipc_for_test(server);
         manager.process = Some(process);
         manager.pending_request = true;
@@ -312,9 +313,10 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+        let _ = worker.send(WorkerToServerIpcMessage::InputLine {
+            turn_id: 1,
             prompt,
-            line: "quit()\n".to_string(),
+            text: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: ">>> ".to_string(),

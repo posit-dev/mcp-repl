@@ -2,49 +2,44 @@
 
 ## Summary
 
-A Windows bug exposed a broader design issue in the embedded worker model: stdin should have a single owner inside the worker process.
+A Windows bug exposed a broader design issue in the embedded worker model:
+managed turn input should have a single owner inside the worker process.
 
 This repo has already pulled forward a narrow mitigation from that future work: on Windows, pause the worker's background stdin reader while a request is active so another runtime is not competing with a blocked reader on fd `0`.
 
-The remaining follow-up is broader than that point fix. We still need to tighten the general stdin transport model so future interpreters fit the same design cleanly and stdin ownership is structural rather than incidental.
+The main protocol follow-up has been pulled into the current worker contract:
+accepted input is queued through sideband IPC and runtime stdin surfaces are
+worker-owned implementation details. The remaining value of this note is to keep
+future interpreters on that same single-owner path.
 
 ## Why This Matters
 
 - The Windows `reticulate` hang was a concrete symptom of stdin ownership problems in the worker model.
 - The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
-- Future embedded interpreters can run into similar issues if worker stdin
-  ownership drifts again.
-- The current protocol-worker path carries request input in `turn_start` and
-  lets the worker own the runtime boundary. The remaining R and Python built-in
-  adapters still have different in-worker stdin ownership details.
+- Future embedded interpreters can run into similar issues if managed input
+  ownership drifts back toward shared raw process stdin.
+- The current worker protocol carries accepted input in `turn_start` or
+  same-turn `turn_input` and lets the worker own the runtime boundary.
 
 ## Current Scope
 
-The remaining built-in adapters still use raw stdin for worker payloads and
-sideband IPC for request metadata:
-
-- R worker mode owns stdin in a worker-side reader thread. The server announces
-  the payload byte length on sideband IPC; the worker reader consumes exactly
-  that many raw bytes and submits them to embedded R.
-- Python worker mode lets CPython own stdin. The server announces request
-  metadata on sideband IPC, waits for the built-in adapter to accept that
-  metadata, then writes raw bytes for CPython's interactive loop to consume.
-
-The remaining follow-up is to either move those adapters behind the v3 turn
-boundary or make their ownership split explicit enough that request handling no
-longer branches on interpreter details.
+Built-in and custom workers should keep managed turn input in a worker-owned
+queue. The worker may expose that queue through `ReadConsole`, `PyOS_Readline`,
+a managed `sys.stdin`, direct fd shims, a PTY writer, or another runtime bridge,
+but the server-side request path should stay opaque.
 
 ## Intended Transport Model
 
-- Treat the v3 `turn_start` payload as the protocol-worker input transport.
-- Do not add framing headers or other synthetic protocol markers to raw stdin.
-- For backend-internal stdin adapters, keep request metadata on sideband IPC.
+- Treat the v3 `turn_start` and `turn_input` payloads as the managed input
+  transport.
+- Do not add framing headers or other synthetic protocol markers to raw process
+  stdin.
+- Keep request metadata and queued input on sideband IPC.
 - Let the worker own when the current input payload is complete.
 - For line-oriented runtimes such as embedded R, expect a single logical request to be satisfied across multiple `readline` or `ReadConsole` calls.
 
-The current embedded worker adapters keep stdin raw and preserve request
-boundaries with IPC metadata; that is adapter behavior, not the protocol-worker
-contract.
+Raw process stdin may still exist for launch, terminal behavior, or child
+process policy, but it is not the managed request payload transport.
 
 ## Observed Windows Failure
 
@@ -64,9 +59,9 @@ The following patterns reproduced locally on Windows:
 
 ## Intended Follow-Up
 
-- Keep stdin as the primary worker payload transport.
-- Make stdin ownership explicit per backend instead of relying on scattered
-  server-side branching.
+- Keep IPC-queued input as the primary managed worker payload transport.
+- Make runtime stdin ownership explicit per backend instead of relying on
+  scattered server-side branching.
 - Avoid a permanently blocked background stdin reader while embedded runtimes
   may also inspect or wrap fd `0`.
 - Prefer demand-driven reads from stdin, or another single-owner design, so

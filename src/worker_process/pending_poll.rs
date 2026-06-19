@@ -218,8 +218,9 @@ impl WorkerManager {
     ) -> Result<PendingPollState, WorkerError> {
         match self.wait_for_request_completion(timeout) {
             Ok(info) => {
-                self.clear_pending_request_state();
                 let session_end = info.session_end_seen;
+                let preserve_active_turn = !session_end && info.stdin_wait_prompt.is_some();
+                self.clear_pending_request_state_with_active_turn(preserve_active_turn);
                 if session_end {
                     self.note_session_end(true);
                 }

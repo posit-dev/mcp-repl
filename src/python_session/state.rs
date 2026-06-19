@@ -71,20 +71,11 @@ pub(super) enum PythonReadlineState {
 
 pub(super) enum StdinReadAccounting {
     Accounted,
-    #[cfg(target_family = "unix")]
-    DiscardedAfterInterrupt,
 }
 
 impl StdinReadAccounting {
     pub(super) fn discarded_after_interrupt(&self) -> bool {
-        #[cfg(target_family = "unix")]
-        {
-            matches!(self, Self::DiscardedAfterInterrupt)
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            false
-        }
+        false
     }
 }
 

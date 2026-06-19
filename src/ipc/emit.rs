@@ -84,48 +84,12 @@ pub fn emit_readline_start(prompt: &str) {
     }
 }
 
-pub fn emit_readline_input_bytes(bytes: &[u8]) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInputBytes {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-}
-
-pub fn emit_readline_discard_bytes(bytes: &[u8]) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscardBytes {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-}
-
-pub fn emit_readline_result(prompt: &str, line: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: prompt.to_string(),
-            line: line.to_string(),
-        });
-    }
-}
-
 pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
             turn_id,
             prompt: prompt.to_string(),
             text: text.to_string(),
-        });
-    }
-}
-
-#[cfg(target_family = "unix")]
-pub fn emit_pty_feed(turn_id: u64, seq: u64, bytes: &[u8]) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::PtyFeed {
-            turn_id,
-            seq,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
     }
 }
@@ -188,16 +152,5 @@ pub fn emit_session_end_with_reason(reason: &str, turn_id: Option<u64>) {
             message_b64: None,
             turn_id,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{emit_readline_discard_bytes, emit_readline_input_bytes};
-
-    #[test]
-    fn readline_accounting_emitters_are_platform_neutral_noops_without_global_ipc() {
-        emit_readline_input_bytes(b"answer\n");
-        emit_readline_discard_bytes(b"queued\n");
     }
 }

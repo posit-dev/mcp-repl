@@ -9,8 +9,8 @@ This file is the entrypoint for deciding how to verify a change.
 - `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
 - `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`/`repl_reset` behavior, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
-- `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, PTY-backed Python readline behavior, and image output.
-- `tests/zod_protocol.rs`: protocol-worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
+- `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, queued stdin/readline behavior, and image output.
+- `tests/zod_protocol.rs`: IPC-queued custom worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
 - `tests/sandbox.rs` and `tests/sandbox_state_meta.rs`: sandbox policy behavior and Codex per-tool-call sandbox metadata.
 - `tests/client_config_dual_backend.rs`, `tests/release_script.rs`, `tests/codex_integration.rs`, and `tests/claude_integration.rs`: install-path and real client integration coverage.
 - `tests/docs_contracts.rs`: docs map and snapshot-facing documentation contracts.

@@ -25,8 +25,8 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcPtyFeed, IpcServer, IpcWaitError, ServerIpcConnection,
-    WorkerToServerIpcMessage,
+    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
@@ -249,9 +249,6 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const PTY_FEED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(debug_assertions)]
-const PTY_FEED_WRITE_TIMEOUT_ENV: &str = "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS";
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
@@ -365,23 +362,6 @@ fn seed_initial_prompt_from_process(
             Ok(None)
         }
     }
-}
-
-fn pty_feed_write_timeout() -> Duration {
-    #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var(PTY_FEED_WRITE_TIMEOUT_ENV) {
-        let millis = value
-            .trim()
-            .parse::<u64>()
-            .expect("MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be integer milliseconds");
-        assert!(
-            millis > 0,
-            "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be greater than zero"
-        );
-        return Duration::from_millis(millis);
-    }
-
-    PTY_FEED_WRITE_TIMEOUT
 }
 
 pub(crate) struct WorkerProcess {
@@ -588,8 +568,6 @@ impl WorkerProcess {
             let output_capture = live_output.clone();
             let image_capture = live_output.clone();
             let sideband_capture = live_output.clone();
-            let pty_feed_stdin_tx = stdin_tx.clone();
-            let allow_pty_feed = matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python));
             let handlers = IpcHandlers {
                 on_output_text: Some(Arc::new(move |text| {
                     output_capture.append_output_text(
@@ -614,20 +592,6 @@ impl WorkerProcess {
                         });
                     }))
                 },
-                on_pty_feed: Some(Arc::new(move |feed: IpcPtyFeed| {
-                    if !allow_pty_feed {
-                        return Err(
-                            "pty_feed is only supported by the built-in Python worker".to_string()
-                        );
-                    }
-                    let _ = (feed.turn_id, feed.seq);
-                    send_stdin_command(
-                        &pty_feed_stdin_tx,
-                        Some(feed.bytes),
-                        pty_feed_write_timeout(),
-                    )
-                    .map_err(|err| err.to_string())
-                })),
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
@@ -953,6 +917,15 @@ impl WorkerProcess {
         self.send_stdin_payload(None, timeout)
     }
 
+    fn request_ipc_shutdown(&self) {
+        if let Some(ipc) = self.ipc.get() {
+            let _ = ipc.send_with_timeout(
+                ServerToWorkerIpcMessage::Shutdown {},
+                Duration::from_millis(200),
+            );
+        }
+    }
+
     fn send_stdin_payload(
         &mut self,
         payload: Option<Vec<u8>>,
@@ -1097,6 +1070,7 @@ impl WorkerProcess {
     }
 
     pub(crate) fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
+        self.request_ipc_shutdown();
         let _ = self.close_stdin(Duration::from_millis(200));
 
         let start = std::time::Instant::now();
@@ -2391,7 +2365,7 @@ mod tests {
         let result_capture = capture.clone();
         let image_capture = capture.clone();
         let session_capture = capture.clone();
-        let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
+        let (server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
             on_output_text: Some(Arc::new(move |text| {
                 output_capture.append_output_text(&text.bytes, text.stream, text.is_continuation);
             })),
@@ -2412,9 +2386,9 @@ mod tests {
                 session_capture.append_sideband(PendingSidebandKind::SessionEnd);
                 done_tx.send(()).expect("send session end marker");
             })),
-            ..IpcHandlers::default()
         })
         .expect("ipc pair");
+        server.begin_turn(1);
 
         worker
             .send(WorkerToServerIpcMessage::ReadlineStart {
@@ -2429,11 +2403,12 @@ mod tests {
             })
             .expect("send stdout output_text");
         worker
-            .send(WorkerToServerIpcMessage::ReadlineResult {
+            .send(WorkerToServerIpcMessage::InputLine {
+                turn_id: 1,
                 prompt: "> ".to_string(),
-                line: "plot(1)\n".to_string(),
+                text: "plot(1)\n".to_string(),
             })
-            .expect("send readline_result");
+            .expect("send input_line");
         worker
             .send(WorkerToServerIpcMessage::PlotImage {
                 mime_type: "image/png".to_string(),

@@ -138,7 +138,8 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
-        let interrupt_result = self.driver.interrupt(process);
+        let reopen_completed_turn = self.stdin_waiting && !self.pending_request;
+        let interrupt_result = self.driver.interrupt(process, reopen_completed_turn);
         if let Err(err) = interrupt_result {
             self.reset()?;
             crate::event_log::log(
@@ -194,22 +195,39 @@ impl WorkerManager {
     ) -> Result<InterruptPromptWait, WorkerError> {
         let mut timed_out = false;
         let mut prompt: Option<String> = None;
+        let ignore_empty_prompt = self.stdin_waiting;
         if let Some(process) = self.process.as_ref()
             && let Some(ipc) = process.ipc_connection()
         {
-            let result = ipc.wait_for_prompt(timeout);
-            match result {
-                Ok(value) => {
-                    prompt = Some(value);
-                }
-                Err(IpcWaitError::Timeout) => {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
                     timed_out = true;
+                    break;
                 }
-                Err(IpcWaitError::SessionEnd) => {
-                    self.note_session_end(true);
+                let result = ipc.wait_for_prompt(remaining);
+                match result {
+                    Ok(value) if ignore_empty_prompt && value.is_empty() => {
+                        continue;
+                    }
+                    Ok(value) => {
+                        prompt = Some(value);
+                        break;
+                    }
+                    Err(IpcWaitError::Timeout) => {
+                        timed_out = true;
+                        break;
+                    }
+                    Err(IpcWaitError::SessionEnd) => {
+                        self.note_session_end(true);
+                        break;
+                    }
+                    Err(IpcWaitError::Disconnected) => break,
+                    Err(IpcWaitError::Protocol(message)) => {
+                        return Err(WorkerError::Protocol(message));
+                    }
                 }
-                Err(IpcWaitError::Disconnected) => {}
-                Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
             }
         }
 
@@ -252,7 +270,15 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        if !session_end && !prompt_wait.timed_out {
+            self.stdin_waiting = false;
+        }
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if !session_end && !prompt_wait.timed_out {
             reconcile_trailing_completion_prompt(
                 &mut contents,
@@ -315,7 +341,15 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        if !session_end && !prompt_wait.timed_out {
+            self.stdin_waiting = false;
+        }
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }

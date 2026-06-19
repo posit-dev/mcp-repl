@@ -16,12 +16,14 @@ description selection.
 
 The intended contract is a narrow server/worker boundary:
 
-- `turn_start` carries user input to protocol workers,
+- `turn_start` carries user input to workers,
+- `turn_input` carries same-turn stdin follow-up input when the runtime is
+  waiting at a stdin-style boundary,
 - `output_text` sideband frames carry worker-owned text back to the server,
 - raw stdout/stderr carry unowned visible text from child processes or direct
   file-descriptor writes,
 - sideband IPC also carries structural facts such as input lines, images,
-  request completion, and session end,
+  `idle`, `stdin_wait`, and session end,
 - the server formats replies from those streams without understanding the
   runtime's internal implementation.
 
@@ -51,10 +53,10 @@ buckets:
   is documentation wiring, not request execution policy, and should move with
   `docs/futurework/composable-tool-descriptions.md`.
 - `src/worker_process.rs` selects a `BackendDriver` at `WorkerManager`
-  creation. The driver owns backend-specific adapter behavior such as Python
-  newline normalization, interrupt behavior, completion waiting, and startup
-  tolerance. This is acceptable only as a server-side adapter until the worker
-  can advertise these narrow capabilities or move behind the v3 turn boundary.
+  creation. Residual driver behavior should stay limited to launch-time setup,
+  narrow timeout or interrupt policy, and worker-advertised metadata. It should
+  not make the server infer request completion from backend-specific runtime
+  behavior.
 - `src/worker_process.rs` also branches at spawn time to configure R worker mode
   or Python worker mode in the same `mcp-repl` executable. Python launch setup
   additionally resolves the selected interpreter executable and loadable
@@ -62,17 +64,17 @@ buckets:
 - On Windows, `src/worker_process.rs` still has platform-specific launch setup,
   but Python no longer depends on a Unix PTY.
 - The main steady-state leak found by this audit was the former
-  `WorkerManager::should_settle_multiline_r_timeout()` branch. The behavior now
-  sits behind the backend driver as timeout-output-settle policy; a later
-  cleanup should replace that adapter method with worker-advertised metadata or
-  move the need behind the worker protocol.
+  `WorkerManager::should_settle_multiline_r_timeout()` branch. Any remaining
+  timeout-output-settle policy should be worker-advertised metadata rather than
+  interpreter-specific server logic.
 
 ## Intended Direction
 
 - Treat `--interpreter r|python` as user-facing worker selection.
 - Keep backend-specific runtime behavior in the worker process.
-- Keep the server's steady-state contract generic: accepted input in,
-  worker-owned `output_text` plus raw stdout/stderr and sideband facts out.
+- Keep the server's steady-state contract generic: accepted input enters via
+  IPC, worker-owned `output_text` plus raw stdout/stderr and sideband facts come
+  out.
 - Prefer worker-advertised capabilities or narrow launch-time metadata over
   server-side branching on backend.
 - Coordinate tool-description cleanup with
@@ -89,8 +91,8 @@ Initial candidates:
 
 - `supports_images`: already present in `worker_ready.capabilities`; controls
   whether image events are expected.
-- `turn_input_transport`: whether accepted input is carried by `turn_start` or
-  by a backend-internal adapter.
+- `stdin_wait_followup`: whether a completed turn can leave the runtime waiting
+  for same-turn stdin continuation input.
 - `worker_ready_startup_timeout`: whether startup may continue after a short
   worker-ready timeout.
 - `timeout_output_settle`: whether a timed-out request needs an additional

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by `docs/worker_sideband_protocol.md` version 3
 
 ## Date
 
@@ -26,6 +26,8 @@ That design had three problems:
   stdin code, sideband notification, and OS escalation.
 
 ## Decision
+
+This decision is no longer active.
 
 Graceful worker shutdown is requested only by closing the worker stdin
 transport. The server must not send interpreter shutdown code over stdin and
@@ -54,3 +56,16 @@ ending. It is not a shutdown request from the server to the worker.
 - The server/worker lifecycle is simpler: stdin carries user input and EOF,
   sideband carries facts observed by the worker, and process control remains
   server-owned.
+
+## Superseding Decision
+
+Worker protocol version 3 moves accepted input onto IPC-managed turn queues.
+Because managed request input no longer travels over worker stdin, stdin EOF is
+not a reliable lifecycle signal for built-in workers. The server now requests
+worker shutdown with the server-to-worker `shutdown` sideband message, then
+falls back to stdin close and bounded process termination if the worker does not
+exit promptly.
+
+The replacement keeps the original race fix: the server still does not send
+interpreter shutdown code as user-readable stdin. `shutdown` carries no
+`turn_id`, text payload, or interpreter expression.

@@ -112,6 +112,7 @@ impl WorkerManager {
     ) -> Result<RequestState, WorkerError> {
         let text = self.driver.prepare_input_text(text);
         let started_at = Instant::now();
+        let append_to_stdin_wait = self.stdin_waiting;
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt);
         self.pending_request_input = Some(text.clone());
@@ -129,8 +130,14 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
-        self.driver
-            .on_input_start(&text, &payload, &ipc, remaining)?;
+        if append_to_stdin_wait {
+            self.driver
+                .on_turn_input(&text, &payload, &ipc, remaining)?;
+        } else {
+            self.driver
+                .on_input_start(&text, &payload, &ipc, remaining)?;
+        }
+        self.stdin_waiting = false;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(Instant::now());
@@ -368,7 +375,9 @@ impl WorkerManager {
                     },
                     None => true,
                 };
-                self.clear_pending_request_state();
+                let preserve_active_turn =
+                    !worker_exited && settled_completion.stdin_wait_prompt.is_some();
+                self.clear_pending_request_state_with_active_turn(preserve_active_turn);
                 if worker_exited {
                     settled_completion.session_end_seen = true;
                     self.note_session_end(true);
@@ -409,9 +418,15 @@ impl WorkerManager {
     }
 
     pub(super) fn clear_pending_request_state(&mut self) {
+        self.clear_pending_request_state_with_active_turn(false);
+    }
+
+    pub(super) fn clear_pending_request_state_with_active_turn(&mut self, preserve: bool) {
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.driver.clear_active_turn();
+        if !preserve {
+            self.driver.clear_active_turn();
+        }
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);

@@ -111,10 +111,6 @@ impl TurnState {
         });
     }
 
-    pub(crate) fn protocol_error_observed_at(&self) -> Option<Instant> {
-        self.protocol_error.as_ref().map(|error| error.observed_at)
-    }
-
     pub(crate) fn take_protocol_error(&mut self) -> Option<String> {
         self.protocol_error.take().map(|error| error.message)
     }

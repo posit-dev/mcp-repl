@@ -480,6 +480,50 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_readline_reports_stdin_wait_then_consumes_follow_up() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "answer <- readline('ASK> '); cat('ANSWER=', answer, '\\n', sep = '')",
+            Some(10.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("ASK> "),
+        "expected readline prompt, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("<<repl status: waiting for stdin>>"),
+        "expected stdin-wait status for nested R input, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
+    let second = wait_until_not_busy(&mut session, second).await?;
+    let second_text = result_text(&second);
+
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("ANSWER=alpha"),
+        "expected follow-up input to satisfy readline, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("ASK> alpha"),
+        "did not expect synthetic readline input echo in reply, got: {second_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_does_not_treat_colon_input_as_pager_command_by_default() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;

@@ -8,7 +8,7 @@ use crate::worker_protocol::TextStream;
 pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
     TurnStart {
         turn_id: u64,
@@ -22,6 +22,7 @@ pub enum ServerToWorkerIpcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<u64>,
     },
+    Shutdown {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,25 +42,10 @@ pub enum WorkerToServerIpcMessage {
     ReadlineStart {
         prompt: String,
     },
-    ReadlineInputBytes {
-        data_b64: String,
-    },
-    ReadlineDiscardBytes {
-        data_b64: String,
-    },
-    ReadlineResult {
-        prompt: String,
-        line: String,
-    },
     InputLine {
         turn_id: u64,
         prompt: String,
         text: String,
-    },
-    PtyFeed {
-        turn_id: u64,
-        seq: u64,
-        data_b64: String,
     },
     StdinWait {
         turn_id: u64,
@@ -128,13 +114,6 @@ pub struct IpcOutputText {
 }
 
 #[derive(Clone)]
-pub struct IpcPtyFeed {
-    pub turn_id: u64,
-    pub seq: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone)]
 pub struct IpcPlotImage {
     pub id: String,
     pub mime_type: String,
@@ -150,11 +129,8 @@ pub struct IpcHandlers {
     pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
     pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
-    pub on_pty_feed: Option<IpcPtyFeedHandler>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
-
-pub type IpcPtyFeedHandler = Arc<dyn Fn(IpcPtyFeed) -> Result<(), String> + Send + Sync>;
 
 pub(crate) fn worker_ready_message(
     worker_name: &str,
@@ -364,23 +340,7 @@ mod tests {
         );
     }
     #[test]
-    fn builtin_python_demand_feed_messages_are_directional() {
-        let feed = serde_json::to_value(WorkerToServerIpcMessage::PtyFeed {
-            turn_id: 7,
-            seq: 2,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(b"answer\n"),
-        })
-        .expect("serialize pty_feed");
-        assert_eq!(
-            feed,
-            json!({
-                "type": "pty_feed",
-                "turn_id": 7,
-                "seq": 2,
-                "data_b64": "YW5zd2VyCg=="
-            })
-        );
-
+    fn turn_input_and_stdin_wait_messages_are_directional() {
         let wait = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "stdin_wait",
             "turn_id": 7,
@@ -414,10 +374,6 @@ mod tests {
         );
 
         assert!(
-            serde_json::from_value::<ServerToWorkerIpcMessage>(feed).is_err(),
-            "pty_feed should not deserialize as a server-to-worker message"
-        );
-        assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "stdin_wait",
                 "turn_id": 7,
@@ -434,6 +390,33 @@ mod tests {
             }))
             .is_err(),
             "turn_input should not deserialize as a worker-to-server message"
+        );
+    }
+
+    #[test]
+    fn shutdown_is_server_to_worker_lifecycle_control() {
+        let shutdown = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "shutdown"
+        }));
+        assert!(
+            matches!(shutdown, Ok(ServerToWorkerIpcMessage::Shutdown {})),
+            "shutdown should deserialize as a server-to-worker message"
+        );
+
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "shutdown"
+            }))
+            .is_err(),
+            "shutdown should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "shutdown",
+                "turn_id": 1
+            }))
+            .is_err(),
+            "shutdown should not carry turn payload"
         );
     }
 }
