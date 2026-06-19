@@ -28,6 +28,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
+use crate::windows_sandbox_setup::WindowsSandboxOfflineSetup;
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(test)]
 use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
@@ -202,6 +203,7 @@ pub struct PreparedSandboxLaunch {
     sandbox_policy_cwd: PathBuf,
     session_temp_dir: PathBuf,
     capability_sid: String,
+    network_identity: WindowsSandboxNetworkIdentity,
 }
 
 impl PreparedSandboxLaunch {
@@ -209,18 +211,52 @@ impl PreparedSandboxLaunch {
         &self.capability_sid
     }
 
+    pub fn offline_user_sid(&self) -> Option<&str> {
+        match &self.network_identity {
+            WindowsSandboxNetworkIdentity::CurrentUser => None,
+            WindowsSandboxNetworkIdentity::OfflineProxy(setup) => Some(setup.user_sid.as_str()),
+        }
+    }
+
+    pub fn network_identity(&self) -> &WindowsSandboxNetworkIdentity {
+        &self.network_identity
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn matches(
         &self,
         policy: &SandboxPolicy,
         sandbox_policy_cwd: &Path,
         session_temp_dir: &Path,
     ) -> bool {
+        self.matches_with_network_identity(
+            policy,
+            sandbox_policy_cwd,
+            session_temp_dir,
+            &WindowsSandboxNetworkIdentity::CurrentUser,
+        )
+    }
+
+    pub fn matches_with_network_identity(
+        &self,
+        policy: &SandboxPolicy,
+        sandbox_policy_cwd: &Path,
+        session_temp_dir: &Path,
+        network_identity: &WindowsSandboxNetworkIdentity,
+    ) -> bool {
         let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
         self.policy == *policy
             && self.sandbox_policy_cwd == canonical_cwd
             && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
             && self.capability_sid == stable_cap_sid_string(policy, sandbox_policy_cwd)
+            && &self.network_identity == network_identity
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsSandboxNetworkIdentity {
+    CurrentUser,
+    OfflineProxy(WindowsSandboxOfflineSetup),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,12 +764,14 @@ fn build_prepared_sandbox_launch(
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
     capability_sid: &str,
+    network_identity: WindowsSandboxNetworkIdentity,
 ) -> PreparedSandboxLaunch {
     PreparedSandboxLaunch {
         policy: policy.clone(),
         sandbox_policy_cwd: canonicalize_or_identity(sandbox_policy_cwd),
         session_temp_dir: canonicalize_or_identity(session_temp_dir),
         capability_sid: capability_sid.to_string(),
+        network_identity,
     }
 }
 
@@ -1324,6 +1362,7 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
         sandbox_policy_cwd,
         session_temp_dir,
         prepared_capability_sid,
+        WindowsSandboxNetworkIdentity::CurrentUser,
     );
     apply_prepared_workspace_acl_state(
         &launch,
@@ -1335,10 +1374,25 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
     Ok(launch)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn prepare_sandbox_launch(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
+) -> Result<PreparedSandboxLaunch, String> {
+    prepare_sandbox_launch_with_network_identity(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        WindowsSandboxNetworkIdentity::CurrentUser,
+    )
+}
+
+pub fn prepare_sandbox_launch_with_network_identity(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    network_identity: WindowsSandboxNetworkIdentity,
 ) -> Result<PreparedSandboxLaunch, String> {
     #[cfg(test)]
     if let Some(error) = test_support::prepare_sandbox_launch_test_error() {
@@ -1348,8 +1402,13 @@ pub fn prepare_sandbox_launch(
     validate_windows_policy(policy)?;
 
     let cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
-    let launch =
-        build_prepared_sandbox_launch(policy, sandbox_policy_cwd, session_temp_dir, &cap_sid);
+    let launch = build_prepared_sandbox_launch(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        &cap_sid,
+        network_identity,
+    );
     let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
 
     unsafe {
@@ -1362,8 +1421,13 @@ pub fn prepare_sandbox_launch(
             PreparedLaunchAllowScope::RootsOnly,
             PreparedLaunchAllowScope::RootsOnly,
         );
+        if let Err(err) = apply_result {
+            LocalFree(psid_capability as HLOCAL);
+            return Err(err);
+        }
+        let offline_result = apply_offline_identity_acl_state(&launch, "prepare");
         LocalFree(psid_capability as HLOCAL);
-        apply_result?;
+        offline_result?;
     }
 
     Ok(launch)
@@ -1383,9 +1447,73 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
             PreparedLaunchAllowScope::RootsAndDirectChildren,
             PreparedLaunchAllowScope::RootsAndDirectChildren,
         );
+        if let Err(err) = refresh_result {
+            LocalFree(psid_capability as HLOCAL);
+            return Err(err);
+        }
+        let offline_result = apply_offline_identity_acl_state(launch, "refresh");
         LocalFree(psid_capability as HLOCAL);
-        refresh_result
+        offline_result
     }
+}
+
+unsafe fn apply_offline_identity_acl_state(
+    launch: &PreparedSandboxLaunch,
+    action: &str,
+) -> Result<(), String> {
+    let WindowsSandboxNetworkIdentity::OfflineProxy(setup) = &launch.network_identity else {
+        return Ok(());
+    };
+    let psid_offline = convert_string_sid_to_sid(&setup.user_sid)
+        .ok_or_else(|| "ConvertStringSidToSidW failed for offline sandbox SID".to_string())?;
+    let result = apply_offline_identity_acl_state_with_sid(launch, psid_offline, action);
+    LocalFree(psid_offline as HLOCAL);
+    result
+}
+
+unsafe fn apply_offline_identity_acl_state_with_sid(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+    action: &str,
+) -> Result<(), String> {
+    let mut paths = prepared_launch_acl_paths(launch).allow;
+    paths.insert(launch.sandbox_policy_cwd.clone());
+    paths.insert(launch.session_temp_dir.clone());
+    if let Ok(exe) = std::env::current_exe() {
+        paths.insert(canonicalize_or_identity(&exe));
+        if let Some(parent) = exe.parent() {
+            paths.insert(canonicalize_or_identity(parent));
+        }
+    }
+    for env_key in [
+        crate::python_runtime::PYTHON_EXECUTABLE_ENV,
+        "PYTHONHOME",
+        "R_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(env_key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                paths.insert(canonicalize_or_identity(&path));
+                if path.is_file()
+                    && let Some(parent) = path.parent()
+                {
+                    paths.insert(canonicalize_or_identity(parent));
+                }
+            }
+        }
+    }
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        add_allow_ace(&path, sid).map_err(|err| {
+            format!(
+                "failed to {action} offline sandbox user ACL on '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -1423,7 +1551,10 @@ fn run_sandboxed_command_with_env_map(
 
     unsafe {
         crate::diagnostics::startup_log("windows-sandbox: begin");
-        if should_apply_network_block(policy) {
+        if should_apply_network_block(policy)
+            && env_get_case_insensitive(&env_map, crate::managed_network::PROXY_ACTIVE_ENV_KEY)
+                != Some("1")
+        {
             apply_no_network_to_env(&mut env_map);
         }
         let session_temp_dir = env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV)
@@ -4380,6 +4511,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             sandbox_policy_cwd: canonicalize_or_identity(&cwd),
             session_temp_dir: canonicalize_or_identity(&session_temp_dir),
             capability_sid: stable_cap_sid_string(&policy, &cwd),
+            network_identity: WindowsSandboxNetworkIdentity::CurrentUser,
         };
         assert!(
             launch.matches(&policy, &cwd, &session_temp_dir),
@@ -4544,8 +4676,9 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
 
     #[test]
     fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
+        let _temp_env = PreparedLaunchTempEnvGuard::install();
         let workspace = prepared_launch_workspace_tempdir();
-        let session_root = tempdir().expect("session temp root");
+        let session_root = prepared_launch_session_root_tempdir();
         let cwd = workspace.path().join("workspace");
         let session_temp_dir = session_root.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");

@@ -263,14 +263,39 @@ impl WorkerManager {
             return Ok(());
         };
 
-        if self
-            .managed_network_proxy
-            .as_ref()
-            .is_some_and(|proxy| proxy.config() == &config)
-        {
+        #[cfg(target_os = "windows")]
+        let offline_setup =
+            crate::windows_sandbox_setup::load_offline_setup().map_err(WorkerError::Sandbox)?;
+
+        if self.managed_network_proxy.as_ref().is_some_and(|proxy| {
+            proxy.config() == &config && {
+                #[cfg(target_os = "windows")]
+                {
+                    proxy.http_addr().port() == offline_setup.http_proxy_port
+                        && proxy.socks_addr().port() == offline_setup.socks_proxy_port
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    true
+                }
+            }
+        }) {
             return Ok(());
         }
 
+        #[cfg(target_os = "windows")]
+        let proxy = crate::managed_network::ManagedNetworkProxy::start_on_loopback_ports(
+            config,
+            offline_setup.http_proxy_port,
+            offline_setup.socks_proxy_port,
+        )
+        .map_err(|err| {
+            WorkerError::Sandbox(format!(
+                "{err}; Windows sandbox setup reserves fixed managed proxy ports {} and {}. Stop the conflicting process or rerun `mcp-repl windows-sandbox setup` with different ports.",
+                offline_setup.http_proxy_port, offline_setup.socks_proxy_port
+            ))
+        })?;
+        #[cfg(not(target_os = "windows"))]
         let proxy = crate::managed_network::ManagedNetworkProxy::start(config)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log(

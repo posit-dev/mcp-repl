@@ -9,7 +9,7 @@
 ## Status
 
 - State: active
-- Last updated: 2026-06-18
+- Last updated: 2026-06-19
 - Current phase: validation
 
 ## Current Direction
@@ -17,6 +17,8 @@
 - Public end-to-end Rust tests now run on Windows where the product behavior is expected to match other platforms.
 - Use normal Windows `cargo test` failures to identify real shared-state, host-dependency, or Windows launcher issues instead of preserving CI serialization as a workaround.
 - Keep Windows-specific compatibility tests when they assert Windows-only process, console, sandbox, or path behavior.
+- Windows public network-policy cases now require `mcp-repl windows-sandbox setup`
+  before the suite so the offline account and firewall rules are present.
 
 ## Long-Term Direction
 
@@ -28,7 +30,7 @@
 - Phase 0: completed - inventoried skipped Windows tests and CI serialization.
 - Phase 1: completed - enabled skipped public R/Python tests where feasible.
 - Phase 2: completed - removed Windows-only CI serialization after local validation.
-- Phase 3: pending - decide whether Windows managed-network enforcement should close the remaining external public API skips.
+- Phase 3: completed - Windows managed-network enforcement closes the remaining external public API network skips.
 
 ## Locked Decisions
 
@@ -36,16 +38,16 @@
 - Cargo discovery should remain the source of truth for Rust integration tests.
 - Windows test target names must avoid installer/update keywords that trigger UAC installer detection for test executables.
 - Standalone ConPTY terminal mode toggles are snapshot noise and should be normalized out of shared snapshots.
+- Windows no-network and managed-domain sandbox tests depend on the explicit
+  offline-account setup command rather than silently weakening enforcement.
 
 ## Open Questions
 
-- Whether Windows managed-network/domain enforcement should be implemented so the external workspace-write network allow/block cases can run instead of reporting unsupported platform skips.
 - Whether optional reticulate help coverage should gain a Windows-specific server fix for hosts where reticulate initializes under `Rscript` but hangs inside the MCP R worker.
 - Whether the shared Windows suite server startup mutex is still necessary now that live test sessions pass under ordinary Cargo scheduling.
 
 ## Next Safe Slice
 
-- Investigate Windows managed-network enforcement for the external public API suite, or prove it should remain a documented unsupported sandbox feature.
 - Investigate the reticulate Windows MCP-worker initialization hang separately from test scheduling.
 
 ## Stop Conditions
@@ -61,3 +63,5 @@
 - 2026-06-18: Removed Windows-only CI serialization after `cargo test --quiet` passed locally under normal Cargo scheduling.
 - 2026-06-18: Renamed Rust test targets containing `install` or `updates` because Windows UAC installer detection can refuse to launch those test executables with `os error 740`.
 - 2026-06-18: Kept external public API network policy cases as unsupported on Windows because managed/domain network enforcement is not implemented there yet.
+- 2026-06-19: Added Windows sandbox setup to CI and removed the Windows skips
+  from the external public API workspace-write network allow/block cases.

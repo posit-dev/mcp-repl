@@ -37,8 +37,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Security::Cryptography::{
@@ -48,7 +48,7 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Security::{
     ACL, CopySid, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_GROUPS, TOKEN_QUERY,
-    TokenLogonSid,
+    TOKEN_USER, TokenLogonSid, TokenUser,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1182,19 +1182,7 @@ impl IpcServer {
         }
         #[cfg(target_family = "windows")]
         {
-            let base = next_pipe_name()?;
-            let pipe_name_to_worker = format!("{base}-to-worker");
-            let pipe_name_from_worker = format!("{base}-from-worker");
-            let server_pipe_to_worker =
-                create_named_pipe_server(&pipe_name_to_worker, PIPE_ACCESS_OUTBOUND)?;
-            let server_pipe_from_worker =
-                create_named_pipe_server(&pipe_name_from_worker, PIPE_ACCESS_INBOUND)?;
-            Ok(Self {
-                pipe_name_to_worker: Some(pipe_name_to_worker),
-                pipe_name_from_worker: Some(pipe_name_from_worker),
-                server_pipe_to_worker: Some(server_pipe_to_worker),
-                server_pipe_from_worker: Some(server_pipe_from_worker),
-            })
+            Self::bind_with_allowed_sids(&[])
         }
         #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
@@ -1203,6 +1191,29 @@ impl IpcServer {
                 "IPC sideband is unsupported on this platform",
             ))
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    pub fn bind_with_allowed_sids(extra_allowed_sids: &[&str]) -> io::Result<Self> {
+        let base = next_pipe_name()?;
+        let pipe_name_to_worker = format!("{base}-to-worker");
+        let pipe_name_from_worker = format!("{base}-from-worker");
+        let server_pipe_to_worker = create_named_pipe_server(
+            &pipe_name_to_worker,
+            PIPE_ACCESS_OUTBOUND,
+            extra_allowed_sids,
+        )?;
+        let server_pipe_from_worker = create_named_pipe_server(
+            &pipe_name_from_worker,
+            PIPE_ACCESS_INBOUND,
+            extra_allowed_sids,
+        )?;
+        Ok(Self {
+            pipe_name_to_worker: Some(pipe_name_to_worker),
+            pipe_name_from_worker: Some(pipe_name_from_worker),
+            server_pipe_to_worker: Some(server_pipe_to_worker),
+            server_pipe_from_worker: Some(server_pipe_from_worker),
+        })
     }
 
     #[cfg(target_family = "unix")]
@@ -1425,26 +1436,153 @@ fn current_logon_sid() -> io::Result<Vec<u8>> {
 }
 
 #[cfg(target_family = "windows")]
+fn current_user_sid() -> io::Result<Vec<u8>> {
+    let mut token = std::ptr::null_mut();
+    let open_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if open_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    struct TokenGuard(*mut c_void);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    let _guard = TokenGuard(token);
+
+    let mut required_len = 0u32;
+    unsafe {
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required_len);
+    }
+    if required_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut info = vec![0u8; required_len as usize];
+    let info_ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            info.as_mut_ptr() as *mut c_void,
+            required_len,
+            &mut required_len,
+        )
+    };
+    if info_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let user = unsafe { &*(info.as_ptr() as *const TOKEN_USER) };
+    let sid = user.User.Sid;
+    if sid.is_null() {
+        return Err(io::Error::other("user SID pointer was null"));
+    }
+
+    let sid_len = unsafe { GetLengthSid(sid) };
+    if sid_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut sid_copy = vec![0u8; sid_len as usize];
+    let copy_ok = unsafe { CopySid(sid_len, sid_copy.as_mut_ptr() as *mut c_void, sid) };
+    if copy_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sid_copy)
+}
+
+#[cfg(target_family = "windows")]
 fn create_named_pipe_server(
     pipe_name: &str,
     access_mode: windows_sys::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+    extra_allowed_sids: &[&str],
 ) -> io::Result<File> {
     let wide = to_wide_nul(pipe_name);
+    let mut user_sid = current_user_sid()?;
     let mut logon_sid = current_logon_sid()?;
-    let mut explicit: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
-    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-    explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance = 0;
-    explicit.Trustee = TRUSTEE_W {
+    let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
+    let mut user_explicit: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    user_explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    user_explicit.grfAccessMode = GRANT_ACCESS;
+    user_explicit.grfInheritance = 0;
+    user_explicit.Trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: user_sid.as_mut_ptr() as *mut u16,
+    };
+    entries.push(user_explicit);
+
+    let mut logon_explicit: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    logon_explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    logon_explicit.grfAccessMode = GRANT_ACCESS;
+    logon_explicit.grfInheritance = 0;
+    logon_explicit.Trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
         MultipleTrusteeOperation: 0,
         TrusteeForm: TRUSTEE_IS_SID,
         TrusteeType: TRUSTEE_IS_UNKNOWN,
         ptstrName: logon_sid.as_mut_ptr() as *mut u16,
     };
+    entries.push(logon_explicit);
+
+    let mut extra_sids: Vec<*mut c_void> = Vec::new();
+    for extra_allowed_sid in extra_allowed_sids {
+        if extra_allowed_sid.is_empty() {
+            continue;
+        }
+        let ok = unsafe {
+            let mut sid: *mut c_void = std::ptr::null_mut();
+            let ok = ConvertStringSidToSidW(to_wide_nul(extra_allowed_sid).as_ptr(), &mut sid);
+            if ok != 0 {
+                extra_sids.push(sid);
+            }
+            ok
+        };
+        if ok == 0 {
+            for sid in extra_sids {
+                unsafe {
+                    let _ = LocalFree(sid as HLOCAL);
+                }
+            }
+            return Err(io::Error::last_os_error());
+        }
+        let mut extra_explicit: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+        extra_explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        extra_explicit.grfAccessMode = GRANT_ACCESS;
+        extra_explicit.grfInheritance = 0;
+        extra_explicit.Trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: *extra_sids
+                .last()
+                .expect("extra SID should have been pushed") as *mut u16,
+        };
+        entries.push(extra_explicit);
+    }
 
     let mut dacl: *mut ACL = std::ptr::null_mut();
-    let acl_status = unsafe { SetEntriesInAclW(1, &explicit, std::ptr::null_mut(), &mut dacl) };
+    let acl_status = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            std::ptr::null_mut(),
+            &mut dacl,
+        )
+    };
+    for sid in extra_sids {
+        unsafe {
+            let _ = LocalFree(sid as HLOCAL);
+        }
+    }
     if acl_status != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(acl_status as i32));
     }

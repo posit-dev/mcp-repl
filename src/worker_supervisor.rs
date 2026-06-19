@@ -533,6 +533,20 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
+        #[cfg(target_family = "windows")]
+        let mut ipc_server = {
+            if let Some(launch) = prepared_windows_launch.as_ref() {
+                let mut allowed_sids = vec![launch.capability_sid()];
+                if let Some(offline_sid) = launch.offline_user_sid() {
+                    allowed_sids.push(offline_sid);
+                }
+                IpcServer::bind_with_allowed_sids(&allowed_sids)
+            } else {
+                IpcServer::bind()
+            }
+        }
+        .map_err(WorkerError::Io)?;
+        #[cfg(not(target_family = "windows"))]
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(
             oversized_output,

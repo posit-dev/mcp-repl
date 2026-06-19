@@ -507,14 +507,26 @@ def normalize_output_bundle_paths(value: str) -> str:
 
 
 def normalize_text_value(value: str) -> str:
-    return normalize_output_bundle_paths(normalize_busy_timeout_elapsed_ms(value))
+    normalized = normalize_output_bundle_paths(normalize_busy_timeout_elapsed_ms(value))
+    for sequence in ["\x1b[?9001h", "\x1b[?1004h"]:
+        normalized = normalized.replace(sequence, "")
+    return normalized
 
 
 def normalize_response(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: normalize_response(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [normalize_response(item) for item in value]
+        normalized = [normalize_response(item) for item in value]
+        return [
+            item
+            for item in normalized
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and item.get("text") == ""
+            )
+        ]
     if isinstance(value, str):
         return normalize_text_value(value)
     return value
@@ -1200,12 +1212,16 @@ CASES: dict[str, SuiteCase] = {
             "--config",
             "sandbox_workspace_write.network_access=true",
         ),
-        platforms=("darwin", "linux"),
+        server_cwd=Path(
+            "target/test-scratch/run-integration-tests/r-workspace-write-network-allowed"
+        ),
     ),
     "r-workspace-write-network-blocked": r_suite_case(
         r_workspace_write_network_blocked,
         server_args=("--sandbox", "workspace-write"),
-        platforms=("darwin", "linux"),
+        server_cwd=Path(
+            "target/test-scratch/run-integration-tests/r-workspace-write-network-blocked"
+        ),
     ),
 }
 

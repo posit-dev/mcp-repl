@@ -186,10 +186,15 @@ impl WorkerManager {
         }
 
         let launch_matches = self.windows_sandbox_launch.as_ref().is_some_and(|launch| {
-            launch.matches(
+            let network_identity = windows_sandbox_network_identity_for_state(&self.sandbox_state);
+            let Ok(network_identity) = network_identity else {
+                return false;
+            };
+            launch.matches_with_network_identity(
                 &self.sandbox_state.sandbox_policy,
                 &self.sandbox_state.sandbox_cwd,
                 &self.sandbox_state.session_temp_dir,
+                &network_identity,
             )
         });
         if launch_matches {
@@ -208,10 +213,12 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
             worker_context_event_payload(&self.worker_launch, self.backend, &self.sandbox_state)
         });
-        let prepared = crate::windows_sandbox::prepare_sandbox_launch(
+        let network_identity = windows_sandbox_network_identity_for_state(&self.sandbox_state)?;
+        let prepared = crate::windows_sandbox::prepare_sandbox_launch_with_network_identity(
             &self.sandbox_state.sandbox_policy,
             &self.sandbox_state.sandbox_cwd,
             &self.sandbox_state.session_temp_dir,
+            network_identity,
         );
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -222,6 +229,10 @@ impl WorkerManager {
             serde_json::json!({
                 "status": "ok",
                 "capability_sid": prepared.capability_sid(),
+                "network_identity": match prepared.network_identity() {
+                    crate::windows_sandbox::WindowsSandboxNetworkIdentity::CurrentUser => "current-user",
+                    crate::windows_sandbox::WindowsSandboxNetworkIdentity::OfflineProxy(_) => "offline-proxy",
+                },
             }),
         );
         self.windows_sandbox_launch = Some(prepared);
@@ -230,13 +241,28 @@ impl WorkerManager {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_sandbox_network_identity_for_state(
+    state: &crate::sandbox::SandboxState,
+) -> Result<crate::windows_sandbox::WindowsSandboxNetworkIdentity, WorkerError> {
+    if state.sandbox_policy.has_full_network_access()
+        && !state.managed_network_policy.has_domain_restrictions()
+    {
+        return Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::CurrentUser);
+    }
+    let setup = crate::windows_sandbox_setup::load_offline_setup().map_err(WorkerError::Sandbox)?;
+    Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::OfflineProxy(setup))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::oversized_output::OversizedOutputMode;
+    #[cfg(any(target_os = "linux", target_family = "windows"))]
+    use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
-    use crate::sandbox::{SandboxPolicy, SandboxState, SandboxStateUpdate};
+    use crate::sandbox::{SandboxState, SandboxStateUpdate};
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::sandbox_cli::SandboxCliPlan;
     #[cfg(target_os = "linux")]
@@ -245,6 +271,15 @@ mod tests {
     use crate::worker_process::test_support::contents_text;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[cfg(target_family = "windows")]
+    fn force_windows_full_network_workspace_write(manager: &mut WorkerManager) {
+        if let SandboxPolicy::WorkspaceWrite { network_access, .. } =
+            &mut manager.sandbox_state.sandbox_policy
+        {
+            *network_access = true;
+        }
+    }
 
     #[test]
     fn python_backend_prepares_windows_sandbox_launch() {
@@ -457,6 +492,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
         let result = manager.ensure_windows_sandbox_launch();
 
         crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
@@ -492,6 +528,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
         let result = manager.ensure_windows_sandbox_launch();
 
         crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
@@ -523,6 +560,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
 
         let first = manager
             .ensure_windows_sandbox_launch()

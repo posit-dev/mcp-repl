@@ -165,8 +165,27 @@ Optional `bwrap` stage:
 - Python support is not part of the stable Windows surface yet. The embedded
   backend no longer requires a Unix PTY, but Windows support still depends on
   the selected CPython installation exposing a loadable runtime library.
-- managed domain allowlists are not enforced on Windows yet; configuring allowed
-  or denied domains with enabled network access currently fails closed.
+- network-restricted and managed-domain Windows sandboxes require one-time
+  elevated setup:
+
+  ```powershell
+  mcp-repl windows-sandbox setup --http-proxy-port 39080 --socks-proxy-port 39081
+  ```
+
+  Setup creates or refreshes the local non-admin `McpReplSandboxOffline`
+  account, stores its password with current-user DPAPI protection under
+  `%LOCALAPPDATA%\mcp-repl\windows-sandbox\`, and installs outbound firewall
+  block rules scoped to that account SID.
+- `workspace-write` with `network_access=true` and no managed domain rules keeps
+  the current-user sandbox path and allows network access normally.
+- `read-only`, default `workspace-write`, and managed-domain `workspace-write`
+  launches run the Windows wrapper through the offline account. Firewall rules
+  block non-loopback outbound traffic and loopback traffic except the configured
+  managed proxy ports.
+- when allowed or denied domains are configured on Windows, the server starts
+  the same managed HTTP/SOCKS proxy used on macOS on the fixed setup ports and
+  injects proxy env vars into the worker. Missing setup, stale setup, or occupied
+  fixed proxy ports fail closed with an actionable error.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
   - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
