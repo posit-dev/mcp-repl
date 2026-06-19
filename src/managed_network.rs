@@ -201,6 +201,7 @@ impl ManagedNetworkProxy {
         )
     }
 
+    #[cfg(any(test, target_os = "windows"))]
     pub fn start_on_loopback_ports(
         config: ManagedProxyConfig,
         http_port: u16,

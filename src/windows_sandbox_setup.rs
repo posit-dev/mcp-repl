@@ -562,7 +562,9 @@ fn ensure_offline_user(password: &str) -> Result<String, String> {
         r#"
 $ErrorActionPreference = 'Stop'
 $name = '{escaped_name}'
-$password = ConvertTo-SecureString -String '{escaped_password}' -AsPlainText -Force
+$password = [System.Security.SecureString]::new()
+foreach ($ch in '{escaped_password}'.ToCharArray()) {{ $password.AppendChar($ch) }}
+$password.MakeReadOnly()
 $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
 if ($null -eq $user) {{
   New-LocalUser -Name $name -Password $password -AccountNeverExpires -UserMayNotChangePassword -Description 'mcp-repl offline sandbox user' | Out-Null
