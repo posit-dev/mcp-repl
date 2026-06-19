@@ -47,6 +47,7 @@
 ## Next Safe Slice
 
 - The basic sandbox write-policy contrasts and workspace-write network policy contrasts now live in the Python runner.
+- A representative R `write_stdin` public-behavior cluster now lives in the Python runner.
 - Migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
 - Keep additional sandbox migrations focused on public behavior that does not require internal server or launch-state inspection.
 
@@ -72,3 +73,4 @@
 - 2026-06-18: Migrated workspace-write network block/allow coverage into the external runner and removed the duplicate Unix Rust integration cases.
 - 2026-06-18: Migrated the basic Python console smoke check into the external runner and removed the duplicate Rust integration case.
 - 2026-06-18: Migrated the Python busy-input discard check into the external runner and removed the duplicate Rust integration case.
+- 2026-06-18: Migrated the R `write_stdin` multiple-call, timeout-polling, error-recovery, huge echo-only, and files-mode echo-trimming cases into the external runner and removed the duplicate Rust integration cases.

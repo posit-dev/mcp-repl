@@ -621,6 +621,159 @@ def r_console_basic(client: McpStdioClient) -> None:
     assert_identical(expected, received, "repl")
 
 
+def r_write_stdin_multiple_calls(client: McpStdioClient) -> None:
+    set_var = client.repl("x <- 1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("> ")),
+        set_var,
+        "write_stdin set variable repl",
+    )
+
+    add_var = client.repl("x + 1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("[1] 2\n"), text("> ")),
+        add_var,
+        "write_stdin follow-up repl",
+    )
+
+
+def r_write_stdin_timeout_polling_returns_pending_output(
+    client: McpStdioClient,
+) -> None:
+    warmup = client.repl("1+1\n", timeout_ms=30000)
+    assert_identical(
+        tool_result(text("[1] 2\n"), text("> ")),
+        warmup,
+        "timeout polling warmup repl",
+    )
+
+    first = client.repl(
+        'cat("POLL_START\\n"); flush.console(); Sys.sleep(2); cat("POLL_END\\n")',
+        timeout_ms=500,
+    )
+    first_text = require_success(first, "timeout polling first repl")
+    if "POLL_START" not in first_text:
+        raise SuiteFailure(
+            f"expected timeout reply to include early output, got: {first_text!r}"
+        )
+    if not is_busy_response(first):
+        raise SuiteFailure(
+            f"expected timeout reply to remain busy, got: {first_text!r}"
+        )
+
+    second = client.repl("", timeout_ms=5000)
+    second_text = require_success(second, "timeout polling empty poll repl")
+    if is_busy_response(second):
+        raise SuiteFailure(
+            f"expected empty poll to finish request, got: {second_text!r}"
+        )
+    if "POLL_END" not in second_text:
+        raise SuiteFailure(
+            f"expected empty poll to return trailing output, got: {second_text!r}"
+        )
+
+
+def r_write_stdin_recovers_after_error(client: McpStdioClient) -> None:
+    failed = client.repl("stop('boom')\n", timeout_ms=30000)
+    failed_text = require_success(failed, "write_stdin error repl")
+    if "Error" not in failed_text or "boom" not in failed_text:
+        raise SuiteFailure(f"expected R error output, got: {failed_text!r}")
+
+    recovered = client.repl("cat('after\\n')\n", timeout_ms=30000)
+    recovered_text = require_success(recovered, "write_stdin recovery repl")
+    if is_busy_response(recovered):
+        raise SuiteFailure(
+            f"expected follow-up after error to complete, got: {recovered_text!r}"
+        )
+    if "after" not in recovered_text:
+        raise SuiteFailure(
+            f"expected follow-up output after error, got: {recovered_text!r}"
+        )
+
+
+def r_write_stdin_drops_huge_echo_only_inputs(client: McpStdioClient) -> None:
+    input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 2001))
+    received = client.repl(input_text, timeout_ms=30000)
+    received_text = require_success(received, "write_stdin huge echo-only repl")
+    if is_busy_response(received):
+        raise SuiteFailure(
+            f"expected huge echo-only input to complete, got: {received_text!r}"
+        )
+    if "--More--" in received_text:
+        raise SuiteFailure(
+            f"did not expect pager activation for echo-only input, got: {received_text!r}"
+        )
+    if "echoed input elided" in received_text:
+        raise SuiteFailure(
+            f"did not expect echo elision marker, got: {received_text!r}"
+        )
+    if received_text != "> ":
+        raise SuiteFailure(f"expected prompt-only reply, got: {received_text!r}")
+
+
+def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None:
+    input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 1001))
+    input_text += 'cat("ok\\n")\n'
+    input_text += "".join(f"y{idx} <- {idx}\n" for idx in range(1, 1001))
+    input_text += 'cat("done\\n")\n'
+
+    received = client.repl(input_text, timeout_ms=30000)
+    received_text = require_success(received, "write_stdin huge interleaved echo repl")
+    if is_busy_response(received):
+        raise SuiteFailure(
+            f"expected huge interleaved echo input to complete, got: {received_text!r}"
+        )
+    if "echoed input elided" in received_text:
+        raise SuiteFailure(
+            f"did not expect echo elision marker, got: {received_text!r}"
+        )
+    if "--More--" in received_text:
+        raise SuiteFailure(
+            "did not expect pager activation for huge echo with small output, "
+            f"got: {received_text!r}"
+        )
+
+    transcript_path = bundle_transcript_path(received_text)
+    if transcript_path is not None:
+        spill_text = require_text_file(
+            transcript_path,
+            "write_stdin huge interleaved echo transcript",
+        )
+        if "x500 <- 500" in spill_text:
+            raise SuiteFailure(
+                "did not expect the pure leading echo prefix in spill file, "
+                f"got: {spill_text!r}"
+            )
+        if "y500 <- 500" not in spill_text:
+            raise SuiteFailure(
+                "expected later echoed input to remain after output interleaving, "
+                f"got: {spill_text!r}"
+            )
+        if "ok" not in spill_text or "done" not in spill_text:
+            raise SuiteFailure(
+                f"expected output from both cat() calls in spill file, got: {spill_text!r}"
+            )
+        if "done" not in received_text:
+            raise SuiteFailure(
+                f"expected the inline tail to keep the final output, got: {received_text!r}"
+            )
+        return
+
+    if "ok" not in received_text or "done" not in received_text:
+        raise SuiteFailure(
+            f"expected output from both cat() calls inline, got: {received_text!r}"
+        )
+    if "x500 <- 500" in received_text:
+        raise SuiteFailure(
+            f"did not expect the pure leading echo prefix inline, got: {received_text!r}"
+        )
+    if "y500 <- 500" not in received_text:
+        raise SuiteFailure(
+            "expected later echoed input to remain after output interleaving, "
+            f"got: {received_text!r}"
+        )
+
+
 def python_startup_deadline_seconds() -> float:
     return 90.0 if sys.platform == "darwin" else 20.0
 
@@ -1187,6 +1340,20 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
+    "r-write-stdin-drops-huge-echo-only-inputs": r_suite_case(
+        r_write_stdin_drops_huge_echo_only_inputs
+    ),
+    "r-write-stdin-multiple-calls": r_suite_case(r_write_stdin_multiple_calls),
+    "r-write-stdin-recovers-after-error": r_suite_case(
+        r_write_stdin_recovers_after_error
+    ),
+    "r-write-stdin-timeout-polling-returns-pending-output": r_suite_case(
+        r_write_stdin_timeout_polling_returns_pending_output
+    ),
+    "r-write-stdin-trims-huge-leading-echo-prefix": r_suite_case(
+        r_write_stdin_trims_huge_leading_echo_prefix,
+        server_args=("--oversized-output", "files"),
+    ),
     "r-workspace-write-sandbox": r_suite_case(
         r_workspace_write_sandbox,
         server_args=("--sandbox", "workspace-write"),
