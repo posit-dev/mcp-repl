@@ -54,12 +54,11 @@ before runtime user code runs.
 On Unix, built-in workers register an at-fork handler that disables sideband IPC
 in forked children and closes inherited sideband file descriptors. Those
 children may still write inherited raw stdout/stderr, but they must not emit
-sideband messages or consume managed queued input. Managed stdin for
-sideband-disabled fork children should return EOF where the worker controls that
-stdin surface; Python fork children currently do this. If R exposes a
-worker-controlled stdin surface to fork children, it should follow the same EOF
-policy. Raw inherited fd0 that bypasses managed stdin is unsupported by the
-worker protocol.
+sideband messages or consume managed queued input. Python's managed stdin
+surfaces return EOF in sideband-disabled fork children. R's `ReadConsole`
+callback does not currently implement that EOF policy in fork children; aligning
+it is pending implementation work. Raw inherited fd0 that bypasses managed stdin
+is unsupported by the worker protocol.
 
 PTY-backed Unix workers expose one raw terminal stream to the server, so raw PTY
 capture does not preserve separate stdout/stderr identity. Sideband
