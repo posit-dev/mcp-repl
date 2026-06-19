@@ -1215,6 +1215,7 @@ fn create_process_with_offline_logon(
     unsafe {
         let current_exe = std::env::current_exe()
             .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+        let cwd = offline_logon_cwd(&child_args)?;
         let mut argv = vec![current_exe.to_string_lossy().to_string()];
         argv.extend(child_args);
         let cmdline = argv
@@ -1227,8 +1228,6 @@ fn create_process_with_offline_logon(
         let username = to_wide(&credentials.setup.username);
         let domain = to_wide(".");
         let password = to_wide(&credentials.password);
-        let cwd = std::env::current_dir()
-            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
         let cwd = to_wide(cwd);
         let env_block = make_env_block(&std::env::vars().collect());
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();
@@ -1290,6 +1289,37 @@ fn create_process_with_offline_logon(
         CloseHandle(proc_info.hProcess);
         Ok(exit_code as i32)
     }
+}
+
+fn offline_logon_cwd(child_args: &[String]) -> Result<PathBuf, String> {
+    if let Some(path) = sandbox_policy_cwd_arg(child_args) {
+        return Ok(path);
+    }
+    if let Some(path) = std::env::var_os(crate::sandbox::R_SESSION_TMPDIR_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+    Err(format!(
+        "offline logon wrapper requires --sandbox-policy-cwd or {}",
+        crate::sandbox::R_SESSION_TMPDIR_ENV
+    ))
+}
+
+fn sandbox_policy_cwd_arg(args: &[String]) -> Option<PathBuf> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => return None,
+            "--sandbox-policy-cwd" => {
+                return args.get(index + 1).map(PathBuf::from);
+            }
+            arg if arg.starts_with("--sandbox-policy-cwd=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                return Some(PathBuf::from(value));
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
@@ -1447,6 +1477,40 @@ mod tests {
     }
 
     #[test]
+    fn offline_logon_cwd_prefers_sandbox_policy_cwd_arg() {
+        let args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            r"C:\workspace".to_string(),
+            "--".to_string(),
+            "worker.exe".to_string(),
+        ];
+
+        assert_eq!(
+            offline_logon_cwd(&args).expect("offline cwd"),
+            PathBuf::from(r"C:\workspace")
+        );
+    }
+
+    #[test]
+    fn offline_logon_cwd_uses_session_temp_when_policy_cwd_is_missing() {
+        let _guard = ScopedEnvVar::set(
+            crate::sandbox::R_SESSION_TMPDIR_ENV,
+            std::ffi::OsString::from(r"C:\session-temp"),
+        );
+        let args = vec![
+            "--windows-sandbox".to_string(),
+            "--".to_string(),
+            "worker.exe".to_string(),
+        ];
+
+        assert_eq!(
+            offline_logon_cwd(&args).expect("offline cwd"),
+            PathBuf::from(r"C:\session-temp")
+        );
+    }
+
+    #[test]
     fn setup_arg_parser_accepts_default_ports() {
         let parsed = parse_setup_args(&[]).expect("default setup args");
         assert_eq!(parsed.http_proxy_port, DEFAULT_HTTP_PROXY_PORT);
@@ -1463,5 +1527,32 @@ mod tests {
         ])
         .expect_err("same ports should fail");
         assert!(err.contains("must be different"));
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: std::ffi::OsString) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }

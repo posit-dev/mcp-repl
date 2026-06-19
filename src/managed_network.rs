@@ -262,6 +262,11 @@ impl ManagedNetworkProxy {
         set_env_keys(env, SOCKS_PROXY_ENV_KEYS, &socks_proxy_url);
         set_env_keys(env, NO_PROXY_ENV_KEYS, DEFAULT_NO_PROXY_VALUE);
     }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn route_local_targets_through_proxy(env: &mut HashMap<String, String>) {
+        set_env_keys(env, NO_PROXY_ENV_KEYS, "");
+    }
 }
 
 impl Drop for ManagedNetworkProxy {

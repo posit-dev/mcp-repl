@@ -786,6 +786,11 @@ pub fn prepare_worker_command_with_managed_network(
     {
         let command = build_command_vec(program, &args);
         let use_offline_identity = managed_network_proxy.is_some();
+        if use_offline_identity {
+            crate::managed_network::ManagedNetworkProxy::route_local_targets_through_proxy(
+                &mut env,
+            );
+        }
         let sandbox_args = create_windows_sandbox_command_args(
             command,
             &state.sandbox_policy,
@@ -2675,6 +2680,50 @@ mod tests {
         assert_eq!(
             prepared.env.get("USERPROFILE").map(String::as_str),
             Some(session_temp.as_str())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: true,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-proxy-test-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: tmp.path().join("session"),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(prepared.env.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(prepared.env.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(
+            prepared.env.get("npm_config_noproxy").map(String::as_str),
+            Some("")
         );
     }
 

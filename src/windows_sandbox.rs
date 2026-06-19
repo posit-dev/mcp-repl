@@ -2773,7 +2773,11 @@ unsafe fn add_write_dac_ace(path: &Path, sid: *mut c_void) -> Result<bool, Strin
     let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
     explicit.grfAccessPermissions = WRITE_DAC;
     explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance = 0;
+    explicit.grfInheritance = if path.is_dir() {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
     explicit.Trustee = trustee;
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -5937,6 +5941,51 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         mask
     }
 
+    unsafe fn path_has_inheritable_write_dac_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && (allowed.Mask & WRITE_DAC) == WRITE_DAC
+                    && ace_has_container_and_object_inheritance(header.AceFlags)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
     unsafe fn add_custom_allow_ace(
         path: &Path,
         sid: *mut c_void,
@@ -6633,6 +6682,10 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
                 mask & WRITE_DAC,
                 WRITE_DAC,
                 "WRITE_DAC bit should be present"
+            );
+            assert!(
+                path_has_inheritable_write_dac_ace(&session_temp, sid),
+                "WRITE_DAC grant should inherit to descendants"
             );
             assert_eq!(
                 mask & (FILE_WRITE_DATA
