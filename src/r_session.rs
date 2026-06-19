@@ -1018,7 +1018,9 @@ pub extern "C-unwind" fn r_read_console(
         ipc::emit_input_wait(&prompt);
         let mut guard = state.inner.lock().unwrap();
 
-        guard = state.cvar.wait(guard).unwrap();
+        if guard.input_queue.is_empty() && !guard.shutdown {
+            guard = state.cvar.wait(guard).unwrap();
+        }
         drop(guard);
     }
 }
