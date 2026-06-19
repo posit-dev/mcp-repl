@@ -58,16 +58,19 @@ cargo test
 The Rust suite uses plain `cargo test` as its single runner. Plain `cargo test`
 remains the full Cargo compatibility path. It must continue to discover the
 binary unit tests and Rust integration targets. CI passes Cargo's `--quiet`
-flag to keep successful logs compact.
+flag to keep successful logs compact and caps the Rust test harness at five
+threads so integration tests do not oversubscribe worker-backed REPL sessions on
+hosted runners.
 
 ```sh
-cargo test --quiet
+cargo test --quiet -- --test-threads=5
 ```
 
 CI installs Codex before `cargo test` and sets `MCP_REPL_CODEX_BACKEND=mock`,
 so the Codex integration target runs through the mocked provider as part of the
-ordinary Rust suite. CI uses the same Cargo scheduling on Linux, macOS, and
-Windows by running `cargo test --quiet` for every matrix target.
+ordinary Rust suite. CI uses the same capped Cargo scheduling on Linux, macOS,
+and Windows by running `cargo test --quiet -- --test-threads=5` for every matrix
+target.
 
 Do not opt Rust test targets out of Cargo discovery in anticipation of a future
 Python migration; migrate a scenario only when the Rust coverage is deleted or

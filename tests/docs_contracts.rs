@@ -286,7 +286,7 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "name: Install Codex CLI (windows)",
         "npm install -g @openai/codex",
         "name: cargo test",
-        "run: cargo test --quiet",
+        "run: cargo test --quiet -- --test-threads=5",
         "MCP_REPL_CODEX_BACKEND: mock",
     ] {
         assert!(
@@ -322,7 +322,12 @@ fn ci_runs_codex_integration_with_mock_backend() {
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "CI passes Cargo's `--quiet` flag to keep successful logs compact.",
+        "CI passes Cargo's `--quiet` flag to keep successful logs compact and caps the Rust test harness at five threads so integration tests do not oversubscribe worker-backed REPL sessions on hosted runners.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI uses the same capped Cargo scheduling on Linux, macOS, and Windows by running `cargo test --quiet -- --test-threads=5` for every matrix target.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(

@@ -1076,13 +1076,12 @@ async fn mixed_plot_reply_with_four_images_and_under_grace_text_stays_inline() -
 
     let input = format!(
         r#"
-options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 72)
 big <- paste(rep("u", {UNDER_HARD_SPILL_TEXT_LEN}), collapse = "")
 cat("UNDER_START\n")
 cat(big)
 cat("\nUNDER_END\n")
 for (i in 1:4) {{
-  plot(1, main = sprintf("plot%03d", i))
+  plot(1:10, main = sprintf("plot%03d", i))
 }}
 "#
     );
