@@ -1549,6 +1549,8 @@ unsafe fn apply_offline_identity_acl_state_with_sid(
 
     let mut read_paths = write_paths.clone();
     read_paths.extend(offline_identity_read_execute_paths(launch));
+    #[cfg(debug_assertions)]
+    read_paths.extend(debug_asset_read_roots());
 
     let mut traverse_paths = HashSet::new();
     for path in read_paths.iter().chain(write_paths.iter()) {
@@ -1673,6 +1675,32 @@ fn existing_ancestor_dirs(path: &Path) -> Vec<PathBuf> {
 fn is_acl_access_denied(err: &str) -> bool {
     err.contains("GetNamedSecurityInfoW failed: 5")
         || err.contains("SetNamedSecurityInfoW failed: 5")
+}
+
+#[cfg(debug_assertions)]
+fn debug_asset_read_roots() -> Vec<PathBuf> {
+    let Some(cargo_home) = cargo_home_dir() else {
+        return Vec::new();
+    };
+    [cargo_home.join("git").join("checkouts")]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .map(|path| canonicalize_or_identity(&path))
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+fn cargo_home_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(path);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    Some(home.join(".cargo"))
 }
 
 #[repr(C)]
