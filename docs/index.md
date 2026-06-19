@@ -13,8 +13,6 @@ checked-in execution plans without relying on stale notes.
 - `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
 - `docs/worker_sideband_protocol.md`: IPC-queued server/worker protocol
   contract.
-- `docs/adr/0001-stdin-close-graceful-shutdown.md`: superseded decision from
-  the pre-queued-input shutdown design.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
 - `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
 
@@ -26,7 +24,6 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
-- `docs/adr/`: accepted architecture decision records.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 
 ## Exploratory Docs
@@ -46,11 +43,9 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
-- `docs/futurework/r-worker-turn-boundary-simplification.md`: superseded historical note on why turn-boundary ownership moved into the worker protocol.
 - `docs/futurework/server-backend-boundary.md`: deferred note on keeping backend-specific execution semantics out of opaque queued server-side request handling.
 - `docs/futurework/sidecar-viewer-observability.md`: deferred note on a local read-only sidecar viewer for transcripts, plots, and output bundles.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
-- `docs/futurework/worker-pty-stdin-transport.md`: historical design note for PTY launch configuration kept separate from IPC-queued request input.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
 - `docs/futurework/stdin-transport-single-owner.md`: historical and deferred design note for keeping managed input batches owned by the worker queue.

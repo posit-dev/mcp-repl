@@ -156,11 +156,10 @@ Before changing the graphics device, require:
 
 This is separate from:
 
-- `docs/futurework/r-worker-turn-boundary-simplification.md`
 - `docs/futurework/r-embedding-minimal-callbacks.md`
 
-Those notes are about worker semantics and embedding complexity. This note is
-specifically about the plot-capture mechanism.
+That note is about embedding complexity. This note is specifically about the
+plot-capture mechanism.
 
 ## Non-Goals
 
