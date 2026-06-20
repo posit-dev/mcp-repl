@@ -43,19 +43,14 @@ pub(crate) fn collapse_echo_with_attribution(
     let mut anchored_events: BTreeMap<usize, Vec<OutputEventKind>> = BTreeMap::new();
     let saw_event_output = Cell::new(false);
     let anchor_idx_for_readline_count = |readline_results_seen: usize| {
-        let is_visible_raw_echo = |idx: usize| {
-            echo_events
-                .get(idx)
-                .is_some_and(|event| event.source == OutputTextSource::Raw)
-        };
         if echo_event_base > 0 && readline_results_seen <= echo_event_base {
             // If the matching echo was drained earlier, anchor before the
             // first remaining echo when there is one. Otherwise keep the event
             // at its rendered offset in the current snapshot.
-            return is_visible_raw_echo(0).then_some(0);
+            return echo_event_is_visible(echo_events.first()).then_some(0);
         }
         let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
-        is_visible_raw_echo(anchor_idx).then_some(anchor_idx)
+        echo_event_is_visible(echo_events.get(anchor_idx)).then_some(anchor_idx)
     };
 
     let mut events: Vec<(usize, OutputEventKind)> = range
@@ -264,6 +259,10 @@ fn event_has_readline_ordering(kind: &OutputEventKind) -> bool {
                 ..
             }
     )
+}
+
+fn echo_event_is_visible(event: Option<&IpcEchoEvent>) -> bool {
+    event.is_some_and(|event| event.source == OutputTextSource::Raw)
 }
 
 #[derive(Default)]
@@ -552,6 +551,10 @@ fn consume_text_segment(
         }
         let line = &segment[start..end];
         start = end;
+
+        while *echo_idx < echo_events.len() && !echo_event_is_visible(echo_events.get(*echo_idx)) {
+            *echo_idx = (*echo_idx).saturating_add(1);
+        }
 
         let echo_prefix = if !is_stderr
             && matches!(origin, ContentOrigin::Worker)
@@ -874,13 +877,16 @@ mod tests {
                 end_byte: 27,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            &[
+                raw_echo_event("> ", "x <- 1\n"),
+                raw_echo_event("> ", "y <- 2\n"),
+            ],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -916,13 +922,13 @@ mod tests {
                 end_byte: 42,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "x\n")],
+            &[raw_echo_event("> ", "x\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -958,13 +964,13 @@ mod tests {
                 end_byte: 25,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            &[raw_echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -1051,7 +1057,9 @@ mod tests {
 
         assert_eq!(
             contents,
-            vec![WorkerContent::stdout("> 1+1\n> 1+1\n[1] 2\n")]
+            vec![WorkerContent::stdout(
+                "> system(\"printf '> 1+1\\\\n'\")\n> 1+1\n> 1+1\n[1] 2\n"
+            )]
         );
     }
 
@@ -1068,13 +1076,16 @@ mod tests {
                 end_byte: 21,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("FIRST> ", "alpha\n"), echo_event("SECOND> ", "")],
+            &[
+                raw_echo_event("FIRST> ", "alpha\n"),
+                raw_echo_event("SECOND> ", ""),
+            ],
             0,
             &["FIRST> ".to_string(), "SECOND> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -1111,13 +1122,13 @@ mod tests {
                 end_byte: 13,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "plot(1:10)\n")],
+            &[raw_echo_event("> ", "plot(1:10)\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::Preserve,
@@ -1214,13 +1225,16 @@ mod tests {
                 end_byte: echo.len() + output.len(),
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "input(); plot(1:10); cat('done\\n')\n")],
+            &[raw_echo_event(
+                "> ",
+                "input(); plot(1:10); cat('done\\n')\n",
+            )],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,

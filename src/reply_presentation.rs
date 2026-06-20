@@ -3,11 +3,14 @@ use crate::ipc::IpcEchoEvent;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 pub(crate) fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<String> {
-    if events.is_empty() {
+    if !should_trim_echo_prefix(events) {
         return None;
     }
     let mut transcript = String::new();
     for event in events {
+        if !is_visible_echo_event(event) {
+            continue;
+        }
         transcript.push_str(&event.prompt);
         transcript.push_str(&event.line);
     }
@@ -15,11 +18,15 @@ pub(crate) fn echo_transcript_from_events(events: &[IpcEchoEvent]) -> Option<Str
 }
 
 pub(crate) fn should_trim_echo_prefix(events: &[IpcEchoEvent]) -> bool {
-    !events.is_empty()
+    events.iter().any(is_visible_echo_event)
 }
 
 pub(crate) fn should_drop_echo_only_contents(events: &[IpcEchoEvent]) -> bool {
-    !events.is_empty()
+    events.iter().any(is_visible_echo_event)
+}
+
+fn is_visible_echo_event(event: &IpcEchoEvent) -> bool {
+    event.source == crate::output_capture::OutputTextSource::Raw
 }
 
 pub(crate) fn maybe_trim_echo_prefix(
@@ -648,6 +655,14 @@ mod tests {
         }
     }
 
+    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+        IpcEchoEvent {
+            prompt: prompt.to_string(),
+            line: line.to_string(),
+            source: OutputTextSource::Raw,
+        }
+    }
+
     fn contents_text(contents: &[WorkerContent]) -> String {
         contents
             .iter()
@@ -762,20 +777,23 @@ mod tests {
     }
 
     #[test]
-    fn trim_decision_applies_to_any_sideband_echo() {
-        let single = vec![echo_event("> ", "1+1\n")];
+    fn trim_decision_applies_to_any_visible_echo() {
+        let structural = vec![echo_event("> ", "1+1\n")];
+        assert!(!should_trim_echo_prefix(&structural));
+
+        let single = vec![raw_echo_event("> ", "1+1\n")];
         assert!(should_trim_echo_prefix(&single));
 
-        let continuation = vec![echo_event("> ", "1+\n"), echo_event("+ ", "1\n")];
+        let continuation = vec![raw_echo_event("> ", "1+\n"), raw_echo_event("+ ", "1\n")];
         assert!(should_trim_echo_prefix(&continuation));
 
-        let multi = vec![echo_event("> ", "1+1\n"), echo_event("> ", "2+2\n")];
+        let multi = vec![raw_echo_event("> ", "1+1\n"), raw_echo_event("> ", "2+2\n")];
         assert!(should_trim_echo_prefix(&multi));
 
-        let browser = vec![echo_event("Browse[1]> ", "n\n")];
+        let browser = vec![raw_echo_event("Browse[1]> ", "n\n")];
         assert!(should_trim_echo_prefix(&browser));
 
-        let readline = vec![echo_event("FIRST> ", "alpha\n")];
+        let readline = vec![raw_echo_event("FIRST> ", "alpha\n")];
         assert!(should_trim_echo_prefix(&readline));
     }
 
@@ -788,9 +806,9 @@ mod tests {
         let trimmed = trim_matching_echo_event_suffix_from_contents(
             &mut contents,
             &[
-                echo_event("> ", "cat(\"HEAD_ONLY\\n\")\n"),
-                echo_event("> ", "flush.console()\n"),
-                echo_event("> ", "cat(\"TAIL_ONLY\\n\")\n"),
+                raw_echo_event("> ", "cat(\"HEAD_ONLY\\n\")\n"),
+                raw_echo_event("> ", "flush.console()\n"),
+                raw_echo_event("> ", "cat(\"TAIL_ONLY\\n\")\n"),
             ],
         );
 
@@ -805,8 +823,8 @@ mod tests {
         let trimmed = trim_matching_echo_event_suffix_from_contents(
             &mut contents,
             &[
-                echo_event("FIRST> ", "alpha\n"),
-                echo_event("SECOND> ", "beta\n"),
+                raw_echo_event("FIRST> ", "alpha\n"),
+                raw_echo_event("SECOND> ", "beta\n"),
             ],
         );
 

@@ -204,6 +204,15 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "output-matching-input-line" {
+        output_text(
+            writer,
+            control_log_path,
+            b"v5> output-matching-input-line\nVISIBLE\n",
+        )?;
+        return Ok(false);
+    }
+
     if command == "late-input-line-after-input-wait" {
         state.input_line_after_input_wait = true;
         return Ok(false);

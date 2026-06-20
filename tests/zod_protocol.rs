@@ -430,6 +430,32 @@ async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_elided() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v5_output_text_matching_input_line_remains_visible() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-matching-input-line",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("v5> output-matching-input-line\nVISIBLE\n"),
+        "output_text that matches input_line metadata should remain visible, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_wait_completes_batch() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

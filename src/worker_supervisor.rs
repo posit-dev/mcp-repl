@@ -2358,11 +2358,11 @@ mod tests {
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
-    fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
-            source: OutputTextSource::Ipc,
+            source: OutputTextSource::Raw,
         }
     }
 
@@ -2749,7 +2749,7 @@ mod tests {
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
         capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
@@ -2759,7 +2759,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let contents = tape
             .drain_final_snapshot()
@@ -2970,12 +2970,12 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let end = output_ring.end_offset();
         let collapsed = collapse_echo_with_attribution(
             output_ring.read_range(0, end),
-            &[echo_event("> ", "lines(4:8, 4:8)\n")],
+            &[raw_echo_event("> ", "lines(4:8, 4:8)\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
