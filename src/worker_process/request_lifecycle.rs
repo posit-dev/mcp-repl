@@ -171,6 +171,9 @@ impl WorkerManager {
             Err(WorkerError::Protocol(message))
                 if message.contains("ipc disconnected while waiting for request completion")
         ) {
+            crate::diagnostics::startup_log(
+                "worker-request: ipc disconnected while waiting for completion; checking process",
+            );
             let deadline = Instant::now() + Duration::from_millis(500);
             let mut worker_exited = self.process.is_none();
             while !worker_exited {
@@ -184,6 +187,9 @@ impl WorkerManager {
                 thread::sleep(Duration::from_millis(20));
             }
             if worker_exited {
+                crate::diagnostics::startup_log(
+                    "worker-request: treating disconnected exited worker as session end",
+                );
                 result = Ok(CompletionInfo {
                     prompt: None,
                     prompt_variants: None,
@@ -191,6 +197,10 @@ impl WorkerManager {
                     protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
+            } else {
+                crate::diagnostics::startup_log(
+                    "worker-request: disconnected worker did not exit during grace period",
+                );
             }
         }
         // Best-effort: after IPC completion, give the output reader threads a brief window to

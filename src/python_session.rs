@@ -290,9 +290,16 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     ipc::emit_worker_ready("python", plot_capable());
 
     let result = run_repl(&runtime);
+    crate::diagnostics::startup_log("python-session: repl loop exited; finalizing python");
     let finalize_result = finalize_python(api, thread_state);
+    match &finalize_result {
+        Ok(()) => crate::diagnostics::startup_log("python-session: python finalized"),
+        Err(err) => {
+            crate::diagnostics::startup_log(format!("python-session: finalize failed: {err}"))
+        }
+    }
     finish_session_end();
-    crate::diagnostics::startup_log("python-session: repl exited");
+    crate::diagnostics::startup_log("python-session: emitted session_end");
     result?;
     finalize_result?;
     Ok(())

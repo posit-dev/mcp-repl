@@ -142,10 +142,6 @@ fn python_startup_probe_budget() -> Duration {
     Duration::from_secs(if cfg!(target_os = "macos") { 90 } else { 10 })
 }
 
-fn github_actions_linux() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("GITHUB_ACTIONS").is_some()
-}
-
 async fn start_python_session_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<Option<common::McpTestSession>> {
@@ -187,6 +183,43 @@ async fn start_python_session_with_env_vars(
 
 async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
+}
+
+fn debug_dir_env(debug_dir: &Path) -> Vec<(String, String)> {
+    vec![(
+        "MCP_REPL_DEBUG_DIR".to_string(),
+        debug_dir.to_string_lossy().into_owned(),
+    )]
+}
+
+fn debug_log_summary(debug_dir: &Path) -> String {
+    let mut entries = fs::read_dir(debug_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let mut summary = String::new();
+    for session_dir in entries {
+        for file_name in ["startup.log", "worker-startup.log"] {
+            let path = session_dir.join(file_name);
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            summary.push_str(&format!("\n--- {} ---\n{}", path.display(), contents));
+        }
+    }
+
+    if summary.is_empty() {
+        return format!(
+            "\n--- debug logs unavailable under {} ---",
+            debug_dir.display()
+        );
+    }
+    summary
 }
 
 #[cfg(windows)]
@@ -1289,11 +1322,12 @@ async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()
 #[tokio::test(flavor = "multi_thread")]
 async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let Some(session) = start_python_session_with_env_vars(debug_dir_env(&debug_dir)).await? else {
         return Ok(());
     };
 
-    let temp = tempdir()?;
     let marker = temp.path().join("atexit-marker.txt");
     let marker_literal = serde_json::to_string(
         marker
@@ -1329,11 +1363,7 @@ sys.exit()
         "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
     );
     if let Err(err) = marker_result {
-        if github_actions_linux() {
-            eprintln!("python atexit marker was not observed on GitHub Linux; skipping: {err}");
-            return Ok(());
-        }
-        return Err(err);
+        return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
     }
     Ok(())
 }
@@ -4219,10 +4249,11 @@ print("parent ready")
 #[tokio::test(flavor = "multi_thread")]
 async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let marker_dir = tempdir()?;
+    let debug_dir = marker_dir.path().join("debug");
+    let Some(session) = start_python_session_with_env_vars(debug_dir_env(&debug_dir)).await? else {
         return Ok(());
     };
-    let marker_dir = tempdir()?;
     let tail_marker_path = marker_dir.path().join("idle-tail-written");
     let tail_marker = tail_marker_path
         .to_str()
@@ -4291,11 +4322,7 @@ threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
     fs::write(&release_marker_path, "go")?;
     if let Err(err) = wait_for_detached_holder_exit(&exit_marker_path).await {
         session.cancel().await?;
-        if github_actions_linux() {
-            eprintln!("python idle-exit marker was not observed on GitHub Linux; skipping: {err}");
-            return Ok(());
-        }
-        return Err(err);
+        return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
     }
     let reply = session
         .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
