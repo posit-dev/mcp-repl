@@ -252,17 +252,18 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
                     }
                 }
                 Ok(None) => {
+                    if !output.is_empty() {
+                        return Ok(output);
+                    }
                     if guard.input_queue.take_completed_input() {
                         let prompt = String::new();
                         ReadlineAction::InputWait { prompt }
-                    } else if output.is_empty() {
+                    } else {
                         let allow_threads = PythonThreadsAllowed::new();
                         guard = state.cvar.wait(guard).unwrap();
                         drop(guard);
                         drop(allow_threads);
                         continue;
-                    } else {
-                        return Ok(output);
                     }
                 }
                 Err(message) => {

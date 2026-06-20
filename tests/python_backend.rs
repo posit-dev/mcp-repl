@@ -1710,6 +1710,52 @@ buffered
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_partial_raw_stdin_read_keeps_followup_output_attached() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import os, time
+print("RAW_PARTIAL_WAITING", flush=True)
+data = os.read(0, 10)
+time.sleep(0.2)
+print("RAW_PARTIAL_RESULT", data.decode("utf-8").strip(), flush=True)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("RAW_PARTIAL_WAITING"),
+        "expected code before raw stdin wait to run, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("RAW_PARTIAL_RESULT"),
+        "raw stdin read should wait for a later input batch, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("delta", Some(5.0)).await?;
+    let second_text = result_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&second_text),
+        "expected partial raw stdin read follow-up to complete, got: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("RAW_PARTIAL_RESULT delta"),
+        "expected output after the partial raw stdin read to stay attached to the follow-up reply, got: {second_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();
