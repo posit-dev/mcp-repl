@@ -140,7 +140,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     let init_start = std::time::Instant::now();
-    let init_result = initialize_r();
+    let init_result = initialize_r(&init);
     if let Err(err) = init_result {
         init.mark_failed(err.clone());
         return Err(err);
@@ -149,9 +149,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         "r-session: init complete ({} ms)",
         crate::diagnostics::elapsed_ms(init_start.elapsed())
     ));
-
-    init.mark_ready();
-    ipc::emit_worker_ready("r", true);
 
     unsafe {
         libr::run_Rmainloop();
@@ -195,7 +192,7 @@ impl SessionState {
     }
 }
 
-fn initialize_r() -> Result<(), String> {
+fn initialize_r(init: &SessionInit) -> Result<(), String> {
     let start = std::time::Instant::now();
     prepare_r_home_env();
     let r_home = r_home_setup().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
@@ -230,7 +227,7 @@ fn initialize_r() -> Result<(), String> {
         "--no-save".to_string(),
     ];
     let setup_start = std::time::Instant::now();
-    setup_r(&args)?;
+    setup_r(&args, init)?;
     crate::diagnostics::startup_log(format!(
         "r-session: setup_r {} ms",
         crate::diagnostics::elapsed_ms(setup_start.elapsed())
@@ -497,7 +494,7 @@ fn configure_r_tempdir() {
 }
 
 #[cfg(target_family = "unix")]
-fn setup_r(args: &[String]) -> Result<(), String> {
+fn setup_r(args: &[String], init: &SessionInit) -> Result<(), String> {
     unsafe {
         let (owned_args, mut c_args) = build_c_args_owned(args);
         let _ = R_MAIN_ARGS.set(owned_args);
@@ -514,6 +511,8 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         libr::set(ptr_R_Busy, Some(r_busy));
         libr::set(ptr_R_Suicide, Some(r_suicide));
 
+        init.mark_ready();
+        ipc::emit_worker_ready("r", true);
         libr::setup_Rmainloop();
     }
 
@@ -521,7 +520,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_family = "windows")]
-fn setup_r(args: &[String]) -> Result<(), String> {
+fn setup_r(args: &[String], init: &SessionInit) -> Result<(), String> {
     unsafe {
         libr::set(libr::R_SignalHandlers, 1);
 
@@ -571,6 +570,8 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         R_SetParams(params);
         libr::graphapp::GA_initapp(0, std::ptr::null_mut());
         readconsolecfg();
+        init.mark_ready();
+        ipc::emit_worker_ready("r", true);
         libr::setup_Rmainloop();
     }
 
