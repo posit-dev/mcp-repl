@@ -524,6 +524,57 @@ async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_interrupt_aborts_pending_r_readline() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "answer <- readline('INTERRUPT_ASK> '); cat('READLINE_ANSWER=', answer, '\\n', sep = '')",
+            Some(10.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("INTERRUPT_ASK> "),
+        "expected readline prompt before interrupt, got: {first_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains("<<repl status: busy"),
+        "expected readline interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("cat('AFTER_R_READLINE_INTERRUPT\\n')", Some(10.0))
+        .await?;
+    let follow_up = wait_until_not_busy(&mut session, follow_up).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_R_READLINE_INTERRUPT"),
+        "expected follow-up to run after readline interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("READLINE_ANSWER="),
+        "did not expect follow-up input to satisfy the interrupted readline, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_does_not_treat_colon_input_as_pager_command_by_default() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;

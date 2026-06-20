@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use crate::ipc;
@@ -130,6 +130,21 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
+pub(crate) fn interrupt_pending_input() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let had_pending = !guard.input_queue.is_empty();
+    drain_input_queue(&mut guard.input_queue);
+    let interrupted_waiting_read = guard.waiting_for_input;
+    if interrupted_waiting_read {
+        guard.read_interrupted = true;
+    }
+    state.cvar.notify_all();
+    had_pending || interrupted_waiting_read
+}
+
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     crate::diagnostics::startup_log("r-session: init begin");
     let state = Arc::new(SessionState::new());
@@ -169,6 +184,8 @@ struct SessionStateInner {
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
+    waiting_for_input: bool,
+    read_interrupted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +203,8 @@ impl SessionState {
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
+                waiting_for_input: false,
+                read_interrupted: false,
             }),
             cvar: Condvar::new(),
         }
@@ -624,6 +643,16 @@ fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     drained
 }
 
+fn wait_until_console_input_changes(
+    state: &SessionState,
+    mut guard: MutexGuard<'_, SessionStateInner>,
+) {
+    while guard.input_queue.is_empty() && !guard.shutdown && !guard.read_interrupted {
+        guard = state.cvar.wait(guard).unwrap();
+    }
+    guard.waiting_for_input = false;
+}
+
 fn split_console_line(
     mut line: InputBatchLine,
     max: usize,
@@ -981,6 +1010,16 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
+        if guard.read_interrupted {
+            guard.read_interrupted = false;
+            guard.waiting_for_input = false;
+            drop(guard);
+            unsafe {
+                libr::Rf_onintr();
+            }
+            return 0;
+        }
+
         if let Some(line) = guard.input_queue.pop_front() {
             let max = (buflen as usize).saturating_sub(1);
             let (line_text, tail) = split_console_line(line, max);
@@ -1004,25 +1043,20 @@ pub extern "C-unwind" fn r_read_console(
         if guard.active_input {
             guard.active_input = false;
             guard.plot_hashes.clear();
+            guard.waiting_for_input = true;
             drop(guard);
             ipc::emit_input_wait(prompt);
-            let mut guard = state.inner.lock().unwrap();
-            if guard.input_queue.is_empty() && !guard.shutdown {
-                guard = state.cvar.wait(guard).unwrap();
-            }
-            drop(guard);
+            let guard = state.inner.lock().unwrap();
+            wait_until_console_input_changes(state, guard);
             continue;
         }
 
         let prompt = prompt.to_string();
+        guard.waiting_for_input = true;
         drop(guard);
         ipc::emit_input_wait(&prompt);
-        let mut guard = state.inner.lock().unwrap();
-
-        if guard.input_queue.is_empty() && !guard.shutdown {
-            guard = state.cvar.wait(guard).unwrap();
-        }
-        drop(guard);
+        let guard = state.inner.lock().unwrap();
+        wait_until_console_input_changes(state, guard);
     }
 }
 

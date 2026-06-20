@@ -63,7 +63,7 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt {}) => {
-                        crate::r_session::clear_pending_input();
+                        crate::r_session::interrupt_pending_input();
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
                         std::process::exit(0);
