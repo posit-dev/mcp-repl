@@ -1337,8 +1337,27 @@ async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             format!(
-                r#"import atexit, pathlib, sys
-atexit.register(lambda: pathlib.Path({marker_literal}).write_text("atexit ran"))
+                r#"import atexit, os, sys
+marker_path = {marker_literal}
+open_fd = os.open
+write_fd = os.write
+close_fd = os.close
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+def write_marker(
+    path=marker_path,
+    data=b"atexit ran",
+    open_fd=open_fd,
+    write_fd=write_fd,
+    close_fd=close_fd,
+    flags=flags,
+):
+    fd = open_fd(path, flags, 0o666)
+    try:
+        write_fd(fd, data)
+    finally:
+        close_fd(fd)
+
+atexit.register(write_marker)
 sys.exit()
 "#
             ),
@@ -1351,20 +1370,24 @@ sys.exit()
         return Err("python sys.exit() with atexit remained busy".into());
     }
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_ATEXIT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
     let marker_result = wait_for_file_text(&marker, "atexit ran").await;
-    session.cancel().await?;
-
-    assert!(
-        follow_up_text.contains("AFTER_ATEXIT"),
-        "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
-    );
     if let Err(err) = marker_result {
+        session.cancel().await?;
         return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
     }
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            "print('AFTER_ATEXIT', 'write_marker' in globals())",
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+    assert!(
+        follow_up_text.contains("AFTER_ATEXIT False"),
+        "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
+    );
     Ok(())
 }
 
@@ -4259,47 +4282,42 @@ async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult
         .to_str()
         .ok_or("idle tail marker path must be valid utf-8")?;
     let tail_marker_literal = serde_json::to_string(tail_marker)?;
-    let exit_marker_path = marker_dir.path().join("idle-worker-exiting");
-    let exit_marker = exit_marker_path
+    let signal_marker_path = marker_dir.path().join("idle-worker-signaled");
+    let signal_marker = signal_marker_path
         .to_str()
-        .ok_or("idle exit marker path must be valid utf-8")?;
-    let exit_marker_literal = serde_json::to_string(exit_marker)?;
+        .ok_or("idle signal marker path must be valid utf-8")?;
+    let signal_marker_literal = serde_json::to_string(signal_marker)?;
     let release_marker_path = marker_dir.path().join("idle-tail-release");
     let release_marker = release_marker_path
         .to_str()
         .ok_or("idle tail release marker path must be valid utf-8")?;
     let release_marker_literal = serde_json::to_string(release_marker)?;
     let script = format!(
-        r#"import os, pathlib, subprocess, sys, threading, time
+        r#"import os, pathlib, subprocess, sys
 tail_marker = {tail_marker_literal}
-exit_marker = {exit_marker_literal}
+signal_marker = {signal_marker_literal}
 release_marker = {release_marker_literal}
-writer = """import os, pathlib, sys, time
+worker_pid = os.getpid()
+writer = """import os, pathlib, signal, sys, time
 deadline = time.monotonic() + 30
-while not os.path.exists(sys.argv[2]):
+while not os.path.exists(sys.argv[3]):
     if time.monotonic() >= deadline:
         sys.exit(2)
     time.sleep(0.02)
 sys.stdout.write("IDLE_TAIL\\n")
 sys.stdout.flush()
 pathlib.Path(sys.argv[1]).write_text("done")
-time.sleep(0.2)
+os.kill(int(sys.argv[4]), signal.SIGTERM)
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", writer, tail_marker, release_marker],
+    [sys.executable, "-c", writer, tail_marker, signal_marker, release_marker, str(worker_pid)],
     stdin=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
     start_new_session=True,
 )
-print("armed")
-def exit_after_detached_tail():
-    while not os.path.exists(tail_marker):
-        time.sleep(0.02)
-    time.sleep(0.4)
-    pathlib.Path(exit_marker).write_text("done")
-    os._exit(0)
-threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
+print("armed")"#
     );
     let script_literal = serde_json::to_string(&script)?;
 
@@ -4320,7 +4338,7 @@ threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
     );
 
     fs::write(&release_marker_path, "go")?;
-    if let Err(err) = wait_for_detached_holder_exit(&exit_marker_path).await {
+    if let Err(err) = wait_for_detached_holder_exit(&signal_marker_path).await {
         session.cancel().await?;
         return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
     }
