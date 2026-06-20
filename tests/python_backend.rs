@@ -185,6 +185,43 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     start_python_session_with_env_vars(Vec::new()).await
 }
 
+fn debug_dir_env(debug_dir: &Path) -> Vec<(String, String)> {
+    vec![(
+        "MCP_REPL_DEBUG_DIR".to_string(),
+        debug_dir.to_string_lossy().into_owned(),
+    )]
+}
+
+fn debug_log_summary(debug_dir: &Path) -> String {
+    let mut entries = fs::read_dir(debug_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let mut summary = String::new();
+    for session_dir in entries {
+        for file_name in ["startup.log", "worker-startup.log"] {
+            let path = session_dir.join(file_name);
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            summary.push_str(&format!("\n--- {} ---\n{}", path.display(), contents));
+        }
+    }
+
+    if summary.is_empty() {
+        return format!(
+            "\n--- debug logs unavailable under {} ---",
+            debug_dir.display()
+        );
+    }
+    summary
+}
+
 #[cfg(windows)]
 async fn start_python_session_with_sandbox(
     sandbox: &str,
@@ -594,7 +631,7 @@ impl DetachedHolderProbe {
 }
 
 async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if marker_path.exists() {
             sleep(Duration::from_millis(250)).await;
@@ -603,6 +640,33 @@ async fn wait_for_detached_holder_exit(marker_path: &Path) -> TestResult<()> {
         sleep(Duration::from_millis(50)).await;
     }
     Err(format!("detached holder did not exit: {}", marker_path.display()).into())
+}
+
+async fn wait_for_file_text(path: &Path, expected: &str) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_text = None;
+    while Instant::now() < deadline {
+        match fs::read_to_string(path) {
+            Ok(text) if text == expected => return Ok(()),
+            Ok(text) => last_text = Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    match last_text {
+        Some(text) => Err(format!(
+            "timed out waiting for {} to contain {expected:?}; last contents were {text:?}",
+            path.display()
+        )
+        .into()),
+        None => Err(format!(
+            "timed out waiting for {} to contain {expected:?}",
+            path.display()
+        )
+        .into()),
+    }
 }
 
 #[cfg(unix)]
@@ -692,7 +756,7 @@ print("ipc background ready")
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plot_hook_flushes_before_stdin_wait_reply() -> TestResult<()> {
+async fn python_plot_hook_flushes_before_input_wait_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1153,12 +1217,7 @@ async fn python_long_physical_line_does_not_complete_before_execution() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session_with_env_vars(vec![(
-        "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS".to_string(),
-        "1000".to_string(),
-    )])
-    .await?
-    else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -1179,8 +1238,8 @@ async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestRes
         "expected request to remain busy instead of reporting a worker error, got: {poll_text:?}"
     );
     assert!(
-        !poll_text.contains("pty_feed write failed"),
-        "PTY backpressure should not become a protocol error, got: {poll_text:?}"
+        !poll_text.contains("worker error:"),
+        "queued input tail should not become a worker error, got: {poll_text:?}"
     );
 
     let interrupt = session
@@ -1263,11 +1322,12 @@ async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()
 #[tokio::test(flavor = "multi_thread")]
 async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let Some(session) = start_python_session_with_env_vars(debug_dir_env(&debug_dir)).await? else {
         return Ok(());
     };
 
-    let temp = tempdir()?;
     let marker = temp.path().join("atexit-marker.txt");
     let marker_literal = serde_json::to_string(
         marker
@@ -1277,8 +1337,27 @@ async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             format!(
-                r#"import atexit, pathlib, sys
-atexit.register(lambda: pathlib.Path({marker_literal}).write_text("atexit ran"))
+                r#"import atexit, os, sys
+marker_path = {marker_literal}
+open_fd = os.open
+write_fd = os.write
+close_fd = os.close
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+def write_marker(
+    path=marker_path,
+    data=b"atexit ran",
+    open_fd=open_fd,
+    write_fd=write_fd,
+    close_fd=close_fd,
+    flags=flags,
+):
+    fd = open_fd(path, flags, 0o666)
+    try:
+        write_fd(fd, data)
+    finally:
+        close_fd(fd)
+
+atexit.register(write_marker)
 sys.exit()
 "#
             ),
@@ -1291,17 +1370,24 @@ sys.exit()
         return Err("python sys.exit() with atexit remained busy".into());
     }
 
+    let marker_result = wait_for_file_text(&marker, "atexit ran").await;
+    if let Err(err) = marker_result {
+        session.cancel().await?;
+        return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
+    }
+
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_ATEXIT')", Some(5.0))
+        .write_stdin_raw_with(
+            "print('AFTER_ATEXIT', 'write_marker' in globals())",
+            Some(5.0),
+        )
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
-
     assert!(
-        follow_up_text.contains("AFTER_ATEXIT"),
+        follow_up_text.contains("AFTER_ATEXIT False"),
         "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
     );
-    assert_eq!(fs::read_to_string(&marker)?, "atexit ran");
     Ok(())
 }
 
@@ -1394,7 +1480,7 @@ print("PTY_INPUT", value)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_uses_cpython_stdin_surface_without_direct_fd_shims() -> TestResult<()> {
+async fn python_pty_routes_stdin_surfaces_through_queue() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1419,8 +1505,8 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
     session.cancel().await?;
 
     assert!(
-        text.contains("STDIN_SURFACE _io TextIOWrapper 0 True"),
-        "expected sys.stdin to be CPython's PTY-backed stdin, got: {text:?}"
+        text.contains("STDIN_SURFACE __main__ McpInputStream 0 True"),
+        "expected sys.stdin to be the managed stdin bridge, got: {text:?}"
     );
     let direct_fd_modules = text
         .lines()
@@ -1434,19 +1520,12 @@ print("DIRECT_FD_SHIMS", builtins.open.__module__, io.open.__module__, io.FileIO
         6,
         "expected six direct fd stdin API module names, got: {text:?}"
     );
-    for (label, module) in [
-        ("builtins.open", direct_fd_modules[0]),
-        ("io.open", direct_fd_modules[1]),
-    ] {
-        assert!(
-            matches!(module, "io" | "_io"),
-            "expected {label} to come from io or _io, got: {text:?}"
-        );
-    }
     assert_eq!(
-        &direct_fd_modules[2..],
-        ["_io", "_io", "posix", "posix"],
-        "expected FileIO and os fd APIs to come from standard modules, got: {text:?}"
+        direct_fd_modules,
+        [
+            "__main__", "__main__", "__main__", "__main__", "__main__", "__main__"
+        ],
+        "expected stdin fd APIs to be routed through the managed bridge, got: {text:?}"
     );
     Ok(())
 }
@@ -1527,7 +1606,7 @@ gamma
     );
     assert!(
         text.contains("WIN_STDIN_VALUES alpha beta gamma"),
-        "expected input/sys.stdin/dup fd reads to consume buffered turn input, got: {text:?}"
+        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {text:?}"
     );
     assert!(
         text.contains("REPLACED_STDIN_ISATTY False"),
@@ -1559,7 +1638,7 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     let first_text = result_text(&first);
     assert!(
         !is_busy_response(&first_text),
-        "expected raw stdin read to complete the turn at an input boundary, got: {first_text:?}"
+        "expected raw stdin read to complete the input batch at an input boundary, got: {first_text:?}"
     );
     assert!(
         first_text.contains("RAW_STDIN_WAITING"),
@@ -1591,14 +1670,14 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     );
     assert!(
         text.contains("RAW_STDIN_RESULT delta"),
-        "expected raw stdin read to consume next turn input, got: {text:?}"
+        "expected raw stdin read to consume next input batch, got: {text:?}"
     );
     Ok(())
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_pty_direct_stdin_reads_consume_buffered_turn_input() -> TestResult<()> {
+async fn python_pty_direct_stdin_reads_consume_buffered_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1632,7 +1711,7 @@ print("DIRECT_STDIN_VALUES", line, data)
 
     assert!(
         !is_busy_response(&text),
-        "expected direct stdin reads to consume queued turn input, got: {text:?}"
+        "expected direct stdin reads to consume queued input batch, got: {text:?}"
     );
     assert!(
         text.contains("DIRECT_STDIN_VALUES alpha bravo"),
@@ -1680,6 +1759,52 @@ buffered
     assert!(
         followup_text.contains("BUFFER_FOLLOWUP buffered"),
         "expected follow-up REPL input to run after sys.stdin.buffer read, got: {followup_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_partial_raw_stdin_read_keeps_followup_output_attached() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import os, time
+print("RAW_PARTIAL_WAITING", flush=True)
+data = os.read(0, 10)
+time.sleep(0.2)
+print("RAW_PARTIAL_RESULT", data.decode("utf-8").strip(), flush=True)
+""")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("RAW_PARTIAL_WAITING"),
+        "expected code before raw stdin wait to run, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("RAW_PARTIAL_RESULT"),
+        "raw stdin read should wait for a later input batch, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("delta", Some(5.0)).await?;
+    let second_text = result_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&second_text),
+        "expected partial raw stdin read follow-up to complete, got: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("RAW_PARTIAL_RESULT delta"),
+        "expected output after the partial raw stdin read to stay attached to the follow-up reply, got: {second_text:?}"
     );
     Ok(())
 }
@@ -3101,7 +3226,7 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() -> TestResult<()> {
+async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3137,7 +3262,7 @@ async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() ->
     let interrupt_text = result_text(&interrupt);
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected idle input interrupt to complete, got: {interrupt_text:?}"
+        "expected input-wait interrupt to complete, got: {interrupt_text:?}"
     );
 
     let follow_up = session
@@ -3148,7 +3273,7 @@ async fn python_windows_idle_stdin_wait_interrupt_preserves_next_turn_input() ->
 
     assert!(
         follow_up_text.contains("AFTER_WINDOWS_STDIN_INTERRUPT"),
-        "expected follow-up to run after idle input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        "expected follow-up to run after input-wait interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3441,8 +3566,8 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "expected Python backend to start before empty input prompt, got: {prompt_text:?}"
     );
     assert!(
-        prompt_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty input prompt to return a visible waiting status, got: {prompt_text:?}"
+        prompt_text.contains("<<repl status: waiting for input>>"),
+        "expected empty input prompt to return a visible generic waiting status, got: {prompt_text:?}"
     );
     assert!(
         !prompt_text.contains("stdin> "),
@@ -3477,7 +3602,7 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()> {
+async fn python_empty_poll_after_empty_input_prompt_uses_idle_poll_path() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3488,19 +3613,15 @@ async fn python_empty_poll_preserves_empty_input_prompt_wait() -> TestResult<()>
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
-        prompt_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty input prompt to return waiting status, got: {prompt_text:?}"
+        prompt_text.contains("<<repl status: waiting for input>>"),
+        "expected empty input prompt to return generic waiting status, got: {prompt_text:?}"
     );
 
     let poll = session.write_stdin_raw_with("", Some(1.0)).await?;
     let poll_text = result_text(&poll);
     assert!(
-        poll_text.contains("<<repl status: waiting for stdin>>"),
-        "expected empty poll to preserve stdin wait status, got: {poll_text:?}"
-    );
-    assert!(
-        !poll_text.contains("<<repl status: idle>>"),
-        "did not expect empty poll to report idle while input() is waiting, got: {poll_text:?}"
+        poll_text.contains("<<repl status: idle>>"),
+        "expected empty poll to use normal idle status, got: {poll_text:?}"
     );
 
     let answer = session
@@ -3613,12 +3734,8 @@ async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()
     let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
     let poll_text = result_text(&poll);
     assert!(
-        poll_text.contains("<<repl status: waiting for stdin>>"),
-        "expected poll to report empty input prompt, got: {poll_text:?}"
-    );
-    assert!(
-        !poll_text.contains("<<repl status: idle>>"),
-        "did not expect poll to report idle while input() is waiting, got: {poll_text:?}"
+        poll_text.contains("<<repl status: waiting for input>>"),
+        "expected poll to report generic input wait, got: {poll_text:?}"
     );
 
     let answer = session
@@ -3942,7 +4059,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_ctrl_c_prefix_preserves_followup_turn_input() -> TestResult<()> {
+async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3979,7 +4096,7 @@ async fn python_ctrl_c_prefix_preserves_followup_turn_input() -> TestResult<()> 
 
     assert!(
         text.contains("AFTER_STALE_INTERRUPT queued-answer"),
-        "expected follow-up turn input after ctrl-c prefix, got: {text:?}"
+        "expected follow-up input batch after ctrl-c prefix, got: {text:?}"
     );
     Ok(())
 }
@@ -4155,56 +4272,52 @@ print("parent ready")
 #[tokio::test(flavor = "multi_thread")]
 async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let marker_dir = tempdir()?;
+    let debug_dir = marker_dir.path().join("debug");
+    let Some(session) = start_python_session_with_env_vars(debug_dir_env(&debug_dir)).await? else {
         return Ok(());
     };
-    let marker_dir = tempdir()?;
     let tail_marker_path = marker_dir.path().join("idle-tail-written");
     let tail_marker = tail_marker_path
         .to_str()
         .ok_or("idle tail marker path must be valid utf-8")?;
     let tail_marker_literal = serde_json::to_string(tail_marker)?;
-    let exit_marker_path = marker_dir.path().join("idle-worker-exiting");
-    let exit_marker = exit_marker_path
+    let signal_marker_path = marker_dir.path().join("idle-worker-signaled");
+    let signal_marker = signal_marker_path
         .to_str()
-        .ok_or("idle exit marker path must be valid utf-8")?;
-    let exit_marker_literal = serde_json::to_string(exit_marker)?;
+        .ok_or("idle signal marker path must be valid utf-8")?;
+    let signal_marker_literal = serde_json::to_string(signal_marker)?;
     let release_marker_path = marker_dir.path().join("idle-tail-release");
     let release_marker = release_marker_path
         .to_str()
         .ok_or("idle tail release marker path must be valid utf-8")?;
     let release_marker_literal = serde_json::to_string(release_marker)?;
     let script = format!(
-        r#"import os, pathlib, subprocess, sys, threading, time
+        r#"import os, pathlib, subprocess, sys
 tail_marker = {tail_marker_literal}
-exit_marker = {exit_marker_literal}
+signal_marker = {signal_marker_literal}
 release_marker = {release_marker_literal}
-writer = """import os, pathlib, sys, time
-deadline = time.monotonic() + 5
-while not os.path.exists(sys.argv[2]):
+worker_pid = os.getpid()
+writer = """import os, pathlib, signal, sys, time
+deadline = time.monotonic() + 30
+while not os.path.exists(sys.argv[3]):
     if time.monotonic() >= deadline:
         sys.exit(2)
     time.sleep(0.02)
 sys.stdout.write("IDLE_TAIL\\n")
 sys.stdout.flush()
 pathlib.Path(sys.argv[1]).write_text("done")
-time.sleep(0.2)
+os.kill(int(sys.argv[4]), signal.SIGTERM)
+pathlib.Path(sys.argv[2]).write_text("done")
 """
 subprocess.Popen(
-    [sys.executable, "-c", writer, tail_marker, release_marker],
+    [sys.executable, "-c", writer, tail_marker, signal_marker, release_marker, str(worker_pid)],
     stdin=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
     start_new_session=True,
 )
-print("armed")
-def exit_after_detached_tail():
-    while not os.path.exists(tail_marker):
-        time.sleep(0.02)
-    time.sleep(0.4)
-    pathlib.Path(exit_marker).write_text("done")
-    os._exit(0)
-threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
+print("armed")"#
     );
     let script_literal = serde_json::to_string(&script)?;
 
@@ -4225,7 +4338,10 @@ threading.Thread(target=exit_after_detached_tail, daemon=True).start()"#
     );
 
     fs::write(&release_marker_path, "go")?;
-    wait_for_detached_holder_exit(&exit_marker_path).await?;
+    if let Err(err) = wait_for_detached_holder_exit(&signal_marker_path).await {
+        session.cancel().await?;
+        return Err(format!("{err}{}", debug_log_summary(&debug_dir)).into());
+    }
     let reply = session
         .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
         .await?;

@@ -3,11 +3,10 @@ use std::time::Duration;
 use crate::backend::Backend;
 use crate::ipc::IpcEchoEvent;
 use crate::reply_presentation::{
-    append_prompt_if_missing, echo_transcript_from_events, fallback_prompt_variants,
-    normalize_prompt, reconcile_completion_prompt, should_drop_echo_only_contents,
-    should_trim_echo_prefix, trim_echo_prefix_after_leading_nonstdout_contents,
-    trim_echo_then_append_protocol_warnings, trim_leading_input_echo_from_contents,
-    trim_matching_echo_event_suffix_from_contents,
+    echo_transcript_from_events, fallback_prompt_variants, normalize_prompt,
+    reconcile_completion_prompt, should_drop_echo_only_contents, should_trim_echo_prefix,
+    trim_echo_prefix_after_leading_nonstdout_contents, trim_echo_then_append_protocol_warnings,
+    trim_leading_input_echo_from_contents, trim_matching_echo_event_suffix_from_contents,
 };
 use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
 
@@ -36,7 +35,6 @@ pub(crate) struct ReplyWithOffset {
 
 pub(crate) struct CompletionInfo {
     pub(crate) prompt: Option<String>,
-    pub(crate) stdin_wait_prompt: Option<String>,
     pub(crate) prompt_variants: Option<Vec<String>>,
     pub(crate) echo_events: Vec<IpcEchoEvent>,
     pub(crate) protocol_warnings: Vec<String>,
@@ -47,7 +45,6 @@ impl CompletionInfo {
     pub(crate) fn empty() -> Self {
         Self {
             prompt: None,
-            stdin_wait_prompt: None,
             prompt_variants: None,
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -88,8 +85,7 @@ pub(crate) fn build_completed_reply(
         completion.prompt.clone()
     };
     if raw_prompt.as_deref() == Some("") {
-        append_stdin_wait_prompt(&mut contents, completion);
-        contents.push(stdin_wait_status_content());
+        contents.push(input_wait_status_content());
     }
     let resolved_prompt = normalize_prompt(raw_prompt.clone());
 
@@ -172,12 +168,8 @@ pub(crate) fn idle_status_content() -> WorkerContent {
     WorkerContent::server_stdout("<<repl status: idle>>")
 }
 
-pub(crate) fn stdin_wait_status_content() -> WorkerContent {
-    WorkerContent::server_stdout("<<repl status: waiting for stdin>>")
-}
-
-fn append_stdin_wait_prompt(contents: &mut Vec<WorkerContent>, completion: &CompletionInfo) {
-    append_prompt_if_missing(contents, completion.stdin_wait_prompt.clone());
+pub(crate) fn input_wait_status_content() -> WorkerContent {
+    WorkerContent::server_stdout("<<repl status: waiting for input>>")
 }
 
 fn finalize_files_contents(

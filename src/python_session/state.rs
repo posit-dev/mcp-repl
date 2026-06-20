@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[cfg(target_family = "unix")]
-use crate::python_turn_input::PythonTurnInput;
+use crate::python_input_queue::PythonInputQueue;
 
 pub(super) static SESSION_STATE: OnceLock<Arc<SessionState>> = OnceLock::new();
 
@@ -14,7 +14,6 @@ pub(super) struct SessionState {
 pub(super) struct SessionStateInner {
     pub(super) active_request: Option<ActiveRequest>,
     pub(super) request_active: bool,
-    pub(super) request_completed_at_stdin_wait: bool,
     pub(super) current_prompt: Option<String>,
     pub(super) current_readline_state: Option<PythonReadlineState>,
     #[cfg(windows)]
@@ -34,16 +33,15 @@ pub(super) struct SessionStateInner {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(super) turn_cleanup_uncertain: bool,
     #[cfg(target_family = "unix")]
-    pub(super) turn_input: PythonTurnInput,
+    pub(super) input_queue: PythonInputQueue,
 }
 
 #[allow(dead_code)]
 pub(super) struct ActiveRequest {
-    pub(super) turn_id: Option<u64>,
     pub(super) byte_len: usize,
     pub(super) line_count: usize,
     pub(super) fallback_prompt: Option<String>,
-    pub(super) queued_lines: VecDeque<TurnInputLine>,
+    pub(super) queued_lines: VecDeque<InputBatchLine>,
     pub(super) consumed_lines: usize,
     pub(super) skip_next_hook: bool,
     pub(super) stdin_write_complete: bool,
@@ -51,7 +49,7 @@ pub(super) struct ActiveRequest {
     pub(super) started_after_continuation_prompt: bool,
 }
 
-pub(super) struct TurnInputLine {
+pub(super) struct InputBatchLine {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(super) text: String,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -71,20 +69,11 @@ pub(super) enum PythonReadlineState {
 
 pub(super) enum StdinReadAccounting {
     Accounted,
-    #[cfg(target_family = "unix")]
-    DiscardedAfterInterrupt,
 }
 
 impl StdinReadAccounting {
     pub(super) fn discarded_after_interrupt(&self) -> bool {
-        #[cfg(target_family = "unix")]
-        {
-            matches!(self, Self::DiscardedAfterInterrupt)
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            false
-        }
+        false
     }
 }
 
@@ -100,7 +89,6 @@ impl SessionState {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
                 request_active: false,
-                request_completed_at_stdin_wait: false,
                 current_prompt: None,
                 current_readline_state: None,
                 #[cfg(windows)]
@@ -118,7 +106,7 @@ impl SessionState {
                 turn_write_in_flight: false,
                 turn_cleanup_uncertain: false,
                 #[cfg(target_family = "unix")]
-                turn_input: PythonTurnInput::new(),
+                input_queue: PythonInputQueue::new(),
             }),
             cvar: Condvar::new(),
         }
@@ -225,19 +213,17 @@ pub(super) fn remember_emitted_prompt(prompt: &str) {
     guard.last_prompt_was_continuation = prompt == guard.python_continuation_prompt;
 }
 
-pub(super) fn mark_stdin_wait_prompt_completed_request() {
+pub(super) fn mark_input_wait_completed_request() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
     let mut guard = state.inner.lock().unwrap();
-    // An input()/sys.stdin.readline() prompt with no buffered answer is the
-    // response boundary for the current MCP request. The Python read can then
-    // block while background Python threads keep running. Clear the plot gate at
-    // this boundary to prevent those background updates from being attributed to
-    // the request that already completed. Callers flush prompt-time plots before
-    // closing this gate.
+    // A managed input callback with no queued bytes is the response boundary for
+    // the current MCP request. The Python read can then block while background
+    // Python threads keep running. Clear the plot gate at this boundary to
+    // prevent those background updates from being attributed to the request that
+    // already completed. Callers flush prompt-time plots before closing this gate.
     guard.request_active = false;
-    guard.request_completed_at_stdin_wait = true;
 }
 
 pub(super) fn request_active() -> bool {
@@ -245,7 +231,7 @@ pub(super) fn request_active() -> bool {
         return false;
     };
     let guard = state.inner.lock().unwrap();
-    guard.request_active && !guard.request_completed_at_stdin_wait
+    guard.request_active
 }
 
 #[cfg(target_family = "unix")]
@@ -274,7 +260,6 @@ mod tests {
         fallback_prompt: Option<&str>,
     ) -> ActiveRequest {
         ActiveRequest {
-            turn_id: None,
             byte_len: 1,
             line_count,
             fallback_prompt: fallback_prompt.map(str::to_string),

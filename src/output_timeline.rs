@@ -47,10 +47,10 @@ pub(crate) fn collapse_echo_with_attribution(
             // If the matching echo was drained earlier, anchor before the
             // first remaining echo when there is one. Otherwise keep the event
             // at its rendered offset in the current snapshot.
-            return (!echo_events.is_empty()).then_some(0);
+            return echo_event_is_visible(echo_events.first()).then_some(0);
         }
         let anchor_idx = readline_results_seen.saturating_sub(echo_event_base);
-        (!echo_events.is_empty() && anchor_idx < echo_events.len()).then_some(anchor_idx)
+        echo_event_is_visible(echo_events.get(anchor_idx)).then_some(anchor_idx)
     };
 
     let mut events: Vec<(usize, OutputEventKind)> = range
@@ -259,6 +259,10 @@ fn event_has_readline_ordering(kind: &OutputEventKind) -> bool {
                 ..
             }
     )
+}
+
+fn echo_event_is_visible(event: Option<&IpcEchoEvent>) -> bool {
+    event.is_some_and(|event| event.source == OutputTextSource::Raw)
 }
 
 #[derive(Default)]
@@ -548,6 +552,10 @@ fn consume_text_segment(
         let line = &segment[start..end];
         start = end;
 
+        while *echo_idx < echo_events.len() && !echo_event_is_visible(echo_events.get(*echo_idx)) {
+            *echo_idx = (*echo_idx).saturating_add(1);
+        }
+
         let echo_prefix = if !is_stderr
             && matches!(origin, ContentOrigin::Worker)
             && *echo_idx < echo_events.len()
@@ -614,6 +622,14 @@ mod tests {
         }
     }
 
+    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+        IpcEchoEvent {
+            prompt: prompt.to_string(),
+            line: line.to_string(),
+            source: OutputTextSource::Raw,
+        }
+    }
+
     fn contents_text(contents: &[WorkerContent]) -> String {
         contents
             .iter()
@@ -647,15 +663,15 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
             &[
-                echo_event("> ", "plot(1:10)\n"),
-                echo_event("> ", "cat('done\\n')\n"),
+                raw_echo_event("> ", "plot(1:10)\n"),
+                raw_echo_event("> ", "cat('done\\n')\n"),
             ],
             0,
             &["> ".to_string()],
@@ -704,15 +720,15 @@ mod tests {
                 end_byte: 34,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
             &[
-                echo_event("> ", "plot(1:10)\n"),
-                echo_event("> ", "cat('done\\n')\n"),
+                raw_echo_event("> ", "plot(1:10)\n"),
+                raw_echo_event("> ", "cat('done\\n')\n"),
             ],
             0,
             &["> ".to_string()],
@@ -774,6 +790,82 @@ mod tests {
     }
 
     #[test]
+    fn ipc_echo_events_do_not_reorder_sideband_image_updates_without_visible_echo() {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: 0,
+            bytes: Vec::new(),
+            events: vec![
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "first".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                        readline_results_seen: 1,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "second".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 2,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "third".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 3,
+                    },
+                },
+                OutputEvent {
+                    offset: 0,
+                    kind: OutputEventKind::Image {
+                        data: "final".to_string(),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                        readline_results_seen: 4,
+                    },
+                },
+            ],
+            text_spans: Vec::new(),
+        };
+
+        let collapsed = collapse_echo_with_attribution(
+            range,
+            &[
+                echo_event("> ", "plot(1:10)\n"),
+                echo_event("> ", "lines(2:9)\n"),
+                echo_event("> ", "lines(3:8)\n"),
+            ],
+            0,
+            &["> ".to_string()],
+            EchoCollapseMode::CollapseForFinalReply,
+        );
+        let contents = pager::contents_from_collapsed_output(
+            collapsed.bytes,
+            collapsed.events,
+            collapsed.text_spans,
+            0,
+        );
+
+        let final_image = contents.last().expect("expected final image content");
+        assert!(
+            matches!(final_image, WorkerContent::ContentImage { data, .. } if data == "final"),
+            "expected final image update to stay last, got: {contents:?}"
+        );
+    }
+
+    #[test]
     fn collapse_echo_with_attribution_drops_leading_multi_expression_echo_prefix() {
         let range = OutputRange {
             start_offset: 0,
@@ -785,13 +877,16 @@ mod tests {
                 end_byte: 27,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "x <- 1\n"), echo_event("> ", "y <- 2\n")],
+            &[
+                raw_echo_event("> ", "x <- 1\n"),
+                raw_echo_event("> ", "y <- 2\n"),
+            ],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -827,13 +922,13 @@ mod tests {
                 end_byte: 42,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "x\n")],
+            &[raw_echo_event("> ", "x\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -869,13 +964,13 @@ mod tests {
                 end_byte: 25,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
+            &[raw_echo_event("> ", "Sys.sleep(0.2); 1+1\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -962,7 +1057,9 @@ mod tests {
 
         assert_eq!(
             contents,
-            vec![WorkerContent::stdout("> 1+1\n> 1+1\n[1] 2\n")]
+            vec![WorkerContent::stdout(
+                "> system(\"printf '> 1+1\\\\n'\")\n> 1+1\n> 1+1\n[1] 2\n"
+            )]
         );
     }
 
@@ -979,13 +1076,16 @@ mod tests {
                 end_byte: 21,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("FIRST> ", "alpha\n"), echo_event("SECOND> ", "")],
+            &[
+                raw_echo_event("FIRST> ", "alpha\n"),
+                raw_echo_event("SECOND> ", ""),
+            ],
             0,
             &["FIRST> ".to_string(), "SECOND> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -1022,13 +1122,13 @@ mod tests {
                 end_byte: 13,
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "plot(1:10)\n")],
+            &[raw_echo_event("> ", "plot(1:10)\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::Preserve,
@@ -1125,13 +1225,16 @@ mod tests {
                 end_byte: echo.len() + output.len(),
                 is_stderr: false,
                 origin: ContentOrigin::Worker,
-                source: crate::output_capture::OutputTextSource::Ipc,
+                source: crate::output_capture::OutputTextSource::Raw,
             }],
         };
 
         let collapsed = collapse_echo_with_attribution(
             range,
-            &[echo_event("> ", "input(); plot(1:10); cat('done\\n')\n")],
+            &[raw_echo_event(
+                "> ",
+                "input(); plot(1:10); cat('done\\n')\n",
+            )],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,

@@ -119,7 +119,7 @@ jobs:
       - name: cargo test
         env:
           MCP_REPL_CODEX_BACKEND: mock
-        run: cargo test --quiet
+        run: cargo test --quiet -- --test-threads=5
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check

@@ -21,21 +21,18 @@ expression: transcript
 >>> help()
 <<< <PYTHON HELP BANNER>
 <<< help>
-<<< <<repl status: waiting for stdin>>
 
 4) py_repl timeout_ms=1000
 >>> len
-<<< Help on built-in function len in module builtins:
+<<< help> Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
-<<<
 <<< help>
-<<< <<repl status: waiting for stdin>>
 
 5) py_repl timeout_ms=1000
 >>> q
-<<<
+<<< help>
 <<< You are now leaving help and returning to the Python interpreter.
 <<< If you want to ask for help on a particular object directly from the
 <<< interpreter, you can type "help(object)".  Executing "help('string')"

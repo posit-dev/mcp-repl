@@ -76,74 +76,18 @@ pub(crate) fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd)
     Ok(())
 }
 
-pub fn emit_readline_start(prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: prompt.to_string(),
-        });
-    }
-}
-
-pub fn emit_readline_input_bytes(bytes: &[u8]) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineInputBytes {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-}
-
-pub fn emit_readline_discard_bytes(bytes: &[u8]) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineDiscardBytes {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-}
-
-pub fn emit_readline_result(prompt: &str, line: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::ReadlineResult {
-            prompt: prompt.to_string(),
-            line: line.to_string(),
-        });
-    }
-}
-
-pub fn emit_input_line(turn_id: u64, prompt: &str, text: &str) {
+pub fn emit_input_line(prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
-            turn_id,
             prompt: prompt.to_string(),
             text: text.to_string(),
         });
     }
 }
 
-#[cfg(target_family = "unix")]
-pub fn emit_pty_feed(turn_id: u64, seq: u64, bytes: &[u8]) {
+pub fn emit_input_wait(prompt: &str) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::PtyFeed {
-            turn_id,
-            seq,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-}
-
-#[cfg(target_family = "unix")]
-pub fn emit_stdin_wait(turn_id: u64, prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::StdinWait {
-            turn_id,
-            prompt: prompt.to_string(),
-        });
-    }
-}
-
-pub fn emit_idle(turn_id: u64, prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::Idle {
-            turn_id,
+        let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
             prompt: prompt.to_string(),
         });
     }
@@ -154,11 +98,11 @@ pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
     ipc.send_output_text(stream, bytes)
 }
 
-pub fn emit_plot_image(mime_type: &str, data: &str, is_update: bool, source: Option<&str>) {
+pub fn emit_output_image(mime_type: &str, data_b64: &str, is_update: bool, source: Option<&str>) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::PlotImage {
+        let _ = ipc.send(WorkerToServerIpcMessage::OutputImage {
             mime_type: mime_type.to_string(),
-            data: data.to_string(),
+            data_b64: data_b64.to_string(),
             is_update,
             source: source.map(ToString::to_string),
         });
@@ -175,29 +119,16 @@ pub fn emit_session_end() {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: None,
-            message_b64: None,
-            turn_id: None,
+            message: None,
         });
     }
 }
 
-pub fn emit_session_end_with_reason(reason: &str, turn_id: Option<u64>) {
+pub fn emit_session_end_with_reason(reason: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: Some(reason.to_string()),
-            message_b64: None,
-            turn_id,
+            message: None,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{emit_readline_discard_bytes, emit_readline_input_bytes};
-
-    #[test]
-    fn readline_accounting_emitters_are_platform_neutral_noops_without_global_ipc() {
-        emit_readline_input_bytes(b"answer\n");
-        emit_readline_discard_bytes(b"queued\n");
     }
 }

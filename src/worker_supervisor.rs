@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -13,8 +13,10 @@ use std::time::Duration;
 use std::cell::RefCell;
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
+#[cfg(any(target_family = "unix", target_family = "windows"))]
+use std::fs::File;
 #[cfg(target_family = "unix")]
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 
 use crate::backend::{
     Backend, CustomWorkerSpec, CustomWorkerWorkingDir, CustomWorkerWorkingDirPolicy, WorkerLaunch,
@@ -25,11 +27,11 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcPtyFeed, IpcServer, IpcWaitError, ServerIpcConnection,
-    WorkerToServerIpcMessage,
+    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
-use crate::ipc::{IpcHandlers, IpcPlotImage};
+use crate::ipc::{IpcHandlers, IpcOutputImage};
 use crate::output_capture::OutputTimeline;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind, PendingTextSource};
@@ -51,16 +53,23 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::io::AsRawHandle;
 #[cfg(target_family = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::process::ExitStatusExt;
 #[cfg(target_family = "unix")]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
+};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, GetExitCodeProcess, PROCESS_INFORMATION, TerminateProcess,
+    WaitForSingleObject,
+};
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
@@ -118,6 +127,8 @@ pub(crate) struct GuardrailShared {
 pub(crate) struct LiveOutputCapture {
     pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
+    #[cfg(any(test, target_os = "windows"))]
+    drop_windows_conpty_startup_noise_before_input: Option<Arc<AtomicBool>>,
 }
 
 impl LiveOutputCapture {
@@ -130,7 +141,15 @@ impl LiveOutputCapture {
             pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
                 .then_some(pending_output_tape),
             output_timeline,
+            #[cfg(any(test, target_os = "windows"))]
+            drop_windows_conpty_startup_noise_before_input: None,
         }
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn with_windows_conpty_startup_noise_filter(mut self) -> Self {
+        self.drop_windows_conpty_startup_noise_before_input = Some(Arc::new(AtomicBool::new(true)));
+        self
     }
 
     pub(crate) fn append_output_text(
@@ -143,7 +162,41 @@ impl LiveOutputCapture {
     }
 
     fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
+        #[cfg(any(test, target_os = "windows"))]
+        if matches!(stream, TextStream::Stdout)
+            && self.should_drop_windows_conpty_startup_noise(bytes)
+        {
+            return;
+        }
         self.append_text(bytes, stream, false, false);
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn note_accepted_input_starting(&self) {
+        let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
+            return;
+        };
+        drop_startup_noise.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(not(any(test, target_os = "windows")))]
+    fn note_accepted_input_starting(&self) {}
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn should_drop_windows_conpty_startup_noise(&self, bytes: &[u8]) -> bool {
+        let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
+            return false;
+        };
+        if !drop_startup_noise.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // Windows ConPTY emits these terminal-mode toggles on its raw output
+        // stream during startup. They are not Python output and do not come over
+        // sideband. We only drop this exact standalone pre-input noise; after an
+        // accepted input starts, raw output might be runtime/user output and is
+        // passed through unchanged.
+        windows_conpty_startup_noise_only(bytes)
     }
 
     fn append_text(
@@ -201,7 +254,7 @@ impl LiveOutputCapture {
         }
     }
 
-    pub(crate) fn append_image(&self, image: IpcPlotImage) {
+    pub(crate) fn append_image(&self, image: IpcOutputImage) {
         if image.updates_previous_image {
             self.output_timeline.append_text_event(
                 PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
@@ -241,6 +294,15 @@ impl LiveOutputCapture {
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn windows_conpty_startup_noise_only(bytes: &[u8]) -> bool {
+    const STARTUP_NOISE: &[u8] = b"\x1b[?9001h\x1b[?1004h";
+    let Some(rest) = bytes.strip_prefix(STARTUP_NOISE) else {
+        return false;
+    };
+    rest.iter().all(|byte| matches!(byte, b'\r' | b'\n'))
+}
+
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 #[cfg(target_family = "unix")]
@@ -248,10 +310,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const PTY_FEED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(debug_assertions)]
-const PTY_FEED_WRITE_TIMEOUT_ENV: &str = "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS";
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
@@ -300,7 +359,7 @@ impl WorkerSupervisor {
         if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             return Err(Self::terminate_spawn_error(process, backend, err));
         }
-        let initial_prompt = match seed_initial_prompt_from_process(&process) {
+        let initial_prompt = match seed_initial_input_wait_from_process(&process) {
             Ok(prompt) => prompt,
             Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
         };
@@ -356,7 +415,7 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
     }
 }
 
-fn seed_initial_prompt_from_process(
+fn seed_initial_input_wait_from_process(
     process: &WorkerProcess,
 ) -> Result<Option<InitialWorkerPrompt>, WorkerError> {
     let Some(ipc) = process.ipc_connection() else {
@@ -365,37 +424,25 @@ fn seed_initial_prompt_from_process(
     if let Some(raw_prompt) = ipc.try_take_prompt() {
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
-    match ipc.wait_for_prompt(Duration::from_millis(200)) {
+    match ipc.wait_for_input_wait(WORKER_READY_TIMEOUT) {
         Ok(prompt) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-        Err(IpcWaitError::Timeout | IpcWaitError::SessionEnd | IpcWaitError::Disconnected) => {
-            Ok(None)
-        }
+        Err(IpcWaitError::Timeout) => Ok(None),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before input_wait".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker input_wait".to_string(),
+        )),
     }
-}
-
-fn pty_feed_write_timeout() -> Duration {
-    #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var(PTY_FEED_WRITE_TIMEOUT_ENV) {
-        let millis = value
-            .trim()
-            .parse::<u64>()
-            .expect("MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be integer milliseconds");
-        assert!(
-            millis > 0,
-            "MCP_REPL_TEST_PTY_FEED_WRITE_TIMEOUT_MS must be greater than zero"
-        );
-        return Duration::from_millis(millis);
-    }
-
-    PTY_FEED_WRITE_TIMEOUT
 }
 
 pub(crate) struct WorkerProcess {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
+    live_output: LiveOutputCapture,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
     expected_exit: bool,
@@ -450,7 +497,7 @@ fn send_stdin_command(
 }
 
 struct SpawnedWorker {
-    child: Child,
+    child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
@@ -466,15 +513,161 @@ struct SpawnedWorkerStdio {
 }
 
 struct SpawnedCommand {
-    child: Child,
-    #[cfg(target_family = "unix")]
+    child: WorkerChild,
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     pty_stdio: Option<SpawnedPtyStdio>,
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 struct SpawnedPtyStdio {
     reader: File,
     writer: Box<dyn Write + Send>,
+}
+
+enum WorkerChild {
+    Standard(Child),
+    #[cfg(target_family = "windows")]
+    DirectWindows(WindowsProcess),
+}
+
+impl WorkerChild {
+    fn standard(child: Child) -> Self {
+        Self::Standard(child)
+    }
+
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.id(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Standard(child) => child.try_wait(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Standard(child) => child.wait(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.wait(),
+        }
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Standard(child) => child.kill(),
+            #[cfg(target_family = "windows")]
+            Self::DirectWindows(child) => child.kill(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn standard_child(&self) -> &Child {
+        match self {
+            Self::Standard(child) => child,
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn close_job(&mut self) {
+        match self {
+            Self::Standard(_) => {}
+            Self::DirectWindows(child) => child.close_job(),
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+struct WindowsProcess {
+    process: HANDLE,
+    thread: HANDLE,
+    process_id: u32,
+    job: Option<crate::windows_conpty::JobHandle>,
+    _conpty: Option<crate::windows_conpty::Conpty>,
+}
+
+#[cfg(target_family = "windows")]
+unsafe impl Send for WindowsProcess {}
+
+#[cfg(target_family = "windows")]
+impl WindowsProcess {
+    unsafe fn from_process_information(
+        proc_info: PROCESS_INFORMATION,
+        conpty: Option<crate::windows_conpty::Conpty>,
+        job: Option<crate::windows_conpty::JobHandle>,
+    ) -> Self {
+        Self {
+            process: proc_info.hProcess,
+            thread: proc_info.hThread,
+            process_id: proc_info.dwProcessId,
+            job,
+            _conpty: conpty,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.process_id
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let wait = unsafe { WaitForSingleObject(self.process, 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if wait == WAIT_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.exit_status().map(Some)
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let wait = unsafe { WaitForSingleObject(self.process, u32::MAX) };
+        if wait == WAIT_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.exit_status()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if let Some(job) = self.job.take() {
+            drop(job);
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(self.process, 1) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close_job(&mut self) {
+        self.job.take();
+    }
+
+    fn exit_status(&self) -> std::io::Result<ExitStatus> {
+        let mut exit_code = 0u32;
+        if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ExitStatus::from_raw(exit_code))
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl Drop for WindowsProcess {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.thread);
+            CloseHandle(self.process);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -560,6 +753,12 @@ impl WorkerProcess {
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
+        #[cfg(target_os = "windows")]
+        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+            live_output.with_windows_conpty_startup_noise_filter()
+        } else {
+            live_output
+        };
         let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
@@ -609,8 +808,6 @@ impl WorkerProcess {
             let output_capture = live_output.clone();
             let image_capture = live_output.clone();
             let sideband_capture = live_output.clone();
-            let pty_feed_stdin_tx = stdin_tx.clone();
-            let allow_pty_feed = matches!(worker_launch, WorkerLaunch::Builtin(Backend::Python));
             let handlers = IpcHandlers {
                 on_output_text: Some(Arc::new(move |text| {
                     output_capture.append_output_text(
@@ -619,11 +816,11 @@ impl WorkerProcess {
                         text.is_continuation,
                     );
                 })),
-                on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
+                on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
                     image_capture.append_image(image);
                 })),
-                on_readline_start: Some(Arc::new(move |prompt: String| {
-                    sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+                on_input_wait: Some(Arc::new(move |prompt: String| {
+                    sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
                 on_readline_result: {
                     let sideband_capture = live_output.clone();
@@ -635,20 +832,6 @@ impl WorkerProcess {
                         });
                     }))
                 },
-                on_pty_feed: Some(Arc::new(move |feed: IpcPtyFeed| {
-                    if !allow_pty_feed {
-                        return Err(
-                            "pty_feed is only supported by the built-in Python worker".to_string()
-                        );
-                    }
-                    let _ = (feed.turn_id, feed.seq);
-                    send_stdin_command(
-                        &pty_feed_stdin_tx,
-                        Some(feed.bytes),
-                        pty_feed_write_timeout(),
-                    )
-                    .map_err(|err| err.to_string())
-                })),
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
@@ -665,7 +848,7 @@ impl WorkerProcess {
                 ipc_server.connect(
                     ipc.clone(),
                     handlers,
-                    &mut child,
+                    || child.try_wait().map(|status| status.is_some()),
                     WINDOWS_IPC_CONNECT_MAX_WAIT,
                 ),
                 &mut child,
@@ -681,6 +864,7 @@ impl WorkerProcess {
             stdin_tx,
             session_tmpdir,
             ipc,
+            live_output,
             stdout_reader,
             stderr_reader,
             expected_exit: false,
@@ -794,7 +978,7 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
@@ -811,7 +995,7 @@ impl WorkerProcess {
         } = attach_spawned_worker_stdio(
             &mut child,
             spawn_stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -820,7 +1004,7 @@ impl WorkerProcess {
         let mut denial_logger = prepared.denial_logger;
         #[cfg(target_os = "macos")]
         if let Some(logger) = denial_logger.as_mut() {
-            logger.on_child_spawn(&child);
+            logger.on_child_spawn(child.standard_child());
         }
 
         Ok(SpawnedWorker {
@@ -918,7 +1102,7 @@ impl WorkerProcess {
         }
         let SpawnedCommand {
             mut child,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
         } = child_result?;
         if let Some(status) = child.try_wait()? {
@@ -935,7 +1119,7 @@ impl WorkerProcess {
         } = attach_spawned_worker_stdio(
             &mut child,
             spawn_stdin_transport,
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             pty_stdio,
             live_output.clone(),
         )?;
@@ -944,7 +1128,7 @@ impl WorkerProcess {
         let mut denial_logger = prepared.denial_logger;
         #[cfg(target_os = "macos")]
         if let Some(logger) = denial_logger.as_mut() {
-            logger.on_child_spawn(&child);
+            logger.on_child_spawn(child.standard_child());
         }
 
         Ok(SpawnedWorker {
@@ -970,8 +1154,21 @@ impl WorkerProcess {
         self.send_stdin_payload(Some(payload), timeout)
     }
 
+    pub(crate) fn note_accepted_input_starting(&self) {
+        self.live_output.note_accepted_input_starting();
+    }
+
     fn close_stdin(&mut self, timeout: Duration) -> Result<(), WorkerError> {
         self.send_stdin_payload(None, timeout)
+    }
+
+    fn request_ipc_shutdown(&self) {
+        if let Some(ipc) = self.ipc.get() {
+            let _ = ipc.send_with_timeout(
+                ServerToWorkerIpcMessage::Shutdown {},
+                Duration::from_millis(200),
+            );
+        }
     }
 
     fn send_stdin_payload(
@@ -987,14 +1184,18 @@ impl WorkerProcess {
         {
             self.send_signal(libc::SIGINT)
         }
-        #[cfg(not(target_family = "unix"))]
+        #[cfg(target_family = "windows")]
+        {
+            self.send_windows_ctrl_break()
+        }
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
             Ok(())
         }
     }
 
     #[cfg(target_family = "windows")]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
@@ -1007,6 +1208,11 @@ impl WorkerProcess {
             Some(_) => Ok(()),
             None => Err(WorkerError::Io(std::io::Error::last_os_error())),
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
+        self.send_windows_ctrl_break()
     }
 
     #[cfg(not(target_family = "windows"))]
@@ -1118,6 +1324,7 @@ impl WorkerProcess {
     }
 
     pub(crate) fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
+        self.request_ipc_shutdown();
         let _ = self.close_stdin(Duration::from_millis(200));
 
         let start = std::time::Instant::now();
@@ -1190,6 +1397,10 @@ impl WorkerProcess {
             // TODO: Track descendants or use stronger OS-level containment so children that have
             // escaped the worker process group are still killable after the root exits.
         }
+        #[cfg(target_family = "windows")]
+        {
+            self.child.close_job();
+        }
         self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
         self.report_denials();
@@ -1251,10 +1462,17 @@ impl WorkerProcess {
     pub(crate) fn new_for_test(child: Child) -> Self {
         let (stdin_tx, _stdin_rx) = mpsc::channel();
         Self {
-            child,
+            child: WorkerChild::standard(child),
             stdin_tx,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
+            live_output: LiveOutputCapture::new(
+                OversizedOutputMode::Files,
+                PendingOutputTape::new(),
+                OutputTimeline::new(Arc::new(crate::output_capture::OutputRing::with_capacity(
+                    crate::output_capture::OUTPUT_RING_CAPACITY_BYTES,
+                ))),
+            ),
             stdout_reader: None,
             stderr_reader: None,
             expected_exit: false,
@@ -1717,8 +1935,8 @@ fn spawn_command_with_transport(
                 .stderr(Stdio::piped())
                 .spawn()?;
             Ok(SpawnedCommand {
-                child,
-                #[cfg(target_family = "unix")]
+                child: WorkerChild::standard(child),
+                #[cfg(any(target_family = "unix", target_family = "windows"))]
                 pty_stdio: None,
             })
         }
@@ -1802,9 +2020,59 @@ fn spawn_command_with_pty(
     let child = command.spawn()?;
 
     Ok(SpawnedCommand {
-        child,
+        child: WorkerChild::standard(child),
         pty_stdio: Some(SpawnedPtyStdio { reader, writer }),
     })
+}
+
+#[cfg(any(test, target_family = "windows"))]
+fn apply_command_env_overrides_for_windows_conpty(
+    env_map: &mut std::collections::HashMap<String, String>,
+    command_envs: impl IntoIterator<Item = (String, Option<String>)>,
+) {
+    for (key, value) in command_envs {
+        if let Some(value) = value {
+            upsert_windows_conpty_env(env_map, &key, &value);
+        } else {
+            remove_windows_conpty_env(env_map, &key);
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn upsert_windows_conpty_env(
+    env_map: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    crate::windows_conpty::upsert_env_case_insensitive(env_map, key, value);
+}
+
+#[cfg(all(test, not(target_family = "windows")))]
+fn upsert_windows_conpty_env(
+    env_map: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    remove_windows_conpty_env(env_map, key);
+    env_map.insert(key.to_string(), value.to_string());
+}
+
+#[cfg(target_family = "windows")]
+fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, String>, key: &str) {
+    crate::windows_conpty::remove_env_case_insensitive(env_map, key);
+}
+
+#[cfg(all(test, not(target_family = "windows")))]
+fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, String>, key: &str) {
+    let removals: Vec<String> = env_map
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(key))
+        .cloned()
+        .collect();
+    for existing in removals {
+        env_map.remove(&existing);
+    }
 }
 
 #[cfg(target_family = "windows")]
@@ -1812,28 +2080,46 @@ fn spawn_command_with_pty(
     command: &mut Command,
     _echo: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
-    let mut wrapper = Command::new(std::env::current_exe()?);
-    wrapper.arg(crate::windows_conpty::WINDOWS_CONPTY_ARG);
-    wrapper.arg("--");
-    wrapper.arg(command.get_program());
-    wrapper.args(command.get_args());
-    if let Some(cwd) = command.get_current_dir() {
-        wrapper.current_dir(cwd);
-    }
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            wrapper.env(key, value);
-        } else {
-            wrapper.env_remove(key);
-        }
-    }
-    wrapper.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    let child = wrapper
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(SpawnedCommand { child })
+    let mut command_line = Vec::new();
+    command_line.push(command.get_program().to_string_lossy().to_string());
+    command_line.extend(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string()),
+    );
+    let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+    apply_command_env_overrides_for_windows_conpty(
+        &mut env_map,
+        command.get_envs().map(|(key, value)| {
+            (
+                key.to_string_lossy().to_string(),
+                value.map(|value| value.to_string_lossy().to_string()),
+            )
+        }),
+    );
+    let (proc_info, mut conpty) = unsafe {
+        crate::windows_conpty::spawn_conpty_process_direct(
+            &command_line,
+            command.get_current_dir(),
+            &mut env_map,
+        )
+        .map_err(WorkerError::Protocol)?
+    };
+    let job = unsafe {
+        crate::windows_conpty::JobHandle::kill_on_close()
+            .ok()
+            .and_then(|job| job.assign_process(proc_info.hProcess).ok().map(|()| job))
+    };
+    let writer = conpty.take_input_writer().map_err(WorkerError::Protocol)?;
+    let reader = conpty.take_output_reader().map_err(WorkerError::Protocol)?;
+    let child = unsafe { WindowsProcess::from_process_information(proc_info, Some(conpty), job) };
+    Ok(SpawnedCommand {
+        child: WorkerChild::DirectWindows(child),
+        pty_stdio: Some(SpawnedPtyStdio {
+            reader,
+            writer: Box::new(writer),
+        }),
+    })
 }
 
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -1876,15 +2162,28 @@ fn configure_pty_slave_echo(fd: libc::c_int, enabled: bool) -> Result<(), Worker
 }
 
 fn attach_spawned_worker_stdio(
-    child: &mut Child,
+    child: &mut WorkerChild,
     stdin_transport: WorkerStdinTransport,
-    #[cfg(target_family = "unix")] pty_stdio: Option<SpawnedPtyStdio>,
+    #[cfg(any(target_family = "unix", target_family = "windows"))] pty_stdio: Option<
+        SpawnedPtyStdio,
+    >,
     live_output: LiveOutputCapture,
 ) -> Result<SpawnedWorkerStdio, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
-            #[cfg(target_family = "unix")]
+            #[cfg(any(target_family = "unix", target_family = "windows"))]
             let _ = pty_stdio;
+            #[cfg(target_family = "windows")]
+            let child = match child {
+                WorkerChild::Standard(child) => child,
+                WorkerChild::DirectWindows(_) => {
+                    return Err(WorkerError::Protocol(
+                        "pipe worker process does not expose pipe stdio".to_string(),
+                    ));
+                }
+            };
+            #[cfg(not(target_family = "windows"))]
+            let WorkerChild::Standard(child) = child;
             let stdin = child
                 .stdin
                 .take()
@@ -1917,22 +2216,16 @@ fn attach_spawned_worker_stdio(
             }
             #[cfg(target_family = "windows")]
             {
-                let stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
-                let stdin_tx = spawn_stdin_writer(stdin);
-                let stdout_reader = spawn_output_reader(
-                    child.stdout.take(),
-                    TextStream::Stdout,
-                    live_output.clone(),
-                )?;
-                let stderr_reader =
-                    spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output)?;
+                let pty_stdio = pty_stdio.ok_or_else(|| {
+                    WorkerError::Protocol("worker ConPTY stdio unavailable".to_string())
+                })?;
+                let stdin_tx = spawn_stdin_writer(pty_stdio.writer);
+                let stdout_reader =
+                    spawn_output_reader(Some(pty_stdio.reader), TextStream::Stdout, live_output)?;
                 Ok(SpawnedWorkerStdio {
                     stdin_tx,
                     stdout_reader,
-                    stderr_reader,
+                    stderr_reader: None,
                 })
             }
             #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -1994,14 +2287,14 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
 }
 
 #[cfg(target_family = "windows")]
-pub(crate) fn handle_windows_ipc_connect_result(
+fn handle_windows_ipc_connect_result(
     connect_result: Result<(), std::io::Error>,
-    child: &mut Child,
+    child: &mut WorkerChild,
 ) -> Result<(), WorkerError> {
     match connect_result {
         Ok(()) => Ok(()),
-        // The child here is the sandbox wrapper process. Give it a short grace
-        // period to unwind ACL changes before forcing termination/reap.
+        // Give the worker a short grace period to unwind before forcing
+        // termination/reap after IPC startup failure.
         Err(err) => {
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
@@ -2029,9 +2322,9 @@ pub(crate) fn handle_windows_ipc_connect_result(
 }
 
 #[cfg(target_family = "windows")]
-pub(crate) fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
-    // The Windows child is the sandbox wrapper. Let it exit naturally so it can
-    // roll back temporary ACL state before process teardown.
+fn request_soft_termination(_child: &mut WorkerChild) -> Result<(), WorkerError> {
+    // Let Windows workers exit through sideband shutdown when possible. Hard
+    // termination remains the bounded fallback in the caller.
     Ok(())
 }
 
@@ -2084,12 +2377,30 @@ mod tests {
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
-    fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
+    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
             prompt: prompt.to_string(),
             line: line.to_string(),
-            source: OutputTextSource::Ipc,
+            source: OutputTextSource::Raw,
         }
+    }
+
+    fn capture_with_ring(
+        oversized_output: OversizedOutputMode,
+    ) -> (LiveOutputCapture, Arc<OutputRing>, PendingOutputTape) {
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            oversized_output,
+            tape.clone(),
+            OutputTimeline::new(output_ring.clone()),
+        );
+        (capture, output_ring, tape)
+    }
+
+    fn ring_bytes(output_ring: &OutputRing) -> Vec<u8> {
+        let output_end = output_ring.end_offset();
+        output_ring.read_range(0, output_end).bytes
     }
 
     #[cfg(target_family = "unix")]
@@ -2316,7 +2627,7 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
@@ -2353,6 +2664,98 @@ mod tests {
     }
 
     #[test]
+    fn raw_windows_conpty_startup_noise_is_dropped_before_input() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h\r\n", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents
+                .is_empty(),
+            "raw ConPTY startup toggles should not enter output bundles"
+        );
+    }
+
+    #[test]
+    fn sideband_terminal_mode_toggles_are_preserved() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_output_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout, false);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
+        );
+    }
+
+    #[test]
+    fn raw_terminal_mode_toggles_are_preserved_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_startup_filter_preserves_mixed_output() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001hvisible\n", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001hvisible\n");
+        assert_eq!(
+            tape.drain_final_snapshot()
+                .format_contents_for_reply()
+                .contents,
+            vec![WorkerContent::worker_stdout("\u{1b}[?9001hvisible\n")]
+        );
+    }
+
+    #[test]
+    fn windows_conpty_env_merge_overrides_case_insensitive_names() {
+        let mut env_map = std::collections::HashMap::from([
+            ("Path".to_string(), "old-path".to_string()),
+            ("Temp".to_string(), "old-temp".to_string()),
+        ]);
+
+        apply_command_env_overrides_for_windows_conpty(
+            &mut env_map,
+            [
+                ("PATH".to_string(), Some("new-path".to_string())),
+                ("temp".to_string(), None),
+            ],
+        );
+
+        assert_eq!(env_map.get("PATH"), Some(&"new-path".to_string()));
+        assert!(
+            !env_map.contains_key("Path"),
+            "PATH override should replace inherited Path entry"
+        );
+        assert!(
+            !env_map.keys().any(|key| key.eq_ignore_ascii_case("temp")),
+            "temp removal should remove inherited Temp entry"
+        );
+    }
+
+    #[test]
     fn files_output_capture_anchors_update_notice_before_late_echo() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
@@ -2365,9 +2768,9 @@ mod tests {
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
@@ -2375,7 +2778,7 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let contents = tape
             .drain_final_snapshot()
@@ -2408,16 +2811,16 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
 
         let output_capture = capture.clone();
-        let start_capture = capture.clone();
+        let wait_capture = capture.clone();
         let result_capture = capture.clone();
         let image_capture = capture.clone();
         let session_capture = capture.clone();
-        let (_server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
+        let (server, worker) = crate::ipc::test_connection_pair_with_handlers(IpcHandlers {
             on_output_text: Some(Arc::new(move |text| {
                 output_capture.append_output_text(&text.bytes, text.stream, text.is_continuation);
             })),
-            on_readline_start: Some(Arc::new(move |prompt| {
-                start_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+            on_input_wait: Some(Arc::new(move |prompt| {
+                wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
             on_readline_result: Some(Arc::new(move |event| {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
@@ -2426,22 +2829,25 @@ mod tests {
                     echo_source: PendingTextSource::Ipc,
                 });
             })),
-            on_plot_image: Some(Arc::new(move |image| {
+            on_output_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
             })),
             on_session_end: Some(Arc::new(move || {
                 session_capture.append_sideband(PendingSidebandKind::SessionEnd);
                 done_tx.send(()).expect("send session end marker");
             })),
-            ..IpcHandlers::default()
         })
         .expect("ipc pair");
 
         worker
-            .send(WorkerToServerIpcMessage::ReadlineStart {
+            .send(WorkerToServerIpcMessage::InputWait {
                 prompt: "> ".to_string(),
             })
-            .expect("send readline_start");
+            .expect("send initial input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observed initial input_wait");
+        server.begin_input().expect("server starts input");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stdout,
@@ -2450,19 +2856,19 @@ mod tests {
             })
             .expect("send stdout output_text");
         worker
-            .send(WorkerToServerIpcMessage::ReadlineResult {
+            .send(WorkerToServerIpcMessage::InputLine {
                 prompt: "> ".to_string(),
-                line: "plot(1)\n".to_string(),
+                text: "plot(1)\n".to_string(),
             })
-            .expect("send readline_result");
+            .expect("send input_line");
         worker
-            .send(WorkerToServerIpcMessage::PlotImage {
+            .send(WorkerToServerIpcMessage::OutputImage {
                 mime_type: "image/png".to_string(),
-                data: "AA==".to_string(),
+                data_b64: "AA==".to_string(),
                 is_update: false,
                 source: None,
             })
-            .expect("send plot_image");
+            .expect("send output_image");
         worker
             .send(WorkerToServerIpcMessage::OutputText {
                 stream: TextStream::Stderr,
@@ -2471,10 +2877,14 @@ mod tests {
             })
             .expect("send stderr output_text");
         worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "> ".to_string(),
+            })
+            .expect("send completion input_wait");
+        worker
             .send(WorkerToServerIpcMessage::SessionEnd {
                 reason: None,
-                message_b64: None,
-                turn_id: None,
+                message: None,
             })
             .expect("send session_end");
 
@@ -2483,11 +2893,11 @@ mod tests {
             .expect("server IPC consumed session_end");
 
         let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 6);
+        assert_eq!(snapshot.events.len(), 7);
         assert!(matches!(
             &snapshot.events[0],
             PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineStart { prompt },
+                kind: PendingSidebandKind::InputWait { prompt },
                 ..
             } if prompt == "> "
         ));
@@ -2528,6 +2938,13 @@ mod tests {
         assert!(matches!(
             &snapshot.events[5],
             PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::InputWait { prompt },
+                ..
+            } if prompt == "> "
+        ));
+        assert!(matches!(
+            &snapshot.events[6],
+            PendingOutputEvent::Sideband {
                 kind: PendingSidebandKind::SessionEnd,
                 ..
             }
@@ -2564,7 +2981,7 @@ mod tests {
             OutputTimeline::new(output_ring.clone()),
         );
 
-        capture.append_image(IpcPlotImage {
+        capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
             mime_type: "image/png".to_string(),
@@ -2572,12 +2989,12 @@ mod tests {
             updates_previous_image: true,
             readline_results_seen: 1,
         });
-        capture.append_output_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout, false);
+        capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let end = output_ring.end_offset();
         let collapsed = collapse_echo_with_attribution(
             output_ring.read_range(0, end),
-            &[echo_event("> ", "lines(4:8, 4:8)\n")],
+            &[raw_echo_event("> ", "lines(4:8, 4:8)\n")],
             0,
             &["> ".to_string()],
             EchoCollapseMode::CollapseForFinalReply,
@@ -2605,8 +3022,8 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_ipc_connect_error_reaps_wrapper_process() {
-        let mut child = sleeping_test_child();
+    fn windows_ipc_connect_error_reaps_worker_process() {
+        let mut child = WorkerChild::standard(sleeping_test_child());
 
         let result = handle_windows_ipc_connect_result(
             Err(std::io::Error::other("ipc connect failed")),
@@ -2632,7 +3049,7 @@ mod tests {
     #[cfg(target_family = "windows")]
     #[test]
     fn windows_soft_termination_does_not_kill_child() {
-        let mut child = sleeping_test_child();
+        let mut child = WorkerChild::standard(sleeping_test_child());
 
         request_soft_termination(&mut child).expect("soft terminate call should succeed");
 

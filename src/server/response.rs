@@ -2798,6 +2798,55 @@ mod tests {
     }
 
     #[test]
+    fn standalone_terminal_mode_toggles_are_preserved_from_worker_content() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h"),
+                    WorkerContent::worker_stdout("2\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        assert_eq!(result_text(&result), "\u{1b}[?9001h\u{1b}[?1004h2\n");
+    }
+
+    #[test]
+    fn standalone_terminal_mode_toggles_are_preserved_in_output_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let visible = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let toggles = "\u{1b}[?9001h\u{1b}[?1004h";
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(toggles),
+                    WorkerContent::worker_stdout(visible.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+        assert_eq!(transcript, format!("{toggles}{visible}"));
+        assert!(
+            text.contains("\u{1b}[?9001h") && text.contains("\u{1b}[?1004h"),
+            "expected terminal mode toggles in inline preview: {text:?}"
+        );
+    }
+
+    #[test]
     fn events_log_text_rows_preserve_partial_line_state_across_images() {
         let mut store = OutputStore::new().expect("output store should initialize");
         let mut bundle = store.new_bundle().expect("bundle should initialize");

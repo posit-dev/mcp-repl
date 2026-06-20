@@ -168,13 +168,16 @@ impl IpcServer {
     }
 
     #[cfg(target_family = "windows")]
-    pub fn connect(
+    pub fn connect<ChildExited>(
         self,
         handle: IpcHandle,
         handlers: IpcHandlers,
-        child: &mut std::process::Child,
+        child_exited: ChildExited,
         max_wait: Duration,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        ChildExited: FnMut() -> io::Result<bool>,
+    {
         let Some(server_pipe_to_worker) = self.server_pipe_to_worker else {
             return Err(io::Error::other(
                 "missing ipc named pipe handle (to-worker)",
@@ -186,9 +189,14 @@ impl IpcServer {
             ));
         };
         let start = Instant::now();
-        connect_named_pipe_with_process_retry(&server_pipe_to_worker, child, max_wait)?;
+        let mut child_exited = child_exited;
+        connect_named_pipe_with_process_retry(&server_pipe_to_worker, &mut child_exited, max_wait)?;
         let remaining = max_wait.saturating_sub(start.elapsed());
-        connect_named_pipe_with_process_retry(&server_pipe_from_worker, child, remaining)?;
+        connect_named_pipe_with_process_retry(
+            &server_pipe_from_worker,
+            &mut child_exited,
+            remaining,
+        )?;
         let conn = ServerIpcConnection::new(
             IpcTransport {
                 reader: Box::new(server_pipe_from_worker),
@@ -645,12 +653,12 @@ fn join_connector_with_grace(connector: thread::JoinHandle<()>, max_wait: Durati
 #[cfg(target_family = "windows")]
 fn connect_named_pipe_with_process_retry(
     server_pipe: &File,
-    child: &mut std::process::Child,
+    child_exited: &mut impl FnMut() -> io::Result<bool>,
     max_wait: Duration,
 ) -> io::Result<()> {
     connect_named_pipe_with_process_retry_impl(
         |timeout| connect_named_pipe(server_pipe, timeout),
-        || child.try_wait().map(|status| status.is_some()),
+        child_exited,
         max_wait,
     )
 }
@@ -778,6 +786,13 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC to-worker pipe missing"))?;
         let pipe_from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV)
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC from-worker pipe missing"))?;
+        // The main worker owns the live sideband pipe names. Once startup has consumed the
+        // bootstrap env vars, user code and descendants must not see or reuse them.
+        // SAFETY: worker startup consumes these env vars before any worker-managed threads exist.
+        unsafe {
+            std::env::remove_var(IPC_PIPE_TO_WORKER_ENV);
+            std::env::remove_var(IPC_PIPE_FROM_WORKER_ENV);
+        }
         let deadline = Instant::now() + timeout;
         let mut reader: Option<File> = None;
         let mut writer: Option<File> = None;

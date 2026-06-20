@@ -101,21 +101,23 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
-fn worker_sideband_protocol_keeps_plot_images_one_way() {
+fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
-        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 3 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
-        r#"{ "type": "turn_start", "turn_id": <integer>, "input": <string> }"#,
-        r#"{ "type": "input_line", "turn_id": <integer>, "prompt": <string>, "text": <string> }"#,
-        r#"{ "type": "idle", "turn_id": <integer>, "prompt": <string> }"#,
-        r#"{ "type": "interrupt", "turn_id": <integer> }"#,
-        "This document defines worker protocol version 3.",
-        "The server rejects other",
-        "There is no plot-image acknowledgement message.",
-        "Workers must not delay stdout/stderr output waiting for sideband responses.",
+        r#"{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "input_batch", "input": <string> }"#,
+        r#"{ "type": "input_line", "prompt": <string>, "text": <string> }"#,
+        r#"{ "type": "input_wait", "prompt": <string> }"#,
+        r#"{ "type": "session_end", "reason": <string>, "message": <string, optional> }"#,
+        r#"{ "type": "interrupt" }"#,
+        "This document defines worker protocol version 6.",
+        "The server rejects unsupported",
+        "There is no image acknowledgement message.",
+        "Worker-owned runtime output must be emitted only on sideband IPC",
+        "Workers must not delay unowned raw",
         "Submitted input must not be emitted as `output_text`.",
         "The server may reconstruct `prompt + text` from ordered `input_line` events",
     ] {
@@ -126,39 +128,24 @@ fn worker_sideband_protocol_keeps_plot_images_one_way() {
     }
 
     for forbidden in [
+        r#"{ "type": "plot_image", "mime_type": <string>, "data": <base64>, "is_update": <bool>, "source": <string|null> }"#,
+        r#"{ "type": "output_image", "image_id": <string>, "mime_type": <string>, "data_b64": <base64>, "update": <bool> }"#,
         "`plot_image_ack`",
         r#""sequence": <integer|null>"#,
+        r#"{ "type": "readline_start", "prompt": <string> }"#,
+        r#"{ "type": "input_batch", "input_id": <integer>, "input": <string> }"#,
+        r#"{ "type": "input_line", "input_id": <integer>, "prompt": <string>, "text": <string> }"#,
+        r#"{ "type": "input_wait", "input_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "interrupt", "input_id": <integer> }"#,
+        r#"{ "type": "idle", "input_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "stdin_wait", "input_id": <integer>, "prompt": <string> }"#,
+        r#"{ "type": "turn_input", "input_id": <integer>, "input": <string> }"#,
         "version 2 from built-in and migrating workers",
         "Legacy v2 image event retained for built-in workers during migration.",
     ] {
         assert!(
             !protocol.contains(forbidden),
             "did not expect {forbidden} in docs/worker_sideband_protocol.md"
-        );
-    }
-}
-
-#[test]
-fn futurework_does_not_revive_server_inferred_worker_completion() {
-    let note = read(&repo_root().join("docs/futurework/r-worker-turn-boundary-simplification.md"));
-
-    for required in [
-        "worker-emitted `idle` or `session_end`",
-        "Server-inferred completion is no longer the intended direction",
-    ] {
-        assert!(
-            note.contains(required),
-            "missing {required} in r-worker simplification futurework"
-        );
-    }
-
-    for forbidden in [
-        "request completion is now inferred by the\nserver from prompt/readline sideband facts",
-        "The server should infer more of the logical request timeline",
-    ] {
-        assert!(
-            !note.contains(forbidden),
-            "did not expect {forbidden} in r-worker simplification futurework"
         );
     }
 }
@@ -301,7 +288,7 @@ fn ci_runs_codex_integration_with_mock_backend() {
         "name: Install Codex CLI (windows)",
         "npm install -g @openai/codex",
         "name: cargo test",
-        "run: cargo test --quiet",
+        "run: cargo test --quiet -- --test-threads=5",
         "MCP_REPL_CODEX_BACKEND: mock",
     ] {
         assert!(
@@ -337,7 +324,12 @@ fn ci_runs_codex_integration_with_mock_backend() {
     );
     assert_contains_wrapped_text(
         &testing_docs,
-        "CI passes Cargo's `--quiet` flag to keep successful logs compact.",
+        "CI passes Cargo's `--quiet` flag to keep successful logs compact and caps the Rust test harness at five threads so integration tests do not oversubscribe worker-backed REPL sessions on hosted runners.",
+        "docs/testing.md",
+    );
+    assert_contains_wrapped_text(
+        &testing_docs,
+        "CI uses the same capped Cargo scheduling on Linux, macOS, and Windows by running `cargo test --quiet -- --test-threads=5` for every matrix target.",
         "docs/testing.md",
     );
     assert_contains_wrapped_text(

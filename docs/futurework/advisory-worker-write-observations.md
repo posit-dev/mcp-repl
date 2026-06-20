@@ -17,7 +17,7 @@ just "readline happened":
 - they know which stream is being written,
 - they know the exact byte slice being written,
 - they know the local callback order relative to other worker-side events such
-  as `readline_result` and `plot_image`.
+  as `input_line` and `output_image`.
 
 That information is incomplete, but it may still be useful.
 

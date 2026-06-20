@@ -1,7 +1,7 @@
 `repl` runs source text in a persistent Python REPL session and returns emitted stdout/stderr and images.
 
 Arguments:
-- `input` (string): bytes to write to backend stdin.
+- `input` (string): Python source text to send to the persistent REPL session.
 - `timeout_ms` (number, optional): maximum milliseconds to wait before returning.
   Timeout bounds only this response window; it does not cancel backend work.
 

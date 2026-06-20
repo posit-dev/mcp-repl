@@ -29,7 +29,6 @@ impl WorkerManager {
 
     pub(super) fn note_session_end(&mut self, include_notice: bool) {
         self.session_end_seen = true;
-        self.stdin_waiting = false;
         if let Some(process) = self.process.as_mut() {
             process.note_expected_exit();
             if include_notice {
@@ -302,6 +301,13 @@ mod tests {
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
+            prompt: ">>> ".to_string(),
+        });
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes initial input_wait");
+        server.begin_input().expect("begin input");
         process.set_ipc_for_test(server);
         manager.process = Some(process);
         manager.pending_request = true;
@@ -309,15 +315,9 @@ mod tests {
         manager.pending_request_input = Some("quit()\n".to_string());
 
         let prompt = ">>> ".to_string();
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: prompt.clone(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+        let _ = worker.send(WorkerToServerIpcMessage::InputLine {
             prompt,
-            line: "quit()\n".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: ">>> ".to_string(),
+            text: "quit()\n".to_string(),
         });
         drop(worker);
         manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));

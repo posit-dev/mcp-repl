@@ -1,10 +1,11 @@
 use std::sync::atomic::Ordering;
 
 use super::WorkerManager;
-use super::backend_driver::output_echo_source_for_backend;
 use crate::completion_reply::{CompletionInfo, InputContext};
 use crate::ipc::IpcEchoEvent;
-use crate::output_capture::{OutputBuffer, reset_last_reply_marker_offset, reset_output_ring};
+use crate::output_capture::{
+    OutputBuffer, OutputTextSource, reset_last_reply_marker_offset, reset_output_ring,
+};
 use crate::output_snapshot::take_range_from_ring_after_completion;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
@@ -234,7 +235,6 @@ impl WorkerManager {
         let prompt = self.last_prompt.clone();
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: prompt.clone(),
-            stdin_wait_prompt: None,
             prompt_variants: prompt.clone().map(|prompt| vec![prompt]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -256,13 +256,12 @@ impl WorkerManager {
             (Some(prompt), Some(line)) => vec![IpcEchoEvent {
                 prompt,
                 line,
-                source: output_echo_source_for_backend(self.backend),
+                source: OutputTextSource::Raw,
             }],
             _ => Vec::new(),
         };
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: self.last_prompt.clone(),
-            stdin_wait_prompt: None,
             prompt_variants,
             echo_events,
             protocol_warnings: Vec::new(),
@@ -283,7 +282,7 @@ impl WorkerManager {
         if !preserve_detached_output {
             self.pending_request_input = None;
         }
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -291,7 +290,6 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -315,7 +313,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -324,7 +322,6 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -407,7 +404,6 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -445,7 +441,6 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
@@ -507,26 +502,24 @@ mod tests {
 
     #[test]
     fn pager_respawned_pending_request_trims_echo_without_echo_events() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        let _guard = output_ring_test_guard();
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
         manager.pending_request = true;
         manager.last_prompt = Some(">>> ".to_string());
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.output.start_capture();
-        manager.output_timeline.append_ipc_text_with_continuation(
+        manager.output_timeline.append_text(
             b">>> import time; time.sleep(0.2)\nDETACHED_OK\n",
             false,
             ContentOrigin::Worker,
-            false,
         );
 
         manager.reset_output_state_pager_preserving_detached_output(false);
@@ -613,13 +606,13 @@ mod tests {
 
         manager
             .pending_output_tape
-            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
         manager
             .pending_output_tape
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
+                echo_source: PendingTextSource::Raw,
             });
         manager.pending_output_tape.append_stdout_bytes(b"start\n");
 

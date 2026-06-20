@@ -229,6 +229,28 @@ async fn wait_until_busy_follow_up_discloses_transcript_path(
     )
 }
 
+async fn retry_input_until_output_contains(
+    session: &mut common::McpTestSession,
+    input: &str,
+    needle: &str,
+    label: &str,
+) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
+        let result = wait_until_not_busy(session, result).await?;
+        let text = result_text(&result);
+        if text.contains(needle) {
+            return Ok(text);
+        }
+        last_text = text;
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(format!("{label} did not produce {needle:?}; last response: {last_text:?}").into())
+}
+
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -365,8 +387,8 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         "did not expect the leading echoed prefix to remain, got: {text:?}"
     );
     assert!(
-        text.contains("> 1+1"),
-        "expected later echoed expression to remain for attribution after output interleaving, got: {text:?}"
+        !text.contains("> 1+1"),
+        "did not expect submitted expression echo after output interleaving, got: {text:?}"
     );
 
     let result = session
@@ -382,12 +404,12 @@ async fn write_stdin_echo_prefix_batch() -> TestResult<()> {
         "expected all expression output, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('SECOND\\n')"),
-        "expected second submitted expression echo for attribution, got: {text:?}"
+        !text.contains("> cat('SECOND\\n')"),
+        "did not expect second submitted expression echo, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('THIRD\\n')"),
-        "expected third submitted expression echo for attribution, got: {text:?}"
+        !text.contains("> cat('THIRD\\n')"),
+        "did not expect third submitted expression echo, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -419,8 +441,8 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_echo
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() >= 2,
-        "expected raw child stdout and later R echo to both remain visible, got: {text:?}"
+        text.matches("> 1+1").count() == 1,
+        "expected raw child stdout to remain visible without a submitted-input echo, got: {text:?}"
     );
     Ok(())
 }
@@ -476,6 +498,99 @@ async fn write_stdin_trims_matched_readline_transcripts() -> TestResult<()> {
         "expected spilled worker output in transcript.txt, got: {transcript:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "answer <- readline('ASK> '); cat('ANSWER=', answer, '\\n', sep = '')",
+            Some(10.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("ASK> "),
+        "expected readline prompt, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("<<repl status: waiting for stdin>>"),
+        "did not expect stale stdin-wait status for nested R input, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
+    let second = wait_until_not_busy(&mut session, second).await?;
+    let second_text = result_text(&second);
+
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("ANSWER=alpha"),
+        "expected follow-up input to satisfy readline, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("ASK> alpha"),
+        "did not expect synthetic readline input echo in reply, got: {second_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_interrupt_aborts_pending_r_readline() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first = session
+        .write_stdin_raw_with(
+            "answer <- readline('INTERRUPT_ASK> '); cat('READLINE_ANSWER=', answer, '\\n', sep = '')",
+            Some(10.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        first_text.contains("INTERRUPT_ASK> "),
+        "expected readline prompt before interrupt, got: {first_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(10.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !interrupt_text.contains("<<repl status: busy"),
+        "expected readline interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up_text = retry_input_until_output_contains(
+        &mut session,
+        "cat('AFTER_R_READLINE_INTERRUPT\\n')",
+        "AFTER_R_READLINE_INTERRUPT",
+        "readline interrupt follow-up",
+    )
+    .await?;
+
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("READLINE_ANSWER="),
+        "did not expect follow-up input to satisfy the interrupted readline, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
     Ok(())
 }
 
@@ -1398,52 +1513,39 @@ async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = spawn_behavior_session().await?;
+    let mut session = spawn_behavior_session().await?;
 
-    let tail_sleep_secs = if cfg!(windows) { 1.0 } else { 0.6 };
+    let temp = workspace_tempdir()?;
+    let gate_path = temp.path().join("tail-gate");
+    let gate_literal = r_path_literal(&gate_path)?;
     let input = format!(
-        "big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep({tail_sleep_secs}); cat('TAIL\\n')"
+        "gate <- {gate_literal}; big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); while (!file.exists(gate)) Sys.sleep(0.05); cat('TAIL\\n')"
     );
-    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(1.0, 2.0)))
+        .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-
-    sleep(test_delay_ms(160, 700)).await;
-    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
-    let spilled_text = result_text(&spilled);
-    let transcript_path = match bundle_transcript_path(&spilled_text) {
-        Some(path) => path,
-        None if spilled_text.contains("<<repl status: busy") => {
-            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        None => {
-            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
-        }
-    };
+    let transcript_path = bundle_transcript_path(&first_text).unwrap_or_else(|| {
+        panic!("expected transcript path in gated timeout reply, got: {first_text:?}")
+    });
 
     let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
     let busy_text = result_text(&busy_follow_up);
-    if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<repl status: busy")
-    {
-        eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+    assert!(
+        busy_text.contains("input discarded while worker busy")
+            || busy_text.contains("<<repl status: busy"),
+        "expected busy follow-up while the gated request was still pending, got: {busy_text:?}"
+    );
 
+    fs::write(&gate_path, b"release")?;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<repl status: busy") {
-        eprintln!("write_stdin_behavior final poll remained busy; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     let transcript = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;

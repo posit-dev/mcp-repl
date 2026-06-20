@@ -506,6 +506,10 @@ local({
     return(invisible(NULL))
   }
 
+  .mcp_repl_plot_flush <- function(reason = "") {
+    invisible(NULL)
+  }
+
   .mcp_repl_plot_state <- new.env(parent = emptyenv())
   .mcp_repl_plot_state$counter <- 0L
   .mcp_repl_plot_state$current_id <- NULL
@@ -723,6 +727,10 @@ local({
       silent = TRUE
     )
     invisible(NULL)
+  }
+
+  .mcp_repl_plot_flush <<- function(reason = "") {
+    .mcp_repl_plot_process_changes(reason)
   }
 
   .mcp_repl_plot_before_new_page <- function(reason = "") {
