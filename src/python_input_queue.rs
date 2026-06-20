@@ -41,6 +41,11 @@ impl PythonInputQueue {
         self.queued_bytes.clear();
     }
 
+    pub(crate) fn clear_after_cell_finish(&mut self) {
+        self.active_input = false;
+        self.queued_bytes.clear();
+    }
+
     pub(crate) fn has_active_input(&self) -> bool {
         self.active_input
     }

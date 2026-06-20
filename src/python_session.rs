@@ -533,7 +533,7 @@ fn finish_cell_request(generation: u64) {
         }
         #[cfg(target_family = "unix")]
         {
-            let _ = guard.input_queue.take_completed_input();
+            guard.input_queue.clear_after_cell_finish();
         }
         guard.current_prompt = None;
         guard.current_readline_state = None;

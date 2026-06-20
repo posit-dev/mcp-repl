@@ -104,22 +104,35 @@ def _mcp_repl_capture_prompts():
         sys.ps2 = _mcp_repl_suppressed_ps2
 
 
-def _mcp_repl_run_cell(source):
-    module = ast.parse(source, "<mcp-repl>", "exec")
-    namespace = globals()
-    if module.body and isinstance(module.body[-1], ast.Expr):
-        setup = ast.Module(body=module.body[:-1], type_ignores=module.type_ignores)
-        ast.fix_missing_locations(setup)
-        setup_code = compile(setup, "<mcp-repl>", "exec")
+# Run a complete cell, displaying a final top-level expression like the REPL.
+def _mcp_repl_run_cell(
+    source,
+    _ast_parse=ast.parse,
+    _ast_module=ast.Module,
+    _ast_expr=ast.Expr,
+    _ast_expression=ast.Expression,
+    _ast_fix_missing_locations=ast.fix_missing_locations,
+    _compile=compile,
+    _eval=eval,
+    _globals=globals,
+    _isinstance=isinstance,
+    _sys=sys,
+):
+    module = _ast_parse(source, "<mcp-repl>", "exec")
+    namespace = _globals()
+    if module.body and _isinstance(module.body[-1], _ast_expr):
+        setup = _ast_module(body=module.body[:-1], type_ignores=module.type_ignores)
+        _ast_fix_missing_locations(setup)
+        setup_code = _compile(setup, "<mcp-repl>", "exec")
 
-        expression = ast.Expression(module.body[-1].value)
-        ast.fix_missing_locations(expression)
-        expression_code = compile(expression, "<mcp-repl>", "eval")
+        expression = _ast_expression(module.body[-1].value)
+        _ast_fix_missing_locations(expression)
+        expression_code = _compile(expression, "<mcp-repl>", "eval")
         exec(setup_code, namespace, namespace)
-        value = eval(expression_code, namespace, namespace)
-        sys.displayhook(value)
+        value = _eval(expression_code, namespace, namespace)
+        _sys.displayhook(value)
     else:
-        exec(compile(module, "<mcp-repl>", "exec"), namespace, namespace)
+        exec(_compile(module, "<mcp-repl>", "exec"), namespace, namespace)
 
 
 def _input(prompt=""):

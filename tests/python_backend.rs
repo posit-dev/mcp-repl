@@ -1828,6 +1828,54 @@ print("RAW_PARTIAL_RESULT", data.decode("utf-8").strip(), flush=True)
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_partial_raw_stdin_read_clears_leftover_newline_before_next_cell() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 5).decode("utf-8")
+print("RAW_PARTIAL_EXACT", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected raw stdin read to wait for follow-up input, got: {first_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("bravo", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("RAW_PARTIAL_EXACT bravo"),
+        "expected raw stdin read to consume five bytes from the answer, got: {answer_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_PARTIAL_RAW_CELL')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&follow_up_text),
+        "expected fresh cell after partial raw stdin read to finish, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_PARTIAL_RAW_CELL"),
+        "expected fresh cell after partial raw stdin read to run, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();
@@ -2590,6 +2638,42 @@ async fn python_cell_custom_displayhook_is_honored() -> TestResult<()> {
     assert!(
         text.contains("DISPLAYHOOK_VALUE 42"),
         "expected final expression to use custom displayhook, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_runner_survives_shadowed_user_globals() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            "ast = 1\nglobals = 2\ncompile = 3\nprint('SHADOW_SETUP')",
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        setup_text.contains("SHADOW_SETUP"),
+        "expected shadowing setup to run, got: {setup_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('SHADOW_FOLLOWUP')\n40 + 2", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&follow_up_text),
+        "expected follow-up after shadowed globals to finish, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SHADOW_FOLLOWUP") && follow_up_text.contains("42"),
+        "expected follow-up cell to run after user globals shadow helper names, got: {follow_up_text:?}"
     );
     Ok(())
 }
