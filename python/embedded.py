@@ -110,11 +110,13 @@ def _mcp_repl_run_cell(source):
     if module.body and isinstance(module.body[-1], ast.Expr):
         setup = ast.Module(body=module.body[:-1], type_ignores=module.type_ignores)
         ast.fix_missing_locations(setup)
-        exec(compile(setup, "<mcp-repl>", "exec"), namespace, namespace)
+        setup_code = compile(setup, "<mcp-repl>", "exec")
 
         expression = ast.Expression(module.body[-1].value)
         ast.fix_missing_locations(expression)
-        value = eval(compile(expression, "<mcp-repl>", "eval"), namespace, namespace)
+        expression_code = compile(expression, "<mcp-repl>", "eval")
+        exec(setup_code, namespace, namespace)
+        value = eval(expression_code, namespace, namespace)
         sys.displayhook(value)
     else:
         exec(compile(module, "<mcp-repl>", "exec"), namespace, namespace)

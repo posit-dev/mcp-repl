@@ -156,10 +156,20 @@ pub(super) fn read_windows_turn_line(
                         guard.exec_state,
                         PythonExecState::RunningCell { .. } | PythonExecState::WaitingInput { .. }
                     ) {
-                        mark_waiting_input_locked(&mut guard, prompt, kind);
-                        drop(guard);
-                        ipc::emit_input_wait(prompt);
-                        idle_repl_prompt_emitted = true;
+                        if !idle_repl_prompt_emitted {
+                            mark_waiting_input_locked(&mut guard, prompt, kind);
+                            drop(guard);
+                            ipc::emit_input_wait(prompt);
+                            idle_repl_prompt_emitted = true;
+                        } else if release_gil_while_waiting {
+                            let allow_threads = PythonThreadsAllowed::new();
+                            guard = state.cvar.wait(guard).unwrap();
+                            drop(guard);
+                            drop(allow_threads);
+                        } else {
+                            guard = state.cvar.wait(guard).unwrap();
+                            drop(guard);
+                        }
                         continue;
                     }
                     let should_emit_idle_repl_prompt = !idle_repl_prompt_emitted
@@ -203,6 +213,7 @@ pub(super) fn read_windows_turn_line(
             mark_input_wait_completed_request();
             remember_emitted_prompt(prompt);
             ipc::emit_input_wait(prompt);
+            idle_repl_prompt_emitted = true;
         }
     }
 }

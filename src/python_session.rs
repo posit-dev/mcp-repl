@@ -233,6 +233,16 @@ fn input_route() -> Result<InputRoute, String> {
 
 fn begin_cell_input(input: String) -> Result<(), String> {
     let state = session_state();
+    #[cfg(target_family = "unix")]
+    {
+        let should_record_background_plots = {
+            let guard = state.inner.lock().unwrap();
+            !guard.request_active
+        };
+        if should_record_background_plots {
+            record_background_plots();
+        }
+    }
     let prompt;
     {
         let mut guard = state.inner.lock().unwrap();

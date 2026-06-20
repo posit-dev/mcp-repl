@@ -740,6 +740,78 @@ print("late background plot scheduled")"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_background_plot_before_new_idle_cell_does_not_emit() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+    let temp_dir = tempdir()?;
+    let done_path = temp_dir.path().join("background-plot-done");
+    let done_path = done_path
+        .to_str()
+        .ok_or("done path must be UTF-8")?
+        .to_string();
+    let done_path_literal = serde_json::to_string(&done_path)?;
+
+    let input = format!(
+        r#"{}
+import threading, time
+plt.figure(316)
+plt.clf()
+done_path = {done_path_literal}
+def _mcp_repl_late_idle_plot():
+    time.sleep(0.5)
+    plt.plot([1, 2, 3], [3, 1, 2])
+    with open(done_path, "w") as done_file:
+        done_file.write("done")
+
+threading.Thread(target=_mcp_repl_late_idle_plot, daemon=True).start()
+print("idle background plot scheduled")"#,
+        python_plot_preamble()
+    );
+    let schedule_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    assert_ne!(
+        schedule_result.is_error,
+        Some(true),
+        "background plot setup reported an error: {}",
+        result_text(&schedule_result)
+    );
+    assert!(
+        result_text(&schedule_result).contains("idle background plot scheduled"),
+        "expected setup response before background plot, got: {}",
+        result_text(&schedule_result)
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&done_path).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background plot did not finish before the next idle cell"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let noop_result = session
+        .write_stdin_raw_with("print('NEW_IDLE_CELL_DONE')", Some(30.0))
+        .await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        noop_result.is_error,
+        Some(true),
+        "new idle cell reported an error: {}",
+        result_text(&noop_result)
+    );
+    assert!(
+        result_text(&noop_result).contains("NEW_IDLE_CELL_DONE"),
+        "expected new idle cell output, got: {}",
+        result_text(&noop_result)
+    );
+    assert_no_images(&noop_result, "background plot before new idle cell");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_background_plot_while_input_waits_does_not_emit() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

@@ -2988,6 +2988,38 @@ async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_final_expression_syntax_error_has_no_setup_side_effects() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("failed_eval_side_effect = 1\nyield 2", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("SyntaxError"),
+        "expected invalid final expression to raise SyntaxError, got: {text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            "print('FAILED_EVAL_SIDE_EFFECT', 'failed_eval_side_effect' in globals())",
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("FAILED_EVAL_SIDE_EFFECT False"),
+        "failed final-expression compile should not run setup statements, got initial: {text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_stdout_replaces_lone_surrogates() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
