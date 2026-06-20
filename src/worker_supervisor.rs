@@ -569,6 +569,14 @@ impl WorkerChild {
             Self::Standard(child) => child,
         }
     }
+
+    #[cfg(target_family = "windows")]
+    fn close_job(&mut self) {
+        match self {
+            Self::Standard(_) => {}
+            Self::DirectWindows(child) => child.close_job(),
+        }
+    }
 }
 
 #[cfg(target_family = "windows")]
@@ -576,6 +584,7 @@ struct WindowsProcess {
     process: HANDLE,
     thread: HANDLE,
     process_id: u32,
+    job: Option<crate::windows_conpty::JobHandle>,
     _conpty: Option<crate::windows_conpty::Conpty>,
 }
 
@@ -587,11 +596,13 @@ impl WindowsProcess {
     unsafe fn from_process_information(
         proc_info: PROCESS_INFORMATION,
         conpty: Option<crate::windows_conpty::Conpty>,
+        job: Option<crate::windows_conpty::JobHandle>,
     ) -> Self {
         Self {
             process: proc_info.hProcess,
             thread: proc_info.hThread,
             process_id: proc_info.dwProcessId,
+            job,
             _conpty: conpty,
         }
     }
@@ -620,11 +631,19 @@ impl WindowsProcess {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
+        if let Some(job) = self.job.take() {
+            drop(job);
+            return Ok(());
+        }
         if unsafe { TerminateProcess(self.process, 1) } == 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(())
         }
+    }
+
+    fn close_job(&mut self) {
+        self.job.take();
     }
 
     fn exit_status(&self) -> std::io::Result<ExitStatus> {
@@ -1359,6 +1378,10 @@ impl WorkerProcess {
             // TODO: Track descendants or use stronger OS-level containment so children that have
             // escaped the worker process group are still killable after the root exits.
         }
+        #[cfg(target_family = "windows")]
+        {
+            self.child.close_job();
+        }
         self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
         self.report_denials();
@@ -1983,6 +2006,56 @@ fn spawn_command_with_pty(
     })
 }
 
+#[cfg(any(test, target_family = "windows"))]
+fn apply_command_env_overrides_for_windows_conpty(
+    env_map: &mut std::collections::HashMap<String, String>,
+    command_envs: impl IntoIterator<Item = (String, Option<String>)>,
+) {
+    for (key, value) in command_envs {
+        if let Some(value) = value {
+            upsert_windows_conpty_env(env_map, &key, &value);
+        } else {
+            remove_windows_conpty_env(env_map, &key);
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn upsert_windows_conpty_env(
+    env_map: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    crate::windows_conpty::upsert_env_case_insensitive(env_map, key, value);
+}
+
+#[cfg(all(test, not(target_family = "windows")))]
+fn upsert_windows_conpty_env(
+    env_map: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    remove_windows_conpty_env(env_map, key);
+    env_map.insert(key.to_string(), value.to_string());
+}
+
+#[cfg(target_family = "windows")]
+fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, String>, key: &str) {
+    crate::windows_conpty::remove_env_case_insensitive(env_map, key);
+}
+
+#[cfg(all(test, not(target_family = "windows")))]
+fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, String>, key: &str) {
+    let removals: Vec<String> = env_map
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(key))
+        .cloned()
+        .collect();
+    for existing in removals {
+        env_map.remove(&existing);
+    }
+}
+
 #[cfg(target_family = "windows")]
 fn spawn_command_with_pty(
     command: &mut Command,
@@ -1996,16 +2069,15 @@ fn spawn_command_with_pty(
             .map(|arg| arg.to_string_lossy().to_string()),
     );
     let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            env_map.insert(
+    apply_command_env_overrides_for_windows_conpty(
+        &mut env_map,
+        command.get_envs().map(|(key, value)| {
+            (
                 key.to_string_lossy().to_string(),
-                value.to_string_lossy().to_string(),
-            );
-        } else {
-            env_map.remove(&key.to_string_lossy().to_string());
-        }
-    }
+                value.map(|value| value.to_string_lossy().to_string()),
+            )
+        }),
+    );
     let (proc_info, mut conpty) = unsafe {
         crate::windows_conpty::spawn_conpty_process_direct(
             &command_line,
@@ -2014,9 +2086,14 @@ fn spawn_command_with_pty(
         )
         .map_err(WorkerError::Protocol)?
     };
+    let job = unsafe {
+        crate::windows_conpty::JobHandle::kill_on_close()
+            .ok()
+            .and_then(|job| job.assign_process(proc_info.hProcess).ok().map(|()| job))
+    };
     let writer = conpty.take_input_writer().map_err(WorkerError::Protocol)?;
     let reader = conpty.take_output_reader().map_err(WorkerError::Protocol)?;
-    let child = unsafe { WindowsProcess::from_process_information(proc_info, Some(conpty)) };
+    let child = unsafe { WindowsProcess::from_process_information(proc_info, Some(conpty), job) };
     Ok(SpawnedCommand {
         child: WorkerChild::DirectWindows(child),
         pty_stdio: Some(SpawnedPtyStdio {
@@ -2630,6 +2707,32 @@ mod tests {
                 .format_contents_for_reply()
                 .contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001hvisible\n")]
+        );
+    }
+
+    #[test]
+    fn windows_conpty_env_merge_overrides_case_insensitive_names() {
+        let mut env_map = std::collections::HashMap::from([
+            ("Path".to_string(), "old-path".to_string()),
+            ("Temp".to_string(), "old-temp".to_string()),
+        ]);
+
+        apply_command_env_overrides_for_windows_conpty(
+            &mut env_map,
+            [
+                ("PATH".to_string(), Some("new-path".to_string())),
+                ("temp".to_string(), None),
+            ],
+        );
+
+        assert_eq!(env_map.get("PATH"), Some(&"new-path".to_string()));
+        assert!(
+            !env_map.contains_key("Path"),
+            "PATH override should replace inherited Path entry"
+        );
+        assert!(
+            !env_map.keys().any(|key| key.eq_ignore_ascii_case("temp")),
+            "temp removal should remove inherited Temp entry"
         );
     }
 

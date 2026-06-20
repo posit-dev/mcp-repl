@@ -186,10 +186,8 @@ pub fn run_conpty_command_with_env_map(
         conpty.close_child_side_handles();
         crate::diagnostics::startup_log("windows-conpty: child spawned");
         let _job_handle = JobHandle::kill_on_close()
-            .inspect(|job| {
-                let _ = AssignProcessToJobObject(job.raw(), proc_info.hProcess);
-            })
-            .ok();
+            .ok()
+            .and_then(|job| job.assign_process(proc_info.hProcess).ok().map(|()| job));
 
         let wait_status = WaitForSingleObject(proc_info.hProcess, INFINITE);
         if wait_status == WAIT_FAILED {
@@ -218,10 +216,10 @@ pub fn run_conpty_command_with_env_map(
     }
 }
 
-struct JobHandle(HANDLE);
+pub(crate) struct JobHandle(HANDLE);
 
 impl JobHandle {
-    unsafe fn kill_on_close() -> Result<Self, String> {
+    pub(crate) unsafe fn kill_on_close() -> Result<Self, String> {
         let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
         if handle.is_null() {
             return Err(format!(
@@ -245,8 +243,18 @@ impl JobHandle {
         Ok(Self(handle))
     }
 
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         self.0
+    }
+
+    pub(crate) unsafe fn assign_process(&self, process: HANDLE) -> Result<(), String> {
+        if AssignProcessToJobObject(self.raw(), process) == 0 {
+            return Err(format!(
+                "AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -640,15 +648,19 @@ pub fn env_get_case_insensitive<'a>(
 }
 
 pub fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
+    remove_env_case_insensitive(env_map, key);
+    env_map.insert(key.to_string(), value.to_string());
+}
+
+pub fn remove_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str) {
     let removals: Vec<String> = env_map
         .keys()
-        .filter(|existing| existing.eq_ignore_ascii_case(key) && existing.as_str() != key)
+        .filter(|existing| existing.eq_ignore_ascii_case(key))
         .cloned()
         .collect();
     for existing in removals {
         env_map.remove(&existing);
     }
-    env_map.insert(key.to_string(), value.to_string());
 }
 
 #[cfg(test)]
