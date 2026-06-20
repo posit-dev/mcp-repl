@@ -1,6 +1,5 @@
 use crate::ipc;
 use crate::python_input_queue::normalize_pty_input_payload;
-use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 
 use super::state::{
@@ -11,6 +10,14 @@ use super::stdio::{PythonThreadsAllowed, StdioLineRead};
 use super::{CStdinLine, emit_output_text, emit_plots, record_background_plots};
 
 pub(super) fn set_runtime_stdin_fd(_fd: libc::c_int) {}
+
+fn prepare_worker_stdin_payload(input: &str) -> Vec<u8> {
+    let mut payload = input.as_bytes().to_vec();
+    if !payload.is_empty() && !payload.ends_with(b"\n") {
+        payload.push(b'\n');
+    }
+    payload
+}
 
 pub(super) fn flush_terminal_input() {
     let _ = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
