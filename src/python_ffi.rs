@@ -88,9 +88,6 @@ pub struct PythonApi {
         *mut PyObject,
         *mut std::ffi::c_void,
     ) -> *mut PyObject,
-    #[cfg_attr(windows, allow(dead_code))]
-    pub py_run_interactive_one_flags:
-        unsafe extern "C" fn(*mut libc::FILE, *const c_char, *mut c_void) -> c_int,
     pub py_object_get_attr_string:
         unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut PyObject,
     pub py_object_call_object: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
@@ -155,9 +152,6 @@ impl PythonApi {
             py_import_import_module: unsafe { load_symbol(&library, b"PyImport_ImportModule\0")? },
             py_module_get_dict: unsafe { load_symbol(&library, b"PyModule_GetDict\0")? },
             py_run_string_flags: unsafe { load_symbol(&library, b"PyRun_StringFlags\0")? },
-            py_run_interactive_one_flags: unsafe {
-                load_symbol(&library, b"PyRun_InteractiveOneFlags\0")?
-            },
             py_object_get_attr_string: unsafe {
                 load_symbol(&library, b"PyObject_GetAttrString\0")?
             },
@@ -258,6 +252,14 @@ impl PythonApi {
         let result = PyPtr::from_owned(result, "Python code execution failed")?;
         drop(result);
         Ok(())
+    }
+
+    pub fn call_one_string_arg(&self, func: *mut PyObject, arg: &str) -> Result<PyPtr, String> {
+        let arg = self.unicode(arg)?;
+        let args = unsafe { (self.py_build_value)(c"(O)".as_ptr(), arg.as_ptr()) };
+        let args = PyPtr::from_owned(args, "failed to allocate Python argument tuple")?;
+        let result = unsafe { (self.py_object_call_object)(func, args.as_ptr()) };
+        PyPtr::from_owned(result, "Python function call failed")
     }
 
     pub fn unicode(&self, value: &str) -> Result<PyPtr, String> {

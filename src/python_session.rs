@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 use std::path::Path;
 use std::ptr;
@@ -8,14 +9,16 @@ use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
 use crate::worker_protocol::TextStream;
 
+#[cfg(windows)]
+use state::ReadlineKind;
 use state::{
-    ActiveRequest, PythonReadlineState, RawStdinReadError, SESSION_STATE, SessionState,
-    StdinReadAccounting, begin_repl_turn, clear_current_readline_prompt, remember_emitted_prompt,
-    repl_prompt_for, request_active, session_state, set_current_readline_prompt,
-    set_current_repl_readline_prompt,
+    ActiveRequest, PendingCell, PythonExecState, PythonReadlineState, RawStdinReadError,
+    SESSION_STATE, SessionState, StdinReadAccounting, clear_current_readline_prompt,
+    remember_emitted_prompt, request_active, session_state, set_current_cell_readline_prompt,
+    set_current_readline_prompt,
 };
 #[cfg(not(any(target_family = "unix", windows)))]
-use state::{input_hook_prompt, mark_input_wait_completed_request};
+use state::{input_hook_prompt, mark_input_wait_completed_request, repl_prompt_for};
 use stdio::{PYTHON_STDIN_FILE, PythonRuntime, StdioLineRead, open_python_runtime};
 #[cfg(all(not(target_family = "unix"), not(windows)))]
 use stdio::{read_stdio_line_bytes, read_stdio_line_bytes_allowing_python_threads};
@@ -28,7 +31,6 @@ mod unix_stdin;
 mod windows_stdin;
 
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
-const PYTHON_EOF: c_int = 11;
 
 pub struct PythonSession {
     #[cfg(windows)]
@@ -178,6 +180,15 @@ fn take_interrupt_requested() -> bool {
 }
 
 pub(crate) fn begin_input(input: String) -> Result<(), String> {
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    match input_route()? {
+        InputRoute::Cell => return begin_cell_input(input),
+        InputRoute::Stdin => {}
+    }
+
     #[cfg(target_family = "unix")]
     {
         unix_stdin::begin_input_batch(&input)
@@ -193,6 +204,74 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         let _ = input;
         Ok(())
     }
+}
+
+enum InputRoute {
+    Cell,
+    Stdin,
+}
+
+fn input_route() -> Result<InputRoute, String> {
+    let state = session_state();
+    let guard = state.inner.lock().unwrap();
+    match &guard.exec_state {
+        PythonExecState::Idle => Ok(InputRoute::Cell),
+        PythonExecState::WaitingInput {
+            generation,
+            prompt,
+            kind,
+        } => {
+            let _ = (generation, prompt, kind);
+            Ok(InputRoute::Stdin)
+        }
+        PythonExecState::RunningCell { .. } => {
+            Err("Python session is already running a cell".to_string())
+        }
+        PythonExecState::ShuttingDown => Err("Python session is shutting down".to_string()),
+    }
+}
+
+fn begin_cell_input(input: String) -> Result<(), String> {
+    let state = session_state();
+    let prompt;
+    {
+        let mut guard = state.inner.lock().unwrap();
+        if !matches!(guard.exec_state, PythonExecState::Idle) {
+            return Err("Python session is not idle".to_string());
+        }
+        #[cfg(target_family = "unix")]
+        {
+            guard.input_queue.begin_input(Vec::new())?;
+        }
+        guard.next_generation = guard.next_generation.saturating_add(1);
+        let generation = guard.next_generation;
+        prompt = guard.python_primary_prompt.clone();
+        guard.pending_cell = Some(PendingCell {
+            source: input.clone(),
+            generation,
+        });
+        guard.exec_state = PythonExecState::RunningCell { generation };
+        guard.request_active = true;
+        guard.plot_reset_pending = true;
+        guard.interrupt_requested = false;
+        guard.waiting_for_input = false;
+        guard.current_prompt = None;
+        guard.current_readline_state = None;
+        guard.active_request = Some(ActiveRequest {
+            byte_len: 0,
+            line_count: 0,
+            fallback_prompt: None,
+            queued_lines: VecDeque::new(),
+            consumed_lines: 0,
+            skip_next_hook: false,
+            stdin_write_complete: true,
+            repl_turn_finished: false,
+            started_after_continuation_prompt: false,
+        });
+    }
+    ipc::emit_input_line(&prompt, &input);
+    state.cvar.notify_all();
+    Ok(())
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -289,8 +368,8 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     init.mark_ready();
     ipc::emit_worker_ready("python", plot_capable());
 
-    let result = run_repl(&runtime);
-    crate::diagnostics::startup_log("python-session: repl loop exited; finalizing python");
+    let result = run_cell_loop(&runtime);
+    crate::diagnostics::startup_log("python-session: cell loop exited; finalizing python");
     let finalize_result = finalize_python(api, thread_state);
     match &finalize_result {
         Ok(()) => crate::diagnostics::startup_log("python-session: python finalized"),
@@ -346,33 +425,117 @@ fn configure_python(api: &'static PythonApi) -> Result<(), String> {
     Ok(())
 }
 
-fn run_repl(runtime: &PythonRuntime) -> Result<(), String> {
+fn run_cell_loop(_runtime: &PythonRuntime) -> Result<(), String> {
     let api = PythonApi::global();
+    emit_ready_prompt()?;
     loop {
-        let status = {
-            let _gil = GilGuard::acquire();
-            begin_repl_turn();
-            let status = unsafe {
-                (api.py_run_interactive_one_flags)(
-                    runtime.stdin,
-                    c"<stdin>".as_ptr(),
-                    ptr::null_mut(),
-                )
-            };
-            capture_python_prompts(api)?;
-            status
+        let Some(cell) = wait_for_pending_cell() else {
+            flush_original_stdio();
+            return Ok(());
         };
+        {
+            let _gil = GilGuard::acquire();
+            run_python_cell(api, &cell.source);
+            capture_python_prompts(api)?;
+            flush_original_stdio();
+        }
         if take_exit_requested() {
             flush_original_stdio();
             return Ok(());
         }
         emit_plots();
-        finish_repl_turn_request();
-        if status == PYTHON_EOF {
-            flush_original_stdio();
-            return Ok(());
-        }
+        finish_cell_request(cell.generation);
     }
+}
+
+fn emit_ready_prompt() -> Result<(), String> {
+    let api = PythonApi::global();
+    {
+        let _gil = GilGuard::acquire();
+        capture_python_prompts(api)?;
+    }
+    let prompt = {
+        let state = session_state();
+        let mut guard = state.inner.lock().unwrap();
+        guard.exec_state = PythonExecState::Idle;
+        guard.waiting_for_input = true;
+        guard.request_active = false;
+        guard.active_request = None;
+        guard.python_primary_prompt.clone()
+    };
+    remember_emitted_prompt(&prompt);
+    ipc::emit_input_wait(&prompt);
+    Ok(())
+}
+
+fn wait_for_pending_cell() -> Option<PendingCell> {
+    let state = session_state();
+    let mut guard = state.inner.lock().unwrap();
+    loop {
+        if guard.shutdown || guard.exit_requested {
+            guard.exec_state = PythonExecState::ShuttingDown;
+            return None;
+        }
+        if let Some(cell) = guard.pending_cell.take() {
+            return Some(cell);
+        }
+        guard = state.cvar.wait(guard).unwrap();
+    }
+}
+
+fn run_python_cell(api: &'static PythonApi, source: &str) {
+    let main = match api.import_module("__main__") {
+        Ok(main) => main,
+        Err(_) => {
+            api.print_error();
+            return;
+        }
+    };
+    let func = match api.get_attr_string(main.as_ptr(), "_mcp_repl_run_cell") {
+        Ok(func) => func,
+        Err(_) => {
+            api.print_error();
+            return;
+        }
+    };
+    match api.call_one_string_arg(func.as_ptr(), source) {
+        Ok(result) => drop(result),
+        Err(_) => api.print_error(),
+    }
+}
+
+fn finish_cell_request(generation: u64) {
+    let state = session_state();
+    let (prompt, active) = {
+        let mut guard = state.inner.lock().unwrap();
+        match guard.exec_state {
+            PythonExecState::RunningCell {
+                generation: current,
+            }
+            | PythonExecState::WaitingInput {
+                generation: current,
+                ..
+            } if current == generation => {
+                guard.exec_state = PythonExecState::Idle;
+            }
+            PythonExecState::ShuttingDown => return,
+            _ => {}
+        }
+        #[cfg(target_family = "unix")]
+        {
+            let _ = guard.input_queue.take_completed_input();
+        }
+        guard.current_prompt = None;
+        guard.current_readline_state = None;
+        guard.waiting_for_input = true;
+        guard.request_active = false;
+        let active = guard.active_request.take();
+        let prompt = guard.python_primary_prompt.clone();
+        (prompt, active)
+    };
+    remember_emitted_prompt(&prompt);
+    ipc::emit_input_wait(&prompt);
+    complete_active_request(state, active, false);
 }
 
 fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
@@ -530,94 +693,9 @@ fn request_prompt_wait_should_complete(
     active.consumed_lines >= active.line_count
 }
 
-fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
-    #[cfg(target_family = "unix")]
-    {
-        request_input_drained(active)
-    }
-    #[cfg(windows)]
-    {
-        active.line_count == 1 || (active.byte_len > 0 && stdin_pending_byte_count() == Some(0))
-    }
-    #[cfg(not(any(target_family = "unix", windows)))]
-    {
-        active.consumed_lines >= active.line_count
-    }
-}
-
-#[cfg(target_family = "unix")]
-fn request_input_drained(active: &ActiveRequest) -> bool {
-    if !active.stdin_write_complete || active.byte_len == 0 {
-        return false;
-    }
-    unix_stdin::stdin_pending_byte_count() == Some(0)
-}
-
-fn finish_repl_turn_request() {
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let mut completed = None;
-    let mut prompt = None;
-    {
-        let mut guard = state.inner.lock().unwrap();
-        let current_prompt_from_state = guard.current_prompt.clone();
-        let current_readline_state = guard.current_readline_state;
-        let primary_prompt = guard.python_primary_prompt.clone();
-        let continuation_prompt = guard.python_continuation_prompt.clone();
-        guard.interrupt_requested = false;
-        #[cfg(windows)]
-        if guard.active_request.is_some() {
-            return;
-        }
-        if guard.active_request.is_some() {
-            guard.waiting_for_input = true;
-        } else {
-            // Protocol-style Unix Python has no worker-local ActiveRequest; the
-            // server owns completion, so request-start metadata keeps plot
-            // state active across all PyRun_InteractiveOne turns in one MCP
-            // request.
-            #[cfg(not(target_family = "unix"))]
-            {
-                guard.request_active = false;
-            }
-        }
-        if let Some(active) = guard.active_request.as_mut() {
-            active.repl_turn_finished = true;
-            if active.line_count == 1 {
-                active.consumed_lines = active.consumed_lines.max(1);
-            }
-            if request_repl_turn_should_complete(active) {
-                prompt = Some(repl_prompt_for(
-                    current_prompt_from_state.clone(),
-                    None,
-                    current_readline_state,
-                    &primary_prompt,
-                    &continuation_prompt,
-                ));
-                completed = guard.active_request.take();
-                guard.request_active = false;
-            }
-        }
-    }
-
-    if let Some(active) = completed {
-        flush_original_stdio();
-        let prompt = prompt.as_deref().unwrap_or(">>> ");
-        remember_emitted_prompt(prompt);
-        ipc::emit_input_wait(prompt);
-        complete_active_request(state, Some(active), false);
-    }
-}
-
-#[cfg(windows)]
-fn stdin_pending_byte_count() -> Option<usize> {
-    windows_stdin::stdin_pending_byte_count()
-}
-
 #[cfg(not(any(target_family = "unix", windows)))]
-fn stdin_pending_byte_count() -> Option<usize> {
-    None
+fn request_repl_turn_should_complete(active: &ActiveRequest) -> bool {
+    active.consumed_lines >= active.line_count
 }
 
 unsafe extern "C" fn mcp_repl_readline(
@@ -639,9 +717,9 @@ unsafe extern "C" fn mcp_repl_readline(
         return allocate_readline_result(&[]);
     }
     #[cfg(any(target_family = "unix", windows))]
-    let readline_state = set_current_repl_readline_prompt(&prompt_text);
+    let readline_state = set_current_cell_readline_prompt(&prompt_text);
     #[cfg(not(any(target_family = "unix", windows)))]
-    set_current_repl_readline_prompt(&prompt_text);
+    set_current_cell_readline_prompt(&prompt_text);
     #[cfg(any(target_family = "unix", windows))]
     // This uses CPython's current readline callback and tracked turn state, not
     // rendered output parsing. Suppress only actual REPL prompts; client-input
@@ -676,6 +754,7 @@ unsafe extern "C" fn mcp_repl_readline(
     #[cfg(windows)]
     let read = match windows_stdin::read_windows_turn_line(
         &prompt_text,
+        ReadlineKind::PyOSReadline,
         !prompt_text.is_empty() && !suppress_repl_prompt_echo,
         false,
     ) {
@@ -796,6 +875,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     #[cfg(windows)]
     let read = match windows_stdin::read_windows_turn_line(
         prompt_for_sideband.to_str().unwrap_or(""),
+        ReadlineKind::RawStdin,
         !prompt.is_empty(),
         true,
     ) {

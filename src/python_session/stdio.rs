@@ -13,7 +13,7 @@ pub(super) static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr:
 pub(super) static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 
 pub(super) struct PythonRuntime {
-    #[cfg_attr(windows, allow(dead_code))]
+    #[allow(dead_code)]
     pub(super) stdin: *mut libc::FILE,
 }
 

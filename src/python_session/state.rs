@@ -13,6 +13,9 @@ pub(super) struct SessionState {
 
 pub(super) struct SessionStateInner {
     pub(super) active_request: Option<ActiveRequest>,
+    pub(super) exec_state: PythonExecState,
+    pub(super) next_generation: u64,
+    pub(super) pending_cell: Option<PendingCell>,
     pub(super) request_active: bool,
     pub(super) current_prompt: Option<String>,
     pub(super) current_readline_state: Option<PythonReadlineState>,
@@ -20,7 +23,6 @@ pub(super) struct SessionStateInner {
     pub(super) visible_input_prompt: Option<String>,
     pub(super) python_primary_prompt: String,
     pub(super) python_continuation_prompt: String,
-    pub(super) repl_readline_count: usize,
     pub(super) last_prompt_was_continuation: bool,
     pub(super) waiting_for_input: bool,
     pub(super) exit_requested: bool,
@@ -34,6 +36,31 @@ pub(super) struct SessionStateInner {
     pub(super) turn_cleanup_uncertain: bool,
     #[cfg(target_family = "unix")]
     pub(super) input_queue: PythonInputQueue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PythonExecState {
+    Idle,
+    RunningCell {
+        generation: u64,
+    },
+    WaitingInput {
+        generation: u64,
+        prompt: String,
+        kind: ReadlineKind,
+    },
+    ShuttingDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadlineKind {
+    PyOSReadline,
+    RawStdin,
+}
+
+pub(super) struct PendingCell {
+    pub(super) source: String,
+    pub(super) generation: u64,
 }
 
 #[allow(dead_code)]
@@ -60,6 +87,7 @@ pub(super) struct InputBatchLine {
     pub(super) input_line_emitted: bool,
 }
 
+#[cfg_attr(target_family = "unix", allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PythonReadlineState {
     Primary,
@@ -88,6 +116,9 @@ impl SessionState {
         Self {
             inner: Mutex::new(SessionStateInner {
                 active_request: None,
+                exec_state: PythonExecState::Idle,
+                next_generation: 0,
+                pending_cell: None,
                 request_active: false,
                 current_prompt: None,
                 current_readline_state: None,
@@ -95,7 +126,6 @@ impl SessionState {
                 visible_input_prompt: None,
                 python_primary_prompt: ">>> ".to_string(),
                 python_continuation_prompt: "... ".to_string(),
-                repl_readline_count: 0,
                 last_prompt_was_continuation: false,
                 waiting_for_input: false,
                 exit_requested: false,
@@ -151,40 +181,18 @@ pub(super) fn input_hook_prompt(
     )
 }
 
-pub(super) fn begin_repl_turn() {
+pub(super) fn set_current_cell_readline_prompt(prompt: &str) -> PythonReadlineState {
     let Some(state) = SESSION_STATE.get() else {
-        return;
+        return PythonReadlineState::ClientInput;
     };
     let mut guard = state.inner.lock().unwrap();
-    guard.repl_readline_count = 0;
-}
-
-pub(super) fn set_current_repl_readline_prompt(prompt: &str) -> PythonReadlineState {
-    let Some(state) = SESSION_STATE.get() else {
-        return PythonReadlineState::Primary;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    let started_after_continuation_prompt = guard
-        .active_request
-        .as_ref()
-        .is_some_and(|active| active.started_after_continuation_prompt);
-    let readline_state = if prompt == guard.python_continuation_prompt
-        || (prompt.is_empty() && started_after_continuation_prompt)
-    {
-        PythonReadlineState::Continuation
-    } else if guard.repl_readline_count > 0 {
-        PythonReadlineState::ClientInput
-    } else {
-        PythonReadlineState::Primary
-    };
-    guard.repl_readline_count = guard.repl_readline_count.saturating_add(1);
     guard.current_prompt = if prompt.is_empty() {
         None
     } else {
         Some(prompt.to_string())
     };
-    guard.current_readline_state = Some(readline_state);
-    readline_state
+    guard.current_readline_state = Some(PythonReadlineState::ClientInput);
+    PythonReadlineState::ClientInput
 }
 
 pub(super) fn set_current_readline_prompt(prompt: &str, readline_state: PythonReadlineState) {
@@ -224,6 +232,37 @@ pub(super) fn mark_input_wait_completed_request() {
     // prevent those background updates from being attributed to the request that
     // already completed. Callers flush prompt-time plots before closing this gate.
     guard.request_active = false;
+}
+
+pub(super) fn mark_waiting_input_locked(
+    guard: &mut SessionStateInner,
+    prompt: &str,
+    kind: ReadlineKind,
+) {
+    let generation = match guard.exec_state {
+        PythonExecState::RunningCell { generation }
+        | PythonExecState::WaitingInput { generation, .. } => Some(generation),
+        PythonExecState::Idle | PythonExecState::ShuttingDown => None,
+    };
+    if let Some(generation) = generation {
+        guard.exec_state = PythonExecState::WaitingInput {
+            generation,
+            prompt: prompt.to_string(),
+            kind,
+        };
+    }
+    guard.current_prompt = if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt.to_string())
+    };
+    guard.current_readline_state = Some(PythonReadlineState::ClientInput);
+}
+
+pub(super) fn mark_running_cell_after_input_locked(guard: &mut SessionStateInner) {
+    if let PythonExecState::WaitingInput { generation, .. } = guard.exec_state {
+        guard.exec_state = PythonExecState::RunningCell { generation };
+    }
 }
 
 pub(super) fn request_active() -> bool {

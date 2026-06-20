@@ -4,8 +4,9 @@ use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_protocol::TextStream;
 
 use super::state::{
-    RawStdinReadError, SESSION_STATE, SessionStateInner, StdinReadAccounting,
-    mark_input_wait_completed_request, remember_emitted_prompt,
+    RawStdinReadError, ReadlineKind, SESSION_STATE, SessionStateInner, StdinReadAccounting,
+    mark_input_wait_completed_request, mark_running_cell_after_input_locked,
+    mark_waiting_input_locked, remember_emitted_prompt,
 };
 use super::stdio::{PythonThreadsAllowed, StdioLineRead};
 use super::{CStdinLine, emit_output_text, emit_plots, record_background_plots};
@@ -81,6 +82,7 @@ pub(super) fn emit_protocol_failure(message: &str) {
 fn next_readline_action_locked(
     guard: &mut SessionStateInner,
     prompt: &str,
+    kind: ReadlineKind,
 ) -> Result<ReadlineAction, String> {
     guard.waiting_for_input = true;
 
@@ -93,6 +95,7 @@ fn next_readline_action_locked(
     }
 
     if let Some(read) = guard.input_queue.consume_line()? {
+        mark_running_cell_after_input_locked(guard);
         guard.waiting_for_input = false;
         guard.request_active = true;
         return Ok(ReadlineAction::Line {
@@ -103,6 +106,7 @@ fn next_readline_action_locked(
 
     if guard.input_queue.take_completed_input() {
         let prompt = prompt.to_string();
+        mark_waiting_input_locked(guard, &prompt, kind);
         return Ok(ReadlineAction::InputWait { prompt });
     }
 
@@ -113,6 +117,7 @@ fn next_readline_action_locked(
 
 fn wait_for_turn_line(
     prompt: &str,
+    kind: ReadlineKind,
     emit_prompt_to_stdout: bool,
     release_gil_while_waiting: bool,
 ) -> Result<StdioLineRead, String> {
@@ -124,7 +129,7 @@ fn wait_for_turn_line(
     loop {
         let action = {
             let mut guard = state.inner.lock().unwrap();
-            match next_readline_action_locked(&mut guard, prompt) {
+            match next_readline_action_locked(&mut guard, prompt, kind) {
                 Ok(ReadlineAction::IdleWait { prompt }) => {
                     if !idle_prompt_emitted {
                         idle_prompt_emitted = true;
@@ -192,11 +197,16 @@ pub(super) fn read_cpython_readline_turn_line(
     prompt: &str,
     emit_prompt_to_stdout: bool,
 ) -> Result<StdioLineRead, String> {
-    wait_for_turn_line(prompt, emit_prompt_to_stdout, false)
+    wait_for_turn_line(
+        prompt,
+        ReadlineKind::PyOSReadline,
+        emit_prompt_to_stdout,
+        false,
+    )
 }
 
 pub(super) fn read_runtime_stdin_line(prompt: &str) -> Result<StdioLineRead, String> {
-    wait_for_turn_line(prompt, !prompt.is_empty(), true)
+    wait_for_turn_line(prompt, ReadlineKind::RawStdin, !prompt.is_empty(), true)
 }
 
 pub(super) fn note_cpython_readline_bytes_read(
@@ -244,6 +254,7 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
             let remaining = size - output.len();
             match guard.input_queue.consume_bytes(remaining) {
                 Ok(Some(read)) => {
+                    mark_running_cell_after_input_locked(&mut guard);
                     guard.waiting_for_input = false;
                     guard.request_active = true;
                     ReadlineAction::Line {
@@ -257,6 +268,7 @@ pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadE
                     }
                     if guard.input_queue.take_completed_input() {
                         let prompt = String::new();
+                        mark_waiting_input_locked(&mut guard, &prompt, ReadlineKind::RawStdin);
                         ReadlineAction::InputWait { prompt }
                     } else {
                         let allow_threads = PythonThreadsAllowed::new();
@@ -298,10 +310,6 @@ pub(super) fn note_stdin_line_read(
     _bytes: &[u8],
 ) -> Result<StdinReadAccounting, String> {
     Ok(StdinReadAccounting::Accounted)
-}
-
-pub(super) fn stdin_pending_byte_count() -> Option<usize> {
-    None
 }
 
 pub(super) fn handle_protocol_input_hook() {

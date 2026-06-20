@@ -33,11 +33,11 @@ async fn snapshots_buffered_input_prompt_matching_primary_prompt() -> TestResult
                     r#"import sys
 sys.ps1 = "same> "
 value = input("same> ")
-buffered
 print("MATCHED_PROMPT_VALUE", value)
 "#,
                     timeout = 5.0
                 );
+                write_stdin("buffered", timeout = 5.0);
             },
         )
         .await?;

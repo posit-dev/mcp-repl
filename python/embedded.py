@@ -1,6 +1,6 @@
+import ast
 import base64
 import builtins
-import code
 import codecs
 import errno
 import hashlib
@@ -45,8 +45,6 @@ _mcp_repl_windows_conpty = (
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 _mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
-_mcp_repl_interpreter = code.InteractiveInterpreter(globals())
-_mcp_repl_last_incomplete = False
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -106,9 +104,20 @@ def _mcp_repl_capture_prompts():
         sys.ps2 = _mcp_repl_suppressed_ps2
 
 
-def _mcp_repl_runsource_b64(source_b64):
-    source = base64.b64decode(source_b64).decode("utf-8", "replace")
-    return _mcp_repl_interpreter.runsource(source, "<stdin>", "single")
+def _mcp_repl_run_cell(source):
+    module = ast.parse(source, "<mcp-repl>", "exec")
+    namespace = globals()
+    if module.body and isinstance(module.body[-1], ast.Expr):
+        setup = ast.Module(body=module.body[:-1], type_ignores=module.type_ignores)
+        ast.fix_missing_locations(setup)
+        exec(compile(setup, "<mcp-repl>", "exec"), namespace, namespace)
+
+        expression = ast.Expression(module.body[-1].value)
+        ast.fix_missing_locations(expression)
+        value = eval(compile(expression, "<mcp-repl>", "eval"), namespace, namespace)
+        sys.displayhook(value)
+    else:
+        exec(compile(module, "<mcp-repl>", "exec"), namespace, namespace)
 
 
 def _input(prompt=""):

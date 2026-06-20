@@ -11,8 +11,9 @@ use crate::ipc;
 use crate::worker_protocol::TextStream;
 
 use super::state::{
-    ActiveRequest, InputBatchLine, RawStdinReadError, SESSION_STATE, input_hook_prompt,
-    mark_input_wait_completed_request, remember_emitted_prompt, session_state,
+    ActiveRequest, InputBatchLine, PythonExecState, RawStdinReadError, ReadlineKind, SESSION_STATE,
+    input_hook_prompt, mark_input_wait_completed_request, mark_running_cell_after_input_locked,
+    mark_waiting_input_locked, remember_emitted_prompt, session_state,
 };
 use super::stdio::{PYTHON_STDIN_FILE, PythonThreadsAllowed, StdioLineRead};
 use super::{emit_output_text, emit_plots};
@@ -82,6 +83,7 @@ fn emit_input_batch_line(prompt: &str, line: &mut InputBatchLine) {
 
 pub(super) fn read_windows_turn_line(
     prompt: &str,
+    kind: ReadlineKind,
     emit_prompt_to_stdout: bool,
     release_gil_while_waiting: bool,
 ) -> Result<StdioLineRead, String> {
@@ -138,16 +140,28 @@ pub(super) fn read_windows_turn_line(
                         let prompt_already_visible =
                             guard.visible_input_prompt.as_deref() == Some(prompt);
                         guard.visible_input_prompt = None;
+                        mark_running_cell_after_input_locked(&mut guard);
                         guard.waiting_for_input = false;
                         guard.request_active = true;
                         Some((Some(line), prompt_already_visible))
                     } else {
                         guard.active_request.take();
                         guard.visible_input_prompt = Some(prompt.to_string());
+                        mark_waiting_input_locked(&mut guard, prompt, kind);
                         Some((None, false))
                     }
                 }
                 None => {
+                    if matches!(
+                        guard.exec_state,
+                        PythonExecState::RunningCell { .. } | PythonExecState::WaitingInput { .. }
+                    ) {
+                        mark_waiting_input_locked(&mut guard, prompt, kind);
+                        drop(guard);
+                        ipc::emit_input_wait(prompt);
+                        idle_repl_prompt_emitted = true;
+                        continue;
+                    }
                     let should_emit_idle_repl_prompt = !idle_repl_prompt_emitted
                         && (prompt == guard.python_primary_prompt
                             || prompt == guard.python_continuation_prompt);
@@ -243,26 +257,6 @@ fn drain_stdin_pipe() {
     }
 }
 
-pub(super) fn stdin_pending_byte_count() -> Option<usize> {
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let mut available = 0u32;
-    let ok = unsafe {
-        PeekNamedPipe(
-            handle,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            &mut available,
-            ptr::null_mut(),
-        )
-    };
-    (ok != 0).then_some(available as usize)
-}
-
 pub(super) fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     if size == 0 {
         return Ok(Vec::new());
@@ -325,6 +319,7 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     return Ok(output);
                 }
                 guard.active_request.take();
+                mark_waiting_input_locked(&mut guard, &prompt, ReadlineKind::RawStdin);
                 RawInputEvent::InputWait { prompt }
             } else {
                 let active = guard.active_request.as_mut().expect("active input exists");
@@ -348,6 +343,7 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if line.offset >= line.bytes.len() {
                     active.queued_lines.pop_front();
                 }
+                mark_running_cell_after_input_locked(&mut guard);
                 event
             }
         };
