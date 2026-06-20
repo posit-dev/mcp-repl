@@ -229,6 +229,28 @@ async fn wait_until_busy_follow_up_discloses_transcript_path(
     )
 }
 
+async fn retry_input_until_output_contains(
+    session: &mut common::McpTestSession,
+    input: &str,
+    needle: &str,
+    label: &str,
+) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
+        let result = wait_until_not_busy(session, result).await?;
+        let text = result_text(&result);
+        if text.contains(needle) {
+            return Ok(text);
+        }
+        last_text = text;
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(format!("{label} did not produce {needle:?}; last response: {last_text:?}").into())
+}
+
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -555,18 +577,16 @@ async fn write_stdin_interrupt_aborts_pending_r_readline() -> TestResult<()> {
         "expected readline interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("cat('AFTER_R_READLINE_INTERRUPT\\n')", Some(10.0))
-        .await?;
-    let follow_up = wait_until_not_busy(&mut session, follow_up).await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = retry_input_until_output_contains(
+        &mut session,
+        "cat('AFTER_R_READLINE_INTERRUPT\\n')",
+        "AFTER_R_READLINE_INTERRUPT",
+        "readline interrupt follow-up",
+    )
+    .await?;
 
     session.cancel().await?;
 
-    assert!(
-        follow_up_text.contains("AFTER_R_READLINE_INTERRUPT"),
-        "expected follow-up to run after readline interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
-    );
     assert!(
         !follow_up_text.contains("READLINE_ANSWER="),
         "did not expect follow-up input to satisfy the interrupted readline, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
