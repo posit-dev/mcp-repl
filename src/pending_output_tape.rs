@@ -79,7 +79,7 @@ impl PendingOutputEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingSidebandKind {
-    ReadlineStart {
+    InputWait {
         prompt: String,
     },
     ReadlineResult {
@@ -661,7 +661,7 @@ impl PendingOutputSnapshot {
                     last_rendered_text = None;
                 }
                 PendingOutputEvent::Sideband { kind, .. } => match kind {
-                    PendingSidebandKind::ReadlineStart { prompt } => {
+                    PendingSidebandKind::InputWait { prompt } => {
                         push_prompt_variant(&mut prompt_variants, prompt);
                     }
                     PendingSidebandKind::ReadlineResult {
@@ -1801,13 +1801,13 @@ mod tests {
     fn reply_format_anchors_image_before_later_echoed_input_and_stdout() {
         let tape = PendingOutputTape::new();
 
-        tape.append_stdout_ipc_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
-        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1819,7 +1819,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
 
         let snapshot = tape.drain_snapshot();
@@ -1841,13 +1841,13 @@ mod tests {
     fn nonfinal_format_drops_leading_repl_echo_once_output_arrives() {
         let tape = PendingOutputTape::new();
 
-        tape.append_stdout_ipc_bytes(b"> plot(1:10)\n");
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
-        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1859,7 +1859,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
 
         let snapshot = tape.drain_snapshot();
@@ -1887,7 +1887,7 @@ mod tests {
             line: "alpha\n".to_string(),
             echo_source: PendingTextSource::Raw,
         });
-        tape.append_sideband(PendingSidebandKind::ReadlineStart {
+        tape.append_sideband(PendingSidebandKind::InputWait {
             prompt: "SECOND> ".to_string(),
         });
 
@@ -1905,7 +1905,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "plot(1:10)\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
         let first = tape.drain_snapshot();
         assert!(
@@ -1913,7 +1913,7 @@ mod tests {
             "sideband-only snapshot should not render visible content"
         );
 
-        tape.append_stdout_ipc_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
         tape.append_stdout_bytes(b"done\n");
         tape.append_image(
             "img-1".to_string(),
@@ -1925,7 +1925,7 @@ mod tests {
         tape.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "cat('done\\n')\n".to_string(),
-            echo_source: PendingTextSource::Ipc,
+            echo_source: PendingTextSource::Raw,
         });
 
         let second = tape.drain_snapshot();

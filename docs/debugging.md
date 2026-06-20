@@ -35,6 +35,11 @@ Use `MCP_REPL_DEBUG_DIR` or `--debug-dir` when the worker fails early or startup
 
 The worker-side `MCP_REPL_IPC_*` env vars are bootstrap-only. Backends clear them before handing control to user code, so child-process debugging should not rely on those names being visible inside the REPL.
 
+For worker protocol issues, inspect the internal event log and any wire trace
+for `input_batch`, `input_line`, `input_wait`, and `session_end`. Raw
+stdout/stderr or prompt-shaped text are visible-output clues only; they are not
+request-completion facts.
+
 Example:
 
 ```sh

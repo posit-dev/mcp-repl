@@ -148,7 +148,6 @@ pub struct WorkerManager {
     last_detached_prefix_item_count: usize,
     pager_prompt: Option<String>,
     last_prompt: Option<String>,
-    stdin_waiting: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -197,6 +196,10 @@ impl WorkerManager {
             });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
+        #[cfg(test)]
+        let _output_ring_guard = crate::output_capture::output_ring_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
@@ -233,7 +236,6 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
-            stdin_waiting: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {
@@ -375,11 +377,14 @@ mod tests {
     fn worker_manager_new_does_not_panic_for_non_utf8_tmpdir_env() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
 
         let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
-        let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
+        let non_utf8_tmpdir = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec()));
+        #[cfg(target_os = "linux")]
+        std::fs::create_dir_all(&non_utf8_tmpdir).expect("create non-UTF-8 TMPDIR parent");
 
         unsafe {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
@@ -400,6 +405,8 @@ mod tests {
                 std::env::remove_var("TMPDIR");
             },
         }
+        #[cfg(target_os = "linux")]
+        let _ = std::fs::remove_dir(&non_utf8_tmpdir);
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
     }

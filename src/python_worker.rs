@@ -31,38 +31,27 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             loop {
                 match conn.recv(None) {
-                    Some(ServerToWorkerIpcMessage::TurnStart { turn_id, input }) => {
-                        match python_session::begin_turn(turn_id, input) {
+                    Some(ServerToWorkerIpcMessage::InputBatch { input }) => {
+                        match python_session::begin_input(input) {
                             Ok(()) => {}
                             Err(err) => {
                                 emit_stderr_message(&err);
-                                emit_session_end_with_reason("protocol_error", Some(turn_id));
+                                emit_session_end_with_reason("protocol_error");
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::TurnInput { turn_id, input }) => {
-                        match python_session::append_turn_input(turn_id, input) {
-                            Ok(()) => {}
-                            Err(err) => {
-                                emit_stderr_message(&err);
-                                emit_session_end_with_reason("protocol_error", Some(turn_id));
-                            }
-                        }
-                    }
-                    Some(ServerToWorkerIpcMessage::Interrupt { turn_id }) => {
+                    Some(ServerToWorkerIpcMessage::Interrupt {}) => {
                         #[cfg(windows)]
                         {
-                            if let Some(turn_id) = turn_id {
-                                python_session::interrupt_turn(turn_id);
-                            } else {
-                                python_session::interrupt();
-                            }
+                            python_session::interrupt();
                         }
                         #[cfg(not(windows))]
                         {
-                            let _ = turn_id;
                             python_session::interrupt();
                         }
+                    }
+                    Some(ServerToWorkerIpcMessage::Shutdown {}) => {
+                        std::process::exit(0);
                     }
                     None => {
                         std::process::exit(0);

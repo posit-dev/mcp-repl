@@ -197,19 +197,24 @@ impl WorkerManager {
         if let Some(process) = self.process.as_ref()
             && let Some(ipc) = process.ipc_connection()
         {
-            let result = ipc.wait_for_prompt(timeout);
-            match result {
-                Ok(value) => {
-                    prompt = Some(value);
+            if timeout.is_zero() {
+                timed_out = true;
+            } else {
+                match ipc.wait_for_input_wait(timeout) {
+                    Ok(value) => {
+                        prompt = Some(value);
+                    }
+                    Err(IpcWaitError::Timeout) => {
+                        timed_out = true;
+                    }
+                    Err(IpcWaitError::SessionEnd) => {
+                        self.note_session_end(true);
+                    }
+                    Err(IpcWaitError::Disconnected) => {}
+                    Err(IpcWaitError::Protocol(message)) => {
+                        return Err(WorkerError::Protocol(message));
+                    }
                 }
-                Err(IpcWaitError::Timeout) => {
-                    timed_out = true;
-                }
-                Err(IpcWaitError::SessionEnd) => {
-                    self.note_session_end(true);
-                }
-                Err(IpcWaitError::Disconnected) => {}
-                Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
             }
         }
 
@@ -252,7 +257,12 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if !session_end && !prompt_wait.timed_out {
             reconcile_trailing_completion_prompt(
                 &mut contents,
@@ -315,7 +325,12 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if self.pager.is_active() && !session_end {
             self.pager_prompt = resolved_prompt.clone();
         }
@@ -365,7 +380,6 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.07)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),

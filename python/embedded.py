@@ -1097,22 +1097,26 @@ _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 if _mcp_repl_c_stdio_tty:
     sys.ps1 = _mcp_repl_ps1
     sys.ps2 = _mcp_repl_ps2
+    builtins.open = _mcp_repl_open
+    io.open = _mcp_repl_open
+    io.FileIO = _McpReplFileIO
+    _io.open = _mcp_repl_open
+    _io.FileIO = _McpReplFileIO
+    os.fdopen = _mcp_repl_os_fdopen
     if os.name == "nt":
-        builtins.open = _mcp_repl_open
-        io.open = _mcp_repl_open
-        io.FileIO = _McpReplFileIO
-        _io.open = _mcp_repl_open
-        _io.FileIO = _McpReplFileIO
-        os.fdopen = _mcp_repl_os_fdopen
         os.dup = _mcp_repl_os_dup
         os.dup2 = _mcp_repl_os_dup2
         os.close = _mcp_repl_os_close
-        os.read = _mcp_repl_os_read
+    os.read = _mcp_repl_os_read
+    if _original_os_readv is not None:
+        os.readv = _mcp_repl_os_readv
+    if _mcp_repl_posix is not None:
+        _mcp_repl_posix.read = _mcp_repl_os_read
         if _original_os_readv is not None:
-            os.readv = _mcp_repl_os_readv
-        _mcp_repl_stdin = McpInputStream()
-        sys.stdin = _mcp_repl_stdin
-        sys.__stdin__ = _mcp_repl_stdin
+            _mcp_repl_posix.readv = _mcp_repl_os_readv
+    _mcp_repl_stdin = McpInputStream()
+    sys.stdin = _mcp_repl_stdin
+    sys.__stdin__ = _mcp_repl_stdin
 else:
     builtins.input = _input
     builtins.open = _mcp_repl_open

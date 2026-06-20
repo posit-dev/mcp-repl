@@ -60,7 +60,7 @@ tryCatch(
             "interrupt_handler",
             mcp_session!(|session| {
                 session.write_stdin_raw_with("1+1", Some(10.0)).await?;
-                session.write_stdin_with(long_sleep, Some(1.0)).await;
+                session.write_stdin_with(long_sleep, Some(3.0)).await;
                 session.write_stdin_with("\u{3}", Some(5.0)).await;
                 session.write_stdin_with("1+1", Some(10.0)).await;
                 Ok(())

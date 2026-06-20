@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 
 #[cfg(target_family = "unix")]
 const IPC_READ_FD_ENV: &str = "MCP_REPL_IPC_READ_FD";
@@ -29,12 +31,14 @@ const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 
-#[cfg(target_family = "unix")]
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_family = "unix")]
     install_signal_handler();
+    #[cfg(target_family = "windows")]
+    install_signal_handler()?;
 
     let transport = IpcTransport::connect_from_env()?;
     run_worker(transport.reader, IpcWriter::new(transport.writer))
@@ -53,7 +57,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 3,
+            version: 6,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -64,6 +68,10 @@ fn run_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
+    writer.send(&WorkerToServer::InputWait {
+        prompt: "v5> ".to_string(),
+    })?;
+    append_control_log(control_log_path.as_deref(), "input_wait")?;
     if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
@@ -80,20 +88,19 @@ fn run_worker(
     );
 
     let mut state = CommandState {
-        next_prompt: "v3> ".to_string(),
+        next_prompt: "v5> ".to_string(),
         previous_line_empty: false,
-        input_line_after_idle: false,
-        session_end_after_idle: false,
-        bad_output_after_idle: None,
+        input_line_after_input_wait: false,
+        session_end_after_input_wait: false,
+        bad_output_after_input_wait: None,
     };
     while let Ok(message) = rx.recv() {
         match message {
-            ControlMessage::TurnStart { turn_id, input } => {
+            ControlMessage::InputBatch { input } => {
                 if run_turn(
                     &writer,
                     &sideband_interrupted,
                     &control_log_path,
-                    turn_id,
                     &input,
                     &mut state,
                 )? {
@@ -102,7 +109,7 @@ fn run_worker(
             }
             ControlMessage::Interrupt => {}
             ControlMessage::Shutdown => {
-                send_session_end(&writer, None, "shutdown")?;
+                send_session_end(&writer, "shutdown")?;
                 return Ok(());
             }
         }
@@ -115,30 +122,24 @@ fn run_turn(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     control_log_path: &Option<PathBuf>,
-    turn_id: u64,
     input: &str,
     state: &mut CommandState,
 ) -> io::Result<bool> {
     for raw_line in runtime_lines(input) {
         let prompt = state.next_prompt.clone();
         writer.send(&WorkerToServer::InputLine {
-            turn_id,
             prompt,
             text: raw_line.clone(),
         })?;
         append_control_log(
             control_log_path.as_deref(),
-            &format!(
-                "input_line turn_id={turn_id} text={}",
-                escape_bytes(raw_line.as_bytes())
-            ),
+            &format!("input_line text={}", escape_bytes(raw_line.as_bytes())),
         )?;
         let command = raw_line.trim_end_matches(['\r', '\n']);
         if run_command(
             writer,
             sideband_interrupted,
             control_log_path,
-            turn_id,
             command,
             state,
         )? {
@@ -147,13 +148,10 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v3> ".to_string());
-    writer.send(&WorkerToServer::Idle { turn_id, prompt })?;
-    append_control_log(
-        control_log_path.as_deref(),
-        &format!("idle turn_id={turn_id}"),
-    )?;
-    emit_deferred_protocol_faults(writer, control_log_path, turn_id, state)?;
+    let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
+    writer.send(&WorkerToServer::InputWait { prompt })?;
+    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    emit_deferred_protocol_faults(writer, control_log_path, state)?;
     Ok(false)
 }
 
@@ -161,11 +159,10 @@ fn run_command(
     writer: &IpcWriter,
     sideband_interrupted: &AtomicBool,
     control_log_path: &Option<PathBuf>,
-    turn_id: u64,
     command: &str,
     state: &mut CommandState,
 ) -> io::Result<bool> {
-    if command == "idle-only" {
+    if command == "input-wait-only" {
         return Ok(false);
     }
 
@@ -181,10 +178,7 @@ fn run_command(
 
     if let Some(millis) = command.strip_prefix("bad-output-after-sleep ") {
         sleep_for(parse_millis(millis)?, sideband_interrupted, false);
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("bad_output_after_sleep turn_id={turn_id}"),
-        )?;
+        append_control_log(control_log_path.as_deref(), "bad_output_after_sleep")?;
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
         sleep_for(5_000, sideband_interrupted, false);
         return Ok(false);
@@ -201,75 +195,73 @@ fn run_command(
             },
             if report.os { "observed" } else { "missing" },
         );
-        output_text(writer, control_log_path, turn_id, text.as_bytes())?;
+        output_text(writer, control_log_path, text.as_bytes())?;
         return Ok(false);
     }
 
     if command == "emit-output-after-input" {
-        output_text(writer, control_log_path, turn_id, b"after input_line\n")?;
+        output_text(writer, control_log_path, b"after input_line\n")?;
         return Ok(false);
     }
 
-    if command == "late-input-line-after-idle" {
-        state.input_line_after_idle = true;
+    if command == "output-matching-input-line" {
+        output_text(
+            writer,
+            control_log_path,
+            b"v5> output-matching-input-line\nVISIBLE\n",
+        )?;
         return Ok(false);
     }
 
-    if command == "session-end-after-idle" {
-        state.session_end_after_idle = true;
+    if command == "late-input-line-after-input-wait" {
+        state.input_line_after_input_wait = true;
         return Ok(false);
     }
 
-    if let Some(millis) = command.strip_prefix("bad-output-after-idle ") {
-        state.bad_output_after_idle = Some(Duration::from_millis(parse_millis(millis)?));
+    if command == "session-end-after-input-wait" {
+        state.session_end_after_input_wait = true;
+        return Ok(false);
+    }
+
+    if let Some(millis) = command.strip_prefix("bad-output-after-input-wait ") {
+        state.bad_output_after_input_wait = Some(Duration::from_millis(parse_millis(millis)?));
         return Ok(false);
     }
 
     if command == "exit" {
-        send_session_end(writer, Some(turn_id), "runtime_exit")?;
+        send_session_end(writer, "runtime_exit")?;
         return Ok(true);
     }
 
-    let text = format!("v3-output: {command}\n");
-    output_text(writer, control_log_path, turn_id, text.as_bytes())?;
+    let text = format!("v5-output: {command}\n");
+    output_text(writer, control_log_path, text.as_bytes())?;
     Ok(false)
 }
 
 fn emit_deferred_protocol_faults(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
-    turn_id: u64,
     state: &mut CommandState,
 ) -> io::Result<()> {
-    if state.input_line_after_idle {
-        state.input_line_after_idle = false;
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("late_input_line turn_id={turn_id}"),
-        )?;
+    if state.input_line_after_input_wait {
+        state.input_line_after_input_wait = false;
+        append_control_log(control_log_path.as_deref(), "late_input_line")?;
         writer.send(&WorkerToServer::InputLine {
-            turn_id,
-            prompt: "v3> ".to_string(),
+            prompt: "v5> ".to_string(),
             text: "late\n".to_string(),
         })?;
     }
-    if state.session_end_after_idle {
-        state.session_end_after_idle = false;
-        append_control_log(
-            control_log_path.as_deref(),
-            &format!("late_session_end turn_id={turn_id}"),
-        )?;
-        send_session_end(writer, Some(turn_id), "runtime_exit")?;
+    if state.session_end_after_input_wait {
+        state.session_end_after_input_wait = false;
+        append_control_log(control_log_path.as_deref(), "late_session_end")?;
+        send_session_end(writer, "runtime_exit")?;
     }
-    if let Some(delay) = state.bad_output_after_idle.take() {
+    if let Some(delay) = state.bad_output_after_input_wait.take() {
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
         thread::spawn(move || {
             thread::sleep(delay);
-            let _ = append_control_log(
-                control_log_path.as_deref(),
-                &format!("late_bad_output turn_id={turn_id}"),
-            );
+            let _ = append_control_log(control_log_path.as_deref(), "late_bad_output");
             let _ = writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64);
         });
     }
@@ -279,21 +271,16 @@ fn emit_deferred_protocol_faults(
 fn output_text(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
-    turn_id: u64,
     bytes: &[u8],
 ) -> io::Result<()> {
-    append_control_log(
-        control_log_path.as_deref(),
-        &format!("output_text turn_id={turn_id}"),
-    )?;
+    append_control_log(control_log_path.as_deref(), "output_text")?;
     writer.output_text("stdout", bytes)
 }
 
-fn send_session_end(writer: &IpcWriter, turn_id: Option<u64>, reason: &str) -> io::Result<()> {
+fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
-        message_b64: None,
-        turn_id,
+        message: None,
     })
 }
 
@@ -319,9 +306,9 @@ fn runtime_lines(input: &str) -> Vec<String> {
 struct CommandState {
     next_prompt: String,
     previous_line_empty: bool,
-    input_line_after_idle: bool,
-    session_end_after_idle: bool,
-    bad_output_after_idle: Option<Duration>,
+    input_line_after_input_wait: bool,
+    session_end_after_input_wait: bool,
+    bad_output_after_input_wait: Option<Duration>,
 }
 
 fn start_control_reader(
@@ -344,22 +331,16 @@ fn start_control_reader(
             }
             let message = serde_json::from_str::<ServerToWorker>(line.trim_end());
             match message {
-                Ok(ServerToWorker::TurnStart { turn_id, input }) => {
+                Ok(ServerToWorker::InputBatch { input }) => {
                     let _ = append_control_log(
                         control_log_path.as_deref(),
-                        &format!(
-                            "turn_start turn_id={turn_id} input={}",
-                            escape_bytes(input.as_bytes())
-                        ),
+                        &format!("input_batch input={}", escape_bytes(input.as_bytes())),
                     );
-                    let _ = turn_tx.send(ControlMessage::TurnStart { turn_id, input });
+                    let _ = turn_tx.send(ControlMessage::InputBatch { input });
                 }
-                Ok(ServerToWorker::Interrupt { turn_id }) => {
+                Ok(ServerToWorker::Interrupt {}) => {
                     interrupted.store(true, Ordering::SeqCst);
-                    let _ = append_control_log(
-                        control_log_path.as_deref(),
-                        &format!("interrupt turn_id={}", turn_id.unwrap_or(0)),
-                    );
+                    let _ = append_control_log(control_log_path.as_deref(), "interrupt");
                     let _ = turn_tx.send(ControlMessage::Interrupt);
                 }
                 Err(_) => {}
@@ -390,7 +371,7 @@ fn start_stdin_observer(control_log_path: Option<PathBuf>) {
 
 #[derive(Debug)]
 enum ControlMessage {
-    TurnStart { turn_id: u64, input: String },
+    InputBatch { input: String },
     Interrupt,
     Shutdown,
 }
@@ -398,8 +379,8 @@ enum ControlMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerToWorker {
-    TurnStart { turn_id: u64, input: String },
-    Interrupt { turn_id: Option<u64> },
+    InputBatch { input: String },
+    Interrupt {},
 }
 
 #[derive(Serialize)]
@@ -415,18 +396,15 @@ enum WorkerToServer {
         data_b64: String,
     },
     InputLine {
-        turn_id: u64,
         prompt: String,
         text: String,
     },
-    Idle {
-        turn_id: u64,
+    InputWait {
         prompt: String,
     },
     SessionEnd {
         reason: String,
-        message_b64: Option<String>,
-        turn_id: Option<u64>,
+        message: Option<String>,
     },
 }
 
@@ -604,7 +582,32 @@ fn take_os_interrupt() -> bool {
     INTERRUPTED_BY_OS.swap(false, Ordering::SeqCst)
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(target_family = "windows")]
+fn install_signal_handler() -> io::Result<()> {
+    let ok = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), 1) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "windows")]
+unsafe extern "system" fn handle_console_ctrl(event: u32) -> i32 {
+    if event == CTRL_BREAK_EVENT || event == CTRL_C_EVENT {
+        INTERRUPTED_BY_OS.store(true, Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn take_os_interrupt() -> bool {
+    INTERRUPTED_BY_OS.swap(false, Ordering::SeqCst)
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
 fn take_os_interrupt() -> bool {
     false
 }

@@ -15,11 +15,9 @@ use state::{
     set_current_repl_readline_prompt,
 };
 #[cfg(not(any(target_family = "unix", windows)))]
-use state::{input_hook_prompt, mark_stdin_wait_prompt_completed_request};
-#[cfg(windows)]
-use stdio::StdioLineRead;
-use stdio::{PYTHON_STDIN_FILE, PythonRuntime, open_python_runtime};
-#[cfg(not(windows))]
+use state::{input_hook_prompt, mark_input_wait_completed_request};
+use stdio::{PYTHON_STDIN_FILE, PythonRuntime, StdioLineRead, open_python_runtime};
+#[cfg(all(not(target_family = "unix"), not(windows)))]
 use stdio::{read_stdio_line_bytes, read_stdio_line_bytes_allowing_python_threads};
 
 mod state;
@@ -63,9 +61,9 @@ impl PythonSession {
     }
 
     #[cfg(windows)]
-    pub fn begin_turn(&self, turn_id: u64, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
-        windows_stdin::begin_tracked_turn(turn_id, input)
+        windows_stdin::begin_tracked_input_batch(input)
     }
 }
 
@@ -141,11 +139,6 @@ pub(crate) fn interrupt() {
     interrupt_for_request_generation(None);
 }
 
-#[cfg(windows)]
-pub(crate) fn interrupt_turn(turn_id: u64) {
-    windows_stdin::interrupt_turn(turn_id);
-}
-
 fn interrupt_for_request_generation(request_generation: Option<u64>) {
     let _ = request_generation;
     discard_pending_stdin();
@@ -184,40 +177,22 @@ fn take_interrupt_requested() -> bool {
     requested
 }
 
-pub(crate) fn begin_turn(turn_id: u64, input: String) -> Result<(), String> {
+pub(crate) fn begin_input(input: String) -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
-        unix_stdin::begin_or_append_turn_input(turn_id, &input);
-        Ok(())
+        unix_stdin::begin_input_batch(&input)
     }
 
     #[cfg(windows)]
     {
-        PythonSession::global()?.begin_turn(turn_id, input)
+        PythonSession::global()?.begin_input(input)
     }
 
     #[cfg(not(any(target_family = "unix", windows)))]
     {
-        let _ = (turn_id, input);
+        let _ = input;
         Ok(())
     }
-}
-
-#[cfg(target_family = "unix")]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    unix_stdin::begin_or_append_turn_input(turn_id, &input);
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    windows_stdin::append_tracked_turn_input(turn_id, input)
-}
-
-#[cfg(not(any(target_family = "unix", windows)))]
-pub(crate) fn append_turn_input(turn_id: u64, input: String) -> Result<(), String> {
-    let _ = (turn_id, input);
-    Ok(())
 }
 
 #[cfg_attr(target_family = "unix", allow(dead_code))]
@@ -228,6 +203,8 @@ fn finish_active_request_at_next_read() {
     let mut guard = state.inner.lock().unwrap();
     guard.waiting_for_input = false;
     if let Some(active) = guard.active_request.as_mut() {
+        #[cfg(windows)]
+        active.queued_lines.clear();
         active.line_count = active.consumed_lines.saturating_add(1);
         active.fallback_prompt = None;
         active.skip_next_hook = false;
@@ -313,9 +290,16 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     ipc::emit_worker_ready("python", plot_capable());
 
     let result = run_repl(&runtime);
+    crate::diagnostics::startup_log("python-session: repl loop exited; finalizing python");
     let finalize_result = finalize_python(api, thread_state);
+    match &finalize_result {
+        Ok(()) => crate::diagnostics::startup_log("python-session: python finalized"),
+        Err(err) => {
+            crate::diagnostics::startup_log(format!("python-session: finalize failed: {err}"))
+        }
+    }
     finish_session_end();
-    crate::diagnostics::startup_log("python-session: repl exited");
+    crate::diagnostics::startup_log("python-session: emitted session_end");
     result?;
     finalize_result?;
     Ok(())
@@ -444,7 +428,7 @@ fn handle_input_hook() {
         };
         let mut completed = None;
         let mut prompt = None;
-        let mut emit_idle = false;
+        let mut emit_readline_prompt = false;
         let mut flush_before_wait = false;
         {
             let mut guard = state.inner.lock().unwrap();
@@ -492,7 +476,7 @@ fn handle_input_hook() {
             } else if !guard.waiting_for_input {
                 guard.waiting_for_input = true;
                 prompt = Some(idle_prompt);
-                emit_idle = true;
+                emit_readline_prompt = true;
             }
         }
 
@@ -501,16 +485,16 @@ fn handle_input_hook() {
         } else if let Some(active) = completed {
             emit_plots();
             #[cfg(not(target_family = "unix"))]
-            mark_stdin_wait_prompt_completed_request();
+            mark_input_wait_completed_request();
             flush_original_stdio();
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
-            ipc::emit_readline_start(prompt);
+            ipc::emit_input_wait(prompt);
             complete_active_request(state, Some(active), false);
-        } else if emit_idle {
+        } else if emit_readline_prompt {
             let prompt = prompt.as_deref().unwrap_or(">>> ");
             remember_emitted_prompt(prompt);
-            ipc::emit_readline_start(prompt);
+            ipc::emit_input_wait(prompt);
         }
     }
 }
@@ -582,11 +566,8 @@ fn finish_repl_turn_request() {
         let primary_prompt = guard.python_primary_prompt.clone();
         let continuation_prompt = guard.python_continuation_prompt.clone();
         guard.interrupt_requested = false;
-        if guard
-            .active_request
-            .as_ref()
-            .is_some_and(|active| active.turn_id.is_some())
-        {
+        #[cfg(windows)]
+        if guard.active_request.is_some() {
             return;
         }
         if guard.active_request.is_some() {
@@ -624,7 +605,7 @@ fn finish_repl_turn_request() {
         flush_original_stdio();
         let prompt = prompt.as_deref().unwrap_or(">>> ");
         remember_emitted_prompt(prompt);
-        ipc::emit_readline_start(prompt);
+        ipc::emit_input_wait(prompt);
         complete_active_request(state, Some(active), false);
     }
 }
@@ -644,7 +625,7 @@ unsafe extern "C" fn mcp_repl_readline(
     _stdout: *mut libc::FILE,
     prompt: *const c_char,
 ) -> *mut c_char {
-    #[cfg(windows)]
+    #[cfg(any(target_family = "unix", windows))]
     let _ = stdin;
     let prompt_text = if prompt.is_null() {
         String::new()
@@ -671,17 +652,27 @@ unsafe extern "C" fn mcp_repl_readline(
     ) && prompt_matches_python_repl_prompt(&prompt_text);
     #[cfg(target_family = "unix")]
     flush_original_stdio();
-    #[cfg(target_family = "unix")]
-    if !prompt_text.is_empty() && !suppress_repl_prompt_echo {
-        emit_output_text(TextStream::Stdout, prompt_text.as_bytes());
-    }
-    #[cfg(target_family = "unix")]
-    request_cpython_readline_stdin_line(&prompt_text);
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     handle_input_hook();
 
     #[cfg(windows)]
     flush_original_stdio();
+    #[cfg(target_family = "unix")]
+    let read = match unix_stdin::read_cpython_readline_turn_line(
+        &prompt_text,
+        !prompt_text.is_empty() && !suppress_repl_prompt_echo,
+    ) {
+        Ok(read) => read,
+        Err(err) => {
+            emit_output_text(TextStream::Stderr, err.as_bytes());
+            ipc::emit_session_end_with_reason("protocol_error");
+            request_exit();
+            StdioLineRead {
+                bytes: Vec::new(),
+                interrupted: true,
+            }
+        }
+    };
     #[cfg(windows)]
     let read = match windows_stdin::read_windows_turn_line(
         &prompt_text,
@@ -691,7 +682,7 @@ unsafe extern "C" fn mcp_repl_readline(
         Ok(read) => read,
         Err(err) => {
             emit_output_text(TextStream::Stderr, err.as_bytes());
-            ipc::emit_session_end_with_reason("protocol_error", None);
+            ipc::emit_session_end_with_reason("protocol_error");
             request_exit();
             StdioLineRead {
                 bytes: Vec::new(),
@@ -699,7 +690,7 @@ unsafe extern "C" fn mcp_repl_readline(
             }
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(all(not(target_family = "unix"), not(windows)))]
     let read = read_stdio_line_bytes(stdin);
     if read.interrupted {
         #[cfg(target_family = "unix")]
@@ -736,11 +727,6 @@ fn allocate_readline_result(bytes: &[u8]) -> *mut c_char {
         *result.add(bytes.len()) = 0;
     }
     result
-}
-
-#[cfg(target_family = "unix")]
-fn request_cpython_readline_stdin_line(prompt: &str) {
-    unix_stdin::request_cpython_readline_stdin_line(prompt);
 }
 
 fn prompt_matches_python_repl_prompt(prompt: &str) -> bool {
@@ -799,12 +785,6 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     );
     #[cfg(target_family = "unix")]
     flush_original_stdio();
-    #[cfg(target_family = "unix")]
-    if !prompt.is_empty() {
-        emit_output_text(TextStream::Stdout, prompt.as_bytes());
-    }
-    #[cfg(target_family = "unix")]
-    unix_stdin::request_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""));
     #[cfg(all(not(target_family = "unix"), not(windows)))]
     {
         flush_original_stdio();
@@ -826,7 +806,17 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
             return CStdinLine::Error;
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(target_family = "unix")]
+    let read = match unix_stdin::read_runtime_stdin_line(prompt_for_sideband.to_str().unwrap_or(""))
+    {
+        Ok(read) => read,
+        Err(err) => {
+            set_callback_error(&err);
+            clear_current_readline_prompt();
+            return CStdinLine::Error;
+        }
+    };
+    #[cfg(all(not(target_family = "unix"), not(windows)))]
     let read = read_stdio_line_bytes_allowing_python_threads(stdin);
     if read.interrupted {
         #[cfg(target_family = "unix")]
@@ -1043,7 +1033,7 @@ unsafe extern "C" fn initialize_mcp_repl_module() -> *mut PyObject {
         },
         ModuleMethod {
             name: "emit_plot_image",
-            function: py_emit_plot_image,
+            function: py_emit_output_image,
         },
         ModuleMethod {
             name: "set_python_prompts",
@@ -1184,7 +1174,7 @@ unsafe extern "C" fn py_request_exit(_self: *mut PyObject, args: *mut PyObject) 
     api.none()
 }
 
-unsafe extern "C" fn py_emit_plot_image(
+unsafe extern "C" fn py_emit_output_image(
     _self: *mut PyObject,
     args: *mut PyObject,
 ) -> *mut PyObject {
@@ -1210,7 +1200,7 @@ unsafe extern "C" fn py_emit_plot_image(
     let Some(source) = api.unicode_arg(args, 3) else {
         return ptr::null_mut();
     };
-    ipc::emit_plot_image(&mime_type, &data, is_update == 1, Some(&source));
+    ipc::emit_output_image(&mime_type, &data, is_update == 1, Some(&source));
     api.none()
 }
 

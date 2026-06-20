@@ -422,7 +422,7 @@ async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResult<()> {
+async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
@@ -452,8 +452,8 @@ async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResul
 
     let matching_lines = text.matches("> 1 + 1\n").count();
     assert_eq!(
-        matching_lines, 2,
-        "expected raw child text plus later matching R echo, got: {text:?}"
+        matching_lines, 1,
+        "expected only raw child text, not a synthetic R echo, got: {text:?}"
     );
     let raw_child_line = text
         .find("> 1 + 1\n")
@@ -504,7 +504,7 @@ async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
+async fn repl_tool_hides_ipc_env_vars_from_r_user_code() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
@@ -512,7 +512,7 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
         .call_tool_raw(
             session.repl_tool_name(),
             json!({
-                "input": "cat(sprintf(\"%s %s\\n\", nzchar(Sys.getenv(\"MCP_REPL_IPC_READ_FD\")), nzchar(Sys.getenv(\"MCP_REPL_IPC_WRITE_FD\"))))\n",
+                "input": "vars <- c('MCP_REPL_IPC_READ_FD', 'MCP_REPL_IPC_WRITE_FD', 'MCP_REPL_IPC_PIPE_TO_WORKER', 'MCP_REPL_IPC_PIPE_FROM_WORKER')\ncat(paste(nzchar(Sys.getenv(vars)), collapse = ' '), '\\n')\n",
                 "timeout_ms": 10_000
             }),
         )
@@ -531,8 +531,8 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains("FALSE FALSE"),
-        "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
+        text.contains("FALSE FALSE FALSE FALSE"),
+        "expected IPC env vars to be hidden from R user code, got: {text:?}"
     );
 
     Ok(())

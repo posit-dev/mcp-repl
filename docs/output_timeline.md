@@ -14,7 +14,7 @@ The worker emits different kinds of information on different channels:
 - PTY-backed workers expose raw terminal output through the PTY master, which
   may merge stdout/stderr identity and apply terminal behavior such as CRLF
   translation, echo, and width-dependent formatting.
-- Sideband IPC carries structural events such as `input_line`, `idle`,
+- Sideband IPC carries structural events such as `input_line`, `input_wait`,
   `output_image`, and `session_end`.
 
 Raw pipes and IPC do not arrive at the server in one globally ordered stream.
@@ -33,8 +33,8 @@ changes what must stay buffered between tool calls.
   reply.
 - Worker-owned `output_text` frames and raw stdout/stderr bytes are buffered as
   `TextFragment` events.
-- Sideband events are stored alongside text so later formatting can suppress
-  synthetic input echoes and respect request boundaries.
+- Sideband events are stored alongside text so later formatting can respect
+  request boundaries and reconstruct interactive transcripts when needed.
 - When a reply is sealed, `PendingOutputSnapshot::format_contents()` converts the
   tape into `WorkerContent`.
 
@@ -55,17 +55,17 @@ The important design split is not "files mode vs pager mode". It is:
   input, append protocol warnings, and restore the final prompt
 
 Timeline resolution must not depend on request completion. For example, the
-server does not need to wait for completion to know that a `plot_image` event
-belongs before a later `readline_result` echo. That ordering fact is already
-present in the mixed timeline.
+server does not need to wait for completion to know that an `output_image` event
+belongs before later worker-owned output. That ordering fact is already present
+in the mixed timeline.
 
 Completion matters only for reply cleanup choices that are unsafe while a
 request is still in flight. In particular:
 
 - timed-out or otherwise non-final drains must preserve echoed input so the user
   can still see what is running
-- completed replies may trim or drop echo-only content once the server knows the
-  request is settled
+- completed replies may trim or drop echo-only raw terminal content once the
+  server knows the request is settled
 
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
@@ -74,7 +74,8 @@ Echo matching must be driven by the sideband facts themselves:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
-- `idle` supplies the final prompt text for a completed turn
+- `input_wait` supplies the prompt text for worker readiness and completed
+  input batches
 - the server should match and collapse those exact sideband facts
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`
@@ -113,9 +114,9 @@ resolution, not in the wire protocol.
 - Worker text must remain in the order observed on its stdout/stderr pipes.
 - For PTY-backed workers, worker text from the PTY master must remain in the
   order observed on that terminal stream.
-- Sideband `readline_result` events define the order in which input lines were
-  consumed.
-- Sideband `plot_image` events define when plot updates happened relative to
+- Sideband `input_line` events define the order in which logical input was
+  delivered to the runtime.
+- Sideband `output_image` events define when image updates happened relative to
   other sideband events.
 - Visible replies must preserve evaluation order when that order is represented
   by sideband facts. They must not invent a strict order between unframed
@@ -136,5 +137,5 @@ the same thing as "execution order in the backend".
 ## Current limitation
 
 This document describes the current server contract, not future simplification
-work. Broader changes to worker dumbness, request completion inference, or R
-worker structure should be tracked in `docs/futurework/`.
+work. Broader changes to output storage, response presentation, or worker
+structure should be tracked in `docs/futurework/`.

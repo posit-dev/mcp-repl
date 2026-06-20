@@ -169,7 +169,11 @@ Optional `bwrap` stage:
   or denied domains with enabled network access currently fails closed.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
-  - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
+  - the internal Windows sandbox wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
+- Unsandboxed Windows ConPTY launches attach the worker process directly to the
+  pseudoconsole. Sandboxed ConPTY launches create the pseudoconsole inside the
+  Windows sandbox wrapper so the restricted worker, not an outer process, owns
+  the terminal endpoint.
 - Worker spawn refreshes prepared workspace ACL coverage before launch.
 - The per-session temp directory stays launch-scoped and is not shared through the stable workspace SID; the same configured path may be reused across respawns, but it is reset before each fresh worker launch.
 - `danger-full-access` and `external-sandbox` run without built-in sandbox enforcement.

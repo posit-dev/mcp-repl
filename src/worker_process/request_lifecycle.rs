@@ -95,7 +95,6 @@ pub(super) fn completion_info_from_ipc(
 
     CompletionInfo {
         prompt,
-        stdin_wait_prompt: ipc.take_stdin_wait_prompt(),
         prompt_variants,
         echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
@@ -129,6 +128,9 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
+        if let Some(process) = self.process.as_ref() {
+            process.note_accepted_input_starting();
+        }
         self.driver
             .on_input_start(&text, &payload, &ipc, remaining)?;
         self.settled_pending_completion = None;
@@ -169,6 +171,9 @@ impl WorkerManager {
             Err(WorkerError::Protocol(message))
                 if message.contains("ipc disconnected while waiting for request completion")
         ) {
+            crate::diagnostics::startup_log(
+                "worker-request: ipc disconnected while waiting for completion; checking process",
+            );
             let deadline = Instant::now() + Duration::from_millis(500);
             let mut worker_exited = self.process.is_none();
             while !worker_exited {
@@ -182,14 +187,20 @@ impl WorkerManager {
                 thread::sleep(Duration::from_millis(20));
             }
             if worker_exited {
+                crate::diagnostics::startup_log(
+                    "worker-request: treating disconnected exited worker as session end",
+                );
                 result = Ok(CompletionInfo {
                     prompt: None,
-                    stdin_wait_prompt: None,
                     prompt_variants: None,
                     echo_events: Vec::new(),
                     protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
+            } else {
+                crate::diagnostics::startup_log(
+                    "worker-request: disconnected worker did not exit during grace period",
+                );
             }
         }
         // Best-effort: after IPC completion, give the output reader threads a brief window to
@@ -381,7 +392,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
-                self.driver.clear_active_turn();
+                self.driver.clear_active_input();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
@@ -409,9 +420,15 @@ impl WorkerManager {
     }
 
     pub(super) fn clear_pending_request_state(&mut self) {
+        self.clear_pending_request_state_with_active_turn(false);
+    }
+
+    pub(super) fn clear_pending_request_state_with_active_turn(&mut self, preserve: bool) {
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.driver.clear_active_turn();
+        if !preserve {
+            self.driver.clear_active_input();
+        }
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);

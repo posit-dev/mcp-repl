@@ -13,8 +13,9 @@ descendants to survive long enough to interfere with later sessions."
 Today worker teardown is asymmetric:
 
 - Unix has best-effort descendant signaling.
-- Windows mainly manages the root worker / wrapper process and does not provide
-  equally strong descendant cleanup.
+- Windows mainly manages the root worker process, or the sandbox wrapper that
+  owns a restricted worker launch, and does not provide equally strong
+  descendant cleanup.
 
 That leaves room for detached descendants to survive past session end and keep
 resources alive, including:
@@ -29,8 +30,8 @@ This is one of the reasons tempdir delete-in-place can fail on Windows.
 ## Current Behavior
 
 - Unix teardown signals the worker and discovered descendants.
-- Windows soft termination deliberately lets the wrapper exit naturally so it
-  can unwind temporary ACL state.
+- Sandboxed Windows soft termination deliberately lets the wrapper exit
+  naturally so it can unwind temporary ACL state.
 - Windows hard termination kills the child process but does not provide an
   equivalent descendant sweep.
 - Teardown is intentionally bounded even if a detached descendant still holds

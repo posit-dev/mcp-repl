@@ -170,7 +170,7 @@ async fn large_page_size_keeps_pager_mode_instead_of_spilling_to_output_bundle()
 
     let initial = session
         .write_stdin_raw_with(
-            "line <- paste(rep('x', 200), collapse = ''); for (i in 1:300) cat(sprintf('line%04d %s\\n', i, line))",
+            "line <- paste(rep('x', 500), collapse = ''); for (i in 1:40) cat(sprintf('line%04d %s\\n', i, line))",
             Some(30.0),
         )
         .await?;

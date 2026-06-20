@@ -57,7 +57,7 @@ screen” signal. That means server-side timeline fixes can only help after the
 image exists; they cannot make an image arrive earlier than the worker emits it.
 
 That limitation is separate from ordinary plot/stdout ordering across separate
-input lines. The server timeline can already place an emitted `plot_image`
+input lines. The server timeline can already place an emitted `output_image`
 before later stdout when the sideband facts contain that ordering.
 
 ## Investigation Outcome
@@ -156,11 +156,10 @@ Before changing the graphics device, require:
 
 This is separate from:
 
-- `docs/futurework/r-worker-turn-boundary-simplification.md`
 - `docs/futurework/r-embedding-minimal-callbacks.md`
 
-Those notes are about worker semantics and embedding complexity. This note is
-specifically about the plot-capture mechanism.
+That note is about embedding complexity. This note is specifically about the
+plot-capture mechanism.
 
 ## Non-Goals
 

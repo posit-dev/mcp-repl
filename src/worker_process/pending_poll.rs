@@ -218,8 +218,8 @@ impl WorkerManager {
     ) -> Result<PendingPollState, WorkerError> {
         match self.wait_for_request_completion(timeout) {
             Ok(info) => {
-                self.clear_pending_request_state();
                 let session_end = info.session_end_seen;
+                self.clear_pending_request_state();
                 if session_end {
                     self.note_session_end(true);
                 }
@@ -283,7 +283,6 @@ mod tests {
         manager.process = Some(test_worker_process(sleeping_test_child()));
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec!["> ".to_string()]),
             echo_events: Vec::new(),
             protocol_warnings: Vec::new(),

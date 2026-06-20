@@ -1,11 +1,11 @@
 mod backend;
-mod builtin_adapter_request_state;
 mod completion_reply;
 mod debug_logs;
 mod debug_repl;
 mod diagnostics;
 mod event_log;
 mod html_to_markdown;
+mod input_state;
 mod install;
 mod ipc;
 mod managed_network;
@@ -17,9 +17,9 @@ mod oversized_output;
 mod pager;
 mod pending_output_tape;
 mod python_ffi;
+mod python_input_queue;
 mod python_runtime;
 mod python_session;
-mod python_turn_input;
 mod python_worker;
 mod r_controls;
 mod r_graphics;
@@ -30,7 +30,6 @@ mod sandbox;
 mod sandbox_cli;
 mod server;
 mod stdin_payload;
-mod turn_state;
 #[cfg(target_os = "windows")]
 mod windows_conpty;
 #[cfg(target_os = "windows")]

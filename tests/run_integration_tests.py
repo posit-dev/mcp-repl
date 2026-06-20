@@ -744,9 +744,9 @@ def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None
                 "did not expect the pure leading echo prefix in spill file, "
                 f"got: {spill_text!r}"
             )
-        if "y500 <- 500" not in spill_text:
+        if "y500 <- 500" in spill_text:
             raise SuiteFailure(
-                "expected later echoed input to remain after output interleaving, "
+                "did not expect later submitted input echo in spill file, "
                 f"got: {spill_text!r}"
             )
         if "ok" not in spill_text or "done" not in spill_text:
@@ -767,9 +767,9 @@ def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None
         raise SuiteFailure(
             f"did not expect the pure leading echo prefix inline, got: {received_text!r}"
         )
-    if "y500 <- 500" not in received_text:
+    if "y500 <- 500" in received_text:
         raise SuiteFailure(
-            "expected later echoed input to remain after output interleaving, "
+            "did not expect later submitted input echo inline, "
             f"got: {received_text!r}"
         )
 
