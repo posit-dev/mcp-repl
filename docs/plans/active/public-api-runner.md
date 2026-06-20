@@ -46,9 +46,8 @@
 
 ## Next Safe Slice
 
-- The basic sandbox write-policy contrasts and workspace-write network policy contrasts now live in the Python runner.
-- A representative R `write_stdin` public-behavior cluster now lives in the Python runner.
 - Migrate another representative real-binary Rust integration scenario to the Python runner and remove or reduce only the matching Rust coverage.
+- Rename, split, or retire temporary staging suites such as `tests/refactor_coverage.rs` when equivalent scenarios have clearer homes in the external runner or behavior-specific Rust suites.
 - Keep additional sandbox migrations focused on public behavior that does not require internal server or launch-state inspection.
 
 ## Stop Conditions

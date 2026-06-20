@@ -5,7 +5,6 @@ use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
 use crate::output_capture::OutputTextSource;
 use crate::oversized_output::OversizedOutputMode;
-use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_supervisor::WorkerProcess;
 
 use super::WorkerError;
@@ -23,31 +22,18 @@ pub(super) trait BackendDriver: Send {
         text
     }
 
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        prepare_worker_stdin_payload(text)
-    }
-
     fn on_input_start(
         &mut self,
         text: &str,
-        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError>;
-
-    fn on_input_written(&mut self, _ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        Ok(())
-    }
 
     fn should_settle_output_after_timeout(
         &self,
         oversized_output: OversizedOutputMode,
         pending_input: Option<&str>,
     ) -> bool;
-
-    fn should_write_stdin_payload(&self) -> bool {
-        true
-    }
 
     fn clear_active_input(&mut self) {}
 
@@ -144,7 +130,6 @@ impl BackendDriver for RBackendDriver {
     fn on_input_start(
         &mut self,
         text: &str,
-        _payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
@@ -168,10 +153,6 @@ impl BackendDriver for RBackendDriver {
             return Err(WorkerError::Protocol(message));
         }
         Ok(())
-    }
-
-    fn should_write_stdin_payload(&self) -> bool {
-        false
     }
 
     fn clear_active_input(&mut self) {}
@@ -222,11 +203,9 @@ impl BackendDriver for ProtocolBackendDriver {
     fn on_input_start(
         &mut self,
         text: &str,
-        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        let _ = payload;
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -249,20 +228,11 @@ impl BackendDriver for ProtocolBackendDriver {
         Ok(())
     }
 
-    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        let _ = ipc;
-        Ok(())
-    }
-
     fn should_settle_output_after_timeout(
         &self,
         _oversized_output: OversizedOutputMode,
         _pending_input: Option<&str>,
     ) -> bool {
-        false
-    }
-
-    fn should_write_stdin_payload(&self) -> bool {
         false
     }
 
@@ -311,19 +281,15 @@ mod tests {
     }
 
     #[test]
-    fn r_driver_sends_input_batch_without_stdin_payload_write() {
+    fn r_driver_sends_input_batch() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
         make_ready_for_input(&server, &worker, "> ");
 
         driver
-            .on_input_start("1+1", b"1+1\n", &server, Duration::from_millis(200))
+            .on_input_start("1+1", &server, Duration::from_millis(200))
             .expect("R input_batch should send");
 
-        assert!(
-            !driver.should_write_stdin_payload(),
-            "R driver should not ask the server to write managed input to stdin"
-        );
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
             Some(ServerToWorkerIpcMessage::InputBatch { input }) if input == "1+1"
@@ -375,12 +341,7 @@ mod tests {
         make_ready_for_input(&server, &worker, ">>> ");
 
         driver
-            .on_input_start(
-                "answer = input('p> ')",
-                b"answer = input('p> ')\n",
-                &server,
-                Duration::from_millis(200),
-            )
+            .on_input_start("answer = input('p> ')", &server, Duration::from_millis(200))
             .expect("input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
@@ -397,7 +358,7 @@ mod tests {
         assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .on_input_start("ok\n", &server, Duration::from_millis(200))
             .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
@@ -414,7 +375,6 @@ mod tests {
         driver
             .on_input_start(
                 "answer <- readline('p> ')",
-                b"answer <- readline('p> ')\n",
                 &server,
                 Duration::from_millis(200),
             )
@@ -434,7 +394,7 @@ mod tests {
         assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .on_input_start("ok\n", &server, Duration::from_millis(200))
             .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
