@@ -127,24 +127,15 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        let payload = self.driver.prepare_input_payload(&text);
         if let Some(process) = self.process.as_ref() {
             process.note_accepted_input_starting();
         }
-        self.driver
-            .on_input_start(&text, &payload, &ipc, remaining)?;
+        self.driver.on_input_start(&text, &ipc, remaining)?;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
-        }
-        if self.driver.should_write_stdin_payload() {
-            self.process
-                .as_mut()
-                .expect("worker process should be available")
-                .write_stdin_payload(payload, remaining)?;
-            self.driver.on_input_written(&ipc)?;
         }
         Ok(RequestState {
             timeout: worker_timeout,
