@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::CompletionInfo;
@@ -122,6 +122,20 @@ fn send_worker_ipc_with_timeout(
     }
 }
 
+fn begin_input_when_ready(ipc: &ServerIpcConnection, timeout: Duration) -> Result<(), WorkerError> {
+    match ipc.begin_input_when_ready(timeout) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before input_wait".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected while waiting for worker input_wait".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 impl BackendDriver for RBackendDriver {
     fn prepare_input_text(&self, text: String) -> String {
         normalize_input_newlines(&text)
@@ -137,13 +151,18 @@ impl BackendDriver for RBackendDriver {
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
-        ipc.begin_input().map_err(WorkerError::Protocol)?;
+        let start = Instant::now();
+        begin_input_when_ready(ipc, timeout)?;
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(WorkerError::Timeout(timeout));
+        }
         send_worker_ipc_with_timeout(
             ipc,
             ServerToWorkerIpcMessage::InputBatch {
                 input: text.to_string(),
             },
-            timeout,
+            remaining,
         )?;
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
@@ -211,13 +230,18 @@ impl BackendDriver for ProtocolBackendDriver {
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
-        ipc.begin_input().map_err(WorkerError::Protocol)?;
+        let start = Instant::now();
+        begin_input_when_ready(ipc, timeout)?;
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(WorkerError::Timeout(timeout));
+        }
         send_worker_ipc_with_timeout(
             ipc,
             ServerToWorkerIpcMessage::InputBatch {
                 input: text.to_string(),
             },
-            timeout,
+            remaining,
         )?;
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));

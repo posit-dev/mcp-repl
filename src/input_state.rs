@@ -35,6 +35,10 @@ impl InputState {
         self.active
     }
 
+    pub(crate) fn ready_for_input(&self) -> bool {
+        self.ready_for_input
+    }
+
     pub(crate) fn validate_active_input(&self, event_type: &str) -> Result<(), String> {
         if !self.active {
             return Err(format!("{event_type} reported with no active input"));

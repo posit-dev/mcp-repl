@@ -196,6 +196,46 @@ async fn rprofile_startup_prompt_accepts_first_input_after_worker_ready() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rprofile_slow_startup_after_worker_ready_uses_request_timeout() -> TestResult<()> {
+    let home_dir = tempfile::tempdir()?;
+    let profile = home_dir.path().join("slow-startup.Rprofile");
+    std::fs::write(
+        &profile,
+        "Sys.sleep(11)\noptions(mcp_repl_slow_startup = \"READY_AFTER_SLEEP\")\n",
+    )?;
+
+    let profile = profile.to_string_lossy().to_string();
+    let mut env_vars = r_home_env_vars(home_dir.path());
+    env_vars.push(("R_PROFILE_USER".to_string(), profile));
+
+    let session = common::spawn_server_with_env_vars(env_vars).await?;
+    let result = session
+        .write_stdin_raw_with(
+            "cat(\"SLOW_STARTUP=\", getOption(\"mcp_repl_slow_startup\"), \"\\n\", sep = \"\")\n",
+            Some(25.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("r_startup backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        !text.contains("timed out waiting for worker input_wait"),
+        "slow R startup must not fail the worker spawn prompt probe, got: {text:?}"
+    );
+    assert!(
+        text.contains("SLOW_STARTUP=READY_AFTER_SLEEP"),
+        "expected first request timeout to cover slow .Rprofile startup, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_server_spawns_with_plain_pager_env() -> TestResult<()> {
     let session = common::spawn_server_with_files().await?;
 

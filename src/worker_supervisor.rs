@@ -420,9 +420,7 @@ fn seed_initial_input_wait_from_process(
     match ipc.wait_for_input_wait(WORKER_READY_TIMEOUT) {
         Ok(prompt) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
-        Err(IpcWaitError::Timeout) => Err(WorkerError::Protocol(
-            "timed out waiting for worker input_wait".to_string(),
-        )),
+        Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
             "worker session ended before input_wait".to_string(),
         )),

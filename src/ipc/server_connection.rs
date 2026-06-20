@@ -328,6 +328,7 @@ impl ServerIpcConnection {
         guard.protocol_warnings.clear();
     }
 
+    #[cfg(test)]
     pub fn begin_input(&self) -> Result<(), String> {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
@@ -336,6 +337,45 @@ impl ServerIpcConnection {
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
         Ok(())
+    }
+
+    pub fn begin_input_when_ready(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        reset_after_completed_request(&mut guard);
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if guard.input_state.ready_for_input() {
+                guard.last_prompt = None;
+                guard
+                    .input_state
+                    .begin_input()
+                    .map_err(IpcWaitError::Protocol)?;
+                guard.echo_events.clear();
+                guard.prompt_history.clear();
+                guard.protocol_warnings.clear();
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
     }
 
     pub fn note_interrupt_sent(&self) {
