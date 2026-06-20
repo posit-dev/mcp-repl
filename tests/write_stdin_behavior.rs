@@ -1493,52 +1493,39 @@ async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = spawn_behavior_session().await?;
+    let mut session = spawn_behavior_session().await?;
 
-    let tail_sleep_secs = if cfg!(windows) { 1.0 } else { 0.6 };
+    let temp = workspace_tempdir()?;
+    let gate_path = temp.path().join("tail-gate");
+    let gate_literal = r_path_literal(&gate_path)?;
     let input = format!(
-        "big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep({tail_sleep_secs}); cat('TAIL\\n')"
+        "gate <- {gate_literal}; big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); while (!file.exists(gate)) Sys.sleep(0.05); cat('TAIL\\n')"
     );
-    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(1.0, 2.0)))
+        .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-
-    sleep(test_delay_ms(160, 700)).await;
-    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
-    let spilled_text = result_text(&spilled);
-    let transcript_path = match bundle_transcript_path(&spilled_text) {
-        Some(path) => path,
-        None if spilled_text.contains("<<repl status: busy") => {
-            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        None => {
-            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
-        }
-    };
+    let transcript_path = bundle_transcript_path(&first_text).unwrap_or_else(|| {
+        panic!("expected transcript path in gated timeout reply, got: {first_text:?}")
+    });
 
     let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
     let busy_text = result_text(&busy_follow_up);
-    if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<repl status: busy")
-    {
-        eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+    assert!(
+        busy_text.contains("input discarded while worker busy")
+            || busy_text.contains("<<repl status: busy"),
+        "expected busy follow-up while the gated request was still pending, got: {busy_text:?}"
+    );
 
+    fs::write(&gate_path, b"release")?;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<repl status: busy") {
-        eprintln!("write_stdin_behavior final poll remained busy; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     let transcript = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
