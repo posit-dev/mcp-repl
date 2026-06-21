@@ -177,6 +177,8 @@ impl ServerIpcConnection {
                     WorkerToServerIpcMessage::Ready {} => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.input_state.record_ready(Instant::now());
+                        guard.last_prompt = None;
+                        guard.prompt_history.clear();
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::SessionEnd { reason, message } => {
@@ -319,6 +321,10 @@ impl ServerIpcConnection {
             .join()
             .map_err(|_| io::Error::other("ipc reader thread panicked"))?;
         Ok(())
+    }
+
+    pub fn detach_reader_thread(&self) {
+        let _ = self.reader_thread.lock().unwrap().take();
     }
 
     #[cfg_attr(

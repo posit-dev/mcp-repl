@@ -352,9 +352,13 @@ impl WorkerSupervisor {
         if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             return Err(Self::terminate_spawn_error(process, backend, err));
         }
-        let initial_prompt = match seed_initial_input_wait_from_process(&process) {
-            Ok(prompt) => prompt,
-            Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
+        let initial_prompt = if matches!(backend, Backend::Python) {
+            None
+        } else {
+            match seed_initial_input_wait_from_process(&process) {
+                Ok(prompt) => prompt,
+                Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
+            }
         };
         Ok(SupervisorSpawn {
             process,
@@ -694,6 +698,16 @@ impl OutputReader {
         self.handle
             .join()
             .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
+    }
+
+    fn stop_and_detach(mut self) {
+        if self
+            .done_rx
+            .recv_timeout(OUTPUT_READER_QUIESCE_GRACE)
+            .is_err()
+        {
+            self.request_stop();
+        }
     }
 
     fn request_stop(&mut self) {
@@ -1363,6 +1377,47 @@ impl WorkerProcess {
         self.finalize_terminated_process()
     }
 
+    pub(crate) fn finish_session_end_for_respawn(mut self) -> Result<(), WorkerError> {
+        if self.exit_status.is_none() {
+            match self.child.try_wait()? {
+                Some(status) => self.exit_status = Some(status),
+                None => {
+                    self.detach_output_producers();
+                    let _ = thread::Builder::new()
+                        .name("worker-session-end-reaper".to_string())
+                        .spawn(move || {
+                            if let Ok(status) = self.child.wait() {
+                                self.exit_status = Some(status);
+                            }
+                            #[cfg(target_family = "unix")]
+                            {
+                                self.send_signal_descendants_only(libc::SIGKILL);
+                            }
+                            #[cfg(target_family = "windows")]
+                            {
+                                self.child.close_job();
+                            }
+                            self.cleanup_session_tmpdir();
+                            self.report_denials();
+                        });
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(target_family = "unix")]
+        {
+            self.send_signal_descendants_only(libc::SIGKILL);
+        }
+        #[cfg(target_family = "windows")]
+        {
+            self.child.close_job();
+        }
+        self.detach_output_producers();
+        self.cleanup_session_tmpdir();
+        self.report_denials();
+        Ok(())
+    }
+
     fn finalize_terminated_process(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {
@@ -1384,6 +1439,18 @@ impl WorkerProcess {
         self.cleanup_session_tmpdir();
         self.report_denials();
         Ok(())
+    }
+
+    fn detach_output_producers(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.stop_and_detach();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.stop_and_detach();
+        }
+        if let Some(ipc) = self.ipc.get() {
+            ipc.detach_reader_thread();
+        }
     }
 
     fn quiesce_output_producers(&mut self) -> Result<(), WorkerError> {

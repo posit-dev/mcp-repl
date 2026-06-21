@@ -40,10 +40,6 @@ response:
     {
       "type": "text",
       "text": "hello Ada"
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }

@@ -8,9 +8,9 @@
 
 ## Status
 
-- State: active
+- State: completed
 - Last updated: 2026-06-21
-- Current phase: implementation
+- Current phase: complete
 
 ## Current Direction
 
@@ -28,8 +28,8 @@
 ## Phase Status
 
 - Phase 0: completed - inspected current branch and useful existing pieces.
-- Phase 1: active - add public regressions and collapse Python request/stdin ownership.
-- Phase 2: pending - run full required checks.
+- Phase 1: completed - public regressions now assert FIFO cell/stdin ownership and prompt-free top-level readiness.
+- Phase 2: completed - full required checks passed.
 
 ## Locked Decisions
 
@@ -40,13 +40,12 @@
 
 ## Open Questions
 
-- Background Python thread reads may need a narrower v1 ownership rule if they compete for stdin with foreground code.
-- Empty-prompt reads may surface only a generic wait status or no visible prompt; concrete behavior will follow focused tests.
+- Background Python thread reads still share the same exclusive read-consumer primitive; fairness between competing foreground/background reads is not broadened in this slice.
+- Empty-prompt reads keep the existing generic wait-status behavior rather than inventing a visible prompt.
 
-## Next Safe Slice
+## Follow-Up Notes
 
-- Adjust public tests to assert no rendered top-level idle prompt after completed Python cells.
-- Add a focused queue-ownership test that proves a follow-up payload is stdin only while a running read owns the queue, and then source code again after that read completes.
+- Revisit only future failures that point to this prompt-free Python cell contract or session-end respawn behavior.
 
 ## Stop Conditions
 
@@ -57,3 +56,6 @@
 
 - 2026-06-21: Use a checked-in plan because the change spans Python worker state, platform stdin adapters, server protocol completion, and public behavior.
 - 2026-06-21: Prefer a worker readiness signal without rendered prompt for top-level idle completion; real read prompts remain prompt-bearing waits.
+- 2026-06-21: Treat built-in Python `worker_ready` as spawn-ready without waiting for an initial top-level `InputWait`; top-level readiness is now prompt-free.
+- 2026-06-21: Convert Python `SystemExit` inside the embedded cell runner into a worker exit request, then emit `session_end` before CPython finalization. Session-end respawn detaches old output/sideband readers so finalization or inherited holders cannot block the tool response.
+- 2026-06-21: Required checks passed: `cargo check`, `cargo build`, `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --quiet`, and `cargo +nightly fmt`.

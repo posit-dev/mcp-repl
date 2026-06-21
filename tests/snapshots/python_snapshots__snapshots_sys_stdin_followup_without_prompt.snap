@@ -40,10 +40,6 @@ response:
     {
       "type": "text",
       "text": "stdin bravo"
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }

@@ -984,10 +984,6 @@ async fn python_incomplete_bracket_reports_syntax_error() -> TestResult<()> {
         "expected incomplete bracket cell to report SyntaxError, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected incomplete bracket cell to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "incomplete bracket cell should not report continuation prompt, got: {text:?}"
     );
@@ -1036,10 +1032,6 @@ async fn python_blank_line_inside_bracket_cell_runs() -> TestResult<()> {
     assert!(
         text.contains("BLANK_LIST []"),
         "expected blank-line bracket cell to complete, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected blank-line bracket cell to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -1111,7 +1103,7 @@ async fn python_blank_line_inside_parenthesized_block_cell_runs() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_closed_indented_expression_reports_primary_prompt() -> TestResult<()> {
+async fn python_closed_indented_expression_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1128,10 +1120,6 @@ async fn python_closed_indented_expression_reports_primary_prompt() -> TestResul
         "expected closed indented expression to execute, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected closed indented expression to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "expected closed indented expression not to report continuation prompt, got: {text:?}"
     );
@@ -1139,7 +1127,7 @@ async fn python_closed_indented_expression_reports_primary_prompt() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> TestResult<()> {
+async fn python_closed_multiline_string_with_colon_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1152,10 +1140,6 @@ async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> T
     assert!(
         !is_busy_response(&text),
         "expected closed multiline string to complete, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected closed multiline string to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -1245,7 +1229,7 @@ async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
+async fn python_terminated_block_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1265,7 +1249,7 @@ async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
     );
     assert!(
         !text.contains(r#"prompt: "... ""#),
-        "expected primary prompt after terminated block, got: {text:?}"
+        "terminated block should not render a continuation prompt, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -3074,7 +3058,7 @@ async fn python_comment_only_block_body_reports_indentation_error() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
+async fn python_comment_backslash_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3087,10 +3071,6 @@ async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
     assert!(
         !is_busy_response(&text),
         "expected comment backslash input to complete, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected comment backslash input to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -3135,7 +3115,7 @@ async fn python_decorator_without_definition_reports_syntax_error() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_whitespace_only_reports_primary_prompt() -> TestResult<()> {
+async fn python_whitespace_only_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3146,18 +3126,14 @@ async fn python_whitespace_only_reports_primary_prompt() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains(">>> "),
-        "expected whitespace-only Python input to report primary prompt, got: {text:?}"
-    );
-    assert!(
-        !text.contains("... "),
-        "expected whitespace-only Python input not to report continuation prompt, got: {text:?}"
+        !text.contains(">>> ") && !text.contains("... "),
+        "expected whitespace-only Python input not to render top-level prompts, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<()> {
+async fn python_invalid_top_level_indent_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3172,10 +3148,6 @@ async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<
     assert!(
         text.contains("IndentationError"),
         "expected invalid top-level indent to raise IndentationError, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected invalid top-level indent to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -3202,10 +3174,6 @@ async fn python_dedented_block_cell_runs() -> TestResult<()> {
         "expected dedented top-level code after block to run in one cell, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected dedented block cell to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "dedented block cell should not report continuation prompt, got: {text:?}"
     );
@@ -3213,7 +3181,7 @@ async fn python_dedented_block_cell_runs() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult<()> {
+async fn python_unterminated_single_quote_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3226,10 +3194,6 @@ async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult
     assert!(
         text.contains("SyntaxError"),
         "expected unterminated single quote to raise SyntaxError, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected unterminated single quote to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -3818,7 +3782,7 @@ async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResult<()> {
+async fn python_custom_primary_prompt_does_not_render_at_idle() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3832,36 +3796,23 @@ async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResul
         .await?;
     let setup_text = result_text(&setup);
     assert!(
-        setup_text.contains("CUSTOM_READY") && setup_text.contains("custom> "),
-        "expected custom primary prompt after setup, got: {setup_text:?}"
+        setup_text.contains("CUSTOM_READY"),
+        "expected setup output after custom primary prompt assignment, got: {setup_text:?}"
+    );
+    assert!(
+        !setup_text.contains("custom> "),
+        "completed cells should not render custom top-level prompts, got: {setup_text:?}"
     );
 
-    let interrupt = session
-        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
-        .await?;
-    let interrupt_text = result_text(&interrupt);
-    if is_busy_response(&interrupt_text) || interrupt_text.contains("timed out") {
-        eprintln!("idle custom prompt interrupt stayed busy in this Python runtime; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if !interrupt_text.contains("KeyboardInterrupt") {
-        session.cancel().await?;
-        return Err(format!(
-            "expected idle custom prompt interrupt to reach Python, got: {interrupt_text:?}"
-        )
-        .into());
-    }
-
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_CUSTOM_PROMPT_INTERRUPT')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_CUSTOM_PROMPT_SETUP')", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("AFTER_CUSTOM_PROMPT_INTERRUPT"),
-        "expected follow-up after idle custom prompt interrupt, got: {follow_up_text:?}"
+        follow_up_text.contains("AFTER_CUSTOM_PROMPT_SETUP"),
+        "expected follow-up after custom primary prompt setup, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3941,8 +3892,8 @@ async fn python_custom_prompts_do_not_escape_as_stderr() -> TestResult<()> {
         "expected request output after custom prompts, got: {setup_text:?}"
     );
     assert!(
-        setup_text.contains("custom> "),
-        "expected custom primary prompt metadata, got: {setup_text:?}"
+        !setup_text.contains("custom> "),
+        "completed cells should not render custom top-level prompts, got: {setup_text:?}"
     );
     assert_ne!(setup.is_error, Some(true));
     assert!(
@@ -4361,7 +4312,7 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && is_busy_response(&exit_text)
-            && !exit_text.contains(">>>")
+            && !exit_text.contains("You are now leaving help")
         {
             sleep(Duration::from_millis(50)).await;
             exit_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
@@ -4369,10 +4320,7 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
     }
     if is_busy_response(&exit_text) {
         session.cancel().await?;
-        return Err(format!(
-            "interactive help() did not return to the Python prompt: {exit_text:?}"
-        )
-        .into());
+        return Err(format!("interactive help() did not finish after q: {exit_text:?}").into());
     }
     let exit_visible = visible_reply_text(&exit_text)?;
 
@@ -4400,12 +4348,8 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
     );
     assert_no_pager_markers(&exit_visible, "help() roundtrip");
     assert!(
-        exit_visible.contains(">>>"),
-        "expected interactive help() to return to the Python prompt, got: {exit_visible:?}"
-    );
-    assert!(
         follow_up_text.contains("2"),
-        "expected a ready prompt after interactive help(), got: {follow_up_text:?}"
+        "expected follow-up cell after interactive help(), got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4490,8 +4434,12 @@ async fn python_trailing_prompt_shaped_stdout_stays_visible() -> TestResult<()> 
     }
 
     assert!(
-        text.contains("PROMPT_STDOUT>>> >>> "),
-        "expected trailing prompt-shaped stdout and worker prompt to both remain visible, got: {text:?}"
+        text.contains("PROMPT_STDOUT>>> "),
+        "expected trailing prompt-shaped stdout to remain visible, got: {text:?}"
+    );
+    assert!(
+        !text.contains("PROMPT_STDOUT>>> >>> "),
+        "completed cells should not append an idle Python prompt, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -4519,8 +4467,8 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
         .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
-        "expected prompt after interrupt, got: {interrupt_text:?}"
+        !is_busy_response(&interrupt_text) && interrupt_text.contains("KeyboardInterrupt"),
+        "expected interrupt to complete with KeyboardInterrupt, got: {interrupt_text:?}"
     );
 
     let deadline = interrupt_recovery_deadline();
@@ -5060,8 +5008,8 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
-        "expected prompt after interrupt, got: {interrupt_text:?}"
+        !is_busy_response(&interrupt_text) && interrupt_text.contains("KeyboardInterrupt"),
+        "expected interrupt to complete with KeyboardInterrupt, got: {interrupt_text:?}"
     );
 
     let poll_result = session.write_stdin_raw_with("", Some(0.5)).await?;
@@ -5325,10 +5273,6 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
         text.contains("PDB_AFTER_CONTINUE 42"),
         "expected Python cell to resume after pdb continue, got: {text:?}"
     );
-    assert!(
-        text.contains(">>>"),
-        "expected python prompt after continue, got: {text:?}"
-    );
 
     session.cancel().await?;
     Ok(())
@@ -5406,8 +5350,8 @@ print("MATCHED_PROMPT_VALUE", value)
     session.cancel().await?;
 
     assert!(
-        answer_text.contains("same> "),
-        "expected final prompt matching sys.ps1 to stay visible, got: {answer_text:?}"
+        !answer_text.contains("same> "),
+        "completed cells should not render final prompt matching sys.ps1, got: {answer_text:?}"
     );
     assert!(
         answer_text.contains("MATCHED_PROMPT_VALUE buffered"),

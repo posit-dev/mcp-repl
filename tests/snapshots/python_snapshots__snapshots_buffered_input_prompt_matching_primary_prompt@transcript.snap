@@ -13,4 +13,3 @@ expression: transcript
 2) py_repl timeout_ms=5000
 >>> buffered
 <<< MATCHED_PROMPT_VALUE buffered
-<<< same>

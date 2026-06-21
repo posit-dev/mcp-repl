@@ -786,10 +786,7 @@ def python_console_basic(client: McpStdioClient) -> None:
         "python console repl",
         deadline_seconds=python_startup_deadline_seconds(),
     )
-    expected = tool_result(
-        text("2\n"),
-        text(">>> "),
-    )
+    expected = tool_result(text("2\n"))
 
     assert_identical(expected, normalize_response(received), "python console repl")
 
@@ -830,7 +827,7 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
 
     recovered = client.repl("1+1", timeout_ms=5000)
     assert_identical(
-        tool_result(text("2\n"), text(">>> ")),
+        tool_result(text("2\n")),
         normalize_response(recovered),
         "python busy recovery repl",
     )

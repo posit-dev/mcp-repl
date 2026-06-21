@@ -20,10 +20,6 @@ response:
     {
       "type": "text",
       "text": "loop 0\nloop 1\ndone"
-    },
-    {
-      "type": "text",
-      "text": ">>> "
     }
   ]
 }

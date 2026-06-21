@@ -184,7 +184,8 @@ def _mcp_repl_run_cell(
     except _base_exception as exc:
         _cell_compiler.flags = compiler_flags
         if _isinstance(exc, _system_exit):
-            raise
+            _mcp_repl.request_exit()
+            return
         _report_exception(exc)
         return
 
@@ -198,7 +199,8 @@ def _mcp_repl_run_cell(
             exec(cell_code, namespace, namespace)
     except _base_exception as exc:
         if _isinstance(exc, _system_exit):
-            raise
+            _mcp_repl.request_exit()
+            return
         _report_exception(exc)
 
 

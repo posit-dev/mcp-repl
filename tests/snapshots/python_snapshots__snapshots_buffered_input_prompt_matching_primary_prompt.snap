@@ -40,10 +40,6 @@ response:
     {
       "type": "text",
       "text": "MATCHED_PROMPT_VALUE buffered"
-    },
-    {
-      "type": "text",
-      "text": "same> "
     }
   ]
 }
