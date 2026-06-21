@@ -206,12 +206,12 @@ def _mcp_repl_report_cell_exception(exc, _sys=sys, _type=type):
     tb = exc.__traceback__
     while tb is not None and tb.tb_frame.f_code.co_name == "_mcp_repl_run_cell":
         tb = tb.tb_next
-    original_tb = exc.__traceback__
     exc.__traceback__ = tb
-    try:
-        _sys.excepthook(_type(exc), exc, tb)
-    finally:
-        exc.__traceback__ = original_tb
+    _sys.last_exc = exc
+    _sys.last_type = _type(exc)
+    _sys.last_value = exc
+    _sys.last_traceback = tb
+    _sys.excepthook(_type(exc), exc, tb)
 
 
 def _input(prompt=""):

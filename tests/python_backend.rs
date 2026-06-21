@@ -1640,6 +1640,10 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
         "expected code before raw stdin wait to run, got: {first_text:?}"
     );
     assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "raw stdin read should report a wait before the follow-up input batch, got: {first_text:?}"
+    );
+    assert!(
         !first_text.contains("RAW_STDIN_RESULT"),
         "raw stdin read should wait for a later turn instead of returning EOF, got: {first_text:?}"
     );
@@ -5088,6 +5092,59 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_exception_updates_sys_last_exception() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("1/0", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_cell_exception_updates_sys_last_exception remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            r#"import sys
+print("SYS_LAST_VALUE", type(sys.last_value).__name__, str(sys.last_value))
+print("SYS_LAST_TYPE", sys.last_type.__name__)
+print("SYS_LAST_TRACEBACK", sys.last_traceback.tb_frame.f_code.co_filename, sys.last_traceback.tb_lineno)
+print("SYS_LAST_EXC", getattr(sys, "last_exc", sys.last_value) is sys.last_value)
+print("SYS_LAST_EXC_TRACEBACK", sys.last_exc.__traceback__ is sys.last_traceback)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("SYS_LAST_VALUE ZeroDivisionError division by zero"),
+        "expected sys.last_value to preserve the failed cell exception, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_TYPE ZeroDivisionError"),
+        "expected sys.last_type to preserve the failed cell exception type, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_TRACEBACK <mcp-repl> 1"),
+        "expected sys.last_traceback to point at the failed user cell, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC True"),
+        "expected sys.last_exc to match sys.last_value when available, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC_TRACEBACK True"),
+        "expected sys.last_exc to carry the same traceback as sys.last_traceback, got: {follow_up_text:?}"
+    );
     Ok(())
 }
 

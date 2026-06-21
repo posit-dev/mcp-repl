@@ -286,6 +286,7 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         RawStdinReadError::Runtime("Python session state is not initialized".to_string())
     })?;
     let mut output = Vec::new();
+    let mut input_wait_emitted = false;
     while output.len() < size {
         let event = {
             let mut guard = state.inner.lock().unwrap();
@@ -314,14 +315,21 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if !output.is_empty() {
                     return Ok(output);
                 }
-                let allow_threads = PythonThreadsAllowed::new();
-                guard = state.cvar.wait(guard).unwrap();
-                drop(guard);
-                drop(allow_threads);
-                continue;
-            };
-
-            if guard
+                if matches!(
+                    guard.exec_state,
+                    PythonExecState::RunningCell { .. } | PythonExecState::WaitingInput { .. }
+                ) && !input_wait_emitted
+                {
+                    mark_waiting_input_locked(&mut guard, &prompt, ReadlineKind::RawStdin);
+                    RawInputEvent::InputWait { prompt }
+                } else {
+                    let allow_threads = PythonThreadsAllowed::new();
+                    guard = state.cvar.wait(guard).unwrap();
+                    drop(guard);
+                    drop(allow_threads);
+                    continue;
+                }
+            } else if guard
                 .active_request
                 .as_ref()
                 .is_some_and(|active| active.queued_lines.is_empty())
@@ -361,6 +369,7 @@ fn take_raw_input_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         match event {
             RawInputEvent::InputLine { prompt, text } => ipc::emit_input_line(&prompt, &text),
             RawInputEvent::InputWait { prompt } => {
+                input_wait_emitted = true;
                 emit_plots();
                 mark_input_wait_completed_request();
                 remember_emitted_prompt(&prompt);
