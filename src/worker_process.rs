@@ -291,6 +291,19 @@ impl WorkerManager {
         self.pending_request
     }
 
+    pub fn python_executable_matches(&self, target: &std::path::Path) -> bool {
+        if self.backend != Backend::Python {
+            return false;
+        }
+        let current = match self.worker_launch.python_executable() {
+            Some(executable) => Some(executable.to_path_buf()),
+            None => crate::python_prepare::current_python_executable(),
+        };
+        current
+            .as_deref()
+            .is_some_and(|current| crate::python_prepare::same_python_executable(current, target))
+    }
+
     pub fn refresh_timeout_marker_with_wait(&mut self, wait: Duration) {
         self.resolve_timeout_marker_with_wait(wait);
     }

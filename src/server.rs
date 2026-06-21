@@ -1,8 +1,8 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ErrorData as McpError, JsonObject, Meta, ProtocolVersion, ServerCapabilities,
-    ServerInfo,
+    CallToolResult, Content, ErrorData as McpError, JsonObject, Meta, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -436,6 +436,93 @@ impl SharedServer {
         })
         .await
     }
+
+    async fn run_reset(&self, meta: Meta) -> Result<CallToolResult, McpError> {
+        let timeout = parse_timeout(None, "repl_reset", false)?;
+        let worker_timeout = apply_tool_call_margin(timeout);
+        let sandbox_state_update = self.sandbox_state_update_for_tool_call(&meta);
+        let result = self
+            .run_state(move |state| {
+                let sandbox_state_result = match &sandbox_state_update {
+                    Ok(update) => {
+                        SharedServer::stage_tool_call_sandbox_state_for_reset(state, update.clone())
+                    }
+                    Err(WorkerError::Sandbox(message)) => {
+                        Err(WorkerError::Sandbox(message.clone()))
+                    }
+                    Err(err) => Err(WorkerError::Sandbox(err.to_string())),
+                };
+                if let Err(err) = sandbox_state_result {
+                    let mut result = state.response.finalize_local_error(err, true);
+                    strip_text_stream_meta(&mut result);
+                    return result;
+                }
+                let result = state.worker.restart(worker_timeout);
+                let pending_request_after = state.worker.pending_request();
+                let mut result = finalize_visible_reply(
+                    state,
+                    result,
+                    pending_request_after,
+                    TimeoutBundleReuse::None,
+                    0,
+                    true,
+                );
+                strip_text_stream_meta(&mut result);
+                result
+            })
+            .await?;
+        Ok(result)
+    }
+
+    async fn run_prepare_python(
+        &self,
+        args: crate::python_prepare::ReplPrepareArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let request = crate::python_prepare::validate_prepare_args(args)
+            .map_err(|message| McpError::invalid_params(message, None))?;
+        let target = match crate::python_prepare::resolve_prepare_target(&request) {
+            Ok(target) => target,
+            Err(err) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "repl_prepare failed: {err}"
+                ))]));
+            }
+        };
+        let target_executable = target.executable;
+        let target_module_search_paths = target.module_search_paths;
+        self.run_state(move |state| {
+            let had_pending_work = state.worker.pending_request();
+            let unchanged =
+                !had_pending_work && state.worker.python_executable_matches(&target_executable);
+            let discarded = if had_pending_work {
+                "pending work discarded"
+            } else {
+                "no pending work discarded"
+            };
+            if unchanged {
+                return CallToolResult::success(vec![Content::text(format!(
+                    "repl_prepare: session unchanged; {discarded}\n"
+                ))]);
+            }
+
+            match state
+                .worker
+                .replace_worker_launch(WorkerLaunch::PythonExecutable {
+                    executable: target_executable,
+                    module_search_paths: target_module_search_paths,
+                }) {
+                Ok(()) => CallToolResult::success(vec![Content::text(format!(
+                    "repl_prepare: session replaced; {discarded}\n"
+                ))]),
+                Err(err) => {
+                    let mut result = state.response.finalize_local_error(err, true);
+                    strip_text_stream_meta(&mut result);
+                    result
+                }
+            }
+        })
+        .await
+    }
 }
 
 fn input_uses_local_pager_state(state: &ServerState, input: &str) -> bool {
@@ -539,7 +626,65 @@ where
     }
 }
 
-macro_rules! define_backend_tool_server {
+macro_rules! define_repl_only_tool_server {
+    ($server_ty:ident, $repl_doc_path:literal) => {
+        #[derive(Clone)]
+        struct $server_ty {
+            shared: SharedServer,
+            tool_router: ToolRouter<Self>,
+        }
+
+        #[tool_router]
+        impl $server_ty {
+            fn new(
+                worker_launch: WorkerLaunch,
+                sandbox_plan: SandboxCliPlan,
+                oversized_output: OversizedOutputMode,
+            ) -> Result<Self, WorkerError> {
+                Ok(Self {
+                    shared: SharedServer::new(worker_launch, sandbox_plan, oversized_output)?,
+                    tool_router: Self::tool_router(),
+                })
+            }
+
+            fn get_info(&self) -> ServerInfo {
+                server_info(self.shared.accepts_sandbox_state_meta())
+            }
+
+            fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
+                LoggedToolRouter::new(&self.tool_router)
+            }
+
+            #[doc = include_str!($repl_doc_path)]
+            #[tool(
+                name = "repl",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl(
+                &self,
+                meta: Meta,
+                params: Parameters<ReplArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                let ReplArgs { input, timeout_ms } = params.0;
+                let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
+                self.shared.run_write_input(input, timeout, meta).await
+            }
+        }
+
+        #[tool_handler(router = self.logged_tool_router())]
+        impl ServerHandler for $server_ty {
+            fn get_info(&self) -> ServerInfo {
+                $server_ty::get_info(self)
+            }
+        }
+    };
+}
+
+macro_rules! define_repl_reset_tool_server {
     ($server_ty:ident, $repl_doc_path:literal) => {
         #[derive(Clone)]
         struct $server_ty {
@@ -601,42 +746,82 @@ macro_rules! define_backend_tool_server {
                 meta: Meta,
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
-                let timeout = parse_timeout(None, "repl_reset", false)?;
-                let worker_timeout = apply_tool_call_margin(timeout);
-                let sandbox_state_update = self.shared.sandbox_state_update_for_tool_call(&meta);
-                let result = self
-                    .shared
-                    .run_state(move |state| {
-                        let sandbox_state_result = match &sandbox_state_update {
-                            Ok(update) => SharedServer::stage_tool_call_sandbox_state_for_reset(
-                                state,
-                                update.clone(),
-                            ),
-                            Err(WorkerError::Sandbox(message)) => {
-                                Err(WorkerError::Sandbox(message.clone()))
-                            }
-                            Err(err) => Err(WorkerError::Sandbox(err.to_string())),
-                        };
-                        if let Err(err) = sandbox_state_result {
-                            let mut result = state.response.finalize_local_error(err, true);
-                            strip_text_stream_meta(&mut result);
-                            return result;
-                        }
-                        let result = state.worker.restart(worker_timeout);
-                        let pending_request_after = state.worker.pending_request();
-                        let mut result = finalize_visible_reply(
-                            state,
-                            result,
-                            pending_request_after,
-                            TimeoutBundleReuse::None,
-                            0,
-                            true,
-                        );
-                        strip_text_stream_meta(&mut result);
-                        result
-                    })
-                    .await?;
-                Ok(result)
+                self.shared.run_reset(meta).await
+            }
+        }
+
+        #[tool_handler(router = self.logged_tool_router())]
+        impl ServerHandler for $server_ty {
+            fn get_info(&self) -> ServerInfo {
+                $server_ty::get_info(self)
+            }
+        }
+    };
+}
+
+macro_rules! define_python_prepare_tool_server {
+    ($server_ty:ident, $repl_doc_path:literal) => {
+        #[derive(Clone)]
+        struct $server_ty {
+            shared: SharedServer,
+            tool_router: ToolRouter<Self>,
+        }
+
+        #[tool_router]
+        impl $server_ty {
+            fn new(
+                worker_launch: WorkerLaunch,
+                sandbox_plan: SandboxCliPlan,
+                oversized_output: OversizedOutputMode,
+            ) -> Result<Self, WorkerError> {
+                Ok(Self {
+                    shared: SharedServer::new(worker_launch, sandbox_plan, oversized_output)?,
+                    tool_router: Self::tool_router(),
+                })
+            }
+
+            fn get_info(&self) -> ServerInfo {
+                server_info(self.shared.accepts_sandbox_state_meta())
+            }
+
+            fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
+                LoggedToolRouter::new(&self.tool_router)
+            }
+
+            #[doc = include_str!($repl_doc_path)]
+            #[tool(
+                name = "repl",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl(
+                &self,
+                meta: Meta,
+                params: Parameters<ReplArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                let ReplArgs { input, timeout_ms } = params.0;
+                let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
+                self.shared.run_write_input(input, timeout, meta).await
+            }
+
+            #[doc = include_str!("../docs/tool-descriptions/repl_prepare_python.md")]
+            #[tool(
+                name = "repl_prepare",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl_prepare(
+                &self,
+                _meta: Meta,
+                params: Parameters<crate::python_prepare::ReplPrepareArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                self.shared.run_prepare_python(params.0).await
             }
         }
 
@@ -676,17 +861,25 @@ fn finalize_visible_reply(
     }
 }
 
-define_backend_tool_server!(RFilesToolServer, "../docs/tool-descriptions/repl_tool_r.md");
-define_backend_tool_server!(
+define_repl_reset_tool_server!(RFilesToolServer, "../docs/tool-descriptions/repl_tool_r.md");
+define_repl_reset_tool_server!(
     RPagerToolServer,
     "../docs/tool-descriptions/repl_tool_r_pager.md"
 );
-define_backend_tool_server!(
+define_repl_only_tool_server!(
     PythonFilesToolServer,
     "../docs/tool-descriptions/repl_tool_python.md"
 );
-define_backend_tool_server!(
+define_repl_only_tool_server!(
     PythonPagerToolServer,
+    "../docs/tool-descriptions/repl_tool_python_pager.md"
+);
+define_python_prepare_tool_server!(
+    PythonPrepareFilesToolServer,
+    "../docs/tool-descriptions/repl_tool_python.md"
+);
+define_python_prepare_tool_server!(
+    PythonPreparePagerToolServer,
     "../docs/tool-descriptions/repl_tool_python_pager.md"
 );
 
@@ -805,14 +998,32 @@ pub async fn run(
         },
         Backend::Python => match oversized_output {
             OversizedOutputMode::Files => {
-                let service =
-                    PythonFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
-                run_backend_server(service.clone(), service.shared.state()).await
+                if crate::python_prepare::uv_available() {
+                    let service = PythonPrepareFilesToolServer::new(
+                        worker_launch,
+                        sandbox_plan,
+                        oversized_output,
+                    )?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                } else {
+                    let service =
+                        PythonFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                }
             }
             OversizedOutputMode::Pager => {
-                let service =
-                    PythonPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
-                run_backend_server(service.clone(), service.shared.state()).await
+                if crate::python_prepare::uv_available() {
+                    let service = PythonPreparePagerToolServer::new(
+                        worker_launch,
+                        sandbox_plan,
+                        oversized_output,
+                    )?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                } else {
+                    let service =
+                        PythonPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                }
             }
         },
     }

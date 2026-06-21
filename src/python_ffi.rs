@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
 
@@ -69,6 +69,7 @@ pub struct PythonApi {
     _library: Library,
     py_decode_locale: unsafe extern "C" fn(*const c_char, *mut usize) -> *mut libc::wchar_t,
     py_set_program_name: unsafe extern "C" fn(*const libc::wchar_t),
+    py_set_path: unsafe extern "C" fn(*const libc::wchar_t),
     pub py_initialize_ex: unsafe extern "C" fn(c_int),
     pub py_is_initialized: unsafe extern "C" fn() -> c_int,
     pub py_eval_save_thread: unsafe extern "C" fn() -> *mut PyThreadState,
@@ -141,6 +142,7 @@ impl PythonApi {
         let api = Self {
             py_decode_locale: unsafe { load_symbol(&library, b"Py_DecodeLocale\0")? },
             py_set_program_name: unsafe { load_symbol(&library, b"Py_SetProgramName\0")? },
+            py_set_path: unsafe { load_symbol(&library, b"Py_SetPath\0")? },
             py_initialize_ex: unsafe { load_symbol(&library, b"Py_InitializeEx\0")? },
             py_is_initialized: unsafe { load_symbol(&library, b"Py_IsInitialized\0")? },
             py_eval_save_thread: unsafe { load_symbol(&library, b"PyEval_SaveThread\0")? },
@@ -402,6 +404,23 @@ impl PythonApi {
             return Err("failed to decode Python executable path".to_string());
         }
         unsafe { (self.py_set_program_name)(decoded) };
+        Ok(())
+    }
+
+    pub fn set_module_search_paths(&self, paths: &[PathBuf]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let joined = std::env::join_paths(paths)
+            .map_err(|err| format!("failed to join Python module search paths: {err}"))?;
+        let joined = CString::new(joined.to_string_lossy().as_bytes())
+            .map_err(|_| "Python module search path contains NUL".to_string())?;
+        let mut size = 0;
+        let decoded = unsafe { (self.py_decode_locale)(joined.as_ptr(), &mut size) };
+        if decoded.is_null() {
+            return Err("failed to decode Python module search path".to_string());
+        }
+        unsafe { (self.py_set_path)(decoded) };
         Ok(())
     }
 

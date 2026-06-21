@@ -687,6 +687,15 @@ impl McpTestSession {
         self.service.peer_info()
     }
 
+    pub async fn list_tool_names(&self) -> Result<Vec<String>, ServiceError> {
+        let tools = self.service.peer().list_tools(None).await?;
+        Ok(tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect())
+    }
+
     #[allow(dead_code)]
     pub async fn write_stdin(&mut self, input: impl Into<String>) {
         self.write_stdin_with(input, None).await;

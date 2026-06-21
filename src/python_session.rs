@@ -259,7 +259,11 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    let thread_state = match initialize_python(api, &runtime_config.executable) {
+    let thread_state = match initialize_python(
+        api,
+        &runtime_config.executable,
+        &runtime_config.module_search_paths,
+    ) {
         Ok(thread_state) => thread_state,
         Err(err) => {
             init.mark_failed(err.clone());
@@ -308,6 +312,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 fn initialize_python(
     api: &'static PythonApi,
     executable: &Path,
+    module_search_paths: &[std::path::PathBuf],
 ) -> Result<*mut PyThreadState, String> {
     let module_name = CString::new("_mcp_repl").expect("module name must not contain NUL");
     let module_name = module_name.into_raw();
@@ -321,6 +326,7 @@ fn initialize_python(
             return Err("embedded Python interpreter was already initialized".to_string());
         }
         api.set_program_name(executable)?;
+        api.set_module_search_paths(module_search_paths)?;
         api.set_interactive_flags()?;
         (api.py_initialize_ex)(1);
         api.install_readline_function(mcp_repl_readline)?;

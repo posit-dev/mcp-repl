@@ -674,6 +674,18 @@ pub(crate) struct WorkerSpawnContext<'a> {
     pub(crate) prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PythonLaunchConfig<'a> {
+    executable_override: Option<&'a Path>,
+    module_search_paths_override: Option<&'a [PathBuf]>,
+}
+
+fn encode_python_module_search_paths(
+    paths: &[PathBuf],
+) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    std::env::join_paths(paths)
+}
+
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
     done_rx: mpsc::Receiver<()>,
@@ -733,7 +745,7 @@ impl WorkerProcess {
             output_timeline.clone(),
         );
         #[cfg(target_os = "windows")]
-        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+        let live_output = if worker_launch.builtin_backend() == Some(Backend::Python) {
             live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
@@ -750,6 +762,7 @@ impl WorkerProcess {
         } = match &worker_launch {
             WorkerLaunch::Builtin(Backend::R) => Self::spawn_embedded_worker(
                 Backend::R,
+                PythonLaunchConfig::default(),
                 exe_path,
                 sandbox_state,
                 managed_network_proxy,
@@ -760,6 +773,24 @@ impl WorkerProcess {
             )?,
             WorkerLaunch::Builtin(Backend::Python) => Self::spawn_embedded_worker(
                 Backend::Python,
+                PythonLaunchConfig::default(),
+                exe_path,
+                sandbox_state,
+                managed_network_proxy,
+                live_output.clone(),
+                &mut ipc_server,
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch.as_ref(),
+            )?,
+            WorkerLaunch::PythonExecutable {
+                executable,
+                module_search_paths,
+            } => Self::spawn_embedded_worker(
+                Backend::Python,
+                PythonLaunchConfig {
+                    executable_override: Some(executable.as_path()),
+                    module_search_paths_override: Some(module_search_paths.as_slice()),
+                },
                 exe_path,
                 sandbox_state,
                 managed_network_proxy,
@@ -861,6 +892,7 @@ impl WorkerProcess {
 
     fn spawn_embedded_worker(
         backend: Backend,
+        python_config: PythonLaunchConfig<'_>,
         exe_path: &Path,
         sandbox_state: &SandboxState,
         managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
@@ -906,14 +938,29 @@ impl WorkerProcess {
                 Backend::Python => "python",
             },
         );
-        if matches!(backend, Backend::Python)
-            && let Some(python_executable) =
-                std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV)
-        {
-            command.env(
-                crate::python_runtime::PYTHON_EXECUTABLE_ENV,
-                python_executable,
-            );
+        if matches!(backend, Backend::Python) {
+            let python_executable = python_config
+                .executable_override
+                .map(|path| path.as_os_str().to_os_string())
+                .or_else(|| std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV));
+            if let Some(python_executable) = python_executable {
+                command.env(
+                    crate::python_runtime::PYTHON_EXECUTABLE_ENV,
+                    python_executable,
+                );
+            }
+            if let Some(module_search_paths) = python_config.module_search_paths_override {
+                let module_search_paths = encode_python_module_search_paths(module_search_paths)
+                    .map_err(|err| {
+                        WorkerError::Protocol(format!(
+                            "failed to build prepared Python module search path: {err}"
+                        ))
+                    })?;
+                command.env(
+                    crate::python_runtime::PYTHON_MODULE_SEARCH_PATH_ENV,
+                    module_search_paths,
+                );
+            }
         }
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {

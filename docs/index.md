@@ -23,6 +23,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_r_pager.md`: R `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
+- `docs/tool-descriptions/repl_prepare_python.md`: Python `repl_prepare` behavior.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 

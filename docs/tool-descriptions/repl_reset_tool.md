@@ -1,4 +1,6 @@
-`repl_reset` restarts the active backend REPL session.
+`repl_reset` restarts the active R REPL session.
+
+Python servers do not advertise this tool; use `\u0004` in `repl` input for a plain Python reset.
 
 Behavior:
 - Clears in-memory session state (objects, variables, loaded runtime state tied to the process).
