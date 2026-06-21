@@ -1366,6 +1366,45 @@ sys.exit()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_returns_atexit_output_before_session_end() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import atexit, sys
+def report():
+    print("ATEXIT_STDOUT")
+    sys.stderr.write("ATEXIT_STDERR\n")
+
+atexit.register(report)
+sys.exit()
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.exit() with atexit output remained busy".into());
+    }
+
+    assert!(
+        text.contains("ATEXIT_STDOUT") && text.contains("ATEXIT_STDERR"),
+        "expected atexit stdout/stderr before session end, got: {text:?}"
+    );
+    assert!(
+        !text.contains("worker protocol error"),
+        "atexit output should not arrive after session_end, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_reads_from_sys_stdin() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
