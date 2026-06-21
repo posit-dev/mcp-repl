@@ -12,6 +12,7 @@ pub(super) struct SessionState {
 pub(super) struct SessionStateInner {
     pub(super) input_queue: PythonInputQueue,
     pub(super) request_active: bool,
+    pub(super) cell_running: bool,
     pub(super) visible_input_prompt: Option<String>,
     pub(super) python_primary_prompt: String,
     pub(super) python_continuation_prompt: String,
@@ -44,6 +45,7 @@ impl SessionState {
             inner: Mutex::new(SessionStateInner {
                 input_queue: PythonInputQueue::new(),
                 request_active: false,
+                cell_running: false,
                 visible_input_prompt: None,
                 python_primary_prompt: ">>> ".to_string(),
                 python_continuation_prompt: "... ".to_string(),

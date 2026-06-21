@@ -326,6 +326,7 @@ fn run_cell_loop() -> Result<(), String> {
             flush_original_stdio();
             return Ok(());
         };
+        mark_cell_running(true);
         {
             let _gil = GilGuard::acquire();
             run_python_cell(api, &cell.source);
@@ -333,6 +334,7 @@ fn run_cell_loop() -> Result<(), String> {
             flush_original_stdio();
         }
         if take_exit_requested() {
+            mark_cell_running(false);
             flush_original_stdio();
             return Ok(());
         }
@@ -355,10 +357,17 @@ fn emit_ready() -> Result<(), String> {
         let state = session_state();
         let mut guard = state.inner.lock().unwrap();
         guard.request_active = false;
+        guard.cell_running = false;
         guard.visible_input_prompt = None;
     }
     ipc::emit_ready();
     Ok(())
+}
+
+fn mark_cell_running(running: bool) {
+    let state = session_state();
+    let mut guard = state.inner.lock().unwrap();
+    guard.cell_running = running;
 }
 
 fn wait_for_next_cell() -> Option<CellInput> {
@@ -418,6 +427,7 @@ fn finish_cell_request() -> Result<(), String> {
     {
         let mut guard = state.inner.lock().unwrap();
         guard.request_active = false;
+        guard.cell_running = false;
         guard.visible_input_prompt = None;
         guard.input_queue.clear_after_cell_finish();
     }
@@ -487,6 +497,7 @@ enum QueueReadAction {
     Line {
         bytes: Vec<u8>,
         prompt_already_visible: bool,
+        detached_request: bool,
     },
     InputWait {
         prompt: String,
@@ -545,6 +556,7 @@ fn next_queue_line_action(
         }
         if let Some(read) = guard.input_queue.consume_line() {
             let prompt_already_visible = guard.visible_input_prompt.as_deref() == Some(prompt);
+            let detached_request = !guard.cell_running;
             guard.visible_input_prompt = None;
             guard.request_active = true;
             if *owns_consumer {
@@ -555,6 +567,7 @@ fn next_queue_line_action(
             return QueueReadAction::Line {
                 bytes: read.protocol_bytes,
                 prompt_already_visible,
+                detached_request,
             };
         }
         if !*owns_consumer {
@@ -597,10 +610,14 @@ fn read_queue_line(
             QueueReadAction::Line {
                 bytes,
                 prompt_already_visible,
+                detached_request,
             } => {
                 ipc::emit_input_line(prompt, &String::from_utf8_lossy(&bytes));
                 if emit_prompt_to_stdout && !prompt.is_empty() && !prompt_already_visible {
                     emit_output_text(TextStream::Stdout, prompt.as_bytes());
+                }
+                if detached_request {
+                    complete_detached_read_request();
                 }
                 return Ok(StdioLineRead {
                     bytes,
@@ -670,6 +687,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     break QueueReadAction::Line {
                         bytes: read.protocol_bytes,
                         prompt_already_visible: true,
+                        detached_request: !guard.cell_running,
                     };
                 }
                 if !output.is_empty() {
@@ -713,6 +731,16 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         release_read_consumer(state);
     }
     Ok(output)
+}
+
+fn complete_detached_read_request() {
+    let state = session_state();
+    {
+        let mut guard = state.inner.lock().unwrap();
+        guard.request_active = false;
+        guard.visible_input_prompt = None;
+    }
+    ipc::emit_ready();
 }
 
 unsafe extern "C" fn mcp_repl_readline(
@@ -1008,6 +1036,7 @@ fn finish_session_end() {
     guard.session_end_emitted = true;
     guard.shutdown = true;
     guard.request_active = false;
+    guard.cell_running = false;
     guard.input_queue.clear_after_interrupt();
     drop(guard);
     state.cvar.notify_all();

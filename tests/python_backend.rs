@@ -5552,3 +5552,58 @@ wait_and_print()
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_after_cell_return_completes_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_answer = None
+background_waiting = threading.Event()
+
+def background():
+    global background_answer
+    background_waiting.set()
+    background_answer = input('bg> ')
+    print('BACKGROUND_ANSWER', background_answer)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input prompt setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg> "),
+        "expected background input prompt, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("ok", Some(1.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&answer_text),
+        "background input answer should complete its request, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("BACKGROUND_ANSWER ok"),
+        "expected background input answer output, got: {answer_text:?}"
+    );
+    Ok(())
+}
