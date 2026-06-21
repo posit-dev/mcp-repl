@@ -8,9 +8,9 @@
 
 ## Status
 
-- State: completed
+- State: completed for this slice
 - Last updated: 2026-06-21
-- Current phase: complete
+- Current phase: follow-up cleanup complete
 
 ## Current Direction
 
@@ -40,7 +40,7 @@
 
 ## Open Questions
 
-- Background Python thread reads still share the same exclusive read-consumer primitive; fairness between competing foreground/background reads is not broadened in this slice.
+- Background Python thread reads still share the same exclusive read-consumer primitive; fairness between competing foreground/background reads remains a known limitation and is not broadened in this slice.
 - Empty-prompt reads keep the existing generic wait-status behavior rather than inventing a visible prompt.
 
 ## Follow-Up Notes
@@ -56,6 +56,6 @@
 
 - 2026-06-21: Use a checked-in plan because the change spans Python worker state, platform stdin adapters, server protocol completion, and public behavior.
 - 2026-06-21: Prefer a worker readiness signal without rendered prompt for top-level idle completion; real read prompts remain prompt-bearing waits.
-- 2026-06-21: Treat built-in Python `worker_ready` as spawn-ready without waiting for an initial top-level `InputWait`; top-level readiness is now prompt-free.
+- 2026-06-21: Treat startup readiness as protocol-driven: initial `input_wait` preserves prompt-bearing readiness, while `ready` permits prompt-free startup without a backend-specific Python spawn case.
 - 2026-06-21: Convert Python `SystemExit` inside the embedded cell runner into a worker exit request, then emit `session_end` before CPython finalization. Session-end respawn detaches old output/sideband readers so finalization or inherited holders cannot block the tool response.
 - 2026-06-21: Required checks passed: `cargo check`, `cargo build`, `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --quiet`, and `cargo +nightly fmt`.

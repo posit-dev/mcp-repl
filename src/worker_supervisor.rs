@@ -27,7 +27,7 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcEchoEvent, IpcHandle, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -352,13 +352,9 @@ impl WorkerSupervisor {
         if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             return Err(Self::terminate_spawn_error(process, backend, err));
         }
-        let initial_prompt = if matches!(backend, Backend::Python) {
-            None
-        } else {
-            match seed_initial_input_wait_from_process(&process) {
-                Ok(prompt) => prompt,
-                Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
-            }
+        let initial_prompt = match seed_initial_readiness_from_process(&process) {
+            Ok(prompt) => prompt,
+            Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
         };
         Ok(SupervisorSpawn {
             process,
@@ -412,7 +408,7 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
     }
 }
 
-fn seed_initial_input_wait_from_process(
+fn seed_initial_readiness_from_process(
     process: &WorkerProcess,
 ) -> Result<Option<InitialWorkerPrompt>, WorkerError> {
     let Some(ipc) = process.ipc_connection() else {
@@ -421,15 +417,16 @@ fn seed_initial_input_wait_from_process(
     if let Some(raw_prompt) = ipc.try_take_prompt() {
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
-    match ipc.wait_for_input_wait(WORKER_READY_TIMEOUT) {
-        Ok(prompt) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
+    match ipc.wait_for_input_readiness(WORKER_READY_TIMEOUT) {
+        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
+        Ok(IpcInputReadiness::Ready) => Ok(None),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
         Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before input_wait".to_string(),
+            "worker session ended before startup readiness".to_string(),
         )),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for worker input_wait".to_string(),
+            "ipc disconnected while waiting for worker startup readiness".to_string(),
         )),
     }
 }

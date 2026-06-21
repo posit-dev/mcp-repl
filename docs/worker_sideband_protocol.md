@@ -121,6 +121,13 @@ errors.
 - If no input batch is active, this only refreshes readiness and the prompt
   cache. Built-in workers use this for the initial ready prompt.
 
+`ready`
+- `{ "type": "ready" }`
+- Marks the worker ready for the next `input_batch` without a visible prompt.
+- If an input batch is active, this is the successful same-worker completion
+  signal for that batch.
+- If no input batch is active, this permits prompt-free startup readiness.
+
 `input_line`
 - `{ "type": "input_line", "prompt": <string>, "text": <string> }`
 - Records that the worker delivered accounted input to the runtime at this
@@ -174,12 +181,14 @@ The worker emits no other worker-to-server protocol messages in v6.
 ## Readiness And Input
 
 The worker starts not ready for input. The server waits for `worker_ready`, then
-waits for the first `input_wait`. Only then may it send an `input_batch`.
+waits for the first `input_wait` or `ready`. Only then may it send an
+`input_batch`.
 
 After the server sends `input_batch`, it considers the worker not ready. The
 worker queues the batch and wakes its managed runtime input path. When the
 runtime consumes all queued input and asks the managed input boundary for more,
-the worker emits `input_wait`.
+the worker emits `input_wait`; a prompt-free top-level loop may instead emit
+`ready`.
 
 Built-in R and Python use the same ownership model: a worker-owned managed input
 queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
@@ -202,7 +211,7 @@ objects, `os.read(0, ...)`, or equivalent fd-0 aliases. Those surfaces all draw
 from the same worker-owned queue and share the same accounting; they are bridges
 to the managed queue, not independent input sources. Each delivered line or
 byte-oriented managed read emits `input_line`; when the queue is empty after an
-active batch, the worker emits `input_wait`.
+active batch, the worker emits `input_wait` or `ready`.
 
 Python may still use PTY or ConPTY process stdio for terminal behavior, but
 accepted request input is sent over sideband IPC, not by server writes to
@@ -210,9 +219,9 @@ runtime stdin.
 
 Custom workers must implement the same readiness contract themselves. The test
 Zod worker exercises the custom-worker input/readiness path: it sends
-`worker_ready`, sends an initial `input_wait`, accepts `input_batch`, emits
-`input_line` for consumed lines, and emits a later `input_wait` when it is ready
-again. It is not a full implementation of every optional protocol surface.
+`worker_ready`, sends an initial `input_wait` or `ready`, accepts `input_batch`,
+emits `input_line` for consumed lines, and emits a later `input_wait` when it is
+ready again. It is not a full implementation of every optional protocol surface.
 
 ## Interrupts
 

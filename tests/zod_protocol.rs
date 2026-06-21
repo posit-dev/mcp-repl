@@ -119,6 +119,14 @@ async fn spawn_zod_server_with_extra_args(
     control_log: &std::path::Path,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(control_log, Vec::new(), extra_args).await
+}
+
+async fn spawn_zod_server_with_extra_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -126,6 +134,9 @@ async fn spawn_zod_server_with_extra_args(
         "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
         Value::String(control_log.display().to_string()),
     );
+    for (key, value) in extra_env {
+        env.insert(key.to_string(), Value::String(value.to_string()));
+    }
     let spec = json!({
         "executable": zod_worker_path()?,
         "args": [],
@@ -149,6 +160,17 @@ async fn spawn_zod_server_with_extra_args(
 
 async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
+}
+
+async fn spawn_zod_startup_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![("MCP_REPL_ZOD_STARTUP_READY", "1")],
+        Vec::new(),
+    )
+    .await
 }
 
 async fn spawn_zod_stalled_control_server(
@@ -293,6 +315,48 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
     assert!(
         !log.contains("stdin:"),
         "v5 server path must not write request text to raw stdin, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_startup_ready_server(&control_log).await?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.call_tool_raw(
+            "repl",
+            json!({
+                "input": "prompt-free startup",
+                "timeout_ms": 20_000
+            }),
+        ),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!(
+                "startup ready should accept first input without waiting for input_wait timeout"
+            );
+        }
+    };
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("v5-output: prompt-free startup\n"),
+        "expected custom worker startup ready to accept first input, got: {text:?}"
+    );
+    let log = wait_for_log_contains(&control_log, "ready")?;
+    assert!(
+        log.contains("input_batch input=prompt-free startup"),
+        "expected first input after startup ready, got log: {log:?}"
     );
 
     session.cancel().await?;

@@ -45,6 +45,11 @@ pub struct ServerIpcConnection {
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
+pub enum IpcInputReadiness {
+    InputWait(String),
+    Ready,
+}
+
 #[derive(Clone, Default)]
 pub struct IpcHandle {
     inner: Arc<Mutex<Option<ServerIpcConnection>>>,
@@ -521,6 +526,42 @@ impl ServerIpcConnection {
     pub fn try_take_prompt(&self) -> Option<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.last_prompt.take()
+    }
+
+    pub fn wait_for_input_readiness(
+        &self,
+        timeout: Duration,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if let Some(prompt) = guard.last_prompt.take() {
+                return Ok(IpcInputReadiness::InputWait(prompt));
+            }
+            if guard.input_state.ready_for_input() {
+                return Ok(IpcInputReadiness::Ready);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
     }
 
     pub fn wait_for_worker_ready(

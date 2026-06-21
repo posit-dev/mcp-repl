@@ -26,6 +26,7 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
+const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
@@ -68,10 +69,15 @@ fn run_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
-    writer.send(&WorkerToServer::InputWait {
-        prompt: "v5> ".to_string(),
-    })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if std::env::var_os(STARTUP_READY_ENV).is_some() {
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        writer.send(&WorkerToServer::InputWait {
+            prompt: "v5> ".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
@@ -402,6 +408,7 @@ enum WorkerToServer {
     InputWait {
         prompt: String,
     },
+    Ready {},
     SessionEnd {
         reason: String,
         message: Option<String>,

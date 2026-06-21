@@ -22,7 +22,7 @@ pub use protocol::{
     WORKER_PROTOCOL_VERSION, WorkerCapabilities, WorkerIdentity, WorkerProtocol,
     WorkerToServerIpcMessage,
 };
-pub use server_connection::{IpcHandle, IpcWaitError, ServerIpcConnection};
+pub use server_connection::{IpcHandle, IpcInputReadiness, IpcWaitError, ServerIpcConnection};
 #[cfg(target_family = "windows")]
 pub use transport::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
