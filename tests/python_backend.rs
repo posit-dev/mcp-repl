@@ -1585,9 +1585,6 @@ finally:
 print("WIN_STDIN_VALUES", first, second, third)
 print("REPLACED_STDIN_ISATTY", replaced_stdin_isatty)
 """)
-alpha
-beta
-gamma
 "#,
             Some(5.0),
         )
@@ -1607,28 +1604,67 @@ gamma
         session.cancel().await?;
         return Err("python Windows PTY stdin bridge test remained busy".into());
     }
+    assert!(
+        text.contains("win> "),
+        "expected Windows input prompt, got: {text:?}"
+    );
+
+    let mut all_text = text.clone();
+
+    let alpha = session.write_stdin_raw_with("alpha", Some(5.0)).await?;
+    text = result_text(&alpha);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+
+    let beta_gamma = session
+        .write_stdin_raw_with("beta\ngamma", Some(5.0))
+        .await?;
+    text = result_text(&beta_gamma);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("WIN_STDIN_VALUES alpha beta gamma")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows PTY stdin bridge follow-up test remained busy".into());
+    }
 
     session.cancel().await?;
 
     assert!(
-        text.contains("PTY_FDS True True True"),
-        "expected Python fds to be TTY-backed, got: {text:?}"
+        all_text.contains("PTY_FDS True True True"),
+        "expected Python fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("CRT_ISATTY True True True"),
-        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
+        all_text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
-        "expected Windows sys.stdin bridge to report TTY-backed stdin, got: {text:?}"
+        all_text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
+        "expected Windows sys.stdin bridge to report TTY-backed stdin, got: {all_text:?}"
     );
     assert!(
-        text.contains("WIN_STDIN_VALUES alpha beta gamma"),
-        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {text:?}"
+        all_text.contains("WIN_STDIN_VALUES alpha beta gamma"),
+        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {all_text:?}"
     );
     assert!(
-        text.contains("REPLACED_STDIN_ISATTY False"),
-        "expected replaced stdin fd to fall back to real isatty state, got: {text:?}"
+        all_text.contains("REPLACED_STDIN_ISATTY False"),
+        "expected replaced stdin fd to fall back to real isatty state, got: {all_text:?}"
     );
     Ok(())
 }
@@ -3826,14 +3862,17 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     );
 
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_INPUT_INTERRUPT')", Some(5.0))
+        .write_stdin_raw_with(
+            "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
+            Some(5.0),
+        )
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("AFTER_INPUT_INTERRUPT"),
-        "expected follow-up to run after input prompt interrupt, got: {follow_up_text:?}"
+        !is_busy_response(&follow_up_text) && follow_up_text.contains("AFTER_INPUT_INTERRUPT_DONE"),
+        "expected immediate follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }

@@ -4,6 +4,8 @@ use std::time::Instant;
 pub(crate) struct InputState {
     active: bool,
     ready_for_input: bool,
+    ready_observed_at: Option<Instant>,
+    ready_from_input_wait: bool,
     completed_observed_at: Option<Instant>,
     protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
@@ -22,6 +24,7 @@ impl InputState {
         }
         self.active = true;
         self.ready_for_input = false;
+        self.ready_from_input_wait = false;
         self.completed_observed_at = None;
         Ok(())
     }
@@ -39,6 +42,17 @@ impl InputState {
         self.ready_for_input
     }
 
+    pub(crate) fn ready_from_input_wait(&self) -> bool {
+        self.ready_for_input && self.ready_from_input_wait
+    }
+
+    pub(crate) fn readiness_observed_after(&self, since: Instant) -> bool {
+        self.ready_for_input
+            && self
+                .ready_observed_at
+                .is_some_and(|observed_at| observed_at > since)
+    }
+
     pub(crate) fn validate_active_input(&self, event_type: &str) -> Result<(), String> {
         if !self.active {
             return Err(format!("{event_type} reported with no active input"));
@@ -50,11 +64,17 @@ impl InputState {
     }
 
     pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
-        self.record_ready(observed_at);
+        self.record_ready_with_source(observed_at, true);
     }
 
     pub(crate) fn record_ready(&mut self, observed_at: Instant) {
+        self.record_ready_with_source(observed_at, false);
+    }
+
+    fn record_ready_with_source(&mut self, observed_at: Instant, from_input_wait: bool) {
         self.ready_for_input = true;
+        self.ready_observed_at = Some(observed_at);
+        self.ready_from_input_wait = from_input_wait;
         if self.active {
             self.completed_observed_at = Some(observed_at);
         }
