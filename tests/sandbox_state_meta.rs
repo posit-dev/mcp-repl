@@ -844,10 +844,11 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
         "expected local interrupt follow-up to ignore missing inherited metadata checks, got: {interrupt_text}"
     );
     assert!(
-        interrupt_text.contains(">")
+        interrupt_text.is_empty()
+            || interrupt_text.contains(">")
             || interrupt_text.contains("<<repl status: busy")
             || interrupt_text.contains("<<repl status: idle>>"),
-        "expected interrupt follow-up to return local recovery output, got: {interrupt_text}"
+        "expected interrupt follow-up to return local recovery output or an empty clean reply, got: {interrupt_text}"
     );
     session.cancel().await?;
     Ok(())

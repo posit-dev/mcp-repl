@@ -493,6 +493,7 @@ impl ServerIpcConnection {
         }
     }
 
+    #[cfg(test)]
     pub fn wait_for_input_wait(&self, timeout: Duration) -> Result<String, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();

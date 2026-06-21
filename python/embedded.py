@@ -13,6 +13,7 @@ import os
 import pydoc
 import sys
 import threading
+import weakref
 
 import _io
 import _mcp_repl
@@ -48,6 +49,7 @@ _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 _mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
 _mcp_repl_cell_compiler = codeop.Compile()
+_mcp_repl_input_streams = weakref.WeakSet()
 _mcp_repl_codeop_allow_incomplete_input = getattr(
     codeop, "PyCF_ALLOW_INCOMPLETE_INPUT", 0
 )
@@ -249,6 +251,7 @@ class McpInputStream:
         self._buffer = b""
         self._fileno = fileno
         self._closefd = closefd
+        _mcp_repl_input_streams.add(self)
         if encoding is not None:
             self.encoding = encoding
         if errors is not None:
@@ -453,6 +456,11 @@ class McpInputStream:
 
     def flush(self):
         pass
+
+
+def _mcp_repl_clear_stdin_buffers():
+    for stream in tuple(_mcp_repl_input_streams):
+        stream._buffer = b""
 
 
 class McpInputBuffer:

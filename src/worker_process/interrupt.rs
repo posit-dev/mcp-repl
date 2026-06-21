@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{ReplyWithOffset, timeout_status_content};
-use crate::ipc::IpcWaitError;
+use crate::ipc::{IpcInputReadiness, IpcWaitError};
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -200,9 +200,12 @@ impl WorkerManager {
             if timeout.is_zero() {
                 timed_out = true;
             } else {
-                match ipc.wait_for_input_wait(timeout) {
-                    Ok(value) => {
+                match ipc.wait_for_input_readiness(timeout) {
+                    Ok(IpcInputReadiness::InputWait(value)) => {
                         prompt = Some(value);
+                    }
+                    Ok(IpcInputReadiness::Ready) => {
+                        prompt = None;
                     }
                     Err(IpcWaitError::Timeout) => {
                         timed_out = true;

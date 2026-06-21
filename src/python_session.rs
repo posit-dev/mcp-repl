@@ -155,6 +155,7 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         !guard.request_active
     };
     if should_record_background_plots {
+        clear_python_pending_interrupt();
         record_background_plots();
     }
     {
@@ -336,7 +337,7 @@ fn run_cell_loop() -> Result<(), String> {
             return Ok(());
         }
         emit_plots();
-        finish_cell_request();
+        finish_cell_request()?;
     }
 }
 
@@ -366,6 +367,16 @@ fn wait_for_next_cell() -> Option<CellInput> {
     loop {
         if guard.shutdown || guard.exit_requested {
             return None;
+        }
+        if guard.interrupt_requested {
+            guard.interrupt_requested = false;
+            guard.request_active = false;
+            guard.visible_input_prompt = None;
+            state.cvar.notify_all();
+            drop(guard);
+            clear_python_pending_interrupt();
+            guard = state.inner.lock().unwrap();
+            continue;
         }
         if !guard.input_queue.has_active_read_consumer()
             && let Some(source) = guard.input_queue.take_cell_payload()
@@ -397,7 +408,12 @@ fn run_python_cell(api: &'static PythonApi, source: &str) {
     }
 }
 
-fn finish_cell_request() {
+fn finish_cell_request() -> Result<(), String> {
+    let api = PythonApi::global();
+    {
+        let _gil = GilGuard::acquire();
+        clear_python_stdin_buffers(api)?;
+    }
     let state = session_state();
     {
         let mut guard = state.inner.lock().unwrap();
@@ -406,6 +422,7 @@ fn finish_cell_request() {
         guard.input_queue.clear_after_cell_finish();
     }
     ipc::emit_ready();
+    Ok(())
 }
 
 fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
@@ -415,6 +432,21 @@ fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
     let result = PyPtr::from_owned(result, "Python prompt capture failed")?;
     drop(result);
     Ok(())
+}
+
+fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<(), String> {
+    let main = api.import_module("__main__")?;
+    let func = api.get_attr_string(main.as_ptr(), "_mcp_repl_clear_stdin_buffers")?;
+    let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
+    let result = PyPtr::from_owned(result, "Python stdin buffer cleanup failed")?;
+    drop(result);
+    Ok(())
+}
+
+fn clear_python_pending_interrupt() {
+    let api = PythonApi::global();
+    let _gil = GilGuard::acquire();
+    api.clear_pending_signals();
 }
 
 fn finalize_python(
@@ -471,8 +503,9 @@ fn wait_for_queue_notification<'a>(
     if release_gil_while_waiting {
         let allow_threads = PythonThreadsAllowed::new();
         let guard = state.cvar.wait(guard).unwrap();
+        drop(guard);
         drop(allow_threads);
-        guard
+        state.inner.lock().unwrap()
     } else {
         state.cvar.wait(guard).unwrap()
     }

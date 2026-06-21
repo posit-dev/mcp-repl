@@ -1904,6 +1904,61 @@ print("RAW_PARTIAL_EXACT", data)
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdin_partial_text_read_clears_buffer_before_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import sys
+value = sys.stdin.read(2)
+print("TEXT_PARTIAL_READ", value)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected partial sys.stdin read to wait for follow-up input, got: {first_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("abcdef", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("TEXT_PARTIAL_READ ab"),
+        "expected sys.stdin.read(2) to consume the first two characters, got: {answer_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_with(
+            r#"import sys
+line = sys.stdin.readline().strip()
+print("TEXT_PARTIAL_NEXT", line)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let next_text = result_text(&next);
+    assert!(
+        next_text.contains("<<repl status: waiting for input>>"),
+        "expected fresh cell to wait for new stdin instead of buffered leftovers, got: {next_text:?}"
+    );
+
+    let fresh = session.write_stdin_raw_with("fresh", Some(5.0)).await?;
+    let fresh_text = result_text(&fresh);
+    session.cancel().await?;
+
+    assert!(
+        fresh_text.contains("TEXT_PARTIAL_NEXT fresh"),
+        "expected fresh stdin to satisfy the next cell, got: {fresh_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_text_write_returns_character_count() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -4019,6 +4074,39 @@ async fn python_interrupt_aborts_running_cell_without_replaying_tail() -> TestRe
     assert!(
         follow_up_text.contains("AFTER_CONTINUATION_INTERRUPT"),
         "expected follow-up to run after continuation interrupt, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected idle Ctrl-C to settle without waiting for stdin, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_IDLE_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_IDLE_INTERRUPT"),
+        "expected follow-up cell after idle Ctrl-C to run, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("KeyboardInterrupt"),
+        "idle Ctrl-C leaked into the follow-up cell, got: {follow_up_text:?}"
     );
     Ok(())
 }

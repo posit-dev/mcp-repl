@@ -45,7 +45,7 @@ async fn spawn_manage_session() -> TestResult<common::McpTestSession> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
+async fn interrupt_without_active_request_keeps_session_usable() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "manage_session_behavior test mutex poisoned")?;
@@ -63,8 +63,8 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        text.contains(">") || text.contains("<<repl status: busy"),
-        "expected prompt or timeout status in output, got: {text:?}"
+        text.is_empty() || text.contains(">") || text.contains("<<repl status: busy"),
+        "expected empty reply, prompt, or timeout status in output, got: {text:?}"
     );
     assert!(
         !text.contains("worker exited"),
