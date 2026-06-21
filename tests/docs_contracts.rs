@@ -103,6 +103,96 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn examples_folder_documents_chatlas_usage() {
+    let root = repo_root();
+    let readme_path = root.join("examples/README.md");
+    let pager_path = root.join("examples/chatlas_pager_mode.py");
+    let files_path = root.join("examples/chatlas_files_mode.py");
+
+    for path in [&readme_path, &pager_path, &files_path] {
+        assert_exists(path);
+    }
+
+    let readme = read(&readme_path);
+    for required in [
+        "chatlas[mcp]",
+        "chatlas_pager_mode.py",
+        "chatlas_files_mode.py",
+        "pager mode",
+        "overflow files mode",
+        "register_mcp_tools_stdio_async",
+        "--interpreter",
+        "--oversized-output",
+        "list_directory",
+        "read_text_file",
+        "start_line",
+        "end_line",
+        "cleanup_mcp_tools",
+    ] {
+        assert!(readme.contains(required), "missing {required} in README.md");
+    }
+
+    let pager = read(&pager_path);
+    for required in [
+        "from chatlas import ChatOpenAI",
+        "register_mcp_tools_stdio_async",
+        "command=\"mcp-repl\"",
+        "include_tools=[\"repl\"]",
+        "chat_async",
+        "cleanup_mcp_tools",
+    ] {
+        assert!(
+            pager.contains(required),
+            "missing {required} in examples/chatlas_pager_mode.py"
+        );
+    }
+    assert_contains_wrapped_text(
+        &pager,
+        r#""--oversized-output", "pager""#,
+        "examples/chatlas_pager_mode.py",
+    );
+    assert_contains_wrapped_text(
+        &pager,
+        r#""--interpreter", "python""#,
+        "examples/chatlas_pager_mode.py",
+    );
+
+    let files = read(&files_path);
+    for required in [
+        "from chatlas import ChatOpenAI",
+        "register_mcp_tools_stdio_async",
+        "command=\"mcp-repl\"",
+        "include_tools=[\"repl\"]",
+        "def list_directory",
+        "def read_text_file",
+        "from typing import Optional",
+        "start_line: int = 1",
+        "end_line: Optional[int] = None",
+        "chat_async",
+        "cleanup_mcp_tools",
+    ] {
+        assert!(
+            files.contains(required),
+            "missing {required} in examples/chatlas_files_mode.py"
+        );
+    }
+    assert_contains_wrapped_text(
+        &files,
+        r#""--oversized-output", "files""#,
+        "examples/chatlas_files_mode.py",
+    );
+    assert_contains_wrapped_text(
+        &files,
+        r#""--interpreter", "python""#,
+        "examples/chatlas_files_mode.py",
+    );
+    assert!(
+        !files.contains("max_chars"),
+        "read_text_file should not impose a fixed character limit"
+    );
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 

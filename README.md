@@ -210,6 +210,7 @@ wire-trace proxy.
 - Sandbox: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 - Tool guides: `docs/tool-descriptions/`
+- Examples: `examples/README.md`
 
 ## License
 
