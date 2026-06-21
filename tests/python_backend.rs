@@ -2643,6 +2643,38 @@ async fn python_cell_custom_displayhook_is_honored() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_cell_preserves_future_annotations_between_calls() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with("from __future__ import annotations", Some(5.0))
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        !setup_text.contains("Traceback"),
+        "expected future import setup to succeed, got: {setup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            "def f(value: list[int]) -> dict[str, int]:\n    return {}\nprint('FUTURE_ANNOTATIONS', isinstance(f.__annotations__['value'], str), f.__annotations__['value'])",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FUTURE_ANNOTATIONS True list[int]"),
+        "expected future annotations to persist across cells, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_runner_survives_shadowed_user_globals() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -4986,6 +5018,14 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
     assert!(
         text.contains("ZeroDivisionError"),
         "expected traceback, got: {text:?}"
+    );
+    assert!(
+        text.contains("File \"<mcp-repl>\", line 1"),
+        "expected traceback to point at the user cell, got: {text:?}"
+    );
+    assert!(
+        !text.contains("_mcp_repl_run_cell") && !text.contains("File \"<string>\""),
+        "traceback should not expose the cell runner frame, got: {text:?}"
     );
 
     session.cancel().await?;

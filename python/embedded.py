@@ -2,6 +2,7 @@ import ast
 import base64
 import builtins
 import codecs
+import codeop
 import errno
 import hashlib
 import importlib.util
@@ -45,6 +46,7 @@ _mcp_repl_windows_conpty = (
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 _mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
+_mcp_repl_cell_compiler = codeop.Compile()
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -107,32 +109,84 @@ def _mcp_repl_capture_prompts():
 # Run a complete cell, displaying a final top-level expression like the REPL.
 def _mcp_repl_run_cell(
     source,
-    _ast_parse=ast.parse,
+    _ast_pycf_only_ast=ast.PyCF_ONLY_AST,
     _ast_module=ast.Module,
     _ast_expr=ast.Expr,
     _ast_expression=ast.Expression,
     _ast_fix_missing_locations=ast.fix_missing_locations,
+    _base_exception=BaseException,
+    _cell_compiler=_mcp_repl_cell_compiler,
+    _codeop_allow_incomplete_input=codeop.PyCF_ALLOW_INCOMPLETE_INPUT,
+    _codeop_dont_imply_dedent=codeop.PyCF_DONT_IMPLY_DEDENT,
     _compile=compile,
     _eval=eval,
     _globals=globals,
     _isinstance=isinstance,
+    _report_exception=None,
     _sys=sys,
+    _system_exit=SystemExit,
 ):
-    module = _ast_parse(source, "<mcp-repl>", "exec")
+    if _report_exception is None:
+        _report_exception = _mcp_repl_report_cell_exception
     namespace = _globals()
-    if module.body and _isinstance(module.body[-1], _ast_expr):
-        setup = _ast_module(body=module.body[:-1], type_ignores=module.type_ignores)
-        _ast_fix_missing_locations(setup)
-        setup_code = _compile(setup, "<mcp-repl>", "exec")
+    compiler_flags = _cell_compiler.flags
+    try:
+        parse_flags = compiler_flags
+        parse_flags &= ~_codeop_allow_incomplete_input
+        parse_flags &= ~_codeop_dont_imply_dedent
+        module = _compile(
+            source,
+            "<mcp-repl>",
+            "exec",
+            parse_flags | _ast_pycf_only_ast,
+            True,
+        )
+        if module.body and _isinstance(module.body[-1], _ast_expr):
+            setup = _ast_module(body=module.body[:-1], type_ignores=module.type_ignores)
+            _ast_fix_missing_locations(setup)
+            setup_code = _cell_compiler(setup, "<mcp-repl>", "exec", incomplete_input=False)
 
-        expression = _ast_expression(module.body[-1].value)
-        _ast_fix_missing_locations(expression)
-        expression_code = _compile(expression, "<mcp-repl>", "eval")
-        exec(setup_code, namespace, namespace)
-        value = _eval(expression_code, namespace, namespace)
-        _sys.displayhook(value)
-    else:
-        exec(_compile(module, "<mcp-repl>", "exec"), namespace, namespace)
+            expression = _ast_expression(module.body[-1].value)
+            _ast_fix_missing_locations(expression)
+            expression_code = _cell_compiler(
+                expression, "<mcp-repl>", "eval", incomplete_input=False
+            )
+            cell_code = (setup_code, expression_code)
+        else:
+            cell_code = _cell_compiler(
+                module, "<mcp-repl>", "exec", incomplete_input=False
+            )
+    except _base_exception as exc:
+        _cell_compiler.flags = compiler_flags
+        if _isinstance(exc, _system_exit):
+            raise
+        _report_exception(exc)
+        return
+
+    try:
+        if _isinstance(cell_code, tuple):
+            setup_code, expression_code = cell_code
+            exec(setup_code, namespace, namespace)
+            value = _eval(expression_code, namespace, namespace)
+            _sys.displayhook(value)
+        else:
+            exec(cell_code, namespace, namespace)
+    except _base_exception as exc:
+        if _isinstance(exc, _system_exit):
+            raise
+        _report_exception(exc)
+
+
+def _mcp_repl_report_cell_exception(exc, _sys=sys, _type=type):
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_name == "_mcp_repl_run_cell":
+        tb = tb.tb_next
+    original_tb = exc.__traceback__
+    exc.__traceback__ = tb
+    try:
+        _sys.excepthook(_type(exc), exc, tb)
+    finally:
+        exc.__traceback__ = original_tb
 
 
 def _input(prompt=""):
