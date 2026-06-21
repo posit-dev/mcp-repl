@@ -204,7 +204,8 @@ def _mcp_repl_run_cell(
 
 def _mcp_repl_report_cell_exception(exc, _sys=sys, _type=type):
     tb = exc.__traceback__
-    while tb is not None and tb.tb_frame.f_code.co_name == "_mcp_repl_run_cell":
+    helper_frame_names = ("_mcp_repl_run_cell", "_mcp_repl_compile_complete")
+    while tb is not None and tb.tb_frame.f_code.co_name in helper_frame_names:
         tb = tb.tb_next
     exc.__traceback__ = tb
     _sys.last_exc = exc

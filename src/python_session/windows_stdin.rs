@@ -158,6 +158,8 @@ pub(super) fn read_windows_turn_line(
                     ) {
                         if !idle_repl_prompt_emitted {
                             mark_waiting_input_locked(&mut guard, prompt, kind);
+                            guard.visible_input_prompt =
+                                (!prompt.is_empty()).then(|| prompt.to_string());
                             drop(guard);
                             ipc::emit_input_wait(prompt);
                             idle_repl_prompt_emitted = true;

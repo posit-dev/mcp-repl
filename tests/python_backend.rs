@@ -5096,6 +5096,58 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_compile_syntax_error_hides_cell_runner_frames() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("return 1", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_compile_syntax_error_hides_cell_runner_frames remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("SyntaxError"),
+        "expected SyntaxError, got: {text:?}"
+    );
+    assert!(
+        text.contains("File \"<mcp-repl>\", line 1"),
+        "expected syntax error to point at the user cell, got: {text:?}"
+    );
+    assert!(
+        !text.contains("_mcp_repl_run_cell")
+            && !text.contains("_mcp_repl_compile_complete")
+            && !text.contains("File \"<string>\""),
+        "traceback should not expose cell runner frames, got: {text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            r#"import sys
+print("SYS_LAST_TRACEBACK_IS_NONE", sys.last_traceback is None)
+print("SYS_LAST_EXC_TRACEBACK_IS_NONE", sys.last_exc.__traceback__ is None)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("SYS_LAST_TRACEBACK_IS_NONE True"),
+        "expected sys.last_traceback to omit cell runner frames, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC_TRACEBACK_IS_NONE True"),
+        "expected sys.last_exc traceback to omit cell runner frames, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_exception_updates_sys_last_exception() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

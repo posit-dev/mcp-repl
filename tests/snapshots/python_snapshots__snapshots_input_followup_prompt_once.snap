@@ -2,13 +2,13 @@
 source: tests/python_snapshots.rs
 expression: rendered
 ---
-== session: input_prompt_matching_ps1 ==
+== session: input_followup_prompt_once ==
 -- step 1 --
 call:
 {
   "tool": "py_repl",
   "arguments": {
-    "input": "import sys\nsys.ps1 = \"same> \"\nvalue = input(\"same> \")\nprint(\"MATCHED_PROMPT_VALUE\", value)\n",
+    "input": "name = input(\"name: \")\nprint(\"hello\", name)\n",
     "timeout_ms": 5000
   }
 }
@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "same> "
+      "text": "name: "
     }
   ]
 }
@@ -28,7 +28,7 @@ call:
 {
   "tool": "py_repl",
   "arguments": {
-    "input": "buffered\n",
+    "input": "Ada\n",
     "timeout_ms": 5000
   }
 }
@@ -39,11 +39,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "MATCHED_PROMPT_VALUE buffered"
+      "text": "hello Ada"
     },
     {
       "type": "text",
-      "text": "same> "
+      "text": ">>> "
     }
   ]
 }

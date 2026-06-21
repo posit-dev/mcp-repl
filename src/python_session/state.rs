@@ -19,7 +19,6 @@ pub(super) struct SessionStateInner {
     pub(super) request_active: bool,
     pub(super) current_prompt: Option<String>,
     pub(super) current_readline_state: Option<PythonReadlineState>,
-    #[cfg(windows)]
     pub(super) visible_input_prompt: Option<String>,
     pub(super) python_primary_prompt: String,
     pub(super) python_continuation_prompt: String,
@@ -54,7 +53,10 @@ pub(super) enum PythonExecState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadlineKind {
+    // CPython's native readline callback, used by input(), help(), pdb, and
+    // other Python code paths that ask PyOS_Readline for a line.
     PyOSReadline,
+    // Managed sys.stdin, file-like stdin wrappers, and raw fd-0 shims.
     RawStdin,
 }
 
@@ -122,7 +124,6 @@ impl SessionState {
                 request_active: false,
                 current_prompt: None,
                 current_readline_state: None,
-                #[cfg(windows)]
                 visible_input_prompt: None,
                 python_primary_prompt: ">>> ".to_string(),
                 python_continuation_prompt: "... ".to_string(),

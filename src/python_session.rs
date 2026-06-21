@@ -19,7 +19,7 @@ use state::{
 };
 #[cfg(not(any(target_family = "unix", windows)))]
 use state::{input_hook_prompt, mark_input_wait_completed_request, repl_prompt_for};
-use stdio::{PYTHON_STDIN_FILE, PythonRuntime, StdioLineRead, open_python_runtime};
+use stdio::{PYTHON_STDIN_FILE, StdioLineRead, open_python_runtime};
 #[cfg(all(not(target_family = "unix"), not(windows)))]
 use stdio::{read_stdio_line_bytes, read_stdio_line_bytes_allowing_python_threads};
 
@@ -360,13 +360,10 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         init.mark_failed(err.clone());
         return Err(err);
     }
-    let runtime = match open_python_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            init.mark_failed(err.clone());
-            return Err(err);
-        }
-    };
+    if let Err(err) = open_python_runtime() {
+        init.mark_failed(err.clone());
+        return Err(err);
+    }
 
     if let Err(err) = configure_python(api) {
         let _gil = GilGuard::acquire();
@@ -378,7 +375,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     init.mark_ready();
     ipc::emit_worker_ready("python", plot_capable());
 
-    let result = run_cell_loop(&runtime);
+    let result = run_cell_loop();
     crate::diagnostics::startup_log("python-session: cell loop exited; finalizing python");
     let finalize_result = finalize_python(api, thread_state);
     match &finalize_result {
@@ -435,7 +432,7 @@ fn configure_python(api: &'static PythonApi) -> Result<(), String> {
     Ok(())
 }
 
-fn run_cell_loop(_runtime: &PythonRuntime) -> Result<(), String> {
+fn run_cell_loop() -> Result<(), String> {
     let api = PythonApi::global();
     emit_ready_prompt()?;
     loop {

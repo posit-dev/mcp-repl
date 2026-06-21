@@ -95,18 +95,21 @@ fn next_readline_action_locked(
     }
 
     if let Some(read) = guard.input_queue.consume_line()? {
+        let prompt_already_visible = guard.visible_input_prompt.as_deref() == Some(prompt);
+        guard.visible_input_prompt = None;
         mark_running_cell_after_input_locked(guard);
         guard.waiting_for_input = false;
         guard.request_active = true;
         return Ok(ReadlineAction::Line {
             bytes: read.protocol_bytes,
-            prompt_already_visible: false,
+            prompt_already_visible,
         });
     }
 
     if guard.input_queue.take_completed_input() {
         let prompt = prompt.to_string();
         mark_waiting_input_locked(guard, &prompt, kind);
+        guard.visible_input_prompt = (!prompt.is_empty()).then_some(prompt.clone());
         return Ok(ReadlineAction::InputWait { prompt });
     }
 
