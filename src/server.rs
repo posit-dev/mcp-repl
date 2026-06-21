@@ -5,7 +5,7 @@ use rmcp::model::{
     ServerInfo,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -695,7 +695,12 @@ define_backend_tool_server!(
 struct ReplArgs {
     input: String,
     #[serde(default)]
+    #[schemars(with = "u64", transform = remove_schema_default)]
     timeout_ms: Option<u64>,
+}
+
+fn remove_schema_default(schema: &mut Schema) {
+    schema.remove("default");
 }
 
 #[derive(Deserialize, JsonSchema, Default)]

@@ -103,6 +103,141 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn examples_include_ellmer_mcp_repl_starter() {
+    let root = repo_root();
+    let readme_path = root.join("examples/README.md");
+    let pager_script_path = root.join("examples/ellmer-mcp-repl.R");
+    let files_script_path = root.join("examples/ellmer-mcp-repl-files.R");
+
+    assert_exists(&readme_path);
+    assert_exists(&pager_script_path);
+    assert_exists(&files_script_path);
+
+    let readme = read(&readme_path);
+    let pager_script = read(&pager_script_path);
+    let files_script = read(&files_script_path);
+
+    for required in [
+        "examples/ellmer-mcp-repl.R",
+        "examples/ellmer-mcp-repl-files.R",
+        "mcptools::mcp_tools",
+        "ellmer::chat_openai",
+        "mcp-repl",
+        "--interpreter",
+        "r",
+        "pager",
+        "files",
+        "glue",
+        "configuration file path",
+        "readLines",
+        "file-reading tool",
+    ] {
+        assert!(
+            readme.contains(required),
+            "missing {required} in examples/README.md"
+        );
+    }
+
+    for required in [
+        "library(ellmer)",
+        "library(mcptools)",
+        "library(jsonlite)",
+        r#"Sys.which("mcp-repl")"#,
+        "MCP_REPL_BINARY",
+        r#""mcpServers""#,
+        r#""mcp-repl-r""#,
+        r#""--interpreter""#,
+        r#""r""#,
+        r#""--sandbox""#,
+        r#""workspace-write""#,
+        r#""--oversized-output""#,
+        r#""pager""#,
+        "mcp_tools() currently takes a config file path",
+        "mcptools::mcp_tools(config = config_file)",
+        "chat$set_tools(tools)",
+        r#""repl" %in% tool_names"#,
+        r#""repl_reset" %in% tool_names"#,
+        "readLines",
+        "chat$chat(",
+    ] {
+        assert!(
+            pager_script.contains(required),
+            "missing {required} in examples/ellmer-mcp-repl.R"
+        );
+    }
+
+    assert!(
+        !pager_script.contains("--vanilla"),
+        "examples must not tell users to run R with --vanilla"
+    );
+    assert!(
+        !pager_script.contains(r#""--oversized-output", "files""#),
+        "pager example should not require a separate file-reading tool for output bundles"
+    );
+
+    for required in [
+        "library(ellmer)",
+        "library(mcptools)",
+        "library(jsonlite)",
+        "library(glue)",
+        r#"install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))"#,
+        r#"Sys.which("mcp-repl")"#,
+        "MCP_REPL_BINARY",
+        r#""mcpServers""#,
+        r#""mcp-repl-r""#,
+        r#""--interpreter""#,
+        r#""r""#,
+        r#""--sandbox""#,
+        r#""workspace-write""#,
+        r#""--oversized-output""#,
+        r#""files""#,
+        "mcp_tools() currently takes a config file path",
+        "mcptools::mcp_tools(config = config_file)",
+        "read_text_file",
+        "list_directory",
+        "line numbers",
+        r#"sprintf("%-4s %10s %s", "type", "size", "path")"#,
+        "list_directory_tool <- ellmer::tool",
+        "read_text_file_tool <- ellmer::tool",
+        "add_line_numbers <- function",
+        "start_line = 1L",
+        "max_lines = 200L",
+        "max_bytes = 20000L",
+        "readLines(con, n = 1L, warn = FALSE)",
+        "while (line_count < max_lines)",
+        "next_start_line <- line_number",
+        "next start_line = ",
+        "start_line = ellmer::type_integer",
+        "max_lines = ellmer::type_integer",
+        "iconv(text, from = \"UTF-8\", to = \"UTF-8\", sub = \"byte\")",
+        "glue(",
+        "Invalid bytes are shown with byte escapes.",
+        "chat$set_tools(c(tools, list(list_directory_tool, read_text_file_tool)))",
+        "transcript.txt",
+        "events.log",
+        "chat$chat(",
+    ] {
+        assert!(
+            files_script.contains(required),
+            "missing {required} in examples/ellmer-mcp-repl-files.R"
+        );
+    }
+
+    assert!(
+        !files_script.contains("--vanilla"),
+        "examples must not tell users to run R with --vanilla"
+    );
+    assert!(
+        !files_script.contains("offset_bytes"),
+        "files example should expose line ranges, not byte offsets"
+    );
+    assert!(
+        !files_script.contains("line_numbers ="),
+        "files example should keep line numbers as the single happy path"
+    );
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
