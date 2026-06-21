@@ -174,6 +174,11 @@ impl ServerIpcConnection {
                             handler(prompt);
                         }
                     }
+                    WorkerToServerIpcMessage::Ready {} => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.input_state.record_ready(Instant::now());
+                        reader_cvar.notify_all();
+                    }
                     WorkerToServerIpcMessage::SessionEnd { reason, message } => {
                         if let Err(err) = validate_session_end(reason.as_deref()) {
                             let mut guard = reader_inbox.lock().unwrap();

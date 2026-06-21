@@ -2568,6 +2568,78 @@ async fn python_cell_runs_block_and_following_top_level_code() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_fifo_cell_contract_uses_stdin_only_while_read_waits() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with("counter = 41\ncounter", Some(5.0))
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !is_busy_response(&first_text),
+        "expected initial cell to finish, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("41"),
+        "expected final expression display, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains(">>> ") && !first_text.contains("... "),
+        "completed cells should not render top-level Python prompts, got: {first_text:?}"
+    );
+
+    let second = session
+        .write_stdin_raw_with("counter += 1\ncounter", Some(5.0))
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("42"),
+        "expected globals to persist across cells, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains(">>> ") && !second_text.contains("... "),
+        "completed follow-up cells should stay prompt-free, got: {second_text:?}"
+    );
+
+    let prompt = session
+        .write_stdin_raw_with("name = input('name: ')", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("name: "),
+        "expected real input() prompt to stay visible, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("Ada", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "expected answer to complete the waiting input() call, got: {answer_text:?}"
+    );
+    assert!(
+        !answer_text.contains("NameError"),
+        "stdin answer should not execute as a top-level cell, got: {answer_text:?}"
+    );
+
+    let follow_up = session.write_stdin_raw_with("name", Some(5.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("'Ada'"),
+        "expected later input to execute as a fresh cell after input() completed, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains(">>> ") && !follow_up_text.contains("... "),
+        "fresh cell after input() should stay prompt-free, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_runner_accepts_legacy_codeop_compile_api() -> TestResult<()> {
     let _guard = lock_test_mutex();
     if !require_python() {

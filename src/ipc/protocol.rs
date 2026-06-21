@@ -36,6 +36,7 @@ pub enum WorkerToServerIpcMessage {
     InputWait {
         prompt: String,
     },
+    Ready {},
     OutputImage {
         mime_type: String,
         data_b64: String,
@@ -368,6 +369,25 @@ mod tests {
             }))
             .is_err(),
             "input_wait should reject input_id under v5"
+        );
+    }
+
+    #[test]
+    fn ready_message_is_worker_to_server_only() {
+        let ready = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "ready"
+        }));
+        assert!(
+            matches!(ready, Ok(WorkerToServerIpcMessage::Ready {})),
+            "ready should deserialize as a worker-to-server message"
+        );
+
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "ready"
+            }))
+            .is_err(),
+            "ready should not deserialize as a server-to-worker message"
         );
     }
 

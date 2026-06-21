@@ -50,6 +50,10 @@ impl InputState {
     }
 
     pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
+        self.record_ready(observed_at);
+    }
+
+    pub(crate) fn record_ready(&mut self, observed_at: Instant) {
         self.ready_for_input = true;
         if self.active {
             self.completed_observed_at = Some(observed_at);
