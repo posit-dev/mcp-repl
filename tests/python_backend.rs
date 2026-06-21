@@ -2564,6 +2564,65 @@ async fn python_cell_runs_block_and_following_top_level_code() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_cell_runner_accepts_legacy_codeop_compile_api() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if !require_python() {
+        return Ok(());
+    }
+
+    let codeop_dir = tempdir()?;
+    fs::write(
+        codeop_dir.path().join("codeop.py"),
+        r#"
+import __future__
+
+PyCF_DONT_IMPLY_DEDENT = 0x200
+_features = [getattr(__future__, name) for name in __future__.all_feature_names]
+
+
+class Compile:
+    def __init__(self):
+        self.flags = PyCF_DONT_IMPLY_DEDENT
+
+    def __call__(self, source, filename, symbol):
+        codeob = compile(source, filename, symbol, self.flags, True)
+        for feature in _features:
+            if codeob.co_flags & feature.compiler_flag:
+                self.flags |= feature.compiler_flag
+        return codeob
+"#,
+    )?;
+
+    let Some(session) = start_python_session_with_env_vars(vec![(
+        "PYTHONPATH".to_string(),
+        codeop_dir.path().display().to_string(),
+    )])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "from __future__ import annotations\nclass Box:\n    value: MissingName\nprint('LEGACY_CODEOP_OK', Box.__annotations__['value'])",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected legacy codeop cell to finish, got: {text:?}"
+    );
+    assert!(
+        text.contains("LEGACY_CODEOP_OK MissingName"),
+        "expected legacy codeop cell to run with future annotations, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_final_expression_displays_after_block() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

@@ -1,4 +1,5 @@
 import ast
+import __future__
 import base64
 import builtins
 import codecs
@@ -47,6 +48,13 @@ _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 _mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
 _mcp_repl_cell_compiler = codeop.Compile()
+_mcp_repl_codeop_allow_incomplete_input = getattr(
+    codeop, "PyCF_ALLOW_INCOMPLETE_INPUT", 0
+)
+_mcp_repl_codeop_dont_imply_dedent = getattr(codeop, "PyCF_DONT_IMPLY_DEDENT", 0)
+_mcp_repl_future_features = tuple(
+    getattr(__future__, name) for name in __future__.all_feature_names
+)
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -107,6 +115,26 @@ def _mcp_repl_capture_prompts():
 
 
 # Run a complete cell, displaying a final top-level expression like the REPL.
+def _mcp_repl_compile_complete(
+    source,
+    filename,
+    symbol,
+    _cell_compiler=_mcp_repl_cell_compiler,
+    _codeop_allow_incomplete_input=_mcp_repl_codeop_allow_incomplete_input,
+    _codeop_dont_imply_dedent=_mcp_repl_codeop_dont_imply_dedent,
+    _compile=compile,
+    _future_features=_mcp_repl_future_features,
+):
+    flags = _cell_compiler.flags
+    flags &= ~_codeop_allow_incomplete_input
+    flags &= ~_codeop_dont_imply_dedent
+    code = _compile(source, filename, symbol, flags, True)
+    for feature in _future_features:
+        if code.co_flags & feature.compiler_flag:
+            _cell_compiler.flags |= feature.compiler_flag
+    return code
+
+
 def _mcp_repl_run_cell(
     source,
     _ast_pycf_only_ast=ast.PyCF_ONLY_AST,
@@ -116,8 +144,9 @@ def _mcp_repl_run_cell(
     _ast_fix_missing_locations=ast.fix_missing_locations,
     _base_exception=BaseException,
     _cell_compiler=_mcp_repl_cell_compiler,
-    _codeop_allow_incomplete_input=codeop.PyCF_ALLOW_INCOMPLETE_INPUT,
-    _codeop_dont_imply_dedent=codeop.PyCF_DONT_IMPLY_DEDENT,
+    _codeop_allow_incomplete_input=_mcp_repl_codeop_allow_incomplete_input,
+    _codeop_dont_imply_dedent=_mcp_repl_codeop_dont_imply_dedent,
+    _compile_complete=_mcp_repl_compile_complete,
     _compile=compile,
     _eval=eval,
     _globals=globals,
@@ -144,18 +173,14 @@ def _mcp_repl_run_cell(
         if module.body and _isinstance(module.body[-1], _ast_expr):
             setup = _ast_module(body=module.body[:-1], type_ignores=module.type_ignores)
             _ast_fix_missing_locations(setup)
-            setup_code = _cell_compiler(setup, "<mcp-repl>", "exec", incomplete_input=False)
+            setup_code = _compile_complete(setup, "<mcp-repl>", "exec")
 
             expression = _ast_expression(module.body[-1].value)
             _ast_fix_missing_locations(expression)
-            expression_code = _cell_compiler(
-                expression, "<mcp-repl>", "eval", incomplete_input=False
-            )
+            expression_code = _compile_complete(expression, "<mcp-repl>", "eval")
             cell_code = (setup_code, expression_code)
         else:
-            cell_code = _cell_compiler(
-                module, "<mcp-repl>", "exec", incomplete_input=False
-            )
+            cell_code = _compile_complete(module, "<mcp-repl>", "exec")
     except _base_exception as exc:
         _cell_compiler.flags = compiler_flags
         if _isinstance(exc, _system_exit):
