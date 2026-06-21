@@ -1,4 +1,4 @@
-"""Use chatlas with mcp-repl pager mode."""
+"""Use async chatlas MCP registration with mcp-repl pager mode."""
 
 import asyncio
 

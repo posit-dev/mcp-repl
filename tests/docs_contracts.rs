@@ -106,36 +106,34 @@ fn docs_index_lists_main_docs() {
 fn examples_folder_documents_chatlas_usage() {
     let root = repo_root();
     let readme_path = root.join("examples/README.md");
-    let pager_path = root.join("examples/chatlas_pager_mode.py");
-    let files_path = root.join("examples/chatlas_files_mode.py");
-    let sync_pager_path = root.join("examples/chatlas_sync_pager_mode.py");
-    let sync_files_path = root.join("examples/chatlas_sync_files_mode.py");
-    let tool_path = root.join("examples/mcp_repl_tool.py");
+    let async_pager_path = root.join("examples/chatlas_async_pager_mode.py");
+    let async_files_path = root.join("examples/chatlas_async_files_mode.py");
 
-    for path in [
-        &readme_path,
-        &pager_path,
-        &files_path,
-        &sync_pager_path,
-        &sync_files_path,
-        &tool_path,
-    ] {
+    for path in [&readme_path, &async_pager_path, &async_files_path] {
         assert_exists(path);
+    }
+    for removed_path in [
+        "examples/chatlas_pager_mode.py",
+        "examples/chatlas_files_mode.py",
+        "examples/chatlas_normal_pager_mode.py",
+        "examples/chatlas_normal_files_mode.py",
+        "examples/chatlas_sync_pager_mode.py",
+        "examples/chatlas_sync_files_mode.py",
+        "examples/mcp_repl_tool.py",
+    ] {
+        assert!(
+            !root.join(removed_path).exists(),
+            "unsupported chatlas example should be removed: {removed_path}"
+        );
     }
 
     let readme = read(&readme_path);
     for required in [
         "chatlas[mcp]",
-        "chatlas_pager_mode.py",
-        "chatlas_files_mode.py",
-        "chatlas_sync_pager_mode.py",
-        "chatlas_sync_files_mode.py",
-        "mcp_repl_tool.py",
+        "chatlas_async_pager_mode.py",
+        "chatlas_async_files_mode.py",
         "pager mode",
         "overflow files mode",
-        "Synchronous chatlas examples",
-        "repl.start()",
-        "repl.close()",
         "register_mcp_tools_stdio_async",
         "--interpreter",
         "--oversized-output",
@@ -143,15 +141,40 @@ fn examples_folder_documents_chatlas_usage() {
         "read_text_file",
         "start_line",
         "end_line",
-        "chat.chat()",
-        "McpReplTool",
-        "chat.register_tool(repl)",
+        "chat_async",
         "cleanup_mcp_tools",
+        "chatlas supports blocking `chat.chat()`",
+        "synchronous MCP registration",
+        "`chat.chat()` MCP",
     ] {
         assert!(readme.contains(required), "missing {required} in README.md");
     }
+    for removed in [
+        "chatlas_pager_mode.py",
+        "chatlas_files_mode.py",
+        "chatlas_normal_pager_mode.py",
+        "chatlas_normal_files_mode.py",
+        "chatlas_sync_pager_mode.py",
+        "chatlas_sync_files_mode.py",
+        "mcp_repl_tool.py",
+        "McpReplTool",
+        "chat.register_tool(repl)",
+        "repl.start()",
+        "repl.close()",
+        "Synchronous chatlas examples",
+        "Normal chatlas examples",
+        "chat.chat() examples",
+        "subprocess over stdio",
+        "\"tools/call\"",
+        "\"initialize\"",
+    ] {
+        assert!(
+            !readme.contains(removed),
+            "README.md should not mention {removed}"
+        );
+    }
 
-    let pager = read(&pager_path);
+    let async_pager = read(&async_pager_path);
     for required in [
         "from chatlas import ChatOpenAI",
         "register_mcp_tools_stdio_async",
@@ -161,22 +184,22 @@ fn examples_folder_documents_chatlas_usage() {
         "cleanup_mcp_tools",
     ] {
         assert!(
-            pager.contains(required),
-            "missing {required} in examples/chatlas_pager_mode.py"
+            async_pager.contains(required),
+            "missing {required} in examples/chatlas_async_pager_mode.py"
         );
     }
     assert_contains_wrapped_text(
-        &pager,
+        &async_pager,
         r#""--oversized-output", "pager""#,
-        "examples/chatlas_pager_mode.py",
+        "examples/chatlas_async_pager_mode.py",
     );
     assert_contains_wrapped_text(
-        &pager,
+        &async_pager,
         r#""--interpreter", "python""#,
-        "examples/chatlas_pager_mode.py",
+        "examples/chatlas_async_pager_mode.py",
     );
 
-    let files = read(&files_path);
+    let async_files = read(&async_files_path);
     for required in [
         "from chatlas import ChatOpenAI",
         "register_mcp_tools_stdio_async",
@@ -191,121 +214,23 @@ fn examples_folder_documents_chatlas_usage() {
         "cleanup_mcp_tools",
     ] {
         assert!(
-            files.contains(required),
-            "missing {required} in examples/chatlas_files_mode.py"
+            async_files.contains(required),
+            "missing {required} in examples/chatlas_async_files_mode.py"
         );
     }
     assert_contains_wrapped_text(
-        &files,
+        &async_files,
         r#""--oversized-output", "files""#,
-        "examples/chatlas_files_mode.py",
+        "examples/chatlas_async_files_mode.py",
     );
     assert_contains_wrapped_text(
-        &files,
+        &async_files,
         r#""--interpreter", "python""#,
-        "examples/chatlas_files_mode.py",
+        "examples/chatlas_async_files_mode.py",
     );
     assert!(
-        !files.contains("max_chars"),
+        !async_files.contains("max_chars"),
         "read_text_file should not impose a fixed character limit"
-    );
-
-    let tool = read(&tool_path);
-    assert!(
-        !tool.contains("SyncMcpRepl"),
-        "tool helper should use McpReplTool as the normal sync name"
-    );
-    for required in [
-        "class McpReplTool",
-        "def start",
-        "def __call__",
-        "def read_text_file",
-        "start_line: int = 1",
-        "end_line: Optional[int] = None",
-        "\"tools/call\"",
-        "\"initialize\"",
-        "subprocess.Popen",
-    ] {
-        assert!(
-            tool.contains(required),
-            "missing {required} in examples/mcp_repl_tool.py"
-        );
-    }
-
-    let sync_pager = read(&sync_pager_path);
-    for required in [
-        "from chatlas import ChatOpenAI",
-        "from mcp_repl_tool import McpReplTool",
-        "repl = McpReplTool",
-        "repl.start()",
-        "chat.register_tool(repl)",
-        "chat.chat(",
-        "finally:",
-        "repl.close()",
-    ] {
-        assert!(
-            sync_pager.contains(required),
-            "missing {required} in examples/chatlas_sync_pager_mode.py"
-        );
-    }
-    assert!(
-        !sync_pager.contains("with McpReplTool"),
-        "sync pager example should use explicit start/close lifecycle"
-    );
-    assert!(
-        !sync_pager.contains("SyncMcpRepl"),
-        "sync pager example should use McpReplTool"
-    );
-    assert_contains_wrapped_text(
-        &sync_pager,
-        r#""--oversized-output", "pager""#,
-        "examples/chatlas_sync_pager_mode.py",
-    );
-    assert_contains_wrapped_text(
-        &sync_pager,
-        r#""--interpreter", "python""#,
-        "examples/chatlas_sync_pager_mode.py",
-    );
-
-    let sync_files = read(&sync_files_path);
-    for required in [
-        "from chatlas import ChatOpenAI",
-        "from mcp_repl_tool import McpReplTool",
-        "repl = McpReplTool",
-        "repl.start()",
-        "chat.register_tool(repl)",
-        "chat.register_tool(list_directory)",
-        "chat.register_tool(read_text_file)",
-        "chat.chat(",
-        "finally:",
-        "repl.close()",
-    ] {
-        assert!(
-            sync_files.contains(required),
-            "missing {required} in examples/chatlas_sync_files_mode.py"
-        );
-    }
-    assert!(
-        !sync_files.contains("with McpReplTool"),
-        "sync files example should use explicit start/close lifecycle"
-    );
-    assert!(
-        !sync_files.contains("SyncMcpRepl"),
-        "sync files example should use McpReplTool"
-    );
-    assert_contains_wrapped_text(
-        &sync_files,
-        r#""--oversized-output", "files""#,
-        "examples/chatlas_sync_files_mode.py",
-    );
-    assert_contains_wrapped_text(
-        &sync_files,
-        r#""--interpreter", "python""#,
-        "examples/chatlas_sync_files_mode.py",
-    );
-    assert!(
-        !sync_files.contains("max_chars"),
-        "sync read_text_file should not impose a fixed character limit"
     );
 }
 

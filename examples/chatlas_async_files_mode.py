@@ -1,4 +1,4 @@
-"""Use chatlas with mcp-repl overflow files mode."""
+"""Use async chatlas MCP registration with mcp-repl overflow files mode."""
 
 import asyncio
 from pathlib import Path
