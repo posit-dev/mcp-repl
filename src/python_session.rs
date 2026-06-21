@@ -656,6 +656,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     let mut output = Vec::new();
     let mut prompt_wait_emitted = false;
     let mut owns_consumer = false;
+    let mut detached_request_completed = false;
     while output.len() < size {
         let action = {
             let mut guard = state.inner.lock().unwrap();
@@ -713,9 +714,17 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         };
 
         match action {
-            QueueReadAction::Line { bytes, .. } => {
+            QueueReadAction::Line {
+                bytes,
+                detached_request,
+                ..
+            } => {
                 ipc::emit_input_line("", &String::from_utf8_lossy(&bytes));
                 output.extend(bytes);
+                if detached_request && !detached_request_completed {
+                    detached_request_completed = true;
+                    complete_detached_read_request();
+                }
             }
             QueueReadAction::InputWait { prompt } => {
                 emit_plots();

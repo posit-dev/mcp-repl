@@ -27,6 +27,34 @@ fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+#[cfg(target_family = "unix")]
+fn first_logged_pid(log: &str) -> Option<u32> {
+    log.lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.parse().ok())
+}
+
+#[cfg(target_family = "unix")]
+fn process_is_running(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_family = "unix")]
+fn wait_for_process_exit(pid: u32) -> TestResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("expected process {pid} to exit after session_end respawn").into())
+}
+
 fn wait_for_log_contains(path: &std::path::Path, needle: &str) -> TestResult<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -413,6 +441,67 @@ async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<(
 
     session.cancel().await?;
     Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-park",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "park_after_session_end")?;
+    let old_pid = first_logged_pid(&log).ok_or("expected zod worker pid in control log")?;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "new worker after session_end",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let mut second_text = result_text(&second);
+    if !second_text.contains("v5-output: new worker after session_end\n") {
+        assert!(
+            second_text.contains("session ended") || second_text.contains("session_end"),
+            "expected session_end before respawn, got: {second_text:?}"
+        );
+        let third = session
+            .call_tool_raw(
+                "repl",
+                json!({
+                    "input": "new worker after session_end",
+                    "timeout_ms": 10_000
+                }),
+            )
+            .await?;
+        second_text = result_text(&third);
+    }
+    assert!(
+        second_text.contains("v5-output: new worker after session_end\n"),
+        "expected respawned worker to handle follow-up input, got: {second_text:?}"
+    );
+
+    let exit_result = wait_for_process_exit(old_pid);
+    session.cancel().await?;
+    exit_result
 }
 
 #[tokio::test(flavor = "multi_thread")]

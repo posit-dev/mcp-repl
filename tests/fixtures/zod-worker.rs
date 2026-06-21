@@ -50,6 +50,10 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    append_control_log(
+        control_log_path.as_deref(),
+        &format!("pid {}", std::process::id()),
+    )?;
     let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
 
@@ -227,6 +231,14 @@ fn run_command(
     if command == "session-end-after-input-wait" {
         state.session_end_after_input_wait = true;
         return Ok(false);
+    }
+
+    if command == "session-end-park" {
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "park_after_session_end")?;
+        loop {
+            thread::park();
+        }
     }
 
     if let Some(millis) = command.strip_prefix("bad-output-after-input-wait ") {

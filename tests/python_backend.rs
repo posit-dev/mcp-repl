@@ -1857,6 +1857,83 @@ print("RAW_PARTIAL_RESULT", data.decode("utf-8").strip(), flush=True)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_detached_raw_stdin_read_followup_completes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os, threading, time
+def read_later():
+    time.sleep(0.2)
+    print("DETACHED_RAW_THREAD_WAITING", flush=True)
+    data = os.read(0, 5)
+    print("DETACHED_RAW_THREAD_READ", data.decode("utf-8"), flush=True)
+threading.Thread(target=read_later, daemon=True).start()
+print("DETACHED_RAW_MAIN_DONE", flush=True)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_RAW_MAIN_DONE"),
+        "expected main cell to finish before detached raw stdin read, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_THREAD_WAITING") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_RAW_THREAD_WAITING"),
+        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+    );
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.write_stdin_raw_unterminated_with("alpha", Some(10.0)),
+    )
+    .await;
+    let second = match second {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!("detached raw stdin follow-up did not complete after consuming input");
+        }
+    };
+    let mut text = result_text(&second);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !text.contains("DETACHED_RAW_THREAD_READ alpha") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text) && !text.contains("worker response timed out"),
+        "expected detached raw stdin follow-up turn to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("DETACHED_RAW_THREAD_READ alpha"),
+        "expected detached raw stdin read to consume follow-up bytes, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_partial_raw_stdin_read_clears_leftover_newline_before_next_cell() -> TestResult<()>
 {
     let _guard = lock_test_mutex();

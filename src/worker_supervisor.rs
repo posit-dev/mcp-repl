@@ -311,6 +311,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
@@ -1379,23 +1380,11 @@ impl WorkerProcess {
             match self.child.try_wait()? {
                 Some(status) => self.exit_status = Some(status),
                 None => {
-                    self.detach_output_producers();
                     let _ = thread::Builder::new()
                         .name("worker-session-end-reaper".to_string())
                         .spawn(move || {
-                            if let Ok(status) = self.child.wait() {
-                                self.exit_status = Some(status);
-                            }
-                            #[cfg(target_family = "unix")]
-                            {
-                                self.send_signal_descendants_only(libc::SIGKILL);
-                            }
-                            #[cfg(target_family = "windows")]
-                            {
-                                self.child.close_job();
-                            }
-                            self.cleanup_session_tmpdir();
-                            self.report_denials();
+                            let _ =
+                                self.shutdown_graceful(WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT);
                         });
                     return Ok(());
                 }
