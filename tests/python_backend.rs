@@ -1294,6 +1294,68 @@ async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_with_non_daemon_thread_respawns_without_waiting() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let temp = tempdir()?;
+    let marker = temp.path().join("non-daemon-thread-finished.txt");
+    let marker_literal = serde_json::to_string(
+        marker
+            .to_str()
+            .ok_or("thread marker path must be valid utf-8")?,
+    )?;
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let start = Instant::now();
+    let exit = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import pathlib, sys, threading, time
+def hold_session_open():
+    time.sleep(3.0)
+    pathlib.Path({marker_literal}).write_text("done")
+
+threading.Thread(target=hold_session_open).start()
+sys.exit()
+"#
+            ),
+            Some(0.5),
+        )
+        .await?;
+    let exit_text = result_text(&exit);
+    assert!(
+        !exit_text.contains("Traceback") && !exit_text.contains("SystemExit"),
+        "expected sys.exit() to terminate without traceback, got: {exit_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_NON_DAEMON_EXIT')", Some(5.0))
+        .await?;
+    let elapsed = start.elapsed();
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&follow_up_text),
+        "expected follow-up after sys.exit() to run without waiting for the thread, got: {follow_up_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "expected respawn before non-daemon thread shutdown, got {elapsed:?}: {follow_up_text:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "expected follow-up before non-daemon thread marker was written"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_NON_DAEMON_EXIT"),
+        "expected Python session to respawn after sys.exit(), got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_sys_exit_runs_atexit_handlers() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
