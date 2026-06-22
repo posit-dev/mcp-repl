@@ -314,7 +314,6 @@ fn run_cell_loop() -> Result<(), String> {
             flush_original_stdio();
             return Ok(());
         };
-        mark_cell_running(true);
         {
             let _gil = GilGuard::acquire();
             clear_python_stdin_buffers(api)?;
@@ -381,6 +380,7 @@ fn wait_for_next_cell() -> Option<CellInput> {
         if !guard.input_queue.has_active_read_consumer()
             && let Some(source) = guard.input_queue.take_cell_payload()
         {
+            guard.cell_running = true;
             return Some(CellInput { source });
         }
         guard = state.cvar.wait(guard).unwrap();
