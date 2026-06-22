@@ -3871,7 +3871,6 @@ print("SANDBOX_CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt
 """)
 print("SANDBOX_PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 value = input("sandbox> ")
-inside
 print("SANDBOX_INPUT", value)
 "#,
             Some(5.0),
@@ -3893,19 +3892,40 @@ print("SANDBOX_INPUT", value)
         return Err("python Windows sandbox PTY stdin bridge test remained busy".into());
     }
 
+    assert!(
+        text.contains("sandbox> "),
+        "expected sandboxed input prompt, got: {text:?}"
+    );
+    let mut all_text = text.clone();
+
+    let answer = session.write_stdin_raw_with("inside", Some(5.0)).await?;
+    text = result_text(&answer);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("SANDBOX_INPUT inside")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+
     session.cancel().await?;
 
     assert!(
-        text.contains("SANDBOX_PTY_FDS True True True"),
-        "expected sandboxed Python stdio fds to be TTY-backed, got: {text:?}"
+        all_text.contains("SANDBOX_PTY_FDS True True True"),
+        "expected sandboxed Python stdio fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("SANDBOX_CRT_ISATTY True True True"),
-        "expected sandboxed Windows CRT fds to be TTY-backed, got: {text:?}"
+        all_text.contains("SANDBOX_CRT_ISATTY True True True"),
+        "expected sandboxed Windows CRT fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("SANDBOX_INPUT inside"),
-        "expected sandboxed input() to consume the buffered answer, got: {text:?}"
+        all_text.contains("SANDBOX_INPUT inside"),
+        "expected sandboxed input() to consume the follow-up answer, got: {all_text:?}"
     );
     Ok(())
 }

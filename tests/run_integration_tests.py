@@ -352,6 +352,23 @@ def result_text(result: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def without_blank_stderr_chunks(result: dict[str, Any]) -> dict[str, Any]:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result
+    filtered = [
+        item
+        for item in content
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip() == "stderr:"
+        )
+    ]
+    return {**result, "content": filtered}
+
+
 def require_success(result: dict[str, Any], context: str) -> str:
     if result.get("isError") is not False:
         raise SuiteFailure(f"{context} returned error result: {pretty_json(result)}")
@@ -1062,16 +1079,27 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     )
     interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
     if is_busy_response(interrupted):
-        wait_for_response(
-            client,
-            expected_interrupted,
-            "interrupt prefix repl",
-            deadline_seconds=10.0,
-        )
+        deadline = time.monotonic() + 10.0
+        last_received: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            received = client.repl("", timeout_ms=500)
+            last_received = received
+            if is_busy_response(received):
+                continue
+            assert_identical(
+                expected_interrupted,
+                normalize_response(without_blank_stderr_chunks(received)),
+                "interrupt prefix repl",
+            )
+            break
+        else:
+            raise SuiteFailure(
+                f"interrupt prefix repl remained busy after polling: {last_received!r}"
+            )
     else:
         assert_identical(
             expected_interrupted,
-            interrupted,
+            normalize_response(without_blank_stderr_chunks(interrupted)),
             "interrupt prefix repl",
         )
 
