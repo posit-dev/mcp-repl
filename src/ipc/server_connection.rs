@@ -405,11 +405,6 @@ impl ServerIpcConnection {
         guard.input_state.note_interrupt_sent();
     }
 
-    pub fn input_ready_for_input(&self) -> bool {
-        let guard = self.inbox.lock().unwrap();
-        guard.input_state.ready_for_input()
-    }
-
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()
@@ -549,6 +544,7 @@ impl ServerIpcConnection {
         self.wait_for_input_readiness_after(timeout, None)
     }
 
+    #[cfg(test)]
     pub fn wait_for_fresh_input_readiness(
         &self,
         timeout: Duration,

@@ -874,6 +874,10 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         Some(true),
         "input-wait Ctrl-C must remain a non-error control reply, got: {interrupted_text:?}"
     );
+    assert!(
+        !interrupted_text.contains("<<repl status: busy"),
+        "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
+    );
 
     let log = read_optional(&control_log);
     assert!(

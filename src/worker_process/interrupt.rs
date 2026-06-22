@@ -66,10 +66,8 @@ impl WorkerManager {
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
-        let interrupt_started_at = std::time::Instant::now();
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        let wait_for_fresh_readiness = self.interrupt_requires_fresh_readiness();
         self.interrupt_worker_if_running()?;
         let mode = self.resolve_interrupt_mode(mode);
 
@@ -82,10 +80,7 @@ impl WorkerManager {
             );
         }
 
-        let prompt_wait = self.wait_for_interrupt_prompt(
-            timeout,
-            wait_for_fresh_readiness.then_some(interrupt_started_at),
-        )?;
+        let prompt_wait = self.wait_for_interrupt_prompt(timeout)?;
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
@@ -157,13 +152,6 @@ impl WorkerManager {
         Ok(())
     }
 
-    fn interrupt_requires_fresh_readiness(&self) -> bool {
-        self.process
-            .as_ref()
-            .and_then(|process| process.ipc_connection())
-            .is_some_and(|ipc| ipc.input_ready_for_input())
-    }
-
     fn drain_existing_completion_after_interrupt(
         &mut self,
         mode: ResolvedInterruptMode,
@@ -203,7 +191,6 @@ impl WorkerManager {
     fn wait_for_interrupt_prompt(
         &mut self,
         timeout: Duration,
-        fresh_readiness_since: Option<std::time::Instant>,
     ) -> Result<InterruptPromptWait, WorkerError> {
         let mut timed_out = false;
         let mut prompt: Option<String> = None;
@@ -213,11 +200,7 @@ impl WorkerManager {
             if timeout.is_zero() {
                 timed_out = true;
             } else {
-                let readiness = match fresh_readiness_since {
-                    Some(since) => ipc.wait_for_fresh_input_readiness(timeout, since),
-                    None => ipc.wait_for_input_readiness(timeout),
-                };
-                match readiness {
+                match ipc.wait_for_input_readiness(timeout) {
                     Ok(IpcInputReadiness::InputWait(value)) => {
                         prompt = Some(value);
                     }
