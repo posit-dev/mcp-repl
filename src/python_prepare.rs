@@ -12,6 +12,24 @@ use crate::python_runtime::{
 const DEFAULT_PACKAGES: &[&str] = &["numpy"];
 const UV_PROGRAM: &str = "uv";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PythonRequirementsManifest {
+    pub(crate) packages: Vec<String>,
+    pub(crate) python_version: Option<String>,
+}
+
+impl Default for PythonRequirementsManifest {
+    fn default() -> Self {
+        Self {
+            packages: DEFAULT_PACKAGES
+                .iter()
+                .map(|package| package.to_string())
+                .collect(),
+            python_version: None,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReplPrepareArgs {
@@ -28,6 +46,26 @@ pub(crate) struct PrepareRequirements {
     packages: Option<Vec<String>>,
     #[serde(default)]
     python_version: Option<String>,
+    #[serde(default)]
+    action: Option<PrepareRequirementsAction>,
+    #[serde(default)]
+    restart: Option<PrepareRestartPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrepareRequirementsAction {
+    Add,
+    Remove,
+    Set,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrepareRestartPolicy {
+    IfNeeded,
+    Yes,
+    No,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -45,11 +83,15 @@ pub(crate) struct PythonPrepareTarget {
 }
 
 pub(crate) enum ValidatedPrepareRequest {
-    Requirements {
-        packages: Vec<String>,
-        python_version: Option<String>,
-    },
+    Requirements(PrepareRequirementsOperation),
     PythonExecutable(PathBuf),
+}
+
+pub(crate) struct PrepareRequirementsOperation {
+    packages: Option<Vec<String>>,
+    python_version: Option<String>,
+    pub(crate) action: PrepareRequirementsAction,
+    pub(crate) restart: PrepareRestartPolicy,
 }
 
 pub(crate) fn uv_available() -> bool {
@@ -63,13 +105,14 @@ pub(crate) fn validate_prepare_args(
         (Some(_), Some(_)) => {
             Err("repl_prepare accepts either `requirements` or `python`, not both".to_string())
         }
-        (None, None) => Ok(ValidatedPrepareRequest::Requirements {
-            packages: DEFAULT_PACKAGES
-                .iter()
-                .map(|package| package.to_string())
-                .collect(),
-            python_version: None,
-        }),
+        (None, None) => Ok(ValidatedPrepareRequest::Requirements(
+            PrepareRequirementsOperation {
+                packages: None,
+                python_version: None,
+                action: PrepareRequirementsAction::Add,
+                restart: PrepareRestartPolicy::IfNeeded,
+            },
+        )),
         (Some(requirements), None) => validate_requirements(requirements),
         (None, Some(python)) => validate_python(python),
     }
@@ -79,10 +122,11 @@ pub(crate) fn resolve_prepare_target(
     request: &ValidatedPrepareRequest,
 ) -> Result<PythonPrepareTarget, String> {
     let config = match request {
-        ValidatedPrepareRequest::Requirements {
-            packages,
-            python_version,
-        } => resolve_requirements(packages, python_version.as_deref())?,
+        ValidatedPrepareRequest::Requirements(_) => {
+            return Err(
+                "requirements requests must be applied to the current manifest".to_string(),
+            );
+        }
         ValidatedPrepareRequest::PythonExecutable(executable) => {
             query_python_runtime_config(executable)?
         }
@@ -91,6 +135,68 @@ pub(crate) fn resolve_prepare_target(
         executable: config.executable,
         module_search_paths: config.module_search_paths,
     })
+}
+
+pub(crate) fn apply_requirements_operation(
+    manifest: &PythonRequirementsManifest,
+    operation: &PrepareRequirementsOperation,
+) -> PythonRequirementsManifest {
+    let mut manifest = manifest.clone();
+    match operation.action {
+        PrepareRequirementsAction::Add => {
+            if let Some(packages) = operation.packages.as_ref() {
+                for package in packages {
+                    if !manifest.packages.iter().any(|existing| existing == package) {
+                        manifest.packages.push(package.clone());
+                    }
+                }
+            }
+            if let Some(python_version) = operation.python_version.as_ref() {
+                manifest.python_version =
+                    add_python_version_constraint(manifest.python_version, python_version);
+            }
+        }
+        PrepareRequirementsAction::Remove => {
+            if let Some(packages) = operation.packages.as_ref() {
+                manifest
+                    .packages
+                    .retain(|package| !packages.iter().any(|remove| remove == package));
+            }
+            if operation.python_version == manifest.python_version {
+                manifest.python_version = None;
+            }
+        }
+        PrepareRequirementsAction::Set => {
+            manifest.packages = operation.packages.clone().unwrap_or_default();
+            manifest.python_version = operation.python_version.clone();
+        }
+    }
+    manifest
+}
+
+fn add_python_version_constraint(current: Option<String>, requested: &str) -> Option<String> {
+    match current {
+        None => Some(requested.to_string()),
+        Some(current) if current == requested => Some(current),
+        Some(current) => Some(format!("{current},{requested}")),
+    }
+}
+
+pub(crate) fn resolve_requirements_manifest(
+    manifest: &PythonRequirementsManifest,
+) -> Result<PythonPrepareTarget, String> {
+    let config = resolve_requirements(&manifest.packages, manifest.python_version.as_deref())?;
+    Ok(PythonPrepareTarget {
+        executable: config.executable,
+        module_search_paths: config.module_search_paths,
+    })
+}
+
+pub(crate) fn format_requirements_manifest(manifest: &PythonRequirementsManifest) -> String {
+    let packages = serde_json::to_string(&manifest.packages).unwrap_or_else(|_| "[]".to_string());
+    let python_version =
+        serde_json::to_string(&manifest.python_version).unwrap_or_else(|_| "null".to_string());
+    format!("managed requirements manifest: packages={packages}, python_version={python_version}")
 }
 
 fn resolve_requirements(
@@ -139,10 +245,11 @@ fn strip_private_prefix(path: &Path) -> PathBuf {
 fn validate_requirements(
     requirements: PrepareRequirements,
 ) -> Result<ValidatedPrepareRequest, String> {
-    let packages = requirements.packages.unwrap_or_default();
-    for package in &packages {
-        if package.trim().is_empty() {
-            return Err("requirements.packages must not contain empty strings".to_string());
+    if let Some(packages) = requirements.packages.as_ref() {
+        for package in packages {
+            if package.trim().is_empty() {
+                return Err("requirements.packages must not contain empty strings".to_string());
+            }
         }
     }
 
@@ -152,10 +259,18 @@ fn validate_requirements(
         return Err("requirements.python_version must not be empty".to_string());
     }
 
-    Ok(ValidatedPrepareRequest::Requirements {
-        packages,
-        python_version: requirements.python_version,
-    })
+    Ok(ValidatedPrepareRequest::Requirements(
+        PrepareRequirementsOperation {
+            packages: requirements.packages,
+            python_version: requirements.python_version,
+            action: requirements
+                .action
+                .unwrap_or(PrepareRequirementsAction::Add),
+            restart: requirements
+                .restart
+                .unwrap_or(PrepareRestartPolicy::IfNeeded),
+        },
+    ))
 }
 
 fn validate_python(python: PreparePython) -> Result<ValidatedPrepareRequest, String> {

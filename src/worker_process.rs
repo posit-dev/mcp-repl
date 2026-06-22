@@ -139,6 +139,7 @@ pub struct WorkerManager {
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
     pending_request_input: Option<String>,
+    user_state_may_exist: bool,
     session_end_seen: bool,
     settled_pending_completion: Option<CompletionInfo>,
     settled_pending_error: Option<WorkerError>,
@@ -227,6 +228,7 @@ impl WorkerManager {
             pending_request: false,
             pending_request_started_at: None,
             pending_request_input: None,
+            user_state_may_exist: false,
             session_end_seen: false,
             settled_pending_completion: None,
             settled_pending_error: None,
@@ -289,6 +291,10 @@ impl WorkerManager {
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
     pub fn pending_request(&self) -> bool {
         self.pending_request
+    }
+
+    pub fn user_state_may_exist(&self) -> bool {
+        self.user_state_may_exist
     }
 
     pub fn python_executable_matches(&self, target: &std::path::Path) -> bool {

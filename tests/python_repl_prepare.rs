@@ -104,12 +104,14 @@ fn write_fake_uv(bin_dir: &Path) -> TestResult<PathBuf> {
             &uv,
             r#"@echo off
 set venv=%MCP_REPL_TEST_STDLIB_VENV%
+set wants_numpy=
+set wants_plotnine=
 :loop
 if "%~1"=="" goto run
 if "%~1"=="--with" (
   shift
-  if "%~1"=="numpy" set venv=%MCP_REPL_TEST_NUMPY_VENV%
-  if "%~1"=="plotnine" set venv=%MCP_REPL_TEST_PLOTNINE_VENV%
+  if "%~1"=="numpy" set wants_numpy=1
+  if "%~1"=="plotnine" set wants_plotnine=1
   shift
   goto loop
 )
@@ -120,6 +122,9 @@ if "%~1"=="--" (
 shift
 goto loop
 :run
+if defined wants_numpy set venv=%MCP_REPL_TEST_NUMPY_VENV%
+if defined wants_plotnine set venv=%MCP_REPL_TEST_PLOTNINE_VENV%
+if defined wants_numpy if defined wants_plotnine set venv=%MCP_REPL_TEST_NUMPY_PLOTNINE_VENV%
 if "%~1"=="python" shift
 call "%venv%\Scripts\python.exe" %*
 "#,
@@ -133,13 +138,15 @@ if [ -n "${MCP_REPL_TEST_UV_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$MCP_REPL_TEST_UV_LOG"
 fi
 venv="$MCP_REPL_TEST_STDLIB_VENV"
+wants_numpy=
+wants_plotnine=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --with)
       shift
       case "${1:-}" in
-        numpy) venv="$MCP_REPL_TEST_NUMPY_VENV" ;;
-        plotnine) venv="$MCP_REPL_TEST_PLOTNINE_VENV" ;;
+        numpy) wants_numpy=1 ;;
+        plotnine) wants_plotnine=1 ;;
       esac
       ;;
     --)
@@ -149,6 +156,15 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+if [ -n "$wants_numpy" ]; then
+  venv="$MCP_REPL_TEST_NUMPY_VENV"
+fi
+if [ -n "$wants_plotnine" ]; then
+  venv="$MCP_REPL_TEST_PLOTNINE_VENV"
+fi
+if [ -n "$wants_numpy" ] && [ -n "$wants_plotnine" ]; then
+  venv="$MCP_REPL_TEST_NUMPY_PLOTNINE_VENV"
+fi
 if [ -n "${MCP_REPL_TEST_UV_LOG:-}" ]; then
   printf 'venv=%s\n' "$venv" >> "$MCP_REPL_TEST_UV_LOG"
 fi
@@ -170,6 +186,7 @@ struct FakeUv {
     stdlib_venv: PathBuf,
     numpy_venv: PathBuf,
     plotnine_venv: PathBuf,
+    numpy_plotnine_venv: PathBuf,
     log_path: PathBuf,
 }
 
@@ -180,6 +197,7 @@ impl FakeUv {
         let stdlib_venv = create_venv(root, "stdlib", &[])?;
         let numpy_venv = create_venv(root, "numpy", &["numpy"])?;
         let plotnine_venv = create_venv(root, "plotnine", &["plotnine"])?;
+        let numpy_plotnine_venv = create_venv(root, "numpy-plotnine", &["numpy", "plotnine"])?;
         let bin_dir = root.join("bin");
         let log_path = root.join("uv.log");
         write_fake_uv(&bin_dir)?;
@@ -189,6 +207,7 @@ impl FakeUv {
             stdlib_venv,
             numpy_venv,
             plotnine_venv,
+            numpy_plotnine_venv,
             log_path,
         })
     }
@@ -220,6 +239,10 @@ impl FakeUv {
             (
                 "MCP_REPL_TEST_PLOTNINE_VENV".to_string(),
                 self.plotnine_venv.to_string_lossy().to_string(),
+            ),
+            (
+                "MCP_REPL_TEST_NUMPY_PLOTNINE_VENV".to_string(),
+                self.numpy_plotnine_venv.to_string_lossy().to_string(),
             ),
             (
                 "MCP_REPL_TEST_UV_LOG".to_string(),
@@ -263,6 +286,14 @@ async fn call_prepare(
     session.call_tool_raw("repl_prepare", arguments).await
 }
 
+fn assert_manifest_packages(text: &str, packages: &[&str]) {
+    let expected = format!("packages={}", serde_json::to_string(packages).unwrap());
+    assert!(
+        text.contains(&expected),
+        "expected manifest {expected}, got: {text:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_tool_listing_is_gated_by_uv() -> TestResult<()> {
     let fake_uv = FakeUv::new()?;
@@ -297,6 +328,36 @@ async fn r_tool_listing_keeps_repl_reset() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_schema_exposes_manifest_action_and_restart_enums() -> TestResult<()> {
+    let fake_uv = FakeUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let tools = session.list_tools().await?;
+    session.cancel().await?;
+
+    let prepare = tools
+        .iter()
+        .find(|tool| tool.name == "repl_prepare")
+        .ok_or("missing repl_prepare tool")?;
+    let schema = serde_json::to_string(&prepare.input_schema)?;
+    for expected in [
+        "\"action\"",
+        "\"add\"",
+        "\"remove\"",
+        "\"set\"",
+        "\"restart\"",
+        "\"if_needed\"",
+        "\"yes\"",
+        "\"no\"",
+    ] {
+        assert!(
+            schema.contains(expected),
+            "expected schema to contain {expected}, got: {schema}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
     let fake_uv = FakeUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
@@ -308,7 +369,7 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
             &session,
             json!({
                 "requirements": {},
-                "python": { "executable": absolute }
+                "python": { "executable": absolute.clone() }
             }),
         )
         .await,
@@ -318,7 +379,7 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
             &session,
             json!({
                 "python": {
-                    "executable": absolute,
+                    "executable": absolute.clone(),
                     "venv": fake_uv.stdlib_venv.to_string_lossy()
                 }
             }),
@@ -330,6 +391,20 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
     );
     assert_call_error(call_prepare(&session, json!({ "python": { "venv": ".venv" } })).await);
     assert_call_error(call_prepare(&session, json!({ "timeout_ms": 1000 })).await);
+    assert_call_error(call_prepare(&session, json!({ "restart": "no" })).await);
+    assert_call_error(
+        call_prepare(&session, json!({ "requirements": { "action": "replace" } })).await,
+    );
+    assert_call_error(
+        call_prepare(&session, json!({ "requirements": { "restart": "maybe" } })).await,
+    );
+    assert_call_error(
+        call_prepare(
+            &session,
+            json!({ "python": { "executable": absolute, "restart": "no" } }),
+        )
+        .await,
+    );
 
     session.cancel().await?;
     Ok(())
@@ -346,9 +421,10 @@ async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
     let executable_text = common::result_text(&executable_result);
     assert!(
         executable_text.contains("session unchanged")
-            || executable_text.contains("session replaced"),
+            || executable_text.contains("session restarted"),
         "expected prepare status, got: {executable_text:?}"
     );
+    assert_manifest_packages(&executable_text, &["numpy"]);
 
     let venv_result = call_prepare(
         &session,
@@ -357,9 +433,10 @@ async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
     .await?;
     let venv_text = common::result_text(&venv_result);
     assert!(
-        venv_text.contains("session unchanged") || venv_text.contains("session replaced"),
+        venv_text.contains("session unchanged") || venv_text.contains("session restarted"),
         "expected prepare status, got: {venv_text:?}"
     );
+    assert_manifest_packages(&venv_text, &["numpy"]);
 
     session.cancel().await?;
     Ok(())
@@ -376,7 +453,8 @@ async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
             json!({
                 "requirements": {
                     "packages": [],
-                    "python_version": python_version
+                    "python_version": python_version,
+                    "action": "set"
                 }
             }),
         )
@@ -400,7 +478,7 @@ async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_prepare_requirements_control_ephemeral_packages() -> TestResult<()> {
+async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestResult<()> {
     let fake_uv = FakeUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
         fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
@@ -410,9 +488,10 @@ async fn repl_prepare_requirements_control_ephemeral_packages() -> TestResult<()
     let default_result = call_prepare(&session, json!({})).await?;
     let default_text = common::result_text(&default_result);
     assert!(
-        default_text.contains("session unchanged") || default_text.contains("session replaced"),
+        default_text.contains("session unchanged") || default_text.contains("session restarted"),
         "expected prepare status, got: {default_text:?}"
     );
+    assert_manifest_packages(&default_text, &["numpy"]);
     let numpy = session
         .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
         .await?;
@@ -422,48 +501,82 @@ async fn repl_prepare_requirements_control_ephemeral_packages() -> TestResult<()
         "default prepare should make numpy available, got: {numpy_text:?}"
     );
 
-    let stdlib_result = call_prepare(&session, json!({ "requirements": {} })).await?;
-    let stdlib_text = common::result_text(&stdlib_result);
+    let noop_result = call_prepare(&session, json!({ "requirements": {} })).await?;
+    let noop_text = common::result_text(&noop_result);
     assert!(
-        stdlib_text.contains("session replaced") || stdlib_text.contains("session unchanged"),
-        "expected prepare status, got: {stdlib_text:?}"
+        noop_text.contains("session restarted") || noop_text.contains("session unchanged"),
+        "expected prepare status, got: {noop_text:?}"
     );
-    let stdlib_probe = session
+    assert_manifest_packages(&noop_text, &["numpy"]);
+    let noop_probe = session
+        .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
+        .await?;
+    let noop_probe_text = common::result_text(&noop_probe);
+    assert!(
+        noop_probe_text.contains("NUMPY:numpy"),
+        "requirements no-op should keep numpy, got: {noop_probe_text:?}"
+    );
+
+    let add_result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": ["plotnine"] } }),
+    )
+    .await?;
+    let add_text = common::result_text(&add_result);
+    assert!(
+        add_text.contains("session restarted") || add_text.contains("session unchanged"),
+        "expected prepare status, got: {add_text:?}"
+    );
+    assert_manifest_packages(&add_text, &["numpy", "plotnine"]);
+    let add_probe = session
+        .write_stdin_raw_with(
+            "import numpy, plotnine; print('NUMPY:' + numpy.MARKER); print('PLOTNINE:' + plotnine.MARKER)",
+            Some(5.0),
+        )
+        .await?;
+    let add_probe_text = common::result_text(&add_probe);
+    assert!(
+        add_probe_text.contains("NUMPY:numpy") && add_probe_text.contains("PLOTNINE:plotnine"),
+        "add should make both manifest packages available, got: {add_probe_text:?}"
+    );
+
+    let remove_result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": ["plotnine"], "action": "remove" } }),
+    )
+    .await?;
+    let remove_text = common::result_text(&remove_result);
+    assert_manifest_packages(&remove_text, &["numpy"]);
+    let remove_probe = session
+        .write_stdin_raw_with(
+            "import importlib.util, numpy; print('NUMPY:' + numpy.MARKER); print('PLOTNINE_SPEC:' + str(importlib.util.find_spec('plotnine') is not None))",
+            Some(5.0),
+        )
+        .await?;
+    let remove_probe_text = common::result_text(&remove_probe);
+    assert!(
+        remove_probe_text.contains("NUMPY:numpy")
+            && remove_probe_text.contains("PLOTNINE_SPEC:False"),
+        "remove should keep only numpy, got: {remove_probe_text:?}"
+    );
+
+    let set_result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": [], "action": "set", "restart": "yes" } }),
+    )
+    .await?;
+    let set_text = common::result_text(&set_result);
+    assert_manifest_packages(&set_text, &[]);
+    let set_probe = session
         .write_stdin_raw_with(
             "import importlib.util; print('NUMPY_SPEC:' + str(importlib.util.find_spec('numpy') is not None))",
             Some(5.0),
         )
         .await?;
-    let stdlib_probe_text = common::result_text(&stdlib_probe);
+    let set_probe_text = common::result_text(&set_probe);
     assert!(
-        stdlib_probe_text.contains("NUMPY_SPEC:False"),
-        "stdlib-only prepare should not add numpy, got: {stdlib_probe_text:?}"
-    );
-
-    let exact_result = call_prepare(
-        &session,
-        json!({ "requirements": { "packages": ["plotnine"] } }),
-    )
-    .await?;
-    let exact_text = common::result_text(&exact_result);
-    assert!(
-        exact_text.contains("session replaced") || exact_text.contains("session unchanged"),
-        "expected prepare status, got: {exact_text:?}"
-    );
-    let exact_probe = session
-        .write_stdin_raw_with(
-            "import importlib.util, plotnine; print('PLOTNINE:' + plotnine.MARKER); print('NUMPY_SPEC:' + str(importlib.util.find_spec('numpy') is not None))",
-            Some(5.0),
-        )
-        .await?;
-    let exact_probe_text = common::result_text(&exact_probe);
-    assert!(
-        exact_probe_text.contains("PLOTNINE:plotnine"),
-        "explicit package prepare should make plotnine available, got: {exact_probe_text:?}"
-    );
-    assert!(
-        exact_probe_text.contains("NUMPY_SPEC:False"),
-        "explicit package prepare should not add numpy defaults, got: {exact_probe_text:?}"
+        set_probe_text.contains("NUMPY_SPEC:False"),
+        "set empty should produce stdlib-only environment, got: {set_probe_text:?}"
     );
 
     session.cancel().await?;
@@ -471,8 +584,7 @@ async fn repl_prepare_requirements_control_ephemeral_packages() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_prepare_preserves_current_python_when_default_requirements_available()
--> TestResult<()> {
+async fn repl_prepare_preserves_current_python_when_manifest_available() -> TestResult<()> {
     let fake_uv = FakeUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
         fake_uv.env_vars_with_python(venv_python(&fake_uv.numpy_venv))?,
@@ -494,6 +606,7 @@ async fn repl_prepare_preserves_current_python_when_default_requirements_availab
         text.contains("session unchanged"),
         "expected default requirements to preserve current Python, got: {text:?}"
     );
+    assert_manifest_packages(&text, &["numpy"]);
 
     let probe = session
         .write_stdin_raw_with(
@@ -512,9 +625,159 @@ async fn repl_prepare_preserves_current_python_when_default_requirements_availab
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestResult<()> {
+    let fake_uv = FakeUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+    )
+    .await?;
+
+    let initial = call_prepare(&session, json!({ "requirements": { "restart": "no" } })).await?;
+    let initial_text = common::result_text(&initial);
+    assert_manifest_packages(&initial_text, &["numpy"]);
+
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'kept'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected initial assignment to complete, got: {seed_text:?}"
+    );
+
+    let result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": ["plotnine"], "restart": "no" } }),
+    )
+    .await?;
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected restart=no to fail unchanged when restart is required"
+    );
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session unchanged") && text.contains("no user state discarded"),
+        "expected unchanged no-discard status, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &["numpy"]);
+
+    let probe = session
+        .write_stdin_raw_with(
+            "import importlib.util, numpy; print('MARKER:' + _prepare_marker); print('NUMPY:' + numpy.MARKER); print('PLOTNINE_SPEC:' + str(importlib.util.find_spec('plotnine') is not None))",
+            Some(5.0),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("MARKER:kept")
+            && probe_text.contains("NUMPY:numpy")
+            && probe_text.contains("PLOTNINE_SPEC:False"),
+        "restart=no should preserve old session and manifest, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() -> TestResult<()> {
+    let fake_uv = FakeUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+    )
+    .await?;
+
+    call_prepare(&session, json!({})).await?;
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'discarded'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected initial assignment to complete, got: {seed_text:?}"
+    );
+
+    let result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": ["plotnine"] } }),
+    )
+    .await?;
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session restarted") && text.contains("user state discarded"),
+        "expected restart status, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &["numpy", "plotnine"]);
+
+    let probe = session
+        .write_stdin_raw_with(
+            "import numpy, plotnine; print('NUMPY:' + numpy.MARKER); print('PLOTNINE:' + plotnine.MARKER); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
+            Some(5.0),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("NUMPY:numpy")
+            && probe_text.contains("PLOTNINE:plotnine")
+            && probe_text.contains("MARKER_EXISTS:False"),
+        "default restart policy should commit manifest in fresh session, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> TestResult<()> {
+    let fake_uv = FakeUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        fake_uv.env_vars_with_python(venv_python(&fake_uv.numpy_venv))?,
+    )
+    .await?;
+
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'discarded'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected initial assignment to complete, got: {seed_text:?}"
+    );
+
+    let result = call_prepare(&session, json!({ "requirements": { "restart": "yes" } })).await?;
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session restarted") && text.contains("user state discarded"),
+        "expected forced restart status, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &["numpy"]);
+
+    let probe = session
+        .write_stdin_raw_with(
+            "import numpy; print('NUMPY:' + numpy.MARKER); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
+            Some(5.0),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("NUMPY:numpy") && probe_text.contains("MARKER_EXISTS:False"),
+        "forced restart should discard previous state, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() -> TestResult<()> {
     let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+    )
+    .await?;
+
+    call_prepare(&session, json!({})).await?;
 
     let first = session
         .write_stdin_raw_with(
@@ -528,16 +791,21 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
         "expected timed-out active work, got: {first_text:?}"
     );
 
-    let result = call_prepare(&session, json!({ "requirements": {} })).await?;
+    let result = call_prepare(
+        &session,
+        json!({ "requirements": { "packages": ["plotnine"] } }),
+    )
+    .await?;
     let text = common::result_text(&result);
     assert!(
-        text.contains("session replaced"),
+        text.contains("session restarted"),
         "expected replacement status, got: {text:?}"
     );
     assert!(
         text.contains("pending work discarded"),
         "expected discarded-work status, got: {text:?}"
     );
+    assert_manifest_packages(&text, &["numpy", "plotnine"]);
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_PREPARE_REPLACE')", Some(5.0))
@@ -546,6 +814,49 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
     assert!(
         follow_up_text.contains("AFTER_PREPARE_REPLACE"),
         "expected fresh session after prepare, got: {follow_up_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> TestResult<()> {
+    let fake_uv = FakeUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+    )
+    .await?;
+
+    let explicit = call_prepare(
+        &session,
+        json!({ "python": { "venv": fake_uv.stdlib_venv.to_string_lossy() } }),
+    )
+    .await?;
+    let explicit_text = common::result_text(&explicit);
+    assert_manifest_packages(&explicit_text, &["numpy"]);
+    let explicit_probe = session
+        .write_stdin_raw_with(
+            "import importlib.util; print('NUMPY_SPEC:' + str(importlib.util.find_spec('numpy') is not None))",
+            Some(5.0),
+        )
+        .await?;
+    let explicit_probe_text = common::result_text(&explicit_probe);
+    assert!(
+        explicit_probe_text.contains("NUMPY_SPEC:False"),
+        "explicit stdlib venv should be used as-is, got: {explicit_probe_text:?}"
+    );
+
+    let managed = call_prepare(&session, json!({})).await?;
+    let managed_text = common::result_text(&managed);
+    assert_manifest_packages(&managed_text, &["numpy"]);
+    let managed_probe = session
+        .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
+        .await?;
+    let managed_probe_text = common::result_text(&managed_probe);
+    assert!(
+        managed_probe_text.contains("NUMPY:numpy"),
+        "managed manifest should survive explicit Python selection, got: {managed_probe_text:?}"
     );
 
     session.cancel().await?;
@@ -573,8 +884,9 @@ async fn repl_prepare_preserves_matching_executable_session() -> TestResult<()> 
         text.contains("session unchanged"),
         "expected unchanged status, got: {text:?}"
     );
+    assert_manifest_packages(&text, &["numpy"]);
     assert!(
-        text.contains("no pending work discarded"),
+        text.contains("no user state discarded"),
         "expected no-discard status, got: {text:?}"
     );
 

@@ -534,6 +534,7 @@ mod tests {
             PythonRuntimeProbe {
                 executable: executable.to_string(),
                 base_executable: executable.to_string(),
+                path: Vec::new(),
                 prefix: String::new(),
                 base_prefix: String::new(),
                 exec_prefix: String::new(),

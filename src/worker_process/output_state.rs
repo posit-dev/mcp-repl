@@ -313,6 +313,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
+        self.user_state_may_exist = false;
         self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {

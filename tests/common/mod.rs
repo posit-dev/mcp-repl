@@ -696,6 +696,11 @@ impl McpTestSession {
             .collect())
     }
 
+    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
+        let tools = self.service.peer().list_tools(None).await?;
+        Ok(tools.tools.into_iter().collect())
+    }
+
     #[allow(dead_code)]
     pub async fn write_stdin(&mut self, input: impl Into<String>) {
         self.write_stdin_with(input, None).await;

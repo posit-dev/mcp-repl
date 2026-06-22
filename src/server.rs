@@ -69,6 +69,7 @@ struct ServerState {
     worker: WorkerManager,
     response: ResponseState,
     oversized_output: OversizedOutputMode,
+    python_requirements_manifest: crate::python_prepare::PythonRequirementsManifest,
 }
 
 impl SharedServer {
@@ -88,6 +89,8 @@ impl SharedServer {
                 )?,
                 response: ResponseState::new()?,
                 oversized_output,
+                python_requirements_manifest:
+                    crate::python_prepare::PythonRequirementsManifest::default(),
             })),
         })
     }
@@ -480,48 +483,172 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let request = crate::python_prepare::validate_prepare_args(args)
             .map_err(|message| McpError::invalid_params(message, None))?;
-        let target = match crate::python_prepare::resolve_prepare_target(&request) {
-            Ok(target) => target,
-            Err(err) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "repl_prepare failed: {err}"
-                ))]));
+        self.run_state(move |state| match request {
+            crate::python_prepare::ValidatedPrepareRequest::Requirements(operation) => {
+                Self::run_prepare_python_requirements(state, operation)
             }
-        };
-        let target_executable = target.executable;
-        let target_module_search_paths = target.module_search_paths;
-        self.run_state(move |state| {
-            let had_pending_work = state.worker.pending_request();
-            let unchanged =
-                !had_pending_work && state.worker.python_executable_matches(&target_executable);
-            let discarded = if had_pending_work {
-                "pending work discarded"
-            } else {
-                "no pending work discarded"
-            };
-            if unchanged {
-                return CallToolResult::success(vec![Content::text(format!(
-                    "repl_prepare: session unchanged; {discarded}\n"
-                ))]);
-            }
-
-            match state
-                .worker
-                .replace_worker_launch(WorkerLaunch::PythonExecutable {
-                    executable: target_executable,
-                    module_search_paths: target_module_search_paths,
-                }) {
-                Ok(()) => CallToolResult::success(vec![Content::text(format!(
-                    "repl_prepare: session replaced; {discarded}\n"
-                ))]),
-                Err(err) => {
-                    let mut result = state.response.finalize_local_error(err, true);
-                    strip_text_stream_meta(&mut result);
-                    result
-                }
+            crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable) => {
+                Self::run_prepare_python_executable(state, executable)
             }
         })
         .await
+    }
+
+    fn run_prepare_python_requirements(
+        state: &mut ServerState,
+        operation: crate::python_prepare::PrepareRequirementsOperation,
+    ) -> CallToolResult {
+        let current_manifest = state.python_requirements_manifest.clone();
+        let candidate_manifest =
+            crate::python_prepare::apply_requirements_operation(&current_manifest, &operation);
+        let target = match crate::python_prepare::resolve_requirements_manifest(&candidate_manifest)
+        {
+            Ok(target) => target,
+            Err(err) => {
+                return Self::prepare_python_error_reply(
+                    format!("repl_prepare failed: {err}"),
+                    "session unchanged",
+                    "no user state discarded",
+                    &current_manifest,
+                );
+            }
+        };
+
+        let active_matches = state.worker.python_executable_matches(&target.executable);
+        let restart_required = match operation.restart {
+            crate::python_prepare::PrepareRestartPolicy::IfNeeded => !active_matches,
+            crate::python_prepare::PrepareRestartPolicy::Yes => true,
+            crate::python_prepare::PrepareRestartPolicy::No => !active_matches,
+        };
+        let had_pending_work = state.worker.pending_request();
+        let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
+
+        if matches!(
+            operation.restart,
+            crate::python_prepare::PrepareRestartPolicy::No
+        ) && restart_required
+            && user_state_may_exist
+        {
+            return Self::prepare_python_error_reply(
+                "repl_prepare failed: satisfying the requirements would require restarting the current Python session",
+                "session unchanged",
+                "no user state discarded",
+                &current_manifest,
+            );
+        }
+
+        if !restart_required {
+            state.python_requirements_manifest = candidate_manifest;
+            return Self::prepare_python_success_reply(
+                "session unchanged",
+                "no user state discarded",
+                &state.python_requirements_manifest,
+            );
+        }
+
+        let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        match state
+            .worker
+            .replace_worker_launch(WorkerLaunch::PythonExecutable {
+                executable: target.executable,
+                module_search_paths: target.module_search_paths,
+            }) {
+            Ok(()) => {
+                state.python_requirements_manifest = candidate_manifest;
+                Self::prepare_python_success_reply(
+                    "session restarted",
+                    discarded,
+                    &state.python_requirements_manifest,
+                )
+            }
+            Err(err) => {
+                let mut result = state.response.finalize_local_error(err, true);
+                strip_text_stream_meta(&mut result);
+                result
+            }
+        }
+    }
+
+    fn run_prepare_python_executable(
+        state: &mut ServerState,
+        executable: std::path::PathBuf,
+    ) -> CallToolResult {
+        let target = match crate::python_prepare::resolve_prepare_target(
+            &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
+        ) {
+            Ok(target) => target,
+            Err(err) => {
+                return Self::prepare_python_error_reply(
+                    format!("repl_prepare failed: {err}"),
+                    "session unchanged",
+                    "no user state discarded",
+                    &state.python_requirements_manifest,
+                );
+            }
+        };
+        let active_matches = state.worker.python_executable_matches(&target.executable);
+        if active_matches {
+            return Self::prepare_python_success_reply(
+                "session unchanged",
+                "no user state discarded",
+                &state.python_requirements_manifest,
+            );
+        }
+
+        let had_pending_work = state.worker.pending_request();
+        let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
+        let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        match state
+            .worker
+            .replace_worker_launch(WorkerLaunch::PythonExecutable {
+                executable: target.executable,
+                module_search_paths: target.module_search_paths,
+            }) {
+            Ok(()) => Self::prepare_python_success_reply(
+                "session restarted",
+                discarded,
+                &state.python_requirements_manifest,
+            ),
+            Err(err) => {
+                let mut result = state.response.finalize_local_error(err, true);
+                strip_text_stream_meta(&mut result);
+                result
+            }
+        }
+    }
+
+    fn prepare_python_success_reply(
+        session_status: &str,
+        discard_status: &str,
+        manifest: &crate::python_prepare::PythonRequirementsManifest,
+    ) -> CallToolResult {
+        CallToolResult::success(vec![Content::text(format!(
+            "repl_prepare: {session_status}; {discard_status}\n{}\n",
+            crate::python_prepare::format_requirements_manifest(manifest)
+        ))])
+    }
+
+    fn prepare_python_error_reply(
+        message: impl Into<String>,
+        session_status: &str,
+        discard_status: &str,
+        manifest: &crate::python_prepare::PythonRequirementsManifest,
+    ) -> CallToolResult {
+        CallToolResult::error(vec![Content::text(format!(
+            "{}\nrepl_prepare: {session_status}; {discard_status}\n{}\n",
+            message.into(),
+            crate::python_prepare::format_requirements_manifest(manifest)
+        ))])
+    }
+}
+
+fn prepare_discard_status(had_pending_work: bool, user_state_may_exist: bool) -> &'static str {
+    if had_pending_work {
+        "pending work discarded"
+    } else if user_state_may_exist {
+        "user state discarded"
+    } else {
+        "no user state discarded"
     }
 }
 
