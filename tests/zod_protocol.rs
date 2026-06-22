@@ -356,8 +356,8 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
         "expected v5 worker to receive input through input_batch, got: {text:?}"
     );
     assert!(
-        !text.contains("v5> hello v5"),
-        "default reply must not render structural input_line metadata, got: {text:?}"
+        text.contains("v5> hello v5"),
+        "default reply should render synthetic input_line echo, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_batch input=hello v5")?;
@@ -750,8 +750,7 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_not_rendered() -> TestResult<()>
-{
+async fn zod_worker_v5_input_line_is_ordered_before_output_text_and_rendered() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -772,8 +771,8 @@ async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_not_rendered
         "expected output_text after input_line, got: {text:?}"
     );
     assert!(
-        !text.contains("v5> emit-output-after-input"),
-        "input_line is structural and should not be rendered by default, got: {text:?}"
+        text.contains("v5> emit-output-after-input"),
+        "input_line should render as a synthetic echo, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_line text=emit-output-after-input\\n")?;

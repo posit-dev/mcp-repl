@@ -19,7 +19,35 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "INTERRUPT_READY"
+      "text": "> cat(\"INTERRUPT_READY\\n\")\nINTERRUPT_READY"
+    },
+    {
+      "type": "text",
+      "text": "> flush.console()"
+    },
+    {
+      "type": "text",
+      "text": "> tryCatch("
+    },
+    {
+      "type": "text",
+      "text": "+   {"
+    },
+    {
+      "type": "text",
+      "text": "+     repeat Sys.sleep(0.5)"
+    },
+    {
+      "type": "text",
+      "text": "+   },"
+    },
+    {
+      "type": "text",
+      "text": "+   interrupt = function(e) cat(\"interrupt received\\n\")"
+    },
+    {
+      "type": "text",
+      "text": "+ )"
     },
     {
       "type": "text",
@@ -67,7 +95,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

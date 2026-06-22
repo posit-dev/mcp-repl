@@ -19,7 +19,37 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "# Title\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17\nalpha line 18\nalpha line 19\nalpha line 20\nalpha line 21"
+      "text": "> "
+    },
+    {
+      "type": "text",
+      "text": "> set.seed(1)"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"# Title\\n\")\n# Title"
+    },
+    {
+      "type": "text",
+      "text": "> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17\nalpha line 18\nalpha line 19\nalpha line 20\nalpha line 21"
+    },
+    {
+      "type": "text",
+      "text": "[pager] elided output: @293..839"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "text",
+      "text": "[pager] elided output: @839..1610"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
     },
     {
       "type": "text",

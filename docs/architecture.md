@@ -57,7 +57,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 ### Output, images, and debug surfaces
 
 - `src/pending_output_tape.rs` and `src/output_stream.rs` stage worker text and images until reply sealing.
-- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, and how request completion only gates final-reply cleanup rather than ordering.
+- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, and how request completion only gates final-reply presentation rather than ordering.
 - PTY-backed workers may expose one raw terminal output stream rather than
   independent raw stdout and stderr pipes. Worker-owned `output_text` frames
   preserve their declared stream, but raw PTY output can have terminal effects

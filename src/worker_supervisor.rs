@@ -288,6 +288,9 @@ impl LiveOutputCapture {
     }
 
     pub(crate) fn append_sideband(&self, kind: PendingSidebandKind) {
+        if let PendingSidebandKind::ReadlineResult { prompt, line } = &kind {
+            self.output_timeline.append_input_echo(prompt, line);
+        }
         if let Some(tape) = &self.pending_output_tape {
             tape.append_sideband(kind);
         }

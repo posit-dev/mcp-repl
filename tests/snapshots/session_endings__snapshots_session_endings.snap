@@ -19,6 +19,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> x <- 1"
+    },
+    {
+      "type": "text",
       "text": "> "
     }
   ]
@@ -59,7 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] FALSE"
+      "text": "> print(exists(\"x\"))\n[1] FALSE"
     },
     {
       "type": "text",
@@ -83,6 +87,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> x <- 1"
+    },
     {
       "type": "text",
       "text": "> "
@@ -125,7 +133,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] FALSE"
+      "text": "> print(exists(\"x\"))\n[1] FALSE"
     },
     {
       "type": "text",
@@ -171,7 +179,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",
@@ -201,7 +209,11 @@ response:
     },
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> "
+    },
+    {
+      "type": "text",
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",
@@ -227,6 +239,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> x <- 1"
+    },
+    {
+      "type": "text",
       "text": "> "
     }
   ]
@@ -245,6 +261,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> quit(\"no\")"
+    },
     {
       "type": "text",
       "text": "[repl] session ended"
@@ -267,7 +287,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",
@@ -293,6 +313,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> x <- 1"
+    },
+    {
+      "type": "text",
       "text": "> "
     }
   ]
@@ -311,6 +335,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> quit()"
+    },
     {
       "type": "text",
       "text": "[repl] session ended"
@@ -333,7 +361,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",
@@ -359,6 +387,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> setwd(tempdir()); x <- 1"
+    },
+    {
+      "type": "text",
       "text": "> "
     }
   ]
@@ -377,6 +409,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "> quit(\"yes\")"
+    },
     {
       "type": "text",
       "text": "[repl] session ended"
@@ -399,7 +435,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
+      "text": "> 1+1\n[1] 2"
     },
     {
       "type": "text",

@@ -8,8 +8,8 @@ it should.
 Longer term, the cleaner design is:
 
 - collect output into one shared in-memory timeline model,
-- perform timeline resolution, image ordering, and related
-  formatting through one mostly common code path,
+- perform timeline resolution, generated input echo placement, image ordering,
+  and related formatting through one mostly common code path,
 - defer the pager-vs-files split until the final presentation step.
 
 ## Why This Is Deferred
@@ -27,8 +27,8 @@ larger than ideal.
 ## Current Friction
 
 - Files mode and pager mode still buffer different intermediate structures.
-- Timeline resolution and reply assembly now share more logic, but the
-  surrounding assembly path still diverges.
+- Generated input echo placement and timeline resolution still happen in
+  mode-specific assembly paths.
 - Architectural discovery is harder because there is no single “resolved
   timeline” abstraction that both modes consume.
 
@@ -36,8 +36,7 @@ larger than ideal.
 
 - Introduce one canonical resolved output-timeline structure for server-side
   request output.
-- Keep cross-channel ordering and structural input metadata handling in that
-  shared layer.
+- Keep cross-channel ordering and generated echo placement in that shared layer.
 - Let files mode decide how to seal or spill that resolved timeline.
 - Let pager mode decide how to page or elide that same resolved timeline.
 - Keep mode-specific behavior focused on presentation, retention, and paging

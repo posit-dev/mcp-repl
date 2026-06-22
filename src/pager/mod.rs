@@ -1678,6 +1678,7 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
                 }
             }
         }
+        OutputEventKind::InputEcho { text } => WorkerContent::worker_stdout(text.clone()),
     }
 }
 

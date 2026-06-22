@@ -708,27 +708,34 @@ def r_write_stdin_recovers_after_error(client: McpStdioClient) -> None:
         )
 
 
-def r_write_stdin_does_not_synthesize_huge_input_only_transcript(
-    client: McpStdioClient,
-) -> None:
+def r_write_stdin_generates_huge_assignment_input_echoes(client: McpStdioClient) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 2001))
     received = client.repl(input_text, timeout_ms=30000)
     received_text = require_success(received, "write_stdin huge input-only repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge input-only request to complete, got: {received_text!r}"
+            f"expected huge assignment input to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            f"did not expect pager activation for input-only request, got: {received_text!r}"
+            f"did not expect pager activation for huge assignment input, got: {received_text!r}"
         )
-    if received_text != "> ":
-        raise SuiteFailure(f"expected prompt-only reply, got: {received_text!r}")
+    transcript_path = bundle_transcript_path(received_text)
+    if transcript_path is not None:
+        spill_text = require_text_file(
+            transcript_path,
+            "write_stdin huge assignment input transcript",
+        )
+        if "x1 <- 1" not in spill_text or "x2000 <- 2000" not in spill_text:
+            raise SuiteFailure(
+                f"expected generated input echoes in spill file, got: {spill_text!r}"
+            )
+        return
+    if "x1 <- 1" not in received_text or "x2000 <- 2000" not in received_text:
+        raise SuiteFailure(f"expected generated input echoes inline, got: {received_text!r}")
 
 
-def r_write_stdin_does_not_synthesize_huge_submitted_input(
-    client: McpStdioClient,
-) -> None:
+def r_write_stdin_preserves_huge_leading_echo_prefix(client: McpStdioClient) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 1001))
     input_text += 'cat("ok\\n")\n'
     input_text += "".join(f"y{idx} <- {idx}\n" for idx in range(1, 1001))
@@ -738,11 +745,11 @@ def r_write_stdin_does_not_synthesize_huge_submitted_input(
     received_text = require_success(received, "write_stdin huge interleaved input repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge interleaved input to complete, got: {received_text!r}"
+            f"expected huge interleaved echo input to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            "did not expect pager activation for huge input with small output, "
+            "did not expect pager activation for huge generated input text with small output, "
             f"got: {received_text!r}"
         )
 
@@ -752,15 +759,13 @@ def r_write_stdin_does_not_synthesize_huge_submitted_input(
             transcript_path,
             "write_stdin huge interleaved input transcript",
         )
-        if "x500 <- 500" in spill_text:
+        if "x500 <- 500" not in spill_text:
             raise SuiteFailure(
-                "did not expect submitted assignment input in spill file, "
-                f"got: {spill_text!r}"
+                f"expected leading generated input text in spill file, got: {spill_text!r}"
             )
-        if "y500 <- 500" in spill_text:
+        if "y500 <- 500" not in spill_text:
             raise SuiteFailure(
-                "did not expect submitted trailing input in spill file, "
-                f"got: {spill_text!r}"
+                f"expected later generated input echo in spill file, got: {spill_text!r}"
             )
         if "ok" not in spill_text or "done" not in spill_text:
             raise SuiteFailure(
@@ -776,14 +781,13 @@ def r_write_stdin_does_not_synthesize_huge_submitted_input(
         raise SuiteFailure(
             f"expected output from both cat() calls inline, got: {received_text!r}"
         )
-    if "x500 <- 500" in received_text:
+    if "x500 <- 500" not in received_text:
         raise SuiteFailure(
-            f"did not expect submitted assignment input inline, got: {received_text!r}"
+            f"expected leading generated input text inline, got: {received_text!r}"
         )
-    if "y500 <- 500" in received_text:
+    if "y500 <- 500" not in received_text:
         raise SuiteFailure(
-            "did not expect submitted trailing input inline, "
-            f"got: {received_text!r}"
+            f"expected later generated input echo inline, got: {received_text!r}"
         )
 
 
@@ -1361,8 +1365,8 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
-    "r-write-stdin-no-huge-input-only-transcript": r_suite_case(
-        r_write_stdin_does_not_synthesize_huge_input_only_transcript
+    "r-write-stdin-generates-huge-assignment-input-echoes": r_suite_case(
+        r_write_stdin_generates_huge_assignment_input_echoes
     ),
     "r-write-stdin-multiple-calls": r_suite_case(r_write_stdin_multiple_calls),
     "r-write-stdin-recovers-after-error": r_suite_case(
@@ -1371,8 +1375,8 @@ CASES: dict[str, SuiteCase] = {
     "r-write-stdin-timeout-polling-returns-pending-output": r_suite_case(
         r_write_stdin_timeout_polling_returns_pending_output
     ),
-    "r-write-stdin-no-huge-submitted-input-transcript": r_suite_case(
-        r_write_stdin_does_not_synthesize_huge_submitted_input,
+    "r-write-stdin-preserves-huge-leading-echo-prefix": r_suite_case(
+        r_write_stdin_preserves_huge_leading_echo_prefix,
         server_args=("--oversized-output", "files"),
     ),
     "r-workspace-write-sandbox": r_suite_case(

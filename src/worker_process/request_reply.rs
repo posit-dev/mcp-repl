@@ -33,7 +33,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -72,7 +71,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 
@@ -102,7 +100,6 @@ impl WorkerManager {
                 let built = build_completed_reply(
                     contents,
                     is_error,
-                    0,
                     &completion,
                     session_end,
                     CompletionReplyMode::Files {
@@ -143,7 +140,7 @@ impl WorkerManager {
 
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
 
-                Ok(build_timeout_reply(contents, is_error, 0))
+                Ok(build_timeout_reply(contents, is_error))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_files(&err, context);
@@ -203,7 +200,6 @@ impl WorkerManager {
                 let built = build_completed_reply(
                     contents,
                     is_error,
-                    end_offset,
                     &completion,
                     session_end,
                     CompletionReplyMode::Pager {
@@ -263,7 +259,7 @@ impl WorkerManager {
                     last_range,
                 );
 
-                Ok(build_timeout_reply(contents, is_error, end_offset))
+                Ok(build_timeout_reply(contents, is_error))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_pager(&err, context, page_bytes);

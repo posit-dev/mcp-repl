@@ -325,7 +325,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<()> {
+async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -339,27 +339,27 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     }
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        !text.contains("> 1+"),
-        "did not expect structural first line input to be synthesized into output, got: {text:?}"
+        text.contains("> 1+"),
+        "expected consumed first line to be echoed from sideband, got: {text:?}"
     );
     assert!(
-        !text.contains("\n+ 1"),
-        "did not expect structural continuation input to be synthesized into output, got: {text:?}"
+        text.contains("\n+ 1"),
+        "expected consumed continuation line to be echoed from sideband, got: {text:?}"
     );
 
     let result = session
-        .write_stdin_raw_with("plain_x <- 1\nplain_x + 1", Some(30.0))
+        .write_stdin_raw_with("echo_keep_x <- 1\necho_keep_x + 1", Some(30.0))
         .await?;
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        !text.contains("> plain_x <- 1"),
-        "did not expect structural assignment input to be synthesized into output, got: {text:?}"
+        text.contains("> echo_keep_x <- 1"),
+        "expected leading assignment echo from sideband, got: {text:?}"
     );
     assert!(
-        !text.contains("> plain_x + 1"),
-        "did not expect structural expression input to be synthesized into output, got: {text:?}"
+        text.contains("> echo_keep_x + 1"),
+        "expected trailing expression echo from sideband, got: {text:?}"
     );
 
     let result = session
@@ -368,8 +368,8 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     assert!(
-        !text.contains("> plain_drop_x <- 1") && !text.contains("> plain_drop_y <- 2"),
-        "did not expect structural assignment input to be synthesized into output, got: {text:?}"
+        text.contains("> plain_drop_x <- 1") && text.contains("> plain_drop_y <- 2"),
+        "expected generated echoes for assignment-only input, got: {text:?}"
     );
 
     let result = session
@@ -386,12 +386,12 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
         "expected second expression result, got: {text:?}"
     );
     assert!(
-        !text.contains("> cat('A\\n')"),
-        "did not expect structural cat input to be synthesized into output, got: {text:?}"
+        text.contains("> cat('A\\n')"),
+        "expected leading expression echo, got: {text:?}"
     );
     assert!(
-        !text.contains("> 1+1"),
-        "did not expect structural expression input to be synthesized into output, got: {text:?}"
+        text.contains("> 1+1"),
+        "expected submitted expression echo after output interleaving, got: {text:?}"
     );
 
     let result = session
@@ -407,12 +407,12 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
         "expected all expression output, got: {text:?}"
     );
     assert!(
-        !text.contains("> cat('SECOND\\n')"),
-        "did not expect structural second submitted expression to be synthesized into output, got: {text:?}"
+        text.contains("> cat('SECOND\\n')"),
+        "expected second submitted expression echo, got: {text:?}"
     );
     assert!(
-        !text.contains("> cat('THIRD\\n')"),
-        "did not expect structural third submitted expression to be synthesized into output, got: {text:?}"
+        text.contains("> cat('THIRD\\n')"),
+        "expected third submitted expression echo, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -444,14 +444,14 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_inpu
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() == 1,
-        "expected raw child stdout to remain visible without synthesized submitted input, got: {text:?}"
+        text.matches("> 1+1").count() >= 2,
+        "expected raw child stdout and submitted-input echo to remain visible, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
+async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -474,8 +474,8 @@ async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
     let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
     let second_text = result_text(&second);
     assert!(
-        !second_text.contains("FIRST> alpha"),
-        "did not expect synthetic readline answer in follow-up reply, got: {second_text:?}"
+        second_text.contains("FIRST> alpha"),
+        "expected generated readline transcript in follow-up reply, got: {second_text:?}"
     );
     assert!(
         second_text.contains("SECOND> "),
@@ -493,8 +493,8 @@ async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        !transcript.contains("SECOND> beta"),
-        "did not expect synthetic readline answer in transcript.txt, got: {transcript:?}"
+        transcript.contains("SECOND> beta"),
+        "expected generated readline transcript in transcript.txt, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),
@@ -542,8 +542,8 @@ async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> T
         "expected follow-up input to satisfy readline, got: {second_text:?}"
     );
     assert!(
-        !second_text.contains("ASK> alpha"),
-        "did not expect synthetic readline input in reply, got: {second_text:?}"
+        second_text.contains("ASK> alpha"),
+        "expected synthetic readline input echo in reply, got: {second_text:?}"
     );
     Ok(())
 }
@@ -1688,8 +1688,7 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_follow_up_after_resolved_timeout_does_not_synthesize_input_transcript()
--> TestResult<()> {
+async fn pager_follow_up_after_resolved_timeout_preserves_detached_input_echo() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
     let temp = workspace_tempdir()?;
@@ -1759,8 +1758,8 @@ async fn pager_follow_up_after_resolved_timeout_does_not_synthesize_input_transc
         "did not expect synthetic input summary in pager reply, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
-        "did not expect structural timed-out input to be synthesized into the next pager reply, got: {follow_up_text:?}"
+        follow_up_text.contains("file.exists(") && follow_up_text.contains("print(1+1)"),
+        "expected the timed-out request echo to remain visible in the next pager reply, got: {follow_up_text:?}"
     );
 
     Ok(())

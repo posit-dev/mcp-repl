@@ -40,8 +40,7 @@ impl WorkerManager {
             append_prompt_if_missing(contents, resolved_prompt.clone());
             *prompt = resolved_prompt;
         }
-        let end_offset = self.output.end_offset().unwrap_or(0);
-        Some(ReplyWithOffset { reply, end_offset })
+        Some(ReplyWithOffset { reply })
     }
 
     pub(super) fn guardrail_event_pending(&self) -> bool {
@@ -121,7 +120,6 @@ impl WorkerManager {
     }
 
     pub(super) fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        let _ = reply.end_offset;
         reply.reply
     }
 
@@ -168,7 +166,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -185,7 +182,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: self.output.end_offset().unwrap_or(0),
         }
     }
 }

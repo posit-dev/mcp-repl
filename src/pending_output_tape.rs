@@ -6,6 +6,7 @@ use crate::output_capture::{
     OutputEvent, OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan,
 };
 use crate::pager;
+use crate::reply_presentation::input_echo_text;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 #[derive(Clone, Default)]
@@ -546,8 +547,16 @@ impl PendingOutputSnapshot {
                     last_rendered_text = None;
                 }
                 PendingOutputEvent::Sideband { kind, .. } => match kind {
+                    PendingSidebandKind::ReadlineResult { prompt, line } => {
+                        if let Some(text) = input_echo_text(prompt, line) {
+                            events.push(OutputEvent {
+                                offset: bytes.len() as u64,
+                                kind: OutputEventKind::InputEcho { text },
+                            });
+                            last_rendered_text = None;
+                        }
+                    }
                     PendingSidebandKind::InputWait { .. }
-                    | PendingSidebandKind::ReadlineResult { .. }
                     | PendingSidebandKind::RequestBoundary
                     | PendingSidebandKind::SessionEnd => {}
                 },

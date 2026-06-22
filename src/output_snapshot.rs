@@ -68,6 +68,31 @@ pub(crate) fn snapshot_page_with_images(
     }
 }
 
+pub(crate) fn snapshot_pending_timeout_page_with_images(
+    output: &OutputBuffer,
+    end_offset: u64,
+    target_bytes: u64,
+) -> SnapshotWithImages {
+    let start_offset = output.current_offset().unwrap_or(end_offset);
+    let range = output.read_range(start_offset, end_offset);
+    if range.bytes.is_empty()
+        && !range.events.is_empty()
+        && range
+            .events
+            .iter()
+            .all(|event| matches!(event.kind, OutputEventKind::InputEcho { .. }))
+    {
+        return SnapshotWithImages {
+            contents: Vec::new(),
+            pages_left: 0,
+            buffer: None,
+            last_range: None,
+        };
+    }
+
+    snapshot_page_with_images(output, end_offset, target_bytes)
+}
+
 pub(crate) fn snapshot_after_completion(
     output: &OutputBuffer,
     start_offset: u64,

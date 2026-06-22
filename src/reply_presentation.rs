@@ -3,6 +3,16 @@ use crate::backend::Backend;
 use crate::worker_protocol::TextStream;
 use crate::worker_protocol::{ContentOrigin, WorkerContent};
 
+pub(crate) fn input_echo_text(prompt: &str, line: &str) -> Option<String> {
+    if prompt.is_empty() && line.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(prompt.len().saturating_add(line.len()));
+    text.push_str(prompt);
+    text.push_str(line);
+    Some(text)
+}
+
 pub(crate) fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
@@ -172,5 +182,20 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
             }
             | WorkerContent::ContentImage { .. } => return,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_echo_text_combines_prompt_and_consumed_line() {
+        assert_eq!(input_echo_text("> ", "1+1\n").as_deref(), Some("> 1+1\n"));
+    }
+
+    #[test]
+    fn input_echo_text_skips_empty_events() {
+        assert_eq!(input_echo_text("", ""), None);
     }
 }

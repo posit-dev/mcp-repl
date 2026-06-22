@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::reply_presentation::input_echo_text;
 use crate::worker_protocol::ContentOrigin;
 
 static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
@@ -148,6 +149,12 @@ impl OutputTimeline {
         _readline_results_seen: Option<usize>,
     ) {
         self.ring.append_text_event(text, is_stderr, origin);
+    }
+
+    pub(crate) fn append_input_echo(&self, prompt: &str, line: &str) {
+        if let Some(text) = input_echo_text(prompt, line) {
+            self.ring.append_input_echo_event(text);
+        }
     }
 }
 
@@ -317,6 +324,9 @@ pub(crate) enum OutputEventKind {
         is_stderr: bool,
         origin: ContentOrigin,
     },
+    InputEcho {
+        text: String,
+    },
 }
 
 struct CollectedRange {
@@ -484,6 +494,27 @@ impl OutputRing {
             is_stderr,
             origin,
         };
+        let event_bytes = event_size_bytes(&kind);
+        if event_bytes > self.capacity_bytes {
+            return;
+        }
+
+        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+        let mut event_offset = guard.end_offset.max(guard.start_offset);
+        if dropped.dropped_any() {
+            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+            event_offset = event_offset.max(guard.start_offset);
+        }
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    fn append_input_echo_event(&self, text: String) {
+        let mut guard = self.inner.lock().unwrap();
+        let kind = OutputEventKind::InputEcho { text };
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
             return;
@@ -823,7 +854,9 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             .saturating_add(mime_type.len())
             .saturating_add(id.len())
             .saturating_add(32),
-        OutputEventKind::Text { text, .. } => text.len().saturating_add(16),
+        OutputEventKind::Text { text, .. } | OutputEventKind::InputEcho { text } => {
+            text.len().saturating_add(16)
+        }
     }
 }
 

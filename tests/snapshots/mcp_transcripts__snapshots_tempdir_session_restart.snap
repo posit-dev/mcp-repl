@@ -19,7 +19,115 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "TMPDIR_SET=TRUE\nTMPDIR_MATCH=TRUE\nTEMPDIR_UNDER_TMPDIR=TRUE\nTEMPDIR_MARKER_OK\nTEMPFILE_OK\nTEMPDIR_LIST=mcp-repl-snapshot.txt\nROOT_MARKER_OK\nROOT_MARKER_EXISTS=TRUE"
+      "text": "> "
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TMPDIR_SET=\", nzchar(Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTMPDIR_SET=TRUE"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TMPDIR_MATCH=\", Sys.getenv(\"TMPDIR\") == Sys.getenv(\"MCP_REPL_R_SESSION_TMPDIR\"), \"\\n\", sep = \"\")\nTMPDIR_MATCH=TRUE"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE"
+    },
+    {
+      "type": "text",
+      "text": "> marker <- file.path(tempdir(), \"mcp-repl-snapshot.txt\")"
+    },
+    {
+      "type": "text",
+      "text": "> tryCatch({"
+    },
+    {
+      "type": "text",
+      "text": "+   writeLines(\"foo\", marker)"
+    },
+    {
+      "type": "text",
+      "text": "+   cat(\"TEMPDIR_MARKER_OK\\n\")"
+    },
+    {
+      "type": "text",
+      "text": "+ }, error = function(e) {"
+    },
+    {
+      "type": "text",
+      "text": "+   message(\"TEMPDIR_MARKER_ERROR:\", conditionMessage(e))"
+    },
+    {
+      "type": "text",
+      "text": "+ })\nTEMPDIR_MARKER_OK"
+    },
+    {
+      "type": "text",
+      "text": "> tf <- tempfile()"
+    },
+    {
+      "type": "text",
+      "text": "> tryCatch({"
+    },
+    {
+      "type": "text",
+      "text": "+   writeLines(\"bar\", tf)"
+    },
+    {
+      "type": "text",
+      "text": "+   cat(\"TEMPFILE_OK\\n\")"
+    },
+    {
+      "type": "text",
+      "text": "+ }, error = function(e) {"
+    },
+    {
+      "type": "text",
+      "text": "+   message(\"TEMPFILE_ERROR:\", conditionMessage(e))"
+    },
+    {
+      "type": "text",
+      "text": "+ })\nTEMPFILE_OK"
+    },
+    {
+      "type": "text",
+      "text": "> unlink(tf)"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=mcp-repl-snapshot.txt"
+    },
+    {
+      "type": "text",
+      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
+    },
+    {
+      "type": "text",
+      "text": "> tryCatch({"
+    },
+    {
+      "type": "text",
+      "text": "+   writeLines(\"root\", root_marker)"
+    },
+    {
+      "type": "text",
+      "text": "+   cat(\"ROOT_MARKER_OK\\n\")"
+    },
+    {
+      "type": "text",
+      "text": "+ }, error = function(e) {"
+    },
+    {
+      "type": "text",
+      "text": "+   message(\"ROOT_MARKER_ERROR:\", conditionMessage(e))"
+    },
+    {
+      "type": "text",
+      "text": "+ })\nROOT_MARKER_OK"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=TRUE"
     },
     {
       "type": "text",
@@ -62,7 +170,23 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE"
+      "text": "> "
+    },
+    {
+      "type": "text",
+      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE"
     },
     {
       "type": "text",
@@ -105,7 +229,23 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE"
+      "text": "> "
+    },
+    {
+      "type": "text",
+      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE"
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST="
+    },
+    {
+      "type": "text",
+      "text": "> cat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTEMPDIR_UNDER_TMPDIR=TRUE"
     },
     {
       "type": "text",

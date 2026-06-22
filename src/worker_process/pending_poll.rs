@@ -7,6 +7,7 @@ use crate::completion_reply::{
 };
 use crate::output_snapshot::{
     SnapshotWithImages, snapshot_after_completion, snapshot_page_with_images,
+    snapshot_pending_timeout_page_with_images,
 };
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -66,13 +67,12 @@ impl WorkerManager {
 
         if let Some(elapsed) = timed_out_elapsed {
             contents.push(timeout_status_content(elapsed));
-            return Ok(build_timeout_reply(contents, is_error, 0));
+            return Ok(build_timeout_reply(contents, is_error));
         }
 
         let built = build_completed_reply(
             contents,
             is_error,
-            0,
             &completion,
             session_end,
             CompletionReplyMode::Files {
@@ -124,6 +124,13 @@ impl WorkerManager {
             let completed =
                 snapshot_after_completion(&self.output, start_offset, end_offset, page_bytes);
             (completed.saw_stderr, completed.snapshot)
+        } else if timed_out_elapsed.is_some() {
+            let saw_stderr = self
+                .output
+                .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+            let snapshot =
+                snapshot_pending_timeout_page_with_images(&self.output, end_offset, page_bytes);
+            (saw_stderr, snapshot)
         } else {
             let saw_stderr = self
                 .output
@@ -153,13 +160,12 @@ impl WorkerManager {
         );
 
         if timed_out_elapsed.is_some() {
-            return Ok(build_timeout_reply(contents, is_error, end_offset));
+            return Ok(build_timeout_reply(contents, is_error));
         }
 
         let built = build_completed_reply(
             contents,
             is_error,
-            end_offset,
             &completion,
             session_end,
             CompletionReplyMode::Pager {

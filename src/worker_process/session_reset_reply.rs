@@ -37,7 +37,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -98,7 +97,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 }

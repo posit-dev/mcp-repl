@@ -40,10 +40,11 @@ changes what must stay buffered between tool calls.
 
 ### Pager mode
 
-- `src/output_capture.rs` stores text in the global output ring and stores image
-  or server-status events at byte offsets within that ring.
-- `src/worker_process.rs` reads ranges from that ring and then asks
-  `src/pager/` to page the resulting mixed text/image stream.
+- `src/output_capture.rs` stores text in the global output ring and stores image,
+  generated input echo, or server-status events at byte offsets within that
+  ring.
+- `src/worker_process.rs` reads ranges from that ring and asks `src/pager/` to
+  page the resulting mixed text/image stream.
 
 ## Timeline vs completion
 
@@ -51,7 +52,7 @@ The important design split is not "files mode vs pager mode". It is:
 
 - timeline resolution: reconstruct the visible output order from text plus
   sideband facts
-- completion cleanup: once the server knows a request has finished, append
+- completion presentation: once the server knows a request has finished, append
   protocol warnings and restore the final prompt
 
 Timeline resolution must not depend on request completion. For example, the
@@ -59,23 +60,26 @@ server does not need to wait for completion to know that an `output_image` event
 belongs before later worker-owned output. That ordering fact is already present
 in the mixed timeline.
 
-Completion matters only for reply cleanup choices that are unsafe while a
-request is still in flight. In particular, timed-out or otherwise non-final
-drains must still preserve runtime output so the user can see what is running.
+Completion matters only for reply presentation choices that are unsafe while a
+request is still in flight. Timed-out, non-final, and completed drains all
+preserve captured output bytes.
 
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
 
-Input sideband events are structural metadata:
+Generated echoes are driven by input sideband events:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
 - `input_wait` supplies the prompt text for worker readiness and completed
   input batches
-- the server should not render submitted input merely because it received
-  `input_line`
+- the server may generate visible input echo text from `input_line`
+- the server may choose to generate fewer echoes or skip echo generation for a
+  presentation surface
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`
+- the server must not match sideband input against captured output in order to
+  suppress or collapse text
 
 Raw and sideband-owned output remain authoritative:
 

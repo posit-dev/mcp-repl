@@ -23,6 +23,7 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLAUDE_MODEL: &str = "haiku";
 const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
 const TOOL_INPUT: &str = "cat(\"CLAUDE_MCP_OK\\n\")";
+const TOOL_RESULT: &str = "> cat(\"CLAUDE_MCP_OK\\n\")\nCLAUDE_MCP_OK\n";
 const FINAL_RESULT: &str = "DONE";
 const CLAUDE_PROMPT: &str = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CLAUDE_MCP_OK\\n\") Then answer with exactly DONE, with no punctuation or extra text.\n";
 const HOST_CLI_ENV_KEYS: &[&str] = &[
@@ -756,7 +757,7 @@ fn parse_snapshot_skips_tool_search_tool_results() -> TestResult<()> {
                         "type": "tool_result",
                         "tool_use_id": "toolu_repl",
                         "content": [
-                            { "type": "text", "text": "CLAUDE_MCP_OK\n" }
+                            { "type": "text", "text": TOOL_RESULT }
                         ]
                     }
                 ]
@@ -783,7 +784,7 @@ fn parse_snapshot_skips_tool_search_tool_results() -> TestResult<()> {
     let snapshot = parse_snapshot(&stdout, Path::new("/tmp/claude-workspace"))?
         .expect("expected Claude snapshot");
 
-    assert_eq!(snapshot.tool_result, "CLAUDE_MCP_OK\n");
+    assert_eq!(snapshot.tool_result, TOOL_RESULT);
     Ok(())
 }
 
@@ -925,7 +926,7 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
     if tool_call.input != TOOL_INPUT {
         return Err(format!("unexpected Claude tool input: {}", tool_call.input).into());
     }
-    if tool_result != "CLAUDE_MCP_OK\n" {
+    if tool_result != TOOL_RESULT {
         return Err(format!("unexpected Claude tool result: {tool_result:?}").into());
     }
     if final_text != FINAL_RESULT {

@@ -288,7 +288,6 @@ impl WorkerManager {
                 prompt: (!session_end).then_some(()).and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -361,7 +360,6 @@ impl WorkerManager {
                     .and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 }
