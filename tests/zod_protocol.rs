@@ -519,6 +519,78 @@ async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()
     exit_result
 }
 
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_raw_marker = tempdir.path().join("late-raw-marker");
+    let late_raw_marker_env = late_raw_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![("MCP_REPL_ZOD_LATE_RAW_MARKER", late_raw_marker_env.as_str())],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-raw-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_raw_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_raw_marker_for_thread = late_raw_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-respawn",
+        )?;
+        std::fs::write(&late_raw_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late raw marker writer panicked")??;
+    assert!(
+        late_raw_marker.exists(),
+        "expected test marker to trigger old worker raw stdout"
+    );
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_RAW_AFTER_SESSION_END"),
+        "old worker raw stdout leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {

@@ -698,14 +698,12 @@ impl OutputReader {
             .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
     }
 
-    fn stop_and_detach(mut self) {
-        if self
-            .done_rx
-            .recv_timeout(OUTPUT_READER_QUIESCE_GRACE)
-            .is_err()
-        {
-            self.request_stop();
-        }
+    fn stop_now_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
+        self.request_stop();
+        let _ = self.done_rx.recv();
+        self.handle
+            .join()
+            .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
     }
 
     fn request_stop(&mut self) {
@@ -1364,6 +1362,7 @@ impl WorkerProcess {
             match self.child.try_wait()? {
                 Some(status) => self.exit_status = Some(status),
                 None => {
+                    self.quiesce_raw_output_readers()?;
                     // The next spawn resets and reuses this stable session temp path.
                     // The old background reaper must not remove the respawned worker's TMPDIR.
                     self.session_tmpdir = None;
@@ -1385,7 +1384,8 @@ impl WorkerProcess {
         {
             self.child.close_job();
         }
-        self.detach_output_producers();
+        self.quiesce_raw_output_readers()?;
+        self.detach_ipc_reader();
         self.cleanup_session_tmpdir();
         self.report_denials();
         Ok(())
@@ -1414,16 +1414,20 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn detach_output_producers(&mut self) {
-        if let Some(reader) = self.stdout_reader.take() {
-            reader.stop_and_detach();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            reader.stop_and_detach();
-        }
+    fn detach_ipc_reader(&mut self) {
         if let Some(ipc) = self.ipc.get() {
             ipc.detach_reader_thread();
         }
+    }
+
+    fn quiesce_raw_output_readers(&mut self) -> Result<(), WorkerError> {
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.stop_now_and_join("worker stdout reader thread panicked")?;
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.stop_now_and_join("worker stderr reader thread panicked")?;
+        }
+        Ok(())
     }
 
     fn quiesce_output_producers(&mut self) -> Result<(), WorkerError> {

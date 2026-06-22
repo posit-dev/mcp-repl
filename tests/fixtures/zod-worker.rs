@@ -28,9 +28,11 @@ const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
+const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
+const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
 
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -236,6 +238,22 @@ fn run_command(
     if command == "session-end-park" {
         send_session_end(writer, "runtime_exit")?;
         append_control_log(control_log_path.as_deref(), "park_after_session_end")?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-raw-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_raw_marker")?;
+        wait_for_late_raw_marker()?;
+        io::stdout().write_all(LATE_RAW_AFTER_SESSION_END)?;
+        io::stdout().flush()?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_raw_stdout_after_session_end",
+        )?;
         loop {
             thread::park();
         }
@@ -593,6 +611,35 @@ fn parse_millis(value: &str) -> io::Result<u64> {
         .parse::<u64>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
+
+fn wait_for_late_raw_marker() -> io::Result<()> {
+    let marker = std::env::var_os(LATE_RAW_MARKER_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, LATE_RAW_MARKER_ENV))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if marker.exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for {}", marker.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn ignore_sigterm_for_late_raw_test() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn ignore_sigterm_for_late_raw_test() {}
 
 #[cfg(target_family = "unix")]
 fn install_signal_handler() {
