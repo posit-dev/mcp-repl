@@ -328,6 +328,7 @@ fn run_cell_loop() -> Result<(), String> {
         mark_cell_running(true);
         {
             let _gil = GilGuard::acquire();
+            clear_python_stdin_buffers(api)?;
             run_python_cell(api, &cell.source);
             capture_python_prompts(api)?;
             flush_original_stdio();

@@ -10,9 +10,10 @@ contract: the server treats workers as opaque runtimes, sends accepted input wit
 
 ## Core Contract
 
-The server may send non-empty input only after the worker emits `input_wait`.
-That event means the runtime is waiting at a managed input boundary and the
-worker is ready for the next `input_batch`.
+The server may send non-empty input only after the worker emits `input_wait` or
+`ready`. Those events mean the runtime is waiting at a managed input boundary or
+has reached prompt-free readiness, and the worker is ready for the next
+`input_batch`.
 
 An input batch is one accepted non-empty MCP `repl()` payload. Empty polls drain
 output or report current state; they do not create input batches.
@@ -69,8 +70,8 @@ capture does not preserve separate stdout/stderr identity. Sideband
 `input_batch`
 - `{ "type": "input_batch", "input": <string> }`
 - Sends one accepted non-empty client payload.
-- The server sends this only after `input_wait` has made the worker ready for
-  input. Sending it marks the worker not ready for input.
+- The server sends this only after `input_wait` or `ready` has made the worker
+  ready for input. Sending it marks the worker not ready for input.
 - The worker owns input normalization, such as appending a final newline for
   line-oriented runtimes.
 
@@ -83,7 +84,7 @@ capture does not preserve separate stdout/stderr identity. Sideband
   worker to discard pending managed input that has not yet been consumed by the
   runtime.
 - Sending `interrupt` does not change server-side readiness. Readiness changes
-  only when the server sends `input_batch` or receives `input_wait`.
+  only when the server sends `input_batch` or receives `input_wait` or `ready`.
 - While servicing an interrupt request, the server waits for `input_wait`,
   `session_end`, process exit, or timeout.
 
@@ -220,8 +221,9 @@ runtime stdin.
 Custom workers must implement the same readiness contract themselves. The test
 Zod worker exercises the custom-worker input/readiness path: it sends
 `worker_ready`, sends an initial `input_wait` or `ready`, accepts `input_batch`,
-emits `input_line` for consumed lines, and emits a later `input_wait` when it is
-ready again. It is not a full implementation of every optional protocol surface.
+emits `input_line` for consumed lines, and emits a later `input_wait` or `ready`
+when it is ready again. It is not a full implementation of every optional
+protocol surface.
 
 ## Interrupts
 

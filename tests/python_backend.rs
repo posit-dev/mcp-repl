@@ -2140,6 +2140,98 @@ print("DETACHED_TEXT_STALE_MAIN_DONE", flush=True)
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_detached_sys_stdin_partial_read_clears_buffer_before_fresh_stdin_cell()
+-> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+    let temp_dir = tempdir()?;
+    let first_path = temp_dir.path().join("first-text-byte-before-stdin-cell");
+    let first_path_literal = serde_json::to_string(
+        first_path
+            .to_str()
+            .ok_or("first text byte path must be valid utf-8")?,
+    )?;
+
+    let first = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import pathlib, sys, threading, time
+first_path = pathlib.Path({first_path_literal})
+def read_one():
+    time.sleep(0.2)
+    print("DETACHED_TEXT_STDIN_CELL_WAITING", flush=True)
+    first = sys.stdin.read(1)
+    first_path.write_text(first)
+threading.Thread(target=read_one, daemon=True).start()
+print("DETACHED_TEXT_STDIN_CELL_MAIN_DONE", flush=True)
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_TEXT_STDIN_CELL_MAIN_DONE"),
+        "expected main cell to finish before detached sys.stdin read, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_TEXT_STDIN_CELL_WAITING")
+    {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_TEXT_STDIN_CELL_WAITING"),
+        "expected detached sys.stdin reader to start before answer input, got: {wait_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("xy", Some(1.0))
+        .await?;
+    let mut text = result_text(&answer);
+    wait_for_file_text(&first_path, "x").await?;
+
+    let fresh = session
+        .write_stdin_raw_with(
+            r#"import sys
+fresh = sys.stdin.read(1)
+print("DETACHED_TEXT_STDIN_CELL_FRESH", fresh)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let fresh_text = result_text(&fresh);
+    text.push_str(&fresh_text);
+    assert!(
+        fresh_text.contains("<<repl status: waiting for input>>"),
+        "expected fresh stdin cell to wait for new input instead of buffered leftovers, got: {fresh_text:?}"
+    );
+    assert!(
+        !fresh_text.contains("DETACHED_TEXT_STDIN_CELL_FRESH y"),
+        "fresh stdin cell consumed stale detached stdin bytes: {fresh_text:?}"
+    );
+
+    let fresh_stdin = session
+        .write_stdin_raw_unterminated_with("z", Some(5.0))
+        .await?;
+    text.push_str(&result_text(&fresh_stdin));
+    session.cancel().await?;
+
+    assert!(
+        text.contains("DETACHED_TEXT_STDIN_CELL_FRESH z"),
+        "expected fresh stdin to satisfy the next cell, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_foreground_raw_stdin_partial_read_does_not_preserve_for_unrelated_thread()
