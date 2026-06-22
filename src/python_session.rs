@@ -43,7 +43,7 @@ impl PythonSession {
 enum InitState {
     Pending,
     Ready,
-    Failed(String),
+    Failed,
 }
 
 #[derive(Debug)]
@@ -66,24 +66,10 @@ impl SessionInit {
         self.cvar.notify_all();
     }
 
-    fn mark_failed(&self, message: String) {
+    fn mark_failed(&self, _message: String) {
         let mut guard = self.state.lock().unwrap();
-        *guard = InitState::Failed(message);
+        *guard = InitState::Failed;
         self.cvar.notify_all();
-    }
-
-    #[cfg(windows)]
-    fn wait_ready(&self) -> Result<(), String> {
-        let mut guard = self.state.lock().unwrap();
-        loop {
-            match &*guard {
-                InitState::Pending => {
-                    guard = self.cvar.wait(guard).unwrap();
-                }
-                InitState::Ready => return Ok(()),
-                InitState::Failed(message) => return Err(message.clone()),
-            }
-        }
     }
 }
 
