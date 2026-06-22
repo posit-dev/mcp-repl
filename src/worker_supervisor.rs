@@ -1137,20 +1137,12 @@ impl WorkerProcess {
         self.ipc.get()
     }
 
-    pub(crate) fn write_stdin_payload(
-        &mut self,
-        payload: Vec<u8>,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        self.send_stdin_payload(Some(payload), timeout)
-    }
-
     pub(crate) fn note_accepted_input_starting(&self) {
         self.live_output.note_accepted_input_starting();
     }
 
     fn close_stdin(&mut self, timeout: Duration) -> Result<(), WorkerError> {
-        self.send_stdin_payload(None, timeout)
+        send_stdin_command(&self.stdin_tx, None, timeout)
     }
 
     fn request_ipc_shutdown(&self) {
@@ -1160,14 +1152,6 @@ impl WorkerProcess {
                 Duration::from_millis(200),
             );
         }
-    }
-
-    fn send_stdin_payload(
-        &mut self,
-        payload: Option<Vec<u8>>,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        send_stdin_command(&self.stdin_tx, payload, timeout)
     }
 
     pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {

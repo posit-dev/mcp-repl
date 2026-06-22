@@ -5,7 +5,6 @@ pub(crate) struct InputState {
     active: bool,
     ready_for_input: bool,
     ready_observed_at: Option<Instant>,
-    ready_from_input_wait: bool,
     completed_observed_at: Option<Instant>,
     protocol_error: Option<LatchedProtocolError>,
     session_end: bool,
@@ -24,7 +23,6 @@ impl InputState {
         }
         self.active = true;
         self.ready_for_input = false;
-        self.ready_from_input_wait = false;
         self.completed_observed_at = None;
         Ok(())
     }
@@ -40,10 +38,6 @@ impl InputState {
 
     pub(crate) fn ready_for_input(&self) -> bool {
         self.ready_for_input
-    }
-
-    pub(crate) fn ready_from_input_wait(&self) -> bool {
-        self.ready_for_input && self.ready_from_input_wait
     }
 
     pub(crate) fn readiness_observed_after(&self, since: Instant) -> bool {
@@ -64,17 +58,16 @@ impl InputState {
     }
 
     pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
-        self.record_ready_with_source(observed_at, true);
+        self.record_ready_at(observed_at);
     }
 
     pub(crate) fn record_ready(&mut self, observed_at: Instant) {
-        self.record_ready_with_source(observed_at, false);
+        self.record_ready_at(observed_at);
     }
 
-    fn record_ready_with_source(&mut self, observed_at: Instant, from_input_wait: bool) {
+    fn record_ready_at(&mut self, observed_at: Instant) {
         self.ready_for_input = true;
         self.ready_observed_at = Some(observed_at);
-        self.ready_from_input_wait = from_input_wait;
         if self.active {
             self.completed_observed_at = Some(observed_at);
         }

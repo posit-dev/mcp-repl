@@ -1,7 +1,5 @@
 use std::collections::VecDeque;
 
-use crate::stdin_payload::prepare_worker_stdin_payload;
-
 #[derive(Debug)]
 pub(crate) struct PythonInputQueue {
     payloads: VecDeque<String>,
@@ -102,6 +100,14 @@ impl PythonInputQueue {
                 &payload,
             )));
     }
+}
+
+fn prepare_worker_stdin_payload(input: &str) -> Vec<u8> {
+    let mut payload = input.as_bytes().to_vec();
+    if !payload.is_empty() && !payload.ends_with(b"\n") {
+        payload.push(b'\n');
+    }
+    payload
 }
 
 pub(crate) fn normalize_pty_input_payload(payload: Vec<u8>) -> Vec<u8> {

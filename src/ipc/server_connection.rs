@@ -405,9 +405,9 @@ impl ServerIpcConnection {
         guard.input_state.note_interrupt_sent();
     }
 
-    pub fn input_readiness_from_input_wait(&self) -> bool {
+    pub fn input_ready_for_input(&self) -> bool {
         let guard = self.inbox.lock().unwrap();
-        guard.input_state.ready_from_input_wait()
+        guard.input_state.ready_for_input()
     }
 
     pub fn take_prompt_history(&self) -> Vec<String> {

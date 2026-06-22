@@ -161,7 +161,7 @@ impl WorkerManager {
         self.process
             .as_ref()
             .and_then(|process| process.ipc_connection())
-            .is_some_and(|ipc| ipc.input_readiness_from_input_wait())
+            .is_some_and(|ipc| ipc.input_ready_for_input())
     }
 
     fn drain_existing_completion_after_interrupt(

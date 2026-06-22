@@ -380,10 +380,12 @@ fn wait_for_next_cell() -> Option<CellInput> {
         if guard.interrupt_requested {
             guard.interrupt_requested = false;
             guard.request_active = false;
+            guard.cell_running = false;
             guard.visible_input_prompt = None;
             state.cvar.notify_all();
             drop(guard);
             clear_python_pending_interrupt();
+            ipc::emit_ready();
             guard = state.inner.lock().unwrap();
             continue;
         }
