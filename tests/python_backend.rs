@@ -3305,6 +3305,17 @@ async fn python_fifo_cell_contract_uses_stdin_only_while_read_waits() -> TestRes
         "stdin answer should not execute as a top-level cell, got: {answer_text:?}"
     );
 
+    let idle = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let idle_text = result_text(&idle);
+    assert!(
+        idle_text.contains("<<repl status: idle>>"),
+        "expected empty poll after input() answer to report idle, got: {idle_text:?}"
+    );
+    assert!(
+        !idle_text.contains("name: "),
+        "empty poll after input() answer must not repeat stale input prompt, got: {idle_text:?}"
+    );
+
     let follow_up = session.write_stdin_raw_with("name", Some(5.0)).await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;

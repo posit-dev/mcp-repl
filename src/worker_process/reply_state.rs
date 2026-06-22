@@ -126,10 +126,7 @@ impl WorkerManager {
     }
 
     pub(super) fn remember_prompt(&mut self, prompt: Option<String>) {
-        let prompt = normalize_prompt(prompt);
-        if let Some(prompt) = prompt {
-            self.last_prompt = Some(prompt);
-        }
+        self.last_prompt = normalize_prompt(prompt);
     }
 
     pub(super) fn current_prompt_hint(&self) -> Option<String> {
