@@ -500,6 +500,7 @@ enum QueueReadAction {
         bytes: Vec<u8>,
         prompt_already_visible: bool,
         detached_request: bool,
+        emit_input_line: bool,
     },
     InputWait {
         prompt: String,
@@ -557,6 +558,7 @@ fn next_queue_line_action(
             return QueueReadAction::Interrupted;
         }
         if let Some(read) = guard.input_queue.consume_line() {
+            let emit_input_line = guard.request_active;
             let prompt_already_visible = guard.visible_input_prompt.as_deref() == Some(prompt);
             let detached_request = !guard.cell_running;
             guard.visible_input_prompt = None;
@@ -570,6 +572,7 @@ fn next_queue_line_action(
                 bytes: read.protocol_bytes,
                 prompt_already_visible,
                 detached_request,
+                emit_input_line,
             };
         }
         if !*owns_consumer {
@@ -613,8 +616,11 @@ fn read_queue_line(
                 bytes,
                 prompt_already_visible,
                 detached_request,
+                emit_input_line,
             } => {
-                ipc::emit_input_line(prompt, &String::from_utf8_lossy(&bytes));
+                if emit_input_line {
+                    ipc::emit_input_line(prompt, &String::from_utf8_lossy(&bytes));
+                }
                 if emit_prompt_to_stdout && !prompt.is_empty() && !prompt_already_visible {
                     emit_output_text(TextStream::Stdout, prompt.as_bytes());
                 }
@@ -680,6 +686,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 }
                 let remaining = size - output.len();
                 if let Some(read) = guard.input_queue.consume_bytes(remaining) {
+                    let emit_input_line = guard.request_active;
                     guard.visible_input_prompt = None;
                     guard.request_active = true;
                     if owns_consumer {
@@ -691,6 +698,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         bytes: read.protocol_bytes,
                         prompt_already_visible: true,
                         detached_request: !guard.cell_running,
+                        emit_input_line,
                     };
                 }
                 if !output.is_empty() {
@@ -719,9 +727,12 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
             QueueReadAction::Line {
                 bytes,
                 detached_request,
+                emit_input_line,
                 ..
             } => {
-                ipc::emit_input_line("", &String::from_utf8_lossy(&bytes));
+                if emit_input_line {
+                    ipc::emit_input_line("", &String::from_utf8_lossy(&bytes));
+                }
                 output.extend(bytes);
                 if detached_request && !detached_request_completed {
                     detached_request_completed = true;
@@ -750,7 +761,6 @@ fn complete_detached_read_request() {
         let mut guard = state.inner.lock().unwrap();
         guard.request_active = false;
         guard.visible_input_prompt = None;
-        guard.input_queue.clear_after_detached_read();
     }
     ipc::emit_ready();
 }

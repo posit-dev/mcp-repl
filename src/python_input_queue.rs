@@ -29,7 +29,9 @@ impl PythonInputQueue {
         if self.active_read_consumer {
             return None;
         }
-        self.payloads.pop_front()
+        let payload = self.payloads.pop_front()?;
+        self.stdin_bytes.clear();
+        Some(payload)
     }
 
     pub(crate) fn has_active_read_consumer(&self) -> bool {
@@ -55,12 +57,6 @@ impl PythonInputQueue {
     }
 
     pub(crate) fn clear_after_cell_finish(&mut self) {
-        if !self.active_read_consumer {
-            self.stdin_bytes.clear();
-        }
-    }
-
-    pub(crate) fn clear_after_detached_read(&mut self) {
         if !self.active_read_consumer {
             self.stdin_bytes.clear();
         }

@@ -1970,6 +1970,71 @@ print("DETACHED_RAW_MAIN_DONE", flush=True)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_detached_raw_stdin_reads_consume_one_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os, threading, time
+def read_later():
+    time.sleep(0.2)
+    print("DETACHED_RAW_PAIR_WAITING", flush=True)
+    first = os.read(0, 2)
+    second = os.read(0, 2)
+    print("DETACHED_RAW_PAIR_READ", first.decode("utf-8"), second.decode("utf-8"), flush=True)
+threading.Thread(target=read_later, daemon=True).start()
+print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_RAW_PAIR_MAIN_DONE"),
+        "expected main cell to finish before detached raw stdin reads, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_PAIR_WAITING") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_RAW_PAIR_WAITING"),
+        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("abcd", Some(1.0))
+        .await?;
+    let mut answer_text = result_text(&answer);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !answer_text.contains("DETACHED_RAW_PAIR_READ ab cd")
+    {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        answer_text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("DETACHED_RAW_PAIR_READ ab cd"),
+        "expected one answer turn to satisfy both detached raw stdin reads, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_partial_raw_stdin_read_clears_leftover_newline_before_next_cell() -> TestResult<()>
 {
     let _guard = lock_test_mutex();
@@ -5720,6 +5785,64 @@ print('CELL_RETURNED')
     assert!(
         answer_text.contains("BACKGROUND_ANSWER ok"),
         "expected background input answer output, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_consumes_buffered_lines_from_one_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_waiting = threading.Event()
+
+def background():
+    background_waiting.set()
+    first = input('bg1> ')
+    second = input('bg2> ')
+    print('BACKGROUND_BOTH', first, second)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg1> "),
+        "expected first background input prompt, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
+    let mut answer_text = result_text(&answer);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !answer_text.contains("BACKGROUND_BOTH one two") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        answer_text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("BACKGROUND_BOTH one two"),
+        "expected one answer turn to satisfy both background input() calls, got: {answer_text:?}"
     );
     Ok(())
 }
