@@ -635,7 +635,7 @@ fn read_queue_line(
                     emit_output_text(TextStream::Stdout, prompt.as_bytes());
                 }
                 if detached_request {
-                    complete_detached_read_request();
+                    complete_detached_read_request(false);
                 }
                 return Ok(StdioLineRead {
                     bytes,
@@ -746,7 +746,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 output.extend(bytes);
                 if detached_request && !detached_request_completed {
                     detached_request_completed = true;
-                    complete_detached_read_request();
+                    complete_detached_read_request(true);
                 }
             }
             QueueReadAction::InputWait { prompt } => {
@@ -765,14 +765,21 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     Ok(output)
 }
 
-fn complete_detached_read_request() {
+fn complete_detached_read_request(wait_for_buffered_stdin: bool) {
     let state = session_state();
-    {
+    let emit_ready = {
         let mut guard = state.inner.lock().unwrap();
-        guard.request_active = false;
         guard.visible_input_prompt = None;
+        if wait_for_buffered_stdin && guard.input_queue.has_buffered_stdin_data() {
+            false
+        } else {
+            guard.request_active = false;
+            true
+        }
+    };
+    if emit_ready {
+        ipc::emit_ready();
     }
-    ipc::emit_ready();
 }
 
 unsafe extern "C" fn mcp_repl_readline(

@@ -2186,6 +2186,110 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
+async fn python_detached_raw_stdin_partial_read_blocks_fresh_cell_until_drained() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+    let temp_dir = tempdir()?;
+    let first_path = temp_dir.path().join("first-raw-byte-before-fresh");
+    let release_path = temp_dir.path().join("release-raw-reader-before-fresh");
+    let first_path_literal = serde_json::to_string(
+        first_path
+            .to_str()
+            .ok_or("first raw byte path must be valid utf-8")?,
+    )?;
+    let release_path_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("raw reader release path must be valid utf-8")?,
+    )?;
+
+    let first = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os, pathlib, threading, time
+first_path = pathlib.Path({first_path_literal})
+release_path = pathlib.Path({release_path_literal})
+def read_pair():
+    time.sleep(0.2)
+    print("DETACHED_RAW_STALE_PAIR_WAITING", flush=True)
+    first = os.read(0, 1)
+    first_path.write_text(first.decode("utf-8"))
+    while not release_path.exists():
+        time.sleep(0.01)
+    second = os.read(0, 1)
+    print("DETACHED_RAW_STALE_PAIR", (first + second).decode("utf-8"), flush=True)
+threading.Thread(target=read_pair, daemon=True).start()
+print("DETACHED_RAW_STALE_MAIN_DONE", flush=True)
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_RAW_STALE_MAIN_DONE"),
+        "expected main cell to finish before detached raw stdin reads, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_STALE_PAIR_WAITING") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_RAW_STALE_PAIR_WAITING"),
+        "expected detached raw stdin reader to start before answer input, got: {wait_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("xy", Some(1.0))
+        .await?;
+    let mut text = result_text(&answer);
+    wait_for_file_text(&first_path, "x").await?;
+
+    let fresh = session
+        .write_stdin_raw_with("print('DETACHED_RAW_STALE_FRESH')", Some(1.0))
+        .await?;
+    let fresh_text = result_text(&fresh);
+    if !is_busy_response(&fresh_text) {
+        let _ = session.cancel().await;
+        panic!(
+            "fresh cell should stay blocked while detached stdin still has buffered answer bytes, got: {fresh_text:?}"
+        );
+    }
+
+    fs::write(&release_path, "go")?;
+    text.push_str(&fresh_text);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !text.contains("DETACHED_RAW_STALE_PAIR xy") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        text.contains("DETACHED_RAW_STALE_PAIR xy"),
+        "expected detached raw stdin reader to keep the second answer byte, got: {text:?}"
+    );
+    assert!(
+        !text.contains("DETACHED_RAW_STALE_FRESH"),
+        "fresh cell ran before detached stdin drained buffered answer bytes: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn python_partial_raw_stdin_read_clears_leftover_newline_before_next_cell() -> TestResult<()>
 {
     let _guard = lock_test_mutex();

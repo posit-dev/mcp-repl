@@ -38,6 +38,10 @@ impl PythonInputQueue {
         self.active_read_consumer
     }
 
+    pub(crate) fn has_buffered_stdin_data(&self) -> bool {
+        self.stdin_bytes.iter().any(|byte| *byte != b'\n')
+    }
+
     pub(crate) fn begin_read_consumer(&mut self) -> bool {
         if self.active_read_consumer {
             return false;
