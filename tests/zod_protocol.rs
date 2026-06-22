@@ -356,8 +356,12 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
         "expected v5 worker to receive input through input_batch, got: {text:?}"
     );
     assert!(
-        text.contains("v5> hello v5"),
-        "default reply should render synthetic input_line echo, got: {text:?}"
+        !text.contains("v5> hello v5"),
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+    assert!(
+        text.contains("v5> "),
+        "expected worker prompt after v5 output, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_batch input=hello v5")?;
@@ -771,8 +775,12 @@ async fn zod_worker_v5_input_line_is_ordered_before_output_text_and_rendered() -
         "expected output_text after input_line, got: {text:?}"
     );
     assert!(
-        text.contains("v5> emit-output-after-input"),
-        "input_line should render as a synthetic echo, got: {text:?}"
+        !text.contains("v5> emit-output-after-input"),
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+    assert!(
+        text.contains("v5> "),
+        "expected worker prompt after output_text, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_line text=emit-output-after-input\\n")?;

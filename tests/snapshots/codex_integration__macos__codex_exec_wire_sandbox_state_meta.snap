@@ -76,35 +76,7 @@ expression: snapshot
         "content": [
           {
             "type": "text",
-            "text": "> target <- tempfile(\"mcp-repl-codex\")\n"
-          },
-          {
-            "type": "text",
-            "text": "> tryCatch({\n"
-          },
-          {
-            "type": "text",
-            "text": "+   writeLines(\"ok\", target)\n"
-          },
-          {
-            "type": "text",
-            "text": "+   cat(\"WRITE_OK\\n\")\n"
-          },
-          {
-            "type": "text",
-            "text": "+   unlink(target)\n"
-          },
-          {
-            "type": "text",
-            "text": "+ }, error = function(e) {\n"
-          },
-          {
-            "type": "text",
-            "text": "+   message(\"WRITE_ERROR:\", conditionMessage(e))\n"
-          },
-          {
-            "type": "text",
-            "text": "+ })\nWRITE_OK\n"
+            "text": "WRITE_OK\n"
           },
           {
             "type": "text",

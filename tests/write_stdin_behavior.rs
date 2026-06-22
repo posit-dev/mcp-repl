@@ -38,6 +38,17 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn result_text_chunks(result: &rmcp::model::CallToolResult) -> Vec<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -339,12 +350,12 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     }
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.contains("> 1+"),
-        "expected consumed first line to be echoed from sideband, got: {text:?}"
+        !text.contains("> 1+"),
+        "leading generated echo should be absent, got: {text:?}"
     );
     assert!(
-        text.contains("\n+ 1"),
-        "expected consumed continuation line to be echoed from sideband, got: {text:?}"
+        !text.contains("\n+ 1"),
+        "leading continuation echo should be absent, got: {text:?}"
     );
 
     let result = session
@@ -354,12 +365,12 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     let text = result_text(&result);
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.contains("> echo_keep_x <- 1"),
-        "expected leading assignment echo from sideband, got: {text:?}"
+        !text.contains("> echo_keep_x <- 1"),
+        "leading assignment echo should be absent, got: {text:?}"
     );
     assert!(
-        text.contains("> echo_keep_x + 1"),
-        "expected trailing expression echo from sideband, got: {text:?}"
+        !text.contains("> echo_keep_x + 1"),
+        "expression echo before first output should be absent, got: {text:?}"
     );
 
     let result = session
@@ -368,8 +379,8 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     assert!(
-        text.contains("> plain_drop_x <- 1") && text.contains("> plain_drop_y <- 2"),
-        "expected generated echoes for assignment-only input, got: {text:?}"
+        !text.contains("> plain_drop_x <- 1") && !text.contains("> plain_drop_y <- 2"),
+        "assignment-only leading echoes should be absent, got: {text:?}"
     );
 
     let result = session
@@ -386,8 +397,8 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
         "expected second expression result, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('A\\n')"),
-        "expected leading expression echo, got: {text:?}"
+        !text.contains("> cat('A\\n')"),
+        "leading expression echo should be absent, got: {text:?}"
     );
     assert!(
         text.contains("> 1+1"),
@@ -413,6 +424,36 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     assert!(
         text.contains("> cat('THIRD\\n')"),
         "expected third submitted expression echo, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            "cat('BEFORE\\n')\necho_collapse_x <- 1\necho_collapse_y <- 2\ncat('AFTER\\n')",
+            Some(30.0),
+        )
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    let chunks = result_text_chunks(&result);
+    assert!(
+        text.contains("BEFORE\n") && text.contains("AFTER\n"),
+        "expected surrounding output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("> cat('BEFORE\\n')"),
+        "leading generated echo before first output should be absent, got: {text:?}"
+    );
+    assert!(
+        text.contains("> echo_collapse_x <- 1") && text.contains("> echo_collapse_y <- 2"),
+        "expected retained generated echoes after real output, got: {text:?}"
+    );
+    let echo_chunk_count = chunks
+        .iter()
+        .filter(|chunk| chunk.contains("echo_collapse_x") || chunk.contains("echo_collapse_y"))
+        .count();
+    assert_eq!(
+        echo_chunk_count, 1,
+        "expected adjacent generated echoes to be one response text chunk, got: {chunks:?}"
     );
 
     session.cancel().await?;
@@ -444,8 +485,8 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_inpu
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() >= 2,
-        "expected raw child stdout and submitted-input echo to remain visible, got: {text:?}"
+        text.matches("> 1+1").count() == 2,
+        "expected raw child stdout and later generated echo to remain visible, got: {text:?}"
     );
     Ok(())
 }
@@ -474,8 +515,8 @@ async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     let second = session.write_stdin_raw_with("alpha", Some(10.0)).await?;
     let second_text = result_text(&second);
     assert!(
-        second_text.contains("FIRST> alpha"),
-        "expected generated readline transcript in follow-up reply, got: {second_text:?}"
+        !second_text.contains("FIRST> alpha"),
+        "did not expect leading generated readline transcript in follow-up reply, got: {second_text:?}"
     );
     assert!(
         second_text.contains("SECOND> "),
@@ -493,8 +534,8 @@ async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        transcript.contains("SECOND> beta"),
-        "expected generated readline transcript in transcript.txt, got: {transcript:?}"
+        !transcript.contains("SECOND> beta"),
+        "did not expect leading generated readline transcript in transcript.txt, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),
@@ -542,8 +583,8 @@ async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> T
         "expected follow-up input to satisfy readline, got: {second_text:?}"
     );
     assert!(
-        second_text.contains("ASK> alpha"),
-        "expected synthetic readline input echo in reply, got: {second_text:?}"
+        !second_text.contains("ASK> alpha"),
+        "leading synthetic readline input echo should be absent, got: {second_text:?}"
     );
     Ok(())
 }
@@ -1688,7 +1729,8 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_follow_up_after_resolved_timeout_preserves_detached_input_echo() -> TestResult<()> {
+async fn pager_follow_up_after_resolved_timeout_skips_leading_detached_input_echo() -> TestResult<()>
+{
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
     let temp = workspace_tempdir()?;
@@ -1754,12 +1796,8 @@ async fn pager_follow_up_after_resolved_timeout_preserves_detached_input_echo() 
         "expected the fresh pager follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("[repl] input:"),
-        "did not expect synthetic input summary in pager reply, got: {follow_up_text:?}"
-    );
-    assert!(
-        follow_up_text.contains("file.exists(") && follow_up_text.contains("print(1+1)"),
-        "expected the timed-out request echo to remain visible in the next pager reply, got: {follow_up_text:?}"
+        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
+        "timed-out request echo should not lead the next pager reply, got: {follow_up_text:?}"
     );
 
     Ok(())

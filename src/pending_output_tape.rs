@@ -388,15 +388,7 @@ impl PendingOutputTape {
         guard.drained_readline_results = guard
             .drained_readline_results
             .saturating_add(drained_readline_results);
-        if events.iter().any(|event| {
-            matches!(
-                event,
-                PendingOutputEvent::Sideband {
-                    kind: PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd,
-                    ..
-                }
-            )
-        }) {
+        if snapshot_crossed_request_boundary(&events) {
             guard.drained_readline_results = 0;
         }
         guard.last_rendered_text = rendered_text_state_after(events.iter(), prior_rendered_text);
@@ -450,14 +442,14 @@ impl PendingOutputTape {
 
 impl PendingOutputSnapshot {
     pub(crate) fn format_contents(&self) -> FormattedPendingOutput {
-        self.format_contents_preserving_output()
+        self.format_contents_inner()
     }
 
     pub(crate) fn format_contents_for_reply(&self) -> FormattedPendingOutput {
-        self.format_contents_preserving_output()
+        self.format_contents_inner()
     }
 
-    fn format_contents_preserving_output(&self) -> FormattedPendingOutput {
+    fn format_contents_inner(&self) -> FormattedPendingOutput {
         let RenderedPendingOutput { range, saw_stderr } = self.rendered_output();
         let contents = pager::contents_from_output_range(range);
         FormattedPendingOutput {
@@ -574,6 +566,18 @@ impl PendingOutputSnapshot {
             saw_stderr,
         }
     }
+}
+
+fn snapshot_crossed_request_boundary(events: &[PendingOutputEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            PendingOutputEvent::Sideband {
+                kind: PendingSidebandKind::RequestBoundary | PendingSidebandKind::SessionEnd,
+                ..
+            }
+        )
+    })
 }
 
 fn append_rendered_text(
@@ -1136,6 +1140,147 @@ mod tests {
     }
 
     #[test]
+    fn readline_result_generates_echo_and_preserves_late_raw_echo() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "1+\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b">>> 1");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout(">>> 1")]
+        );
+
+        tape.append_stdout_bytes(b"+\n[1] 2\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout("+\n[1] 2\n")]
+        );
+    }
+
+    #[test]
+    fn request_boundary_sideband_snapshot_renders_generated_echo() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "x <- 1\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+    }
+
+    #[test]
+    fn text_event_follows_generated_echo_and_late_raw_echo_is_preserved() {
+        let tape = PendingOutputTape::new();
+        let status = "[repl] previous plot updated\n".to_string();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_stdout_status_event(status.clone(), 1);
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::server_stdout(status)]
+        );
+
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::worker_stdout(">>> plot(1:10)\n")]
+        );
+    }
+
+    #[test]
+    fn image_event_follows_generated_echo_and_late_raw_echo_is_preserved() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::ContentImage {
+                data: "AA==".to_string(),
+                mime_type: "image/png".to_string(),
+                id: "img-1".to_string(),
+                is_new: true,
+            },]
+        );
+
+        tape.append_stdout_bytes(b">>> plot(1:10)\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::worker_stdout(">>> plot(1:10)\n")]
+        );
+    }
+
+    #[test]
+    fn interleaved_output_preserves_generated_and_late_raw_echoes() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "x <- 1\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "y <- 2\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b">>> x <- 1\nok\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout(">>> x <- 1\nok\n")]
+        );
+
+        tape.append_stdout_bytes(b">>> y <- 2\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout(">>> y <- 2\n")]
+        );
+    }
+
+    #[test]
     fn split_utf8_prefix_survives_image_event_without_escape_corruption() {
         let tape = PendingOutputTape::new();
 
@@ -1271,6 +1416,315 @@ mod tests {
                     terminated: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn reply_format_preserves_generated_and_raw_echoes_around_image() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "cat('done\\n')\n".to_string(),
+        });
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents_for_reply().contents,
+            vec![
+                WorkerContent::worker_stdout("> plot(1:10)\n"),
+                WorkerContent::worker_stdout("> plot(1:10)\n> cat('done\\n')\ndone\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nonfinal_format_preserves_generated_and_raw_echoes_around_image() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"> plot(1:10)\n");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "cat('done\\n')\n".to_string(),
+        });
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![
+                WorkerContent::worker_stdout("> plot(1:10)\n"),
+                WorkerContent::worker_stdout("> plot(1:10)\n> cat('done\\n')\ndone\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_format_preserves_raw_prompt_text_and_generated_echo() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(b"FIRST> alpha\nSECOND> ");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "FIRST> ".to_string(),
+            line: "alpha\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::InputWait {
+            prompt: "SECOND> ".to_string(),
+        });
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents_for_reply().contents,
+            vec![
+                WorkerContent::worker_stdout("FIRST> alpha\nSECOND> "),
+                WorkerContent::worker_stdout("FIRST> alpha\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_format_keeps_prior_generated_echo_before_later_image_output() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b"> cat('done\\n')\n");
+        tape.append_stdout_bytes(b"done\n");
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "cat('done\\n')\n".to_string(),
+        });
+
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents_for_reply().contents,
+            vec![
+                WorkerContent::worker_stdout("> cat('done\\n')\ndone\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn r_prompt_generated_echo_preserves_late_raw_stdout() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1 + 1\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b"> 1 + 1\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("> 1 + 1\n")]
+        );
+    }
+
+    #[test]
+    fn r_shaped_prompt_generated_echo_preserves_late_raw_echo() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "answer\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b"> answer\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::worker_stdout("> answer\n")]
+        );
+    }
+
+    #[test]
+    fn mixed_prompt_sources_generate_echoes_and_preserve_late_output() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "first\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second\n".to_string(),
+        });
+
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b">>> first\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::worker_stdout(">>> first\n")]
+        );
+
+        tape.append_stdout_ipc_bytes(b"> second\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::worker_stdout("> second\n")]
+        );
+    }
+
+    #[test]
+    fn r_prompt_generated_echo_preserves_late_ipc_output_text() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1 + 1\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_ipc_bytes(b"> 1 + 1\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::worker_stdout("> 1 + 1\n")]
+        );
+    }
+
+    #[test]
+    fn custom_prompt_generated_echo_preserves_real_output() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "FIRST> ".to_string(),
+            line: "alpha\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_stdout_bytes(b"FIRST> alpha\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("FIRST> alpha\n")]
+        );
+    }
+
+    #[test]
+    fn image_only_intermediate_snapshot_preserves_generated_and_raw_echoes() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: ">>> ".to_string(),
+            line: "plot(1:10)\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            Vec::<WorkerContent>::new()
+        );
+
+        tape.append_image(
+            "img-1".to_string(),
+            "image/png".to_string(),
+            "AA==".to_string(),
+            true,
+            1,
+        );
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::ContentImage {
+                data: "AA==".to_string(),
+                mime_type: "image/png".to_string(),
+                id: "img-1".to_string(),
+                is_new: true,
+            }]
+        );
+
+        tape.append_stdout_bytes(b">>> plot(1:10)\ndone\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout(">>> plot(1:10)\ndone\n")]
         );
     }
 }

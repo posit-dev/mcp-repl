@@ -1056,11 +1056,12 @@ impl McpSnapshot {
                     out.push_str(&format!("{}) {call_desc}\n", step_index + 1));
                 }
 
-                for line in input_lines {
+                for line in &input_lines {
                     out.push_str(&format!(">>> {line}\n"));
                 }
 
-                let response_lines = format_snapshot_response_lines(&response, &step.call.tool);
+                let response_lines =
+                    format_snapshot_response_lines(&response, &step.call.tool, &input_lines);
                 for line in response_lines {
                     out.push_str(&format!("<<< {line}\n"));
                 }
@@ -1259,7 +1260,11 @@ fn format_arg_value(value: &Value) -> String {
     }
 }
 
-fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Vec<String> {
+fn format_snapshot_response_lines(
+    response: &SnapshotResponse,
+    tool: &str,
+    input_lines: &[String],
+) -> Vec<String> {
     match response {
         SnapshotResponse::ToolResult(result) => {
             let mut lines = Vec::new();
@@ -1267,7 +1272,9 @@ fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Ve
                 match content {
                     SnapshotContent::Text { text } => {
                         for line in split_text_lines(text) {
-                            if is_repl_tool_name(tool) && is_prompt_line(&line) {
+                            if is_repl_tool_name(tool)
+                                && prompt_line_matches_input(&line, input_lines)
+                            {
                                 continue;
                             }
                             lines.push(line);
@@ -1309,14 +1316,16 @@ fn split_text_lines(text: &str) -> Vec<String> {
     text.split('\n').map(|line| line.to_string()).collect()
 }
 
-fn is_prompt_line(line: &str) -> bool {
+fn prompt_line_matches_input(line: &str, input_lines: &[String]) -> bool {
     if line.is_empty() {
         return false;
     }
     if line.starts_with(' ') || line.starts_with('\t') {
         return false;
     }
-    strip_prompt_prefix(line).is_some()
+    strip_prompt_prefix(line)
+        .map(|rest| rest.trim().is_empty() || input_lines.iter().any(|input| rest == input))
+        .unwrap_or(false)
 }
 
 fn is_stderr_line(line: &str) -> bool {

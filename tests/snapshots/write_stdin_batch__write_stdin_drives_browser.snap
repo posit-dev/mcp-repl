@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> f <- function() { browser(); x <- 1; x <- x + 1; x }"
-    },
-    {
-      "type": "text",
       "text": "> "
     }
   ]
@@ -43,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> f()\nCalled from: f()"
+      "text": "Called from: f()"
     },
     {
       "type": "text",
@@ -67,7 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Browse[1]> n\ndebug at #1: x <- 1"
+      "text": "debug at #1: x <- 1"
     },
     {
       "type": "text",
@@ -91,7 +87,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Browse[1]> n\ndebug at #1: x <- x + 1"
+      "text": "debug at #1: x <- x + 1"
     },
     {
       "type": "text",
@@ -115,7 +111,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Browse[1]> c\n[1] 2"
+      "text": "[1] 2"
     },
     {
       "type": "text",

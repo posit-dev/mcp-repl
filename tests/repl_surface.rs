@@ -452,11 +452,14 @@ async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestR
 
     let matching_lines = text.matches("> 1 + 1\n").count();
     assert_eq!(
-        matching_lines, 1,
-        "expected only raw child text, not synthesized R input, got: {text:?}"
+        matching_lines, 2,
+        "expected raw child text plus retained generated echo, got: {text:?}"
     );
     let raw_child_line = text
         .find("> 1 + 1\n")
+        .expect("matching line count already checked");
+    let generated_echo_line = text
+        .rfind("> 1 + 1\n")
         .expect("matching line count already checked");
     let value_line = text
         .find("[1] 2")
@@ -464,6 +467,10 @@ async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestR
     assert!(
         raw_child_line < value_line,
         "expected raw child text to remain visible before later result, got: {text:?}"
+    );
+    assert!(
+        raw_child_line < generated_echo_line && generated_echo_line < value_line,
+        "expected generated echo to attribute the later result without replacing raw child text, got: {text:?}"
     );
 
     session.cancel().await?;

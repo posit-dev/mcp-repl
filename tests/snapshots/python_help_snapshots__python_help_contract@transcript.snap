@@ -5,26 +5,40 @@ expression: transcript
 == session: files ==
 1) py_repl timeout_ms=5000
 >>> help(len)
-<<< Help on built-in function len in module builtins:
+<<< >>> Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
 
 2) py_repl timeout_ms=5000
 >>> import pydoc; pydoc.help(len)
-<<< Help on built-in function len in module builtins:
+<<< >>> Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
 
 3) py_repl timeout_ms=1000
 >>> help()
-<<< <PYTHON HELP BANNER>
+<<< >>> Welcome to Python <VERSION>'s help utility! If this is your first time using
+<<< Python, you should definitely check out the tutorial at
+<<< https://docs.python.org/<VERSION>/tutorial/.
+<<<
+<<< Enter the name of any module, keyword, or topic to get help on writing
+<<< Python programs and using Python modules.  To get a list of available
+<<< modules, keywords, symbols, or topics, enter "modules", "keywords",
+<<< "symbols", or "topics".
+<<<
+<<< Each module also comes with a one-line summary of what it does; to list
+<<< the modules whose name or summary contain a given string such as "spam",
+<<< enter "modules spam".
+<<<
+<<< To quit this help utility and return to the interpreter,
+<<< enter "q", "quit" or "exit".
 <<< help>
 
 4) py_repl timeout_ms=1000
 >>> len
-<<< Help on built-in function len in module builtins:
+<<< help> Help on built-in function len in module builtins:
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
@@ -32,7 +46,7 @@ expression: transcript
 
 5) py_repl timeout_ms=1000
 >>> q
-<<<
+<<< help>
 <<< You are now leaving help and returning to the Python interpreter.
 <<< If you want to ask for help on a particular object directly from the
 <<< interpreter, you can type "help(object)".  Executing "help('string')"
@@ -40,4 +54,4 @@ expression: transcript
 
 6) py_repl timeout_ms=5000
 >>> 1+1
-<<< 2
+<<< >>> 2

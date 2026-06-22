@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> 1+1\n[1] 2"
+      "text": "[1] 2"
     },
     {
       "type": "text",

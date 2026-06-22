@@ -10,10 +10,6 @@ expression: serialized
       "response": {
         "content": [
           {
-            "type": "text",
-            "text": "> par(mfrow = c(2, 1)); plot(1:10); plot(10:1)\n"
-          },
-          {
             "type": "image",
             "data": "blake3:<multi_panel_plot>",
             "mimeType": "image/png"
@@ -45,7 +41,7 @@ expression: serialized
         "content": [
           {
             "type": "text",
-            "text": "> 1+1\n[1] 2\n"
+            "text": "[1] 2\n"
           },
           {
             "type": "text",

@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> browser()\nCalled from: top level "
+      "text": "Called from: top level "
     },
     {
       "type": "text",
@@ -43,10 +43,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Browse[1]> c"
-    },
-    {
-      "type": "text",
       "text": "> "
     }
   ]
@@ -67,7 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> 1+1\n[1] 2"
+      "text": "[1] 2"
     },
     {
       "type": "text",

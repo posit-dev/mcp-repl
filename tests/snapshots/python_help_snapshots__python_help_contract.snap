@@ -83,7 +83,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "help> Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
     },
     {
       "type": "text",
@@ -107,7 +107,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
+      "text": "help> \nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
     }
   ]
 }

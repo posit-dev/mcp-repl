@@ -10,10 +10,6 @@ expression: serialized
       "response": {
         "content": [
           {
-            "type": "text",
-            "text": "> plot(1:10)\n"
-          },
-          {
             "type": "image",
             "data": "blake3:<base_plot>",
             "mimeType": "image/png"
@@ -41,10 +37,6 @@ expression: serialized
       "input": "lines(4:8, 4:8)",
       "response": {
         "content": [
-          {
-            "type": "text",
-            "text": "> lines(4:8, 4:8)\n"
-          },
           {
             "type": "text",
             "text": "[repl] image update from previous request shown as a new image\n"
@@ -80,7 +72,7 @@ expression: serialized
         "content": [
           {
             "type": "text",
-            "text": "> 1+1\n[1] 2\n"
+            "text": "[1] 2\n"
           },
           {
             "type": "text",

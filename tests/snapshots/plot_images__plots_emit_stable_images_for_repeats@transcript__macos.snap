@@ -5,7 +5,6 @@ expression: transcript
 == transcript ==
 1) r_repl
 >>> plot(1:10)
-<<<
 <<< [image/png blake3:<base_plot>]
 === reference base_plot via Rscript --vanilla -
 === env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>
@@ -16,7 +15,6 @@ expression: transcript
 
 2) r_repl
 >>> plot(1:10)
-<<<
 <<< [image/png blake3:<base_plot>]
 === reference base_plot via Rscript --vanilla -
 === env MCP_REPL_TEST_PNG_DEST=<REFERENCE_PNG>

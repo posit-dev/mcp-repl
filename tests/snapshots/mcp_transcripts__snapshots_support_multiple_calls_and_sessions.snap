@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x <- 40 + 2"
-    },
-    {
-      "type": "text",
       "text": "> "
     }
   ]
@@ -43,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x\n[1] 42"
+      "text": "[1] 42"
     },
     {
       "type": "text",

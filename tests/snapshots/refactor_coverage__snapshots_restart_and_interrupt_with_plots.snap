@@ -48,13 +48,8 @@ response:
       "data_len": 0
     },
     {
-      "type": "image",
-      "mime_type": "image/png",
-      "data_len": 0
-    },
-    {
       "type": "text",
-      "text": "plots_done"
+      "text": "> cat(\"plots_done\\n\")\nplots_done"
     },
     {
       "type": "text",

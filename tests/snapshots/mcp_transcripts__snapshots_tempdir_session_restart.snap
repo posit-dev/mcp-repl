@@ -19,11 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> "
-    },
-    {
-      "type": "text",
-      "text": "> cat(\"TMPDIR_SET=\", nzchar(Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nTMPDIR_SET=TRUE"
+      "text": "TMPDIR_SET=TRUE"
     },
     {
       "type": "text",
@@ -35,95 +31,19 @@ response:
     },
     {
       "type": "text",
-      "text": "> marker <- file.path(tempdir(), \"mcp-repl-snapshot.txt\")"
+      "text": "> marker <- file.path(tempdir(), \"mcp-repl-snapshot.txt\")\n> tryCatch({\n+   writeLines(\"foo\", marker)\n+   cat(\"TEMPDIR_MARKER_OK\\n\")\n+ }, error = function(e) {\n+   message(\"TEMPDIR_MARKER_ERROR:\", conditionMessage(e))\n+ })\nTEMPDIR_MARKER_OK"
     },
     {
       "type": "text",
-      "text": "> tryCatch({"
+      "text": "> tf <- tempfile()\n> tryCatch({\n+   writeLines(\"bar\", tf)\n+   cat(\"TEMPFILE_OK\\n\")\n+ }, error = function(e) {\n+   message(\"TEMPFILE_ERROR:\", conditionMessage(e))\n+ })\nTEMPFILE_OK"
     },
     {
       "type": "text",
-      "text": "+   writeLines(\"foo\", marker)"
+      "text": "> unlink(tf)\n> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=mcp-repl-snapshot.txt"
     },
     {
       "type": "text",
-      "text": "+   cat(\"TEMPDIR_MARKER_OK\\n\")"
-    },
-    {
-      "type": "text",
-      "text": "+ }, error = function(e) {"
-    },
-    {
-      "type": "text",
-      "text": "+   message(\"TEMPDIR_MARKER_ERROR:\", conditionMessage(e))"
-    },
-    {
-      "type": "text",
-      "text": "+ })\nTEMPDIR_MARKER_OK"
-    },
-    {
-      "type": "text",
-      "text": "> tf <- tempfile()"
-    },
-    {
-      "type": "text",
-      "text": "> tryCatch({"
-    },
-    {
-      "type": "text",
-      "text": "+   writeLines(\"bar\", tf)"
-    },
-    {
-      "type": "text",
-      "text": "+   cat(\"TEMPFILE_OK\\n\")"
-    },
-    {
-      "type": "text",
-      "text": "+ }, error = function(e) {"
-    },
-    {
-      "type": "text",
-      "text": "+   message(\"TEMPFILE_ERROR:\", conditionMessage(e))"
-    },
-    {
-      "type": "text",
-      "text": "+ })\nTEMPFILE_OK"
-    },
-    {
-      "type": "text",
-      "text": "> unlink(tf)"
-    },
-    {
-      "type": "text",
-      "text": "> cat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nTEMPDIR_LIST=mcp-repl-snapshot.txt"
-    },
-    {
-      "type": "text",
-      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
-    },
-    {
-      "type": "text",
-      "text": "> tryCatch({"
-    },
-    {
-      "type": "text",
-      "text": "+   writeLines(\"root\", root_marker)"
-    },
-    {
-      "type": "text",
-      "text": "+   cat(\"ROOT_MARKER_OK\\n\")"
-    },
-    {
-      "type": "text",
-      "text": "+ }, error = function(e) {"
-    },
-    {
-      "type": "text",
-      "text": "+   message(\"ROOT_MARKER_ERROR:\", conditionMessage(e))"
-    },
-    {
-      "type": "text",
-      "text": "+ })\nROOT_MARKER_OK"
+      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")\n> tryCatch({\n+   writeLines(\"root\", root_marker)\n+   cat(\"ROOT_MARKER_OK\\n\")\n+ }, error = function(e) {\n+   message(\"ROOT_MARKER_ERROR:\", conditionMessage(e))\n+ })\nROOT_MARKER_OK"
     },
     {
       "type": "text",
@@ -170,15 +90,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> "
-    },
-    {
-      "type": "text",
-      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
-    },
-    {
-      "type": "text",
-      "text": "> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE"
+      "text": "ROOT_MARKER_EXISTS=FALSE"
     },
     {
       "type": "text",
@@ -229,15 +141,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> "
-    },
-    {
-      "type": "text",
-      "text": "> root_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-repl-snapshot-root.txt\")"
-    },
-    {
-      "type": "text",
-      "text": "> cat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\nROOT_MARKER_EXISTS=FALSE"
+      "text": "ROOT_MARKER_EXISTS=FALSE"
     },
     {
       "type": "text",

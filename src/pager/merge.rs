@@ -73,6 +73,22 @@ fn push_span_text(
     );
 }
 
+fn push_generated_echo(contents: &mut Vec<WorkerContent>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(WorkerContent::ContentText {
+        text: last_text,
+        stream: TextStream::Stdout,
+        origin: ContentOrigin::Worker,
+    }) = contents.last_mut()
+    {
+        last_text.push_str(text);
+        return;
+    }
+    contents.push(WorkerContent::worker_stdout(text.to_string()));
+}
+
 fn emit_text_range<S: TextSpanView>(
     contents: &mut Vec<WorkerContent>,
     bytes: &[u8],
@@ -168,6 +184,8 @@ pub(crate) fn merge_bytes_with_events_and_spans<E: EventView, S: TextSpanView>(
 ) -> Vec<WorkerContent> {
     let mut contents = Vec::new();
     let mut cursor = base_offset;
+    let mut previous_event_was_input_echo = false;
+    let mut saw_non_echo_output = false;
     for event in events
         .iter()
         .filter(|event| event.offset() >= base_offset && event.offset() <= end_offset)
@@ -175,7 +193,12 @@ pub(crate) fn merge_bytes_with_events_and_spans<E: EventView, S: TextSpanView>(
         if event.offset() > base_offset.saturating_add(bytes.len() as u64) {
             break;
         }
+        let pending_text_has_line_break =
+            range_contains_line_break(bytes, base_offset, cursor, event.offset());
         if event.offset() > cursor {
+            if pending_text_has_line_break {
+                saw_non_echo_output = true;
+            }
             emit_text_range(
                 &mut contents,
                 bytes,
@@ -184,12 +207,42 @@ pub(crate) fn merge_bytes_with_events_and_spans<E: EventView, S: TextSpanView>(
                 event.offset(),
                 spans,
             );
+            previous_event_was_input_echo = false;
         }
-        contents.push(event_to_content(event.kind()));
+        match event.kind() {
+            OutputEventKind::InputEcho { .. } if !saw_non_echo_output => {}
+            OutputEventKind::InputEcho { text } if previous_event_was_input_echo => {
+                push_generated_echo(&mut contents, text);
+            }
+            kind @ OutputEventKind::InputEcho { .. } => {
+                contents.push(event_to_content(kind));
+                previous_event_was_input_echo = true;
+            }
+            kind => {
+                contents.push(event_to_content(kind));
+                previous_event_was_input_echo = false;
+                saw_non_echo_output = true;
+            }
+        }
         cursor = event.offset();
     }
     if cursor < end_offset {
         emit_text_range(&mut contents, bytes, base_offset, cursor, end_offset, spans);
     }
     contents
+}
+
+fn range_contains_line_break(
+    bytes: &[u8],
+    base_offset: u64,
+    start_offset: u64,
+    end_offset: u64,
+) -> bool {
+    let start = start_offset
+        .saturating_sub(base_offset)
+        .min(bytes.len() as u64) as usize;
+    let end = end_offset
+        .saturating_sub(base_offset)
+        .min(bytes.len() as u64) as usize;
+    start < end && bytes[start..end].contains(&b'\n')
 }
