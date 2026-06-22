@@ -421,13 +421,15 @@ fn run_python_cell(api: &'static PythonApi, source: &str) {
 
 fn finish_cell_request() -> Result<(), String> {
     let api = PythonApi::global();
-    let preserve_pending_stdin = {
+    let preserve_python_stdin = {
         let _gil = GilGuard::acquire();
         clear_python_stdin_buffers(api)?
     };
     let state = session_state();
     let emit_ready = {
         let mut guard = state.inner.lock().unwrap();
+        let preserve_pending_stdin =
+            preserve_python_stdin || guard.input_queue.has_pending_raw_stdin_owner();
         guard.cell_running = false;
         guard
             .input_queue
@@ -664,7 +666,10 @@ fn read_queue_line(
     }
 }
 
-fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_queue_raw_bytes(
+    size: usize,
+    background_reader: bool,
+) -> Result<Vec<u8>, RawStdinReadError> {
     if size == 0 {
         return Ok(Vec::new());
     }
@@ -707,6 +712,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 }
                 let remaining = size - output.len();
                 if let Some(read) = guard.input_queue.consume_bytes(remaining) {
+                    guard.input_queue.note_raw_stdin_read(background_reader);
                     let emit_input_line = guard.request_active;
                     guard.visible_input_prompt = None;
                     guard.request_active = true;
@@ -952,20 +958,29 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
 }
 
 #[cfg(target_family = "unix")]
-fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_raw_stdin_bytes(
+    size: usize,
+    background_reader: bool,
+) -> Result<Vec<u8>, RawStdinReadError> {
     if ipc::worker_ipc_disabled_for_process() {
         return Ok(Vec::new());
     }
-    read_queue_raw_bytes(size)
+    read_queue_raw_bytes(size, background_reader)
 }
 
 #[cfg(windows)]
-fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
-    read_queue_raw_bytes(size)
+fn read_raw_stdin_bytes(
+    size: usize,
+    background_reader: bool,
+) -> Result<Vec<u8>, RawStdinReadError> {
+    read_queue_raw_bytes(size, background_reader)
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
-fn read_raw_stdin_bytes(_size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_raw_stdin_bytes(
+    _size: usize,
+    _background_reader: bool,
+) -> Result<Vec<u8>, RawStdinReadError> {
     Ok(Vec::new())
 }
 
@@ -1214,18 +1229,22 @@ unsafe extern "C" fn py_write_bytes(_self: *mut PyObject, args: *mut PyObject) -
 
 unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
     let api = PythonApi::global();
-    if api.tuple_size(args) != 1 {
-        set_callback_error("raw_stdin_read expects exactly one argument");
+    if api.tuple_size(args) != 2 {
+        set_callback_error("raw_stdin_read expects exactly two arguments");
         return ptr::null_mut();
     }
     let Some(size) = api.long_arg(args, 0) else {
         return ptr::null_mut();
     };
+    let background_reader = unsafe {
+        let item = (api.py_tuple_get_item)(args, 1);
+        (api.py_object_is_true)(item) == 1
+    };
     let Ok(size) = usize::try_from(size) else {
         set_callback_error("raw_stdin_read size must be non-negative");
         return ptr::null_mut();
     };
-    let bytes = match read_raw_stdin_bytes(size) {
+    let bytes = match read_raw_stdin_bytes(size, background_reader) {
         Ok(bytes) => bytes,
         Err(RawStdinReadError::Interrupted) => {
             api.set_interrupt();

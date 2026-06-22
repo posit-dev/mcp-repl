@@ -5,6 +5,7 @@ pub(crate) struct PythonInputQueue {
     payloads: VecDeque<String>,
     stdin_bytes: VecDeque<u8>,
     active_read_consumer: bool,
+    pending_raw_stdin_owner: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -18,6 +19,7 @@ impl PythonInputQueue {
             payloads: VecDeque::new(),
             stdin_bytes: VecDeque::new(),
             active_read_consumer: false,
+            pending_raw_stdin_owner: false,
         }
     }
 
@@ -31,6 +33,7 @@ impl PythonInputQueue {
         }
         let payload = self.payloads.pop_front()?;
         self.stdin_bytes.clear();
+        self.pending_raw_stdin_owner = false;
         Some(payload)
     }
 
@@ -40,6 +43,14 @@ impl PythonInputQueue {
 
     pub(crate) fn has_buffered_stdin_data(&self) -> bool {
         self.stdin_bytes.iter().any(|byte| *byte != b'\n')
+    }
+
+    pub(crate) fn has_pending_raw_stdin_owner(&self) -> bool {
+        self.pending_raw_stdin_owner
+    }
+
+    pub(crate) fn note_raw_stdin_read(&mut self, background_reader: bool) {
+        self.pending_raw_stdin_owner = background_reader && self.has_buffered_stdin_data();
     }
 
     pub(crate) fn begin_read_consumer(&mut self) -> bool {
@@ -58,10 +69,11 @@ impl PythonInputQueue {
         self.payloads.clear();
         self.stdin_bytes.clear();
         self.active_read_consumer = false;
+        self.pending_raw_stdin_owner = false;
     }
 
     pub(crate) fn clear_after_cell_finish(&mut self, preserve_pending_stdin: bool) {
-        if !self.active_read_consumer && !preserve_pending_stdin {
+        if !self.active_read_consumer && !self.pending_raw_stdin_owner && !preserve_pending_stdin {
             self.stdin_bytes.clear();
         }
     }
@@ -85,6 +97,9 @@ impl PythonInputQueue {
             .stdin_bytes
             .drain(..byte_count.min(self.stdin_bytes.len()))
             .collect::<Vec<_>>();
+        if !self.has_buffered_stdin_data() {
+            self.pending_raw_stdin_owner = false;
+        }
         Some(RuntimeStdinRead { protocol_bytes })
     }
 

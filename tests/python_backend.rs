@@ -2108,6 +2108,114 @@ print("DETACHED_TEXT_PAIR_MAIN_DONE", flush=True)
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_detached_sys_stdin_partial_read_blocks_fresh_cell_until_drained() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+    let temp_dir = tempdir()?;
+    let first_path = temp_dir.path().join("first-text-byte-before-fresh");
+    let release_path = temp_dir.path().join("release-text-reader-before-fresh");
+    let first_path_literal = serde_json::to_string(
+        first_path
+            .to_str()
+            .ok_or("first text byte path must be valid utf-8")?,
+    )?;
+    let release_path_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("text reader release path must be valid utf-8")?,
+    )?;
+
+    let first = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import pathlib, sys, threading, time
+first_path = pathlib.Path({first_path_literal})
+release_path = pathlib.Path({release_path_literal})
+def read_pair():
+    time.sleep(0.2)
+    print("DETACHED_TEXT_STALE_PAIR_WAITING", flush=True)
+    first = sys.stdin.read(1)
+    first_path.write_text(first)
+    while not release_path.exists():
+        time.sleep(0.01)
+    second = sys.stdin.read(1)
+    print("DETACHED_TEXT_STALE_PAIR", first + second, flush=True)
+threading.Thread(target=read_pair, daemon=True).start()
+print("DETACHED_TEXT_STALE_MAIN_DONE", flush=True)
+"#
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_TEXT_STALE_MAIN_DONE"),
+        "expected main cell to finish before detached sys.stdin reads, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_TEXT_STALE_PAIR_WAITING")
+    {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_TEXT_STALE_PAIR_WAITING"),
+        "expected detached sys.stdin reader to start before answer input, got: {wait_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("xy", Some(1.0))
+        .await?;
+    let mut text = result_text(&answer);
+    wait_for_file_text(&first_path, "x").await?;
+
+    let fresh = session
+        .write_stdin_raw_with(
+            r#"import sys
+value = sys.stdin.read(1)
+print("DETACHED_TEXT_STALE_FRESH", value)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let fresh_text = result_text(&fresh);
+    assert!(
+        !fresh_text.contains("DETACHED_TEXT_STALE_FRESH"),
+        "fresh cell consumed detached sys.stdin buffered answer bytes: {fresh_text:?}"
+    );
+
+    fs::write(&release_path, "go")?;
+    text.push_str(&fresh_text);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !text.contains("DETACHED_TEXT_STALE_PAIR xy") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        text.contains("DETACHED_TEXT_STALE_PAIR xy"),
+        "expected detached sys.stdin reader to keep the second answer byte, got: {text:?}"
+    );
+    assert!(
+        !text.contains("DETACHED_TEXT_STALE_FRESH"),
+        "fresh cell ran before detached sys.stdin drained buffered answer bytes: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_detached_raw_stdin_partial_read_preserves_answer_bytes() -> TestResult<()> {
@@ -2180,6 +2288,83 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
     assert!(
         text.contains("DETACHED_RAW_PAIR_DELAYED xy"),
         "expected detached raw stdin reader to keep the second answer byte, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_foreground_raw_stdin_partial_read_does_not_preserve_for_unrelated_thread()
+-> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir.path().join("release-unrelated-raw-reader");
+    let release_path_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("raw reader release path must be valid utf-8")?,
+    )?;
+
+    let first = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os, pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
+def unrelated_reader():
+    while not release_path.exists():
+        time.sleep(0.01)
+    data = os.read(0, 1)
+    print("UNRELATED_RAW_READ", data.decode("utf-8"), flush=True)
+threading.Thread(target=unrelated_reader, daemon=True).start()
+data = os.read(0, 1)
+print("FOREGROUND_RAW_READ", data.decode("utf-8"), flush=True)
+"#
+            ),
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected foreground raw read to wait for input, got: {first_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("xy", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("FOREGROUND_RAW_READ x"),
+        "expected foreground raw read to consume first byte, got: {answer_text:?}"
+    );
+
+    fs::write(&release_path, "go")?;
+    let mut text = String::new();
+    let steal_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < steal_deadline && !text.contains("UNRELATED_RAW_READ") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+    assert!(
+        !text.contains("UNRELATED_RAW_READ y"),
+        "unrelated background reader consumed preserved foreground raw stdin bytes: {text:?}"
+    );
+
+    let fresh = session
+        .write_stdin_raw_unterminated_with("z", Some(5.0))
+        .await?;
+    text.push_str(&result_text(&fresh));
+    session.cancel().await?;
+
+    assert!(
+        text.contains("UNRELATED_RAW_READ z"),
+        "expected unrelated reader to wait for fresh stdin, got: {text:?}"
     );
     Ok(())
 }
