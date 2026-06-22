@@ -15,7 +15,7 @@
 ## Current Direction
 
 - Phase 1 fixed the visible R plot/image ordering bug in server-side timeline processing.
-- The server now uses existing sideband facts to anchor image events before later echoed input and its later stdout, without adding new IPC protocol fields.
+- The server now uses existing sideband facts to anchor image events before later input metadata and stdout, without adding new IPC protocol fields.
 - The broader R-worker/server-completion simplification remains separate future work.
 
 ## Phase Status

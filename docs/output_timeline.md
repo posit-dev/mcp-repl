@@ -42,8 +42,8 @@ changes what must stay buffered between tool calls.
 
 - `src/output_capture.rs` stores text in the global output ring and stores image
   or server-status events at byte offsets within that ring.
-- `src/worker_process.rs` reads ranges from that ring, collapses echoed input,
-  and then asks `src/pager/` to page the resulting mixed text/image stream.
+- `src/worker_process.rs` reads ranges from that ring and then asks
+  `src/pager/` to page the resulting mixed text/image stream.
 
 ## Timeline vs completion
 
@@ -51,8 +51,8 @@ The important design split is not "files mode vs pager mode". It is:
 
 - timeline resolution: reconstruct the visible output order from text plus
   sideband facts
-- completion cleanup: once the server knows a request has finished, trim echoed
-  input, append protocol warnings, and restore the final prompt
+- completion cleanup: once the server knows a request has finished, append
+  protocol warnings and restore the final prompt
 
 Timeline resolution must not depend on request completion. For example, the
 server does not need to wait for completion to know that an `output_image` event
@@ -60,40 +60,33 @@ belongs before later worker-owned output. That ordering fact is already present
 in the mixed timeline.
 
 Completion matters only for reply cleanup choices that are unsafe while a
-request is still in flight. In particular:
-
-- timed-out or otherwise non-final drains must preserve echoed input so the user
-  can still see what is running
-- completed replies may trim or drop echo-only raw terminal content once the
-  server knows the request is settled
+request is still in flight. In particular, timed-out or otherwise non-final
+drains must still preserve runtime output so the user can see what is running.
 
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
 
-Echo matching must be driven by the sideband facts themselves:
+Input sideband events are structural metadata:
 
 - `input_line` describes the exact prompt text and input line the worker
   delivered to the runtime
 - `input_wait` supplies the prompt text for worker readiness and completed
   input batches
-- the server should match and collapse those exact sideband facts
+- the server should not render submitted input merely because it received
+  `input_line`
 - the server should not parse visible output looking for prompt shapes such as
   `>`, `...`, or `Browse[n]>`
 
-That matching is only opportunistic:
+Raw and sideband-owned output remain authoritative:
 
 - raw stdout/stderr remains authoritative for text that did not arrive through
   `output_text`
 - raw PTY output is authoritative for the bytes seen on the terminal stream,
   but it is not authoritative for separate stdout/stderr stream identity
 - forked children, spawned subprocesses, or other writers may interleave with
-  or corrupt what would otherwise have been a clean echoed line
-- if exact sideband-to-stdout matching fails or becomes ambiguous, the server
-  should degrade softly to raw captured stdout/stderr for that region, without
-  eliding echo or inventing a cleaned-up transcript
-- sideband-first carryover is source-aware: when a backend adapter records an
-  echo source, carryover only trims later text from that same source. Prompt
-  spelling must not decide the source.
+  runtime output
+- if output text resembles submitted input, the server still preserves it; output
+  is output
 
 ## Ownership split
 
@@ -129,8 +122,7 @@ the same thing as "execution order in the backend".
 
 - `src/output_capture.rs`: pager-mode output ring and event storage.
 - `src/pending_output_tape.rs`: files-mode mixed event tape.
-- `src/worker_process.rs`: request completion, echo suppression, and reply
-  assembly.
+- `src/worker_process.rs`: request completion and reply assembly.
 - `src/ipc.rs`: sideband event intake and per-request IPC bookkeeping.
 - `docs/worker_sideband_protocol.md`: wire-level IPC contract.
 

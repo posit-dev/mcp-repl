@@ -376,7 +376,7 @@ mod tests {
     use crate::worker_process::test_support::contents_text;
 
     #[test]
-    fn interrupt_files_drains_settled_completion_without_leaking_echo() {
+    fn interrupt_files_drains_settled_completion_preserving_matching_output() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -390,7 +390,6 @@ mod tests {
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
             prompt_variants: Some(vec![">>> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -405,8 +404,8 @@ mod tests {
             "expected the settled completion output to be preserved, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.07)"),
-            "did not expect the settled completion echo to leak through interrupt handling, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.07)"),
+            "expected settled completion output matching submitted input to remain visible through interrupt handling, got: {text:?}"
         );
         assert!(
             text.contains(">>> "),

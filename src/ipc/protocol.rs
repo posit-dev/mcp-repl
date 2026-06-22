@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 
 pub const WORKER_PROTOCOL_VERSION: u32 = 6;
@@ -74,10 +73,9 @@ pub struct WorkerCapabilities {
 }
 
 #[derive(Debug, Clone)]
-pub struct IpcEchoEvent {
+pub struct IpcInputLineEvent {
     pub prompt: String,
     pub line: String,
-    pub source: OutputTextSource,
 }
 
 #[derive(Clone)]
@@ -102,7 +100,7 @@ pub struct IpcHandlers {
     pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
     pub on_output_image: Option<Arc<dyn Fn(IpcOutputImage) + Send + Sync>>,
     pub on_input_wait: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
+    pub on_input_line: Option<Arc<dyn Fn(IpcInputLineEvent) + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 

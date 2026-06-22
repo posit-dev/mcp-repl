@@ -2748,7 +2748,7 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_files_mode()
+async fn python_follow_up_after_resolved_timeout_does_not_synthesize_input_in_files_mode()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -2798,7 +2798,7 @@ async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_f
     );
     assert!(
         !follow_up_text.contains("import time; time.sleep(0.2); print('DETACHED_OK')"),
-        "did not expect the timed-out Python echo to leak into the next visible reply, got: {follow_up_text:?}"
+        "did not expect timed-out Python source to be synthesized into the next visible reply, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3477,6 +3477,29 @@ async fn python_cell_final_expression_displays_after_block() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_cell_final_expression_matching_input_remains_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("2", Some(5.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected final-expression cell to finish in one request, got: {text:?}"
+    );
+    assert_eq!(
+        text.trim(),
+        "2",
+        "expected displayhook output matching the input to be preserved, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_incomplete_code_reports_error_not_continuation() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -3669,7 +3692,7 @@ async fn python_cell_custom_input_loop_consumes_follow_up_stdin() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
+async fn python_multiline_block_does_not_synthesize_input_in_visible_reply() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3681,7 +3704,7 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     let text = result_text(&result);
     if is_busy_response(&text) {
         eprintln!(
-            "python_multiline_block_does_not_echo_input_in_visible_reply remained busy; skipping"
+            "python_multiline_block_does_not_synthesize_input_in_visible_reply remained busy; skipping"
         );
         session.cancel().await?;
         return Ok(());
@@ -3693,11 +3716,11 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     assert!(visible.contains("3"), "expected 3, got: {visible:?}");
     assert!(
         !visible.contains("def f():"),
-        "did not expect the multiline function definition to echo back, got: {visible:?}"
+        "did not expect the multiline function definition to be synthesized into output, got: {visible:?}"
     );
     assert!(
         !visible.contains("return 3"),
-        "did not expect the multiline body to echo back, got: {visible:?}"
+        "did not expect the multiline body to be synthesized into output, got: {visible:?}"
     );
     Ok(())
 }

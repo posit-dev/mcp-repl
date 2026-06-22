@@ -34,6 +34,10 @@ expression: transcript
 <<< alpha line 19
 <<< alpha line 20
 <<< alpha line 21
+<<< [pager] elided output: @293..839
+<<< [image/png len=0]
+<<< [pager] elided output: @839..1610
+<<< [image/png len=0]
 <<< --More-- (Np, 12.0%, @0..293/2441)
 
 2) r_repl timeout_ms=10000

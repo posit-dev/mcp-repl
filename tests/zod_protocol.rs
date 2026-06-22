@@ -356,7 +356,7 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
     );
     assert!(
         !text.contains("v5> hello v5"),
-        "default reply must elide synthetic input_line echo, got: {text:?}"
+        "default reply must not render structural input_line metadata, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_batch input=hello v5")?;
@@ -673,7 +673,8 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_elided() -> TestResult<()> {
+async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_not_rendered() -> TestResult<()>
+{
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;

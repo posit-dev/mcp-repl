@@ -27,14 +27,14 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcHandle, IpcInputLineEvent, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcOutputImage};
 use crate::output_capture::OutputTimeline;
 use crate::oversized_output::OversizedOutputMode;
-use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind, PendingTextSource};
+use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, prepare_worker_command_with_managed_network,
 };
@@ -748,7 +748,6 @@ impl WorkerProcess {
         } else {
             live_output
         };
-        let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -811,13 +810,12 @@ impl WorkerProcess {
                 on_input_wait: Some(Arc::new(move |prompt: String| {
                     sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
-                on_readline_result: {
+                on_input_line: {
                     let sideband_capture = live_output.clone();
-                    Some(Arc::new(move |event: IpcEchoEvent| {
+                    Some(Arc::new(move |event: IpcInputLineEvent| {
                         sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                             prompt: event.prompt,
                             line: event.line,
-                            echo_source: readline_echo_source,
                         });
                     }))
                 },
@@ -2386,10 +2384,7 @@ fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSource,
-    };
-    use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
+    use crate::output_capture::{OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing};
     use crate::pending_output_tape::{PendingOutputEvent, PendingOutputTape};
     use crate::worker_protocol::WorkerContent;
     use base64::Engine as _;
@@ -2398,14 +2393,6 @@ mod tests {
     fn env_test_mutex() -> &'static Mutex<()> {
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
-    }
-
-    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
-        IpcEchoEvent {
-            prompt: prompt.to_string(),
-            line: line.to_string(),
-            source: OutputTextSource::Raw,
-        }
     }
 
     fn capture_with_ring(
@@ -2779,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn files_output_capture_anchors_update_notice_before_late_echo() {
+    fn files_output_capture_anchors_update_notice_before_late_prompt_shaped_text() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
         let capture = LiveOutputCapture::new(
@@ -2791,7 +2778,6 @@ mod tests {
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
-            echo_source: PendingTextSource::Raw,
         });
         capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
@@ -2818,6 +2804,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
+                WorkerContent::stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }
@@ -2845,11 +2832,10 @@ mod tests {
             on_input_wait: Some(Arc::new(move |prompt| {
                 wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
-            on_readline_result: Some(Arc::new(move |event| {
+            on_input_line: Some(Arc::new(move |event| {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                     prompt: event.prompt,
                     line: event.line,
-                    echo_source: PendingTextSource::Ipc,
                 });
             })),
             on_output_image: Some(Arc::new(move |image| {
@@ -2980,23 +2966,17 @@ mod tests {
             .events
             .iter()
             .find_map(|event| match &event.kind {
-                OutputEventKind::Image {
-                    id,
-                    mime_type,
-                    readline_results_seen,
-                    ..
-                } => Some((event.offset, id, mime_type, readline_results_seen)),
+                OutputEventKind::Image { id, mime_type, .. } => Some((event.offset, id, mime_type)),
                 _ => None,
             })
             .expect("timeline image event");
         assert_eq!(image_event.0, b"before\n".len() as u64);
         assert!(image_event.1.starts_with("image-"));
         assert_eq!(image_event.2, "image/png");
-        assert_eq!(*image_event.3, 1);
     }
 
     #[test]
-    fn pager_output_capture_anchors_update_notice_before_late_echo() {
+    fn pager_output_capture_preserves_update_notice_image_and_late_raw_text() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
@@ -3015,19 +2995,7 @@ mod tests {
         capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let end = output_ring.end_offset();
-        let collapsed = collapse_echo_with_attribution(
-            output_ring.read_range(0, end),
-            &[raw_echo_event("> ", "lines(4:8, 4:8)\n")],
-            0,
-            &["> ".to_string()],
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let contents = crate::pager::contents_from_collapsed_output(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end,
-        );
+        let contents = crate::pager::contents_from_output_range(output_ring.read_range(0, end));
 
         assert_eq!(
             contents,
@@ -3039,6 +3007,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }

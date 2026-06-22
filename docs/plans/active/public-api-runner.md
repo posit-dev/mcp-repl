@@ -72,4 +72,4 @@
 - 2026-06-18: Migrated workspace-write network block/allow coverage into the external runner and removed the duplicate Unix Rust integration cases.
 - 2026-06-18: Migrated the basic Python console smoke check into the external runner and removed the duplicate Rust integration case.
 - 2026-06-18: Migrated the Python busy-input discard check into the external runner and removed the duplicate Rust integration case.
-- 2026-06-18: Migrated the R `write_stdin` multiple-call, timeout-polling, error-recovery, huge echo-only, and files-mode echo-trimming cases into the external runner and removed the duplicate Rust integration cases.
+- 2026-06-18: Migrated the R `write_stdin` multiple-call, timeout-polling, error-recovery, huge input-only, and files-mode submitted-input transcript cases into the external runner and removed the duplicate Rust integration cases.

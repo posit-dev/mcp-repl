@@ -15,7 +15,6 @@ pub(super) struct WriteDispatchInput {
     pub(super) server_timeout: Duration,
     pub(super) deferred_sandbox_state_update: Option<SandboxStateUpdate>,
     pub(super) page_bytes: u64,
-    pub(super) echo_input: bool,
     pub(super) process_prechecked: bool,
 }
 
@@ -64,9 +63,7 @@ impl WorkerManager {
     fn prepare_write_dispatch_input_context(&mut self, input: &WriteDispatchInput) -> InputContext {
         match input.mode {
             WriteStdinMode::Files => self.prepare_input_context_files(),
-            WriteStdinMode::Pager => {
-                self.prepare_input_context_pager(&input.text, input.echo_input)
-            }
+            WriteStdinMode::Pager => self.prepare_input_context_pager(),
         }
     }
 

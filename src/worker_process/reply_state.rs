@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::completion_reply::{ReplyWithOffset, idle_status_content};
-use crate::output_capture::set_last_reply_marker_offset;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::reply_presentation::{append_prompt_if_missing, normalize_prompt};
@@ -122,9 +121,7 @@ impl WorkerManager {
     }
 
     pub(super) fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
-            set_last_reply_marker_offset(reply.end_offset);
-        }
+        let _ = reply.end_offset;
         reply.reply
     }
 

@@ -5,8 +5,7 @@ use std::time::Duration;
 use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::{CompletionInfo, PagerCompletionPrompt};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring,
-    reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring, reset_output_ring,
 };
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
@@ -203,7 +202,6 @@ impl WorkerManager {
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
-            reset_last_reply_marker_offset();
             OutputTimeline::new(output_ring)
         };
         Ok(Self {

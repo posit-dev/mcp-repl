@@ -43,10 +43,6 @@ response:
   "is_error": false,
   "content": [
     {
-      "type": "text",
-      "text": "[repl] input: .... [TRUNCATED]"
-    },
-    {
       "type": "image",
       "mime_type": "image/png",
       "data_len": 0

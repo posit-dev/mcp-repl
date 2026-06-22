@@ -18,7 +18,7 @@ pub use emit::{
     worker_ipc_disabled_for_process,
 };
 pub use protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
+    IpcHandlers, IpcInputLineEvent, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
     WORKER_PROTOCOL_VERSION, WorkerCapabilities, WorkerIdentity, WorkerProtocol,
     WorkerToServerIpcMessage,
 };

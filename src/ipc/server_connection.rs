@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 
 use crate::input_state::InputState;
-use crate::output_capture::OutputTextSource;
 
 use super::protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
+    IpcHandlers, IpcInputLineEvent, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
     WorkerToServerIpcMessage,
 };
 use super::transport::IpcTransport;
@@ -27,7 +26,7 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     last_prompt_observed_at: Option<Instant>,
     prompt_history: VecDeque<String>,
-    echo_events: VecDeque<IpcEchoEvent>,
+    input_line_events: VecDeque<IpcInputLineEvent>,
     input_state: InputState,
     readline_result_count: usize,
     current_image_id: Option<String>,
@@ -84,7 +83,7 @@ impl ServerIpcConnection {
         let output_text_handler = handlers.on_output_text.clone();
         let output_image_handler = handlers.on_output_image.clone();
         let input_wait_handler = handlers.on_input_wait.clone();
-        let readline_result_handler = handlers.on_readline_result.clone();
+        let input_line_handler = handlers.on_input_line.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
         let writer = OutputCriticalIpcWriter::new(writer);
@@ -150,10 +149,9 @@ impl ServerIpcConnection {
                 }
                 match message {
                     WorkerToServerIpcMessage::InputLine { prompt, text } => {
-                        let echo_event = IpcEchoEvent {
+                        let input_line_event = IpcInputLineEvent {
                             prompt: prompt.clone(),
                             line: text.clone(),
-                            source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) = guard.input_state.validate_active_input("input_line") {
@@ -163,11 +161,11 @@ impl ServerIpcConnection {
                         }
                         guard.readline_result_count = guard.readline_result_count.saturating_add(1);
                         push_prompt_history(&mut guard, prompt);
-                        guard.echo_events.push_back(echo_event.clone());
+                        guard.input_line_events.push_back(input_line_event.clone());
                         reader_cvar.notify_all();
                         drop(guard);
-                        if let Some(handler) = readline_result_handler.as_ref() {
-                            handler(echo_event);
+                        if let Some(handler) = input_line_handler.as_ref() {
+                            handler(input_line_event);
                         }
                     }
                     WorkerToServerIpcMessage::InputWait { prompt } => {
@@ -344,7 +342,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.echo_events.clear();
+        guard.input_line_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
     }
@@ -354,7 +352,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         guard.input_state.begin_input()?;
-        guard.echo_events.clear();
+        guard.input_line_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
         Ok(())
@@ -381,7 +379,7 @@ impl ServerIpcConnection {
                     .input_state
                     .begin_input()
                     .map_err(IpcWaitError::Protocol)?;
-                guard.echo_events.clear();
+                guard.input_line_events.clear();
                 guard.prompt_history.clear();
                 guard.protocol_warnings.clear();
                 return Ok(());
@@ -410,14 +408,9 @@ impl ServerIpcConnection {
         guard.prompt_history.drain(..).collect()
     }
 
-    pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.echo_events.drain(..).collect()
-    }
-
-    pub fn pending_echo_event_count(&self) -> usize {
+    pub fn pending_input_line_event_count(&self) -> usize {
         let guard = self.inbox.lock().unwrap();
-        guard.echo_events.len()
+        guard.input_line_events.len()
     }
 
     pub fn take_protocol_warnings(&self) -> Vec<String> {

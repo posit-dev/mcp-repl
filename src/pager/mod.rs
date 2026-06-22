@@ -33,8 +33,6 @@ const PAGER_PAGE_BYTES_ENV: &str = "MCP_REPL_PAGER_PAGE_BYTES";
 
 const DEFAULT_PAGER_PAGE_CHARS: u64 = 3_500;
 const MIN_PAGER_PAGE_CHARS: u64 = 64;
-const INPUT_ECHO_MAX_CHARS: usize = 40;
-const INPUT_ECHO_TRUNC_SUFFIX: &str = ".... [TRUNCATED]";
 const DEFAULT_MATCH_LIMIT: usize = 50;
 const MAX_MATCH_LIMIT: usize = 500;
 const DEFAULT_MATCH_CONTEXT: usize = 0;
@@ -136,11 +134,12 @@ impl PagerBuffer {
         }
     }
 
-    /// Construct a pager buffer from already-collapsed text and event offsets expressed in byte
+    /// Construct a pager buffer from text and event offsets expressed in byte
     /// indices within `bytes`.
     ///
     /// `source_end` tracks the worker output ring offset consumed for this buffer, so the pager
     /// can later append any new output that arrives while pager mode is active.
+    #[cfg(test)]
     pub(crate) fn from_bytes_and_events(
         bytes: Vec<u8>,
         events: Vec<(u64, OutputEventKind)>,
@@ -1636,7 +1635,8 @@ pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerConten
     buffer.contents_for_range(0, buffer.len())
 }
 
-pub(crate) fn contents_from_collapsed_output(
+#[cfg(test)]
+pub(crate) fn contents_from_bytes_and_events(
     bytes: Vec<u8>,
     events: Vec<(u64, OutputEventKind)>,
     text_spans: Vec<crate::output_capture::OutputTextSpan>,
@@ -2149,31 +2149,6 @@ pub(crate) fn resolve_page_bytes(override_bytes: Option<u64>) -> u64 {
         .max(MIN_PAGER_PAGE_CHARS)
 }
 
-pub(crate) fn build_input_echo(input: &str) -> Option<String> {
-    let normalized = input.replace("\r\n", "\n");
-    let trimmed = normalized.trim_end_matches('\n').trim_end();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut lines = trimmed.lines();
-    let first_line = lines.next().unwrap_or_default().trim_end();
-    let remaining_lines = lines.next().is_some();
-    let mut summary: String = first_line.chars().take(INPUT_ECHO_MAX_CHARS).collect();
-    let needs_truncate = remaining_lines || first_line.chars().count() > INPUT_ECHO_MAX_CHARS;
-    if needs_truncate {
-        summary.push_str(INPUT_ECHO_TRUNC_SUFFIX);
-    }
-
-    // Avoid a `> ` prefix here: it is indistinguishable from the backend prompt in transcripts.
-    let prefix = "[repl] input: ";
-    let mut echo = String::with_capacity(prefix.len() + summary.len() + 1);
-    echo.push_str(prefix);
-    echo.push_str(&summary);
-    echo.push('\n');
-    Some(echo)
-}
-
 fn pages_left_for_buffer(buffer: &PagerBuffer, page_bytes: u64) -> u64 {
     pages_left(
         buffer,
@@ -2396,7 +2371,6 @@ mod tests {
                     data: "a".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
-                    readline_results_seen: 0,
                 },
             },
             OutputEvent {
@@ -2406,7 +2380,6 @@ mod tests {
                     data: "b".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
-                    readline_results_seen: 0,
                 },
             },
             OutputEvent {
@@ -2416,7 +2389,6 @@ mod tests {
                     data: "c".to_string(),
                     mime_type: "image/png".to_string(),
                     is_new: true,
-                    readline_results_seen: 0,
                 },
             },
         ];
@@ -3990,11 +3962,11 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_output_replay_preserves_server_origin() {
+    fn buffer_replay_preserves_server_origin() {
         let server_line = "[repl] session ended\n";
         let worker_line = "worker output\n";
         let bytes = format!("{server_line}{worker_line}").into_bytes();
-        let contents = contents_from_collapsed_output(
+        let contents = contents_from_bytes_and_events(
             bytes,
             vec![(
                 0,
@@ -4002,7 +3974,6 @@ mod tests {
                     text: "[repl] output truncated (older output dropped)\n".to_string(),
                     is_stderr: false,
                     origin: ContentOrigin::Server,
-                    readline_results_seen: None,
                 },
             )],
             vec![
@@ -4030,7 +4001,7 @@ mod tests {
                 WorkerContent::ContentText { text, origin, .. }
                     if text.contains(server_line) && matches!(origin, ContentOrigin::Server)
             )),
-            "expected collapsed replay to preserve server-originated pager text, got: {:?}",
+            "expected replay to preserve server-originated pager text, got: {:?}",
             contents
         );
         assert!(
@@ -4039,7 +4010,7 @@ mod tests {
                 WorkerContent::ContentText { text, origin, .. }
                     if text.contains("output truncated") && matches!(origin, ContentOrigin::Server)
             )),
-            "expected collapsed replay to preserve server-originated text events, got: {:?}",
+            "expected replay to preserve server-originated text events, got: {:?}",
             contents
         );
     }
