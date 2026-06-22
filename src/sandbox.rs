@@ -593,7 +593,7 @@ fn codex_path_from_file_url(value: &str) -> Result<PathBuf, String> {
             .strip_prefix('/')
             .filter(|stripped| stripped.len() >= 2 && stripped.as_bytes()[1] == b':')
             .unwrap_or(&path);
-        return Ok(PathBuf::from(path.replace('/', "\\")));
+        Ok(PathBuf::from(path.replace('/', "\\")))
     }
 
     #[cfg(not(target_os = "windows"))]
