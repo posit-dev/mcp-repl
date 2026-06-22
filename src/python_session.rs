@@ -421,15 +421,17 @@ fn run_python_cell(api: &'static PythonApi, source: &str) {
 
 fn finish_cell_request() -> Result<(), String> {
     let api = PythonApi::global();
-    {
+    let preserve_pending_stdin = {
         let _gil = GilGuard::acquire();
-        clear_python_stdin_buffers(api)?;
-    }
+        clear_python_stdin_buffers(api)?
+    };
     let state = session_state();
     let emit_ready = {
         let mut guard = state.inner.lock().unwrap();
         guard.cell_running = false;
-        guard.input_queue.clear_after_cell_finish();
+        guard
+            .input_queue
+            .clear_after_cell_finish(preserve_pending_stdin);
         if !guard.input_queue.has_active_read_consumer() {
             guard.request_active = false;
             guard.visible_input_prompt = None;
@@ -453,13 +455,14 @@ fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<(), String> {
+fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<bool, String> {
     let main = api.import_module("__main__")?;
     let func = api.get_attr_string(main.as_ptr(), "_mcp_repl_clear_stdin_buffers")?;
     let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
     let result = PyPtr::from_owned(result, "Python stdin buffer cleanup failed")?;
+    let preserve_pending_stdin = unsafe { (api.py_object_is_true)(result.as_ptr()) == 1 };
     drop(result);
-    Ok(())
+    Ok(preserve_pending_stdin)
 }
 
 fn clear_python_pending_interrupt() {

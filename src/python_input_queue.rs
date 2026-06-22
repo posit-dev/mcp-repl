@@ -56,8 +56,8 @@ impl PythonInputQueue {
         self.active_read_consumer = false;
     }
 
-    pub(crate) fn clear_after_cell_finish(&mut self) {
-        if !self.active_read_consumer {
+    pub(crate) fn clear_after_cell_finish(&mut self, preserve_pending_stdin: bool) {
+        if !self.active_read_consumer && !preserve_pending_stdin {
             self.stdin_bytes.clear();
         }
     }
