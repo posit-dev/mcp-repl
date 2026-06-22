@@ -426,14 +426,21 @@ fn finish_cell_request() -> Result<(), String> {
         clear_python_stdin_buffers(api)?;
     }
     let state = session_state();
-    {
+    let emit_ready = {
         let mut guard = state.inner.lock().unwrap();
-        guard.request_active = false;
         guard.cell_running = false;
-        guard.visible_input_prompt = None;
         guard.input_queue.clear_after_cell_finish();
+        if !guard.input_queue.has_active_read_consumer() {
+            guard.request_active = false;
+            guard.visible_input_prompt = None;
+            true
+        } else {
+            false
+        }
+    };
+    if emit_ready {
+        ipc::emit_ready();
     }
-    ipc::emit_ready();
     Ok(())
 }
 
@@ -557,6 +564,14 @@ fn next_queue_line_action(
             state.cvar.notify_all();
             return QueueReadAction::Interrupted;
         }
+        if !*owns_consumer {
+            if guard.input_queue.begin_read_consumer() {
+                *owns_consumer = true;
+            } else {
+                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
+                continue;
+            }
+        }
         if let Some(read) = guard.input_queue.consume_line() {
             let emit_input_line = guard.request_active;
             let prompt_already_visible = guard.visible_input_prompt.as_deref() == Some(prompt);
@@ -574,14 +589,6 @@ fn next_queue_line_action(
                 detached_request,
                 emit_input_line,
             };
-        }
-        if !*owns_consumer {
-            if guard.input_queue.begin_read_consumer() {
-                *owns_consumer = true;
-            } else {
-                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
-                continue;
-            }
         }
         if !*prompt_wait_emitted {
             *prompt_wait_emitted = true;
@@ -684,6 +691,17 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     }
                     return Err(RawStdinReadError::Interrupted);
                 }
+                if !output.is_empty() {
+                    return Ok(output);
+                }
+                if !owns_consumer {
+                    if guard.input_queue.begin_read_consumer() {
+                        owns_consumer = true;
+                    } else {
+                        guard = wait_for_queue_notification(state, guard, true);
+                        continue;
+                    }
+                }
                 let remaining = size - output.len();
                 if let Some(read) = guard.input_queue.consume_bytes(remaining) {
                     let emit_input_line = guard.request_active;
@@ -700,17 +718,6 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         detached_request: !guard.cell_running,
                         emit_input_line,
                     };
-                }
-                if !output.is_empty() {
-                    return Ok(output);
-                }
-                if !owns_consumer {
-                    if guard.input_queue.begin_read_consumer() {
-                        owns_consumer = true;
-                    } else {
-                        guard = wait_for_queue_notification(state, guard, true);
-                        continue;
-                    }
                 }
                 if !prompt_wait_emitted {
                     prompt_wait_emitted = true;
