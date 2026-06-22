@@ -27,6 +27,7 @@ fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+#[cfg(target_family = "unix")]
 fn extract_prefixed_value(text: &str, prefix: &str) -> Option<String> {
     text.lines()
         .find_map(|line| line.strip_prefix(prefix))

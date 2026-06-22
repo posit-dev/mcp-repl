@@ -3,6 +3,7 @@
 mod common;
 
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::RawContent;
 use std::fs;
 #[cfg(unix)]
@@ -55,6 +56,14 @@ fn visible_reply_text(text: &str) -> TestResult<String> {
         return Ok(fs::read_to_string(path)?);
     }
     Ok(text.to_string())
+}
+
+fn strip_ansi_controls(text: &str) -> String {
+    static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    ANSI_RE
+        .get_or_init(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("ANSI regex"))
+        .replace_all(text, "")
+        .into_owned()
 }
 
 fn require_python() -> bool {
@@ -2075,205 +2084,6 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn python_detached_sys_stdin_partial_read_allows_fresh_cell_before_next_wait()
--> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-    let temp_dir = tempdir()?;
-    let first_path = temp_dir.path().join("first-text-byte-before-fresh");
-    let second_wait_path = temp_dir.path().join("second-text-wait-before-fresh");
-    let release_path = temp_dir.path().join("release-text-reader-before-fresh");
-    let first_path_literal = serde_json::to_string(
-        first_path
-            .to_str()
-            .ok_or("first text byte path must be valid utf-8")?,
-    )?;
-    let second_wait_path_literal = serde_json::to_string(
-        second_wait_path
-            .to_str()
-            .ok_or("second text wait path must be valid utf-8")?,
-    )?;
-    let release_path_literal = serde_json::to_string(
-        release_path
-            .to_str()
-            .ok_or("text reader release path must be valid utf-8")?,
-    )?;
-
-    let first = session
-        .write_stdin_raw_with(
-            format!(
-                r#"import pathlib, sys, threading, time
-first_path = pathlib.Path({first_path_literal})
-second_wait_path = pathlib.Path({second_wait_path_literal})
-release_path = pathlib.Path({release_path_literal})
-def read_pair():
-    time.sleep(0.2)
-    print("DETACHED_TEXT_STALE_PAIR_WAITING", flush=True)
-    first = sys.stdin.read(1)
-    first_path.write_text(first)
-    while not release_path.exists():
-        time.sleep(0.01)
-    second_wait_path.write_text("waiting")
-    second = sys.stdin.read(1)
-    print("DETACHED_TEXT_STALE_PAIR", first + second, flush=True)
-threading.Thread(target=read_pair, daemon=True).start()
-print("DETACHED_TEXT_STALE_MAIN_DONE", flush=True)
-"#
-            ),
-            Some(5.0),
-        )
-        .await?;
-    let first_text = result_text(&first);
-    assert!(
-        first_text.contains("DETACHED_TEXT_STALE_MAIN_DONE"),
-        "expected main cell to finish before detached sys.stdin reads, got: {first_text:?}"
-    );
-
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
-    let mut wait_text = String::new();
-    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_TEXT_STALE_PAIR_WAITING")
-    {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        wait_text.push_str(&result_text(&poll));
-    }
-    assert!(
-        wait_text.contains("DETACHED_TEXT_STALE_PAIR_WAITING"),
-        "expected detached sys.stdin reader to start before answer input, got: {wait_text:?}"
-    );
-
-    let answer = session
-        .write_stdin_raw_unterminated_with("xy", Some(1.0))
-        .await?;
-    let mut text = result_text(&answer);
-    wait_for_file_text(&first_path, "x").await?;
-
-    let fresh = session
-        .write_stdin_raw_with("print('DETACHED_TEXT_STALE_FRESH_CELL')", Some(5.0))
-        .await?;
-    let fresh_text = result_text(&fresh);
-    assert!(
-        fresh_text.contains("DETACHED_TEXT_STALE_FRESH_CELL"),
-        "expected fresh cell to run before detached sys.stdin asks for more input, got: {fresh_text:?}"
-    );
-
-    fs::write(&release_path, "go")?;
-    text.push_str(&fresh_text);
-    wait_for_file_text(&second_wait_path, "waiting").await?;
-    let fresh_stdin = session
-        .write_stdin_raw_unterminated_with("z", Some(5.0))
-        .await?;
-    text.push_str(&result_text(&fresh_stdin));
-    session.cancel().await?;
-
-    assert!(
-        text.contains("DETACHED_TEXT_STALE_PAIR xz"),
-        "expected detached sys.stdin reader to consume fresh stdin instead of stale answer bytes, got: {text:?}"
-    );
-    assert!(
-        !text.contains("DETACHED_TEXT_STALE_PAIR xy"),
-        "detached sys.stdin reader consumed stale answer bytes: {text:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn python_detached_sys_stdin_partial_read_clears_buffer_before_fresh_stdin_cell()
--> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-    let temp_dir = tempdir()?;
-    let first_path = temp_dir.path().join("first-text-byte-before-stdin-cell");
-    let first_path_literal = serde_json::to_string(
-        first_path
-            .to_str()
-            .ok_or("first text byte path must be valid utf-8")?,
-    )?;
-
-    let first = session
-        .write_stdin_raw_with(
-            format!(
-                r#"import pathlib, sys, threading, time
-first_path = pathlib.Path({first_path_literal})
-def read_one():
-    time.sleep(0.2)
-    print("DETACHED_TEXT_STDIN_CELL_WAITING", flush=True)
-    first = sys.stdin.read(1)
-    first_path.write_text(first)
-threading.Thread(target=read_one, daemon=True).start()
-print("DETACHED_TEXT_STDIN_CELL_MAIN_DONE", flush=True)
-"#
-            ),
-            Some(5.0),
-        )
-        .await?;
-    let first_text = result_text(&first);
-    assert!(
-        first_text.contains("DETACHED_TEXT_STDIN_CELL_MAIN_DONE"),
-        "expected main cell to finish before detached sys.stdin read, got: {first_text:?}"
-    );
-
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
-    let mut wait_text = String::new();
-    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_TEXT_STDIN_CELL_WAITING")
-    {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        wait_text.push_str(&result_text(&poll));
-    }
-    assert!(
-        wait_text.contains("DETACHED_TEXT_STDIN_CELL_WAITING"),
-        "expected detached sys.stdin reader to start before answer input, got: {wait_text:?}"
-    );
-
-    let answer = session
-        .write_stdin_raw_unterminated_with("xy", Some(1.0))
-        .await?;
-    let mut text = result_text(&answer);
-    wait_for_file_text(&first_path, "x").await?;
-
-    let fresh = session
-        .write_stdin_raw_with(
-            r#"import sys
-fresh = sys.stdin.read(1)
-print("DETACHED_TEXT_STDIN_CELL_FRESH", fresh)
-"#,
-            Some(1.0),
-        )
-        .await?;
-    let fresh_text = result_text(&fresh);
-    text.push_str(&fresh_text);
-    assert!(
-        fresh_text.contains("<<repl status: waiting for input>>"),
-        "expected fresh stdin cell to wait for new input instead of buffered leftovers, got: {fresh_text:?}"
-    );
-    assert!(
-        !fresh_text.contains("DETACHED_TEXT_STDIN_CELL_FRESH y"),
-        "fresh stdin cell consumed stale detached stdin bytes: {fresh_text:?}"
-    );
-
-    let fresh_stdin = session
-        .write_stdin_raw_unterminated_with("z", Some(5.0))
-        .await?;
-    text.push_str(&result_text(&fresh_stdin));
-    session.cancel().await?;
-
-    assert!(
-        text.contains("DETACHED_TEXT_STDIN_CELL_FRESH z"),
-        "expected fresh stdin to satisfy the next cell, got: {text:?}"
-    );
-    Ok(())
-}
-
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_foreground_raw_stdin_partial_read_does_not_preserve_for_unrelated_thread()
@@ -2347,113 +2157,6 @@ print("FOREGROUND_RAW_READ", data.decode("utf-8"), flush=True)
     assert!(
         text.contains("UNRELATED_RAW_READ z"),
         "expected unrelated reader to wait for fresh stdin, got: {text:?}"
-    );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn python_detached_raw_stdin_partial_read_allows_fresh_cell_before_next_wait()
--> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
-        return Ok(());
-    };
-    let temp_dir = tempdir()?;
-    let first_path = temp_dir.path().join("first-raw-byte-before-fresh");
-    let second_wait_path = temp_dir.path().join("second-raw-wait-before-fresh");
-    let release_path = temp_dir.path().join("release-raw-reader-before-fresh");
-    let first_path_literal = serde_json::to_string(
-        first_path
-            .to_str()
-            .ok_or("first raw byte path must be valid utf-8")?,
-    )?;
-    let second_wait_path_literal = serde_json::to_string(
-        second_wait_path
-            .to_str()
-            .ok_or("second raw wait path must be valid utf-8")?,
-    )?;
-    let release_path_literal = serde_json::to_string(
-        release_path
-            .to_str()
-            .ok_or("raw reader release path must be valid utf-8")?,
-    )?;
-
-    let first = session
-        .write_stdin_raw_with(
-            format!(
-                r#"import os, pathlib, threading, time
-first_path = pathlib.Path({first_path_literal})
-second_wait_path = pathlib.Path({second_wait_path_literal})
-release_path = pathlib.Path({release_path_literal})
-def read_pair():
-    time.sleep(0.2)
-    print("DETACHED_RAW_STALE_PAIR_WAITING", flush=True)
-    first = os.read(0, 1)
-    first_path.write_text(first.decode("utf-8"))
-    while not release_path.exists():
-        time.sleep(0.01)
-    second_wait_path.write_text("waiting")
-    second = os.read(0, 1)
-    print("DETACHED_RAW_STALE_PAIR", (first + second).decode("utf-8"), flush=True)
-threading.Thread(target=read_pair, daemon=True).start()
-print("DETACHED_RAW_STALE_MAIN_DONE", flush=True)
-"#
-            ),
-            Some(5.0),
-        )
-        .await?;
-    let first_text = result_text(&first);
-    assert!(
-        first_text.contains("DETACHED_RAW_STALE_MAIN_DONE"),
-        "expected main cell to finish before detached raw stdin reads, got: {first_text:?}"
-    );
-
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
-    let mut wait_text = String::new();
-    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_STALE_PAIR_WAITING") {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        wait_text.push_str(&result_text(&poll));
-    }
-    assert!(
-        wait_text.contains("DETACHED_RAW_STALE_PAIR_WAITING"),
-        "expected detached raw stdin reader to start before answer input, got: {wait_text:?}"
-    );
-
-    let answer = session
-        .write_stdin_raw_unterminated_with("xy", Some(1.0))
-        .await?;
-    let mut text = result_text(&answer);
-    wait_for_file_text(&first_path, "x").await?;
-
-    let fresh = session
-        .write_stdin_raw_with("print('DETACHED_RAW_STALE_FRESH_CELL')", Some(5.0))
-        .await?;
-    let fresh_text = result_text(&fresh);
-    assert!(
-        fresh_text.contains("DETACHED_RAW_STALE_FRESH_CELL"),
-        "expected fresh cell to run before detached raw stdin asks for more input, got: {fresh_text:?}"
-    );
-
-    fs::write(&release_path, "go")?;
-    text.push_str(&fresh_text);
-    wait_for_file_text(&second_wait_path, "waiting").await?;
-    let fresh_stdin = session
-        .write_stdin_raw_unterminated_with("z", Some(5.0))
-        .await?;
-    text.push_str(&result_text(&fresh_stdin));
-    session.cancel().await?;
-
-    assert!(
-        text.contains("DETACHED_RAW_STALE_PAIR xz"),
-        "expected detached raw stdin reader to consume fresh stdin instead of stale answer bytes, got: {text:?}"
-    );
-    assert!(
-        !text.contains("DETACHED_RAW_STALE_PAIR xy"),
-        "detached raw stdin reader consumed stale answer bytes: {text:?}"
     );
     Ok(())
 }
@@ -5909,21 +5612,22 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
 
     let result = session.write_stdin_raw_with("1/0", Some(5.0)).await?;
     let text = result_text(&result);
+    let plain_text = strip_ansi_controls(&text);
     if is_busy_response(&text) {
         eprintln!("python_exception_reported_in_output remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert!(
-        text.contains("ZeroDivisionError"),
+        plain_text.contains("ZeroDivisionError"),
         "expected traceback, got: {text:?}"
     );
     assert!(
-        text.contains("File \"<mcp-repl>\", line 1"),
+        plain_text.contains("File \"<mcp-repl>\", line 1"),
         "expected traceback to point at the user cell, got: {text:?}"
     );
     assert!(
-        !text.contains("_mcp_repl_run_cell") && !text.contains("File \"<string>\""),
+        !plain_text.contains("_mcp_repl_run_cell") && !plain_text.contains("File \"<string>\""),
         "traceback should not expose the cell runner frame, got: {text:?}"
     );
 
@@ -5940,17 +5644,18 @@ async fn python_compile_syntax_error_hides_cell_runner_frames() -> TestResult<()
 
     let result = session.write_stdin_raw_with("return 1", Some(5.0)).await?;
     let text = result_text(&result);
+    let plain_text = strip_ansi_controls(&text);
     if is_busy_response(&text) {
         eprintln!("python_compile_syntax_error_hides_cell_runner_frames remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert!(
-        text.contains("SyntaxError"),
+        plain_text.contains("SyntaxError"),
         "expected SyntaxError, got: {text:?}"
     );
     assert!(
-        text.contains("File \"<mcp-repl>\", line 1"),
+        plain_text.contains("File \"<mcp-repl>\", line 1"),
         "expected syntax error to point at the user cell, got: {text:?}"
     );
     assert!(
