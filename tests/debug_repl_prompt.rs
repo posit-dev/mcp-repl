@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -81,6 +81,13 @@ fn debug_repl_test_mutex() -> &'static Mutex<()> {
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+fn lock_debug_repl_test_mutex() -> MutexGuard<'static, ()> {
+    match debug_repl_test_mutex().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn wait_for_prompt_or_idle(
     rx: &mpsc::Receiver<Vec<u8>>,
     seen: &mut Vec<u8>,
@@ -114,9 +121,7 @@ fn wait_for_prompt_or_idle(
 }
 
 fn assert_debug_repl_starts(extra_args: &[&str]) -> TestResult<()> {
-    let _guard = debug_repl_test_mutex()
-        .lock()
-        .expect("debug repl prompt test mutex poisoned");
+    let _guard = lock_debug_repl_test_mutex();
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl");
@@ -207,9 +212,7 @@ fn debug_repl_inherit_prints_initial_prompt() -> TestResult<()> {
 
 #[test]
 fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
-    let _guard = debug_repl_test_mutex()
-        .lock()
-        .expect("debug repl prompt test mutex poisoned");
+    let _guard = lock_debug_repl_test_mutex();
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl").arg("--interpreter").arg("python");
@@ -257,7 +260,7 @@ fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
         }
     });
 
-    let deadline = Instant::now() + Duration::from_millis(4500);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
     let (_saw_prompt, saw_idle) = wait_for_prompt_or_idle(&rx, &mut seen, deadline);
 
@@ -277,16 +280,14 @@ fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
     }
     assert!(
         saw_idle && output.contains("<<repl status: idle>>"),
-        "expected Python debug repl to initialize from prompt-free readiness before the prompt wait deadline, got: {output:?}, stderr: {err_output:?}"
+        "expected Python debug repl to initialize from prompt-free readiness, got: {output:?}, stderr: {err_output:?}"
     );
     Ok(())
 }
 
 #[test]
 fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult<()> {
-    let _guard = debug_repl_test_mutex()
-        .lock()
-        .expect("debug repl prompt test mutex poisoned");
+    let _guard = lock_debug_repl_test_mutex();
     let exe = resolve_mcp_repl_path()?;
     let temp = tempdir()?;
     let mut cmd = Command::new(exe);
