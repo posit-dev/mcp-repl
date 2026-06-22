@@ -7,11 +7,11 @@ Arguments:
 
 Python REPL affordances:
 - Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
-- Non-empty input while the session is idle runs as one complete Python cell with persistent globals. Send multi-line blocks and following top-level code in the same call.
+- At the start of each non-empty call, Python routes the whole payload from current state: if it is waiting for stdin, the payload is stdin; otherwise the payload runs as one complete Python cell with persistent globals. Send multi-line blocks and following top-level code in the same cell call.
 - A final top-level expression is displayed through `sys.displayhook`, so custom display hooks are honored.
 - Incomplete code such as a bare block header reports a normal Python syntax error instead of entering continuation mode.
-- If running code asks for stdin through `input()`, `help()`, `pdb`, `sys.stdin`, or raw stdin APIs, the next non-empty `input` is delivered as stdin bytes for that running code. It is not executed as new Python source.
-- Do not mix code plus buffered stdin answers in one payload. Send stdin answers only after Python has reported that it is waiting for input.
+- If running code asks for stdin through `input()`, `help()`, `pdb`, `sys.stdin`, or raw stdin APIs, the next non-empty `input` is delivered as stdin bytes for that running code. The whole payload is stdin for that call, including additional lines.
+- Send new Python source in a later call after Python is ready for cell execution; leftover stdin is not promoted to source at the server boundary.
 - While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
 - Empty `input` polls for more output from a timed-out request or for detached background output while idle. While pager mode is active, empty input advances one page.
 - If a request times out, keep polling with empty `input` until the remaining worker output is drained. New non-empty input is discarded while that timed-out request is still active.

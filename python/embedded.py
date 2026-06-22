@@ -57,7 +57,6 @@ _mcp_repl_codeop_dont_imply_dedent = getattr(codeop, "PyCF_DONT_IMPLY_DEDENT", 0
 _mcp_repl_future_features = tuple(
     getattr(__future__, name) for name in __future__.all_feature_names
 )
-_mcp_repl_main_thread_ident = threading.get_ident()
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -249,7 +248,7 @@ class McpInputStream:
     newlines = None
 
     def __init__(self, fileno=0, closefd=False, encoding=None, errors=None, newline=None):
-        self._buffers = {}
+        self._buffer = b""
         self._fileno = fileno
         self._closefd = closefd
         _mcp_repl_input_streams.add(self)
@@ -280,40 +279,10 @@ class McpInputStream:
         if prompt:
             _mcp_repl.write("stdout", prompt)
 
-    def _current_thread_id(self):
-        return threading.get_ident()
-
-    def _thread_buffer(self):
-        return self._buffers.get(self._current_thread_id(), b"")
-
-    def _replace_buffer(self, buffer):
-        thread_id = self._current_thread_id()
-        if buffer:
-            self._buffers[thread_id] = buffer
-        else:
-            self._buffers.pop(thread_id, None)
-
-    def _append_buffer(self, data):
-        if data:
-            self._replace_buffer(self._thread_buffer() + data)
-
-    def _clear_buffer(self):
-        self._replace_buffer(b"")
-
     def _take_buffered(self, size):
-        buffer = self._thread_buffer()
-        chunk = buffer[:size]
-        self._replace_buffer(buffer[size:])
+        chunk = self._buffer[:size]
+        self._buffer = self._buffer[size:]
         return chunk
-
-    def _clear_stale_buffers(self, live_background_thread_ids):
-        preserved = False
-        for thread_id in tuple(self._buffers):
-            if thread_id in live_background_thread_ids:
-                preserved = True
-            else:
-                self._buffers.pop(thread_id, None)
-        return preserved
 
     def _read_bytes(self, size=-1):
         self._check_open()
@@ -321,8 +290,8 @@ class McpInputStream:
         if size == 0:
             return b""
         if size < 0:
-            chunks = [self._thread_buffer()]
-            self._clear_buffer()
+            chunks = [self._buffer]
+            self._buffer = b""
             while True:
                 line = self._read_backend_line()
                 if line is None:
@@ -332,7 +301,7 @@ class McpInputStream:
 
         chunks = []
         remaining = size
-        if self._thread_buffer():
+        if self._buffer:
             chunk = self._take_buffered(remaining)
             chunks.append(chunk)
             remaining -= len(chunk)
@@ -342,7 +311,7 @@ class McpInputStream:
                 break
             chunks.append(line[:remaining])
             if len(line) > remaining:
-                self._replace_buffer(line[remaining:] + self._thread_buffer())
+                self._buffer = line[remaining:] + self._buffer
             remaining -= len(chunks[-1])
         return b"".join(chunks)
 
@@ -352,37 +321,35 @@ class McpInputStream:
         if size == 0:
             return b""
 
-        buffer = self._thread_buffer()
-        newline_index = buffer.find(b"\n")
+        newline_index = self._buffer.find(b"\n")
         if newline_index >= 0:
             self._emit_prompt(prompt)
             end = newline_index + 1
             if size > 0:
                 end = min(end, size)
             return self._take_buffered(end)
-        if size > 0 and len(buffer) >= size:
+        if size > 0 and len(self._buffer) >= size:
             self._emit_prompt(prompt)
             return self._take_buffered(size)
 
         line = self._read_backend_line(prompt)
         if line is None:
-            return self._take_buffered(len(self._thread_buffer()))
-        self._append_buffer(line)
-        buffer = self._thread_buffer()
-        newline_index = buffer.find(b"\n")
-        end = len(buffer) if newline_index < 0 else newline_index + 1
+            return self._take_buffered(len(self._buffer))
+        self._buffer += line
+        newline_index = self._buffer.find(b"\n")
+        end = len(self._buffer) if newline_index < 0 else newline_index + 1
         if size > 0:
             end = min(end, size)
         return self._take_buffered(end)
 
     def _decode_buffer(self):
-        return self._thread_buffer().decode(self.encoding, self.errors)
+        return self._buffer.decode(self.encoding, self.errors)
 
     def _take_text(self, size):
         text = self._decode_buffer()
         chunk = text[:size]
         byte_len = len(chunk.encode(self.encoding))
-        self._replace_buffer(self._thread_buffer()[byte_len:])
+        self._buffer = self._buffer[byte_len:]
         return chunk
 
     def read(self, size=-1):
@@ -397,7 +364,7 @@ class McpInputStream:
             line = self._read_backend_line()
             if line is None:
                 break
-            self._append_buffer(line)
+            self._buffer += line
         return self._take_text(min(size, len(self._decode_buffer())))
 
     def _readline(self, size=-1, prompt=""):
@@ -424,7 +391,7 @@ class McpInputStream:
             prompt_for_read = ""
             if line is None:
                 return self._take_text(len(self._decode_buffer()))
-            self._append_buffer(line)
+            self._buffer += line
 
     def readline(self, size=-1):
         return self._readline(size)
@@ -492,21 +459,8 @@ class McpInputStream:
 
 
 def _mcp_repl_clear_stdin_buffers():
-    live_background_thread_ids = {
-        thread.ident
-        for thread in threading.enumerate()
-        if thread.ident is not None and thread.ident != _mcp_repl_main_thread_ident
-    }
-    preserve_pending_stdin = False
     for stream in tuple(_mcp_repl_input_streams):
-        if stream._clear_stale_buffers(live_background_thread_ids):
-            preserve_pending_stdin = True
-    return preserve_pending_stdin
-
-
-def _mcp_repl_raw_stdin_read(size):
-    background_reader = threading.get_ident() != _mcp_repl_main_thread_ident
-    return _mcp_repl.raw_stdin_read(size, background_reader)
+        stream._buffer = b""
 
 
 class McpInputBuffer:
@@ -609,7 +563,7 @@ class McpRawInputBuffer(io.RawIOBase):
             return b""
         if size < 0:
             return McpInputStream().buffer.read(size)
-        return _mcp_repl_raw_stdin_read(size)
+        return _mcp_repl.raw_stdin_read(size)
 
     def readall(self):
         return self.read(-1)
@@ -1226,7 +1180,7 @@ def _mcp_repl_os_read(fd, n):
             raise OverflowError("Python int too large to convert to C ssize_t")
         if n < 0:
             raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
-        return _mcp_repl_raw_stdin_read(n)
+        return _mcp_repl.raw_stdin_read(n)
     return _original_os_read(fd, n)
 
 
@@ -1247,7 +1201,7 @@ def _mcp_repl_os_readv(fd, buffers):
         raise OverflowError("Python int too large to convert to C ssize_t")
     if total == 0:
         return 0
-    return _mcp_repl_fill_readv_buffers(views, _mcp_repl_raw_stdin_read(total))
+    return _mcp_repl_fill_readv_buffers(views, _mcp_repl.raw_stdin_read(total))
 
 
 builtins.__import__ = _mcp_repl_import

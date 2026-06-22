@@ -421,19 +421,15 @@ fn run_python_cell(api: &'static PythonApi, source: &str) {
 
 fn finish_cell_request() -> Result<(), String> {
     let api = PythonApi::global();
-    let preserve_python_stdin = {
+    {
         let _gil = GilGuard::acquire();
-        clear_python_stdin_buffers(api)?
-    };
+        clear_python_stdin_buffers(api)?;
+    }
     let state = session_state();
     let emit_ready = {
         let mut guard = state.inner.lock().unwrap();
-        let preserve_pending_stdin =
-            preserve_python_stdin || guard.input_queue.has_pending_raw_stdin_owner();
         guard.cell_running = false;
-        guard
-            .input_queue
-            .clear_after_cell_finish(preserve_pending_stdin);
+        guard.input_queue.clear_after_cell_finish();
         if !guard.input_queue.has_active_read_consumer() {
             guard.request_active = false;
             guard.visible_input_prompt = None;
@@ -457,14 +453,13 @@ fn capture_python_prompts(api: &'static PythonApi) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<bool, String> {
+fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<(), String> {
     let main = api.import_module("__main__")?;
     let func = api.get_attr_string(main.as_ptr(), "_mcp_repl_clear_stdin_buffers")?;
     let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
     let result = PyPtr::from_owned(result, "Python stdin buffer cleanup failed")?;
-    let preserve_pending_stdin = unsafe { (api.py_object_is_true)(result.as_ptr()) == 1 };
     drop(result);
-    Ok(preserve_pending_stdin)
+    Ok(())
 }
 
 fn clear_python_pending_interrupt() {
@@ -637,7 +632,7 @@ fn read_queue_line(
                     emit_output_text(TextStream::Stdout, prompt.as_bytes());
                 }
                 if detached_request {
-                    complete_detached_read_request(false);
+                    complete_detached_read_request();
                 }
                 return Ok(StdioLineRead {
                     bytes,
@@ -666,10 +661,7 @@ fn read_queue_line(
     }
 }
 
-fn read_queue_raw_bytes(
-    size: usize,
-    background_reader: bool,
-) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     if size == 0 {
         return Ok(Vec::new());
     }
@@ -679,7 +671,6 @@ fn read_queue_raw_bytes(
     let mut output = Vec::new();
     let mut prompt_wait_emitted = false;
     let mut owns_consumer = false;
-    let mut detached_request_completed = false;
     while output.len() < size {
         let action = {
             let mut guard = state.inner.lock().unwrap();
@@ -712,7 +703,6 @@ fn read_queue_raw_bytes(
                 }
                 let remaining = size - output.len();
                 if let Some(read) = guard.input_queue.consume_bytes(remaining) {
-                    guard.input_queue.note_raw_stdin_read(background_reader);
                     let emit_input_line = guard.request_active;
                     guard.visible_input_prompt = None;
                     guard.request_active = true;
@@ -750,9 +740,8 @@ fn read_queue_raw_bytes(
                     ipc::emit_input_line("", &String::from_utf8_lossy(&bytes));
                 }
                 output.extend(bytes);
-                if detached_request && !detached_request_completed {
-                    detached_request_completed = true;
-                    complete_detached_read_request(true);
+                if detached_request {
+                    complete_detached_read_request();
                 }
             }
             QueueReadAction::InputWait { prompt } => {
@@ -771,21 +760,14 @@ fn read_queue_raw_bytes(
     Ok(output)
 }
 
-fn complete_detached_read_request(wait_for_buffered_stdin: bool) {
+fn complete_detached_read_request() {
     let state = session_state();
-    let emit_ready = {
+    {
         let mut guard = state.inner.lock().unwrap();
+        guard.request_active = false;
         guard.visible_input_prompt = None;
-        if wait_for_buffered_stdin && guard.input_queue.has_buffered_stdin_data() {
-            false
-        } else {
-            guard.request_active = false;
-            true
-        }
-    };
-    if emit_ready {
-        ipc::emit_ready();
     }
+    ipc::emit_ready();
 }
 
 unsafe extern "C" fn mcp_repl_readline(
@@ -958,29 +940,20 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
 }
 
 #[cfg(target_family = "unix")]
-fn read_raw_stdin_bytes(
-    size: usize,
-    background_reader: bool,
-) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     if ipc::worker_ipc_disabled_for_process() {
         return Ok(Vec::new());
     }
-    read_queue_raw_bytes(size, background_reader)
+    read_queue_raw_bytes(size)
 }
 
 #[cfg(windows)]
-fn read_raw_stdin_bytes(
-    size: usize,
-    background_reader: bool,
-) -> Result<Vec<u8>, RawStdinReadError> {
-    read_queue_raw_bytes(size, background_reader)
+fn read_raw_stdin_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
+    read_queue_raw_bytes(size)
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
-fn read_raw_stdin_bytes(
-    _size: usize,
-    _background_reader: bool,
-) -> Result<Vec<u8>, RawStdinReadError> {
+fn read_raw_stdin_bytes(_size: usize) -> Result<Vec<u8>, RawStdinReadError> {
     Ok(Vec::new())
 }
 
@@ -1229,22 +1202,18 @@ unsafe extern "C" fn py_write_bytes(_self: *mut PyObject, args: *mut PyObject) -
 
 unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
     let api = PythonApi::global();
-    if api.tuple_size(args) != 2 {
-        set_callback_error("raw_stdin_read expects exactly two arguments");
+    if api.tuple_size(args) != 1 {
+        set_callback_error("raw_stdin_read expects exactly one argument");
         return ptr::null_mut();
     }
     let Some(size) = api.long_arg(args, 0) else {
         return ptr::null_mut();
     };
-    let background_reader = unsafe {
-        let item = (api.py_tuple_get_item)(args, 1);
-        (api.py_object_is_true)(item) == 1
-    };
     let Ok(size) = usize::try_from(size) else {
         set_callback_error("raw_stdin_read size must be non-negative");
         return ptr::null_mut();
     };
-    let bytes = match read_raw_stdin_bytes(size, background_reader) {
+    let bytes = match read_raw_stdin_bytes(size) {
         Ok(bytes) => bytes,
         Err(RawStdinReadError::Interrupted) => {
             api.set_interrupt();

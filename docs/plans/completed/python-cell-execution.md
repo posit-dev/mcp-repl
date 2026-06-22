@@ -41,8 +41,7 @@
 - Python `repl` defaults to cell execution with persistent globals.
 - Final expression display is part of v1 and must honor `sys.displayhook`.
 - Follow-up input is stdin only after Python has reported an input wait.
-- Code plus buffered stdin in the same payload is no longer a supported Python
-  pattern.
+- Route each non-empty payload once, at the top of the call. If Python is waiting for stdin, the whole payload is stdin; otherwise the whole payload is one cell.
 - Keep a small Python helper for AST cell execution and plot hooks; do not move
   protocol ownership into Python.
 
@@ -69,5 +68,5 @@
 - 2026-06-20: Kept embedded CPython and implemented cell execution with a small
   AST helper that honors `sys.displayhook`; Rust owns request routing and
   managed stdin state.
-- 2026-06-20: Dropped code-plus-buffered-stdin payload support for Python.
-  Follow-up stdin is accepted only after the running cell reports an input wait.
+- 2026-06-20: Dropped server-side code/stdin splitting for Python. Follow-up
+  stdin is accepted only after the running cell reports an input wait.

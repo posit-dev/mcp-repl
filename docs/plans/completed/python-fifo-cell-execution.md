@@ -36,7 +36,7 @@
 - Keep embedded CPython.
 - Do not add Jupyter/IPython or a separate Python worker process.
 - Do not add MCP tool modes or arguments for cell versus stdin input.
-- Do not support code plus buffered stdin in one payload as the primary contract.
+- Route each non-empty payload once, at the top of the call. If Python is waiting for stdin, the whole payload is stdin; otherwise the whole payload is one cell.
 
 ## Open Questions
 
