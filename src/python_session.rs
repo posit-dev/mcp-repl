@@ -206,7 +206,6 @@ fn discard_queued_input() {
     };
     let mut guard = state.inner.lock().unwrap();
     guard.input_queue.clear_after_interrupt();
-    guard.request_active = false;
     state.cvar.notify_all();
 }
 
