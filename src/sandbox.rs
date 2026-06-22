@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
+#[cfg(target_os = "macos")]
 use url::Url;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -567,14 +568,70 @@ where
 }
 
 fn codex_path_from_string(value: &str) -> Result<PathBuf, String> {
-    if let Ok(url) = Url::parse(value)
-        && url.scheme() == "file"
-    {
-        return url
-            .to_file_path()
-            .map_err(|_| format!("invalid file URL path: {value}"));
+    if value.starts_with("file://") {
+        return codex_path_from_file_url(value);
     }
     Ok(PathBuf::from(value))
+}
+
+fn codex_path_from_file_url(value: &str) -> Result<PathBuf, String> {
+    let rest = value
+        .strip_prefix("file://")
+        .expect("caller checked file URL prefix");
+    let path = if rest.starts_with('/') {
+        rest
+    } else if let Some(path) = rest.strip_prefix("localhost/") {
+        path
+    } else {
+        return Err(format!("unsupported file URL host in path: {value}"));
+    };
+    let path = percent_decode_file_url_path(path)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let path = path
+            .strip_prefix('/')
+            .filter(|stripped| stripped.len() >= 2 && stripped.as_bytes()[1] == b':')
+            .unwrap_or(&path);
+        return Ok(PathBuf::from(path.replace('/', "\\")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(PathBuf::from(path))
+    }
+}
+
+fn percent_decode_file_url_path(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(format!("invalid percent escape in file URL path: {value}"));
+            }
+            let high = hex_value(bytes[index + 1])
+                .ok_or_else(|| format!("invalid percent escape in file URL path: {value}"))?;
+            let low = hex_value(bytes[index + 2])
+                .ok_or_else(|| format!("invalid percent escape in file URL path: {value}"))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|err| format!("file URL path is not valid UTF-8: {err}"))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn sandbox_policy_from_codex_permission_profile(
@@ -3233,9 +3290,7 @@ mod tests {
     #[test]
     fn codex_permission_profile_meta_accepts_file_uri_sandbox_cwd() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-uri-cwd");
-        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
-            .expect("absolute temp path should convert to file URL")
-            .to_string();
+        let sandbox_cwd_uri = file_url_for_test_path(&sandbox_cwd);
         let update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "managed",
@@ -3261,6 +3316,15 @@ mod tests {
 
         assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
         assert_eq!(update.sandbox_policy, SandboxPolicy::ReadOnly);
+    }
+
+    fn file_url_for_test_path(path: &Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
     }
 
     #[test]
