@@ -335,7 +335,7 @@ impl WorkerManager {
         };
         self.remember_prompt(prompt_to_remember);
         if self.pager.is_active() && !session_end {
-            self.pager_prompt = resolved_prompt.clone();
+            self.pager_prompt = Some(resolved_prompt.clone());
         }
         if !session_end && !prompt_wait.timed_out && !self.pager.is_active() {
             reconcile_trailing_completion_prompt(

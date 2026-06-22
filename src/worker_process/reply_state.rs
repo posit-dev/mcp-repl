@@ -24,17 +24,20 @@ impl WorkerManager {
         let resolved_prompt = if pager_active {
             None
         } else {
-            self.pager_prompt.take()
+            match self.pager_prompt.take() {
+                Some(prompt) => prompt,
+                None => {
+                    contents.push(WorkerContent::server_stderr(
+                        "[repl] protocol error: missing prompt after pager dismiss",
+                    ));
+                    None
+                }
+            }
         };
         if pager_active {
             *prompt = None;
         } else {
             self.remember_prompt(resolved_prompt.clone());
-            if resolved_prompt.is_none() {
-                contents.push(WorkerContent::server_stderr(
-                    "[repl] protocol error: missing prompt after pager dismiss",
-                ));
-            }
             append_prompt_if_missing(contents, resolved_prompt.clone());
             *prompt = resolved_prompt;
         }

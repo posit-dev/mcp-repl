@@ -146,7 +146,7 @@ pub struct WorkerManager {
     reply_owned_prefix: PrefixCapture,
     next_live_prefix_belongs_to_reply: bool,
     last_detached_prefix_item_count: usize,
-    pager_prompt: Option<String>,
+    pager_prompt: Option<Option<String>>,
     last_prompt: Option<String>,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,

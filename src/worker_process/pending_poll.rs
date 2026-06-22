@@ -182,7 +182,7 @@ impl WorkerManager {
         );
         self.remember_prompt(built.prompt_to_remember.clone());
         if let Some(pager_prompt) = built.pager_prompt {
-            self.pager_prompt = pager_prompt;
+            self.pager_prompt = Some(pager_prompt);
         }
         Ok(built.reply)
     }

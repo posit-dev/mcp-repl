@@ -3332,6 +3332,64 @@ async fn python_fifo_cell_contract_uses_stdin_only_while_read_waits() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_prompt_free_paged_completion_dismisses_without_protocol_error() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if !require_python() {
+        return Ok(());
+    }
+
+    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        Vec::new(),
+        120,
+    )
+    .await?;
+
+    let input = "for i in range(40):\n    print(f'PROMPT_FREE_PAGER_LINE {i:03d}')";
+    let initial = session.write_stdin_raw_with(input, Some(10.0)).await?;
+    let initial = common::wait_until_not_busy(
+        &mut session,
+        initial,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let initial_text = result_text(&initial);
+    if python_backend_unavailable(&initial_text) {
+        eprintln!("python backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected oversized Python cell output to activate pager, got: {initial_text:?}"
+    );
+
+    let tail = session.write_stdin_raw_with(":tail 1", Some(5.0)).await?;
+    let tail_text = result_text(&tail);
+    session.cancel().await?;
+
+    assert!(
+        tail_text.contains("(END"),
+        "expected :tail to dismiss pager at the end, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains("[repl] protocol error: missing prompt after pager dismiss"),
+        "prompt-free Python pager completion should not report a missing prompt, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains(">>> ") && !tail_text.contains("... "),
+        "prompt-free Python pager completion should not append Python prompts, got: {tail_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_cell_runner_accepts_legacy_codeop_compile_api() -> TestResult<()> {
     let _guard = lock_test_mutex();
     if !require_python() {
