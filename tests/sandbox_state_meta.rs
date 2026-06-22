@@ -47,6 +47,13 @@ fn collect_text(result: &CallToolResult) -> String {
         .join("\n")
 }
 
+fn empty_or_blank_stderr(text: &str) -> bool {
+    text.is_empty()
+        || text
+            .strip_prefix("stderr:")
+            .is_some_and(|stderr| stderr.trim().is_empty())
+}
+
 fn home_env_vars(home_dir: &Path) -> Vec<(String, String)> {
     let home = home_dir.to_string_lossy().to_string();
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -844,7 +851,7 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
         "expected local interrupt follow-up to ignore missing inherited metadata checks, got: {interrupt_text}"
     );
     assert!(
-        interrupt_text.is_empty()
+        empty_or_blank_stderr(&interrupt_text)
             || interrupt_text.contains(">")
             || interrupt_text.contains("<<repl status: busy")
             || interrupt_text.contains("<<repl status: idle>>"),

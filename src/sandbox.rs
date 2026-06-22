@@ -11,10 +11,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
-#[cfg(target_os = "macos")]
 use url::Url;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::Builder;
 
 pub const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
@@ -435,15 +434,81 @@ pub struct SandboxStateUpdate {
     pub use_legacy_landlock: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexSandboxStateMeta {
-    pub sandbox_policy: SandboxPolicy,
+struct CodexSandboxStateMeta {
     #[serde(default)]
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub sandbox_cwd: PathBuf,
+    sandbox_policy: Option<SandboxPolicy>,
     #[serde(default)]
-    pub use_legacy_landlock: bool,
+    permission_profile: Option<CodexPermissionProfile>,
+    #[serde(deserialize_with = "deserialize_codex_path")]
+    sandbox_cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexPermissionProfile {
+    Managed {
+        file_system: CodexManagedFileSystemPermissions,
+        network: NetworkAccess,
+    },
+    Disabled,
+    External {
+        network: NetworkAccess,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexManagedFileSystemPermissions {
+    Restricted {
+        entries: Vec<CodexFileSystemSandboxEntry>,
+        #[serde(default)]
+        glob_scan_max_depth: Option<usize>,
+    },
+    Unrestricted,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexFileSystemSandboxEntry {
+    path: CodexFileSystemPath,
+    access: CodexFileSystemAccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexFileSystemAccessMode {
+    Read,
+    Write,
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexFileSystemPath {
+    Path {
+        #[serde(deserialize_with = "deserialize_codex_path")]
+        path: PathBuf,
+    },
+    GlobPattern {
+        pattern: String,
+    },
+    Special {
+        value: CodexFileSystemSpecialPath,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CodexFileSystemSpecialPath {
+    Root,
+    Minimal,
+    ProjectRoots {
+        #[serde(default)]
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
 }
 
 pub fn sandbox_state_update_from_codex_meta(
@@ -456,6 +521,17 @@ pub fn sandbox_state_update_from_codex_meta(
     }
     let parsed = serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
         .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?;
+    let sandbox_policy = match (parsed.sandbox_policy, parsed.permission_profile) {
+        (Some(policy), _) => policy,
+        (None, Some(permission_profile)) => {
+            sandbox_policy_from_codex_permission_profile(permission_profile, &parsed.sandbox_cwd)
+                .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?
+        }
+        (None, None) => {
+            return Err("failed to parse Codex sandbox state metadata: missing field `sandboxPolicy` or `permissionProfile`"
+                .to_string());
+        }
+    };
 
     if !parsed.sandbox_cwd.is_absolute() {
         return Err(format!(
@@ -463,7 +539,7 @@ pub fn sandbox_state_update_from_codex_meta(
             parsed.sandbox_cwd.display()
         ));
     }
-    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &parsed.sandbox_policy
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &sandbox_policy
         && let Some(root) = writable_roots.iter().find(|root| !root.is_absolute())
     {
         return Err(format!(
@@ -473,13 +549,220 @@ pub fn sandbox_state_update_from_codex_meta(
     }
 
     Ok(SandboxStateUpdate {
-        sandbox_policy: parsed.sandbox_policy,
+        sandbox_policy,
         sandbox_cwd: Some(parsed.sandbox_cwd),
         // Codex reports how its own Linux helper is configured, but mcp-repl's
         // optional bwrap stage is a separate local best-effort knob.
         use_linux_sandbox_bwrap: None,
         use_legacy_landlock: None,
     })
+}
+
+fn deserialize_codex_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    codex_path_from_string(&value).map_err(serde::de::Error::custom)
+}
+
+fn codex_path_from_string(value: &str) -> Result<PathBuf, String> {
+    if let Ok(url) = Url::parse(value)
+        && url.scheme() == "file"
+    {
+        return url
+            .to_file_path()
+            .map_err(|_| format!("invalid file URL path: {value}"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn sandbox_policy_from_codex_permission_profile(
+    permission_profile: CodexPermissionProfile,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    match permission_profile {
+        CodexPermissionProfile::Disabled => Ok(SandboxPolicy::DangerFullAccess),
+        CodexPermissionProfile::External { network } => Ok(SandboxPolicy::ExternalSandbox {
+            network_access: network,
+        }),
+        CodexPermissionProfile::Managed {
+            file_system,
+            network,
+        } => sandbox_policy_from_codex_managed_file_system(file_system, network, sandbox_cwd),
+    }
+}
+
+fn sandbox_policy_from_codex_managed_file_system(
+    file_system: CodexManagedFileSystemPermissions,
+    network: NetworkAccess,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    match file_system {
+        CodexManagedFileSystemPermissions::Unrestricted => {
+            if network.is_enabled() {
+                Ok(SandboxPolicy::DangerFullAccess)
+            } else {
+                Ok(SandboxPolicy::ExternalSandbox {
+                    network_access: NetworkAccess::Restricted,
+                })
+            }
+        }
+        CodexManagedFileSystemPermissions::Restricted {
+            entries,
+            glob_scan_max_depth,
+        } => {
+            if glob_scan_max_depth.is_some() {
+                return Err(
+                    "permissionProfile.file_system.glob_scan_max_depth is not supported"
+                        .to_string(),
+                );
+            }
+            sandbox_policy_from_codex_restricted_entries(entries, network, sandbox_cwd)
+        }
+    }
+}
+
+fn sandbox_policy_from_codex_restricted_entries(
+    entries: Vec<CodexFileSystemSandboxEntry>,
+    network: NetworkAccess,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let mut root_readable = false;
+    let mut root_writable = false;
+    let mut workspace_writable = false;
+    let mut tmpdir_writable = false;
+    let mut slash_tmp_writable = false;
+    let mut writable_roots = Vec::new();
+
+    for entry in entries {
+        match entry.path {
+            CodexFileSystemPath::Path { path } => match entry.access {
+                CodexFileSystemAccessMode::Read => {}
+                CodexFileSystemAccessMode::Write => {
+                    if !path.is_absolute() {
+                        return Err(format!(
+                            "permissionProfile.file_system.entries requires absolute path entries, got: {}",
+                            path.display()
+                        ));
+                    }
+                    if path == sandbox_cwd {
+                        workspace_writable = true;
+                    } else {
+                        writable_roots.push(path);
+                    }
+                }
+                CodexFileSystemAccessMode::Deny => {
+                    return Err(
+                        "permissionProfile.file_system deny entries are not supported".to_string(),
+                    );
+                }
+            },
+            CodexFileSystemPath::GlobPattern { pattern } => {
+                return Err(format!(
+                    "permissionProfile.file_system glob entries are not supported: {pattern}"
+                ));
+            }
+            CodexFileSystemPath::Special { value } => match value {
+                CodexFileSystemSpecialPath::Root => match entry.access {
+                    CodexFileSystemAccessMode::Read => root_readable = true,
+                    CodexFileSystemAccessMode::Write => root_writable = true,
+                    CodexFileSystemAccessMode::Deny => {
+                        return Err(
+                            "permissionProfile.file_system root deny is not supported".to_string()
+                        );
+                    }
+                },
+                CodexFileSystemSpecialPath::ProjectRoots { subpath } => match entry.access {
+                    CodexFileSystemAccessMode::Read => {}
+                    CodexFileSystemAccessMode::Write => {
+                        if let Some(subpath) = subpath {
+                            if subpath.is_absolute() {
+                                writable_roots.push(subpath);
+                            } else {
+                                writable_roots.push(sandbox_cwd.join(subpath));
+                            }
+                        } else {
+                            workspace_writable = true;
+                        }
+                    }
+                    CodexFileSystemAccessMode::Deny => {
+                        return Err(
+                            "permissionProfile.file_system project root deny is not supported"
+                                .to_string(),
+                        );
+                    }
+                },
+                CodexFileSystemSpecialPath::Tmpdir => match entry.access {
+                    CodexFileSystemAccessMode::Write => tmpdir_writable = true,
+                    CodexFileSystemAccessMode::Read => {}
+                    CodexFileSystemAccessMode::Deny => {
+                        return Err("permissionProfile.file_system tmpdir deny is not supported"
+                            .to_string());
+                    }
+                },
+                CodexFileSystemSpecialPath::SlashTmp => match entry.access {
+                    CodexFileSystemAccessMode::Write => slash_tmp_writable = true,
+                    CodexFileSystemAccessMode::Read => {}
+                    CodexFileSystemAccessMode::Deny => {
+                        return Err(
+                            "permissionProfile.file_system slash_tmp deny is not supported"
+                                .to_string(),
+                        );
+                    }
+                },
+                CodexFileSystemSpecialPath::Minimal => match entry.access {
+                    CodexFileSystemAccessMode::Read => {}
+                    CodexFileSystemAccessMode::Write | CodexFileSystemAccessMode::Deny => {
+                        return Err(
+                            "permissionProfile.file_system minimal writes or denies are not supported"
+                                .to_string(),
+                        );
+                    }
+                },
+            },
+        }
+    }
+
+    if root_writable {
+        return Ok(if network.is_enabled() {
+            SandboxPolicy::DangerFullAccess
+        } else {
+            SandboxPolicy::ExternalSandbox {
+                network_access: NetworkAccess::Restricted,
+            }
+        });
+    }
+
+    if !root_readable {
+        return Err(
+            "permissionProfile.file_system restricted entries without root read are not supported"
+                .to_string(),
+        );
+    }
+
+    if workspace_writable {
+        writable_roots.sort();
+        writable_roots.dedup();
+        return Ok(SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access: network.is_enabled(),
+            exclude_tmpdir_env_var: !tmpdir_writable,
+            exclude_slash_tmp: !slash_tmp_writable,
+        });
+    }
+
+    if !writable_roots.is_empty() || tmpdir_writable || slash_tmp_writable {
+        return Err(
+            "permissionProfile.file_system writes without a writable workspace root are not supported"
+                .to_string(),
+        );
+    }
+    if network.is_enabled() {
+        return Err("permissionProfile read-only network access is not supported".to_string());
+    }
+
+    Ok(SandboxPolicy::ReadOnly)
 }
 
 fn codex_unsupported_sandbox_policy_field(meta: &serde_json::Value) -> Option<String> {
@@ -2879,6 +3162,122 @@ mod tests {
             err.contains("relative-root"),
             "expected failing relative root to be named in the error, got: {err}"
         );
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_maps_workspace_write() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-workspace");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd.join(".git")
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("Codex permission profile metadata should map to a legacy sandbox update");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_accepts_file_uri_sandbox_cwd() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-uri-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute temp path should convert to file URL")
+            .to_string();
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("file URI sandboxCwd should parse");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(update.sandbox_policy, SandboxPolicy::ReadOnly);
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_maps_disabled_to_full_access() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-full-access");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("disabled Codex permission profile should map to full access");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(update.sandbox_policy, SandboxPolicy::DangerFullAccess);
     }
 
     #[cfg(target_os = "linux")]
