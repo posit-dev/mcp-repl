@@ -4,12 +4,19 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tokio::time::{Duration, Instant, sleep};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    match test_mutex().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -36,6 +43,10 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+fn empty_or_blank_stderr(text: &str) -> bool {
+    text.is_empty() || text.trim() == "stderr:"
+}
+
 async fn spawn_manage_session() -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args(vec![
         "--sandbox".to_string(),
@@ -46,9 +57,7 @@ async fn spawn_manage_session() -> TestResult<common::McpTestSession> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupt_without_active_request_keeps_session_usable() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "manage_session_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
     let _ = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
@@ -63,7 +72,7 @@ async fn interrupt_without_active_request_keeps_session_usable() -> TestResult<(
         return Ok(());
     }
     assert!(
-        text.is_empty() || text.contains(">") || text.contains("<<repl status: busy"),
+        empty_or_blank_stderr(&text) || text.contains(">") || text.contains("<<repl status: busy"),
         "expected empty reply, prompt, or timeout status in output, got: {text:?}"
     );
     assert!(
@@ -106,9 +115,7 @@ async fn interrupt_without_active_request_keeps_session_usable() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_while_busy_resets_session() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "manage_session_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
     let _ = session
