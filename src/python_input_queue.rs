@@ -62,6 +62,12 @@ impl PythonInputQueue {
         }
     }
 
+    pub(crate) fn clear_after_detached_read(&mut self) {
+        if !self.active_read_consumer {
+            self.stdin_bytes.clear();
+        }
+    }
+
     pub(crate) fn consume_line(&mut self) -> Option<RuntimeStdinRead> {
         self.refill_stdin_bytes();
         let byte_count = self

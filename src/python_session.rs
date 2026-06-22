@@ -748,6 +748,7 @@ fn complete_detached_read_request() {
         let mut guard = state.inner.lock().unwrap();
         guard.request_active = false;
         guard.visible_input_prompt = None;
+        guard.input_queue.clear_after_detached_read();
     }
     ipc::emit_ready();
 }

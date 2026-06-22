@@ -241,6 +241,16 @@ fn run_command(
         }
     }
 
+    if command == "write-session-temp-marker" {
+        let session_tmpdir =
+            std::env::var("MCP_REPL_R_SESSION_TMPDIR").map_err(io::Error::other)?;
+        let marker = PathBuf::from(session_tmpdir).join("respawn-marker.txt");
+        std::fs::write(&marker, b"respawned worker marker")?;
+        let text = format!("session-temp-marker: {}\n", marker.display());
+        output_text(writer, control_log_path, text.as_bytes())?;
+        return Ok(false);
+    }
+
     if let Some(millis) = command.strip_prefix("bad-output-after-input-wait ") {
         state.bad_output_after_input_wait = Some(Duration::from_millis(parse_millis(millis)?));
         return Ok(false);

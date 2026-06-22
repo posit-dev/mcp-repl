@@ -1380,6 +1380,9 @@ impl WorkerProcess {
             match self.child.try_wait()? {
                 Some(status) => self.exit_status = Some(status),
                 None => {
+                    // The next spawn resets and reuses this stable session temp path.
+                    // The old background reaper must not remove the respawned worker's TMPDIR.
+                    self.session_tmpdir = None;
                     let _ = thread::Builder::new()
                         .name("worker-session-end-reaper".to_string())
                         .spawn(move || {

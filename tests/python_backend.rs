@@ -5723,3 +5723,83 @@ print('CELL_RETURNED')
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_discards_extra_answer_lines_before_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_waiting = threading.Event()
+
+def background():
+    background_waiting.set()
+    answer = input('bg> ')
+    print('BACKGROUND_ANSWER', answer)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input prompt setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg> "),
+        "expected background input prompt, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "background input answer should complete its request, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("BACKGROUND_ANSWER one"),
+        "expected background input to consume the first line, got: {answer_text:?}"
+    );
+
+    let foreground = session
+        .write_stdin_raw_with(
+            "foreground = input('fg> ')\nprint('FOREGROUND_ANSWER', foreground)",
+            Some(1.0),
+        )
+        .await?;
+    let foreground_text = result_text(&foreground);
+    assert!(
+        !is_busy_response(&foreground_text),
+        "expected foreground input prompt, got: {foreground_text:?}"
+    );
+    assert!(
+        foreground_text.contains("fg> "),
+        "expected foreground input to wait for fresh input, got: {foreground_text:?}"
+    );
+    assert!(
+        !foreground_text.contains("FOREGROUND_ANSWER two"),
+        "foreground input consumed stale detached stdin tail: {foreground_text:?}"
+    );
+
+    let fresh = session.write_stdin_raw_with("fresh", Some(5.0)).await?;
+    let fresh_text = result_text(&fresh);
+    session.cancel().await?;
+
+    assert!(
+        fresh_text.contains("FOREGROUND_ANSWER fresh"),
+        "expected foreground input to consume fresh line, got: {fresh_text:?}"
+    );
+    Ok(())
+}

@@ -27,6 +27,12 @@ fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn extract_prefixed_value(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(str::to_string)
+}
+
 #[cfg(target_family = "unix")]
 fn first_logged_pid(log: &str) -> Option<u32> {
     log.lines()
@@ -472,13 +478,13 @@ async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()
         .call_tool_raw(
             "repl",
             json!({
-                "input": "new worker after session_end",
+                "input": "write-session-temp-marker",
                 "timeout_ms": 10_000
             }),
         )
         .await?;
     let mut second_text = result_text(&second);
-    if !second_text.contains("v5-output: new worker after session_end\n") {
+    if !second_text.contains("session-temp-marker: ") {
         assert!(
             second_text.contains("session ended") || second_text.contains("session_end"),
             "expected session_end before respawn, got: {second_text:?}"
@@ -487,19 +493,28 @@ async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()
             .call_tool_raw(
                 "repl",
                 json!({
-                    "input": "new worker after session_end",
+                    "input": "write-session-temp-marker",
                     "timeout_ms": 10_000
                 }),
             )
             .await?;
         second_text = result_text(&third);
     }
+    let marker = extract_prefixed_value(&second_text, "session-temp-marker: ")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("expected respawned worker temp marker, got: {second_text:?}"))?;
     assert!(
-        second_text.contains("v5-output: new worker after session_end\n"),
-        "expected respawned worker to handle follow-up input, got: {second_text:?}"
+        marker.exists(),
+        "expected respawned worker marker to exist before old worker cleanup: {}",
+        marker.display()
     );
 
     let exit_result = wait_for_process_exit(old_pid);
+    assert!(
+        marker.exists(),
+        "old worker cleanup removed respawned worker temp marker: {}",
+        marker.display()
+    );
     session.cancel().await?;
     exit_result
 }
