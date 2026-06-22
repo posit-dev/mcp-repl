@@ -4,6 +4,7 @@ use std::time::Instant;
 pub(crate) struct InputState {
     active: bool,
     ready_for_input: bool,
+    ready_from_input_wait: bool,
     ready_observed_at: Option<Instant>,
     completed_observed_at: Option<Instant>,
     protocol_error: Option<LatchedProtocolError>,
@@ -23,6 +24,7 @@ impl InputState {
         }
         self.active = true;
         self.ready_for_input = false;
+        self.ready_from_input_wait = false;
         self.completed_observed_at = None;
         Ok(())
     }
@@ -47,6 +49,10 @@ impl InputState {
                 .is_some_and(|observed_at| observed_at > since)
     }
 
+    pub(crate) fn input_wait_readiness_available(&self) -> bool {
+        self.ready_for_input && self.ready_from_input_wait
+    }
+
     pub(crate) fn validate_active_input(&self, event_type: &str) -> Result<(), String> {
         if !self.active {
             return Err(format!("{event_type} reported with no active input"));
@@ -58,15 +64,16 @@ impl InputState {
     }
 
     pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
-        self.record_ready_at(observed_at);
+        self.record_ready_at(observed_at, true);
     }
 
     pub(crate) fn record_ready(&mut self, observed_at: Instant) {
-        self.record_ready_at(observed_at);
+        self.record_ready_at(observed_at, false);
     }
 
-    fn record_ready_at(&mut self, observed_at: Instant) {
+    fn record_ready_at(&mut self, observed_at: Instant, from_input_wait: bool) {
         self.ready_for_input = true;
+        self.ready_from_input_wait = from_input_wait;
         self.ready_observed_at = Some(observed_at);
         if self.active {
             self.completed_observed_at = Some(observed_at);

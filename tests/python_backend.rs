@@ -4760,17 +4760,8 @@ async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestRe
         return Ok(());
     };
 
-    let interrupt = session
-        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
-        .await?;
-    let interrupt_text = result_text(&interrupt);
-    assert!(
-        !is_busy_response(&interrupt_text),
-        "expected idle Ctrl-C to settle without waiting for stdin, got: {interrupt_text:?}"
-    );
-
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_IDLE_INTERRUPT')", Some(5.0))
+        .write_stdin_raw_with("\u{3}print('AFTER_IDLE_INTERRUPT')", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;

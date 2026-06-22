@@ -207,6 +207,20 @@ async fn spawn_zod_startup_ready_server(
     .await
 }
 
+async fn spawn_zod_delayed_interrupt_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![
+            ("MCP_REPL_ZOD_STARTUP_READY", "1"),
+            ("MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS", "200"),
+        ],
+        Vec::new(),
+    )
+    .await
+}
+
 async fn spawn_zod_stalled_control_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
@@ -391,6 +405,37 @@ async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> T
     assert!(
         log.contains("input_batch input=prompt-free startup"),
         "expected first input after startup ready, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{3}after fresh ready", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("v5-output: after fresh ready\n"),
+        "expected interrupt tail to run after fresh readiness, got: {text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "fresh_ready_after_interrupt")?;
+    let fresh_ready_idx = log
+        .find("fresh_ready_after_interrupt")
+        .expect("fresh readiness log should be present");
+    let input_idx = log
+        .find("input_batch input=after fresh ready")
+        .expect("interrupt tail input log should be present");
+    assert!(
+        fresh_ready_idx < input_idx,
+        "expected tail input only after fresh readiness, got log: {log:?}"
     );
 
     session.cancel().await?;

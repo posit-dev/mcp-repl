@@ -30,6 +30,7 @@ const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
 const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
+const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
@@ -52,6 +53,14 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .parse::<u64>()
+                .map_err(io::Error::other)
+        })
+        .transpose()?;
     append_control_log(
         control_log_path.as_deref(),
         &format!("pid {}", std::process::id()),
@@ -119,7 +128,13 @@ fn run_worker(
                     return Ok(());
                 }
             }
-            ControlMessage::Interrupt => {}
+            ControlMessage::Interrupt => {
+                if let Some(millis) = delay_ready_after_interrupt_ms {
+                    thread::sleep(Duration::from_millis(millis));
+                    writer.send(&WorkerToServer::Ready {})?;
+                    append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
+                }
+            }
             ControlMessage::Shutdown => {
                 send_session_end(&writer, "shutdown")?;
                 return Ok(());

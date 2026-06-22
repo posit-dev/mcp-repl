@@ -541,7 +541,7 @@ impl ServerIpcConnection {
         &self,
         timeout: Duration,
     ) -> Result<IpcInputReadiness, IpcWaitError> {
-        self.wait_for_input_readiness_after(timeout, None)
+        self.wait_for_input_readiness_after(timeout, None, true)
     }
 
     #[cfg(test)]
@@ -550,13 +550,22 @@ impl ServerIpcConnection {
         timeout: Duration,
         since: Instant,
     ) -> Result<IpcInputReadiness, IpcWaitError> {
-        self.wait_for_input_readiness_after(timeout, Some(since))
+        self.wait_for_input_readiness_after(timeout, Some(since), false)
+    }
+
+    pub fn wait_for_input_wait_or_fresh_ready(
+        &self,
+        timeout: Duration,
+        since: Instant,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        self.wait_for_input_readiness_after(timeout, Some(since), true)
     }
 
     fn wait_for_input_readiness_after(
         &self,
         timeout: Duration,
         since: Option<Instant>,
+        accept_stale_prompt: bool,
     ) -> Result<IpcInputReadiness, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -577,7 +586,7 @@ impl ServerIpcConnection {
                         .is_some_and(|observed_at| observed_at > since),
                     None => true,
                 };
-                if prompt_is_fresh {
+                if prompt_is_fresh || accept_stale_prompt {
                     let prompt = prompt.clone();
                     guard.last_prompt = None;
                     guard.last_prompt_observed_at = None;
@@ -587,7 +596,11 @@ impl ServerIpcConnection {
                 guard.last_prompt_observed_at = None;
             }
             let ready = match since {
-                Some(since) => guard.input_state.readiness_observed_after(since),
+                Some(since) => {
+                    guard.input_state.readiness_observed_after(since)
+                        || (accept_stale_prompt
+                            && guard.input_state.input_wait_readiness_available())
+                }
                 None => guard.input_state.ready_for_input(),
             };
             if ready {
