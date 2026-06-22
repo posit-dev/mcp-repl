@@ -680,6 +680,14 @@ struct PythonLaunchConfig<'a> {
     module_search_paths_override: Option<&'a [PathBuf]>,
 }
 
+struct EmbeddedWorkerSpawnConfig<'a, 'b> {
+    managed_network_proxy: Option<&'a crate::managed_network::ManagedNetworkProxy>,
+    live_output: LiveOutputCapture,
+    ipc_server: &'b mut IpcServer,
+    #[cfg(target_os = "windows")]
+    prepared_windows_launch: Option<&'a crate::windows_sandbox::PreparedSandboxLaunch>,
+}
+
 fn encode_python_module_search_paths(
     paths: &[PathBuf],
 ) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
@@ -765,22 +773,26 @@ impl WorkerProcess {
                 PythonLaunchConfig::default(),
                 exe_path,
                 sandbox_state,
-                managed_network_proxy,
-                live_output.clone(),
-                &mut ipc_server,
-                #[cfg(target_os = "windows")]
-                prepared_windows_launch.as_ref(),
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
             )?,
             WorkerLaunch::Builtin(Backend::Python) => Self::spawn_embedded_worker(
                 Backend::Python,
                 PythonLaunchConfig::default(),
                 exe_path,
                 sandbox_state,
-                managed_network_proxy,
-                live_output.clone(),
-                &mut ipc_server,
-                #[cfg(target_os = "windows")]
-                prepared_windows_launch.as_ref(),
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
             )?,
             WorkerLaunch::PythonExecutable {
                 executable,
@@ -793,11 +805,13 @@ impl WorkerProcess {
                 },
                 exe_path,
                 sandbox_state,
-                managed_network_proxy,
-                live_output.clone(),
-                &mut ipc_server,
-                #[cfg(target_os = "windows")]
-                prepared_windows_launch.as_ref(),
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
             )?,
             WorkerLaunch::Custom(spec) => Self::spawn_custom_worker(
                 spec,
@@ -895,13 +909,15 @@ impl WorkerProcess {
         python_config: PythonLaunchConfig<'_>,
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
-        live_output: LiveOutputCapture,
-        ipc_server: &mut IpcServer,
-        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
-            &crate::windows_sandbox::PreparedSandboxLaunch,
-        >,
+        spawn_config: EmbeddedWorkerSpawnConfig<'_, '_>,
     ) -> Result<SpawnedWorker, WorkerError> {
+        let EmbeddedWorkerSpawnConfig {
+            managed_network_proxy,
+            live_output,
+            ipc_server,
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch,
+        } = spawn_config;
         let prepared = prepare_worker_command_with_managed_network(
             exe_path,
             vec![WORKER_MODE_ARG.to_string()],

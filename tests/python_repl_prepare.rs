@@ -77,14 +77,17 @@ fn create_venv(root: &Path, name: &str, packages: &[&str]) -> TestResult<PathBuf
     Ok(venv)
 }
 
+#[cfg(unix)]
 fn make_executable(path: &Path) -> TestResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> TestResult<()> {
     Ok(())
 }
 
