@@ -463,17 +463,6 @@ def _mcp_repl_clear_stdin_buffers():
         stream._buffer = b""
 
 
-def _mcp_repl_has_non_daemon_threads(
-    _current_thread=threading.current_thread,
-    _enumerate=threading.enumerate,
-):
-    current = _current_thread()
-    return any(
-        thread is not current and thread.is_alive() and not thread.daemon
-        for thread in _enumerate()
-    )
-
-
 class McpInputBuffer:
     def __init__(self, text_stream):
         self._text_stream = text_stream

@@ -260,16 +260,9 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     ipc::emit_worker_ready("python", plot_capable());
 
     let result = run_cell_loop();
-    if python_finalization_may_block(api) {
-        crate::diagnostics::startup_log(
-            "python-session: live non-daemon Python thread; emitting session_end before finalization",
-        );
-        finish_session_end();
-        crate::diagnostics::startup_log("python-session: emitted session_end");
-        result?;
-        return Ok(());
-    }
-
+    // Py_FinalizeEx follows CPython shutdown semantics, including waiting for
+    // user-created non-daemon threads. While that wait is in progress the
+    // worker is still alive, so the server must not synthesize session_end.
     crate::diagnostics::startup_log("python-session: cell loop exited; finalizing python");
     let finalize_result = finalize_python(api, thread_state);
     match &finalize_result {
@@ -284,31 +277,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     result?;
     finalize_result?;
     Ok(())
-}
-
-fn python_finalization_may_block(api: &'static PythonApi) -> bool {
-    let _gil = GilGuard::acquire();
-    let Ok(main) = api.import_module("__main__") else {
-        api.print_error();
-        return false;
-    };
-    let Ok(func) = api.get_attr_string(main.as_ptr(), "_mcp_repl_has_non_daemon_threads") else {
-        api.print_error();
-        return false;
-    };
-    let result = unsafe { (api.py_object_call_object)(func.as_ptr(), ptr::null_mut()) };
-    let Ok(result) = PyPtr::from_owned(result, "non-daemon thread probe failed") else {
-        api.print_error();
-        return false;
-    };
-    match unsafe { (api.py_object_is_true)(result.as_ptr()) } {
-        1 => true,
-        0 => false,
-        _ => {
-            api.print_error();
-            false
-        }
-    }
 }
 
 fn initialize_python(
