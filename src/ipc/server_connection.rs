@@ -565,7 +565,7 @@ impl ServerIpcConnection {
         &self,
         timeout: Duration,
         since: Option<Instant>,
-        accept_stale_prompt: bool,
+        accept_existing_input_wait: bool,
     ) -> Result<IpcInputReadiness, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -586,7 +586,7 @@ impl ServerIpcConnection {
                         .is_some_and(|observed_at| observed_at > since),
                     None => true,
                 };
-                if prompt_is_fresh || accept_stale_prompt {
+                if prompt_is_fresh || accept_existing_input_wait {
                     let prompt = prompt.clone();
                     guard.last_prompt = None;
                     guard.last_prompt_observed_at = None;
@@ -598,7 +598,7 @@ impl ServerIpcConnection {
             let ready = match since {
                 Some(since) => {
                     guard.input_state.readiness_observed_after(since)
-                        || (accept_stale_prompt
+                        || (accept_existing_input_wait
                             && guard.input_state.input_wait_readiness_available())
                 }
                 None => guard.input_state.ready_for_input(),

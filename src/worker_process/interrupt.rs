@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
-use crate::completion_reply::{ReplyWithOffset, timeout_status_content};
+use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
 use crate::ipc::{IpcInputReadiness, IpcWaitError};
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
@@ -341,7 +341,7 @@ impl WorkerManager {
         };
         self.remember_prompt(prompt_to_remember);
         if self.pager.is_active() && !session_end {
-            self.pager_prompt = Some(resolved_prompt.clone());
+            self.pager_prompt = Some(PagerCompletionPrompt::from_prompt(resolved_prompt.clone()));
         }
         if !session_end && !prompt_wait.timed_out && !self.pager.is_active() {
             reconcile_trailing_completion_prompt(

@@ -214,6 +214,15 @@ to the managed queue, not independent input sources. Each delivered line or
 byte-oriented managed read emits `input_line`; when the queue is empty after an
 active batch, the worker emits `input_wait` or `ready`.
 
+Built-in Python uses prompt-free cell execution at top level. At the start of a
+non-empty tool call, an existing `input_wait` means the payload is stdin for the
+waiting Python reader; otherwise the payload is one complete Python cell.
+`ready` with no prompt is normal cell readiness, not a missing prompt.
+`input_wait` is the only public signal that the next non-empty payload is
+stdin. After interrupt, the server must wait for fresh `ready`, but an already
+pending `input_wait` remains actionable because it still denotes a waiting
+stdin reader.
+
 Python may still use PTY or ConPTY process stdio for terminal behavior, but
 accepted request input is sent over sideband IPC, not by server writes to
 runtime stdin.

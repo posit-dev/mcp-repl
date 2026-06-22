@@ -67,7 +67,28 @@ pub(crate) enum CompletionReplyMode {
 pub(crate) struct BuiltCompletionReply {
     pub(crate) reply: ReplyWithOffset,
     pub(crate) prompt_to_remember: Option<String>,
-    pub(crate) pager_prompt: Option<Option<String>>,
+    pub(crate) pager_prompt: Option<PagerCompletionPrompt>,
+}
+
+pub(crate) enum PagerCompletionPrompt {
+    PromptFree,
+    Prompt(String),
+}
+
+impl PagerCompletionPrompt {
+    pub(crate) fn from_prompt(prompt: Option<String>) -> Self {
+        match prompt {
+            Some(prompt) => Self::Prompt(prompt),
+            None => Self::PromptFree,
+        }
+    }
+
+    pub(crate) fn into_prompt(self) -> Option<String> {
+        match self {
+            Self::PromptFree => None,
+            Self::Prompt(prompt) => Some(prompt),
+        }
+    }
 }
 
 pub(crate) fn build_completed_reply(
@@ -118,7 +139,9 @@ pub(crate) fn build_completed_reply(
                 (!pager_active && !session_end)
                     .then_some(())
                     .and(resolved_prompt.clone()),
-                (pager_active && !session_end).then_some(resolved_prompt.clone()),
+                (pager_active && !session_end)
+                    .then_some(())
+                    .map(|()| PagerCompletionPrompt::from_prompt(resolved_prompt.clone())),
             )
         }
     };

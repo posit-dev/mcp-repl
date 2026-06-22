@@ -25,7 +25,7 @@ impl WorkerManager {
             None
         } else {
             match self.pager_prompt.take() {
-                Some(prompt) => prompt,
+                Some(prompt) => prompt.into_prompt(),
                 None => {
                     contents.push(WorkerContent::server_stderr(
                         "[repl] protocol error: missing prompt after pager dismiss",
