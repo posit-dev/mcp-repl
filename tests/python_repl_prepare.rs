@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::TestResult;
 use serde_json::{Value, json};
@@ -220,6 +222,43 @@ fn full_access_meta(sandbox_cwd: &Path) -> Value {
             },
         }
     })
+}
+
+fn read_only_meta(sandbox_cwd: &Path) -> Value {
+    json!({
+        SANDBOX_STATE_META_CAPABILITY: {
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [{
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "root" }
+                        },
+                        "access": "read"
+                    }],
+                },
+                "network": "restricted",
+            },
+            "sandboxCwd": sandbox_cwd_uri(sandbox_cwd),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
+                Value::String("/tmp/codex-linux-sandbox".to_string())
+            } else {
+                Value::Null
+            },
+        }
+    })
+}
+
+#[cfg(unix)]
+fn home_sentinel(label: &str) -> TestResult<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("missing HOME for Python repl_prepare sandbox test")?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(home.join(format!(".mcp-repl-python-prepare-{label}-{nanos}.txt")))
 }
 
 async fn spawn_python_inherit_files_server(
@@ -742,6 +781,107 @@ async fn repl_prepare_inherit_requires_meta_before_requirements_uv() -> TestResu
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_explicit_python_probe_obeys_read_only_sandbox() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let cwd = tempfile::tempdir()?;
+    let sentinel = home_sentinel("explicit-python")?;
+    let fake_python_dir = tempfile::tempdir()?;
+    let fake_python = fake_python_dir.path().join("python");
+    fs::write(
+        &fake_python,
+        format!("#!/bin/sh\ntouch {}\nexit 7\n", sentinel.display()),
+    )?;
+    let mut permissions = fs::metadata(&fake_python)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python, permissions)?;
+
+    let session = spawn_python_inherit_files_server(
+        cwd.path(),
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_prepare",
+            json!({ "python": { "executable": fake_python } }),
+            Some(read_only_meta(cwd.path())),
+        )
+        .await?;
+    let text = common::result_text(&result);
+    let wrote_sentinel = sentinel.exists();
+    let _ = fs::remove_file(&sentinel);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected fake Python probe to fail, got: {text:?}"
+    );
+    assert!(
+        !wrote_sentinel,
+        "explicit Python probe wrote outside the read-only sandbox"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_requirements_uv_obeys_read_only_sandbox() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let cwd = tempfile::tempdir()?;
+    let sentinel = home_sentinel("uv")?;
+    let fake_uv_dir = tempfile::tempdir()?;
+    let fake_uv = fake_uv_dir.path().join("uv");
+    fs::write(
+        &fake_uv,
+        format!(
+            "#!/bin/sh\nprintf ran > {}\necho FAKE_UV_READ_ONLY_SANDBOX_PROBE >&2\nexit 7\n",
+            sentinel.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_uv)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_uv, permissions)?;
+
+    let mut env_vars = uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?;
+    env_vars.push((
+        "PATH".to_string(),
+        fake_uv_dir.path().to_string_lossy().to_string(),
+    ));
+    let session = spawn_python_inherit_files_server(cwd.path(), env_vars).await?;
+
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_prepare",
+            json!({
+                "requirements": {
+                    "packages": [EXTRA_PACKAGE],
+                    "action": "set"
+                }
+            }),
+            Some(read_only_meta(cwd.path())),
+        )
+        .await?;
+    let text = common::result_text(&result);
+    let wrote_sentinel = sentinel.exists();
+    let _ = fs::remove_file(&sentinel);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected fake uv to fail, got: {text:?}"
+    );
+    assert!(
+        !wrote_sentinel,
+        "requirements uv resolution wrote outside the read-only sandbox"
+    );
     Ok(())
 }
 

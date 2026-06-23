@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use serde::Deserialize;
 
@@ -40,6 +40,22 @@ pub(crate) struct PythonRuntimeConfig {
     pub(crate) executable: PathBuf,
     pub(crate) libpython: PathBuf,
     pub(crate) module_search_paths: Vec<PathBuf>,
+}
+
+pub(crate) trait PythonCommandRunner {
+    fn output(&mut self, program: &Path, args: &[String]) -> Result<Output, String>;
+}
+
+pub(crate) struct DirectPythonCommandRunner;
+
+impl PythonCommandRunner for DirectPythonCommandRunner {
+    fn output(&mut self, program: &Path, args: &[String]) -> Result<Output, String> {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,12 +204,23 @@ fn python_program_candidates() -> Vec<PathBuf> {
 pub(crate) fn query_python_runtime_config(
     executable: &Path,
 ) -> Result<PythonRuntimeConfig, String> {
-    let output = Command::new(executable)
-        .arg("-I")
-        .arg("-c")
-        .arg(PYTHON_CONFIG_SNIPPET)
-        .stdin(Stdio::null())
-        .output()
+    let mut runner = DirectPythonCommandRunner;
+    query_python_runtime_config_with_runner(executable, &mut runner)
+}
+
+pub(crate) fn query_python_runtime_config_with_runner(
+    executable: &Path,
+    runner: &mut dyn PythonCommandRunner,
+) -> Result<PythonRuntimeConfig, String> {
+    let output = runner
+        .output(
+            executable,
+            &[
+                "-I".to_string(),
+                "-c".to_string(),
+                PYTHON_CONFIG_SNIPPET.to_string(),
+            ],
+        )
         .map_err(|err| {
             format!(
                 "failed to query Python runtime config from {}: {err}",

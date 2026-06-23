@@ -38,6 +38,23 @@ use crate::worker_process::{
 
 const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
+struct PrepareCommandRunner<'a> {
+    worker: &'a mut WorkerManager,
+    sandbox_state: crate::sandbox::SandboxState,
+}
+
+impl crate::python_runtime::PythonCommandRunner for PrepareCommandRunner<'_> {
+    fn output(
+        &mut self,
+        program: &std::path::Path,
+        args: &[String],
+    ) -> Result<std::process::Output, String> {
+        self.worker
+            .run_sandboxed_prepare_command(&self.sandbox_state, program, args)
+            .map_err(|err| err.to_string())
+    }
+}
+
 #[cfg(test)]
 fn repl_tool_description_for_backend(
     backend: Backend,
@@ -520,12 +537,27 @@ impl SharedServer {
             Ok(update) => update,
             Err(err) => return Self::prepare_python_local_error_reply(state, err),
         };
-        let active_python_executable = state.worker.active_python_executable();
-        let target = match crate::python_prepare::resolve_requirements_manifest(
-            &candidate_manifest,
-            operation.allows_current_runtime_shortcut(),
-            active_python_executable.as_deref(),
-        ) {
+        let prepare_command_sandbox_state = match state
+            .worker
+            .prepare_command_sandbox_state(sandbox_state_update.clone())
+        {
+            Ok(sandbox_state) => sandbox_state,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let active_python_executable = state.worker.active_python_executable_hint();
+        let target_result = {
+            let mut runner = PrepareCommandRunner {
+                worker: &mut state.worker,
+                sandbox_state: prepare_command_sandbox_state,
+            };
+            crate::python_prepare::resolve_requirements_manifest(
+                &candidate_manifest,
+                operation.allows_current_runtime_shortcut(),
+                active_python_executable.as_deref(),
+                &mut runner,
+            )
+        };
+        let target = match target_result {
             Ok(target) => target,
             Err(err) => {
                 return Self::prepare_python_error_reply(
@@ -537,7 +569,10 @@ impl SharedServer {
             }
         };
 
-        let active_matches = state.worker.python_executable_matches(&target.executable);
+        let active_matches = target.matches_current_runtime
+            || state
+                .worker
+                .python_executable_hint_matches(&target.executable);
         let restart_required = match operation.restart {
             crate::python_prepare::PrepareRestartPolicy::IfNeeded => !active_matches,
             crate::python_prepare::PrepareRestartPolicy::Yes => true,
@@ -606,9 +641,24 @@ impl SharedServer {
             Ok(update) => update,
             Err(err) => return Self::prepare_python_local_error_reply(state, err),
         };
-        let target = match crate::python_prepare::resolve_prepare_target(
-            &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
-        ) {
+        let prepare_command_sandbox_state = match state
+            .worker
+            .prepare_command_sandbox_state(sandbox_state_update.clone())
+        {
+            Ok(sandbox_state) => sandbox_state,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let target_result = {
+            let mut runner = PrepareCommandRunner {
+                worker: &mut state.worker,
+                sandbox_state: prepare_command_sandbox_state,
+            };
+            crate::python_prepare::resolve_prepare_target(
+                &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
+                &mut runner,
+            )
+        };
+        let target = match target_result {
             Ok(target) => target,
             Err(err) => {
                 return Self::prepare_python_error_reply(
@@ -619,7 +669,9 @@ impl SharedServer {
                 );
             }
         };
-        let active_matches = state.worker.python_executable_matches(&target.executable);
+        let active_matches = state
+            .worker
+            .python_executable_hint_matches(&target.executable);
         if active_matches {
             return Self::prepare_python_success_reply(
                 "session unchanged",

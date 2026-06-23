@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::python_runtime::{
-    PythonRuntimeConfig, find_program_on_path, query_python_runtime_config,
-    resolve_python_runtime_config,
+    PythonCommandRunner, PythonRuntimeConfig, find_program_on_path,
+    query_python_runtime_config_with_runner,
 };
 
 const DEFAULT_PACKAGES: &[&str] = &["numpy"];
@@ -80,6 +79,7 @@ pub(crate) struct PreparePython {
 pub(crate) struct PythonPrepareTarget {
     pub(crate) executable: PathBuf,
     pub(crate) module_search_paths: Vec<PathBuf>,
+    pub(crate) matches_current_runtime: bool,
 }
 
 pub(crate) enum ValidatedPrepareRequest {
@@ -126,6 +126,7 @@ pub(crate) fn validate_prepare_args(
 
 pub(crate) fn resolve_prepare_target(
     request: &ValidatedPrepareRequest,
+    runner: &mut dyn PythonCommandRunner,
 ) -> Result<PythonPrepareTarget, String> {
     let config = match request {
         ValidatedPrepareRequest::Requirements(_) => {
@@ -134,12 +135,13 @@ pub(crate) fn resolve_prepare_target(
             );
         }
         ValidatedPrepareRequest::PythonExecutable(executable) => {
-            query_python_runtime_config(executable)?
+            query_python_runtime_config_with_runner(executable, runner)?
         }
     };
     Ok(PythonPrepareTarget {
         executable: config.executable,
         module_search_paths: config.module_search_paths,
+        matches_current_runtime: false,
     })
 }
 
@@ -192,16 +194,19 @@ pub(crate) fn resolve_requirements_manifest(
     manifest: &PythonRequirementsManifest,
     allow_current_runtime_shortcut: bool,
     current_runtime_executable: Option<&Path>,
+    runner: &mut dyn PythonCommandRunner,
 ) -> Result<PythonPrepareTarget, String> {
-    let config = resolve_requirements(
+    let (config, matches_current_runtime) = resolve_requirements(
         &manifest.packages,
         manifest.python_version.as_deref(),
         allow_current_runtime_shortcut,
         current_runtime_executable,
+        runner,
     )?;
     Ok(PythonPrepareTarget {
         executable: config.executable,
         module_search_paths: config.module_search_paths,
+        matches_current_runtime,
     })
 }
 
@@ -217,33 +222,32 @@ fn resolve_requirements(
     python_version: Option<&str>,
     allow_current_runtime_shortcut: bool,
     current_runtime_executable: Option<&Path>,
-) -> Result<PythonRuntimeConfig, String> {
+    runner: &mut dyn PythonCommandRunner,
+) -> Result<(PythonRuntimeConfig, bool), String> {
     if allow_current_runtime_shortcut
         && let Some(executable) = current_runtime_executable
         && let Some(config) =
-            current_runtime_satisfies_requirements(executable, packages, python_version)
+            current_runtime_satisfies_requirements(executable, packages, python_version, runner)
     {
-        return Ok(config);
+        return Ok((config, true));
     }
-    resolve_uv_requirements(packages, python_version)
+    Ok((
+        resolve_uv_requirements(packages, python_version, runner)?,
+        false,
+    ))
 }
 
 fn current_runtime_satisfies_requirements(
     executable: &Path,
     packages: &[String],
     python_version: Option<&str>,
+    runner: &mut dyn PythonCommandRunner,
 ) -> Option<PythonRuntimeConfig> {
     if packages.is_empty() || python_version.is_some() {
         return None;
     }
-    let config = query_python_runtime_config(executable).ok()?;
-    installed_distributions_satisfy(&config.executable, packages).then_some(config)
-}
-
-pub(crate) fn current_python_executable() -> Option<PathBuf> {
-    resolve_python_runtime_config()
-        .ok()
-        .map(|config| config.executable)
+    let config = query_python_runtime_config_with_runner(executable, runner).ok()?;
+    installed_distributions_satisfy(&config.executable, packages, runner).then_some(config)
 }
 
 pub(crate) fn same_python_executable(left: &Path, right: &Path) -> bool {
@@ -333,27 +337,33 @@ fn python_executable_for_venv(venv: &Path) -> PathBuf {
 fn resolve_uv_requirements(
     packages: &[String],
     python_version: Option<&str>,
+    runner: &mut dyn PythonCommandRunner,
 ) -> Result<PythonRuntimeConfig, String> {
     let uv = find_program_on_path(UV_PROGRAM)
         .ok_or_else(|| "uv is required for repl_prepare but was not found on PATH".to_string())?;
 
-    let mut command = Command::new(&uv);
-    command.arg("tool").arg("run").arg("--isolated");
+    let mut args = vec![
+        "tool".to_string(),
+        "run".to_string(),
+        "--isolated".to_string(),
+    ];
     if let Some(python_version) = python_version {
-        command.arg("--python").arg(python_version);
+        args.push("--python".to_string());
+        args.push(python_version.to_string());
     }
     for package in packages {
-        command.arg("--with").arg(package);
+        args.push("--with".to_string());
+        args.push(package.clone());
     }
-    command
-        .arg("--")
-        .arg("python")
-        .arg("-I")
-        .arg("-c")
-        .arg("import sys; print(sys.executable)");
-    command.stdin(Stdio::null());
+    args.extend([
+        "--".to_string(),
+        "python".to_string(),
+        "-I".to_string(),
+        "-c".to_string(),
+        "import sys; print(sys.executable)".to_string(),
+    ]);
 
-    let output = command.output().map_err(|err| {
+    let output = runner.output(&uv, &args).map_err(|err| {
         format!(
             "failed to run uv while preparing Python requirements with {}: {err}",
             uv.display()
@@ -373,10 +383,14 @@ fn resolve_uv_requirements(
         .find(|line| !line.trim().is_empty())
         .map(str::trim)
         .ok_or_else(|| "uv did not report a Python executable".to_string())?;
-    query_python_runtime_config(Path::new(executable))
+    query_python_runtime_config_with_runner(Path::new(executable), runner)
 }
 
-fn installed_distributions_satisfy(executable: &Path, packages: &[String]) -> bool {
+fn installed_distributions_satisfy(
+    executable: &Path,
+    packages: &[String],
+    runner: &mut dyn PythonCommandRunner,
+) -> bool {
     let mut distribution_names = Vec::with_capacity(packages.len());
     for package in packages {
         let Some(name) = bare_requirement_distribution_name(package) else {
@@ -385,11 +399,10 @@ fn installed_distributions_satisfy(executable: &Path, packages: &[String]) -> bo
         distribution_names.push(name);
     }
 
-    Command::new(executable)
-        .arg("-I")
-        .arg("-c")
-        .arg(
-            r#"
+    let mut args = vec![
+        "-I".to_string(),
+        "-c".to_string(),
+        r#"
 import importlib.metadata
 import sys
 
@@ -398,14 +411,14 @@ for name in sys.argv[1:]:
         importlib.metadata.distribution(name)
     except importlib.metadata.PackageNotFoundError:
         raise SystemExit(1)
-"#,
-        )
-        .args(distribution_names)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+"#
+        .to_string(),
+    ];
+    args.extend(distribution_names);
+
+    runner
+        .output(executable, &args)
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
