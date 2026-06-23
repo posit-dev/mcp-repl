@@ -29,11 +29,13 @@ const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
 const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
+const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
+const LATE_SIDEBAND_AFTER_SESSION_END: &[u8] = b"STALE_SIDEBAND_AFTER_SESSION_END\n";
 
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -262,12 +264,27 @@ fn run_command(
         ignore_sigterm_for_late_raw_test();
         send_session_end(writer, "runtime_exit")?;
         append_control_log(control_log_path.as_deref(), "waiting_late_raw_marker")?;
-        wait_for_late_raw_marker()?;
+        wait_for_marker(LATE_RAW_MARKER_ENV)?;
         io::stdout().write_all(LATE_RAW_AFTER_SESSION_END)?;
         io::stdout().flush()?;
         append_control_log(
             control_log_path.as_deref(),
             "late_raw_stdout_after_session_end",
+        )?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-sideband-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_sideband_marker")?;
+        wait_for_marker(LATE_SIDEBAND_MARKER_ENV)?;
+        output_text(writer, control_log_path, LATE_SIDEBAND_AFTER_SESSION_END)?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_sideband_output_after_session_end",
         )?;
         loop {
             thread::park();
@@ -627,10 +644,10 @@ fn parse_millis(value: &str) -> io::Result<u64> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-fn wait_for_late_raw_marker() -> io::Result<()> {
-    let marker = std::env::var_os(LATE_RAW_MARKER_ENV)
+fn wait_for_marker(env_name: &str) -> io::Result<()> {
+    let marker = std::env::var_os(env_name)
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, LATE_RAW_MARKER_ENV))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, env_name))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if marker.exists() {

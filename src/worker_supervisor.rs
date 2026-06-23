@@ -1358,6 +1358,7 @@ impl WorkerProcess {
     }
 
     pub(crate) fn finish_session_end_for_respawn(mut self) -> Result<(), WorkerError> {
+        self.disable_ipc_handlers();
         if self.exit_status.is_none() {
             match self.child.try_wait()? {
                 Some(status) => self.exit_status = Some(status),
@@ -1420,6 +1421,12 @@ impl WorkerProcess {
     fn detach_ipc_reader(&mut self) {
         if let Some(ipc) = self.ipc.get() {
             ipc.detach_reader_thread();
+        }
+    }
+
+    fn disable_ipc_handlers(&mut self) {
+        if let Some(ipc) = self.ipc.get() {
+            ipc.disable_handlers();
         }
     }
 

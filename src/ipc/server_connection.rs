@@ -43,12 +43,37 @@ pub struct ServerIpcConnection {
     inbox: Arc<Mutex<ServerIpcInbox>>,
     cvar: Arc<Condvar>,
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    handler_gate: Arc<IpcHandlerGate>,
 }
 
 #[derive(Debug)]
 pub enum IpcInputReadiness {
     InputWait(String),
     Ready,
+}
+
+struct IpcHandlerGate {
+    enabled: Mutex<bool>,
+}
+
+impl IpcHandlerGate {
+    fn new() -> Self {
+        Self {
+            enabled: Mutex::new(true),
+        }
+    }
+
+    fn dispatch(&self, handler: impl FnOnce()) {
+        let enabled = self.enabled.lock().unwrap();
+        if *enabled {
+            handler();
+        }
+    }
+
+    fn disable(&self) {
+        let mut enabled = self.enabled.lock().unwrap();
+        *enabled = false;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -77,9 +102,11 @@ impl ServerIpcConnection {
         let inbox = Arc::new(Mutex::new(ServerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
         let reader_thread = Arc::new(Mutex::new(None));
+        let handler_gate = Arc::new(IpcHandlerGate::new());
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
+        let reader_handler_gate = handler_gate.clone();
         let output_text_handler = handlers.on_output_text.clone();
         let output_image_handler = handlers.on_output_image.clone();
         let input_wait_handler = handlers.on_input_wait.clone();
@@ -165,7 +192,7 @@ impl ServerIpcConnection {
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = input_line_handler.as_ref() {
-                            handler(input_line_event);
+                            reader_handler_gate.dispatch(|| handler(input_line_event));
                         }
                     }
                     WorkerToServerIpcMessage::InputWait { prompt } => {
@@ -178,7 +205,7 @@ impl ServerIpcConnection {
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = input_wait_handler.as_ref() {
-                            handler(prompt);
+                            reader_handler_gate.dispatch(|| handler(prompt));
                         }
                     }
                     WorkerToServerIpcMessage::Ready {} => {
@@ -204,7 +231,7 @@ impl ServerIpcConnection {
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
-                            handler();
+                            reader_handler_gate.dispatch(|| handler());
                         }
                     }
                     WorkerToServerIpcMessage::OutputText {
@@ -225,10 +252,12 @@ impl ServerIpcConnection {
                                 }
                             };
                         if let Some(handler) = output_text_handler.as_ref() {
-                            handler(IpcOutputText {
-                                stream,
-                                bytes,
-                                is_continuation,
+                            reader_handler_gate.dispatch(|| {
+                                handler(IpcOutputText {
+                                    stream,
+                                    bytes,
+                                    is_continuation,
+                                })
                             });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
@@ -269,13 +298,15 @@ impl ServerIpcConnection {
                             )
                         };
                         if let Some(handler) = output_image_handler.as_ref() {
-                            handler(IpcOutputImage {
-                                id,
-                                mime_type,
-                                data: data_b64,
-                                is_new,
-                                updates_previous_image,
-                                readline_results_seen,
+                            reader_handler_gate.dispatch(|| {
+                                handler(IpcOutputImage {
+                                    id,
+                                    mime_type,
+                                    data: data_b64,
+                                    is_new,
+                                    updates_previous_image,
+                                    readline_results_seen,
+                                })
                             });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
@@ -305,6 +336,7 @@ impl ServerIpcConnection {
             inbox,
             cvar,
             reader_thread,
+            handler_gate,
         })
     }
 
@@ -333,6 +365,10 @@ impl ServerIpcConnection {
 
     pub fn detach_reader_thread(&self) {
         let _ = self.reader_thread.lock().unwrap().take();
+    }
+
+    pub fn disable_handlers(&self) {
+        self.handler_gate.disable();
     }
 
     #[cfg_attr(

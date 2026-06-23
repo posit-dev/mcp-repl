@@ -637,6 +637,82 @@ async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() 
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_sideband_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_sideband_marker = tempdir.path().join("late-sideband-marker");
+    let late_sideband_marker_env = late_sideband_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![(
+            "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER",
+            late_sideband_marker_env.as_str(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-sideband-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_sideband_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_sideband_marker_for_thread = late_sideband_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-sideband-respawn",
+        )?;
+        std::fs::write(&late_sideband_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-sideband-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late sideband marker writer panicked")??;
+    assert!(
+        late_sideband_marker.exists(),
+        "expected test marker to trigger old worker sideband output"
+    );
+    wait_for_log_contains(&control_log, "late_sideband_output_after_session_end")?;
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-sideband-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_SIDEBAND_AFTER_SESSION_END"),
+        "old worker sideband output leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {
