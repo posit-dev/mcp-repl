@@ -89,6 +89,7 @@ fn docs_index_lists_main_docs() {
         "docs/testing.md",
         "docs/debugging.md",
         "docs/sandbox.md",
+        "docs/releasing.md",
         "docs/worker_sideband_protocol.md",
         "docs/plans/AGENTS.md",
     ] {
@@ -230,38 +231,24 @@ fn pyproject_defines_pypi_binary_package() {
 }
 
 #[test]
-fn ci_workflow_defines_tag_release_and_pypi_contract() {
+fn ci_workflow_validates_release_packaging_without_publishing() {
     let workflow = read(&repo_root().join(".github/workflows/ci.yml"));
 
     for required in [
         "workflow_dispatch:",
-        "publish-release:",
-        "publish-pypi:",
-        "tags:",
-        "- 'v[0-9]+.[0-9]+.[0-9]+'",
-        "- 'v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*'",
-        "- '!v*\\+*'",
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
+        "manylinux: \"2014\"",
+        "manylinux: auto",
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
         "mcp-repl-x86_64-pc-windows-msvc.zip",
-        "SHA256SUMS.txt",
         "PyO3/maturin-action@v1",
         "maturin-version: v1.11.5",
         "Build PyPI wheel",
         "Smoke test PyPI wheel",
-        "Upload PyPI wheel artifact",
-        "pypi-wheel-${{ matrix.target }}",
-        "pattern: pypi-wheel-*",
-        "pypa/gh-action-pypi-publish@release/v1",
-        "id-token: write",
-        "url: https://pypi.org/p/posit-mcp-repl",
-        "packages-dir: dist",
-        "gh release create \"${RELEASE_TAG}\" dist/*",
         "github.event_name == 'pull_request'",
-        "github.event_name == 'push' && github.ref_type == 'tag'",
         "run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
         "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
         "npm install -g @openai/codex",
@@ -269,11 +256,6 @@ fn ci_workflow_defines_tag_release_and_pypi_contract() {
         "name: cargo test",
         "run: cargo test --quiet",
         "MCP_REPL_CODEX_BACKEND: mock",
-        "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
-        "-F draft=false",
-        "-F prerelease=\"${prerelease_flag}\"",
-        "--prerelease",
-        "-f make_latest=\"${latest_flag}\"",
     ] {
         assert!(
             workflow.contains(required),
@@ -287,6 +269,8 @@ fn ci_workflow_defines_tag_release_and_pypi_contract() {
         "- 'v*.*.*'",
         "publish-stable:",
         "publish-dev:",
+        "publish-release:",
+        "publish-pypi:",
         "group: publish-dev",
         "publish_dev",
         "Force-move dev tag",
@@ -298,9 +282,13 @@ fn ci_workflow_defines_tag_release_and_pypi_contract() {
         "releases/tags/dev",
         "workflow_runs_json",
         "refs/heads/main",
+        "github.event_name == 'push' && github.ref_type == 'tag'",
         "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
         "sort -V | tail -n 1",
         "-F make_latest=false",
+        "pypa/gh-action-pypi-publish@release/v1",
+        "gh release create",
+        "id-token: write",
         "CODEX_VERSION:",
         "openai/codex-action",
         "secrets.OPENAI_API_KEY",
@@ -322,6 +310,112 @@ fn ci_workflow_defines_tag_release_and_pypi_contract() {
             !workflow.contains(forbidden),
             "did not expect {forbidden} in .github/workflows/ci.yml"
         );
+    }
+}
+
+#[test]
+fn release_workflow_defines_tag_only_publishing_contract() {
+    let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+
+    for required in [
+        "name: Release",
+        "tags:",
+        "- 'v*.*.*'",
+        "- '!v*+*'",
+        "publish-release:",
+        "publish-pypi:",
+        "github.ref_type == 'tag'",
+        "Validate release tag matches Cargo version",
+        "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+        "ubuntu-22.04",
+        "macos-15",
+        "windows-2022",
+        "manylinux: \"2014\"",
+        "manylinux: auto",
+        "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "mcp-repl-aarch64-apple-darwin.tar.gz",
+        "mcp-repl-x86_64-pc-windows-msvc.zip",
+        "SHA256SUMS.txt",
+        "PyO3/maturin-action@v1",
+        "maturin-version: v1.11.5",
+        "Build PyPI wheel",
+        "Smoke test PyPI wheel",
+        "Upload PyPI wheel artifact",
+        "pypi-wheel-${{ matrix.target }}",
+        "pattern: pypi-wheel-*",
+        "pypa/gh-action-pypi-publish@release/v1",
+        "id-token: write",
+        "url: https://pypi.org/p/posit-mcp-repl",
+        "packages-dir: dist",
+        "gh release create \"${RELEASE_TAG}\" dist/*",
+        "run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
+        "run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe",
+        "npm install -g @openai/codex",
+        "npm config get prefix",
+        "name: cargo test",
+        "run: cargo test --quiet",
+        "MCP_REPL_CODEX_BACKEND: mock",
+        "-F draft=false",
+        "-F prerelease=\"${prerelease_flag}\"",
+        "--prerelease",
+        "-f make_latest=\"${latest_flag}\"",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/release.yml"
+        );
+    }
+
+    for forbidden in [
+        "workflow_dispatch:",
+        "release_tag:",
+        "publish-dev:",
+        "group: publish-dev",
+        "publish_dev",
+        "Force-move dev tag",
+        "gh release upload dev dist/* --clobber",
+        "git tag -f dev",
+        "git push origin refs/tags/dev --force",
+        "releases/tags/dev",
+        "workflow_runs_json",
+        "refs/heads/main",
+        "- 'v[0-9]+.[0-9]+.[0-9]+'",
+        "- 'v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*'",
+        "- '!v*\\+*'",
+        "grep -E '^v[0-9]+(\\.[0-9]+){2}$'",
+        "sort -V | tail -n 1",
+        "-F make_latest=false",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "did not expect {forbidden} in .github/workflows/release.yml"
+        );
+    }
+}
+
+#[test]
+fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
+    let docs = read(&repo_root().join("docs/releasing.md"));
+
+    for required in [
+        "# Releasing",
+        "Update `Cargo.toml`",
+        "`git tag vX.Y.Z`",
+        "`git push origin vX.Y.Z`",
+        "PyPI Trusted Publisher",
+        "Owner: `posit-dev`",
+        "Repository: `mcp-repl`",
+        "Workflow: `release.yml`",
+        "Environment: `pypi`",
+        "Package: `posit-mcp-repl`",
+        "Wheel-only",
+        "sdist",
+        "manylinux2014",
+        "R is optional",
+        "No rolling dev release",
+        "No backfill workflow",
+    ] {
+        assert_contains_wrapped_text(&docs, required, "docs/releasing.md");
     }
 }
 

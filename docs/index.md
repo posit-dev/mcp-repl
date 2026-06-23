@@ -11,6 +11,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/testing.md`: public validation surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
+- `docs/releasing.md`: release checklist and PyPI distribution policy.
 - `docs/worker_sideband_protocol.md`: IPC-queued server/worker protocol
   contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
@@ -24,6 +25,8 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
+- `docs/releasing.md`: release checklist, GitHub Release asset policy, and
+  PyPI wheel policy.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 
 ## Exploratory Docs

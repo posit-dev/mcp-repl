@@ -5,10 +5,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*'
-      - '!v*\+*'
   pull_request:
     branches:
       - main
@@ -25,14 +21,17 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset_name: mcp-repl-x86_64-unknown-linux-gnu.tar.gz
             artifact_name: release-x86_64-unknown-linux-gnu
+            manylinux: "2014"
           - os: macos-15
             target: aarch64-apple-darwin
             asset_name: mcp-repl-aarch64-apple-darwin.tar.gz
             artifact_name: release-aarch64-apple-darwin
+            manylinux: auto
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             asset_name: mcp-repl-x86_64-pc-windows-msvc.zip
             artifact_name: release-x86_64-pc-windows-msvc
+            manylinux: auto
 
     steps:
       - uses: actions/checkout@v4
@@ -55,24 +54,6 @@ jobs:
 
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
-
-      - name: Validate release tag matches Cargo version
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "release tag must be semver like v0.1.0 or v0.1.0-rc1" >&2
-            exit 1
-          fi
-          release_version="${RELEASE_TAG#v}"
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          if [ "${cargo_version}" != "${release_version}" ]; then
-            echo "release tag ${RELEASE_TAG} does not match Cargo version ${cargo_version}" >&2
-            exit 1
-          fi
 
       - name: cargo check
         run: cargo check
@@ -135,7 +116,7 @@ jobs:
           .\target\release\mcp-repl.exe --help
 
       - name: Package release archive
-        if: (github.event_name == 'pull_request' || github.ref_type == 'tag') && matrix.os != 'windows-2022'
+        if: github.event_name == 'pull_request' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -146,7 +127,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
 
       - name: Package release archive (windows)
-        if: (github.event_name == 'pull_request' || github.ref_type == 'tag') && matrix.os == 'windows-2022'
+        if: github.event_name == 'pull_request' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $packageDir = "dist/mcp-repl-${{ matrix.target }}"
@@ -159,16 +140,16 @@ jobs:
           Pop-Location
 
       - name: Build PyPI wheel
-        if: github.event_name == 'pull_request' || github.ref_type == 'tag'
+        if: github.event_name == 'pull_request'
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.11.5
           command: build
           args: --release --locked --compatibility pypi --out dist/wheels
-          container: off
+          manylinux: ${{ matrix.manylinux }}
 
       - name: Smoke test PyPI wheel
-        if: (github.event_name == 'pull_request' || github.ref_type == 'tag') && matrix.os != 'windows-2022'
+        if: github.event_name == 'pull_request' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -179,7 +160,7 @@ jobs:
           ./wheel-smoke/bin/mcp-repl --help
 
       - name: Smoke test PyPI wheel (windows)
-        if: (github.event_name == 'pull_request' || github.ref_type == 'tag') && matrix.os == 'windows-2022'
+        if: github.event_name == 'pull_request' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $wheel = Get-ChildItem -Path "dist/wheels" -Filter "posit_mcp_repl-*.whl" | Select-Object -First 1
@@ -189,149 +170,3 @@ jobs:
           python -m venv wheel-smoke
           .\wheel-smoke\Scripts\python.exe -m pip install --disable-pip-version-check $wheel.FullName
           .\wheel-smoke\Scripts\mcp-repl.exe --help
-
-      - name: Upload packaged artifact
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.asset_name }}
-          if-no-files-found: error
-
-      - name: Upload PyPI wheel artifact
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        uses: actions/upload-artifact@v4
-        with:
-          name: pypi-wheel-${{ matrix.target }}
-          path: dist/wheels/*.whl
-          if-no-files-found: error
-
-  publish-release:
-    name: publish-release
-    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'
-    needs: checks
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ github.ref_name }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Validate release tag
-        id: release_tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}$ ]]; then
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "latest=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)$ ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "latest=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release tag must be final semver like v0.1.0 or prerelease semver like v0.1.0-rc1" >&2
-            exit 1
-          fi
-          git rev-parse "refs/tags/${RELEASE_TAG}" >/dev/null
-
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          merge-multiple: true
-          path: dist
-
-      - name: Verify packaged asset set
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_assets=(
-            mcp-repl-x86_64-unknown-linux-gnu.tar.gz
-            mcp-repl-aarch64-apple-darwin.tar.gz
-            mcp-repl-x86_64-pc-windows-msvc.zip
-          )
-          for asset in "${expected_assets[@]}"; do
-            test -f "dist/$asset"
-          done
-          actual_count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
-          test "$actual_count" = "3"
-
-      - name: Write SHA256SUMS.txt
-        shell: bash
-        run: |
-          set -euo pipefail
-          (
-            cd dist
-            sha256sum \
-              mcp-repl-x86_64-unknown-linux-gnu.tar.gz \
-              mcp-repl-aarch64-apple-darwin.tar.gz \
-              mcp-repl-x86_64-pc-windows-msvc.zip \
-              > SHA256SUMS.txt
-          )
-
-      - name: Create or update tag release
-        shell: bash
-        run: |
-          set -euo pipefail
-          prerelease_flag="${{ steps.release_tag.outputs.prerelease }}"
-          latest_flag="${{ steps.release_tag.outputs.latest }}"
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)"
-            gh api \
-              --method PATCH \
-              -H "Accept: application/vnd.github+json" \
-              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-              -F tag_name="${RELEASE_TAG}" \
-              -F name="${RELEASE_TAG}" \
-              -F draft=false \
-              -F prerelease="${prerelease_flag}" \
-              -f make_latest="${latest_flag}" \
-              >/dev/null
-            gh release upload "${RELEASE_TAG}" dist/* --clobber
-          else
-            latest_args=("--latest=false")
-            prerelease_args=()
-            if [ "${latest_flag}" = "true" ]; then
-              latest_args=("--latest")
-            fi
-            if [ "${prerelease_flag}" = "true" ]; then
-              prerelease_args=("--prerelease")
-            fi
-            gh release create "${RELEASE_TAG}" dist/* --title "${RELEASE_TAG}" --generate-notes "${prerelease_args[@]}" "${latest_args[@]}"
-          fi
-
-  publish-pypi:
-    name: publish-pypi
-    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'
-    needs: checks
-    runs-on: ubuntu-22.04
-    permissions:
-      id-token: write
-    environment:
-      name: pypi
-      url: https://pypi.org/p/posit-mcp-repl
-
-    steps:
-      - name: Download PyPI wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: pypi-wheel-*
-          merge-multiple: true
-          path: dist
-
-      - name: Verify PyPI wheel set
-        shell: bash
-        run: |
-          set -euo pipefail
-          wheel_count="$(find dist -maxdepth 1 -type f -name 'posit_mcp_repl-*.whl' | wc -l | tr -d ' ')"
-          test "$wheel_count" = "3"
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
