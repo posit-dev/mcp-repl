@@ -190,6 +190,26 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "glob_pattern",
+            "pattern": pattern
+        },
+        "access": "deny"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -2582,6 +2602,47 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
     assert!(
         !text.contains("WRITE_ERROR:"),
         "workspace-write unexpectedly blocked write in cwd: {text}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_glob_deny_meta_blocks_write_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-glob-deny-write")?;
+    let target = scratch.path().join("secret.env");
+    fs::write(&target, "original\n")?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "**/*.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected glob-denied write in cwd to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "glob-denied write in cwd unexpectedly succeeded: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "original\n",
+        "glob-denied write should leave existing file contents unchanged"
     );
     session.cancel().await?;
     Ok(())

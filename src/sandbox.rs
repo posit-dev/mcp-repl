@@ -199,6 +199,7 @@ pub struct FileSystemSandboxPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ResolvedFileSystemEntry {
     path: PathBuf,
     access: FileSystemAccessMode,
@@ -210,6 +211,7 @@ impl Default for FileSystemSandboxPolicy {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl FileSystemSandboxPolicy {
     fn read_only() -> Self {
         Self::restricted(vec![FileSystemSandboxEntry {
@@ -298,12 +300,15 @@ impl FileSystemSandboxPolicy {
                 access: FileSystemAccessMode::Read,
             });
         }
-        for root in writable_roots {
-            for subpath in compute_read_only_subpaths(root) {
-                entries.push(FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path: subpath },
-                    access: FileSystemAccessMode::Read,
-                });
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            for root in writable_roots {
+                for subpath in compute_read_only_subpaths(root) {
+                    entries.push(FileSystemSandboxEntry {
+                        path: FileSystemPath::Path { path: subpath },
+                        access: FileSystemAccessMode::Read,
+                    });
+                }
             }
         }
         Self::restricted(entries)
@@ -656,6 +661,7 @@ impl SandboxPolicy {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn file_system_policy_from_legacy(policy: &SandboxPolicy) -> FileSystemSandboxPolicy {
     match policy {
         SandboxPolicy::DangerFullAccess => FileSystemSandboxPolicy::unrestricted(),
@@ -842,7 +848,7 @@ fn temp_writable_roots(
     roots
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
     let mut subpaths = Vec::new();
 
@@ -872,30 +878,7 @@ fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn compute_linux_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
-    let mut subpaths = Vec::new();
-
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() || dot_git.is_file() {
-        if dot_git.is_file()
-            && let Some(gitdir) = resolve_gitdir_from_file(&dot_git)
-            && !subpaths.iter().any(|path| path == &gitdir)
-        {
-            subpaths.push(gitdir);
-        }
-        subpaths.push(dot_git);
-    }
-
-    let dot_codex = root.join(".codex");
-    if dot_codex.is_dir() {
-        subpaths.push(dot_codex);
-    }
-
-    let dot_agents = root.join(".agents");
-    if dot_agents.is_dir() {
-        subpaths.push(dot_agents);
-    }
-
-    subpaths
+    compute_read_only_subpaths(root)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1799,6 +1782,11 @@ pub fn prepare_worker_command_with_managed_network(
                 *exclude_tmpdir_env_var = true;
                 *exclude_slash_tmp = true;
             }
+            SandboxPolicy::Managed { .. } => {
+                return Err(SandboxError::LinuxSandbox(
+                    "managed sandbox policies are only supported on macOS".to_string(),
+                ));
+            }
             _ => {}
         }
         let policy = sanitize_linux_sandbox_policy(&policy);
@@ -1928,6 +1916,9 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
         SandboxPolicy::ExternalSandbox { network_access } => SandboxPolicy::ExternalSandbox {
             network_access: *network_access,
         },
+        SandboxPolicy::Managed { .. } => {
+            unreachable!("managed sandbox policies are rejected before Linux sandbox preparation")
+        }
         SandboxPolicy::DangerFullAccess => SandboxPolicy::DangerFullAccess,
         SandboxPolicy::ReadOnly { network_access } => SandboxPolicy::ReadOnly {
             network_access: *network_access,
@@ -2277,7 +2268,7 @@ fn build_seatbelt_unreadable_glob_policy(
         if let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) {
             let regex = regex.replace('"', "\\\"");
             policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
-            policy_components.push(format!(r#"(deny file-write-unlink (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-write* (regex #"{regex}"))"#));
         }
     }
     policy_components.join("\n")
@@ -4517,8 +4508,8 @@ mod tests {
             "expected glob deny read rule in seatbelt policy: {policy}"
         );
         assert!(
-            policy.contains("(deny file-write-unlink (regex #\""),
-            "expected glob deny unlink rule in seatbelt policy: {policy}"
+            policy.contains("(deny file-write* (regex #\""),
+            "expected glob deny write rule in seatbelt policy: {policy}"
         );
     }
 
@@ -4557,6 +4548,38 @@ mod tests {
         assert!(
             path_entries.iter().any(|entry| entry == &lib_dir),
             "embedded R library dir should be present in LD_LIBRARY_PATH"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_rejects_managed_policy_on_linux() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::Managed {
+                file_system: FileSystemSandboxPolicy {
+                    kind: FileSystemSandboxKind::Restricted,
+                    glob_scan_max_depth: None,
+                    entries: vec![FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    }],
+                },
+                network_access: NetworkAccess::Restricted,
+            },
+            ..SandboxState::default()
+        };
+
+        let err =
+            match prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state) {
+                Ok(_) => panic!("managed policies should be rejected on Linux"),
+                Err(err) => err,
+            };
+
+        assert!(
+            err.to_string().contains("only supported on macOS"),
+            "unexpected error: {err}"
         );
     }
 
