@@ -337,7 +337,7 @@ impl OutputRing {
 
             let mut guard = self.inner.lock().unwrap();
             let dropped = guard.make_room_for(bytes_len, self.capacity_bytes);
-            dropped_any |= dropped.dropped_any();
+            dropped_any |= dropped.dropped_visible();
 
             let start_offset = guard.end_offset;
             guard.end_offset = guard
@@ -386,7 +386,7 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = offset.max(guard.start_offset);
-        if dropped.dropped_any() {
+        if dropped.dropped_visible() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
         }
@@ -418,7 +418,7 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_any() {
+        if dropped.dropped_visible() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
         }
@@ -443,7 +443,7 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_any() {
+        if dropped.dropped_visible() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
         }
@@ -461,12 +461,10 @@ impl OutputRing {
             return;
         }
 
-        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
-        let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_any() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
-            event_offset = event_offset.max(guard.start_offset);
+        if !guard.make_room_for_input_echo(event_bytes, self.capacity_bytes) {
+            return;
         }
+        let event_offset = guard.end_offset.max(guard.start_offset);
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
         guard.events.push_back(OutputEvent {
             offset: event_offset,
@@ -676,12 +674,53 @@ impl OutputRingInner {
         false
     }
 
+    fn pop_oldest_input_echo_event(&mut self) -> bool {
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, OutputEventKind::InputEcho { .. }))
+        else {
+            return false;
+        };
+        let Some(event) = self.events.remove(index) else {
+            return false;
+        };
+        self.buffered_event_bytes = self
+            .buffered_event_bytes
+            .saturating_sub(event_size_bytes(&event.kind));
+        true
+    }
+
+    fn drop_input_echoes_for_room(&mut self, needed_bytes: usize, capacity_bytes: usize) -> usize {
+        let mut dropped = 0usize;
+        while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
+            if !self.pop_oldest_input_echo_event() {
+                break;
+            }
+            dropped = dropped.saturating_add(1);
+        }
+        dropped
+    }
+
+    fn make_room_for_input_echo(&mut self, needed_bytes: usize, capacity_bytes: usize) -> bool {
+        if needed_bytes >= capacity_bytes {
+            return false;
+        }
+        self.drop_input_echoes_for_room(needed_bytes, capacity_bytes);
+        self.total_buffered_bytes().saturating_add(needed_bytes) <= capacity_bytes
+    }
+
     fn make_room_for(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
         let mut dropped = DropStats::default();
         if needed_bytes >= capacity_bytes {
             // If a single chunk consumes the full capacity, drop everything else.
             dropped.dropped_bytes = self.end_offset.saturating_sub(self.start_offset);
-            dropped.dropped_events = self.events.len();
+            for event in &self.events {
+                if !matches!(event.kind, OutputEventKind::InputEcho { .. }) {
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
+                }
+            }
             self.chunks.clear();
             self.line_ends.clear();
             self.events.clear();
@@ -690,6 +729,8 @@ impl OutputRingInner {
             self.buffered_event_bytes = 0;
             return dropped;
         }
+
+        let _ = self.drop_input_echoes_for_room(needed_bytes, capacity_bytes);
 
         while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
             if !self.chunks.is_empty() {
@@ -709,7 +750,8 @@ impl OutputRingInner {
 
             if !self.events.is_empty() {
                 if self.pop_front_event() {
-                    dropped.dropped_events = dropped.dropped_events.saturating_add(1);
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
                 }
                 continue;
             }
@@ -774,12 +816,12 @@ impl OutputRingInner {
 #[derive(Default, Clone, Copy)]
 struct DropStats {
     dropped_bytes: u64,
-    dropped_events: usize,
+    dropped_visible_events: usize,
 }
 
 impl DropStats {
-    fn dropped_any(self) -> bool {
-        self.dropped_bytes > 0 || self.dropped_events > 0
+    fn dropped_visible(self) -> bool {
+        self.dropped_bytes > 0 || self.dropped_visible_events > 0
     }
 }
 

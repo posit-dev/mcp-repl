@@ -222,6 +222,43 @@ async fn spawn_zod_delayed_interrupt_ready_server(
     .await
 }
 
+async fn spawn_zod_pager_server(
+    control_log: &std::path::Path,
+    page_chars: u64,
+) -> TestResult<common::McpTestSession> {
+    let tempdir = tempfile::tempdir()?;
+    let spec_path = tempdir.path().join("zod-worker.json");
+    let mut env = Map::new();
+    env.insert(
+        "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
+        Value::String(control_log.display().to_string()),
+    );
+    let spec = json!({
+        "executable": zod_worker_path()?,
+        "args": [],
+        "working_dir": "inherit",
+        "env": env,
+        "stdin": "pipe",
+        "sandbox": "server"
+    });
+    std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+    common::spawn_server_with_args_env(
+        vec![
+            "--worker-spec".to_string(),
+            spec_path.display().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--oversized-output".to_string(),
+            "pager".to_string(),
+        ],
+        vec![(
+            "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
+            page_chars.to_string(),
+        )],
+    )
+    .await
+}
+
 async fn spawn_zod_stalled_control_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
@@ -444,6 +481,45 @@ async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let hidden_payload = "h".repeat(300_000);
+    let input = format!(
+        "repeat-output 1700000\nsilent {hidden_payload}\nsilent {hidden_payload}\nsilent {hidden_payload}"
+    );
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ZOD_BEGIN"),
+        "hidden input echoes should not evict the beginning of visible pager output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected the anchored output to remain paged, got: {text:?}"
+    );
+    assert!(
+        !text.contains("output gap detected") && !text.contains("output truncated"),
+        "hidden input echoes should not create a visible output gap, got: {text:?}"
+    );
+
     Ok(())
 }
 

@@ -233,6 +233,22 @@ fn run_command(
         return Ok(false);
     }
 
+    if let Some(len) = command.strip_prefix("repeat-output ") {
+        let len: usize = parse_millis(len)?
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "repeat-output too large"))?;
+        let mut text = String::with_capacity(len.saturating_add(32));
+        text.push_str("ZOD_BEGIN\n");
+        text.push_str(&"z".repeat(len));
+        text.push_str("\nZOD_END\n");
+        output_text(writer, control_log_path, text.as_bytes())?;
+        return Ok(false);
+    }
+
+    if command.starts_with("silent ") {
+        return Ok(false);
+    }
+
     if command == "output-matching-input-line" {
         output_text(
             writer,
