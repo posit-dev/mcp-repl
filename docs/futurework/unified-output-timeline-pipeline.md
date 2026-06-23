@@ -5,11 +5,13 @@
 The server currently has more divergence between pager mode and files mode than
 it should.
 
-Longer term, the cleaner design is:
+The current implementation now has a shared resolved output renderer, but still
+uses separate buffering stores for files mode and pager mode. Longer term, the
+cleaner design is:
 
 - collect output into one shared in-memory timeline model,
-- perform timeline resolution, generated input echo placement, image ordering,
-  and related formatting through one mostly common code path,
+- keep timeline resolution, generated input echo presentation, image ordering,
+  and related formatting in the shared resolved-output layer,
 - defer the pager-vs-files split until the final presentation step.
 
 ## Why This Is Deferred
@@ -20,23 +22,26 @@ The current branch is intentionally narrower:
 - do the minimum refactoring required to fix it correctly,
 - avoid broad output-pipeline redesign while landing that fix.
 
-That bug is now fixed in a way that improves sharing, but the overall split
-between `src/pending_output_tape.rs` and the pager/output-ring path remains
-larger than ideal.
+That bug is now fixed in a way that improves sharing. The shared renderer lives
+in `src/resolved_output.rs`, but the overall split between
+`src/pending_output_tape.rs` and the pager/output-ring path remains larger than
+ideal.
 
 ## Current Friction
 
 - Files mode and pager mode still buffer different intermediate structures.
-- Generated input echo placement and timeline resolution still happen in
-  mode-specific assembly paths.
-- Architectural discovery is harder because there is no single “resolved
-  timeline” abstraction that both modes consume.
+- Architectural discovery is still harder than necessary because there is no
+  single backing timeline store that both modes consume.
+- Files mode still owns request sealing, UTF-8 tail flushing, timeout staging,
+  and transcript retention; pager mode still owns byte cursors, page ranges,
+  active pager state, and search state.
 
 ## Intended Direction
 
-- Introduce one canonical resolved output-timeline structure for server-side
+- Keep using one canonical resolved output-timeline structure for server-side
   request output.
-- Keep cross-channel ordering and generated echo placement in that shared layer.
+- Keep cross-channel ordering and generated echo presentation in that shared
+  layer.
 - Let files mode decide how to seal or spill that resolved timeline.
 - Let pager mode decide how to page or elide that same resolved timeline.
 - Keep mode-specific behavior focused on presentation, retention, and paging
@@ -44,9 +49,8 @@ larger than ideal.
 
 ## Possible Follow-On Slices
 
-- Define the canonical resolved timeline type and its invariants.
 - Make `pending_output_tape` and the pager/output-ring path converge on that
-  type.
+  backing store.
 - Move more reply-seal formatting out of mode-specific code and into shared
   helpers.
 - Re-evaluate whether some current files-mode and pager-mode tests should become
@@ -54,6 +58,6 @@ larger than ideal.
 
 ## Non-Goals For The Current Branch
 
-- Replacing both buffering systems with one abstraction immediately.
+- Replacing both buffering systems with one backing store immediately.
 - Redesigning oversized-output retention policy.
 - Expanding the plot-ordering fix into a full output-subsystem rewrite.

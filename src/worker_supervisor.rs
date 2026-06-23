@@ -2881,6 +2881,7 @@ mod tests {
         assert_eq!(
             contents,
             vec![
+                WorkerContent::worker_stdout_transcript_only("> lines(4:8, 4:8)\n"),
                 WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
@@ -3084,6 +3085,7 @@ mod tests {
         assert_eq!(
             contents,
             vec![
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
                 WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),

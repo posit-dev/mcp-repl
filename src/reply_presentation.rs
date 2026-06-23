@@ -126,7 +126,13 @@ pub(crate) fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &
     let Some(idx) = idx else {
         return;
     };
-    let WorkerContent::ContentText { text, stream, .. } = &contents[idx] else {
+    let WorkerContent::ContentText {
+        text,
+        stream,
+        visibility,
+        ..
+    } = &contents[idx]
+    else {
         return;
     };
     let Some(prefix) = text.strip_suffix(prompt) else {
@@ -139,6 +145,7 @@ pub(crate) fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &
             text: prefix.to_string(),
             stream: *stream,
             origin: ContentOrigin::Worker,
+            visibility: *visibility,
         };
     }
 }
@@ -161,6 +168,7 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
                 text,
                 stream: TextStream::Stdout,
                 origin: ContentOrigin::Worker,
+                visibility,
             } => {
                 let Some(prefix) = text.strip_suffix(prompt) else {
                     return;
@@ -172,6 +180,7 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
                         text: prefix.to_string(),
                         stream: TextStream::Stdout,
                         origin: ContentOrigin::Worker,
+                        visibility: *visibility,
                     };
                 }
                 return;

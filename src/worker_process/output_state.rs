@@ -506,8 +506,11 @@ mod tests {
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected an in-flight files-mode drain to keep runtime output visible"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected an in-flight files-mode drain to keep generated echoes as transcript-only text"
         );
     }
 
@@ -535,8 +538,12 @@ mod tests {
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\nstart\n")],
-            "expected files-mode drain to preserve all worker stdout"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+                WorkerContent::stdout("start\n"),
+            ],
+            "expected worker output to preserve raw output and transcript-only generated echoes"
         );
     }
 
@@ -563,8 +570,11 @@ mod tests {
 
         assert_eq!(
             context.detached_prefix_contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected a sealed files-mode prefix without settled completion metadata to keep runtime output"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected a sealed files-mode prefix without settled completion metadata to keep generated echoes as transcript-only text"
         );
     }
 

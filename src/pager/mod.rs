@@ -3,13 +3,13 @@ use std::sync::OnceLock;
 
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
-use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
+use crate::output_capture::OutputBuffer;
+use crate::resolved_output::{self, InputEchoVisibility, OutputEventKind, OutputRange};
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 mod command;
-mod merge;
 mod presentation;
 mod ranges;
 mod search;
@@ -65,16 +65,6 @@ struct PagerTextSpan {
     end: u64,
     is_stderr: bool,
     origin: ContentOrigin,
-}
-
-impl merge::EventView for crate::output_capture::OutputEvent {
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    fn kind(&self) -> &OutputEventKind {
-        &self.kind
-    }
 }
 
 pub(crate) struct SnapshotPage {
@@ -210,6 +200,19 @@ impl PagerBuffer {
     }
 
     fn contents_for_range(&self, start_offset: u64, end_offset: u64) -> Vec<WorkerContent> {
+        self.contents_for_range_with_input_echo_visibility(
+            start_offset,
+            end_offset,
+            InputEchoVisibility::ReplyAndTranscript,
+        )
+    }
+
+    fn contents_for_range_with_input_echo_visibility(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+        input_echo_visibility: InputEchoVisibility,
+    ) -> Vec<WorkerContent> {
         let end_offset = end_offset.min(self.len());
         let start_offset = start_offset.min(end_offset);
         if start_offset > end_offset {
@@ -218,13 +221,13 @@ impl PagerBuffer {
         let start = self.byte_index_for_char_offset(start_offset);
         let end = self.byte_index_for_char_offset(end_offset);
         let bytes = &self.bytes[start..end];
-        merge::merge_bytes_with_events_and_spans(
+        resolved_output::render_bytes_with_events_and_spans(
             bytes,
             start as u64,
             end as u64,
             &self.text_spans_in_byte_offsets(start_offset, end_offset),
             &self.events_in_byte_offsets(start_offset, end_offset),
-            output_event_to_content,
+            input_echo_visibility,
         )
     }
 
@@ -629,7 +632,7 @@ struct PagerEventByte {
     kind: OutputEventKind,
 }
 
-impl merge::EventView for PagerEventByte {
+impl resolved_output::EventView for PagerEventByte {
     fn offset(&self) -> u64 {
         self.offset
     }
@@ -647,7 +650,7 @@ struct PagerTextSpanByte {
     origin: ContentOrigin,
 }
 
-impl merge::TextSpanView for PagerTextSpanByte {
+impl resolved_output::TextSpanView for PagerTextSpanByte {
     fn start(&self) -> u64 {
         self.start
     }
@@ -1543,8 +1546,12 @@ impl Pager {
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
                         state.buffer.advance_offset_to(desired_offset);
-                        let (contents, pages_left, span) =
-                            take_next_page(&mut state.buffer, page_bytes, &mut state.seen_ranges);
+                        let (contents, pages_left, span) = take_next_page(
+                            &mut state.buffer,
+                            page_bytes,
+                            &mut state.seen_ranges,
+                            InputEchoVisibility::ReplyAndTranscript,
+                        );
                         CommandOutcome::page(contents, pages_left, is_error, span)
                     }
                 }
@@ -1627,66 +1634,16 @@ pub(crate) fn maybe_activate_and_append_footer(
     contents.push(WorkerContent::server_stderr(pager.footer(pages_left)));
 }
 
-pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
-    if range.bytes.is_empty() && range.events.is_empty() {
-        return Vec::new();
-    }
-    let buffer = PagerBuffer::from_range(range);
-    buffer.contents_for_range(0, buffer.len())
-}
-
 #[cfg(test)]
-pub(crate) fn contents_from_bytes_and_events(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<crate::output_capture::OutputTextSpan>,
-    source_end: u64,
-) -> Vec<WorkerContent> {
-    let buffer = PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    buffer.contents_for_range(0, buffer.len())
-}
-
-fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
-    match kind {
-        OutputEventKind::Image {
-            data,
-            mime_type,
-            id,
-            is_new,
-            ..
-        } => WorkerContent::ContentImage {
-            data: data.clone(),
-            mime_type: mime_type.clone(),
-            id: id.clone(),
-            is_new: *is_new,
-        },
-        OutputEventKind::Text {
-            text,
-            is_stderr,
-            origin,
-            ..
-        } => {
-            if *is_stderr {
-                match origin {
-                    ContentOrigin::Worker => WorkerContent::worker_stderr(text.clone()),
-                    ContentOrigin::Server => WorkerContent::server_stderr(text.clone()),
-                }
-            } else {
-                match origin {
-                    ContentOrigin::Worker => WorkerContent::worker_stdout(text.clone()),
-                    ContentOrigin::Server => WorkerContent::server_stdout(text.clone()),
-                }
-            }
-        }
-        OutputEventKind::InputEcho { text } => WorkerContent::worker_stdout(text.clone()),
-    }
+pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+    resolved_output::contents_from_output_range(range, InputEchoVisibility::ReplyAndTranscript)
 }
 
 pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
     let start_offset = output.current_offset().unwrap_or(end_offset);
     let range = output.read_range(start_offset, end_offset);
     output.advance_offset_to(end_offset);
-    contents_from_output_range(range)
+    resolved_output::contents_from_output_range(range, InputEchoVisibility::TranscriptOnly)
 }
 
 pub(crate) fn take_snapshot_page_from_ring(
@@ -1711,7 +1668,11 @@ pub(crate) fn take_snapshot_page_from_buffer(
     target_bytes: u64,
 ) -> SnapshotPage {
     if buffer.bytes.is_empty() {
-        let contents = buffer.contents_for_range(0, buffer.len());
+        let contents = buffer.contents_for_range_with_input_echo_visibility(
+            0,
+            buffer.len(),
+            InputEchoVisibility::TranscriptOnly,
+        );
         return SnapshotPage {
             contents,
             pages_left: 0,
@@ -1721,7 +1682,20 @@ pub(crate) fn take_snapshot_page_from_buffer(
         };
     }
     let mut seen = RangeSet::default();
-    let (contents, pages_left, span) = take_next_page(&mut buffer, target_bytes, &mut seen);
+    let page_end = page_end_offset_with_images(
+        &buffer,
+        buffer.current_offset(),
+        buffer.len(),
+        target_bytes.max(1),
+        MAX_IMAGES_PER_PAGE,
+    );
+    let input_echo_visibility = if page_end < buffer.len() {
+        InputEchoVisibility::ReplyAndTranscript
+    } else {
+        InputEchoVisibility::TranscriptOnly
+    };
+    let (contents, pages_left, span) =
+        take_next_page(&mut buffer, target_bytes, &mut seen, input_echo_visibility);
     let last_range_end_byte = span
         .last
         .map(|(_, end)| buffer.byte_index_for_char_offset(end) as u64);
@@ -1749,6 +1723,7 @@ fn take_next_page(
     buffer: &mut PagerBuffer,
     target_bytes: u64,
     seen: &mut RangeSet,
+    input_echo_visibility: InputEchoVisibility,
 ) -> (Vec<WorkerContent>, u64, RangeSpan) {
     let target_bytes = target_bytes.max(1);
     let end_offset = buffer.len();
@@ -1796,7 +1771,11 @@ fn take_next_page(
             contents.push(elision_marker(gap_start, gap_end));
         }
 
-        let segment_contents = buffer.contents_for_range(cursor, visible_end);
+        let segment_contents = buffer.contents_for_range_with_input_echo_visibility(
+            cursor,
+            visible_end,
+            input_echo_visibility,
+        );
         if !segment_contents.is_empty() {
             contents.extend(segment_contents);
         }
@@ -1900,7 +1879,12 @@ fn take_next_pages(
     let mut pages_left = 0;
     let mut span = RangeSpan::default();
     for _ in 0..count {
-        let (page_contents, left, range) = take_next_page(buffer, target_bytes, seen);
+        let (page_contents, left, range) = take_next_page(
+            buffer,
+            target_bytes,
+            seen,
+            InputEchoVisibility::ReplyAndTranscript,
+        );
         pages_left = left;
         if page_contents.is_empty() {
             break;
@@ -1999,7 +1983,12 @@ fn skip_pages_and_take_next(
     }
 
     buffer.advance_offset_to(cursor);
-    take_next_page(buffer, page_bytes, seen)
+    take_next_page(
+        buffer,
+        page_bytes,
+        seen,
+        InputEchoVisibility::ReplyAndTranscript,
+    )
 }
 
 fn take_unseen_segments_in_range(

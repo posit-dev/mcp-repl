@@ -2,11 +2,10 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use crate::output_capture::{
-    OutputEvent, OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan,
+use crate::resolved_output::{
+    self, InputEchoVisibility, OutputEvent, OutputEventKind, OutputRange, OutputTextSource,
+    OutputTextSpan,
 };
-use crate::pager;
-use crate::reply_presentation::input_echo_text;
 use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 #[derive(Clone, Default)]
@@ -451,7 +450,8 @@ impl PendingOutputSnapshot {
 
     fn format_contents_inner(&self) -> FormattedPendingOutput {
         let RenderedPendingOutput { range, saw_stderr } = self.rendered_output();
-        let contents = pager::contents_from_output_range(range);
+        let contents =
+            resolved_output::contents_from_output_range(range, InputEchoVisibility::TranscriptOnly);
         FormattedPendingOutput {
             contents,
             saw_stderr,
@@ -540,10 +540,10 @@ impl PendingOutputSnapshot {
                 }
                 PendingOutputEvent::Sideband { kind, .. } => match kind {
                     PendingSidebandKind::ReadlineResult { prompt, line } => {
-                        if let Some(text) = input_echo_text(prompt, line) {
+                        if let Some(kind) = OutputEventKind::input_echo(prompt, line) {
                             events.push(OutputEvent {
                                 offset: bytes.len() as u64,
-                                kind: OutputEventKind::InputEcho { text },
+                                kind,
                             });
                             last_rendered_text = None;
                         }
@@ -1001,16 +1001,8 @@ mod tests {
         assert_eq!(
             formatted.contents,
             vec![
-                WorkerContent::ContentText {
-                    text: "x".to_string(),
-                    stream: TextStream::Stdout,
-                    origin: ContentOrigin::Worker,
-                },
-                WorkerContent::ContentText {
-                    text: "\n[repl] session ended\n".to_string(),
-                    stream: TextStream::Stdout,
-                    origin: ContentOrigin::Server,
-                },
+                WorkerContent::worker_stdout("x"),
+                WorkerContent::server_stdout("\n[repl] session ended\n"),
             ]
         );
     }
@@ -1024,11 +1016,7 @@ mod tests {
         let formatted = snapshot.format_contents();
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::ContentText {
-                text: "stderr: [repl] guardrail\n".to_string(),
-                stream: TextStream::Stderr,
-                origin: ContentOrigin::Server,
-            }]
+            vec![WorkerContent::server_stderr("stderr: [repl] guardrail\n")]
         );
     }
 
@@ -1150,7 +1138,7 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(">>> 1+\n")]
         );
 
         tape.append_stdout_bytes(b">>> 1");
@@ -1181,7 +1169,7 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(">>> x <- 1\n")]
         );
     }
 
@@ -1200,7 +1188,10 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            vec![WorkerContent::server_stdout(status)]
+            vec![
+                WorkerContent::worker_stdout_transcript_only(">>> plot(1:10)\n"),
+                WorkerContent::server_stdout(status)
+            ]
         );
 
         tape.append_stdout_bytes(b">>> plot(1:10)\n");
@@ -1231,12 +1222,15 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            vec![WorkerContent::ContentImage {
-                data: "AA==".to_string(),
-                mime_type: "image/png".to_string(),
-                id: "img-1".to_string(),
-                is_new: true,
-            },]
+            vec![
+                WorkerContent::worker_stdout_transcript_only(">>> plot(1:10)\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
         );
 
         tape.append_stdout_bytes(b">>> plot(1:10)\n");
@@ -1262,7 +1256,9 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(
+                ">>> x <- 1\n>>> y <- 2\n"
+            )]
         );
 
         tape.append_stdout_bytes(b">>> x <- 1\nok\n");
@@ -1447,14 +1443,15 @@ mod tests {
             snapshot.format_contents_for_reply().contents,
             vec![
                 WorkerContent::worker_stdout("> plot(1:10)\n"),
-                WorkerContent::worker_stdout("> plot(1:10)\n> cat('done\\n')\ndone\n"),
+                WorkerContent::worker_stdout_transcript_only("> plot(1:10)\n"),
+                WorkerContent::worker_stdout("> cat('done\\n')\ndone\n"),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
                     mime_type: "image/png".to_string(),
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+                WorkerContent::worker_stdout_transcript_only("> cat('done\\n')\n"),
             ]
         );
     }
@@ -1487,14 +1484,15 @@ mod tests {
             snapshot.format_contents().contents,
             vec![
                 WorkerContent::worker_stdout("> plot(1:10)\n"),
-                WorkerContent::worker_stdout("> plot(1:10)\n> cat('done\\n')\ndone\n"),
+                WorkerContent::worker_stdout_transcript_only("> plot(1:10)\n"),
+                WorkerContent::worker_stdout("> cat('done\\n')\ndone\n"),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
                     mime_type: "image/png".to_string(),
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+                WorkerContent::worker_stdout_transcript_only("> cat('done\\n')\n"),
             ]
         );
     }
@@ -1517,7 +1515,7 @@ mod tests {
             snapshot.format_contents_for_reply().contents,
             vec![
                 WorkerContent::worker_stdout("FIRST> alpha\nSECOND> "),
-                WorkerContent::worker_stdout("FIRST> alpha\n"),
+                WorkerContent::worker_stdout_transcript_only("FIRST> alpha\n"),
             ]
         );
     }
@@ -1533,7 +1531,9 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(
+                "> plot(1:10)\n"
+            )]
         );
 
         tape.append_stdout_bytes(b"> cat('done\\n')\n");
@@ -1561,7 +1561,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::worker_stdout("> cat('done\\n')\n"),
+                WorkerContent::worker_stdout_transcript_only("> cat('done\\n')\n"),
             ]
         );
     }
@@ -1577,7 +1577,7 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only("> 1 + 1\n")]
         );
 
         tape.append_stdout_bytes(b"> 1 + 1\n");
@@ -1599,7 +1599,7 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only("> answer\n")]
         );
 
         tape.append_stdout_bytes(b"> answer\n");
@@ -1626,7 +1626,9 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(
+                ">>> first\n> second\n"
+            )]
         );
 
         tape.append_stdout_bytes(b">>> first\n");
@@ -1655,7 +1657,7 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only("> 1 + 1\n")]
         );
 
         tape.append_stdout_ipc_bytes(b"> 1 + 1\n");
@@ -1677,7 +1679,9 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(
+                "FIRST> alpha\n"
+            )]
         );
 
         tape.append_stdout_bytes(b"FIRST> alpha\n");
@@ -1699,7 +1703,9 @@ mod tests {
         let first = tape.drain_snapshot();
         assert_eq!(
             first.format_contents().contents,
-            Vec::<WorkerContent>::new()
+            vec![WorkerContent::worker_stdout_transcript_only(
+                ">>> plot(1:10)\n"
+            )]
         );
 
         tape.append_image(

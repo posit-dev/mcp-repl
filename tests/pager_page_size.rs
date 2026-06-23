@@ -88,23 +88,25 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
     session.cancel().await?;
 
     let chunks = text_chunks(&result);
-    let first = chunks
+    let expected_echo = "> for (i in 1:50) cat('abcd\\n')\n";
+    let first_without_optional_echo = chunks
         .iter()
-        .find(|text| !text.contains("--More--") && !text.starts_with("(END"))
-        .copied()
+        .filter(|text| !text.contains("--More--") && !text.starts_with("(END"))
+        .map(|text| text.strip_prefix(expected_echo).unwrap_or(text))
+        .find(|text| !text.is_empty())
         .unwrap_or("");
     assert!(
-        !first.is_empty(),
-        "expected first page content, got: {first:?}"
+        !first_without_optional_echo.is_empty(),
+        "expected first page content, got: {chunks:?}"
     );
     assert!(
-        !first.contains("> for (i in 1:50) cat('abcd\\n')"),
-        "did not expect submitted input to be synthesized into the first page, got: {first:?}"
+        !first_without_optional_echo.contains("> for (i in 1:50) cat('abcd\\n')"),
+        "did not expect submitted input to be synthesized into the first page, got: {first_without_optional_echo:?}"
     );
     assert!(
-        first.len() <= page_bytes as usize,
+        first_without_optional_echo.len() <= page_bytes as usize,
         "first page exceeded page size: {} > {page_bytes}",
-        first.len()
+        first_without_optional_echo.len()
     );
 
     assert!(

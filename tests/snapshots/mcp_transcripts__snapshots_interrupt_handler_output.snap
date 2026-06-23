@@ -23,10 +23,6 @@ response:
     },
     {
       "type": "text",
-      "text": "> flush.console()\n> tryCatch(\n+   {\n+     repeat Sys.sleep(0.5)\n+   },\n+   interrupt = function(e) cat(\"interrupt received\\n\")\n+ )"
-    },
-    {
-      "type": "text",
       "text": "<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]

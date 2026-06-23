@@ -14,7 +14,7 @@ use tempfile::Builder;
 pub(crate) use crate::stdin_payload::{TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use crate::worker_process::WorkerError;
 use crate::worker_protocol::{
-    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+    ContentOrigin, ContentVisibility, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 const INLINE_TEXT_BUDGET: usize = 3500;
@@ -102,16 +102,28 @@ struct OutputStoreLimits {
 
 #[derive(Clone)]
 enum ReplyItem {
-    WorkerText { text: String, stream: TextStream },
-    ServerText { text: String, stream: TextStream },
+    WorkerText {
+        text: String,
+        stream: TextStream,
+        visibility: ContentVisibility,
+    },
+    ServerText {
+        text: String,
+        stream: TextStream,
+    },
     Image(ReplyImage),
 }
 
 impl ReplyItem {
-    fn worker_text(text: impl Into<String>, stream: TextStream) -> Self {
+    fn worker_text_with_visibility(
+        text: impl Into<String>,
+        stream: TextStream,
+        visibility: ContentVisibility,
+    ) -> Self {
         Self::WorkerText {
             text: text.into(),
             stream,
+            visibility,
         }
     }
 
@@ -596,7 +608,7 @@ impl ResponseState {
                                 compact_output_bundle_items(&append.retained_items, &bundle)
                             } else {
                                 let retained_worker_text =
-                                    worker_text_from_items(&append.retained_items);
+                                    reply_visible_worker_text_from_items(&append.retained_items);
                                 compact_text_bundle_items(
                                     append.retained_items,
                                     &retained_worker_text,
@@ -1299,8 +1311,13 @@ impl ActiveOutputBundle {
             }
 
             match item {
-                ReplyItem::WorkerText { text, stream } => {
-                    let append = self.append_worker_text(store, text, *stream)?;
+                ReplyItem::WorkerText {
+                    text,
+                    stream,
+                    visibility,
+                } => {
+                    let append =
+                        self.append_worker_text_with_visibility(store, text, *stream, *visibility)?;
                     if let Some(retained_item) = append {
                         let partial_worker_text = matches!(
                             &retained_item,
@@ -1343,11 +1360,27 @@ impl ActiveOutputBundle {
         })
     }
 
+    #[cfg(test)]
     fn append_worker_text(
         &mut self,
         store: &mut OutputStore,
         text: &str,
         stream: TextStream,
+    ) -> Result<Option<ReplyItem>, WorkerError> {
+        self.append_worker_text_with_visibility(
+            store,
+            text,
+            stream,
+            ContentVisibility::ReplyAndTranscript,
+        )
+    }
+
+    fn append_worker_text_with_visibility(
+        &mut self,
+        store: &mut OutputStore,
+        text: &str,
+        stream: TextStream,
+        visibility: ContentVisibility,
     ) -> Result<Option<ReplyItem>, WorkerError> {
         if text.is_empty() {
             return Ok(None);
@@ -1405,7 +1438,11 @@ impl ActiveOutputBundle {
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
                 self.transcript_lines = next_line_count;
                 self.transcript_has_partial_line = next_has_partial_line;
-                return Ok(Some(ReplyItem::worker_text(retained.to_string(), stream)));
+                return Ok(Some(ReplyItem::worker_text_with_visibility(
+                    retained.to_string(),
+                    stream,
+                    visibility,
+                )));
             }
             let allowed_text_bytes = granted.saturating_sub(row.len().saturating_add(reserve));
             let next = truncate_utf8_prefix(retained, allowed_text_bytes);
@@ -1766,6 +1803,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                 text,
                 origin,
                 stream,
+                visibility,
             } => {
                 let text = if matches!(origin, ContentOrigin::Worker) {
                     normalize_error_prompt(text, is_error)
@@ -1783,7 +1821,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                         } else {
                             reply_worker_text.push_str(&text);
                         }
-                        ReplyItem::worker_text(text, stream)
+                        ReplyItem::worker_text_with_visibility(text, stream, visibility)
                     }
                     ContentOrigin::Server => ReplyItem::server_text(text, stream),
                 };
@@ -1864,15 +1902,60 @@ pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {
 }
 
 fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
-    items
-        .into_iter()
-        .map(|item| match item {
-            ReplyItem::WorkerText { text, stream } | ReplyItem::ServerText { text, stream } => {
-                content_text(text, stream)
+    let mut out = Vec::new();
+    let mut pending_worker_text: Option<(String, TextStream)> = None;
+    let mut skipped_transcript_only_worker_text = false;
+
+    for item in items {
+        match item {
+            ReplyItem::WorkerText {
+                text,
+                stream,
+                visibility,
+            } if visibility.is_reply_visible() => {
+                match &mut pending_worker_text {
+                    Some((pending, pending_stream))
+                        if *pending_stream == stream && skipped_transcript_only_worker_text =>
+                    {
+                        pending.push_str(&text);
+                    }
+                    Some(_) => {
+                        flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                        pending_worker_text = Some((text, stream));
+                    }
+                    None => {
+                        pending_worker_text = Some((text, stream));
+                    }
+                }
+                skipped_transcript_only_worker_text = false;
             }
-            ReplyItem::Image(image) => image_to_content(&image),
-        })
-        .collect()
+            ReplyItem::WorkerText { .. } => {
+                skipped_transcript_only_worker_text = true;
+            }
+            ReplyItem::ServerText { text, stream } => {
+                flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                skipped_transcript_only_worker_text = false;
+                out.push(content_text(text, stream));
+            }
+            ReplyItem::Image(image) => {
+                flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                skipped_transcript_only_worker_text = false;
+                out.push(image_to_content(&image));
+            }
+        }
+    }
+
+    flush_pending_worker_text(&mut out, &mut pending_worker_text);
+    out
+}
+
+fn flush_pending_worker_text(
+    out: &mut Vec<Content>,
+    pending_worker_text: &mut Option<(String, TextStream)>,
+) {
+    if let Some((text, stream)) = pending_worker_text.take() {
+        out.push(content_text(text, stream));
+    }
 }
 
 fn image_to_content(image: &ReplyImage) -> Content {
@@ -1931,13 +2014,27 @@ fn worker_text_from_items(items: &[ReplyItem]) -> String {
     out
 }
 
+fn reply_visible_worker_text_from_items(items: &[ReplyItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        if let ReplyItem::WorkerText {
+            text, visibility, ..
+        } = item
+            && visibility.is_reply_visible()
+        {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 fn compact_text_bundle_items(
     items: Vec<ReplyItem>,
-    worker_text: &str,
+    preview_worker_text: &str,
     bundle: &ActiveOutputBundle,
 ) -> Vec<Content> {
     let preview = build_preview(
-        worker_text,
+        preview_worker_text,
         Some(bundle.disclosure_path()),
         bundle.omitted_tail,
     );
@@ -1961,8 +2058,11 @@ fn compact_text_bundle_items(
     out
 }
 
-fn compact_text_without_bundle_items(items: Vec<ReplyItem>, worker_text: &str) -> Vec<Content> {
-    let preview = build_preview(worker_text, None, false);
+fn compact_text_without_bundle_items(
+    items: Vec<ReplyItem>,
+    preview_worker_text: &str,
+) -> Vec<Content> {
+    let preview = build_preview(preview_worker_text, None, false);
     let mut out = Vec::new();
     let mut worker_inserted = false;
     for item in items {
@@ -2130,6 +2230,7 @@ fn render_active_bundle_contents(
     let append = active.append_items(output_store, bundle_items)?;
     let retained_image_count = count_images(&append.retained_items);
     let retained_worker_text = worker_text_from_items(&append.retained_items);
+    let retained_reply_worker_text = reply_visible_worker_text_from_items(&append.retained_items);
     let has_incremental_content = !append.retained_items.is_empty();
     let has_worker_or_image_incremental_content =
         retained_image_count > 0 || !retained_worker_text.is_empty();
@@ -2143,7 +2244,7 @@ fn render_active_bundle_contents(
         } else {
             Ok(compact_text_bundle_items(
                 append.retained_items.clone(),
-                &retained_worker_text,
+                &retained_reply_worker_text,
                 active,
             ))
         }
@@ -2154,7 +2255,7 @@ fn render_active_bundle_contents(
         active.disclosed = true;
         Ok(compact_text_bundle_items(
             append.retained_items.clone(),
-            &retained_worker_text,
+            &retained_reply_worker_text,
             active,
         ))
     } else if active.was_disclosed()
@@ -2186,7 +2287,8 @@ fn compact_items_without_output_bundle(
         return compact_output_without_bundle_items(bundle_items);
     }
     if text_should_spill(worker_text.chars().count()) {
-        return compact_text_without_bundle_items(inline_items.to_vec(), worker_text);
+        let preview_worker_text = reply_visible_worker_text_from_items(inline_items);
+        return compact_text_without_bundle_items(inline_items.to_vec(), &preview_worker_text);
     }
     materialize_items(inline_items.to_vec())
 }
@@ -2229,7 +2331,6 @@ fn render_reply_items(
             output_store,
             reply_bundle_items,
             reply_inline_items,
-            reply_worker_text,
             false,
             protected_bundle_id,
         );
@@ -2239,7 +2340,6 @@ fn render_reply_items(
             output_store,
             reply_bundle_items,
             reply_inline_items,
-            reply_worker_text,
             true,
             protected_bundle_id,
         );
@@ -2251,7 +2351,6 @@ fn compact_reply_items_with_new_bundle(
     output_store: &mut OutputStore,
     reply_bundle_items: &[ReplyItem],
     reply_inline_items: &[ReplyItem],
-    reply_worker_text: &str,
     text_only: bool,
     protected_bundle_id: Option<u64>,
 ) -> Vec<Content> {
@@ -2259,7 +2358,8 @@ fn compact_reply_items_with_new_bundle(
         Ok(mut bundle) => match bundle.append_items(output_store, reply_bundle_items) {
             Ok(append) => {
                 if text_only {
-                    let retained_worker_text = worker_text_from_items(&append.retained_items);
+                    let retained_worker_text =
+                        reply_visible_worker_text_from_items(&append.retained_items);
                     compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
                 } else if append.omitted_this_reply {
                     compact_output_bundle_items(&append.retained_items, &bundle)
@@ -2275,9 +2375,11 @@ fn compact_reply_items_with_new_bundle(
                     );
                 }
                 if text_only {
+                    let preview_worker_text =
+                        reply_visible_worker_text_from_items(reply_inline_items);
                     compact_text_without_bundle_items(
                         reply_inline_items.to_vec(),
-                        reply_worker_text,
+                        &preview_worker_text,
                     )
                 } else {
                     compact_output_without_bundle_items(reply_inline_items)
@@ -2287,7 +2389,8 @@ fn compact_reply_items_with_new_bundle(
         Err(err) => {
             eprintln!("dropping output-bundle setup after output-bundle error: {err}");
             if text_only {
-                compact_text_without_bundle_items(reply_inline_items.to_vec(), reply_worker_text)
+                let preview_worker_text = reply_visible_worker_text_from_items(reply_inline_items);
+                compact_text_without_bundle_items(reply_inline_items.to_vec(), &preview_worker_text)
             } else {
                 compact_output_without_bundle_items(reply_inline_items)
             }
@@ -2439,7 +2542,11 @@ fn collect_prefix_text_after(items: &[ReplyItem], index: Option<usize>, budget: 
 
 fn item_text(item: &ReplyItem) -> Option<&str> {
     match item {
-        ReplyItem::WorkerText { text, .. } | ReplyItem::ServerText { text, .. } => Some(text),
+        ReplyItem::WorkerText {
+            text, visibility, ..
+        } if visibility.is_reply_visible() => Some(text),
+        ReplyItem::WorkerText { .. } => None,
+        ReplyItem::ServerText { text, .. } => Some(text),
         ReplyItem::Image(_) => None,
     }
 }

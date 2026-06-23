@@ -55,7 +55,11 @@ response:
     },
     {
       "type": "text",
-      "text": "> cat(\"\\nEND\\n\")\n\nEND"
+      "text": "> cat(\"\\nEND\\n\")"
+    },
+    {
+      "type": "text",
+      "text": "\nEND"
     },
     {
       "type": "text",

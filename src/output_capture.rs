@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::reply_presentation::input_echo_text;
+pub(crate) use crate::resolved_output::{
+    OutputEvent, OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan,
+};
 use crate::worker_protocol::ContentOrigin;
 
 static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
@@ -152,8 +154,8 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_input_echo(&self, prompt: &str, line: &str) {
-        if let Some(text) = input_echo_text(prompt, line) {
-            self.ring.append_input_echo_event(text);
+        if let Some(kind) = OutputEventKind::input_echo(prompt, line) {
+            self.ring.append_input_echo_event(kind);
         }
     }
 }
@@ -267,66 +269,6 @@ struct OutputSlice {
     is_stderr: bool,
     origin: ContentOrigin,
     source: OutputTextSource,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum OutputTextSource {
-    #[default]
-    Raw,
-    Ipc,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OutputTextSpan {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub is_stderr: bool,
-    pub origin: ContentOrigin,
-    pub source: OutputTextSource,
-}
-
-pub(crate) struct OutputRange {
-    pub start_offset: u64,
-    pub end_offset: u64,
-    pub bytes: Vec<u8>,
-    pub events: Vec<OutputEvent>,
-    pub text_spans: Vec<OutputTextSpan>,
-}
-
-impl OutputRange {
-    fn empty(start_offset: u64, end_offset: u64) -> Self {
-        Self {
-            start_offset,
-            end_offset,
-            bytes: Vec::new(),
-            events: Vec::new(),
-            text_spans: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OutputEvent {
-    pub offset: u64,
-    pub kind: OutputEventKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum OutputEventKind {
-    Image {
-        id: String,
-        data: String,
-        mime_type: String,
-        is_new: bool,
-    },
-    Text {
-        text: String,
-        is_stderr: bool,
-        origin: ContentOrigin,
-    },
-    InputEcho {
-        text: String,
-    },
 }
 
 struct CollectedRange {
@@ -512,9 +454,8 @@ impl OutputRing {
         });
     }
 
-    fn append_input_echo_event(&self, text: String) {
+    fn append_input_echo_event(&self, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
-        let kind = OutputEventKind::InputEcho { text };
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
             return;

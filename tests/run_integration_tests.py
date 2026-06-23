@@ -601,10 +601,10 @@ def expected_large_text_preview(label: str, output_number: int) -> str:
 
 
 def expected_capped_text_preview(label: str, output_number: int) -> str:
-    lines = "".join(repeated_text_line(label, index) for index in range(1, 17))
+    lines = "".join(repeated_text_line(label, index) for index in range(1, 16))
     return (
         lines
-        + f"{label}017 {label}\n"
+        + f"{label}016 {label * 28}\n"
         + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt; "
         "later content omitted]..."
     )
@@ -708,7 +708,9 @@ def r_write_stdin_recovers_after_error(client: McpStdioClient) -> None:
         )
 
 
-def r_write_stdin_skips_huge_assignment_input_echoes(client: McpStdioClient) -> None:
+def r_write_stdin_files_bundle_includes_huge_assignment_input_echoes(
+    client: McpStdioClient,
+) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 2001))
     received = client.repl(input_text, timeout_ms=30000)
     received_text = require_success(received, "write_stdin huge input-only repl")
@@ -720,24 +722,27 @@ def r_write_stdin_skips_huge_assignment_input_echoes(client: McpStdioClient) -> 
         raise SuiteFailure(
             f"did not expect pager activation for huge assignment input, got: {received_text!r}"
         )
-    transcript_path = bundle_transcript_path(received_text)
-    if transcript_path is not None:
-        spill_text = require_text_file(
-            transcript_path,
-            "write_stdin huge assignment input transcript",
-        )
-        if "x500 <- 500" in spill_text or "x2000 <- 2000" in spill_text:
-            raise SuiteFailure(
-                f"assignment-only leading echoes should be absent from spill file, got: {spill_text!r}"
-            )
-        return
     if "x500 <- 500" in received_text or "x2000 <- 2000" in received_text:
         raise SuiteFailure(
-            f"assignment-only leading echoes should be absent inline, got: {received_text!r}"
+            f"assignment-only generated echoes should be absent inline, got: {received_text!r}"
+        )
+    transcript_path = require_transcript_path(
+        received_text,
+        "write_stdin huge assignment repl",
+    )
+    spill_text = require_text_file(
+        transcript_path,
+        "write_stdin huge assignment transcript",
+    )
+    if "x500 <- 500" not in spill_text or "x2000 <- 2000" not in spill_text:
+        raise SuiteFailure(
+            f"expected full assignment input echo in spill file, got: {spill_text!r}"
         )
 
 
-def r_write_stdin_skips_huge_leading_echo_prefix(client: McpStdioClient) -> None:
+def r_write_stdin_files_bundle_includes_huge_interleaved_input_echoes(
+    client: McpStdioClient,
+) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 1001))
     input_text += 'cat("ok\\n")\n'
     input_text += "".join(f"y{idx} <- {idx}\n" for idx in range(1, 1001))
@@ -755,41 +760,30 @@ def r_write_stdin_skips_huge_leading_echo_prefix(client: McpStdioClient) -> None
             f"got: {received_text!r}"
         )
 
-    transcript_path = bundle_transcript_path(received_text)
-    if transcript_path is not None:
-        spill_text = require_text_file(
-            transcript_path,
-            "write_stdin huge interleaved input transcript",
-        )
-        if "x500 <- 500" in spill_text:
-            raise SuiteFailure(
-                f"leading generated input text should be absent from spill file, got: {spill_text!r}"
-            )
-        if "y500 <- 500" not in spill_text:
-            raise SuiteFailure(
-                f"expected later generated input echo in spill file, got: {spill_text!r}"
-            )
-        if "ok" not in spill_text or "done" not in spill_text:
-            raise SuiteFailure(
-                f"expected output from both cat() calls in spill file, got: {spill_text!r}"
-            )
-        if "done" not in received_text:
-            raise SuiteFailure(
-                f"expected the inline tail to keep the final output, got: {received_text!r}"
-            )
-        return
-
     if "ok" not in received_text or "done" not in received_text:
         raise SuiteFailure(
             f"expected output from both cat() calls inline, got: {received_text!r}"
         )
-    if "x500 <- 500" in received_text:
+    if "x500 <- 500" in received_text or "y500 <- 500" in received_text:
         raise SuiteFailure(
-            f"leading generated input text should be absent inline, got: {received_text!r}"
+            f"generated input text should be absent inline, got: {received_text!r}"
         )
-    if "y500 <- 500" not in received_text:
+
+    transcript_path = require_transcript_path(
+        received_text,
+        "write_stdin huge interleaved echo repl",
+    )
+    spill_text = require_text_file(
+        transcript_path,
+        "write_stdin huge interleaved echo transcript",
+    )
+    if "x500 <- 500" not in spill_text or "y500 <- 500" not in spill_text:
         raise SuiteFailure(
-            f"expected later generated input echo inline, got: {received_text!r}"
+            f"expected full generated input echo in spill file, got: {spill_text!r}"
+        )
+    if "ok" not in spill_text or "done" not in spill_text:
+        raise SuiteFailure(
+            f"expected output from both cat() calls in spill file, got: {spill_text!r}"
         )
 
 
@@ -1251,6 +1245,7 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     )
     assert_identical(
         tool_result(
+            text('> for (i in 1:80) cat(sprintf("L%04d\\n", i))\n'),
             text(expected_pager_lines(1, 13)),
             text("--More-- (6p, 16.2%, @0..78/480)"),
         ),
@@ -1373,8 +1368,9 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
-    "r-write-stdin-skips-huge-assignment-input-echoes": r_suite_case(
-        r_write_stdin_skips_huge_assignment_input_echoes
+    "r-write-stdin-bundles-huge-assignment-input-echoes": r_suite_case(
+        r_write_stdin_files_bundle_includes_huge_assignment_input_echoes,
+        server_args=("--oversized-output", "files"),
     ),
     "r-write-stdin-multiple-calls": r_suite_case(r_write_stdin_multiple_calls),
     "r-write-stdin-recovers-after-error": r_suite_case(
@@ -1383,8 +1379,8 @@ CASES: dict[str, SuiteCase] = {
     "r-write-stdin-timeout-polling-returns-pending-output": r_suite_case(
         r_write_stdin_timeout_polling_returns_pending_output
     ),
-    "r-write-stdin-skips-huge-leading-echo-prefix": r_suite_case(
-        r_write_stdin_skips_huge_leading_echo_prefix,
+    "r-write-stdin-bundles-huge-interleaved-input-echoes": r_suite_case(
+        r_write_stdin_files_bundle_includes_huge_interleaved_input_echoes,
         server_args=("--oversized-output", "files"),
     ),
     "r-workspace-write-sandbox": r_suite_case(

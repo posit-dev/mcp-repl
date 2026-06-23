@@ -49,7 +49,7 @@ response:
     },
     {
       "type": "text",
-      "text": "> cat(\"plots_done\\n\")\nplots_done"
+      "text": "plots_done"
     },
     {
       "type": "text",

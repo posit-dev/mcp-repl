@@ -38,17 +38,6 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-fn result_text_chunks(result: &rmcp::model::CallToolResult) -> Vec<String> {
-    result
-        .content
-        .iter()
-        .filter_map(|item| match &item.raw {
-            RawContent::Text(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -401,8 +390,8 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
         "leading expression echo should be absent, got: {text:?}"
     );
     assert!(
-        text.contains("> 1+1"),
-        "expected submitted expression echo after output interleaving, got: {text:?}"
+        !text.contains("> 1+1"),
+        "normal replies should not include generated expression echo after output interleaving, got: {text:?}"
     );
 
     let result = session
@@ -418,12 +407,12 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
         "expected all expression output, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('SECOND\\n')"),
-        "expected second submitted expression echo, got: {text:?}"
+        !text.contains("> cat('SECOND\\n')"),
+        "normal replies should not include second submitted expression echo, got: {text:?}"
     );
     assert!(
-        text.contains("> cat('THIRD\\n')"),
-        "expected third submitted expression echo, got: {text:?}"
+        !text.contains("> cat('THIRD\\n')"),
+        "normal replies should not include third submitted expression echo, got: {text:?}"
     );
 
     let result = session
@@ -434,7 +423,6 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
         .await?;
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
-    let chunks = result_text_chunks(&result);
     assert!(
         text.contains("BEFORE\n") && text.contains("AFTER\n"),
         "expected surrounding output, got: {text:?}"
@@ -444,16 +432,8 @@ async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
         "leading generated echo before first output should be absent, got: {text:?}"
     );
     assert!(
-        text.contains("> echo_collapse_x <- 1") && text.contains("> echo_collapse_y <- 2"),
-        "expected retained generated echoes after real output, got: {text:?}"
-    );
-    let echo_chunk_count = chunks
-        .iter()
-        .filter(|chunk| chunk.contains("echo_collapse_x") || chunk.contains("echo_collapse_y"))
-        .count();
-    assert_eq!(
-        echo_chunk_count, 1,
-        "expected adjacent generated echoes to be one response text chunk, got: {chunks:?}"
+        !text.contains("> echo_collapse_x <- 1") && !text.contains("> echo_collapse_y <- 2"),
+        "normal replies should not include generated echoes after real output, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -485,8 +465,46 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_inpu
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.matches("> 1+1").count() == 2,
-        "expected raw child stdout and later generated echo to remain visible, got: {text:?}"
+        text.matches("> 1+1").count() == 1,
+        "expected raw child stdout to remain visible without a generated echo, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_files_bundle_uses_full_input_echo_transcript() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "e".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("full_echo_assignment <- {huge_literal}\ncat('VISIBLE_DONE\\n')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected full echo transcript to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("full_echo_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> full_echo_assignment <- "),
+        "expected transcript.txt to include the generated input echo, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("VISIBLE_DONE"),
+        "expected transcript.txt to include worker output, got: {transcript:?}"
     );
     Ok(())
 }
@@ -534,8 +552,8 @@ async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        !transcript.contains("SECOND> beta"),
-        "did not expect leading generated readline transcript in transcript.txt, got: {transcript:?}"
+        transcript.contains("SECOND> beta"),
+        "expected files-mode transcript.txt to include generated readline transcript, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),
