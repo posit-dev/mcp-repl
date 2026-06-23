@@ -100,10 +100,10 @@
 (allow file-read* file-test-existence file-write-data file-ioctl
   (literal "/dev/dtracehelper"))
 
-(allow file-read* file-test-existence file-write* (subpath "/tmp"))
-(allow file-read* file-write* (subpath "/private/tmp"))
-(allow file-read* file-write* (subpath "/var/tmp"))
-(allow file-read* file-write* (subpath "/private/var/tmp"))
+(allow file-read* file-test-existence (subpath "/tmp"))
+(allow file-read* file-test-existence (subpath "/private/tmp"))
+(allow file-read* file-test-existence (subpath "/var/tmp"))
+(allow file-read* file-test-existence (subpath "/private/var/tmp"))
 
 (allow file-read* (subpath "/etc"))
 (allow file-read* (subpath "/private/etc"))

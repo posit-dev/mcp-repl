@@ -2648,6 +2648,7 @@ async fn sandbox_inherit_glob_deny_meta_blocks_write_in_cwd() -> TestResult<()> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
@@ -2674,6 +2675,64 @@ async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestR
     assert!(
         text.contains("[1] 2"),
         "expected input to run after restricted read metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_blocks_slash_tmp_write_without_slash_tmp_entry()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-no-slash-tmp-{nanos}.txt"));
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+slash_tmp_target <- {encoded_slash_tmp_target}
+tmpdir_target <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-tmpdir-write-ok.txt")
+tryCatch({{
+  writeLines("tmpdir", tmpdir_target)
+  cat("TMPDIR_WRITE_OK\n")
+}}, error = function(e) {{
+  message("TMPDIR_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("TMPDIR_WRITE_OK"),
+        "expected minimal metadata to allow TMPDIR writes, got: {text}"
+    );
+    assert!(
+        text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "expected minimal metadata without slash_tmp to block /tmp writes, got: {text}"
+    );
+    assert!(
+        !text.contains("SLASH_TMP_WRITE_OK"),
+        "minimal metadata without slash_tmp unexpectedly allowed /tmp writes: {text}"
     );
     Ok(())
 }
@@ -2801,6 +2860,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
@@ -2827,6 +2887,7 @@ async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestRes
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
