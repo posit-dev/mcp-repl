@@ -69,7 +69,6 @@ pub struct PythonApi {
     _library: Library,
     py_decode_locale: unsafe extern "C" fn(*const c_char, *mut usize) -> *mut libc::wchar_t,
     py_set_program_name: unsafe extern "C" fn(*const libc::wchar_t),
-    py_set_path: unsafe extern "C" fn(*const libc::wchar_t),
     pub py_initialize_ex: unsafe extern "C" fn(c_int),
     pub py_is_initialized: unsafe extern "C" fn() -> c_int,
     pub py_eval_save_thread: unsafe extern "C" fn() -> *mut PyThreadState,
@@ -91,10 +90,14 @@ pub struct PythonApi {
     ) -> *mut PyObject,
     pub py_object_get_attr_string:
         unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut PyObject,
+    py_object_set_attr_string:
+        unsafe extern "C" fn(*mut PyObject, *const c_char, *mut PyObject) -> c_int,
     pub py_object_call_object: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
     pub py_object_is_true: unsafe extern "C" fn(*mut PyObject) -> c_int,
     pub py_tuple_size: unsafe extern "C" fn(*mut PyObject) -> PySsizeT,
     pub py_tuple_get_item: unsafe extern "C" fn(*mut PyObject, PySsizeT) -> *mut PyObject,
+    py_list_new: unsafe extern "C" fn(PySsizeT) -> *mut PyObject,
+    py_list_set_item: unsafe extern "C" fn(*mut PyObject, PySsizeT, *mut PyObject) -> c_int,
     pub py_unicode_from_string_and_size:
         unsafe extern "C" fn(*const c_char, PySsizeT) -> *mut PyObject,
     pub py_unicode_as_utf8_and_size:
@@ -140,7 +143,6 @@ impl PythonApi {
         let api = Self {
             py_decode_locale: unsafe { load_symbol(&library, b"Py_DecodeLocale\0")? },
             py_set_program_name: unsafe { load_symbol(&library, b"Py_SetProgramName\0")? },
-            py_set_path: unsafe { load_symbol(&library, b"Py_SetPath\0")? },
             py_initialize_ex: unsafe { load_symbol(&library, b"Py_InitializeEx\0")? },
             py_is_initialized: unsafe { load_symbol(&library, b"Py_IsInitialized\0")? },
             py_eval_save_thread: unsafe { load_symbol(&library, b"PyEval_SaveThread\0")? },
@@ -158,10 +160,15 @@ impl PythonApi {
             py_object_get_attr_string: unsafe {
                 load_symbol(&library, b"PyObject_GetAttrString\0")?
             },
+            py_object_set_attr_string: unsafe {
+                load_symbol(&library, b"PyObject_SetAttrString\0")?
+            },
             py_object_call_object: unsafe { load_symbol(&library, b"PyObject_CallObject\0")? },
             py_object_is_true: unsafe { load_symbol(&library, b"PyObject_IsTrue\0")? },
             py_tuple_size: unsafe { load_symbol(&library, b"PyTuple_Size\0")? },
             py_tuple_get_item: unsafe { load_symbol(&library, b"PyTuple_GetItem\0")? },
+            py_list_new: unsafe { load_symbol(&library, b"PyList_New\0")? },
+            py_list_set_item: unsafe { load_symbol(&library, b"PyList_SetItem\0")? },
             py_unicode_from_string_and_size: unsafe {
                 load_symbol(&library, b"PyUnicode_FromStringAndSize\0")?
             },
@@ -240,6 +247,36 @@ impl PythonApi {
         let name = CString::new(name).map_err(|_| "attribute name contains NUL".to_string())?;
         let ptr = unsafe { (self.py_object_get_attr_string)(object, name.as_ptr()) };
         PyPtr::from_owned(ptr, "attribute lookup failed")
+    }
+
+    pub fn set_attr_string(
+        &self,
+        object: *mut PyObject,
+        name: &str,
+        value: *mut PyObject,
+    ) -> Result<(), String> {
+        let name = CString::new(name).map_err(|_| "attribute name contains NUL".to_string())?;
+        let rc = unsafe { (self.py_object_set_attr_string)(object, name.as_ptr(), value) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err("attribute assignment failed".to_string())
+        }
+    }
+
+    pub fn list_from_paths(&self, paths: &[PathBuf]) -> Result<PyPtr, String> {
+        let list = unsafe { (self.py_list_new)(paths.len() as PySsizeT) };
+        let list = PyPtr::from_owned(list, "failed to allocate Python path list")?;
+        for (index, path) in paths.iter().enumerate() {
+            let item = self.unicode(path.to_string_lossy().as_ref())?;
+            let rc = unsafe {
+                (self.py_list_set_item)(list.as_ptr(), index as PySsizeT, item.into_raw())
+            };
+            if rc != 0 {
+                return Err("failed to populate Python path list".to_string());
+            }
+        }
+        Ok(list)
     }
 
     pub fn run_code(&self, code: &str, globals: *mut PyObject) -> Result<(), String> {
@@ -421,16 +458,9 @@ impl PythonApi {
         if paths.is_empty() {
             return Ok(());
         }
-        let joined = std::env::join_paths(paths)
-            .map_err(|err| format!("failed to join Python module search paths: {err}"))?;
-        let joined = CString::new(joined.to_string_lossy().as_bytes())
-            .map_err(|_| "Python module search path contains NUL".to_string())?;
-        let mut size = 0;
-        let decoded = unsafe { (self.py_decode_locale)(joined.as_ptr(), &mut size) };
-        if decoded.is_null() {
-            return Err("failed to decode Python module search path".to_string());
-        }
-        unsafe { (self.py_set_path)(decoded) };
+        let sys = self.import_module("sys")?;
+        let path_list = self.list_from_paths(paths)?;
+        self.set_attr_string(sys.as_ptr(), "path", path_list.as_ptr())?;
         Ok(())
     }
 

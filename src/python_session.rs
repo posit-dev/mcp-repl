@@ -286,9 +286,9 @@ fn initialize_python(
             return Err("embedded Python interpreter was already initialized".to_string());
         }
         api.set_program_name(executable)?;
-        api.set_module_search_paths(module_search_paths)?;
         api.set_interactive_flags()?;
         (api.py_initialize_ex)(1);
+        api.set_module_search_paths(module_search_paths)?;
         api.install_readline_function(mcp_repl_readline)?;
         let thread_state = (api.py_eval_save_thread)();
         api.install_input_hook(pyos_input_hook)?;

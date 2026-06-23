@@ -1164,6 +1164,39 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_default_restart_preserves_python_prefixes() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let result = call_prepare(&session, json!({})).await?;
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session restarted"),
+        "expected prepare to restart into managed Python, got: {text:?}"
+    );
+
+    let probe = session
+        .write_stdin_raw_with(
+            "import sys, sysconfig\nprint('PREFIX_NONEMPTY:' + str(bool(sys.prefix)))\nprint('EXEC_PREFIX_NONEMPTY:' + str(bool(sys.exec_prefix)))\nprint('STDLIB_NONEMPTY:' + str(bool(sysconfig.get_path('stdlib'))))",
+            Some(5.0),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("PREFIX_NONEMPTY:True")
+            && probe_text.contains("EXEC_PREFIX_NONEMPTY:True")
+            && probe_text.contains("STDLIB_NONEMPTY:True"),
+        "prepared Python should preserve prefix/sysconfig state, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_no_after_replacement_does_not_see_stale_user_state() -> TestResult<()>
 {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
