@@ -2005,72 +2005,66 @@ tryCatch({
             normalize_temp_paths(&normalize_codex_home_path(&normalized))
         }
 
-        fn normalized_permission_profile_policy(profile: &Value) -> Option<Value> {
-            match profile.get("type")?.as_str()? {
-                "disabled" | "danger-full-access" => Some(serde_json::json!({
-                    "type": "danger-full-access"
-                })),
-                "read-only" => Some(serde_json::json!({
-                    "type": "read-only"
-                })),
-                "managed" => {
-                    let file_system = profile.get("file_system")?;
-                    match file_system.get("type")?.as_str()? {
-                        "read-only" => Some(serde_json::json!({
-                            "type": "read-only"
-                        })),
-                        "unrestricted" => Some(serde_json::json!({
-                            "type": "external-sandbox",
-                            "network_access": if matches!(
-                                profile.get("network").and_then(Value::as_str),
-                                Some("enabled" | "unrestricted" | "full" | "allowed")
-                            ) {
-                                "enabled"
-                            } else {
-                                "restricted"
-                            }
-                        })),
-                        "restricted" => {
-                            let entries = file_system.get("entries")?.as_array()?;
-                            let mut has_write = false;
-                            let mut allows_tmpdir = false;
-                            let mut allows_slash_tmp = false;
-                            for entry in entries {
-                                if entry.get("access").and_then(Value::as_str) != Some("write") {
-                                    continue;
-                                }
-                                has_write = true;
-                                let kind = entry
-                                    .get("path")
-                                    .and_then(|path| path.get("value"))
-                                    .and_then(|value| value.get("kind"))
-                                    .and_then(Value::as_str);
-                                match kind {
-                                    Some("tmpdir") => allows_tmpdir = true,
-                                    Some("slash_tmp") => allows_slash_tmp = true,
-                                    _ => {}
-                                }
-                            }
-                            if !has_write {
-                                return Some(serde_json::json!({
-                                    "type": "read-only"
-                                }));
-                            }
-                            Some(serde_json::json!({
-                                "type": "workspace-write",
-                                "network_access": matches!(
-                                    profile.get("network").and_then(Value::as_str),
-                                    Some("enabled" | "unrestricted" | "full" | "allowed")
-                                ),
-                                "exclude_tmpdir_env_var": !allows_tmpdir,
-                                "exclude_slash_tmp": !allows_slash_tmp,
-                            }))
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
+        fn wire_permission_profile_to_sandbox_policy(profile: &Value) -> Option<Value> {
+            if profile.get("type").and_then(Value::as_str)? != "managed" {
+                return None;
             }
+            let network_access = profile.get("network").and_then(Value::as_str) == Some("enabled");
+            let file_system = profile.get("file_system")?;
+            if file_system.get("type").and_then(Value::as_str)? != "restricted" {
+                return None;
+            }
+
+            let mut workspace_writable = false;
+            let mut tmpdir_writable = false;
+            let mut slash_tmp_writable = false;
+            let mut writable_roots = Vec::new();
+
+            for entry in file_system.get("entries")?.as_array()? {
+                if entry.get("access").and_then(Value::as_str)? != "write" {
+                    continue;
+                }
+                let path = entry.get("path")?;
+                match path.get("type")?.as_str()? {
+                    "path" => {
+                        let path = path.get("path").and_then(Value::as_str)?;
+                        if path == "<WORKSPACE>" {
+                            workspace_writable = true;
+                        } else {
+                            writable_roots.push(Value::String(path.to_string()));
+                        }
+                    }
+                    "special" => {
+                        let kind = path
+                            .get("value")
+                            .and_then(|value| value.get("kind"))
+                            .and_then(Value::as_str)?;
+                        match kind {
+                            "project_roots" => workspace_writable = true,
+                            "tmpdir" => tmpdir_writable = true,
+                            "slash_tmp" => slash_tmp_writable = true,
+                            _ => {}
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+
+            if !workspace_writable {
+                return None;
+            }
+
+            let mut policy = serde_json::json!({
+                "type": "workspace-write",
+                "network_access": network_access,
+                "exclude_tmpdir_env_var": !tmpdir_writable,
+                "exclude_slash_tmp": !slash_tmp_writable
+            });
+            if !writable_roots.is_empty() {
+                writable_roots.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+                policy["writable_roots"] = Value::Array(writable_roots);
+            }
+            Some(policy)
         }
 
         fn normalize_inner(
@@ -2088,9 +2082,10 @@ tryCatch({
                             continue;
                         }
                         if normalized_key == "permissionProfile" {
-                            if path_matches(path, &["codex/sandbox-state-meta"])
-                                && !map.contains_key("sandboxPolicy")
-                                && let Some(policy) = normalized_permission_profile_policy(&child)
+                            path.push(normalized_key.clone());
+                            normalize_inner(&mut child, path, workspace, codex_home);
+                            path.pop();
+                            if let Some(policy) = wire_permission_profile_to_sandbox_policy(&child)
                             {
                                 map.insert("sandboxPolicy".to_string(), policy);
                             }
@@ -2114,22 +2109,6 @@ tryCatch({
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
-                        if path_matches(path, &["sandboxPolicy"])
-                            && normalized_key == "writable_roots"
-                            && matches!(
-                                &child,
-                                Value::Array(items)
-                                    if items.iter().all(|item| {
-                                        matches!(
-                                            item.as_str(),
-                                            Some("<CODEX_HOME>/memories")
-                                                | Some("<CODEX_HOME>\\memories")
-                                        )
-                                    })
-                            )
-                        {
-                            continue;
-                        }
                         map.insert(normalized_key, child);
                     }
                     if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
@@ -2282,15 +2261,26 @@ tryCatch({
     }
 
     #[test]
-    fn normalize_wire_snapshot_drops_default_codex_memories_writable_root() {
+    fn normalize_wire_snapshot_drops_permission_profile() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let memories = codex_home.join("memories");
         let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [memories],
-                "network_access": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": memories
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             }
         });
 
@@ -2298,26 +2288,54 @@ tryCatch({
 
         assert_eq!(
             value,
-            serde_json::json!({
-                "sandboxPolicy": {
-                    "type": "workspace-write",
-                    "network_access": false
-                }
-            }),
-            "wire snapshots should not retain Codex's default memories writable root"
+            serde_json::json!({}),
+            "wire snapshots should not retain Codex's full permission profile"
         );
     }
 
     #[test]
-    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
+    fn normalize_wire_snapshot_maps_permission_profile_to_sandbox_policy() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": ["<CODEX_HOME>\\memories"],
-                "network_access": false
-            }
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": format!("file://{}", workspace.display())
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": format!("file://{}", workspace.display())
         });
 
         normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
@@ -2327,10 +2345,13 @@ tryCatch({
             serde_json::json!({
                 "sandboxPolicy": {
                     "type": "workspace-write",
-                    "network_access": false
-                }
+                    "network_access": false,
+                    "exclude_tmpdir_env_var": false,
+                    "exclude_slash_tmp": false
+                },
+                "sandboxCwd": "<WORKSPACE>"
             }),
-            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
+            "wire snapshots should keep the semantic sandbox policy stable across Codex metadata schema changes"
         );
     }
 

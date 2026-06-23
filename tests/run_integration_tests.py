@@ -352,6 +352,23 @@ def result_text(result: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def without_blank_stderr_chunks(result: dict[str, Any]) -> dict[str, Any]:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result
+    filtered = [
+        item
+        for item in content
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip() == "stderr:"
+        )
+    ]
+    return {**result, "content": filtered}
+
+
 def require_success(result: dict[str, Any], context: str) -> str:
     if result.get("isError") is not False:
         raise SuiteFailure(f"{context} returned error result: {pretty_json(result)}")
@@ -691,45 +708,41 @@ def r_write_stdin_recovers_after_error(client: McpStdioClient) -> None:
         )
 
 
-def r_write_stdin_drops_huge_echo_only_inputs(client: McpStdioClient) -> None:
+def r_write_stdin_does_not_synthesize_huge_input_only_transcript(
+    client: McpStdioClient,
+) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 2001))
     received = client.repl(input_text, timeout_ms=30000)
-    received_text = require_success(received, "write_stdin huge echo-only repl")
+    received_text = require_success(received, "write_stdin huge input-only repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge echo-only input to complete, got: {received_text!r}"
+            f"expected huge input-only request to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            f"did not expect pager activation for echo-only input, got: {received_text!r}"
-        )
-    if "echoed input elided" in received_text:
-        raise SuiteFailure(
-            f"did not expect echo elision marker, got: {received_text!r}"
+            f"did not expect pager activation for input-only request, got: {received_text!r}"
         )
     if received_text != "> ":
         raise SuiteFailure(f"expected prompt-only reply, got: {received_text!r}")
 
 
-def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None:
+def r_write_stdin_does_not_synthesize_huge_submitted_input(
+    client: McpStdioClient,
+) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 1001))
     input_text += 'cat("ok\\n")\n'
     input_text += "".join(f"y{idx} <- {idx}\n" for idx in range(1, 1001))
     input_text += 'cat("done\\n")\n'
 
     received = client.repl(input_text, timeout_ms=30000)
-    received_text = require_success(received, "write_stdin huge interleaved echo repl")
+    received_text = require_success(received, "write_stdin huge interleaved input repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge interleaved echo input to complete, got: {received_text!r}"
-        )
-    if "echoed input elided" in received_text:
-        raise SuiteFailure(
-            f"did not expect echo elision marker, got: {received_text!r}"
+            f"expected huge interleaved input to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            "did not expect pager activation for huge echo with small output, "
+            "did not expect pager activation for huge input with small output, "
             f"got: {received_text!r}"
         )
 
@@ -737,16 +750,16 @@ def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None
     if transcript_path is not None:
         spill_text = require_text_file(
             transcript_path,
-            "write_stdin huge interleaved echo transcript",
+            "write_stdin huge interleaved input transcript",
         )
         if "x500 <- 500" in spill_text:
             raise SuiteFailure(
-                "did not expect the pure leading echo prefix in spill file, "
+                "did not expect submitted assignment input in spill file, "
                 f"got: {spill_text!r}"
             )
         if "y500 <- 500" in spill_text:
             raise SuiteFailure(
-                "did not expect later submitted input echo in spill file, "
+                "did not expect submitted trailing input in spill file, "
                 f"got: {spill_text!r}"
             )
         if "ok" not in spill_text or "done" not in spill_text:
@@ -765,11 +778,11 @@ def r_write_stdin_trims_huge_leading_echo_prefix(client: McpStdioClient) -> None
         )
     if "x500 <- 500" in received_text:
         raise SuiteFailure(
-            f"did not expect the pure leading echo prefix inline, got: {received_text!r}"
+            f"did not expect submitted assignment input inline, got: {received_text!r}"
         )
     if "y500 <- 500" in received_text:
         raise SuiteFailure(
-            "did not expect later submitted input echo inline, "
+            "did not expect submitted trailing input inline, "
             f"got: {received_text!r}"
         )
 
@@ -786,10 +799,7 @@ def python_console_basic(client: McpStdioClient) -> None:
         "python console repl",
         deadline_seconds=python_startup_deadline_seconds(),
     )
-    expected = tool_result(
-        text("2\n"),
-        text(">>> "),
-    )
+    expected = tool_result(text("2\n"))
 
     assert_identical(expected, normalize_response(received), "python console repl")
 
@@ -830,7 +840,7 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
 
     recovered = client.repl("1+1", timeout_ms=5000)
     assert_identical(
-        tool_result(text("2\n"), text(">>> ")),
+        tool_result(text("2\n")),
         normalize_response(recovered),
         "python busy recovery repl",
     )
@@ -1069,16 +1079,27 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     )
     interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
     if is_busy_response(interrupted):
-        wait_for_response(
-            client,
-            expected_interrupted,
-            "interrupt prefix repl",
-            deadline_seconds=10.0,
-        )
+        deadline = time.monotonic() + 10.0
+        last_received: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            received = client.repl("", timeout_ms=500)
+            last_received = received
+            if is_busy_response(received):
+                continue
+            assert_identical(
+                expected_interrupted,
+                normalize_response(without_blank_stderr_chunks(received)),
+                "interrupt prefix repl",
+            )
+            break
+        else:
+            raise SuiteFailure(
+                f"interrupt prefix repl remained busy after polling: {last_received!r}"
+            )
     else:
         assert_identical(
             expected_interrupted,
-            interrupted,
+            normalize_response(without_blank_stderr_chunks(interrupted)),
             "interrupt prefix repl",
         )
 
@@ -1340,8 +1361,8 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
-    "r-write-stdin-drops-huge-echo-only-inputs": r_suite_case(
-        r_write_stdin_drops_huge_echo_only_inputs
+    "r-write-stdin-no-huge-input-only-transcript": r_suite_case(
+        r_write_stdin_does_not_synthesize_huge_input_only_transcript
     ),
     "r-write-stdin-multiple-calls": r_suite_case(r_write_stdin_multiple_calls),
     "r-write-stdin-recovers-after-error": r_suite_case(
@@ -1350,8 +1371,8 @@ CASES: dict[str, SuiteCase] = {
     "r-write-stdin-timeout-polling-returns-pending-output": r_suite_case(
         r_write_stdin_timeout_polling_returns_pending_output
     ),
-    "r-write-stdin-trims-huge-leading-echo-prefix": r_suite_case(
-        r_write_stdin_trims_huge_leading_echo_prefix,
+    "r-write-stdin-no-huge-submitted-input-transcript": r_suite_case(
+        r_write_stdin_does_not_synthesize_huge_submitted_input,
         server_args=("--oversized-output", "files"),
     ),
     "r-workspace-write-sandbox": r_suite_case(

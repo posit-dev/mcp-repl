@@ -111,6 +111,7 @@ fn worker_sideband_protocol_keeps_images_one_way() {
         r#"{ "type": "input_batch", "input": <string> }"#,
         r#"{ "type": "input_line", "prompt": <string>, "text": <string> }"#,
         r#"{ "type": "input_wait", "prompt": <string> }"#,
+        r#"{ "type": "ready" }"#,
         r#"{ "type": "session_end", "reason": <string>, "message": <string, optional> }"#,
         r#"{ "type": "interrupt" }"#,
         "This document defines worker protocol version 6.",

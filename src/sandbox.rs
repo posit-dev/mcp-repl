@@ -11,7 +11,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
-#[cfg(target_os = "macos")]
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -99,7 +98,10 @@ pub enum SandboxPolicy {
     #[serde(rename = "danger-full-access")]
     DangerFullAccess,
     #[serde(rename = "read-only")]
-    ReadOnly,
+    ReadOnly {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        network_access: bool,
+    },
     #[serde(rename = "external-sandbox")]
     ExternalSandbox {
         #[serde(default)]
@@ -131,7 +133,7 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly => false,
+            SandboxPolicy::ReadOnly { .. } => false,
             SandboxPolicy::WorkspaceWrite { .. } => false,
         }
     }
@@ -141,7 +143,7 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly => true,
+            SandboxPolicy::ReadOnly { .. } => true,
             SandboxPolicy::WorkspaceWrite { .. } => true,
         }
     }
@@ -150,7 +152,7 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { network_access } => network_access.is_enabled(),
-            SandboxPolicy::ReadOnly => false,
+            SandboxPolicy::ReadOnly { network_access } => *network_access,
             SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
         }
     }
@@ -169,7 +171,7 @@ impl SandboxPolicy {
         session_temp_dir: Option<&Path>,
     ) -> Vec<WritableRoot> {
         match self {
-            SandboxPolicy::ReadOnly => {
+            SandboxPolicy::ReadOnly { .. } => {
                 let roots = temp_writable_roots(false, false, session_temp_dir);
                 roots
                     .into_iter()
@@ -435,50 +437,106 @@ pub struct SandboxStateUpdate {
     pub use_legacy_landlock: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexSandboxStateMeta {
-    pub sandbox_policy: SandboxPolicy,
+struct CodexSandboxStateMeta {
     #[serde(default)]
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub sandbox_cwd: PathBuf,
+    sandbox_policy: Option<SandboxPolicy>,
     #[serde(default)]
-    pub use_legacy_landlock: bool,
+    permission_profile: Option<CodexPermissionProfile>,
+    #[serde(default)]
+    codex_linux_sandbox_exe: Option<serde_json::Value>,
+    sandbox_cwd: String,
+    #[serde(default)]
+    use_legacy_landlock: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexPermissionProfile {
+    Managed {
+        file_system: CodexManagedFileSystemPermissions,
+        network: NetworkAccess,
+    },
+    Disabled,
+    External {
+        network: NetworkAccess,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexManagedFileSystemPermissions {
+    Restricted {
+        #[serde(default)]
+        entries: Vec<CodexFileSystemSandboxEntry>,
+        #[serde(default)]
+        glob_scan_max_depth: Option<usize>,
+    },
+    Unrestricted,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexFileSystemSandboxEntry {
+    path: CodexFileSystemPath,
+    access: CodexFileSystemAccessMode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexFileSystemAccessMode {
+    Read,
+    Write,
+    #[serde(alias = "none")]
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexFileSystemPath {
+    Path { path: String },
+    GlobPattern { pattern: String },
+    Special { value: CodexFileSystemSpecialPath },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CodexFileSystemSpecialPath {
+    Root,
+    Minimal,
+    ProjectRoots {
+        #[serde(default)]
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
+}
+
+const CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR: &str =
+    "Codex permissionProfile full write access with restricted network access is not supported";
 
 pub fn sandbox_state_update_from_codex_meta(
     meta: &serde_json::Value,
 ) -> Result<SandboxStateUpdate, String> {
-    if let Some(field) = codex_unsupported_sandbox_policy_field(meta) {
-        return Err(format!(
-            "Codex sandbox metadata with {field} is not supported"
-        ));
-    }
-    let mut parsed = parse_codex_sandbox_state_meta(meta)?;
-    let sandbox_cwd = normalize_codex_path(parsed.sandbox_cwd);
-    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &mut parsed.sandbox_policy {
-        for root in writable_roots {
-            *root = normalize_codex_path(root.clone());
-        }
-    }
+    let parsed = serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
+        .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?;
+    let sandbox_cwd = parse_codex_path_uri(&parsed.sandbox_cwd, "sandboxCwd")?;
 
-    if !sandbox_cwd.is_absolute() {
-        return Err(format!(
-            "Codex sandbox metadata requires an absolute sandboxCwd, got: {}",
-            sandbox_cwd.display()
-        ));
-    }
-    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &parsed.sandbox_policy
-        && let Some(root) = writable_roots.iter().find(|root| !root.is_absolute())
-    {
-        return Err(format!(
-            "Codex sandbox metadata requires absolute sandboxPolicy.writable_roots entries, got: {}",
-            root.display()
-        ));
-    }
+    let sandbox_policy = match (parsed.sandbox_policy, parsed.permission_profile) {
+        (Some(policy), _) => validate_codex_sandbox_policy(policy)?,
+        (None, Some(permission_profile)) => {
+            sandbox_policy_from_codex_permission_profile(permission_profile, &sandbox_cwd)?
+        }
+        (None, None) => {
+            return Err("failed to parse Codex sandbox state metadata: missing field `sandboxPolicy` or `permissionProfile`"
+                .to_string());
+        }
+    };
+    let _ = parsed.codex_linux_sandbox_exe;
+    let _ = parsed.use_legacy_landlock;
 
     Ok(SandboxStateUpdate {
-        sandbox_policy: parsed.sandbox_policy,
+        sandbox_policy,
         sandbox_cwd: Some(sandbox_cwd),
         // Codex reports how its own Linux helper is configured, but mcp-repl's
         // optional bwrap stage is a separate local best-effort knob.
@@ -487,191 +545,346 @@ pub fn sandbox_state_update_from_codex_meta(
     })
 }
 
-fn parse_codex_sandbox_state_meta(
-    meta: &serde_json::Value,
-) -> Result<CodexSandboxStateMeta, String> {
-    if meta.get("sandboxPolicy").is_some() {
-        return serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
-            .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"));
-    }
-
-    let Some(permission_profile) = meta.get("permissionProfile") else {
-        return serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
-            .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"));
+fn parse_codex_path_uri(value: &str, field: &str) -> Result<PathBuf, String> {
+    let path = if value.starts_with("file:") {
+        let url = Url::parse(value)
+            .map_err(|err| format!("Codex sandbox metadata has invalid {field}: {err}"))?;
+        if url.scheme() != "file" {
+            return Err(format!(
+                "Codex sandbox metadata requires {field} to be a file URI, got: {value}"
+            ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(format!(
+                "Codex sandbox metadata {field} file URI has unsupported metadata: {value}"
+            ));
+        }
+        url.to_file_path().map_err(|_| {
+            format!("Codex sandbox metadata requires local file URI {field}, got: {value}")
+        })?
+    } else {
+        PathBuf::from(value)
     };
-    let sandbox_cwd = meta
-        .get("sandboxCwd")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "failed to parse Codex sandbox state metadata: missing field `sandboxCwd`".to_string()
-        })?;
 
-    Ok(CodexSandboxStateMeta {
-        sandbox_policy: sandbox_policy_from_permission_profile(permission_profile)?,
-        codex_linux_sandbox_exe: meta
-            .get("codexLinuxSandboxExe")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from),
-        sandbox_cwd,
-        use_legacy_landlock: meta
-            .get("useLegacyLandlock")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    })
-}
-
-fn sandbox_policy_from_permission_profile(
-    profile: &serde_json::Value,
-) -> Result<SandboxPolicy, String> {
-    let profile_type = profile
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            "failed to parse Codex sandbox state metadata: missing permissionProfile.type"
-                .to_string()
-        })?;
-
-    match profile_type {
-        "managed" => managed_permission_profile_policy(profile),
-        "read-only" => Ok(SandboxPolicy::ReadOnly),
-        "disabled" => Ok(SandboxPolicy::DangerFullAccess),
-        "danger-full-access" => Ok(SandboxPolicy::DangerFullAccess),
-        other => Err(format!(
-            "Codex sandbox metadata with permissionProfile.type={other:?} is not supported"
-        )),
+    if !path.is_absolute() {
+        return Err(format!(
+            "Codex sandbox metadata requires an absolute {field}, got: {}",
+            path.display()
+        ));
     }
+    Ok(path)
 }
 
-fn managed_permission_profile_policy(profile: &serde_json::Value) -> Result<SandboxPolicy, String> {
-    let file_system = profile.get("file_system").ok_or_else(|| {
-        "failed to parse Codex sandbox state metadata: missing permissionProfile.file_system"
-            .to_string()
-    })?;
-    let file_system_type = file_system
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            "failed to parse Codex sandbox state metadata: missing permissionProfile.file_system.type"
-                .to_string()
-        })?;
+fn validate_codex_sandbox_policy(policy: SandboxPolicy) -> Result<SandboxPolicy, String> {
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &policy
+        && let Some(root) = writable_roots.iter().find(|root| !root.is_absolute())
+    {
+        return Err(format!(
+            "Codex sandbox metadata requires absolute sandboxPolicy.writable_roots entries, got: {}",
+            root.display()
+        ));
+    }
+    Ok(policy)
+}
 
-    match file_system_type {
-        "restricted" => restricted_permission_file_system_policy(profile, file_system),
-        "read-only" => Ok(SandboxPolicy::ReadOnly),
-        "unrestricted" => Ok(SandboxPolicy::ExternalSandbox {
-            network_access: if permission_profile_network_access(profile) {
-                NetworkAccess::Enabled
-            } else {
-                NetworkAccess::Restricted
-            },
+fn sandbox_policy_from_codex_permission_profile(
+    permission_profile: CodexPermissionProfile,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    match permission_profile {
+        CodexPermissionProfile::Disabled => Ok(SandboxPolicy::DangerFullAccess),
+        CodexPermissionProfile::External { network } => Ok(SandboxPolicy::ExternalSandbox {
+            network_access: network,
         }),
-        other => Err(format!(
-            "Codex sandbox metadata with permissionProfile.file_system.type={other:?} is not supported"
-        )),
+        CodexPermissionProfile::Managed {
+            file_system,
+            network,
+        } => sandbox_policy_from_codex_managed_profile(file_system, network, sandbox_cwd),
     }
 }
 
-fn restricted_permission_file_system_policy(
-    profile: &serde_json::Value,
-    file_system: &serde_json::Value,
+fn sandbox_policy_from_codex_managed_profile(
+    file_system: CodexManagedFileSystemPermissions,
+    network: NetworkAccess,
+    sandbox_cwd: &Path,
 ) -> Result<SandboxPolicy, String> {
-    let entries = file_system
-        .get("entries")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            "failed to parse Codex sandbox state metadata: missing permissionProfile.file_system.entries"
-                .to_string()
-        })?;
-    let mut writable_roots = Vec::new();
-    let mut allows_tmpdir = false;
-    let mut allows_slash_tmp = false;
+    let network_access = network.is_enabled();
+    match file_system {
+        CodexManagedFileSystemPermissions::Unrestricted => {
+            if network_access {
+                Ok(SandboxPolicy::DangerFullAccess)
+            } else {
+                Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string())
+            }
+        }
+        CodexManagedFileSystemPermissions::Restricted {
+            entries,
+            glob_scan_max_depth,
+        } => {
+            if glob_scan_max_depth.is_some() {
+                return Err(
+                    "Codex permissionProfile.file_system.glob_scan_max_depth is not supported"
+                        .to_string(),
+                );
+            }
+            sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RestrictedProfileProjection {
+    root_read: bool,
+    root_write: bool,
+    workspace_root_writable: bool,
+    writable_roots: Vec<PathBuf>,
+    tmpdir_writable: bool,
+    slash_tmp_writable: bool,
+    read_entries: Vec<CodexFileSystemPath>,
+}
+
+fn sandbox_policy_from_codex_restricted_entries(
+    entries: Vec<CodexFileSystemSandboxEntry>,
+    network_access: bool,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let mut projection = RestrictedProfileProjection::default();
 
     for entry in entries {
-        if entry.get("access").and_then(serde_json::Value::as_str) != Some("write") {
+        match entry.access {
+            CodexFileSystemAccessMode::Deny => {
+                return Err(
+                    "Codex permissionProfile.file_system deny entries are not supported"
+                        .to_string(),
+                );
+            }
+            CodexFileSystemAccessMode::Read => {
+                if matches!(
+                    &entry.path,
+                    CodexFileSystemPath::Special {
+                        value: CodexFileSystemSpecialPath::Root
+                    }
+                ) {
+                    projection.root_read = true;
+                }
+                projection.read_entries.push(entry.path);
+            }
+            CodexFileSystemAccessMode::Write => {
+                project_codex_write_entry(entry.path, sandbox_cwd, &mut projection)?
+            }
+        }
+    }
+
+    if projection.root_write {
+        validate_root_write_projection(&projection)?;
+        if !network_access {
+            return Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string());
+        }
+        return Ok(SandboxPolicy::DangerFullAccess);
+    }
+
+    projection.writable_roots.sort();
+    projection.writable_roots.dedup();
+
+    if projection.workspace_root_writable {
+        validate_workspace_write_read_entries(&projection, sandbox_cwd)?;
+        return Ok(SandboxPolicy::WorkspaceWrite {
+            writable_roots: projection.writable_roots,
+            network_access,
+            exclude_tmpdir_env_var: !projection.tmpdir_writable,
+            exclude_slash_tmp: !projection.slash_tmp_writable,
+        });
+    }
+
+    if !projection.writable_roots.is_empty()
+        || projection.tmpdir_writable
+        || projection.slash_tmp_writable
+    {
+        return Err(
+            "Codex permissionProfile requests writes outside the workspace root, which mcp-repl cannot represent"
+                .to_string(),
+        );
+    }
+
+    if !projection.root_read {
+        return Err(
+            "Codex permissionProfile read-only policy without root read access is not supported"
+                .to_string(),
+        );
+    }
+
+    Ok(SandboxPolicy::ReadOnly { network_access })
+}
+
+fn project_codex_write_entry(
+    path: CodexFileSystemPath,
+    sandbox_cwd: &Path,
+    projection: &mut RestrictedProfileProjection,
+) -> Result<(), String> {
+    match path {
+        CodexFileSystemPath::Path { path } => {
+            let path = parse_codex_path_uri(&path, "permissionProfile.file_system.entries.path")?;
+            if path == sandbox_cwd {
+                projection.workspace_root_writable = true;
+            } else {
+                projection.writable_roots.push(path);
+            }
+        }
+        CodexFileSystemPath::Special { value } => match value {
+            CodexFileSystemSpecialPath::Root => {
+                projection.root_write = true;
+            }
+            CodexFileSystemSpecialPath::ProjectRoots { subpath: None } => {
+                projection.workspace_root_writable = true;
+            }
+            CodexFileSystemSpecialPath::ProjectRoots {
+                subpath: Some(subpath),
+            } => {
+                projection
+                    .writable_roots
+                    .push(resolve_codex_project_root_subpath(sandbox_cwd, &subpath));
+            }
+            CodexFileSystemSpecialPath::Tmpdir => {
+                projection.tmpdir_writable = true;
+            }
+            CodexFileSystemSpecialPath::SlashTmp => {
+                projection.slash_tmp_writable = true;
+            }
+            CodexFileSystemSpecialPath::Minimal => {
+                return Err(
+                    "Codex permissionProfile.file_system minimal write access is not supported"
+                        .to_string(),
+                );
+            }
+        },
+        CodexFileSystemPath::GlobPattern { pattern } => {
+            let _ = pattern;
+            return Err(
+                "Codex permissionProfile.file_system glob pattern writes are not supported"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_codex_project_root_subpath(sandbox_cwd: &Path, subpath: &Path) -> PathBuf {
+    if subpath.is_absolute() {
+        subpath.to_path_buf()
+    } else {
+        sandbox_cwd.join(subpath)
+    }
+}
+
+fn validate_root_write_projection(projection: &RestrictedProfileProjection) -> Result<(), String> {
+    for read_entry in &projection.read_entries {
+        if !matches!(
+            read_entry,
+            CodexFileSystemPath::Special {
+                value: CodexFileSystemSpecialPath::Root
+            }
+        ) {
+            return Err(
+                "Codex permissionProfile root write policy with read carveouts is not supported"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_write_read_entries(
+    projection: &RestrictedProfileProjection,
+    sandbox_cwd: &Path,
+) -> Result<(), String> {
+    for read_entry in &projection.read_entries {
+        if workspace_write_read_entry_is_representable(
+            read_entry,
+            sandbox_cwd,
+            &projection.writable_roots,
+            projection.root_read,
+        )? {
             continue;
         }
-        let path = entry.get("path").ok_or_else(|| {
-            "failed to parse Codex sandbox state metadata: missing permissionProfile.file_system.entries[].path"
-                .to_string()
-        })?;
-        match path.get("type").and_then(serde_json::Value::as_str) {
-            Some("path") => {
-                let Some(path) = path.get("path").and_then(serde_json::Value::as_str) else {
-                    return Err("failed to parse Codex sandbox state metadata: missing permissionProfile.file_system.entries[].path.path".to_string());
-                };
-                writable_roots.push(normalize_codex_path(PathBuf::from(path)));
+        return Err(
+            "Codex permissionProfile.file_system read entry cannot be represented by mcp-repl workspace-write"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn workspace_write_read_entry_is_representable(
+    read_entry: &CodexFileSystemPath,
+    sandbox_cwd: &Path,
+    writable_roots: &[PathBuf],
+    root_read: bool,
+) -> Result<bool, String> {
+    match read_entry {
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Root,
+        } => Ok(true),
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::ProjectRoots { subpath },
+        } => Ok(subpath
+            .as_ref()
+            .is_some_and(|subpath| is_protected_metadata_subpath(subpath))),
+        CodexFileSystemPath::Special {
+            value:
+                CodexFileSystemSpecialPath::Tmpdir
+                | CodexFileSystemSpecialPath::SlashTmp
+                | CodexFileSystemSpecialPath::Minimal,
+        } => Ok(root_read),
+        CodexFileSystemPath::Path { path } => {
+            let path = parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?;
+            if is_protected_metadata_path_under_roots(&path, sandbox_cwd, writable_roots) {
+                return Ok(true);
             }
-            Some("special") => {
-                let kind = path
-                    .get("value")
-                    .and_then(|value| value.get("kind"))
-                    .and_then(serde_json::Value::as_str);
-                match kind {
-                    Some("tmpdir") => allows_tmpdir = true,
-                    Some("slash_tmp") => allows_slash_tmp = true,
-                    Some("root") => return Ok(SandboxPolicy::DangerFullAccess),
-                    _ => {}
-                }
-            }
-            _ => {}
+            Ok(root_read && !is_under_any_root(&path, sandbox_cwd, writable_roots))
+        }
+        CodexFileSystemPath::GlobPattern { pattern } => {
+            let _ = pattern;
+            Ok(false)
         }
     }
-
-    if writable_roots.is_empty() && !allows_tmpdir && !allows_slash_tmp {
-        return Ok(SandboxPolicy::ReadOnly);
-    }
-
-    Ok(SandboxPolicy::WorkspaceWrite {
-        writable_roots,
-        network_access: permission_profile_network_access(profile),
-        exclude_tmpdir_env_var: !allows_tmpdir,
-        exclude_slash_tmp: !allows_slash_tmp,
-    })
 }
 
-fn permission_profile_network_access(profile: &serde_json::Value) -> bool {
-    matches!(
-        profile.get("network").and_then(serde_json::Value::as_str),
-        Some("enabled" | "unrestricted" | "full" | "allowed")
-    )
+fn is_protected_metadata_path_under_roots(
+    path: &Path,
+    sandbox_cwd: &Path,
+    writable_roots: &[PathBuf],
+) -> bool {
+    is_protected_metadata_path_under_root(path, sandbox_cwd)
+        || writable_roots
+            .iter()
+            .any(|root| is_protected_metadata_path_under_root(path, root))
 }
 
-fn normalize_codex_path(path: PathBuf) -> PathBuf {
-    let text = path.to_string_lossy();
-    let Some(rest) = text.strip_prefix("file://") else {
-        return path;
+fn is_protected_metadata_path_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(suffix) = path.strip_prefix(root) else {
+        return false;
     };
-
-    #[cfg(target_os = "windows")]
-    {
-        let rest =
-            if rest.starts_with('/') && rest.as_bytes().get(2).is_some_and(|byte| *byte == b':') {
-                &rest[1..]
-            } else {
-                rest
-            };
-        return PathBuf::from(rest);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    PathBuf::from(rest)
+    is_protected_metadata_subpath(suffix)
 }
 
-fn codex_unsupported_sandbox_policy_field(meta: &serde_json::Value) -> Option<String> {
-    let policy = meta
-        .get("sandboxPolicy")
-        .and_then(serde_json::Value::as_object)?;
-    match policy.get("type").and_then(serde_json::Value::as_str) {
-        Some("workspace-write") if policy.contains_key("read_only_access") => {
-            Some("sandboxPolicy.read_only_access".to_string())
-        }
-        Some("read-only") => policy
-            .keys()
-            .find(|key| key.as_str() != "type")
-            .map(|key| format!("sandboxPolicy.{key}")),
-        _ => None,
-    }
+fn is_under_any_root(path: &Path, sandbox_cwd: &Path, writable_roots: &[PathBuf]) -> bool {
+    path.starts_with(sandbox_cwd) || writable_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn is_protected_metadata_subpath(path: &Path) -> bool {
+    let mut components = path.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    matches!(
+        first.as_os_str().to_str(),
+        Some(".git" | ".agents" | ".codex")
+    )
 }
 
 impl SandboxState {
@@ -907,11 +1120,11 @@ pub fn prepare_worker_command_with_managed_network(
         let mut policy = state.sandbox_policy.clone();
         let mut policy_cwd = state.sandbox_cwd.clone();
         match &mut policy {
-            SandboxPolicy::ReadOnly => {
+            SandboxPolicy::ReadOnly { network_access } => {
                 let temp_root = state.session_temp_dir.clone();
                 policy = SandboxPolicy::WorkspaceWrite {
                     writable_roots: vec![temp_root.clone()],
-                    network_access: false,
+                    network_access: *network_access,
                     exclude_tmpdir_env_var: true,
                     exclude_slash_tmp: true,
                 };
@@ -1062,7 +1275,9 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
             network_access: *network_access,
         },
         SandboxPolicy::DangerFullAccess => SandboxPolicy::DangerFullAccess,
-        SandboxPolicy::ReadOnly => SandboxPolicy::ReadOnly,
+        SandboxPolicy::ReadOnly { network_access } => SandboxPolicy::ReadOnly {
+            network_access: *network_access,
+        },
     }
 }
 
@@ -3004,13 +3219,84 @@ mod tests {
     }
 
     #[test]
+    fn codex_sandbox_state_meta_parses_current_permission_profile_payload() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
+                serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
+            } else {
+                serde_json::Value::Null
+            },
+        }))
+        .expect("current Codex sandbox metadata");
+
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+        assert_eq!(update.sandbox_cwd, Some(sandbox_cwd));
+        assert!(update.use_linux_sandbox_bwrap.is_none());
+    }
+
+    #[test]
     fn codex_sandbox_state_meta_does_not_force_internal_linux_bwrap() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "danger-full-access"
+            "permissionProfile": {
+                "type": "disabled"
             },
-            "sandboxCwd": sandbox_cwd,
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
                 serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
@@ -3027,30 +3313,36 @@ mod tests {
     }
 
     #[test]
-    fn codex_permission_profile_meta_maps_workspace_write() {
-        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-permission-profile-cwd");
-        let sandbox_cwd_uri = format!("file://{}", sandbox_cwd.display());
-        let workspace_root = sandbox_cwd.to_string_lossy().to_string();
-        let update = sandbox_state_update_from_codex_meta(&json!({
+    fn codex_sandbox_state_meta_rejects_relative_workspace_write_roots() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+        let err = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "managed",
                 "file_system": {
                     "type": "restricted",
                     "entries": [
                         {
-                            "path": { "type": "special", "value": { "kind": "root" } },
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
                             "access": "read"
                         },
                         {
-                            "path": { "type": "path", "path": workspace_root },
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
                             "access": "write"
                         },
                         {
-                            "path": { "type": "special", "value": { "kind": "tmpdir" } },
-                            "access": "write"
-                        },
-                        {
-                            "path": { "type": "special", "value": { "kind": "slash_tmp" } },
+                            "path": {
+                                "type": "path",
+                                "path": "relative-root"
+                            },
                             "access": "write"
                         }
                     ]
@@ -3065,28 +3357,21 @@ mod tests {
                 serde_json::Value::Null
             },
         }))
-        .expect("codex permission profile metadata");
+        .expect_err("relative writable roots should fail closed");
 
-        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
-        match update.sandbox_policy {
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                network_access,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-            } => {
-                assert_eq!(writable_roots, vec![sandbox_cwd]);
-                assert!(!network_access);
-                assert!(!exclude_tmpdir_env_var);
-                assert!(!exclude_slash_tmp);
-            }
-            other => panic!("expected workspace-write policy, got {other:?}"),
-        }
+        assert!(
+            err.contains("permissionProfile.file_system.entries.path"),
+            "expected path validation error, got: {err}"
+        );
+        assert!(
+            err.contains("relative-root"),
+            "expected failing relative root to be named in the error, got: {err}"
+        );
     }
 
     #[test]
-    fn codex_permission_profile_meta_without_write_entries_maps_read_only() {
-        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-permission-profile-readonly");
+    fn codex_permission_profile_meta_maps_workspace_write() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-workspace");
         let update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "managed",
@@ -3094,7 +3379,38 @@ mod tests {
                     "type": "restricted",
                     "entries": [
                         {
-                            "path": { "type": "special", "value": { "kind": "root" } },
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd.join(".git")
+                            },
                             "access": "read"
                         }
                     ]
@@ -3102,41 +3418,83 @@ mod tests {
                 "network": "restricted"
             },
             "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
         }))
-        .expect("codex permission profile metadata");
+        .expect("Codex permission profile metadata should map to a legacy sandbox update");
 
-        assert!(matches!(update.sandbox_policy, SandboxPolicy::ReadOnly));
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
     }
 
     #[test]
-    fn codex_sandbox_state_meta_rejects_relative_workspace_write_roots() {
-        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
-        let err = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": ["relative-root"],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+    fn codex_permission_profile_meta_accepts_file_uri_sandbox_cwd() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-uri-cwd");
+        let sandbox_cwd_uri = file_url_for_test_path(&sandbox_cwd);
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("file URI sandboxCwd should parse");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::ReadOnly {
+                network_access: false,
+            }
+        );
+    }
+
+    fn file_url_for_test_path(path: &Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_maps_disabled_to_full_access() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-full-access");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
             },
             "sandboxCwd": sandbox_cwd,
             "useLegacyLandlock": false,
-            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
-                serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
-            } else {
-                serde_json::Value::Null
-            },
+            "codexLinuxSandboxExe": serde_json::Value::Null,
         }))
-        .expect_err("relative writable roots should fail closed");
+        .expect("disabled Codex permission profile should map to full access");
 
-        assert!(
-            err.contains("sandboxPolicy.writable_roots"),
-            "expected writable_roots validation error, got: {err}"
-        );
-        assert!(
-            err.contains("relative-root"),
-            "expected failing relative root to be named in the error, got: {err}"
-        );
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(update.sandbox_policy, SandboxPolicy::DangerFullAccess);
     }
 
     #[cfg(target_os = "linux")]

@@ -83,8 +83,7 @@ fn collect_text(result: &CallToolResult) -> String {
             !(trimmed.starts_with("> ")
                 || trimmed.starts_with("+ ")
                 || trimmed == ">"
-                || trimmed.starts_with("[repl] input:")
-                || trimmed.starts_with("[repl] echoed input"))
+                || trimmed.starts_with("[repl] input:"))
         })
         .collect::<Vec<_>>()
         .join("\n")

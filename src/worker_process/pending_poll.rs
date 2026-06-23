@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{
-    CompletionInfo, CompletionReplyMode, InputFallback, ReplyWithOffset, build_completed_reply,
+    CompletionInfo, CompletionReplyMode, ReplyWithOffset, build_completed_reply,
     build_timeout_reply, timeout_status_content,
 };
 use crate::output_snapshot::{
@@ -50,11 +50,6 @@ impl WorkerManager {
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, false, None),
         };
 
-        let fallback_input = if timed_out_elapsed.is_none() && consumed_completion {
-            self.take_input_fallback(&completion)
-        } else {
-            InputFallback::default()
-        };
         if timed_out_elapsed.is_none() && consumed_completion {
             self.wait_for_late_files_output_after_settled_completion(timeout);
         }
@@ -81,7 +76,6 @@ impl WorkerManager {
             &completion,
             session_end,
             CompletionReplyMode::Files {
-                fallback_input,
                 idle_status_if_empty: true,
             },
             self.backend,
@@ -127,14 +121,8 @@ impl WorkerManager {
         };
 
         let (saw_stderr, snapshot) = if observed_completion && timed_out_elapsed.is_none() {
-            let completed = snapshot_after_completion(
-                &self.output,
-                start_offset,
-                end_offset,
-                page_bytes,
-                &completion.echo_events,
-                completion.prompt_variants.as_deref(),
-            );
+            let completed =
+                snapshot_after_completion(&self.output, start_offset, end_offset, page_bytes);
             (completed.saw_stderr, completed.snapshot)
         } else {
             let saw_stderr = self
@@ -176,13 +164,12 @@ impl WorkerManager {
             session_end,
             CompletionReplyMode::Pager {
                 pager_active: self.pager.is_active(),
-                fallback_input_transcript: None,
             },
             self.backend,
         );
         self.remember_prompt(built.prompt_to_remember.clone());
         if let Some(pager_prompt) = built.pager_prompt {
-            self.pager_prompt = pager_prompt;
+            self.pager_prompt = Some(pager_prompt);
         }
         Ok(built.reply)
     }
@@ -284,7 +271,6 @@ mod tests {
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
             prompt_variants: Some(vec!["> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });

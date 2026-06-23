@@ -93,6 +93,12 @@ pub fn emit_input_wait(prompt: &str) {
     }
 }
 
+pub fn emit_ready() {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::Ready {});
+    }
+}
+
 pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
     let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
     ipc.send_output_text(stream, bytes)

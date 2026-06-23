@@ -23,6 +23,24 @@ response:
     },
     {
       "type": "text",
+      "text": "[pager] elided output: @293..839"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "text",
+      "text": "[pager] elided output: @839..1610"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "text",
       "text": "--More-- (Np, 12.0%, @0..293/2441)"
     }
   ]

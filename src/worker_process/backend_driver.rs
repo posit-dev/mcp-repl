@@ -3,19 +3,11 @@ use std::time::{Duration, Instant};
 use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
-use crate::output_capture::OutputTextSource;
 use crate::oversized_output::OversizedOutputMode;
 use crate::worker_supervisor::WorkerProcess;
 
 use super::WorkerError;
 use super::request_lifecycle::{REQUEST_COMPLETION_STABLE_WAIT, completion_info_from_ipc};
-
-pub(super) fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
-    match backend {
-        Backend::R => OutputTextSource::Ipc,
-        Backend::Python => OutputTextSource::Ipc,
-    }
-}
 
 pub(super) trait BackendDriver: Send {
     fn prepare_input_text(&self, text: String) -> String {
@@ -67,15 +59,14 @@ impl RBackendDriver {
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
-    echo_source: OutputTextSource,
 ) -> Result<CompletionInfo, WorkerError> {
     if timeout.is_zero() {
         return Err(WorkerError::Timeout(timeout));
     }
     match ipc.wait_for_request_completion(timeout, REQUEST_COMPLETION_STABLE_WAIT) {
-        Ok(()) => Ok(completion_info_from_ipc(&ipc, false, echo_source)),
+        Ok(()) => Ok(completion_info_from_ipc(&ipc, false)),
         Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true, echo_source)),
+        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true)),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected while waiting for request completion".to_string(),
         )),
@@ -177,7 +168,7 @@ impl BackendDriver for RBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+        driver_wait_for_completion(timeout, ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -245,7 +236,7 @@ impl BackendDriver for ProtocolBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+        driver_wait_for_completion(timeout, ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -263,7 +254,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::ipc::{ServerToWorkerIpcMessage, WorkerToServerIpcMessage};
-    use crate::output_capture::OutputTextSource;
 
     use super::*;
 
@@ -311,14 +301,10 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected explicit input_wait to complete request");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected explicit input_wait to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "1+1\n");
     }
 
     #[test]
@@ -330,9 +316,8 @@ mod tests {
             prompt: "debug> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected input_wait to complete request");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected input_wait to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("debug> "));
     }
 
@@ -413,12 +398,8 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             prompt: "> ".to_string(),
         });
-        let first = driver_wait_for_completion(
-            Duration::from_millis(200),
-            server.clone(),
-            OutputTextSource::Ipc,
-        )
-        .expect("expected first completion");
+        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
+            .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
         server.begin_input().expect("begin second input");
@@ -430,18 +411,14 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let second =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected second completion");
+        let second = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected second completion");
 
         assert!(second.protocol_warnings.is_empty());
-        assert_eq!(second.echo_events.len(), 1);
-        assert_eq!(second.echo_events[0].prompt, "> ");
-        assert_eq!(second.echo_events[0].line, "second()\n");
     }
 
     #[test]
-    fn completion_preserves_echo_events_before_input_wait() {
+    fn completion_tolerates_input_line_before_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         make_ready_for_input(&server, &worker, "> ");
@@ -454,19 +431,15 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after input_wait");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after input_wait");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "first()\n");
     }
 
     #[test]
-    fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
+    fn completion_reports_session_end_after_input_line() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
@@ -480,14 +453,10 @@ mod tests {
             message: None,
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after session end");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]
@@ -505,14 +474,10 @@ mod tests {
             message: None,
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after session end");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]

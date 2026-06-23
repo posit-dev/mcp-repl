@@ -1,6 +1,5 @@
 ---
 source: tests/codex_integration.rs
-assertion_line: 2490
 expression: snapshot
 ---
 {

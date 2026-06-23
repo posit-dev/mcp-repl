@@ -19,12 +19,31 @@ impl WorkerManager {
         result
     }
 
+    pub(super) fn reset_after_session_end_preserving_detached_prefix_item_count(
+        &mut self,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_after_session_end();
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
     pub(super) fn reset_with_pager_preserving_detached_prefix_item_count(
         &mut self,
         preserve_pager: bool,
     ) -> Result<(), WorkerError> {
         let detached_prefix_item_count = self.last_detached_prefix_item_count;
         let result = self.reset_with_pager(preserve_pager);
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
+    pub(super) fn reset_after_session_end_with_pager_preserving_detached_prefix_item_count(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_after_session_end_with_pager(preserve_pager);
         self.last_detached_prefix_item_count = detached_prefix_item_count;
         result
     }
@@ -73,9 +92,13 @@ impl WorkerManager {
     pub(super) fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
             let result = match self.oversized_output {
-                OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
+                OversizedOutputMode::Files => {
+                    self.reset_after_session_end_preserving_detached_prefix_item_count()
+                }
                 OversizedOutputMode::Pager => self
-                    .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
+                    .reset_after_session_end_with_pager_preserving_detached_prefix_item_count(
+                        self.pager.is_active(),
+                    ),
             };
             if result.is_ok() {
                 self.note_respawn_during_write();
@@ -149,6 +172,41 @@ impl WorkerManager {
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
+        Ok(())
+    }
+
+    pub(super) fn reset_after_session_end(&mut self) -> Result<(), WorkerError> {
+        self.reset_after_session_end_for_mode(false)
+    }
+
+    pub(super) fn reset_after_session_end_with_pager(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        self.reset_after_session_end_for_mode(preserve_pager)
+    }
+
+    fn reset_after_session_end_for_mode(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        crate::event_log::log("worker_session_end_reset_begin", serde_json::json!({}));
+        if let Some(process) = self.process.take() {
+            let _ = process.finish_session_end_for_respawn();
+        }
+        self.require_inherited_sandbox_state()?;
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, preserve_pager),
+        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
+        crate::event_log::log(
+            "worker_session_end_reset_end",
+            serde_json::json!({"status": "ok"}),
+        );
         Ok(())
     }
 
