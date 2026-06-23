@@ -69,30 +69,20 @@ fn create_venv(root: &Path, name: &str) -> TestResult<PathBuf> {
     Ok(venv)
 }
 
-fn resolve_uv_python(packages: &[&str], python_version: Option<&str>) -> TestResult<PathBuf> {
+fn install_packages(python: &Path, packages: &[&str]) -> TestResult<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
     let mut command = Command::new("uv");
-    command.args(["tool", "run", "--isolated"]);
-    if let Some(python_version) = python_version {
-        command.arg("--python").arg(python_version);
-    }
+    command.args(["pip", "install", "--python"]).arg(python);
     for package in packages {
-        command.arg("--with").arg(package);
+        command.arg(package);
     }
-    command.args([
-        "--",
-        "python",
-        "-I",
-        "-c",
-        "import sys; print(sys.executable)",
-    ]);
-    let output = run_uv(command, "failed to resolve uv-managed Python")?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let executable = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or("uv did not report a Python executable")?;
-    Ok(PathBuf::from(executable.trim()))
+    run_uv(
+        command,
+        format!("failed to install test packages into {}", python.display()),
+    )?;
+    Ok(())
 }
 
 fn current_python_version() -> TestResult<(u32, u32, u32)> {
@@ -121,7 +111,7 @@ fn current_python_version() -> TestResult<(u32, u32, u32)> {
 }
 
 struct RealUv {
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
     stdlib_venv: PathBuf,
 }
 
@@ -137,7 +127,7 @@ impl RealUv {
         let root = tempdir.path();
         let stdlib_venv = create_venv(root, "stdlib")?;
         Ok(Self {
-            _tempdir: tempdir,
+            tempdir,
             stdlib_venv,
         })
     }
@@ -160,7 +150,10 @@ impl RealUv {
     }
 
     fn managed_python(&self, packages: &[&str]) -> TestResult<PathBuf> {
-        resolve_uv_python(packages, None)
+        let venv = create_venv(self.tempdir.path(), "managed")?;
+        let python = venv_python(&venv);
+        install_packages(&python, packages)?;
+        Ok(python)
     }
 }
 
