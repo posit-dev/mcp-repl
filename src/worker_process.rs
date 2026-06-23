@@ -295,15 +295,18 @@ impl WorkerManager {
         self.user_state_may_exist
     }
 
-    pub fn python_executable_matches(&self, target: &std::path::Path) -> bool {
+    pub fn active_python_executable(&self) -> Option<std::path::PathBuf> {
         if self.backend != Backend::Python {
-            return false;
+            return None;
         }
-        let current = match self.worker_launch.python_executable() {
+        match self.worker_launch.python_executable() {
             Some(executable) => Some(executable.to_path_buf()),
             None => crate::python_prepare::current_python_executable(),
-        };
-        current
+        }
+    }
+
+    pub fn python_executable_matches(&self, target: &std::path::Path) -> bool {
+        self.active_python_executable()
             .as_deref()
             .is_some_and(|current| crate::python_prepare::same_python_executable(current, target))
     }

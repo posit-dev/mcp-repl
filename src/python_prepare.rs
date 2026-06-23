@@ -191,11 +191,13 @@ fn add_python_version_constraint(current: Option<String>, requested: &str) -> Op
 pub(crate) fn resolve_requirements_manifest(
     manifest: &PythonRequirementsManifest,
     allow_current_runtime_shortcut: bool,
+    current_runtime_executable: Option<&Path>,
 ) -> Result<PythonPrepareTarget, String> {
     let config = resolve_requirements(
         &manifest.packages,
         manifest.python_version.as_deref(),
         allow_current_runtime_shortcut,
+        current_runtime_executable,
     )?;
     Ok(PythonPrepareTarget {
         executable: config.executable,
@@ -214,9 +216,12 @@ fn resolve_requirements(
     packages: &[String],
     python_version: Option<&str>,
     allow_current_runtime_shortcut: bool,
+    current_runtime_executable: Option<&Path>,
 ) -> Result<PythonRuntimeConfig, String> {
     if allow_current_runtime_shortcut
-        && let Some(config) = current_runtime_satisfies_requirements(packages, python_version)
+        && let Some(executable) = current_runtime_executable
+        && let Some(config) =
+            current_runtime_satisfies_requirements(executable, packages, python_version)
     {
         return Ok(config);
     }
@@ -224,13 +229,14 @@ fn resolve_requirements(
 }
 
 fn current_runtime_satisfies_requirements(
+    executable: &Path,
     packages: &[String],
     python_version: Option<&str>,
 ) -> Option<PythonRuntimeConfig> {
     if packages.is_empty() || python_version.is_some() {
         return None;
     }
-    let config = resolve_python_runtime_config().ok()?;
+    let config = query_python_runtime_config(executable).ok()?;
     installed_distributions_satisfy(&config.executable, packages).then_some(config)
 }
 

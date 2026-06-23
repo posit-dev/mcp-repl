@@ -691,6 +691,61 @@ async fn repl_prepare_inherit_requires_meta_before_explicit_python_probe() -> Te
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_inherit_requires_meta_before_requirements_uv() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let cwd = tempfile::tempdir()?;
+    let fake_uv_dir = tempfile::tempdir()?;
+    let sentinel = fake_uv_dir.path().join("uv-ran");
+    let fake_uv = fake_uv_dir.path().join("uv");
+    fs::write(
+        &fake_uv,
+        format!(
+            "#!/bin/sh\nprintf ran > {}\necho FAKE_UV_INVOKED_BEFORE_SANDBOX_META >&2\nexit 7\n",
+            sentinel.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_uv)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_uv, permissions)?;
+
+    let mut env_vars = uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?;
+    env_vars.push((
+        "PATH".to_string(),
+        fake_uv_dir.path().to_string_lossy().to_string(),
+    ));
+    let session = spawn_python_inherit_files_server(cwd.path(), env_vars).await?;
+
+    let result = call_prepare(
+        &session,
+        json!({
+            "requirements": {
+                "packages": [EXTRA_PACKAGE],
+                "action": "set"
+            }
+        }),
+    )
+    .await?;
+    let text = common::result_text(&result);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected missing inherited metadata to reject prepare, got: {text:?}"
+    );
+    assert!(
+        text.contains("sandbox inherit requested but no client sandbox state was provided"),
+        "expected inherited metadata error before uv, got: {text:?}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "requirements prepare should not run uv before inherited metadata is accepted"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResult<()> {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let cwd = tempfile::tempdir()?;
@@ -730,6 +785,64 @@ async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResu
     assert!(
         probe_text.contains("PACKAGING_OK:True"),
         "expected prepared worker to run under inherited metadata, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_restart_no_uses_active_python_for_requirement_noop() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let numpy_python = uv_env.managed_python(&["numpy"])?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let explicit = call_prepare(
+        &session,
+        json!({ "python": { "executable": numpy_python } }),
+    )
+    .await?;
+    let explicit_text = common::result_text(&explicit);
+    assert!(
+        explicit_text.contains("session restarted"),
+        "expected explicit Python prepare to restart into numpy venv, got: {explicit_text:?}"
+    );
+
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'kept'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected marker assignment to complete, got: {seed_text:?}"
+    );
+
+    let result = call_prepare(&session, json!({ "requirements": { "restart": "no" } })).await?;
+    let text = common::result_text(&result);
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "restart=no should accept the active Python requirements match: {text:?}"
+    );
+    assert!(
+        text.contains("session unchanged") && text.contains("no user state discarded"),
+        "expected requirements no-op to preserve active Python, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &["numpy"]);
+
+    let probe = session
+        .write_stdin_raw_with(
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('MARKER:' + _prepare_marker)",
+            Some(5.0),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("NUMPY_OK:True") && probe_text.contains("MARKER:kept"),
+        "expected active numpy session to remain unchanged, got: {probe_text:?}"
     );
 
     session.cancel().await?;
