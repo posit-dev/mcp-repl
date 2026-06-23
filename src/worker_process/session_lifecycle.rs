@@ -268,6 +268,19 @@ impl WorkerManager {
         Ok(())
     }
 
+    pub(crate) fn record_worker_launch_for_next_spawn(&mut self, worker_launch: WorkerLaunch) {
+        crate::event_log::log(
+            "worker_record_launch_for_next_spawn",
+            serde_json::json!({
+                "worker_launch": worker_launch.label(),
+            }),
+        );
+        self.worker_launch = worker_launch;
+        self.backend = self.worker_launch.builtin_backend().unwrap_or(self.backend);
+        self.active_python_executable_hint = configured_python_executable_hint(&self.worker_launch);
+        self.driver = new_backend_driver(&self.worker_launch);
+    }
+
     pub(super) fn spawn_worker_after_initial_sandbox_state(&mut self) -> Result<(), WorkerError> {
         match self.oversized_output {
             OversizedOutputMode::Files => self.reset_output_state_files(true),

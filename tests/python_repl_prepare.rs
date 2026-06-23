@@ -201,6 +201,21 @@ fn assert_manifest_packages(text: &str, packages: &[&str]) {
     );
 }
 
+fn assert_manifest_python_version(text: &str, python_version: Option<&str>) {
+    let expected = format!(
+        "python_version={}",
+        serde_json::to_string(&python_version).unwrap()
+    );
+    assert!(
+        text.contains(&expected),
+        "expected manifest {expected}, got: {text:?}"
+    );
+}
+
+fn python_string_literal(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).unwrap()
+}
+
 fn sandbox_cwd_uri(sandbox_cwd: &Path) -> String {
     url::Url::from_file_path(sandbox_cwd)
         .map(|url| url.to_string())
@@ -259,6 +274,30 @@ fn home_sentinel(label: &str) -> TestResult<PathBuf> {
         .ok_or("missing HOME for Python repl_prepare sandbox test")?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(home.join(format!(".mcp-repl-python-prepare-{label}-{nanos}.txt")))
+}
+
+#[cfg(unix)]
+fn create_switching_python(root: &Path, initial_python: &Path) -> TestResult<(PathBuf, PathBuf)> {
+    let target_file = root.join("python-target.txt");
+    fs::write(&target_file, initial_python.to_string_lossy().as_bytes())?;
+    let executable = root.join("python-switch");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ntarget=$(cat {})\nexec \"$target\" \"$@\"\n",
+            target_file.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&executable)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions)?;
+    Ok((executable, target_file))
+}
+
+#[cfg(unix)]
+fn set_switching_python_target(target_file: &Path, python: &Path) -> TestResult<()> {
+    fs::write(target_file, python.to_string_lossy().as_bytes())?;
+    Ok(())
 }
 
 async fn spawn_python_inherit_files_server(
@@ -480,6 +519,60 @@ async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
             "expected {python_version} to produce {expected_version}, got: {probe_text:?}"
         );
     }
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_add_replaces_bare_python_version_request() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
+    let (major, minor, patch) = current_python_version()?;
+    let major_minor = format!("{major}.{minor}");
+    let exact = format!("{major}.{minor}.{patch}");
+
+    let first = call_prepare(
+        &session,
+        json!({
+            "requirements": {
+                "packages": [],
+                "python_version": major_minor,
+                "action": "set"
+            }
+        }),
+    )
+    .await?;
+    let first_text = common::result_text(&first);
+    assert_ne!(
+        first.is_error,
+        Some(true),
+        "initial prepare failed: {first_text:?}"
+    );
+    assert_manifest_packages(&first_text, &[]);
+    assert_manifest_python_version(&first_text, Some(&major_minor));
+
+    let second = call_prepare(
+        &session,
+        json!({
+            "requirements": {
+                "python_version": exact
+            }
+        }),
+    )
+    .await?;
+    let second_text = common::result_text(&second);
+    assert_ne!(
+        second.is_error,
+        Some(true),
+        "adding a bare Python version should replace the prior version request: {second_text:?}"
+    );
+    assert_manifest_packages(&second_text, &[]);
+    assert_manifest_python_version(&second_text, Some(&exact));
+    assert!(
+        !second_text.contains(&format!("{major_minor},{exact}")),
+        "bare Python version requests must not be concatenated: {second_text:?}"
+    );
+
     session.cancel().await?;
     Ok(())
 }
@@ -925,6 +1018,77 @@ async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResu
     assert!(
         probe_text.contains("PACKAGING_OK:True"),
         "expected prepared worker to run under inherited metadata, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_requirement_noop_persists_target_after_ctrl_d_reset() -> TestResult<()> {
+    let _uv_guard = real_uv_test_mutex().lock().await;
+    ensure_uv_available()?;
+    let tempdir = tempfile::tempdir()?;
+    let first_venv = create_venv(tempdir.path(), "first")?;
+    let second_venv = create_venv(tempdir.path(), "second")?;
+    install_packages(&venv_python(&first_venv), &["numpy"])?;
+    let (switching_python, target_file) =
+        create_switching_python(tempdir.path(), &venv_python(&first_venv))?;
+
+    let session = common::spawn_python_server_with_files_env_vars(vec![(
+        "MCP_REPL_PYTHON_EXECUTABLE".to_string(),
+        switching_python.to_string_lossy().to_string(),
+    )])
+    .await?;
+    let prefix_probe = session
+        .write_stdin_raw_with(
+            format!(
+                "import sys, numpy\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+                python_string_literal(&first_venv)
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let prefix_probe_text = common::result_text(&prefix_probe);
+    assert!(
+        prefix_probe_text.contains("PREFIX_IS_FIRST:True")
+            && prefix_probe_text.contains("NUMPY_OK:True"),
+        "expected initial worker to run the first venv, got: {prefix_probe_text:?}"
+    );
+
+    let prepare = call_prepare(&session, json!({ "requirements": {} })).await?;
+    let prepare_text = common::result_text(&prepare);
+    assert!(
+        prepare_text.contains("session unchanged"),
+        "expected matching requirements prepare to preserve the session, got: {prepare_text:?}"
+    );
+    assert_manifest_packages(&prepare_text, &["numpy"]);
+
+    set_switching_python_target(&target_file, &venv_python(&second_venv))?;
+    let reset = session.write_stdin_raw_with("\u{4}", Some(5.0)).await?;
+    let reset_text = common::result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected Ctrl-D to restart the worker, got: {reset_text:?}"
+    );
+
+    let respawn_probe = session
+        .write_stdin_raw_with(
+            format!(
+                "import sys, numpy\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('PREFIX_IS_SECOND:' + str(sys.prefix == {}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+                python_string_literal(&first_venv),
+                python_string_literal(&second_venv)
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let respawn_probe_text = common::result_text(&respawn_probe);
+    assert!(
+        respawn_probe_text.contains("PREFIX_IS_FIRST:True")
+            && respawn_probe_text.contains("PREFIX_IS_SECOND:False")
+            && respawn_probe_text.contains("NUMPY_OK:True"),
+        "expected respawn to keep the prepared requirements target, got: {respawn_probe_text:?}"
     );
 
     session.cancel().await?;
@@ -1461,6 +1625,77 @@ async fn repl_prepare_preserves_auto_selected_matching_executable_session() -> T
     assert!(
         probe_text.contains("MARKER:kept"),
         "expected matching prepare to preserve session, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_matching_executable_persists_target_after_ctrl_d_reset() -> TestResult<()> {
+    let _uv_guard = real_uv_test_mutex().lock().await;
+    ensure_uv_available()?;
+    let tempdir = tempfile::tempdir()?;
+    let first_venv = create_venv(tempdir.path(), "first")?;
+    let second_venv = create_venv(tempdir.path(), "second")?;
+    let (switching_python, target_file) =
+        create_switching_python(tempdir.path(), &venv_python(&first_venv))?;
+
+    let session = common::spawn_python_server_with_files_env_vars(vec![(
+        "MCP_REPL_PYTHON_EXECUTABLE".to_string(),
+        switching_python.to_string_lossy().to_string(),
+    )])
+    .await?;
+    let prefix_probe = session
+        .write_stdin_raw_with(
+            format!(
+                "import sys; print('PREFIX_IS_FIRST:' + str(sys.prefix == {}))",
+                python_string_literal(&first_venv)
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let prefix_probe_text = common::result_text(&prefix_probe);
+    assert!(
+        prefix_probe_text.contains("PREFIX_IS_FIRST:True"),
+        "expected initial worker to run the first venv, got: {prefix_probe_text:?}"
+    );
+
+    let prepare = call_prepare(
+        &session,
+        json!({ "python": { "executable": venv_python(&first_venv) } }),
+    )
+    .await?;
+    let prepare_text = common::result_text(&prepare);
+    assert!(
+        prepare_text.contains("session unchanged"),
+        "expected matching executable prepare to preserve the session, got: {prepare_text:?}"
+    );
+
+    set_switching_python_target(&target_file, &venv_python(&second_venv))?;
+    let reset = session.write_stdin_raw_with("\u{4}", Some(5.0)).await?;
+    let reset_text = common::result_text(&reset);
+    assert!(
+        reset_text.contains("new session started"),
+        "expected Ctrl-D to restart the worker, got: {reset_text:?}"
+    );
+
+    let respawn_probe = session
+        .write_stdin_raw_with(
+            format!(
+                "import sys\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('PREFIX_IS_SECOND:' + str(sys.prefix == {}))",
+                python_string_literal(&first_venv),
+                python_string_literal(&second_venv)
+            ),
+            Some(5.0),
+        )
+        .await?;
+    let respawn_probe_text = common::result_text(&respawn_probe);
+    assert!(
+        respawn_probe_text.contains("PREFIX_IS_FIRST:True")
+            && respawn_probe_text.contains("PREFIX_IS_SECOND:False"),
+        "expected respawn to keep the prepared explicit Python target, got: {respawn_probe_text:?}"
     );
 
     session.cancel().await?;

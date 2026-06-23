@@ -186,8 +186,21 @@ fn add_python_version_constraint(current: Option<String>, requested: &str) -> Op
     match current {
         None => Some(requested.to_string()),
         Some(current) if current == requested => Some(current),
+        Some(current) if is_bare_python_version(&current) || is_bare_python_version(requested) => {
+            Some(requested.to_string())
+        }
         Some(current) => Some(format!("{current},{requested}")),
     }
+}
+
+fn is_bare_python_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    !first.is_empty()
+        && first.bytes().all(|byte| byte.is_ascii_digit())
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 pub(crate) fn resolve_requirements_manifest(

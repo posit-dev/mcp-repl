@@ -596,6 +596,12 @@ impl SharedServer {
         }
 
         if !restart_required {
+            state
+                .worker
+                .record_worker_launch_for_next_spawn(WorkerLaunch::PythonExecutable {
+                    executable: target.executable,
+                    module_search_paths: target.module_search_paths,
+                });
             state.python_requirements_manifest = candidate_manifest;
             return Self::prepare_python_success_reply(
                 "session unchanged",
@@ -673,6 +679,12 @@ impl SharedServer {
             .worker
             .python_executable_hint_matches(&target.executable);
         if active_matches {
+            state
+                .worker
+                .record_worker_launch_for_next_spawn(WorkerLaunch::PythonExecutable {
+                    executable: target.executable,
+                    module_search_paths: target.module_search_paths,
+                });
             return Self::prepare_python_success_reply(
                 "session unchanged",
                 "no user state discarded",
