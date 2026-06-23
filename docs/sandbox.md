@@ -17,10 +17,11 @@ it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
 requested but no client sandbox state was provided`.
 
 Current Codex builds send this metadata as a `permissionProfile` plus a
-`sandboxCwd` file URI. `mcp-repl` translates the supported managed profile
-shapes into its local `read-only`, `workspace-write`, `external-sandbox`, or
-`danger-full-access` policies, and rejects narrower direct filesystem profiles
-that cannot be represented faithfully.
+`sandboxCwd` file URI. `mcp-repl` treats `permissionProfile` as the canonical
+sandbox shape and keeps the older local sandbox modes as CLI/config adapters
+that compile into permission profiles. Legacy `sandboxPolicy` metadata is still
+accepted as a minimal compatibility input and is immediately converted into a
+permission profile.
 
 `--debug-repl` is the one local-only exception. Because there is no MCP client
 metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
@@ -146,24 +147,39 @@ mcp-repl --sandbox workspace-write \
 
 ## Linux behavior
 
-Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock.
+Sandboxing is enforced by an internal Linux sandbox helper. The helper accepts
+`--permission-profile`, prefers a bubblewrap outer sandbox, and applies the
+restricted-network seccomp filter in the final worker process. Legacy Landlock
+filesystem enforcement remains as a fallback for hosts where bubblewrap cannot
+start.
 
 - `workspace-write` always includes the per-session temp directory in writable roots.
 - `read-only` is translated to a minimal writable setup for the session temp directory only.
 - default Linux worker setup disables network unless explicitly enabled.
 - managed domain allowlists are not enforced on Linux yet; configuring allowed
   or denied domains with enabled network access currently fails closed.
-- `mcp-repl` always uses its own internal Linux sandbox launcher; helper
-  executable paths provided by an MCP client are ignored.
-- Codex sandbox metadata does not control `mcp-repl`'s optional internal
-  `bwrap` stage. That remains a local best-effort setting.
+- `codexLinuxSandboxExe` metadata is accepted for compatibility, but
+  `mcp-repl` re-executes its own internal `codex-linux-sandbox`-compatible
+  helper so fallback behavior stays under server control.
+- `useLegacyLandlock=true` metadata requests the legacy Landlock path.
+  `useLegacyLandlock=false` does not force bubblewrap on; the local host
+  default and `MCP_REPL_USE_LINUX_BWRAP` still decide whether bubblewrap is
+  attempted.
+- restricted-read filesystem profiles require the bubblewrap backend for exact
+  read enforcement. Legacy Landlock fallback still enforces the writable roots,
+  but it broadens reads to host-readable paths because Landlock is write-focused
+  in this compatibility path.
 
-Optional `bwrap` stage:
+Bubblewrap defaults and overrides:
 
-- `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
+- when `MCP_REPL_USE_LINUX_BWRAP` is unset, Linux defaults to bubblewrap when
+  `bwrap` is available and `mcp-repl` is not itself already running inside a
+  restricted parent sandbox environment.
+- `MCP_REPL_USE_LINUX_BWRAP=1` forces a bubblewrap attempt.
+- `MCP_REPL_USE_LINUX_BWRAP=0` uses the legacy Landlock path.
 - `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
-- if `bwrap` is requested but worker startup dies before backend info arrives,
-  `mcp-repl` retries once without `bwrap` and continues.
+- if `bwrap` is attempted but worker startup dies before backend info arrives,
+  `mcp-repl` retries once with legacy Landlock and emits a fallback notice.
 
 ## Windows behavior (experimental)
 

@@ -130,9 +130,12 @@ impl WorkerManager {
 
         self.linux_bwrap_fallback_disabled = true;
         self.sandbox_state.use_linux_sandbox_bwrap = false;
+        self.sandbox_state.use_legacy_landlock = true;
         self.sandbox_defaults.use_linux_sandbox_bwrap = false;
+        self.sandbox_defaults.use_legacy_landlock = true;
         if let Some(inherited_state) = self.inherited_sandbox_state.as_mut() {
             inherited_state.use_linux_sandbox_bwrap = false;
+            inherited_state.use_legacy_landlock = true;
         }
 
         match self.oversized_output {
@@ -243,8 +246,6 @@ mod tests {
     use crate::sandbox_cli::resolve_effective_sandbox_state_with_defaults;
     #[cfg(target_os = "linux")]
     use crate::worker_process::test_support::contents_text;
-    #[cfg(target_os = "linux")]
-    use std::time::Duration;
 
     #[test]
     fn python_backend_prepares_windows_sandbox_launch() {
@@ -324,6 +325,7 @@ mod tests {
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             },
+            permission_profile: None,
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: Some(true),
             use_legacy_landlock: None,
@@ -394,7 +396,7 @@ mod tests {
         }))
         .expect("Codex sandbox metadata");
         manager
-            .update_sandbox_state(update, Duration::from_millis(1))
+            .stage_sandbox_state_update(update)
             .expect("follow-up sandbox state");
 
         assert!(
@@ -429,6 +431,7 @@ mod tests {
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             },
+            permission_profile: None,
             sandbox_cwd: Some(std::env::temp_dir()),
             use_linux_sandbox_bwrap: None,
             use_legacy_landlock: None,
@@ -499,7 +502,7 @@ mod tests {
         }))
         .expect("Codex sandbox metadata");
         manager
-            .update_sandbox_state(update, Duration::from_millis(1))
+            .stage_sandbox_state_update(update)
             .expect("follow-up sandbox state");
 
         assert!(

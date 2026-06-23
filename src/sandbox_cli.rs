@@ -231,9 +231,8 @@ pub fn resolve_effective_sandbox_state_with_defaults(
                 apply_mode(&mut state, *mode, inherited, defaults)?
             }
             SandboxCliOperation::AddWritableRoot(path) => {
-                let SandboxPolicy::WorkspaceWrite { writable_roots, .. } =
-                    &mut state.sandbox_policy
-                else {
+                let mut policy = state.sandbox_policy.clone();
+                let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &mut policy else {
                     return Err(
                         "--add-writable-root can only be used while sandbox mode is workspace-write"
                             .to_string(),
@@ -242,6 +241,7 @@ pub fn resolve_effective_sandbox_state_with_defaults(
                 if !writable_roots.iter().any(|root| root == path) {
                     writable_roots.push(path.clone());
                 }
+                state.set_sandbox_policy(policy);
             }
             SandboxCliOperation::AddAllowedDomain(domain) => {
                 let domain = domain.trim();
@@ -383,22 +383,22 @@ fn apply_mode(
         }
         SandboxModeArg::ReadOnly => {
             *state = defaults.clone();
-            state.sandbox_policy = SandboxPolicy::ReadOnly {
+            state.set_sandbox_policy(SandboxPolicy::ReadOnly {
                 network_access: false,
-            };
+            });
         }
         SandboxModeArg::WorkspaceWrite => {
             *state = defaults.clone();
-            state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            state.set_sandbox_policy(SandboxPolicy::WorkspaceWrite {
                 writable_roots: Vec::new(),
                 network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
-            };
+            });
         }
         SandboxModeArg::DangerFullAccess => {
             *state = defaults.clone();
-            state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+            state.set_sandbox_policy(SandboxPolicy::DangerFullAccess);
         }
     }
     Ok(())
@@ -413,10 +413,11 @@ fn apply_config_op(
     match op {
         SandboxConfigOperation::SetMode(mode) => apply_mode(state, *mode, inherited, defaults),
         SandboxConfigOperation::SetWorkspaceNetworkAccess(network_access) => {
+            let mut policy = state.sandbox_policy.clone();
             let SandboxPolicy::WorkspaceWrite {
                 network_access: current,
                 ..
-            } = &mut state.sandbox_policy
+            } = &mut policy
             else {
                 return Err(
                     "sandbox_workspace_write.network_access requires workspace-write mode"
@@ -424,13 +425,15 @@ fn apply_config_op(
                 );
             };
             *current = *network_access;
+            state.set_sandbox_policy(policy);
             Ok(())
         }
         SandboxConfigOperation::SetWorkspaceWritableRoots(roots) => {
+            let mut policy = state.sandbox_policy.clone();
             let SandboxPolicy::WorkspaceWrite {
                 writable_roots: current,
                 ..
-            } = &mut state.sandbox_policy
+            } = &mut policy
             else {
                 return Err(
                     "sandbox_workspace_write.writable_roots requires workspace-write mode"
@@ -438,13 +441,15 @@ fn apply_config_op(
                 );
             };
             *current = roots.clone();
+            state.set_sandbox_policy(policy);
             Ok(())
         }
         SandboxConfigOperation::SetWorkspaceExcludeTmpdirEnvVar(value) => {
+            let mut policy = state.sandbox_policy.clone();
             let SandboxPolicy::WorkspaceWrite {
                 exclude_tmpdir_env_var,
                 ..
-            } = &mut state.sandbox_policy
+            } = &mut policy
             else {
                 return Err(
                     "sandbox_workspace_write.exclude_tmpdir_env_var requires workspace-write mode"
@@ -452,12 +457,14 @@ fn apply_config_op(
                 );
             };
             *exclude_tmpdir_env_var = *value;
+            state.set_sandbox_policy(policy);
             Ok(())
         }
         SandboxConfigOperation::SetWorkspaceExcludeSlashTmp(value) => {
+            let mut policy = state.sandbox_policy.clone();
             let SandboxPolicy::WorkspaceWrite {
                 exclude_slash_tmp, ..
-            } = &mut state.sandbox_policy
+            } = &mut policy
             else {
                 return Err(
                     "sandbox_workspace_write.exclude_slash_tmp requires workspace-write mode"
@@ -465,6 +472,7 @@ fn apply_config_op(
                 );
             };
             *exclude_slash_tmp = *value;
+            state.set_sandbox_policy(policy);
             Ok(())
         }
         SandboxConfigOperation::SetAllowedDomains(values) => {
@@ -481,6 +489,7 @@ fn apply_config_op(
         }
         SandboxConfigOperation::SetUseLinuxSandboxBwrap(value) => {
             state.use_linux_sandbox_bwrap = *value;
+            state.use_legacy_landlock = !*value;
             Ok(())
         }
     }

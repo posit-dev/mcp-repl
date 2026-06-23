@@ -598,6 +598,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly {
                     network_access: false,
                 },
+                permission_profile: None,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -639,6 +640,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly {
                     network_access: false,
                 },
+                permission_profile: None,
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -687,6 +689,7 @@ mod tests {
                 sandbox_policy: SandboxPolicy::ReadOnly {
                     network_access: false,
                 },
+                permission_profile: None,
                 sandbox_cwd: Some(sandbox_cwd.clone()),
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -711,6 +714,7 @@ mod tests {
                         exclude_tmpdir_env_var: false,
                         exclude_slash_tmp: false,
                     },
+                    permission_profile: None,
                     sandbox_cwd: Some(sandbox_cwd.clone()),
                     use_linux_sandbox_bwrap: None,
                     use_legacy_landlock: None,

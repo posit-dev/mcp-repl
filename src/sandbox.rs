@@ -16,6 +16,12 @@ use url::Url;
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
+mod codex_policy;
+pub use codex_policy::{
+    FileSystemSandboxPolicy, NetworkSandboxPolicy, PermissionProfile,
+    normalize_permission_profile_paths,
+};
+
 pub const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_REPL_ALLOWED_DOMAINS";
 pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_REPL_DENIED_DOMAINS";
@@ -128,7 +134,7 @@ pub struct WritableRoot {
 }
 
 impl SandboxPolicy {
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     pub fn has_full_disk_write_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
@@ -221,7 +227,7 @@ impl SandboxPolicy {
     }
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
@@ -234,6 +240,7 @@ fn env_var_truthy(key: &str) -> bool {
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -313,35 +320,7 @@ fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
     subpaths
 }
 
-#[cfg(target_os = "linux")]
-fn compute_linux_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
-    let mut subpaths = Vec::new();
-
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() || dot_git.is_file() {
-        if dot_git.is_file()
-            && let Some(gitdir) = resolve_gitdir_from_file(&dot_git)
-            && !subpaths.iter().any(|path| path == &gitdir)
-        {
-            subpaths.push(gitdir);
-        }
-        subpaths.push(dot_git);
-    }
-
-    let dot_codex = root.join(".codex");
-    if dot_codex.is_dir() {
-        subpaths.push(dot_codex);
-    }
-
-    let dot_agents = root.join(".agents");
-    if dot_agents.is_dir() {
-        subpaths.push(dot_agents);
-    }
-
-    subpaths
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn resolve_gitdir_from_file(dot_git: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(dot_git).ok()?;
     let trimmed = contents.trim();
@@ -366,8 +345,10 @@ fn resolve_gitdir_from_file(dot_git: &Path) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxState {
     pub sandbox_policy: SandboxPolicy,
+    pub permission_profile: PermissionProfile,
     pub sandbox_cwd: PathBuf,
     pub use_linux_sandbox_bwrap: bool,
+    pub use_legacy_landlock: bool,
     pub managed_network_policy: ManagedNetworkPolicy,
     pub session_temp_dir: PathBuf,
 }
@@ -430,6 +411,8 @@ pub fn log_sandbox_state_meta(meta: &serde_json::Value) {
 pub struct SandboxStateUpdate {
     pub sandbox_policy: SandboxPolicy,
     #[serde(default)]
+    pub permission_profile: Option<PermissionProfile>,
+    #[serde(default)]
     pub sandbox_cwd: Option<PathBuf>,
     #[serde(default)]
     pub use_linux_sandbox_bwrap: Option<bool>,
@@ -443,77 +426,13 @@ struct CodexSandboxStateMeta {
     #[serde(default)]
     sandbox_policy: Option<SandboxPolicy>,
     #[serde(default)]
-    permission_profile: Option<CodexPermissionProfile>,
+    permission_profile: Option<PermissionProfile>,
     #[serde(default)]
-    codex_linux_sandbox_exe: Option<serde_json::Value>,
+    codex_linux_sandbox_exe: Option<PathBuf>,
     sandbox_cwd: String,
     #[serde(default)]
     use_legacy_landlock: bool,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum CodexPermissionProfile {
-    Managed {
-        file_system: CodexManagedFileSystemPermissions,
-        network: NetworkAccess,
-    },
-    Disabled,
-    External {
-        network: NetworkAccess,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum CodexManagedFileSystemPermissions {
-    Restricted {
-        #[serde(default)]
-        entries: Vec<CodexFileSystemSandboxEntry>,
-        #[serde(default)]
-        glob_scan_max_depth: Option<usize>,
-    },
-    Unrestricted,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CodexFileSystemSandboxEntry {
-    path: CodexFileSystemPath,
-    access: CodexFileSystemAccessMode,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum CodexFileSystemAccessMode {
-    Read,
-    Write,
-    #[serde(alias = "none")]
-    Deny,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum CodexFileSystemPath {
-    Path { path: String },
-    GlobPattern { pattern: String },
-    Special { value: CodexFileSystemSpecialPath },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum CodexFileSystemSpecialPath {
-    Root,
-    Minimal,
-    ProjectRoots {
-        #[serde(default)]
-        subpath: Option<PathBuf>,
-    },
-    Tmpdir,
-    SlashTmp,
-}
-
-const CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR: &str =
-    "Codex permissionProfile full write access with restricted network access is not supported";
 
 pub fn sandbox_state_update_from_codex_meta(
     meta: &serde_json::Value,
@@ -522,10 +441,19 @@ pub fn sandbox_state_update_from_codex_meta(
         .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?;
     let sandbox_cwd = parse_codex_path_uri(&parsed.sandbox_cwd, "sandboxCwd")?;
 
-    let sandbox_policy = match (parsed.sandbox_policy, parsed.permission_profile) {
-        (Some(policy), _) => validate_codex_sandbox_policy(policy)?,
+    let (sandbox_policy, permission_profile) = match (
+        parsed.sandbox_policy,
+        parsed.permission_profile,
+    ) {
+        (Some(policy), _) => {
+            let policy = validate_codex_sandbox_policy(policy)?;
+            let profile = PermissionProfile::from_legacy_sandbox_policy(&policy, &sandbox_cwd);
+            (policy, Some(profile))
+        }
         (None, Some(permission_profile)) => {
-            sandbox_policy_from_codex_permission_profile(permission_profile, &sandbox_cwd)?
+            let permission_profile = normalize_permission_profile_paths(permission_profile)?;
+            let sandbox_policy = permission_profile.to_legacy_sandbox_policy(&sandbox_cwd);
+            (sandbox_policy, Some(permission_profile))
         }
         (None, None) => {
             return Err("failed to parse Codex sandbox state metadata: missing field `sandboxPolicy` or `permissionProfile`"
@@ -533,15 +461,13 @@ pub fn sandbox_state_update_from_codex_meta(
         }
     };
     let _ = parsed.codex_linux_sandbox_exe;
-    let _ = parsed.use_legacy_landlock;
 
     Ok(SandboxStateUpdate {
         sandbox_policy,
+        permission_profile,
         sandbox_cwd: Some(sandbox_cwd),
-        // Codex reports how its own Linux helper is configured, but mcp-repl's
-        // optional bwrap stage is a separate local best-effort knob.
-        use_linux_sandbox_bwrap: None,
-        use_legacy_landlock: None,
+        use_linux_sandbox_bwrap: parsed.use_legacy_landlock.then_some(false),
+        use_legacy_landlock: parsed.use_legacy_landlock.then_some(true),
     })
 }
 
@@ -592,301 +518,6 @@ fn validate_codex_sandbox_policy(policy: SandboxPolicy) -> Result<SandboxPolicy,
     Ok(policy)
 }
 
-fn sandbox_policy_from_codex_permission_profile(
-    permission_profile: CodexPermissionProfile,
-    sandbox_cwd: &Path,
-) -> Result<SandboxPolicy, String> {
-    match permission_profile {
-        CodexPermissionProfile::Disabled => Ok(SandboxPolicy::DangerFullAccess),
-        CodexPermissionProfile::External { network } => Ok(SandboxPolicy::ExternalSandbox {
-            network_access: network,
-        }),
-        CodexPermissionProfile::Managed {
-            file_system,
-            network,
-        } => sandbox_policy_from_codex_managed_profile(file_system, network, sandbox_cwd),
-    }
-}
-
-fn sandbox_policy_from_codex_managed_profile(
-    file_system: CodexManagedFileSystemPermissions,
-    network: NetworkAccess,
-    sandbox_cwd: &Path,
-) -> Result<SandboxPolicy, String> {
-    let network_access = network.is_enabled();
-    match file_system {
-        CodexManagedFileSystemPermissions::Unrestricted => {
-            if network_access {
-                Ok(SandboxPolicy::DangerFullAccess)
-            } else {
-                Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string())
-            }
-        }
-        CodexManagedFileSystemPermissions::Restricted {
-            entries,
-            glob_scan_max_depth,
-        } => {
-            if glob_scan_max_depth.is_some() {
-                return Err(
-                    "Codex permissionProfile.file_system.glob_scan_max_depth is not supported"
-                        .to_string(),
-                );
-            }
-            sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct RestrictedProfileProjection {
-    root_read: bool,
-    root_write: bool,
-    workspace_root_writable: bool,
-    writable_roots: Vec<PathBuf>,
-    tmpdir_writable: bool,
-    slash_tmp_writable: bool,
-    read_entries: Vec<CodexFileSystemPath>,
-}
-
-fn sandbox_policy_from_codex_restricted_entries(
-    entries: Vec<CodexFileSystemSandboxEntry>,
-    network_access: bool,
-    sandbox_cwd: &Path,
-) -> Result<SandboxPolicy, String> {
-    let mut projection = RestrictedProfileProjection::default();
-
-    for entry in entries {
-        match entry.access {
-            CodexFileSystemAccessMode::Deny => {
-                return Err(
-                    "Codex permissionProfile.file_system deny entries are not supported"
-                        .to_string(),
-                );
-            }
-            CodexFileSystemAccessMode::Read => {
-                if matches!(
-                    &entry.path,
-                    CodexFileSystemPath::Special {
-                        value: CodexFileSystemSpecialPath::Root
-                    }
-                ) {
-                    projection.root_read = true;
-                }
-                projection.read_entries.push(entry.path);
-            }
-            CodexFileSystemAccessMode::Write => {
-                project_codex_write_entry(entry.path, sandbox_cwd, &mut projection)?
-            }
-        }
-    }
-
-    if projection.root_write {
-        validate_root_write_projection(&projection)?;
-        if !network_access {
-            return Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string());
-        }
-        return Ok(SandboxPolicy::DangerFullAccess);
-    }
-
-    projection.writable_roots.sort();
-    projection.writable_roots.dedup();
-
-    if projection.workspace_root_writable {
-        validate_workspace_write_read_entries(&projection, sandbox_cwd)?;
-        return Ok(SandboxPolicy::WorkspaceWrite {
-            writable_roots: projection.writable_roots,
-            network_access,
-            exclude_tmpdir_env_var: !projection.tmpdir_writable,
-            exclude_slash_tmp: !projection.slash_tmp_writable,
-        });
-    }
-
-    if !projection.writable_roots.is_empty()
-        || projection.tmpdir_writable
-        || projection.slash_tmp_writable
-    {
-        return Err(
-            "Codex permissionProfile requests writes outside the workspace root, which mcp-repl cannot represent"
-                .to_string(),
-        );
-    }
-
-    if !projection.root_read {
-        return Err(
-            "Codex permissionProfile read-only policy without root read access is not supported"
-                .to_string(),
-        );
-    }
-
-    Ok(SandboxPolicy::ReadOnly { network_access })
-}
-
-fn project_codex_write_entry(
-    path: CodexFileSystemPath,
-    sandbox_cwd: &Path,
-    projection: &mut RestrictedProfileProjection,
-) -> Result<(), String> {
-    match path {
-        CodexFileSystemPath::Path { path } => {
-            let path = parse_codex_path_uri(&path, "permissionProfile.file_system.entries.path")?;
-            if path == sandbox_cwd {
-                projection.workspace_root_writable = true;
-            } else {
-                projection.writable_roots.push(path);
-            }
-        }
-        CodexFileSystemPath::Special { value } => match value {
-            CodexFileSystemSpecialPath::Root => {
-                projection.root_write = true;
-            }
-            CodexFileSystemSpecialPath::ProjectRoots { subpath: None } => {
-                projection.workspace_root_writable = true;
-            }
-            CodexFileSystemSpecialPath::ProjectRoots {
-                subpath: Some(subpath),
-            } => {
-                projection
-                    .writable_roots
-                    .push(resolve_codex_project_root_subpath(sandbox_cwd, &subpath));
-            }
-            CodexFileSystemSpecialPath::Tmpdir => {
-                projection.tmpdir_writable = true;
-            }
-            CodexFileSystemSpecialPath::SlashTmp => {
-                projection.slash_tmp_writable = true;
-            }
-            CodexFileSystemSpecialPath::Minimal => {
-                return Err(
-                    "Codex permissionProfile.file_system minimal write access is not supported"
-                        .to_string(),
-                );
-            }
-        },
-        CodexFileSystemPath::GlobPattern { pattern } => {
-            let _ = pattern;
-            return Err(
-                "Codex permissionProfile.file_system glob pattern writes are not supported"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn resolve_codex_project_root_subpath(sandbox_cwd: &Path, subpath: &Path) -> PathBuf {
-    if subpath.is_absolute() {
-        subpath.to_path_buf()
-    } else {
-        sandbox_cwd.join(subpath)
-    }
-}
-
-fn validate_root_write_projection(projection: &RestrictedProfileProjection) -> Result<(), String> {
-    for read_entry in &projection.read_entries {
-        if !matches!(
-            read_entry,
-            CodexFileSystemPath::Special {
-                value: CodexFileSystemSpecialPath::Root
-            }
-        ) {
-            return Err(
-                "Codex permissionProfile root write policy with read carveouts is not supported"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn validate_workspace_write_read_entries(
-    projection: &RestrictedProfileProjection,
-    sandbox_cwd: &Path,
-) -> Result<(), String> {
-    for read_entry in &projection.read_entries {
-        if workspace_write_read_entry_is_representable(
-            read_entry,
-            sandbox_cwd,
-            &projection.writable_roots,
-            projection.root_read,
-        )? {
-            continue;
-        }
-        return Err(
-            "Codex permissionProfile.file_system read entry cannot be represented by mcp-repl workspace-write"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn workspace_write_read_entry_is_representable(
-    read_entry: &CodexFileSystemPath,
-    sandbox_cwd: &Path,
-    writable_roots: &[PathBuf],
-    root_read: bool,
-) -> Result<bool, String> {
-    match read_entry {
-        CodexFileSystemPath::Special {
-            value: CodexFileSystemSpecialPath::Root,
-        } => Ok(true),
-        CodexFileSystemPath::Special {
-            value: CodexFileSystemSpecialPath::ProjectRoots { subpath },
-        } => Ok(subpath
-            .as_ref()
-            .is_some_and(|subpath| is_protected_metadata_subpath(subpath))),
-        CodexFileSystemPath::Special {
-            value:
-                CodexFileSystemSpecialPath::Tmpdir
-                | CodexFileSystemSpecialPath::SlashTmp
-                | CodexFileSystemSpecialPath::Minimal,
-        } => Ok(root_read),
-        CodexFileSystemPath::Path { path } => {
-            let path = parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?;
-            if is_protected_metadata_path_under_roots(&path, sandbox_cwd, writable_roots) {
-                return Ok(true);
-            }
-            Ok(root_read && !is_under_any_root(&path, sandbox_cwd, writable_roots))
-        }
-        CodexFileSystemPath::GlobPattern { pattern } => {
-            let _ = pattern;
-            Ok(false)
-        }
-    }
-}
-
-fn is_protected_metadata_path_under_roots(
-    path: &Path,
-    sandbox_cwd: &Path,
-    writable_roots: &[PathBuf],
-) -> bool {
-    is_protected_metadata_path_under_root(path, sandbox_cwd)
-        || writable_roots
-            .iter()
-            .any(|root| is_protected_metadata_path_under_root(path, root))
-}
-
-fn is_protected_metadata_path_under_root(path: &Path, root: &Path) -> bool {
-    let Ok(suffix) = path.strip_prefix(root) else {
-        return false;
-    };
-    is_protected_metadata_subpath(suffix)
-}
-
-fn is_under_any_root(path: &Path, sandbox_cwd: &Path, writable_roots: &[PathBuf]) -> bool {
-    path.starts_with(sandbox_cwd) || writable_roots.iter().any(|root| path.starts_with(root))
-}
-
-fn is_protected_metadata_subpath(path: &Path) -> bool {
-    let mut components = path.components();
-    let Some(first) = components.next() else {
-        return false;
-    };
-    matches!(
-        first.as_os_str().to_str(),
-        Some(".git" | ".agents" | ".codex")
-    )
-}
-
 impl SandboxState {
     pub fn apply_update(&mut self, update: SandboxStateUpdate) -> bool {
         let mut next = self.clone();
@@ -894,14 +525,25 @@ impl SandboxState {
         if let Some(cwd) = update.sandbox_cwd {
             next.sandbox_cwd = cwd;
         }
+        next.permission_profile = update.permission_profile.unwrap_or_else(|| {
+            PermissionProfile::from_legacy_sandbox_policy(&next.sandbox_policy, &next.sandbox_cwd)
+        });
         if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
             next.use_linux_sandbox_bwrap = use_bwrap;
-        } else if let Some(use_legacy_landlock) = update.use_legacy_landlock {
-            next.use_linux_sandbox_bwrap = !use_legacy_landlock;
+            next.use_legacy_landlock = !use_bwrap;
+        } else if update.use_legacy_landlock == Some(true) {
+            next.use_linux_sandbox_bwrap = false;
+            next.use_legacy_landlock = true;
         }
         let changed = next != *self;
         *self = next;
         changed
+    }
+
+    pub fn set_sandbox_policy(&mut self, policy: SandboxPolicy) {
+        self.sandbox_policy = policy;
+        self.permission_profile =
+            PermissionProfile::from_legacy_sandbox_policy(&self.sandbox_policy, &self.sandbox_cwd);
     }
 }
 
@@ -916,8 +558,10 @@ impl Default for SandboxState {
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             },
+            permission_profile: PermissionProfile::workspace_write(),
             sandbox_cwd,
-            use_linux_sandbox_bwrap: false,
+            use_linux_sandbox_bwrap: cfg!(target_os = "linux"),
+            use_legacy_landlock: false,
             managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
         }
@@ -1001,7 +645,7 @@ pub fn prepare_worker_command_with_managed_network(
     managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
 ) -> Result<PreparedCommand, SandboxError> {
     let mut env = HashMap::new();
-    if !state.sandbox_policy.has_full_network_access() {
+    if !state.permission_profile.has_full_network_access() {
         env.insert(
             CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
             "1".to_string(),
@@ -1058,7 +702,19 @@ pub fn prepare_worker_command_with_managed_network(
     #[cfg(target_family = "unix")]
     configure_embedded_r_runtime_env(&mut env);
 
+    #[cfg(not(target_os = "linux"))]
     if !state.sandbox_policy.requires_sandbox() {
+        return Ok(PreparedCommand {
+            program: program.to_path_buf(),
+            args,
+            env,
+            arg0: None,
+            #[cfg(target_os = "macos")]
+            denial_logger: None,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    if !state.permission_profile.requires_managed_sandbox() {
         return Ok(PreparedCommand {
             program: program.to_path_buf(),
             args,
@@ -1117,43 +773,16 @@ pub fn prepare_worker_command_with_managed_network(
 
     #[cfg(target_os = "linux")]
     {
-        let mut policy = state.sandbox_policy.clone();
-        let mut policy_cwd = state.sandbox_cwd.clone();
-        match &mut policy {
-            SandboxPolicy::ReadOnly { network_access } => {
-                let temp_root = state.session_temp_dir.clone();
-                policy = SandboxPolicy::WorkspaceWrite {
-                    writable_roots: vec![temp_root.clone()],
-                    network_access: *network_access,
-                    exclude_tmpdir_env_var: true,
-                    exclude_slash_tmp: true,
-                };
-                policy_cwd = temp_root;
-            }
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-                network_access: _,
-            } => {
-                if !writable_roots
-                    .iter()
-                    .any(|root| root == &state.session_temp_dir)
-                {
-                    writable_roots.push(state.session_temp_dir.clone());
-                }
-                *exclude_tmpdir_env_var = true;
-                *exclude_slash_tmp = true;
-            }
-            _ => {}
-        }
-        let policy = sanitize_linux_sandbox_policy(&policy);
+        let permission_profile = state
+            .permission_profile
+            .clone()
+            .with_additional_writable_root(state.session_temp_dir.clone());
         let command = build_command_vec(program, &args);
         let sandbox_args = create_linux_sandbox_command_args(
             command,
-            &policy,
-            &policy_cwd,
-            state.use_linux_sandbox_bwrap,
+            &permission_profile,
+            &state.sandbox_cwd,
+            state.use_legacy_landlock || !state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
         let sandbox_program =
@@ -1204,23 +833,22 @@ fn build_command_vec(program: &Path, args: &[String]) -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn create_linux_sandbox_command_args(
     command: Vec<String>,
-    sandbox_policy: &SandboxPolicy,
+    permission_profile: &PermissionProfile,
     sandbox_policy_cwd: &Path,
-    use_bwrap_sandbox: bool,
+    use_legacy_landlock: bool,
     no_proc: bool,
 ) -> Vec<String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
-    let sanitized_policy = sanitize_linux_sandbox_policy(sandbox_policy);
-    let sandbox_policy_json =
-        serde_json::to_string(&sanitized_policy).expect("failed to serialize Linux sandbox policy");
+    let permission_profile_json =
+        serde_json::to_string(permission_profile).expect("failed to serialize permission profile");
     let mut linux_cmd: Vec<String> = vec![
         "--sandbox-policy-cwd".to_string(),
         sandbox_policy_cwd,
-        "--sandbox-policy".to_string(),
-        sandbox_policy_json,
+        "--permission-profile".to_string(),
+        permission_profile_json,
     ];
-    if use_bwrap_sandbox {
-        linux_cmd.push("--use-bwrap-sandbox".to_string());
+    if use_legacy_landlock {
+        linux_cmd.push("--use-legacy-landlock".to_string());
     }
     if no_proc {
         linux_cmd.push("--no-proc".to_string());
@@ -1249,36 +877,6 @@ fn create_windows_sandbox_command_args(
     ];
     windows_cmd.extend(command);
     Ok(windows_cmd)
-}
-
-#[cfg(target_os = "linux")]
-fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
-    match policy {
-        SandboxPolicy::WorkspaceWrite {
-            writable_roots,
-            network_access,
-            exclude_tmpdir_env_var,
-            exclude_slash_tmp,
-        } => {
-            let writable_roots = writable_roots
-                .iter()
-                .filter_map(|root| ensure_absolute(root.clone()))
-                .collect();
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                network_access: *network_access,
-                exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
-                exclude_slash_tmp: *exclude_slash_tmp,
-            }
-        }
-        SandboxPolicy::ExternalSandbox { network_access } => SandboxPolicy::ExternalSandbox {
-            network_access: *network_access,
-        },
-        SandboxPolicy::DangerFullAccess => SandboxPolicy::DangerFullAccess,
-        SandboxPolicy::ReadOnly { network_access } => SandboxPolicy::ReadOnly {
-            network_access: *network_access,
-        },
-    }
 }
 
 // Allocate the server-owned session temp root. Today SandboxState keeps this
@@ -1388,9 +986,40 @@ pub fn sandbox_state_defaults_with_environment() -> SandboxState {
         env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
     #[cfg(target_os = "linux")]
     {
-        defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+        if let Some(value) = std::env::var_os(LINUX_BWRAP_ENABLED_ENV) {
+            defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+            defaults.use_legacy_landlock = !defaults.use_linux_sandbox_bwrap;
+            crate::event_log::log(
+                "linux_bwrap_default",
+                serde_json::json!({
+                    "source": "env",
+                    "env_value": value.to_string_lossy(),
+                    "use_linux_sandbox_bwrap": defaults.use_linux_sandbox_bwrap,
+                }),
+            );
+        } else {
+            defaults.use_linux_sandbox_bwrap = linux_bwrap_usable_on_current_host();
+            defaults.use_legacy_landlock = !defaults.use_linux_sandbox_bwrap;
+            crate::event_log::log(
+                "linux_bwrap_default",
+                serde_json::json!({
+                    "source": "host",
+                    "use_linux_sandbox_bwrap": defaults.use_linux_sandbox_bwrap,
+                }),
+            );
+        }
     }
     defaults
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bwrap_usable_on_current_host() -> bool {
+    if std::env::var_os(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_some()
+        || std::env::var_os("CODEX_SANDBOX").is_some()
+    {
+        return false;
+    }
+    linux_find_bwrap_program().is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -1679,9 +1308,9 @@ pub fn run_linux_sandbox_main() -> ! {
 #[cfg(target_os = "linux")]
 struct LinuxSandboxArgs {
     sandbox_policy_cwd: PathBuf,
-    sandbox_policy: SandboxPolicy,
+    permission_profile: PermissionProfile,
     command: Vec<std::ffi::OsString>,
-    use_bwrap_sandbox: bool,
+    use_legacy_landlock: bool,
     apply_seccomp_then_exec: bool,
     no_proc: bool,
 }
@@ -1690,18 +1319,23 @@ struct LinuxSandboxArgs {
 fn linux_sandbox_main_impl() -> Result<(), String> {
     let args = linux_sandbox_parse_args()?;
     if args.apply_seccomp_then_exec {
-        linux_apply_sandbox_policy_to_current_thread(
-            &args.sandbox_policy,
+        linux_apply_permission_profile_to_current_thread(
+            &args.permission_profile,
             &args.sandbox_policy_cwd,
+            false,
         )?;
         linux_execvp(args.command)?;
         return Ok(());
     }
-    if args.use_bwrap_sandbox {
+    if !args.use_legacy_landlock && !args.permission_profile.has_full_disk_write_access() {
         linux_exec_bwrap_sandbox(args)?;
         return Ok(());
     }
-    linux_apply_sandbox_policy_to_current_thread(&args.sandbox_policy, &args.sandbox_policy_cwd)?;
+    linux_apply_permission_profile_to_current_thread(
+        &args.permission_profile,
+        &args.sandbox_policy_cwd,
+        args.use_legacy_landlock,
+    )?;
     linux_execvp(args.command)?;
     Ok(())
 }
@@ -1709,16 +1343,16 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     let mut sandbox_policy_cwd: Option<PathBuf> = None;
-    let mut sandbox_policy: Option<SandboxPolicy> = None;
+    let mut permission_profile: Option<PermissionProfile> = None;
     let mut command: Vec<std::ffi::OsString> = Vec::new();
-    let mut use_bwrap_sandbox = false;
+    let mut use_legacy_landlock = false;
     let mut apply_seccomp_then_exec = false;
     let mut no_proc = false;
 
     let mut args = std::env::args_os().skip(1).peekable();
     while let Some(arg) = args.next() {
-        if arg == "--use-bwrap-sandbox" {
-            use_bwrap_sandbox = true;
+        if arg == "--use-legacy-landlock" {
+            use_legacy_landlock = true;
             continue;
         }
         if arg == "--apply-seccomp-then-exec" {
@@ -1736,6 +1370,19 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
             sandbox_policy_cwd = Some(PathBuf::from(value));
             continue;
         }
+        if arg == "--permission-profile" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --permission-profile".to_string())?;
+            let value = value
+                .into_string()
+                .map_err(|_| "--permission-profile must be valid UTF-8".to_string())?;
+            permission_profile = Some(
+                serde_json::from_str(&value)
+                    .map_err(|err| format!("failed to parse --permission-profile: {err}"))?,
+            );
+            continue;
+        }
         if arg == "--sandbox-policy" {
             let value = args
                 .next()
@@ -1743,10 +1390,14 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
             let value = value
                 .into_string()
                 .map_err(|_| "--sandbox-policy must be valid UTF-8".to_string())?;
-            sandbox_policy = Some(
-                serde_json::from_str(&value)
-                    .map_err(|err| format!("failed to parse --sandbox-policy: {err}"))?,
-            );
+            let sandbox_policy: SandboxPolicy = serde_json::from_str(&value)
+                .map_err(|err| format!("failed to parse --sandbox-policy: {err}"))?;
+            permission_profile = Some(PermissionProfile::from_legacy_sandbox_policy(
+                &sandbox_policy,
+                sandbox_policy_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("/")),
+            ));
             continue;
         }
         if arg == "--" {
@@ -1758,16 +1409,17 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
 
     let sandbox_policy_cwd =
         sandbox_policy_cwd.ok_or_else(|| "missing --sandbox-policy-cwd".to_string())?;
-    let sandbox_policy = sandbox_policy.ok_or_else(|| "missing --sandbox-policy".to_string())?;
+    let permission_profile =
+        permission_profile.ok_or_else(|| "missing --permission-profile".to_string())?;
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
 
     Ok(LinuxSandboxArgs {
         sandbox_policy_cwd,
-        sandbox_policy,
+        permission_profile,
         command,
-        use_bwrap_sandbox,
+        use_legacy_landlock,
         apply_seccomp_then_exec,
         no_proc,
     })
@@ -1793,14 +1445,14 @@ fn linux_find_bwrap_program() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<String>, String> {
     let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let policy = sanitize_linux_sandbox_policy(&args.sandbox_policy);
-    let policy_json = serde_json::to_string(&policy).map_err(|err| err.to_string())?;
+    let permission_profile_json =
+        serde_json::to_string(&args.permission_profile).map_err(|err| err.to_string())?;
     let mut inner = vec![
         current_exe.to_string_lossy().to_string(),
         "--sandbox-policy-cwd".to_string(),
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
-        "--sandbox-policy".to_string(),
-        policy_json,
+        "--permission-profile".to_string(),
+        permission_profile_json,
         "--apply-seccomp-then-exec".to_string(),
         "--".to_string(),
     ];
@@ -1817,15 +1469,18 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
     let bwrap_program = linux_find_bwrap_program()
         .ok_or_else(|| "bwrap executable not found (tried /usr/bin/bwrap and PATH)".to_string())?;
     let inner = linux_build_inner_seccomp_command(&args)?;
+    let (file_system_policy, network_policy) = args.permission_profile.to_runtime_permissions();
     let mount_proc = !args.no_proc
         && linux_bwrap_supports_proc_mount(
             bwrap_program.as_path(),
-            &args.sandbox_policy,
+            &file_system_policy,
+            network_policy,
             &args.sandbox_policy_cwd,
         );
     let bwrap_args = create_linux_bwrap_command_args(
         inner,
-        &args.sandbox_policy,
+        &file_system_policy,
+        network_policy,
         &args.sandbox_policy_cwd,
         mount_proc,
     )?;
@@ -1839,7 +1494,8 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn linux_bwrap_supports_proc_mount(
     bwrap_program: &Path,
-    sandbox_policy: &SandboxPolicy,
+    file_system_policy: &FileSystemSandboxPolicy,
+    network_policy: NetworkSandboxPolicy,
     sandbox_policy_cwd: &Path,
 ) -> bool {
     let true_path = if Path::new("/usr/bin/true").is_file() {
@@ -1851,7 +1507,8 @@ fn linux_bwrap_supports_proc_mount(
     };
     let args = match create_linux_bwrap_command_args(
         vec![true_path.to_string()],
-        sandbox_policy,
+        file_system_policy,
+        network_policy,
         sandbox_policy_cwd,
         true,
     ) {
@@ -1878,159 +1535,109 @@ fn linux_bwrap_supports_proc_mount(
 #[cfg(target_os = "linux")]
 fn create_linux_bwrap_command_args(
     command: Vec<String>,
-    sandbox_policy: &SandboxPolicy,
+    file_system_policy: &FileSystemSandboxPolicy,
+    network_policy: NetworkSandboxPolicy,
     sandbox_policy_cwd: &Path,
     mount_proc: bool,
 ) -> Result<Vec<String>, String> {
-    let sandbox_policy = sanitize_linux_sandbox_policy(sandbox_policy);
-    let writable_roots = linux_writable_roots(&sandbox_policy, sandbox_policy_cwd);
-    linux_ensure_bwrap_mount_targets_exist(&writable_roots)?;
-
+    let writable_roots = file_system_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
     let mut bwrap_args = vec![
         "--die-with-parent".to_string(),
         "--new-session".to_string(),
+        "--unshare-user".to_string(),
         "--unshare-pid".to_string(),
     ];
-    if !sandbox_policy.has_full_network_access() {
+    if !network_policy.is_enabled() {
         bwrap_args.push("--unshare-net".to_string());
     }
     if mount_proc {
         bwrap_args.push("--proc".to_string());
         bwrap_args.push("/proc".to_string());
     }
-    bwrap_args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
+    if file_system_policy.has_full_disk_read_access() {
+        bwrap_args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
+        bwrap_args.extend(["--dev".to_string(), "/dev".to_string()]);
+    } else {
+        bwrap_args.extend(["--tmpfs".to_string(), "/".to_string()]);
+        bwrap_args.extend(["--dev".to_string(), "/dev".to_string()]);
+        for root in file_system_policy.get_readable_roots_with_cwd(sandbox_policy_cwd) {
+            if root.exists() {
+                let root_str = root.to_string_lossy().to_string();
+                bwrap_args.extend(["--ro-bind".to_string(), root_str.clone(), root_str]);
+            }
+        }
+        if file_system_policy.include_platform_defaults() {
+            for root in linux_platform_default_read_roots() {
+                if root.exists() {
+                    let root_str = root.to_string_lossy().to_string();
+                    bwrap_args.extend(["--ro-bind".to_string(), root_str.clone(), root_str]);
+                }
+            }
+        }
+    }
 
-    for root in &writable_roots {
-        let root_str = root.to_string_lossy().to_string();
+    for writable_root in &writable_roots {
+        if !writable_root.root.exists() {
+            continue;
+        }
+        let root_str = writable_root.root.to_string_lossy().to_string();
         bwrap_args.extend(["--bind".to_string(), root_str.clone(), root_str]);
     }
 
-    let read_only_subpaths = collect_linux_read_only_subpaths(&writable_roots);
-    for subpath in read_only_subpaths {
-        if let Some(symlink_path) = find_symlink_in_path(&subpath, &writable_roots) {
-            let target = symlink_path.to_string_lossy().to_string();
-            bwrap_args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
-            continue;
-        }
-
-        if !subpath.exists() {
-            if let Some(first_missing) = find_first_non_existent_component(&subpath)
-                && is_within_allowed_write_paths(&first_missing, &writable_roots)
-            {
-                let target = first_missing.to_string_lossy().to_string();
-                bwrap_args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
-            }
-            continue;
-        }
-
-        if is_within_allowed_write_paths(&subpath, &writable_roots) {
-            let target = subpath.to_string_lossy().to_string();
-            bwrap_args.extend(["--ro-bind".to_string(), target.clone(), target]);
+    for writable_root in &writable_roots {
+        for subpath in &writable_root.read_only_subpaths {
+            append_linux_bwrap_read_only_mask(&mut bwrap_args, subpath, &writable_root.root);
         }
     }
 
-    bwrap_args.extend([
-        "--dev-bind".to_string(),
-        "/dev/null".to_string(),
-        "/dev/null".to_string(),
-    ]);
+    for unreadable in file_system_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd) {
+        append_linux_bwrap_unreadable_mask(&mut bwrap_args, &unreadable);
+    }
 
-    let command_index = bwrap_args.len();
+    bwrap_args.push("--argv0".to_string());
+    bwrap_args.push("codex-linux-sandbox".to_string());
     bwrap_args.push("--".to_string());
     bwrap_args.extend(command);
-    bwrap_args.splice(
-        command_index..command_index,
-        ["--argv0".to_string(), "codex-linux-sandbox".to_string()],
-    );
     Ok(bwrap_args)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_ensure_bwrap_mount_targets_exist(writable_roots: &[PathBuf]) -> Result<(), String> {
-    for root in writable_roots {
-        if !root.exists() {
-            return Err(format!(
-                "sandbox expected writable root {}, but it does not exist",
-                root.display()
-            ));
-        }
+fn append_linux_bwrap_read_only_mask(bwrap_args: &mut Vec<String>, subpath: &Path, root: &Path) {
+    if !subpath.starts_with(root) {
+        return;
     }
-    Ok(())
+    if subpath.exists() {
+        let target = subpath.to_string_lossy().to_string();
+        bwrap_args.extend(["--ro-bind".to_string(), target.clone(), target]);
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn collect_linux_read_only_subpaths(writable_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut subpaths = std::collections::BTreeSet::<PathBuf>::new();
-    for root in writable_roots {
-        for subpath in compute_linux_read_only_subpaths(root) {
-            subpaths.insert(subpath);
-        }
+fn append_linux_bwrap_unreadable_mask(bwrap_args: &mut Vec<String>, path: &Path) {
+    if path.is_dir() {
+        let target = path.to_string_lossy().to_string();
+        bwrap_args.extend(["--tmpfs".to_string(), target]);
+    } else if path.exists() {
+        let target = path.to_string_lossy().to_string();
+        bwrap_args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
     }
-    subpaths.into_iter().collect()
 }
 
 #[cfg(target_os = "linux")]
-fn is_within_allowed_write_paths(path: &Path, allowed_write_paths: &[PathBuf]) -> bool {
-    allowed_write_paths
-        .iter()
-        .any(|root| path.starts_with(root.as_path()))
-}
-
-#[cfg(target_os = "linux")]
-fn find_symlink_in_path(target_path: &Path, allowed_write_paths: &[PathBuf]) -> Option<PathBuf> {
-    let mut current = PathBuf::new();
-    for component in target_path.components() {
-        use std::path::Component;
-        match component {
-            Component::RootDir => {
-                current.push(Path::new("/"));
-                continue;
-            }
-            Component::CurDir => continue,
-            Component::ParentDir => {
-                current.pop();
-                continue;
-            }
-            Component::Normal(part) => current.push(part),
-            Component::Prefix(_) => continue,
-        }
-
-        let metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(_) => break,
-        };
-        if metadata.file_type().is_symlink()
-            && is_within_allowed_write_paths(&current, allowed_write_paths)
-        {
-            return Some(current);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn find_first_non_existent_component(target_path: &Path) -> Option<PathBuf> {
-    let mut current = PathBuf::new();
-    for component in target_path.components() {
-        use std::path::Component;
-        match component {
-            Component::RootDir => {
-                current.push(Path::new("/"));
-                continue;
-            }
-            Component::CurDir => continue,
-            Component::ParentDir => {
-                current.pop();
-                continue;
-            }
-            Component::Normal(part) => current.push(part),
-            Component::Prefix(_) => continue,
-        }
-        if !current.exists() {
-            return Some(current);
-        }
-    }
-    None
+fn linux_platform_default_read_roots() -> Vec<PathBuf> {
+    [
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/nix/store",
+        "/run/current-system/sw",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -2039,20 +1646,28 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_apply_sandbox_policy_to_current_thread(
-    sandbox_policy: &SandboxPolicy,
+fn linux_apply_permission_profile_to_current_thread(
+    permission_profile: &PermissionProfile,
     cwd: &Path,
+    apply_landlock_fs: bool,
 ) -> Result<(), String> {
-    if !sandbox_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access() {
+    let (file_system_policy, network_policy) = permission_profile.to_runtime_permissions();
+    if !network_policy.is_enabled()
+        || (apply_landlock_fs && !file_system_policy.has_full_disk_write_access())
+    {
         linux_set_no_new_privs()?;
     }
 
-    if !sandbox_policy.has_full_network_access() {
+    if !network_policy.is_enabled() {
         linux_install_network_seccomp_filter_on_current_thread()?;
     }
 
-    if !sandbox_policy.has_full_disk_write_access() {
-        let writable_roots = linux_writable_roots(sandbox_policy, cwd);
+    if apply_landlock_fs && !file_system_policy.has_full_disk_write_access() {
+        let writable_roots = file_system_policy
+            .get_writable_roots_with_cwd(cwd)
+            .into_iter()
+            .map(|root| root.root)
+            .collect();
         linux_install_filesystem_landlock_rules_on_current_thread(writable_roots)?;
     }
 
@@ -2066,33 +1681,6 @@ fn linux_set_no_new_privs() -> Result<(), String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_writable_roots(policy: &SandboxPolicy, cwd: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let Some(cwd) = ensure_absolute(cwd.to_path_buf()) else {
-        return roots;
-    };
-
-    if let SandboxPolicy::WorkspaceWrite {
-        writable_roots,
-        exclude_tmpdir_env_var,
-        exclude_slash_tmp,
-        network_access: _,
-    } = policy
-    {
-        roots.extend(writable_roots.iter().cloned().filter_map(ensure_absolute));
-        roots.push(cwd);
-        roots.extend(temp_roots_from_system(
-            *exclude_tmpdir_env_var,
-            *exclude_slash_tmp,
-        ));
-    }
-
-    roots.sort();
-    roots.dedup();
-    roots
 }
 
 #[cfg(target_os = "linux")]

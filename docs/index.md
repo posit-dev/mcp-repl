@@ -15,6 +15,7 @@ checked-in execution plans without relying on stale notes.
   contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
 - `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
+- `docs/plans/completed/linux-permission-profile-sandbox.md`: completed plan for replacing Linux sandbox internals with permission-profile metadata and helper-backed enforcement.
 
 ## Normative Docs
 

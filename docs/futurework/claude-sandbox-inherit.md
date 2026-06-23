@@ -21,7 +21,8 @@ Minimal task:
 - Claude install currently writes `.claude.json` MCP server entries and updates
   `.claude/settings.json` permissions so Claude can call the generated tools.
 - Claude install uses an explicit `mcp-repl` sandbox mode because Claude does
-  not send Codex-style per-tool-call sandbox metadata to MCP servers.
+  not send `_meta["codex/sandbox-state-meta"]` per-tool-call sandbox metadata to
+  MCP servers.
 - Claude's public settings shape is JSON, not TOML. Project settings live under
   `.claude/settings.json` and `.claude/settings.local.json`, and sandbox options
   are nested under `sandbox`.

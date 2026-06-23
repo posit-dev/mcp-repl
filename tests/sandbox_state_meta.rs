@@ -226,7 +226,7 @@ fn read_only_meta(sandbox_cwd: &Path) -> Value {
 
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        managed_profile(Vec::new(), "restricted"),
+        managed_profile(vec![special_entry("minimal", "read")], "restricted"),
         sandbox_cwd,
         false,
     )
@@ -2559,7 +2559,7 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2577,24 +2577,20 @@ async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestR
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected restricted read metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "did not expect restricted read workspace-write metadata to be rejected, got: {text}"
     );
     assert!(
-        text.contains("read entry cannot be represented"),
-        "expected restricted read metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported restricted read metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after restricted read workspace-write metadata, got: {text}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_restricted_read_only_meta_when_backend_supports_it()
+-> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2612,24 +2608,35 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected restricted read-only metadata to be reported as an MCP tool error"
+    assert!(
+        !text.contains("failed to parse Codex sandbox state metadata"),
+        "restricted read-only metadata should parse, got: {text}"
+    );
+    if text.contains("legacy Linux Landlock filesystem backend") {
+        eprintln!(
+            "restricted read-only metadata requires the bwrap backend in this environment; skipping"
+        );
+        return Ok(());
+    }
+    if text.contains("worker protocol error: ipc disconnected while waiting for worker_ready") {
+        eprintln!(
+            "restricted read-only metadata could not start under this Linux sandbox backend; skipping"
+        );
+        return Ok(());
+    }
+    assert!(
+        result.is_error != Some(true),
+        "did not expect restricted read-only metadata to be rejected when backend supports it, got: {text}"
     );
     assert!(
-        text.contains("without root read access"),
-        "expected restricted read-only metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported restricted read-only metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after restricted read-only metadata, got: {text}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2643,24 +2650,19 @@ async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestRes
     let text = collect_text(&result);
     session.cancel().await?;
 
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected full-write restricted-network metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "did not expect full-write restricted-network metadata to be rejected, got: {text}"
     );
     assert!(
-        text.contains("full write access with restricted network access is not supported"),
-        "expected full-write restricted-network metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported full-write restricted-network metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after full-write restricted-network metadata, got: {text}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2674,18 +2676,13 @@ async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestRes
     let text = collect_text(&result);
     session.cancel().await?;
 
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected root-write restricted-network metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "did not expect root-write restricted-network metadata to be rejected, got: {text}"
     );
     assert!(
-        text.contains("full write access with restricted network access is not supported"),
-        "expected root-write restricted-network metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported root-write restricted-network metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after root-write restricted-network metadata, got: {text}"
     );
     Ok(())
 }

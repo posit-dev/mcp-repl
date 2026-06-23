@@ -73,6 +73,7 @@ impl WorkerManager {
 
         let update = SandboxStateUpdate {
             sandbox_policy: self.sandbox_defaults.sandbox_policy.clone(),
+            permission_profile: Some(self.sandbox_defaults.permission_profile.clone()),
             sandbox_cwd: Some(self.sandbox_defaults.sandbox_cwd.clone()),
             use_linux_sandbox_bwrap: Some(self.sandbox_defaults.use_linux_sandbox_bwrap),
             use_legacy_landlock: None,
@@ -156,6 +157,7 @@ impl WorkerManager {
     fn apply_linux_bwrap_fallback_override(&self, state: &mut SandboxState) {
         if self.linux_bwrap_fallback_disabled {
             state.use_linux_sandbox_bwrap = false;
+            state.use_legacy_landlock = true;
         }
     }
 
@@ -289,6 +291,7 @@ mod tests {
                     exclude_tmpdir_env_var: false,
                     exclude_slash_tmp: false,
                 },
+                permission_profile: None,
                 sandbox_cwd: Some(writable_root.clone()),
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -337,6 +340,7 @@ mod tests {
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             },
+            permission_profile: None,
             sandbox_cwd: None,
             use_linux_sandbox_bwrap: None,
             use_legacy_landlock: None,
@@ -353,6 +357,7 @@ mod tests {
             .update_sandbox_state(
                 SandboxStateUpdate {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
+                    permission_profile: None,
                     sandbox_cwd: None,
                     use_linux_sandbox_bwrap: None,
                     use_legacy_landlock: None,

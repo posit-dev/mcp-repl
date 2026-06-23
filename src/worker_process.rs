@@ -101,14 +101,18 @@ pub(crate) fn worker_context_event_payload(
 ) -> serde_json::Value {
     let sandbox_policy = serde_json::to_value(&sandbox_state.sandbox_policy)
         .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
+    let permission_profile = serde_json::to_value(&sandbox_state.permission_profile)
+        .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
     serde_json::json!({
         "backend": format!("{backend:?}"),
         "worker_launch": worker_launch.label(),
         "stdin_transport": worker_launch.stdin_transport().as_str(),
         "sandbox_policy": sandbox_policy,
+        "permission_profile": permission_profile,
         "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
         "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
         "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
+        "use_legacy_landlock": sandbox_state.use_legacy_landlock,
         "managed_network_policy": {
             "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
             "denied_domains": sandbox_state.managed_network_policy.denied_domains.clone(),
