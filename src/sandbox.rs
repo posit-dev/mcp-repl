@@ -118,6 +118,12 @@ pub enum SandboxPolicy {
         #[serde(default)]
         exclude_slash_tmp: bool,
     },
+    #[serde(rename = "managed")]
+    Managed {
+        file_system: FileSystemSandboxPolicy,
+        #[serde(default)]
+        network_access: NetworkAccess,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -127,24 +133,444 @@ pub struct WritableRoot {
     pub read_only_subpaths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileSystemAccessMode {
+    Read,
+    Write,
+    #[serde(alias = "none")]
+    Deny,
+}
+
+impl FileSystemAccessMode {
+    pub(crate) fn can_read(self) -> bool {
+        !matches!(self, FileSystemAccessMode::Deny)
+    }
+
+    pub(crate) fn can_write(self) -> bool {
+        matches!(self, FileSystemAccessMode::Write)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileSystemSpecialPath {
+    Root,
+    Minimal,
+    #[serde(alias = "current_working_directory")]
+    ProjectRoots {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileSystemPath {
+    Path { path: PathBuf },
+    GlobPattern { pattern: String },
+    Special { value: FileSystemSpecialPath },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSystemSandboxEntry {
+    pub path: FileSystemPath,
+    pub access: FileSystemAccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileSystemSandboxKind {
+    #[default]
+    Restricted,
+    Unrestricted,
+    ExternalSandbox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSystemSandboxPolicy {
+    pub kind: FileSystemSandboxKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob_scan_max_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<FileSystemSandboxEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFileSystemEntry {
+    path: PathBuf,
+    access: FileSystemAccessMode,
+}
+
+impl Default for FileSystemSandboxPolicy {
+    fn default() -> Self {
+        Self::read_only()
+    }
+}
+
+impl FileSystemSandboxPolicy {
+    fn read_only() -> Self {
+        Self::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        }])
+    }
+
+    fn unrestricted() -> Self {
+        Self {
+            kind: FileSystemSandboxKind::Unrestricted,
+            glob_scan_max_depth: None,
+            entries: Vec::new(),
+        }
+    }
+
+    fn external_sandbox() -> Self {
+        Self {
+            kind: FileSystemSandboxKind::ExternalSandbox,
+            glob_scan_max_depth: None,
+            entries: Vec::new(),
+        }
+    }
+
+    fn restricted(entries: Vec<FileSystemSandboxEntry>) -> Self {
+        Self {
+            kind: FileSystemSandboxKind::Restricted,
+            glob_scan_max_depth: None,
+            entries,
+        }
+    }
+
+    fn workspace_write(
+        writable_roots: &[PathBuf],
+        exclude_tmpdir_env_var: bool,
+        exclude_slash_tmp: bool,
+    ) -> Self {
+        let mut entries = vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ];
+        if !exclude_slash_tmp {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::SlashTmp,
+                },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+        if !exclude_tmpdir_env_var {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+        entries.extend(
+            writable_roots
+                .iter()
+                .cloned()
+                .map(|path| FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path },
+                    access: FileSystemAccessMode::Write,
+                }),
+        );
+        for subpath in [".git", ".agents", ".codex"] {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots {
+                        subpath: Some(PathBuf::from(subpath)),
+                    },
+                },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+        for root in writable_roots {
+            for subpath in compute_read_only_subpaths(root) {
+                entries.push(FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path: subpath },
+                    access: FileSystemAccessMode::Read,
+                });
+            }
+        }
+        Self::restricted(entries)
+    }
+
+    fn has_root_access(&self, predicate: impl Fn(FileSystemAccessMode) -> bool) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self.entries.iter().any(|entry| {
+                matches!(
+                    &entry.path,
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    } if predicate(entry.access)
+                )
+            })
+    }
+
+    fn has_denied_read_restrictions(&self) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.access == FileSystemAccessMode::Deny)
+    }
+
+    fn has_write_narrowing_entries(&self) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self.entries.iter().any(|entry| {
+                if entry.access.can_write() {
+                    return false;
+                }
+                !matches!(
+                    &entry.path,
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    } if entry.access == FileSystemAccessMode::Read
+                )
+            })
+    }
+
+    pub(crate) fn has_full_disk_read_access(&self) -> bool {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => true,
+            FileSystemSandboxKind::Restricted => {
+                self.has_root_access(FileSystemAccessMode::can_read)
+                    && !self.has_denied_read_restrictions()
+            }
+        }
+    }
+
+    pub(crate) fn has_full_disk_write_access(&self) -> bool {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => true,
+            FileSystemSandboxKind::Restricted => {
+                self.has_root_access(FileSystemAccessMode::can_write)
+                    && !self.has_write_narrowing_entries()
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn include_platform_defaults(&self) -> bool {
+        !self.has_full_disk_read_access()
+            && matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self.entries.iter().any(|entry| {
+                entry.access.can_read()
+                    && matches!(
+                        &entry.path,
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Minimal,
+                        }
+                    )
+            })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_readable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if self.has_full_disk_read_access() {
+            return Vec::new();
+        }
+        let roots = self
+            .resolved_entries_with_cwd(cwd, session_temp_dir)
+            .into_iter()
+            .filter(|entry| entry.access.can_read())
+            .filter(|entry| self.can_read_path_with_cwd(&entry.path, cwd, session_temp_dir))
+            .map(|entry| entry.path)
+            .collect();
+        dedup_paths(roots, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_writable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<WritableRoot> {
+        if self.has_full_disk_write_access() {
+            return Vec::new();
+        }
+        let resolved_entries = self.resolved_entries_with_cwd(cwd, session_temp_dir);
+        let writable_entries = resolved_entries
+            .iter()
+            .filter(|entry| entry.access.can_write())
+            .filter(|entry| self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        dedup_paths(writable_entries, true)
+            .into_iter()
+            .map(|root| {
+                let mut read_only_subpaths = compute_read_only_subpaths(&root);
+                read_only_subpaths.extend(
+                    resolved_entries
+                        .iter()
+                        .filter(|entry| !entry.access.can_write())
+                        .filter(|entry| {
+                            !self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir)
+                        })
+                        .filter_map(|entry| {
+                            if entry.path == root || !entry.path.starts_with(&root) {
+                                None
+                            } else {
+                                Some(entry.path.clone())
+                            }
+                        }),
+                );
+                WritableRoot {
+                    root,
+                    read_only_subpaths: dedup_paths(read_only_subpaths, false),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_unreadable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+        let root = filesystem_root_for_cwd(cwd);
+        dedup_paths(
+            self.resolved_entries_with_cwd(cwd, session_temp_dir)
+                .into_iter()
+                .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+                .filter(|entry| !self.can_read_path_with_cwd(&entry.path, cwd, session_temp_dir))
+                .filter(|entry| Some(entry.path.as_path()) != root.as_deref())
+                .map(|entry| entry.path)
+                .collect(),
+            true,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_unreadable_globs_with_cwd(&self, cwd: &Path) -> Vec<String> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+        let mut patterns = self
+            .entries
+            .iter()
+            .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+            .filter_map(|entry| match &entry.path {
+                FileSystemPath::GlobPattern { pattern } => {
+                    Some(resolve_glob_pattern_against_cwd(pattern, cwd))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
+
+    #[cfg(target_os = "macos")]
+    fn can_read_path_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        self.resolve_access_with_cwd(path, cwd, session_temp_dir)
+            .can_read()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn can_write_path_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        self.resolve_access_with_cwd(path, cwd, session_temp_dir)
+            .can_write()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolve_access_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> FileSystemAccessMode {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
+                return FileSystemAccessMode::Write;
+            }
+            FileSystemSandboxKind::Restricted => {}
+        }
+        let Some(path) = resolve_candidate_path(path, cwd) else {
+            return FileSystemAccessMode::Deny;
+        };
+        self.resolved_entries_with_cwd(cwd, session_temp_dir)
+            .into_iter()
+            .filter(|entry| path.starts_with(&entry.path))
+            .max_by_key(|entry| (entry.path.components().count(), entry.access))
+            .map(|entry| entry.access)
+            .unwrap_or(FileSystemAccessMode::Deny)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolved_entries_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<ResolvedFileSystemEntry> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                resolve_entry_path(&entry.path, cwd, session_temp_dir).map(|path| {
+                    ResolvedFileSystemEntry {
+                        path,
+                        access: entry.access,
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
 impl SandboxPolicy {
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[allow(dead_code)]
     pub fn has_full_disk_write_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
             SandboxPolicy::ReadOnly { .. } => false,
             SandboxPolicy::WorkspaceWrite { .. } => false,
+            SandboxPolicy::Managed { file_system, .. } => file_system.has_full_disk_write_access(),
         }
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub fn has_full_disk_read_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
             SandboxPolicy::ReadOnly { .. } => true,
             SandboxPolicy::WorkspaceWrite { .. } => true,
+            SandboxPolicy::Managed { file_system, .. } => file_system.has_full_disk_read_access(),
         }
     }
 
@@ -154,17 +580,23 @@ impl SandboxPolicy {
             SandboxPolicy::ExternalSandbox { network_access } => network_access.is_enabled(),
             SandboxPolicy::ReadOnly { network_access } => *network_access,
             SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
+            SandboxPolicy::Managed { network_access, .. } => network_access.is_enabled(),
         }
     }
 
     pub fn requires_sandbox(&self) -> bool {
-        !matches!(
-            self,
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-        )
+        match self {
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => false,
+            SandboxPolicy::Managed {
+                file_system,
+                network_access,
+            } => !file_system.has_full_disk_write_access() || !network_access.is_enabled(),
+            SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => true,
+        }
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub fn get_writable_roots_with_cwd(
         &self,
         cwd: &Path,
@@ -216,14 +648,138 @@ impl SandboxPolicy {
                     })
                     .collect()
             }
+            SandboxPolicy::Managed { file_system, .. } => {
+                file_system.get_writable_roots_with_cwd(cwd, session_temp_dir)
+            }
             _ => Vec::new(),
         }
+    }
+}
+
+fn file_system_policy_from_legacy(policy: &SandboxPolicy) -> FileSystemSandboxPolicy {
+    match policy {
+        SandboxPolicy::DangerFullAccess => FileSystemSandboxPolicy::unrestricted(),
+        SandboxPolicy::ExternalSandbox { .. } => FileSystemSandboxPolicy::external_sandbox(),
+        SandboxPolicy::ReadOnly { .. } => FileSystemSandboxPolicy::read_only(),
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } => FileSystemSandboxPolicy::workspace_write(
+            writable_roots,
+            *exclude_tmpdir_env_var,
+            *exclude_slash_tmp,
+        ),
+        SandboxPolicy::Managed { file_system, .. } => file_system.clone(),
     }
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
+}
+
+#[cfg(target_os = "macos")]
+fn dedup_paths(paths: Vec<PathBuf>, normalize_existing_paths: bool) -> Vec<PathBuf> {
+    let mut deduped = Vec::with_capacity(paths.len());
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let path = if normalize_existing_paths {
+            normalize_existing_path(path)
+        } else {
+            path
+        };
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_existing_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    let cwd = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        return None;
+    };
+    cwd.ancestors().last().map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if cwd.is_absolute() {
+        Some(cwd.join(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_entry_path(
+    path: &FileSystemPath,
+    cwd: &Path,
+    session_temp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match path {
+        FileSystemPath::Path { path } => Some(path.clone()),
+        FileSystemPath::GlobPattern { .. } => None,
+        FileSystemPath::Special { value } => {
+            resolve_file_system_special_path(value, cwd, session_temp_dir)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_file_system_special_path(
+    value: &FileSystemSpecialPath,
+    cwd: &Path,
+    session_temp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match value {
+        FileSystemSpecialPath::Root => filesystem_root_for_cwd(cwd),
+        FileSystemSpecialPath::Minimal => None,
+        FileSystemSpecialPath::ProjectRoots { subpath } => {
+            let cwd = ensure_absolute(cwd.to_path_buf())?;
+            match subpath {
+                Some(subpath) if subpath.is_absolute() => Some(subpath.clone()),
+                Some(subpath) => Some(cwd.join(subpath)),
+                None => Some(cwd),
+            }
+        }
+        FileSystemSpecialPath::Tmpdir => session_temp_dir
+            .and_then(|path| ensure_absolute(path.to_path_buf()))
+            .or_else(|| {
+                let tmpdir = std::env::var_os("TMPDIR")?;
+                if tmpdir.is_empty() {
+                    None
+                } else {
+                    ensure_absolute(PathBuf::from(tmpdir))
+                }
+            }),
+        FileSystemSpecialPath::SlashTmp => {
+            let slash_tmp = PathBuf::from("/tmp");
+            slash_tmp.is_dir().then_some(slash_tmp)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_glob_pattern_against_cwd(pattern: &str, cwd: &Path) -> String {
+    let path = Path::new(pattern);
+    if path.is_absolute() {
+        pattern.to_string()
+    } else {
+        cwd.join(path).to_string_lossy().into_owned()
+    }
 }
 
 fn env_var_truthy(key: &str) -> bool {
@@ -233,7 +789,7 @@ fn env_var_truthy(key: &str) -> bool {
     })
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[allow(dead_code)]
 fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -269,6 +825,7 @@ pub fn invoked_as_codex_linux_sandbox() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn temp_writable_roots(
     exclude_tmpdir_env_var: bool,
     exclude_slash_tmp: bool,
@@ -482,7 +1039,7 @@ struct CodexFileSystemSandboxEntry {
     access: CodexFileSystemAccessMode,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CodexFileSystemAccessMode {
     Read,
@@ -619,21 +1176,22 @@ fn sandbox_policy_from_codex_managed_profile(
             if network_access {
                 Ok(SandboxPolicy::DangerFullAccess)
             } else {
-                Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string())
+                Ok(SandboxPolicy::Managed {
+                    file_system: FileSystemSandboxPolicy::unrestricted(),
+                    network_access: network,
+                })
             }
         }
         CodexManagedFileSystemPermissions::Restricted {
             entries,
             glob_scan_max_depth,
-        } => {
-            if glob_scan_max_depth.is_some() {
-                return Err(
-                    "Codex permissionProfile.file_system.glob_scan_max_depth is not supported"
-                        .to_string(),
-                );
-            }
-            sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
-        }
+        } => sandbox_policy_from_codex_restricted_entries(
+            entries,
+            glob_scan_max_depth,
+            network,
+            network_access,
+            sandbox_cwd,
+        ),
     }
 }
 
@@ -649,6 +1207,102 @@ struct RestrictedProfileProjection {
 }
 
 fn sandbox_policy_from_codex_restricted_entries(
+    entries: Vec<CodexFileSystemSandboxEntry>,
+    glob_scan_max_depth: Option<usize>,
+    network: NetworkAccess,
+    network_access: bool,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let file_system =
+        file_system_policy_from_codex_restricted_entries(&entries, glob_scan_max_depth)?;
+    if let Ok(policy) =
+        legacy_sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
+    {
+        return Ok(policy);
+    }
+    Ok(SandboxPolicy::Managed {
+        file_system,
+        network_access: network,
+    })
+}
+
+fn file_system_policy_from_codex_restricted_entries(
+    entries: &[CodexFileSystemSandboxEntry],
+    glob_scan_max_depth: Option<usize>,
+) -> Result<FileSystemSandboxPolicy, String> {
+    let mut runtime_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let path = file_system_path_from_codex(&entry.path)?;
+        match (&path, &entry.access) {
+            (FileSystemPath::GlobPattern { .. }, CodexFileSystemAccessMode::Deny) => {}
+            (FileSystemPath::GlobPattern { .. }, _) => {
+                return Err(
+                    "Codex permissionProfile.file_system glob pattern entries only support deny access"
+                        .to_string(),
+                );
+            }
+            (
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal,
+                },
+                CodexFileSystemAccessMode::Write,
+            ) => {
+                return Err(
+                    "Codex permissionProfile.file_system minimal write access is not supported"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        runtime_entries.push(FileSystemSandboxEntry {
+            path,
+            access: match entry.access {
+                CodexFileSystemAccessMode::Read => FileSystemAccessMode::Read,
+                CodexFileSystemAccessMode::Write => FileSystemAccessMode::Write,
+                CodexFileSystemAccessMode::Deny => FileSystemAccessMode::Deny,
+            },
+        });
+    }
+
+    if !runtime_entries.iter().any(|entry| entry.access.can_read()) {
+        return Err(
+            "Codex permissionProfile.file_system restricted policy requires at least one readable entry"
+                .to_string(),
+        );
+    }
+
+    Ok(FileSystemSandboxPolicy {
+        kind: FileSystemSandboxKind::Restricted,
+        glob_scan_max_depth,
+        entries: runtime_entries,
+    })
+}
+
+fn file_system_path_from_codex(path: &CodexFileSystemPath) -> Result<FileSystemPath, String> {
+    match path {
+        CodexFileSystemPath::Path { path } => Ok(FileSystemPath::Path {
+            path: parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?,
+        }),
+        CodexFileSystemPath::GlobPattern { pattern } => Ok(FileSystemPath::GlobPattern {
+            pattern: pattern.clone(),
+        }),
+        CodexFileSystemPath::Special { value } => Ok(FileSystemPath::Special {
+            value: match value {
+                CodexFileSystemSpecialPath::Root => FileSystemSpecialPath::Root,
+                CodexFileSystemSpecialPath::Minimal => FileSystemSpecialPath::Minimal,
+                CodexFileSystemSpecialPath::ProjectRoots { subpath } => {
+                    FileSystemSpecialPath::ProjectRoots {
+                        subpath: subpath.clone(),
+                    }
+                }
+                CodexFileSystemSpecialPath::Tmpdir => FileSystemSpecialPath::Tmpdir,
+                CodexFileSystemSpecialPath::SlashTmp => FileSystemSpecialPath::SlashTmp,
+            },
+        }),
+    }
+}
+
+fn legacy_sandbox_policy_from_codex_restricted_entries(
     entries: Vec<CodexFileSystemSandboxEntry>,
     network_access: bool,
     sandbox_cwd: &Path,
@@ -1371,6 +2025,9 @@ const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("sandbox/seatbelt_base_pol
 #[cfg(target_os = "macos")]
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("sandbox/seatbelt_network_policy.sbpl");
 #[cfg(target_os = "macos")]
+const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
+    include_str!("sandbox/restricted_read_only_platform_defaults.sbpl");
+#[cfg(target_os = "macos")]
 const PROXY_URL_ENV_KEYS: [&str; 6] = [
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -1531,6 +2188,176 @@ fn sandbox_network_env_snapshot() -> HashMap<String, String> {
 }
 
 #[cfg(target_os = "macos")]
+struct SeatbeltAccessRoot {
+    root: PathBuf,
+    excluded_subpaths: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = vec![path.to_path_buf()];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_access_policy(
+    action: &str,
+    param_prefix: &str,
+    roots: Vec<SeatbeltAccessRoot>,
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policy_components = Vec::new();
+    let mut params = Vec::new();
+
+    for (root_index, access_root) in roots.into_iter().enumerate() {
+        for (variant_index, root) in sandbox_path_variants(&access_root.root)
+            .into_iter()
+            .enumerate()
+        {
+            let root_param = if variant_index == 0 {
+                format!("{param_prefix}_{root_index}")
+            } else {
+                format!("{param_prefix}_{root_index}_{variant_index}")
+            };
+            params.push((root_param.clone(), root));
+            if access_root.excluded_subpaths.is_empty() {
+                policy_components.push(format!("(subpath (param \"{root_param}\"))"));
+                continue;
+            }
+
+            let mut require_parts = vec![format!("(subpath (param \"{root_param}\"))")];
+            for (excluded_index, excluded_subpath) in
+                access_root.excluded_subpaths.iter().enumerate()
+            {
+                for (excluded_variant_index, excluded) in sandbox_path_variants(excluded_subpath)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let excluded_param = if excluded_variant_index == 0 {
+                        format!("{param_prefix}_{root_index}_EXCLUDED_{excluded_index}")
+                    } else {
+                        format!(
+                            "{param_prefix}_{root_index}_EXCLUDED_{excluded_index}_{excluded_variant_index}"
+                        )
+                    };
+                    require_parts.push(format!(
+                        "(require-not (literal (param \"{excluded_param}\")))"
+                    ));
+                    require_parts.push(format!(
+                        "(require-not (subpath (param \"{excluded_param}\")))"
+                    ));
+                    params.push((excluded_param, excluded));
+                }
+            }
+            policy_components.push(format!("(require-all {} )", require_parts.join(" ")));
+        }
+    }
+
+    if policy_components.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        (
+            format!("(allow {action}\n{}\n)", policy_components.join(" ")),
+            params,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_unreadable_glob_policy(
+    file_system: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> String {
+    let mut policy_components = Vec::new();
+    for pattern in file_system.get_unreadable_globs_with_cwd(cwd) {
+        if let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) {
+            let regex = regex.replace('"', "\\\"");
+            policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-write-unlink (regex #"{regex}"))"#));
+        }
+    }
+    policy_components.join("\n")
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let mut regex = String::from("^");
+    let mut chars = pattern.chars().collect::<std::collections::VecDeque<_>>();
+    let mut saw_glob = false;
+
+    while let Some(ch) = chars.pop_front() {
+        match ch {
+            '*' => {
+                saw_glob = true;
+                if chars.front() == Some(&'*') {
+                    chars.pop_front();
+                    if chars.front() == Some(&'/') {
+                        chars.pop_front();
+                        regex.push_str("(.*/)?");
+                    } else {
+                        regex.push_str(".*");
+                    }
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '?' => {
+                saw_glob = true;
+                regex.push_str("[^/]");
+            }
+            '[' => {
+                saw_glob = true;
+                let mut class = Vec::new();
+                let mut closed = false;
+                while let Some(class_ch) = chars.pop_front() {
+                    if class_ch == ']' {
+                        closed = true;
+                        break;
+                    }
+                    class.push(class_ch);
+                }
+                if !closed {
+                    regex.push_str("\\[");
+                    for class_ch in class.into_iter().rev() {
+                        chars.push_front(class_ch);
+                    }
+                    continue;
+                }
+                regex.push('[');
+                for class_ch in class {
+                    match class_ch {
+                        '\\' => regex.push_str("\\\\"),
+                        '!' if regex.ends_with('[') => regex.push('^'),
+                        '^' if regex.ends_with('[') => regex.push_str("\\^"),
+                        _ => regex.push(class_ch),
+                    }
+                }
+                regex.push(']');
+            }
+            ']' => {
+                saw_glob = true;
+                regex.push_str("\\]");
+            }
+            _ => regex.push_str(&regex_lite::escape(&ch.to_string())),
+        }
+    }
+
+    if !saw_glob {
+        regex.push_str("(/.*)?");
+    }
+    regex.push('$');
+    Some(regex)
+}
+
+#[cfg(target_os = "macos")]
 fn create_seatbelt_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
@@ -1539,103 +2366,124 @@ fn create_seatbelt_command_args(
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
 ) -> Vec<String> {
-    let (file_write_policy, file_write_dir_params) = {
-        if sandbox_policy.has_full_disk_write_access() {
+    let mut file_system = file_system_policy_from_legacy(sandbox_policy);
+    let mut required_temp_roots = vec![session_temp_dir.to_path_buf()];
+    if matches!(
+        sandbox_policy,
+        SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. }
+    ) {
+        required_temp_roots.extend(temp_roots_from_system(false, false));
+    }
+    required_temp_roots.sort();
+    required_temp_roots.dedup();
+    for root in required_temp_roots {
+        if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+            && !file_system.can_write_path_with_cwd(
+                &root,
+                sandbox_policy_cwd,
+                Some(session_temp_dir),
+            )
+        {
+            file_system.entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+    }
+    for root in helper_read_roots_from_command(&command) {
+        if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+            && !file_system.can_read_path_with_cwd(
+                &root,
+                sandbox_policy_cwd,
+                Some(session_temp_dir),
+            )
+        {
+            file_system.entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+    }
+    let unreadable_roots =
+        file_system.get_unreadable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
+
+    let (file_write_policy, file_write_dir_params) = if file_system.has_full_disk_write_access() {
+        if unreadable_roots.is_empty() {
             (
                 r#"(allow file-write* (regex #"^/"))"#.to_string(),
                 Vec::new(),
             )
         } else {
-            let writable_roots = sandbox_policy
-                .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
-            let mut writable_folder_policies = Vec::new();
-            let mut file_write_params = Vec::new();
-
-            for (index, wr) in writable_roots.iter().enumerate() {
-                // NOTE: macOS has multiple common path spellings for the same locations:
-                // - `/tmp` vs `/private/tmp`
-                // - `/var/...` vs `/private/var/...`
-                //
-                // Seatbelt path matching is sensitive to these differences in practice, so we
-                // include both the original and canonicalized paths for each writable root (and
-                // any read-only exclusions) to avoid accidental denials.
-                let mut root_candidates = Vec::new();
-                root_candidates.push(wr.root.clone());
-                if let Ok(canonical_root) = wr.root.canonicalize() {
-                    root_candidates.push(canonical_root);
-                }
-                let mut seen_root = std::collections::HashSet::<String>::new();
-                let mut root_params = Vec::new();
-                for (variant, root_path) in root_candidates.into_iter().enumerate() {
-                    let key = root_path.to_string_lossy().to_string();
-                    if !seen_root.insert(key) {
-                        continue;
-                    }
-                    let root_param = if variant == 0 {
-                        format!("WRITABLE_ROOT_{index}")
-                    } else {
-                        format!("WRITABLE_ROOT_{index}_{variant}")
-                    };
-                    file_write_params.push((root_param.clone(), root_path));
-                    root_params.push(root_param);
-                }
-
-                if wr.read_only_subpaths.is_empty() {
-                    for root_param in root_params {
-                        writable_folder_policies
-                            .push(format!("(subpath (param \"{root_param}\"))"));
-                    }
-                } else {
-                    for root_param in root_params {
-                        let mut require_parts = Vec::new();
-                        require_parts.push(format!("(subpath (param \"{root_param}\"))"));
-
-                        for (subpath_index, ro) in wr.read_only_subpaths.iter().enumerate() {
-                            let mut ro_candidates = Vec::new();
-                            ro_candidates.push(ro.to_path_buf());
-                            if let Ok(canonical_ro) = ro.canonicalize() {
-                                ro_candidates.push(canonical_ro);
-                            }
-                            let mut seen_ro = std::collections::HashSet::<String>::new();
-                            for (ro_variant, ro_path) in ro_candidates.into_iter().enumerate() {
-                                let key = ro_path.to_string_lossy().to_string();
-                                if !seen_ro.insert(key) {
-                                    continue;
-                                }
-                                let ro_param = if ro_variant == 0 {
-                                    format!("WRITABLE_ROOT_{index}_RO_{subpath_index}")
-                                } else {
-                                    format!("WRITABLE_ROOT_{index}_RO_{subpath_index}_{ro_variant}")
-                                };
-                                require_parts.push(format!(
-                                    "(require-not (subpath (param \"{ro_param}\")))"
-                                ));
-                                file_write_params.push((ro_param, ro_path));
-                            }
-                        }
-
-                        writable_folder_policies
-                            .push(format!("(require-all {} )", require_parts.join(" ")));
-                    }
-                }
-            }
-
-            if writable_folder_policies.is_empty() {
-                ("".to_string(), Vec::new())
-            } else {
-                let file_write_policy = format!(
-                    "(allow file-write*\n{}\n)",
-                    writable_folder_policies.join(" ")
-                );
-                (file_write_policy, file_write_params)
-            }
+            build_seatbelt_access_policy(
+                "file-write*",
+                "WRITABLE_ROOT",
+                vec![SeatbeltAccessRoot {
+                    root: PathBuf::from("/"),
+                    excluded_subpaths: unreadable_roots.clone(),
+                }],
+            )
         }
+    } else {
+        build_seatbelt_access_policy(
+            "file-write*",
+            "WRITABLE_ROOT",
+            file_system
+                .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+                .into_iter()
+                .map(|root| SeatbeltAccessRoot {
+                    root: root.root,
+                    excluded_subpaths: root.read_only_subpaths,
+                })
+                .collect(),
+        )
     };
 
-    let file_read_policy = if sandbox_policy.has_full_disk_read_access() {
-        "; allow read-only file operations\n(allow file-read*)"
+    let (file_read_policy, file_read_dir_params) = if file_system.has_full_disk_read_access() {
+        if unreadable_roots.is_empty() {
+            (
+                "; allow read-only file operations\n(allow file-read*)".to_string(),
+                Vec::new(),
+            )
+        } else {
+            let (policy, params) = build_seatbelt_access_policy(
+                "file-read*",
+                "READABLE_ROOT",
+                vec![SeatbeltAccessRoot {
+                    root: PathBuf::from("/"),
+                    excluded_subpaths: unreadable_roots,
+                }],
+            );
+            (
+                format!("; allow read-only file operations\n{policy}"),
+                params,
+            )
+        }
     } else {
-        ""
+        let readable_roots =
+            file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
+        let (policy, params) = build_seatbelt_access_policy(
+            "file-read*",
+            "READABLE_ROOT",
+            readable_roots
+                .into_iter()
+                .map(|root| SeatbeltAccessRoot {
+                    excluded_subpaths: file_system
+                        .get_unreadable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+                        .into_iter()
+                        .filter(|path| path.starts_with(&root))
+                        .collect(),
+                    root,
+                })
+                .collect(),
+        );
+        if policy.is_empty() {
+            (String::new(), params)
+        } else {
+            (
+                format!("; allow read-only file operations\n{policy}"),
+                params,
+            )
+        }
     };
 
     let proxy = proxy_policy_inputs_from_env(network_env);
@@ -1649,11 +2497,28 @@ fn create_seatbelt_command_args(
         &proxy,
     );
 
-    let full_policy = format!(
-        "{MACOS_SEATBELT_BASE_POLICY}\n{file_read_policy}\n{file_write_policy}\n{network_policy}"
-    );
+    let deny_read_policy = build_seatbelt_unreadable_glob_policy(&file_system, sandbox_policy_cwd);
+    let mut policy_sections = vec![
+        MACOS_SEATBELT_BASE_POLICY.to_string(),
+        file_read_policy,
+        file_write_policy,
+        deny_read_policy,
+        network_policy,
+    ];
+    if file_system.include_platform_defaults() {
+        policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
+    }
+    let full_policy = policy_sections.join("\n");
+    if let Some(path) = crate::debug_logs::log_path("seatbelt-policy.sbpl") {
+        let _ = std::fs::write(path, &full_policy);
+    }
 
-    let dir_params = [file_write_dir_params, macos_dir_params()].concat();
+    let dir_params = [
+        file_read_dir_params,
+        file_write_dir_params,
+        macos_dir_params(),
+    ]
+    .concat();
 
     let mut seatbelt_args = vec!["-p".to_string(), full_policy];
     let definition_args = dir_params
@@ -1663,6 +2528,20 @@ fn create_seatbelt_command_args(
     seatbelt_args.push("--".to_string());
     seatbelt_args.extend(command);
     seatbelt_args
+}
+
+#[cfg(target_os = "macos")]
+fn helper_read_roots_from_command(command: &[String]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(program) = command.first()
+        && let Some(parent) = Path::new(program).parent()
+        && let Some(parent) = ensure_absolute(parent.to_path_buf())
+    {
+        roots.push(parent);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[cfg(target_os = "linux")]
@@ -3495,6 +4374,152 @@ mod tests {
 
         assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
         assert_eq!(update.sandbox_policy, SandboxPolicy::DangerFullAccess);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_meta_accepts_minimal_read_policy() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-minimal-read");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "minimal" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex minimal read metadata should parse");
+
+        assert!(
+            !update.sandbox_policy.has_full_disk_read_access(),
+            "minimal read policy must not be flattened to full read access"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_meta_accepts_deny_read_carveout() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-deny-read");
+        let private_dir = sandbox_cwd.join("private");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": private_dir
+                            },
+                            "access": "deny"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex deny-read metadata should parse");
+
+        assert!(
+            !update.sandbox_policy.has_full_disk_read_access(),
+            "deny-read carveout must not be flattened to full read access"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_glob_deny_is_rendered_in_seatbelt_policy() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-glob-deny");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "glob_pattern",
+                                "pattern": "**/*.env"
+                            },
+                            "access": "deny"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex glob-deny metadata should parse");
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains("(deny file-read* (regex #\""),
+            "expected glob deny read rule in seatbelt policy: {policy}"
+        );
+        assert!(
+            policy.contains("(deny file-write-unlink (regex #\""),
+            "expected glob deny unlink rule in seatbelt policy: {policy}"
+        );
     }
 
     #[cfg(target_os = "linux")]

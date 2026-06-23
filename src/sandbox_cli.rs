@@ -83,6 +83,19 @@ impl SandboxValidationMode {
         match policy {
             SandboxPolicy::ReadOnly { .. } => Self::ReadOnly,
             SandboxPolicy::WorkspaceWrite { .. } => Self::WorkspaceWrite,
+            SandboxPolicy::Managed { file_system, .. } => {
+                if file_system.has_full_disk_write_access() {
+                    Self::DangerFullAccess
+                } else if file_system
+                    .entries
+                    .iter()
+                    .any(|entry| entry.access.can_write())
+                {
+                    Self::WorkspaceWrite
+                } else {
+                    Self::ReadOnly
+                }
+            }
             SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
                 Self::DangerFullAccess
             }

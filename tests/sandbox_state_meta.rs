@@ -224,6 +224,21 @@ fn read_only_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "read"),
+                special_entry("tmpdir", "write"),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(Vec::new(), "restricted"),
@@ -351,6 +366,20 @@ fn backend_unavailable(text: &str) -> bool {
 async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     common::spawn_server_with_args_env_and_cwd(
         vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_python_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+        ],
         Vec::new(),
         Some(cwd.to_path_buf()),
     )
@@ -2559,7 +2588,7 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2577,18 +2606,101 @@ async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestR
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected restricted read metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "expected restricted read metadata to be accepted, got: {text}"
     );
     assert!(
-        text.contains("read entry cannot be represented"),
-        "expected restricted read metadata rejection, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after restricted read metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_allows_python_libomp_shm() -> TestResult<()> {
+    let _guard = test_guard();
+    if !common::python_available() {
+        eprintln!("python not available; skipping");
+        return Ok(());
+    }
+    let temp = tempdir()?;
+    let session = spawn_python_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            r#"
+import ctypes
+import os
+
+libc = ctypes.CDLL(None, use_errno=True)
+name = f"/__KMP_REGISTERED_LIB_{os.getpid()}".encode()
+fd = libc.shm_open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+if fd == -1:
+    err = ctypes.get_errno()
+    print(f"SHM_ERROR:{err}:{os.strerror(err)}")
+else:
+    os.close(fd)
+    libc.shm_unlink(name)
+    print("SHM_OK")
+"#,
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SHM_OK"),
+        "expected libomp-style shared memory registration under minimal metadata, got: {text}"
     );
     assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported restricted read metadata, got: {text}"
+        !text.contains("SHM_ERROR:"),
+        "minimal metadata blocked libomp-style shared memory registration: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_allows_r_startup_and_practical_probes() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            r#"
+brand <- suppressWarnings(system("/usr/sbin/sysctl machdep.cpu.brand_string", intern = TRUE))
+suppressWarnings({
+  logical <- parallel::detectCores(logical = TRUE)
+  physical <- parallel::detectCores(logical = FALSE)
+  cat("SYSCTL_BRAND_OK=", length(brand) > 0 && any(grepl("Intel|Apple", brand)), "\n", sep = "")
+  cat("DETECT_CORES_OK=", is.numeric(logical) && is.numeric(physical) && logical >= physical && physical >= 1, "\n", sep = "")
+})
+"#,
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SYSCTL_BRAND_OK=TRUE"),
+        "expected Quarto-style sysctl probe under minimal metadata, got: {text}"
+    );
+    assert!(
+        text.contains("DETECT_CORES_OK=TRUE"),
+        "expected R parallel::detectCores under minimal metadata, got: {text}"
     );
     Ok(())
 }
@@ -2618,7 +2730,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
         "expected restricted read-only metadata to be reported as an MCP tool error"
     );
     assert!(
-        text.contains("without root read access"),
+        text.contains("requires at least one readable entry"),
         "expected restricted read-only metadata rejection, got: {text}"
     );
     assert!(
@@ -2629,7 +2741,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2643,24 +2755,19 @@ async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestRes
     let text = collect_text(&result);
     session.cancel().await?;
 
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected full-write restricted-network metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "expected full-write restricted-network metadata to be accepted, got: {text}"
     );
     assert!(
-        text.contains("full write access with restricted network access is not supported"),
-        "expected full-write restricted-network metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported full-write restricted-network metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after full-write restricted-network metadata, got: {text}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2674,18 +2781,13 @@ async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestRes
     let text = collect_text(&result);
     session.cancel().await?;
 
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected root-write restricted-network metadata to be reported as an MCP tool error"
+    assert!(
+        result.is_error != Some(true),
+        "expected root-write restricted-network metadata to be accepted, got: {text}"
     );
     assert!(
-        text.contains("full write access with restricted network access is not supported"),
-        "expected root-write restricted-network metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported root-write restricted-network metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after root-write restricted-network metadata, got: {text}"
     );
     Ok(())
 }
