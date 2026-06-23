@@ -1,6 +1,5 @@
 ---
 source: tests/codex_integration.rs
-assertion_line: 2490
 expression: snapshot
 ---
 {
@@ -34,8 +33,14 @@ expression: snapshot
             "sandbox": "<SANDBOX_BACKEND>"
           },
           "codex/sandbox-state-meta": {
+            "sandboxPolicy": {
+              "type": "workspace-write",
+              "network_access": false,
+              "exclude_tmpdir_env_var": false,
+              "exclude_slash_tmp": false
+            },
             "codexLinuxSandboxExe": "<CODEX_LINUX_SANDBOX_EXE>",
-            "sandboxCwd": "file://<WORKSPACE>",
+            "sandboxCwd": "<WORKSPACE>",
             "useLegacyLandlock": false
           }
         },
