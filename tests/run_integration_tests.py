@@ -1245,7 +1245,6 @@ def r_pager_command_smoke(client: McpStdioClient) -> None:
     )
     assert_identical(
         tool_result(
-            text('> for (i in 1:80) cat(sprintf("L%04d\\n", i))\n'),
             text(expected_pager_lines(1, 13)),
             text("--More-- (6p, 16.2%, @0..78/480)"),
         ),

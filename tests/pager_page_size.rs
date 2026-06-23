@@ -118,6 +118,79 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()> {
+    let page_bytes = 80;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let mut input = (0..120)
+        .map(|idx| format!("echo_budget_{idx} <- {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    input.push_str("\nfor (i in 1:50) cat('abcd\\n')");
+
+    let mut result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let mut full_text = result_text(&result);
+    if backend_unavailable(&full_text) {
+        eprintln!("pager_page_size backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    if busy_response(&full_text) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            result = next;
+            full_text = text;
+            if !busy_response(&full_text) {
+                break;
+            }
+        }
+    }
+    assert!(
+        !busy_response(&full_text),
+        "pager_page_size worker remained busy after waiting for completion: {full_text:?}"
+    );
+    session.cancel().await?;
+
+    assert!(
+        !full_text.contains("echo_budget_"),
+        "generated input echo should not be reply-visible in pager output, got: {full_text:?}"
+    );
+
+    let chunks = text_chunks(&result);
+    let first = chunks
+        .iter()
+        .filter(|text| !text.contains("--More--") && !text.starts_with("(END"))
+        .find(|text| !text.is_empty())
+        .copied()
+        .unwrap_or("");
+    assert!(
+        !first.is_empty(),
+        "expected first page content, got: {chunks:?}"
+    );
+    assert!(
+        first.len() <= page_bytes as usize,
+        "first page exceeded page size: {} > {page_bytes}",
+        first.len()
+    );
+    assert!(
+        chunks.iter().any(|text| text.contains("--More--")),
+        "expected pager footer in response"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_large_page_size() -> TestResult<()> {
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;

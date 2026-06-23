@@ -2626,8 +2626,8 @@ fn image_extension(mime_type: &str) -> &str {
 }
 
 fn build_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
-    if omitted_tail && text.chars().count() <= INLINE_TEXT_BUDGET {
-        return build_short_preview(text, path);
+    if text.chars().count() <= INLINE_TEXT_BUDGET {
+        return build_short_preview(text, path, omitted_tail);
     }
     if let Some(preview) = build_line_preview(text, path, omitted_tail) {
         return preview;
@@ -2716,15 +2716,21 @@ fn build_char_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> St
     format!("{head}\n{marker}\n{tail}")
 }
 
-fn build_short_preview(text: &str, path: Option<&Path>) -> String {
+fn build_short_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
     let mut out = String::new();
     out.push_str(text);
     if !text.is_empty() && !text.ends_with('\n') {
         out.push('\n');
     }
+    let omitted = if omitted_tail {
+        "; later content omitted"
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "...[{}; later content omitted]...",
-        preview_storage_clause(path)
+        "...[{}{}]...",
+        preview_storage_clause(path),
+        omitted
     ));
     out
 }

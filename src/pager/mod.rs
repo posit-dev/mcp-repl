@@ -1682,20 +1682,12 @@ pub(crate) fn take_snapshot_page_from_buffer(
         };
     }
     let mut seen = RangeSet::default();
-    let page_end = page_end_offset_with_images(
-        &buffer,
-        buffer.current_offset(),
-        buffer.len(),
-        target_bytes.max(1),
-        MAX_IMAGES_PER_PAGE,
+    let (contents, pages_left, span) = take_next_page(
+        &mut buffer,
+        target_bytes,
+        &mut seen,
+        InputEchoVisibility::TranscriptOnly,
     );
-    let input_echo_visibility = if page_end < buffer.len() {
-        InputEchoVisibility::ReplyAndTranscript
-    } else {
-        InputEchoVisibility::TranscriptOnly
-    };
-    let (contents, pages_left, span) =
-        take_next_page(&mut buffer, target_bytes, &mut seen, input_echo_visibility);
     let last_range_end_byte = span
         .last
         .map(|(_, end)| buffer.byte_index_for_char_offset(end) as u64);
@@ -4003,6 +3995,37 @@ mod tests {
             "expected replay to preserve server-originated text events, got: {:?}",
             contents
         );
+    }
+
+    #[test]
+    fn ring_range_replay_rebases_text_spans_after_advanced_cursor() {
+        let guard = output_ring_test_guard();
+        reset_output_ring();
+        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let timeline = OutputTimeline::new(ring);
+        let output = OutputBuffer::default();
+
+        output.start_capture();
+        timeline.append_text(b"already consumed\n", false, ContentOrigin::Worker);
+        let consumed_end = output.end_offset().expect("output end offset");
+        output.advance_offset_to(consumed_end);
+
+        timeline.append_text(b"warning details\n", true, ContentOrigin::Worker);
+        let end_offset = output.end_offset().expect("output end offset");
+        let contents = take_range_from_ring(&output, end_offset);
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream, .. }
+                    if text.contains("warning details")
+                        && matches!(stream, TextStream::Stderr)
+            )),
+            "expected nonzero ring range replay to preserve stderr, got: {:?}",
+            contents
+        );
+
+        drop(guard);
     }
 
     #[test]

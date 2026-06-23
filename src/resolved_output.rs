@@ -390,12 +390,26 @@ pub(crate) fn contents_from_output_range(
     if range.bytes.is_empty() && range.events.is_empty() {
         return Vec::new();
     }
+    let base_offset = range.start_offset;
+    let end_offset = range.end_offset;
+    let events: Vec<OutputEvent> = range
+        .events
+        .into_iter()
+        .filter_map(|mut event| {
+            if event.offset < base_offset || event.offset > end_offset {
+                return None;
+            }
+            event.offset = event.offset.saturating_sub(base_offset);
+            Some(event)
+        })
+        .collect();
+    let end_offset = range.bytes.len() as u64;
     render_bytes_with_events_and_spans(
         &range.bytes,
-        range.start_offset,
-        range.end_offset,
+        0,
+        end_offset,
         &range.text_spans,
-        &range.events,
+        &events,
         input_echo_visibility,
     )
 }

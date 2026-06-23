@@ -510,6 +510,52 @@ async fn write_stdin_files_bundle_uses_full_input_echo_transcript() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_hidden_only_echo_spill_uses_clean_bundle_notice() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "h".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_only_assignment <- {huge_literal}");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden-only echo to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("full output:"),
+        "expected a bundle disclosure in the reply, got: {text:?}"
+    );
+    assert!(
+        !text.contains("shown chars") && !text.contains("shown lines"),
+        "hidden-only spills should not claim to truncate visible output, got: {text:?}"
+    );
+    assert!(
+        text.matches("> ").count() <= 1,
+        "hidden-only spills should not duplicate the prompt in the preview, got: {text:?}"
+    );
+    assert!(
+        !text.contains("hidden_only_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> hidden_only_assignment <- "),
+        "expected transcript.txt to include the generated input echo, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

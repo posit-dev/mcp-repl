@@ -545,7 +545,6 @@ impl PendingOutputSnapshot {
                                 offset: bytes.len() as u64,
                                 kind,
                             });
-                            last_rendered_text = None;
                         }
                     }
                     PendingSidebandKind::InputWait { .. }
@@ -986,6 +985,32 @@ mod tests {
             vec![
                 WorkerContent::stdout("x"),
                 WorkerContent::stderr("\nstderr: boom\n")
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_generated_echo_does_not_clear_partial_stdout_separator_state() {
+        let tape = PendingOutputTape::new();
+        tape.append_stdout_bytes(b"x");
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::stdout("x")]
+        );
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "hidden <- 1\n".to_string(),
+        });
+        tape.append_stderr_bytes(b"boom\n");
+
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![
+                WorkerContent::worker_stdout_transcript_only("> hidden <- 1\n"),
+                WorkerContent::stderr("\nstderr: boom\n"),
             ]
         );
     }
