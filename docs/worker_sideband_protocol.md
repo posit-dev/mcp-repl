@@ -104,12 +104,14 @@ invalid enum values, and invalid base64 payloads in base64 fields are protocol
 errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> }, "runtime": { "executable": <string, optional> } }`
 - Normal first worker message.
 - `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `6`.
 - `worker.name` and `worker.version` are diagnostic metadata.
 - `capabilities.images` is advertised by workers that may emit image output; if
   the field is omitted inside `capabilities`, the server treats it as `false`.
+- `runtime` is optional. Built-in Python uses `runtime.executable` to report the
+  active interpreter executable selected inside the worker sandbox.
 - A worker may instead end before readiness; the server treats early
   `session_end`, IPC EOF, or process exit as startup failure.
 - Any other first worker-to-server message is a protocol error.

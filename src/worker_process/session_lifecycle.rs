@@ -7,7 +7,9 @@ use crate::sandbox::SandboxStateUpdate;
 use crate::worker_protocol::ContentOrigin;
 
 use super::backend_driver::new_backend_driver;
-use super::{WORKER_SHUTDOWN_TIMEOUT, WorkerError, WorkerManager};
+use super::{
+    WORKER_SHUTDOWN_TIMEOUT, WorkerError, WorkerManager, configured_python_executable_hint,
+};
 
 impl WorkerManager {
     pub(super) fn reset_preserving_detached_prefix_item_count(
@@ -249,6 +251,7 @@ impl WorkerManager {
         }
         self.worker_launch = worker_launch;
         self.backend = self.worker_launch.builtin_backend().unwrap_or(self.backend);
+        self.active_python_executable_hint = configured_python_executable_hint(&self.worker_launch);
         self.driver = new_backend_driver(&self.worker_launch);
         match self.oversized_output {
             OversizedOutputMode::Files => self.reset_output_state_files(true),

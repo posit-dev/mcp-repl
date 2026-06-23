@@ -247,7 +247,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    ipc::emit_worker_ready("python", plot_capable());
+    ipc::emit_worker_ready_with_runtime("python", plot_capable(), Some(&runtime_config.executable));
 
     let result = run_cell_loop();
     // Py_FinalizeEx follows CPython shutdown semantics, including waiting for

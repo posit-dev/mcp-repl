@@ -326,6 +326,7 @@ pub(crate) enum InitialWorkerPrompt {
 pub(crate) struct SupervisorSpawn {
     pub(crate) process: WorkerProcess,
     pub(crate) initial_prompt: Option<InitialWorkerPrompt>,
+    pub(crate) python_executable_hint: Option<PathBuf>,
 }
 
 pub(crate) struct WorkerSupervisor;
@@ -350,9 +351,10 @@ impl WorkerSupervisor {
         let ipc = process
             .ipc_connection()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
-            return Err(Self::terminate_spawn_error(process, backend, err));
-        }
+        let ready = match wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
+            Ok(ready) => ready,
+            Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
+        };
         let initial_prompt = match seed_initial_readiness_from_process(&process) {
             Ok(prompt) => prompt,
             Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
@@ -360,6 +362,7 @@ impl WorkerSupervisor {
         Ok(SupervisorSpawn {
             process,
             initial_prompt,
+            python_executable_hint: ready.python_executable,
         })
     }
 
@@ -380,9 +383,18 @@ impl WorkerSupervisor {
     }
 }
 
-fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<u32, WorkerError> {
+struct WorkerReadyInfo {
+    python_executable: Option<PathBuf>,
+}
+
+fn wait_for_worker_ready(
+    ipc: ServerIpcConnection,
+    timeout: Duration,
+) -> Result<WorkerReadyInfo, WorkerError> {
     match ipc.wait_for_worker_ready(timeout) {
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+        Ok(WorkerToServerIpcMessage::WorkerReady {
+            protocol, runtime, ..
+        }) => {
             if protocol.name != "mcp-repl-worker"
                 || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
             {
@@ -391,7 +403,12 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
                     protocol.name, protocol.version
                 )));
             }
-            Ok(protocol.version)
+            Ok(WorkerReadyInfo {
+                python_executable: runtime
+                    .and_then(|runtime| runtime.executable)
+                    .filter(|executable| !executable.is_empty())
+                    .map(PathBuf::from),
+            })
         }
         Ok(_) => Err(WorkerError::Protocol(
             "expected worker_ready before user input".to_string(),

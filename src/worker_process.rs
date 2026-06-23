@@ -121,9 +121,22 @@ pub(crate) fn worker_context_event_payload(
     })
 }
 
+fn configured_python_executable_hint(worker_launch: &WorkerLaunch) -> Option<PathBuf> {
+    if worker_launch.builtin_backend() != Some(Backend::Python) {
+        return None;
+    }
+    worker_launch
+        .python_executable()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV).map(PathBuf::from)
+        })
+}
+
 pub struct WorkerManager {
     exe_path: PathBuf,
     worker_launch: WorkerLaunch,
+    active_python_executable_hint: Option<PathBuf>,
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
@@ -182,6 +195,7 @@ impl WorkerManager {
     ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
+        let active_python_executable_hint = configured_python_executable_hint(&worker_launch);
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let initial_sandbox =
             sandbox_state::prepare_initial_sandbox_state(&sandbox_plan, &sandbox_defaults)?;
@@ -212,6 +226,7 @@ impl WorkerManager {
         Ok(Self {
             exe_path,
             worker_launch: worker_launch.clone(),
+            active_python_executable_hint,
             backend,
             process: None,
             sandbox_plan,
@@ -303,11 +318,7 @@ impl WorkerManager {
         if self.backend != Backend::Python {
             return None;
         }
-        match self.worker_launch.python_executable() {
-            Some(executable) => Some(executable.to_path_buf()),
-            None => std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV)
-                .map(std::path::PathBuf::from),
-        }
+        self.active_python_executable_hint.clone()
     }
 
     pub fn python_executable_hint_matches(&self, target: &std::path::Path) -> bool {

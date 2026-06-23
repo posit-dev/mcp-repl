@@ -13,7 +13,7 @@ use crate::worker_supervisor::{
 
 #[cfg(target_os = "windows")]
 use super::worker_context_event_payload;
-use super::{WorkerError, WorkerManager};
+use super::{WorkerError, WorkerManager, configured_python_executable_hint};
 
 #[cfg(target_os = "linux")]
 const LINUX_BWRAP_FALLBACK_NOTICE: &str =
@@ -77,6 +77,7 @@ impl WorkerManager {
         let SupervisorSpawn {
             process,
             initial_prompt,
+            python_executable_hint,
         } = WorkerSupervisor::spawn(
             self.worker_launch.clone(),
             &self.exe_path,
@@ -92,6 +93,8 @@ impl WorkerManager {
                 prepared_windows_launch,
             },
         )?;
+        self.active_python_executable_hint = python_executable_hint
+            .or_else(|| configured_python_executable_hint(&self.worker_launch));
         self.remember_spawned_initial_prompt(initial_prompt);
         self.record_spawn();
         let payload = if pager_spawn {

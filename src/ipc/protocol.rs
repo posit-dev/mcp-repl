@@ -21,6 +21,8 @@ pub enum WorkerToServerIpcMessage {
         protocol: WorkerProtocol,
         worker: WorkerIdentity,
         capabilities: WorkerCapabilities,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<WorkerRuntimeInfo>,
     },
     OutputText {
         stream: TextStream,
@@ -72,6 +74,13 @@ pub struct WorkerCapabilities {
     pub images: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRuntimeInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcInputLineEvent {
     pub prompt: String,
@@ -108,6 +117,14 @@ pub(crate) fn worker_ready_message(
     worker_name: &str,
     supports_images: bool,
 ) -> WorkerToServerIpcMessage {
+    worker_ready_message_with_runtime(worker_name, supports_images, None)
+}
+
+pub(crate) fn worker_ready_message_with_runtime(
+    worker_name: &str,
+    supports_images: bool,
+    runtime: Option<WorkerRuntimeInfo>,
+) -> WorkerToServerIpcMessage {
     WorkerToServerIpcMessage::WorkerReady {
         protocol: WorkerProtocol {
             name: "mcp-repl-worker".to_string(),
@@ -120,6 +137,7 @@ pub(crate) fn worker_ready_message(
         capabilities: WorkerCapabilities {
             images: supports_images,
         },
+        runtime,
     }
 }
 

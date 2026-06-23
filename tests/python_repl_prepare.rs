@@ -1382,6 +1382,59 @@ async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_preserves_auto_selected_matching_executable_session() -> TestResult<()> {
+    let _uv_guard = real_uv_test_mutex().lock().await;
+    ensure_uv_available()?;
+    let session = common::spawn_python_server_with_files().await?;
+
+    let executable_probe = session
+        .write_stdin_raw_with(
+            "import sys; print('EXECUTABLE:' + sys.executable)",
+            Some(5.0),
+        )
+        .await?;
+    let executable_probe_text = common::result_text(&executable_probe);
+    let executable = executable_probe_text
+        .lines()
+        .find_map(|line| line.strip_prefix("EXECUTABLE:"))
+        .ok_or_else(|| {
+            format!("expected running Python executable, got: {executable_probe_text:?}")
+        })?;
+
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'kept'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected initial assignment to complete, got: {seed_text:?}"
+    );
+
+    let result = call_prepare(&session, json!({ "python": { "executable": executable } })).await?;
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session unchanged"),
+        "expected unchanged status, got: {text:?}"
+    );
+    assert!(
+        text.contains("no user state discarded"),
+        "expected no-discard status, got: {text:?}"
+    );
+
+    let probe = session
+        .write_stdin_raw_with("print('MARKER:' + _prepare_marker)", Some(5.0))
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("MARKER:kept"),
+        "expected matching prepare to preserve session, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_preserves_matching_executable_session() -> TestResult<()> {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
