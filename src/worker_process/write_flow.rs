@@ -19,7 +19,6 @@ const DEFERRED_SANDBOX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WriteStdinOptions {
     pub page_bytes_override: Option<u64>,
-    pub echo_input: bool,
     pub pending_state_prechecked: bool,
     pub deferred_sandbox_state_update: Option<SandboxStateUpdate>,
     pub suppress_session_end_reset: bool,
@@ -32,7 +31,6 @@ impl WriteStdinOptions {
     ) -> Self {
         Self {
             page_bytes_override: self.page_bytes_override,
-            echo_input: self.echo_input,
             pending_state_prechecked: false,
             deferred_sandbox_state_update,
             suppress_session_end_reset: false,
@@ -300,7 +298,6 @@ impl WorkerManager {
             text: &text,
             worker_timeout,
             page_bytes: 0,
-            echo_input: false,
             options: &options,
         })? {
             WritePreflightOutcome::Continue => {}
@@ -314,7 +311,6 @@ impl WorkerManager {
             server_timeout,
             deferred_sandbox_state_update: options.deferred_sandbox_state_update,
             page_bytes: 0,
-            echo_input: false,
             process_prechecked: false,
         })
     }
@@ -327,7 +323,6 @@ impl WorkerManager {
         options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
         let page_bytes_override = options.page_bytes_override;
-        let echo_input = options.echo_input;
         self.last_detached_prefix_item_count = 0;
         if let Some(reply) = self.write_stdin_control_prefix(
             WriteStdinMode::Pager,
@@ -345,7 +340,6 @@ impl WorkerManager {
             text: &text,
             worker_timeout,
             page_bytes,
-            echo_input,
             options: &options,
         })? {
             WritePreflightOutcome::Continue => {}
@@ -359,7 +353,6 @@ impl WorkerManager {
             server_timeout,
             deferred_sandbox_state_update: options.deferred_sandbox_state_update,
             page_bytes,
-            echo_input,
             process_prechecked: true,
         })
     }

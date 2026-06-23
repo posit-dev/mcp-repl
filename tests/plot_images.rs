@@ -1560,7 +1560,7 @@ cat("TAIL_ONLY\n")
     );
     assert!(
         !final_text.contains("> cat(\"TAIL_ONLY\\n\")"),
-        "did not expect the trailing command echo to survive the final timeout poll: {final_text:?}"
+        "did not expect submitted command input to be synthesized into the final timeout poll: {final_text:?}"
     );
     assert!(
         final_text.contains("TAIL_ONLY\n") || final_text.contains("<<repl status: idle>>"),

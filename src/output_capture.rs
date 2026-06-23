@@ -2,13 +2,11 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::worker_protocol::ContentOrigin;
 
 static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
-static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
 const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
@@ -29,37 +27,6 @@ pub(crate) fn reset_output_ring() {
     if let Some(ring) = OUTPUT_RING.get() {
         ring.reset();
     }
-}
-
-pub(crate) fn set_last_reply_marker_offset(offset: u64) {
-    LAST_REPLY_MARKER_OFFSET.store(offset, Ordering::SeqCst);
-}
-
-pub(crate) fn update_last_reply_marker_offset_max(offset: u64) {
-    let mut current = LAST_REPLY_MARKER_OFFSET.load(Ordering::SeqCst);
-    loop {
-        if current != u64::MAX && current >= offset {
-            return;
-        }
-        match LAST_REPLY_MARKER_OFFSET.compare_exchange(
-            current,
-            offset,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => return,
-            Err(next) => current = next,
-        }
-    }
-}
-
-fn last_reply_marker_offset() -> Option<u64> {
-    let value = LAST_REPLY_MARKER_OFFSET.load(Ordering::SeqCst);
-    (value != u64::MAX).then_some(value)
-}
-
-pub(crate) fn reset_last_reply_marker_offset() {
-    LAST_REPLY_MARKER_OFFSET.store(u64::MAX, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -168,10 +135,9 @@ impl OutputTimeline {
         mime_type: String,
         data: String,
         is_new: bool,
-        readline_results_seen: usize,
+        _readline_results_seen: usize,
     ) {
-        self.ring
-            .append_image_event(id, mime_type, data, is_new, readline_results_seen);
+        self.ring.append_image_event(id, mime_type, data, is_new);
     }
 
     pub(crate) fn append_text_event(
@@ -179,10 +145,9 @@ impl OutputTimeline {
         text: String,
         is_stderr: bool,
         origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
+        _readline_results_seen: Option<usize>,
     ) {
-        self.ring
-            .append_text_event(text, is_stderr, origin, readline_results_seen);
+        self.ring.append_text_event(text, is_stderr, origin);
     }
 }
 
@@ -262,19 +227,6 @@ impl OutputBuffer {
             return false;
         };
         ring.end_offset() > offset || ring.has_events_at_or_after(offset)
-    }
-
-    pub fn pending_output_since_last_reply(&self) -> bool {
-        let Some((offset, ring)) = self.read_offset_with_ring() else {
-            return false;
-        };
-        if ring.end_offset() <= offset && !ring.has_events_at_or_after(offset) {
-            return false;
-        }
-        let Some(last_reply_marker) = last_reply_marker_offset() else {
-            return false;
-        };
-        offset >= last_reply_marker
     }
 }
 
@@ -359,13 +311,11 @@ pub(crate) enum OutputEventKind {
         data: String,
         mime_type: String,
         is_new: bool,
-        readline_results_seen: usize,
     },
     Text {
         text: String,
         is_stderr: bool,
         origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
     },
 }
 
@@ -501,7 +451,6 @@ impl OutputRing {
         mime_type: String,
         data: String,
         is_new: bool,
-        readline_results_seen: usize,
     ) {
         let mut guard = self.inner.lock().unwrap();
         let kind = OutputEventKind::Image {
@@ -509,7 +458,6 @@ impl OutputRing {
             data,
             mime_type,
             is_new,
-            readline_results_seen,
         };
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
@@ -529,19 +477,12 @@ impl OutputRing {
         });
     }
 
-    pub(crate) fn append_text_event(
-        &self,
-        text: String,
-        is_stderr: bool,
-        origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
-    ) {
+    pub(crate) fn append_text_event(&self, text: String, is_stderr: bool, origin: ContentOrigin) {
         let mut guard = self.inner.lock().unwrap();
         let kind = OutputEventKind::Text {
             text,
             is_stderr,
             origin,
-            readline_results_seen,
         };
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
@@ -729,7 +670,6 @@ impl OutputRing {
             text: OUTPUT_TRUNCATION_NOTICE.to_string(),
             is_stderr: false,
             origin: ContentOrigin::Server,
-            readline_results_seen: None,
         };
         let notice_bytes = event_size_bytes(&notice_kind);
         if notice_bytes.saturating_add(extra_bytes) > self.capacity_bytes {
@@ -878,7 +818,6 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             mime_type,
             id,
             is_new: _,
-            readline_results_seen: _,
         } => data
             .len()
             .saturating_add(mime_type.len())
@@ -912,7 +851,6 @@ fn insert_leading_stderr_prefix_event(
             text: String::from_utf8_lossy(STDERR_PREFIX).into_owned(),
             is_stderr: true,
             origin,
-            readline_results_seen: None,
         },
     };
     let insert_at = events
@@ -982,7 +920,6 @@ mod tests {
                     data,
                     mime_type: format!("image/{idx}"),
                     is_new: true,
-                    readline_results_seen: 0,
                 },
             );
         }
@@ -1039,7 +976,6 @@ mod tests {
                 data: "img".to_string(),
                 mime_type: "image/png".to_string(),
                 is_new: true,
-                readline_results_seen: 0,
             },
         );
 
@@ -1095,7 +1031,6 @@ mod tests {
                         text,
                         is_stderr: false,
                         origin: ContentOrigin::Worker,
-                        readline_results_seen: None,
                     },
                 );
             }

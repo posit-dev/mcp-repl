@@ -27,6 +27,41 @@ fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+#[cfg(target_family = "unix")]
+fn extract_prefixed_value(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(str::to_string)
+}
+
+#[cfg(target_family = "unix")]
+fn first_logged_pid(log: &str) -> Option<u32> {
+    log.lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.parse().ok())
+}
+
+#[cfg(target_family = "unix")]
+fn process_is_running(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_family = "unix")]
+fn wait_for_process_exit(pid: u32) -> TestResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("expected process {pid} to exit after session_end respawn").into())
+}
+
 fn wait_for_log_contains(path: &std::path::Path, needle: &str) -> TestResult<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -119,6 +154,14 @@ async fn spawn_zod_server_with_extra_args(
     control_log: &std::path::Path,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(control_log, Vec::new(), extra_args).await
+}
+
+async fn spawn_zod_server_with_extra_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -126,6 +169,9 @@ async fn spawn_zod_server_with_extra_args(
         "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
         Value::String(control_log.display().to_string()),
     );
+    for (key, value) in extra_env {
+        env.insert(key.to_string(), Value::String(value.to_string()));
+    }
     let spec = json!({
         "executable": zod_worker_path()?,
         "args": [],
@@ -149,6 +195,31 @@ async fn spawn_zod_server_with_extra_args(
 
 async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
+}
+
+async fn spawn_zod_startup_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![("MCP_REPL_ZOD_STARTUP_READY", "1")],
+        Vec::new(),
+    )
+    .await
+}
+
+async fn spawn_zod_delayed_interrupt_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![
+            ("MCP_REPL_ZOD_STARTUP_READY", "1"),
+            ("MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS", "200"),
+        ],
+        Vec::new(),
+    )
+    .await
 }
 
 async fn spawn_zod_stalled_control_server(
@@ -286,13 +357,86 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
     );
     assert!(
         !text.contains("v5> hello v5"),
-        "default reply must elide synthetic input_line echo, got: {text:?}"
+        "default reply must not render structural input_line metadata, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_batch input=hello v5")?;
     assert!(
         !log.contains("stdin:"),
         "v5 server path must not write request text to raw stdin, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_startup_ready_server(&control_log).await?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.call_tool_raw(
+            "repl",
+            json!({
+                "input": "prompt-free startup",
+                "timeout_ms": 20_000
+            }),
+        ),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!(
+                "startup ready should accept first input without waiting for input_wait timeout"
+            );
+        }
+    };
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("v5-output: prompt-free startup\n"),
+        "expected custom worker startup ready to accept first input, got: {text:?}"
+    );
+    let log = wait_for_log_contains(&control_log, "ready")?;
+    assert!(
+        log.contains("input_batch input=prompt-free startup"),
+        "expected first input after startup ready, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{3}after fresh ready", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("v5-output: after fresh ready\n"),
+        "expected interrupt tail to run after fresh readiness, got: {text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "fresh_ready_after_interrupt")?;
+    let fresh_ready_idx = log
+        .find("fresh_ready_after_interrupt")
+        .expect("fresh readiness log should be present");
+    let input_idx = log
+        .find("input_batch input=after fresh ready")
+        .expect("interrupt tail input log should be present");
+    assert!(
+        fresh_ready_idx < input_idx,
+        "expected tail input only after fresh readiness, got log: {log:?}"
     );
 
     session.cancel().await?;
@@ -351,6 +495,224 @@ async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<(
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-park",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "park_after_session_end")?;
+    let old_pid = first_logged_pid(&log).ok_or("expected zod worker pid in control log")?;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "write-session-temp-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let mut second_text = result_text(&second);
+    if !second_text.contains("session-temp-marker: ") {
+        assert!(
+            second_text.contains("session ended") || second_text.contains("session_end"),
+            "expected session_end before respawn, got: {second_text:?}"
+        );
+        let third = session
+            .call_tool_raw(
+                "repl",
+                json!({
+                    "input": "write-session-temp-marker",
+                    "timeout_ms": 10_000
+                }),
+            )
+            .await?;
+        second_text = result_text(&third);
+    }
+    let marker = extract_prefixed_value(&second_text, "session-temp-marker: ")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("expected respawned worker temp marker, got: {second_text:?}"))?;
+    assert!(
+        marker.exists(),
+        "expected respawned worker marker to exist before old worker cleanup: {}",
+        marker.display()
+    );
+
+    let exit_result = wait_for_process_exit(old_pid);
+    assert!(
+        marker.exists(),
+        "old worker cleanup removed respawned worker temp marker: {}",
+        marker.display()
+    );
+    session.cancel().await?;
+    exit_result
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_raw_marker = tempdir.path().join("late-raw-marker");
+    let late_raw_marker_env = late_raw_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![("MCP_REPL_ZOD_LATE_RAW_MARKER", late_raw_marker_env.as_str())],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-raw-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_raw_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_raw_marker_for_thread = late_raw_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-respawn",
+        )?;
+        std::fs::write(&late_raw_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late raw marker writer panicked")??;
+    assert!(
+        late_raw_marker.exists(),
+        "expected test marker to trigger old worker raw stdout"
+    );
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_RAW_AFTER_SESSION_END"),
+        "old worker raw stdout leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_sideband_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_sideband_marker = tempdir.path().join("late-sideband-marker");
+    let late_sideband_marker_env = late_sideband_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![(
+            "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER",
+            late_sideband_marker_env.as_str(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-sideband-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_sideband_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_sideband_marker_for_thread = late_sideband_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-sideband-respawn",
+        )?;
+        std::fs::write(&late_sideband_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-sideband-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late sideband marker writer panicked")??;
+    assert!(
+        late_sideband_marker.exists(),
+        "expected test marker to trigger old worker sideband output"
+    );
+    wait_for_log_contains(&control_log, "late_sideband_output_after_session_end")?;
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-sideband-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_SIDEBAND_AFTER_SESSION_END"),
+        "old worker sideband output leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {
@@ -388,7 +750,8 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_elided() -> TestResult<()> {
+async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_not_rendered() -> TestResult<()>
+{
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -633,6 +996,10 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         interrupted.is_error,
         Some(true),
         "input-wait Ctrl-C must remain a non-error control reply, got: {interrupted_text:?}"
+    );
+    assert!(
+        !interrupted_text.contains("<<repl status: busy"),
+        "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
     );
 
     let log = read_optional(&control_log);

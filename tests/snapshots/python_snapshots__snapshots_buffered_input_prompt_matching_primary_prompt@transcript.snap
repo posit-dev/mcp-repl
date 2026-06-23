@@ -7,7 +7,9 @@ expression: transcript
 >>> import sys
 >>> sys.ps1 = "same> "
 >>> value = input("same> ")
->>> buffered
 >>> print("MATCHED_PROMPT_VALUE", value)
-<<< same> MATCHED_PROMPT_VALUE buffered
-<<< same>
+<<< same> 
+
+2) py_repl timeout_ms=5000
+>>> buffered
+<<< MATCHED_PROMPT_VALUE buffered

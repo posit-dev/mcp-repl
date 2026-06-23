@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::completion_reply::{ReplyWithOffset, idle_status_content};
-use crate::output_capture::set_last_reply_marker_offset;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::reply_presentation::{append_prompt_if_missing, normalize_prompt};
@@ -24,17 +23,20 @@ impl WorkerManager {
         let resolved_prompt = if pager_active {
             None
         } else {
-            self.pager_prompt.take()
+            match self.pager_prompt.take() {
+                Some(prompt) => prompt.into_prompt(),
+                None => {
+                    contents.push(WorkerContent::server_stderr(
+                        "[repl] protocol error: missing prompt after pager dismiss",
+                    ));
+                    None
+                }
+            }
         };
         if pager_active {
             *prompt = None;
         } else {
             self.remember_prompt(resolved_prompt.clone());
-            if resolved_prompt.is_none() {
-                contents.push(WorkerContent::server_stderr(
-                    "[repl] protocol error: missing prompt after pager dismiss",
-                ));
-            }
             append_prompt_if_missing(contents, resolved_prompt.clone());
             *prompt = resolved_prompt;
         }
@@ -119,17 +121,12 @@ impl WorkerManager {
     }
 
     pub(super) fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
-            set_last_reply_marker_offset(reply.end_offset);
-        }
+        let _ = reply.end_offset;
         reply.reply
     }
 
     pub(super) fn remember_prompt(&mut self, prompt: Option<String>) {
-        let prompt = normalize_prompt(prompt);
-        if let Some(prompt) = prompt {
-            self.last_prompt = Some(prompt);
-        }
+        self.last_prompt = normalize_prompt(prompt);
     }
 
     pub(super) fn current_prompt_hint(&self) -> Option<String> {

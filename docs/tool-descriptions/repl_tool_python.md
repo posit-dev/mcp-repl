@@ -1,21 +1,23 @@
-`repl` runs source text in a persistent Python REPL session and returns emitted stdout/stderr and images.
+`repl` runs source text in a persistent Python session and returns emitted stdout/stderr and images.
 
 Arguments:
-- `input` (string): Python source text to send to the persistent REPL session.
+- `input` (string): Python source text to run in the persistent session, or stdin text when Python is already waiting for input.
 - `timeout_ms` (number, optional): maximum milliseconds to wait before returning.
   Timeout bounds only this response window; it does not cancel backend work.
 
 Python REPL affordances:
 - Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
-- Input is sent to CPython interactive mode line by line, not script or notebook-cell mode; script-like blocks may execute earlier than they would in a file or cell.
-- When a compound block may continue, end the submitted input with two newline characters (`\n\n`) or put `\n\n` before unrelated top-level code.
-- If Python is waiting at the continuation prompt, send a blank line (`\n`) to run a complete block, or send `\u0003` to abandon pending input without resetting the session.
+- At the start of each non-empty call, Python routes the whole payload from current state: if it is waiting for stdin, the payload is stdin; otherwise the payload runs as one complete Python cell with persistent globals. Send multi-line blocks and following top-level code in the same cell call.
+- A final top-level expression is displayed through `sys.displayhook`, so custom display hooks are honored.
+- Incomplete code such as a bare block header reports a normal Python syntax error instead of entering continuation mode.
+- If running code asks for stdin through `input()`, `help()`, `pdb`, `sys.stdin`, or raw stdin APIs, the next non-empty `input` is delivered as stdin bytes for that running code. The whole payload is stdin for that call, including additional lines.
+- Send new Python source in a later call after Python is ready for cell execution; leftover stdin is not promoted to source at the server boundary.
 - While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
 - Empty `input` polls for more output from a timed-out request or for detached background output while idle.
 - If a request times out, keep polling with empty `input` until the remaining worker output is drained. New non-empty input is discarded while that timed-out request is still active.
 - Large output replies may stay inline when only slightly oversized. Larger overages may be written to a server-owned output bundle directory. The inline reply stays bounded and may show a preview plus the most relevant disclosed path inside that bundle.
 - Bundle files are materialized lazily. Text-only oversized replies disclose `transcript.txt`. Image bundles use `images/` for the latest image aliases and `images/history/` for ordered image history. `events.log` is created only once a bundle needs ordered mixed text+image indexing.
-- `transcript.txt` contains worker-originated REPL text such as echoed input, prompts, stdout, and rendered stderr text. Ordinary server status lines stay inline and are not written into `transcript.txt`.
+- `transcript.txt` contains worker-originated REPL text such as prompts, stdout, and rendered stderr text. Ordinary server status lines stay inline and are not written into `transcript.txt`.
 - `events.log`, when present, is the authoritative ordered index for the retained mixed worker-text/image bundle contents. `T` rows point to line and byte ranges in `transcript.txt`. `I` rows point to relative image history paths such as `images/history/001/002.png`. `S` rows are reserved for server-only omission notices when bundle retention drops later content.
 - When an output bundle is used for images, the inline preview keeps the first and last image as anchors. Inspect top-level files under `images/` first for the latest image state. Use `events.log` plus `images/history/` only when you need ordered image history.
 - Example image bundle layout:
