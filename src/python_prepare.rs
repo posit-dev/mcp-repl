@@ -357,12 +357,12 @@ fn resolve_uv_requirements(
 }
 
 fn installed_distributions_satisfy(executable: &Path, packages: &[String]) -> bool {
-    let distribution_names = packages
-        .iter()
-        .map(|package| requirement_distribution_name(package))
-        .collect::<Vec<_>>();
-    if distribution_names.iter().any(|name| name.is_empty()) {
-        return false;
+    let mut distribution_names = Vec::with_capacity(packages.len());
+    for package in packages {
+        let Some(name) = bare_requirement_distribution_name(package) else {
+            return false;
+        };
+        distribution_names.push(name);
     }
 
     Command::new(executable)
@@ -389,11 +389,22 @@ for name in sys.argv[1:]:
         .unwrap_or(false)
 }
 
-fn requirement_distribution_name(requirement: &str) -> String {
-    requirement
-        .trim()
-        .split(['<', '>', '=', '!', '~', '[', ';', ' '])
-        .next()
-        .unwrap_or("")
-        .to_string()
+fn bare_requirement_distribution_name(requirement: &str) -> Option<String> {
+    let trimmed = requirement.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !trimmed
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !trimmed
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }

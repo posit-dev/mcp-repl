@@ -1,5 +1,8 @@
 mod common;
 
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -34,6 +37,7 @@ fn venv_python(venv: &Path) -> PathBuf {
 }
 
 const EXTRA_PACKAGE: &str = "packaging";
+const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 
 fn run_uv(mut command: Command, context: impl Into<String>) -> TestResult<Output> {
     let context = context.into();
@@ -193,6 +197,58 @@ fn assert_manifest_packages(text: &str, packages: &[&str]) {
         text.contains(&expected),
         "expected manifest {expected}, got: {text:?}"
     );
+}
+
+fn sandbox_cwd_uri(sandbox_cwd: &Path) -> String {
+    url::Url::from_file_path(sandbox_cwd)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| panic!("failed to convert {} to file URI", sandbox_cwd.display()))
+}
+
+fn full_access_meta(sandbox_cwd: &Path) -> Value {
+    json!({
+        SANDBOX_STATE_META_CAPABILITY: {
+            "permissionProfile": {
+                "type": "disabled",
+            },
+            "sandboxCwd": sandbox_cwd_uri(sandbox_cwd),
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
+                Value::String("/tmp/codex-linux-sandbox".to_string())
+            } else {
+                Value::Null
+            },
+        }
+    })
+}
+
+async fn spawn_python_inherit_files_server(
+    cwd: &Path,
+    env_vars: Vec<(String, String)>,
+) -> TestResult<common::McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+        ],
+        env_vars,
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    let end = text
+        .find("transcript.txt")?
+        .saturating_add("transcript.txt".len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -543,6 +599,102 @@ async fn repl_prepare_preserves_current_python_when_manifest_available() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_checks_non_bare_requirement_with_uv() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let packaging_python = uv_env.managed_python(&[EXTRA_PACKAGE])?;
+    let fake_uv_dir = tempfile::tempdir()?;
+    let fake_uv = fake_uv_dir.path().join("uv");
+    fs::write(
+        &fake_uv,
+        "#!/bin/sh\necho FAKE_UV_INVOKED_FOR_NON_BARE_REQUIREMENT >&2\nexit 7\n",
+    )?;
+    let mut permissions = fs::metadata(&fake_uv)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_uv, permissions)?;
+
+    let mut env_vars = uv_env.env_vars_with_python(packaging_python)?;
+    env_vars.push((
+        "PATH".to_string(),
+        fake_uv_dir.path().to_string_lossy().to_string(),
+    ));
+    let session = common::spawn_python_server_with_files_env_vars(env_vars).await?;
+
+    let result = call_prepare(
+        &session,
+        json!({
+            "requirements": {
+                "packages": ["packaging>=999999"],
+                "action": "set",
+                "restart": "no"
+            }
+        }),
+    )
+    .await?;
+    let text = common::result_text(&result);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected non-bare requirement to run uv and fail, got: {text:?}"
+    );
+    assert!(
+        text.contains("FAKE_UV_INVOKED_FOR_NON_BARE_REQUIREMENT")
+            && text.contains("session unchanged"),
+        "expected uv failure while preserving the session, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &["numpy"]);
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let cwd = tempfile::tempdir()?;
+    let session = spawn_python_inherit_files_server(
+        cwd.path(),
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let result = session
+        .call_tool_raw_with_meta(
+            "repl_prepare",
+            json!({
+                "requirements": {
+                    "packages": [EXTRA_PACKAGE],
+                    "action": "set"
+                }
+            }),
+            Some(full_access_meta(cwd.path())),
+        )
+        .await?;
+    let text = common::result_text(&result);
+    assert!(
+        text.contains("session restarted") && !text.contains("sandbox inherit requested"),
+        "expected inherited metadata to be staged before prepare replacement, got: {text:?}"
+    );
+    assert_manifest_packages(&text, &[EXTRA_PACKAGE]);
+
+    let probe = session
+        .write_stdin_raw_with_meta(
+            "import packaging; print('PACKAGING_OK:' + str(hasattr(packaging, '__version__')))",
+            Some(5.0),
+            Some(full_access_meta(cwd.path())),
+        )
+        .await?;
+    let probe_text = common::result_text(&probe);
+    assert!(
+        probe_text.contains("PACKAGING_OK:True"),
+        "expected prepared worker to run under inherited metadata, got: {probe_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestResult<()> {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
@@ -647,6 +799,59 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_restart_no_after_replacement_does_not_see_stale_user_state() -> TestResult<()>
+{
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let session = common::spawn_python_server_with_files_env_vars(
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let seed = session
+        .write_stdin_raw_with("_prepare_marker = 'discarded'", Some(5.0))
+        .await?;
+    let seed_text = common::result_text(&seed);
+    assert!(
+        !common::is_busy_response(&seed_text),
+        "expected initial assignment to complete, got: {seed_text:?}"
+    );
+
+    let first_prepare = call_prepare(&session, json!({})).await?;
+    let first_text = common::result_text(&first_prepare);
+    assert!(
+        first_text.contains("session restarted") && first_text.contains("user state discarded"),
+        "expected first prepare to replace the user session, got: {first_text:?}"
+    );
+
+    let second_prepare = call_prepare(
+        &session,
+        json!({
+            "requirements": {
+                "packages": [EXTRA_PACKAGE],
+                "action": "set",
+                "restart": "no"
+            }
+        }),
+    )
+    .await?;
+    let second_text = common::result_text(&second_prepare);
+    assert_ne!(
+        second_prepare.is_error,
+        Some(true),
+        "restart=no should not see stale user state after prepare replacement: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("session restarted")
+            && second_text.contains("no user state discarded"),
+        "expected restart=no to replace the fresh session without stale user state, got: {second_text:?}"
+    );
+    assert_manifest_packages(&second_text, &[EXTRA_PACKAGE]);
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 // Linux CI intermittently exits before worker_ready when this case forces a
 // restart into uv's isolated target; other tests cover Linux restart behavior.
 #[cfg_attr(
@@ -705,7 +910,7 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
 
     let first = session
         .write_stdin_raw_with(
-            "import time\nprint('PREPARE_BUSY_READY', flush=True)\ntime.sleep(60)",
+            "import time\nprint('PREPARE_BUSY_READY:' + ('x' * 5000), flush=True)\ntime.sleep(60)",
             Some(0.5),
         )
         .await?;
@@ -714,6 +919,7 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
         common::is_busy_response(&first_text) || first_text.contains("PREPARE_BUSY_READY"),
         "expected timed-out active work, got: {first_text:?}"
     );
+    let first_transcript_path = bundle_transcript_path(&first_text);
 
     let result = call_prepare(
         &session,
@@ -739,6 +945,26 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
         follow_up_text.contains("AFTER_PREPARE_REPLACE"),
         "expected fresh session after prepare, got: {follow_up_text:?}"
     );
+    assert!(
+        !follow_up_text.contains("PREPARE_BUSY_READY"),
+        "did not expect discarded timeout output in the fresh reply, got: {follow_up_text:?}"
+    );
+    let follow_up_transcript_path = bundle_transcript_path(&follow_up_text);
+    if let (Some(first_path), Some(follow_up_path)) =
+        (&first_transcript_path, &follow_up_transcript_path)
+    {
+        assert_ne!(
+            first_path, follow_up_path,
+            "expected prepare replacement to retire the discarded timeout bundle"
+        );
+    }
+    if let Some(first_path) = &first_transcript_path {
+        let first_transcript_after = fs::read_to_string(first_path)?;
+        assert!(
+            !first_transcript_after.contains("AFTER_PREPARE_REPLACE"),
+            "did not expect fresh output appended to discarded timeout bundle: {first_transcript_after:?}"
+        );
+    }
 
     session.cancel().await?;
     Ok(())

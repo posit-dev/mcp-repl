@@ -480,15 +480,29 @@ impl SharedServer {
     async fn run_prepare_python(
         &self,
         args: crate::python_prepare::ReplPrepareArgs,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let request = crate::python_prepare::validate_prepare_args(args)
             .map_err(|message| McpError::invalid_params(message, None))?;
+        let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
         self.run_state(move |state| match request {
             crate::python_prepare::ValidatedPrepareRequest::Requirements(operation) => {
-                Self::run_prepare_python_requirements(state, operation)
+                let sandbox_state_update = || {
+                    SharedServer::sandbox_state_update_for_tool_call_meta(
+                        accepts_sandbox_state_meta,
+                        &meta,
+                    )
+                };
+                Self::run_prepare_python_requirements(state, operation, &sandbox_state_update)
             }
             crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable) => {
-                Self::run_prepare_python_executable(state, executable)
+                let sandbox_state_update = || {
+                    SharedServer::sandbox_state_update_for_tool_call_meta(
+                        accepts_sandbox_state_meta,
+                        &meta,
+                    )
+                };
+                Self::run_prepare_python_executable(state, executable, &sandbox_state_update)
             }
         })
         .await
@@ -497,6 +511,7 @@ impl SharedServer {
     fn run_prepare_python_requirements(
         state: &mut ServerState,
         operation: crate::python_prepare::PrepareRequirementsOperation,
+        sandbox_state_update: &dyn Fn() -> Result<Option<SandboxStateUpdate>, WorkerError>,
     ) -> CallToolResult {
         let current_manifest = state.python_requirements_manifest.clone();
         let candidate_manifest =
@@ -547,6 +562,9 @@ impl SharedServer {
         }
 
         let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        if let Err(err) = Self::stage_prepare_sandbox_state(state, sandbox_state_update()) {
+            return Self::prepare_python_local_error_reply(state, err);
+        }
         match state
             .worker
             .replace_worker_launch(WorkerLaunch::PythonExecutable {
@@ -554,6 +572,7 @@ impl SharedServer {
                 module_search_paths: target.module_search_paths,
             }) {
             Ok(()) => {
+                Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
                 state.python_requirements_manifest = candidate_manifest;
                 Self::prepare_python_success_reply(
                     "session restarted",
@@ -562,9 +581,10 @@ impl SharedServer {
                 )
             }
             Err(err) => {
-                let mut result = state.response.finalize_local_error(err, true);
-                strip_text_stream_meta(&mut result);
-                result
+                if had_pending_work && !state.worker.pending_request() {
+                    Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                }
+                Self::prepare_python_local_error_reply(state, err)
             }
         }
     }
@@ -572,6 +592,7 @@ impl SharedServer {
     fn run_prepare_python_executable(
         state: &mut ServerState,
         executable: std::path::PathBuf,
+        sandbox_state_update: &dyn Fn() -> Result<Option<SandboxStateUpdate>, WorkerError>,
     ) -> CallToolResult {
         let target = match crate::python_prepare::resolve_prepare_target(
             &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
@@ -598,23 +619,52 @@ impl SharedServer {
         let had_pending_work = state.worker.pending_request();
         let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
         let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        if let Err(err) = Self::stage_prepare_sandbox_state(state, sandbox_state_update()) {
+            return Self::prepare_python_local_error_reply(state, err);
+        }
         match state
             .worker
             .replace_worker_launch(WorkerLaunch::PythonExecutable {
                 executable: target.executable,
                 module_search_paths: target.module_search_paths,
             }) {
-            Ok(()) => Self::prepare_python_success_reply(
-                "session restarted",
-                discarded,
-                &state.python_requirements_manifest,
-            ),
+            Ok(()) => {
+                Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                Self::prepare_python_success_reply(
+                    "session restarted",
+                    discarded,
+                    &state.python_requirements_manifest,
+                )
+            }
             Err(err) => {
-                let mut result = state.response.finalize_local_error(err, true);
-                strip_text_stream_meta(&mut result);
-                result
+                if had_pending_work && !state.worker.pending_request() {
+                    Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                }
+                Self::prepare_python_local_error_reply(state, err)
             }
         }
+    }
+
+    fn stage_prepare_sandbox_state(
+        state: &mut ServerState,
+        update: Result<Option<SandboxStateUpdate>, WorkerError>,
+    ) -> Result<(), WorkerError> {
+        SharedServer::stage_tool_call_sandbox_state_for_reset(state, update?)
+    }
+
+    fn clear_prepare_timeout_state_if_discarded(state: &mut ServerState, had_pending_work: bool) {
+        if had_pending_work && let Err(err) = state.response.clear_active_timeout_bundle() {
+            eprintln!("dropping discarded timeout bundle after repl_prepare replacement: {err}");
+        }
+    }
+
+    fn prepare_python_local_error_reply(
+        state: &mut ServerState,
+        err: WorkerError,
+    ) -> CallToolResult {
+        let mut result = state.response.finalize_local_error(err, true);
+        strip_text_stream_meta(&mut result);
+        result
     }
 
     fn prepare_python_success_reply(
@@ -945,10 +995,10 @@ macro_rules! define_python_prepare_tool_server {
             )]
             async fn repl_prepare(
                 &self,
-                _meta: Meta,
+                meta: Meta,
                 params: Parameters<crate::python_prepare::ReplPrepareArgs>,
             ) -> Result<CallToolResult, McpError> {
-                self.shared.run_prepare_python(params.0).await
+                self.shared.run_prepare_python(params.0, meta).await
             }
         }
 
