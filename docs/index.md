@@ -40,7 +40,6 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
 - `docs/futurework/portable-plugin-skill-mcp-bundle.md`: futurework note on packaging a shared skill plus MCP server config as a portable Codex/Claude plugin.
 - `docs/futurework/project-local-mcp-repl-config.md`: deferred design note on loading project-local `mcp-repl-config.toml` files from `.agents`, `.codex`, or `.claude`.
-- `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
 - `docs/futurework/server-backend-boundary.md`: deferred note on keeping backend-specific execution semantics out of opaque queued server-side request handling.
