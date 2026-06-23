@@ -556,6 +556,40 @@ async fn write_stdin_hidden_only_echo_spill_uses_clean_bundle_notice() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_error_bundle_preserves_transcript_only_echo_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "h".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_error_payload <- {huge_literal}\nError <- stop('x')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden error echo to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("hidden_error_payload"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> Error <- stop('x')"),
+        "expected transcript.txt to preserve the generated input prompt, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
@@ -1862,6 +1896,59 @@ async fn pager_follow_up_after_resolved_timeout_skips_leading_detached_input_ech
     assert!(
         !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
         "timed-out request echo should not lead the next pager reply, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_hidden_only_detached_echo_does_not_consume_follow_up_page_budget() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let session = spawn_pager_behavior_session(80).await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("hidden-prefix-start-ready");
+    let done_path = temp.path().join("hidden-prefix-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
+
+    let hidden_payload = "h".repeat(500);
+    let hidden_literal = serde_json::to_string(&hidden_payload)?;
+    let first_input = format!(
+        "while (!file.exists({start_gate_literal})) Sys.sleep(0.01); hidden_prefix_assignment <- {hidden_literal}; writeLines('done', {done_literal})"
+    );
+    let first = session
+        .write_stdin_raw_with(&first_input, Some(0.05))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated pager request to time out, got: {first_text:?}"
+    );
+
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&done_path, "pager hidden-prefix output marker").await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let follow_up = session
+        .write_stdin_raw_with("cat('FRESH_VISIBLE\\n')", Some(2.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("hidden_prefix_assignment"),
+        "timed-out request echo should stay hidden in the next pager reply, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("FRESH_VISIBLE"),
+        "hidden-only detached echo should not consume the fresh reply page budget, got: {follow_up_text:?}"
     );
 
     Ok(())

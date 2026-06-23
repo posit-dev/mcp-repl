@@ -1805,11 +1805,12 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                 stream,
                 visibility,
             } => {
-                let text = if matches!(origin, ContentOrigin::Worker) {
-                    normalize_error_prompt(text, is_error)
-                } else {
-                    text
-                };
+                let text =
+                    if matches!(origin, ContentOrigin::Worker) && visibility.is_reply_visible() {
+                        normalize_error_prompt(text, is_error)
+                    } else {
+                        text
+                    };
                 if text.is_empty() {
                     continue;
                 }

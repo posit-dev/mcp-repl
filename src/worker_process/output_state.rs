@@ -292,8 +292,9 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
             WorkerContent::ContentText {
                 text,
                 origin: ContentOrigin::Worker,
+                visibility,
                 ..
-            } => text.len() as u64,
+            } if visibility.is_reply_visible() => text.len() as u64,
             WorkerContent::ContentText { .. } | WorkerContent::ContentImage { .. } => 0,
         })
         .sum()
