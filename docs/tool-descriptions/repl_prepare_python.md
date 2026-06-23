@@ -1,4 +1,11 @@
-`repl_prepare` prepares the Python REPL for later `repl` calls.
+`repl_prepare` changes or explicitly realizes the Python environment for later
+`repl` calls.
+
+Do not call `repl_prepare` preemptively. The Python `repl` tool is
+self-starting, self-healing, and available for immediate code evaluation. Call
+`repl_prepare` only when you intentionally need to change the default managed
+requirements, request a Python version, select an existing Python executable or
+venv, or explicitly realize the current managed requirements manifest.
 
 mcp-repl maintains a persistent managed-Python requirements manifest, initially containing `numpy`; `uv` realizes that manifest into an ephemeral environment. Use `requirements` to add, remove, or set manifest entries. By default, mcp-repl restarts only if needed to satisfy the manifest. Set `restart: "no"` to preserve current session state, or `restart: "yes"` to force a fresh session. Use `python` to select an explicit Python executable or venv instead of the ephemeral environment produced from the manifest.
 
@@ -15,4 +22,7 @@ Arguments:
 
 Provide either `requirements` or `python`, not both. Inside `python`, provide exactly one of `executable` or `venv`. `restart` applies only inside `requirements`.
 
-Omit all arguments to realize the current manifest. The result reports whether the session was unchanged or restarted and echoes the full managed requirements manifest.
+Omit all arguments only when you explicitly want to realize the current managed
+manifest without changing it. This is not required before normal `repl` use. The
+result reports whether the session was unchanged or restarted and echoes the
+full managed requirements manifest.
