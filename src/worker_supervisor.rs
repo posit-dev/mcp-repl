@@ -442,6 +442,7 @@ pub(crate) struct WorkerProcess {
     stderr_reader: Option<OutputReader>,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
+    finalized: bool,
     #[cfg(target_family = "unix")]
     guardrail_stop: Arc<AtomicBool>,
     #[cfg(target_family = "unix")]
@@ -856,6 +857,7 @@ impl WorkerProcess {
             stderr_reader,
             expected_exit: false,
             exit_status: None,
+            finalized: false,
             #[cfg(target_family = "unix")]
             guardrail_stop,
             #[cfg(target_family = "unix")]
@@ -1390,6 +1392,9 @@ impl WorkerProcess {
     }
 
     fn finalize_terminated_process(&mut self) -> Result<(), WorkerError> {
+        if self.finalized {
+            return Ok(());
+        }
         #[cfg(target_family = "unix")]
         {
             // Once the root worker is gone, kill any remaining session peers before waiting on
@@ -1407,8 +1412,8 @@ impl WorkerProcess {
             self.child.close_job();
         }
         self.quiesce_output_producers()?;
-        self.cleanup_session_tmpdir();
         self.report_denials();
+        self.finalized = true;
         Ok(())
     }
 
@@ -1448,17 +1453,47 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn cleanup_session_tmpdir(&self) {
-        let Some(path) = self.session_tmpdir.as_ref() else {
+    fn cleanup_session_tmpdir(&mut self) {
+        let Some(path) = self.session_tmpdir.take() else {
             return;
         };
         if !path.is_absolute() || path.as_path() == std::path::Path::new("/") {
             return;
         }
         cleanup_worker_session_tmpdir(
-            path,
+            &path,
             crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
         );
+    }
+
+    fn terminate_for_drop(&mut self) {
+        if self.exit_status.is_some() {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.exit_status = Some(status);
+            }
+            Ok(None) | Err(_) => {
+                let _ = self.send_sigkill();
+                if let Ok(status) = self.child.wait() {
+                    self.exit_status = Some(status);
+                }
+            }
+        }
+    }
+
+    fn stop_guardrail(&mut self) {
+        #[cfg(target_family = "unix")]
+        {
+            self.guardrail_stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.guardrail_thread_handle.as_ref() {
+                thread.unpark();
+            }
+            if let Some(handle) = self.guardrail_thread.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1498,6 +1533,7 @@ impl WorkerProcess {
             stderr_reader: None,
             expected_exit: false,
             exit_status: None,
+            finalized: false,
             #[cfg(target_family = "unix")]
             guardrail_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(target_family = "unix")]
@@ -1562,16 +1598,12 @@ pub(crate) fn cleanup_worker_session_tmpdir(
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        #[cfg(target_family = "unix")]
-        {
-            self.guardrail_stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.guardrail_thread_handle.as_ref() {
-                thread.unpark();
-            }
-            if let Some(handle) = self.guardrail_thread.take() {
-                let _ = handle.join();
-            }
+        self.stop_guardrail();
+        if !self.finalized {
+            self.terminate_for_drop();
+            let _ = self.finalize_terminated_process();
         }
+        self.cleanup_session_tmpdir();
     }
 }
 
@@ -2624,6 +2656,48 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&destination).expect("read destination log"),
             "worker startup log\n"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn drop_cleans_live_worker_session_tmpdir() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::write(session_tmpdir.join("marker"), "temp").expect("write temp marker");
+
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                let _ = libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn child");
+        let pid = child.id();
+        let mut process = WorkerProcess::new_for_test(child);
+        process.session_tmpdir = Some(session_tmpdir.clone());
+
+        drop(process);
+
+        let leaked_tmpdir = session_tmpdir.exists();
+        if leaked_tmpdir {
+            let _ = raw_unix_kill(-(pid as i32), libc::SIGKILL);
+            unsafe {
+                let _ = libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+            }
+            let _ = std::fs::remove_dir_all(&session_tmpdir);
+        }
+        assert!(
+            !leaked_tmpdir,
+            "dropping WorkerProcess should remove the session temp dir"
         );
     }
 

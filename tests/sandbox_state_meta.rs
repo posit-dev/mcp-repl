@@ -91,14 +91,21 @@ fn linux_sandbox_exe_value(use_legacy_landlock: bool) -> Value {
     }
 }
 
+fn sandbox_cwd_uri(sandbox_cwd: &Path) -> String {
+    url::Url::from_file_path(sandbox_cwd)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| panic!("failed to convert {} to file URI", sandbox_cwd.display()))
+}
+
 fn codex_sandbox_state_meta(
-    sandbox_policy: Value,
+    permission_profile: Value,
     sandbox_cwd: &Path,
     use_legacy_landlock: bool,
 ) -> Value {
+    let sandbox_cwd = sandbox_cwd_uri(sandbox_cwd);
     json!({
         SANDBOX_STATE_META_CAPABILITY: {
-            "sandboxPolicy": sandbox_policy,
+            "permissionProfile": permission_profile,
             "sandboxCwd": sandbox_cwd,
             "useLegacyLandlock": use_legacy_landlock,
             "codexLinuxSandboxExe": linux_sandbox_exe_value(use_legacy_landlock),
@@ -106,15 +113,78 @@ fn codex_sandbox_state_meta(
     })
 }
 
+fn root_read_entry() -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": { "kind": "root" }
+        },
+        "access": "read"
+    })
+}
+
+fn special_entry(kind: &str, access: &str) -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": { "kind": kind }
+        },
+        "access": access
+    })
+}
+
+fn protected_project_entry(subpath: &str) -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": {
+                "kind": "project_roots",
+                "subpath": subpath
+            }
+        },
+        "access": "read"
+    })
+}
+
+fn managed_profile(entries: Vec<Value>, network: &str) -> Value {
+    json!({
+        "type": "managed",
+        "file_system": {
+            "type": "restricted",
+            "entries": entries,
+        },
+        "network": network,
+    })
+}
+
+fn managed_unrestricted_profile(network: &str) -> Value {
+    json!({
+        "type": "managed",
+        "file_system": {
+            "type": "unrestricted",
+        },
+        "network": network,
+    })
+}
+
+fn workspace_write_profile() -> Value {
+    managed_profile(
+        vec![
+            root_read_entry(),
+            special_entry("project_roots", "write"),
+            special_entry("tmpdir", "write"),
+            special_entry("slash_tmp", "write"),
+            protected_project_entry(".git"),
+            protected_project_entry(".agents"),
+            protected_project_entry(".codex"),
+        ],
+        "restricted",
+    )
+}
+
 fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "workspace-write",
-            "writable_roots": [],
-            "network_access": false,
-            "exclude_tmpdir_env_var": false,
-            "exclude_slash_tmp": false,
-        }),
+        workspace_write_profile(),
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
     )
@@ -122,33 +192,41 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
 
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "workspace-write",
-            "writable_roots": [],
-            "network_access": false,
-            "exclude_tmpdir_env_var": false,
-            "exclude_slash_tmp": false,
-            "read_only_access": {
-                "mode": "read-only",
-            },
-        }),
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("project_roots", "write"),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "project_roots",
+                            "subpath": "restricted"
+                        }
+                    },
+                    "access": "read"
+                }),
+            ],
+            "restricted",
+        ),
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
     )
 }
 
 fn read_only_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(
+        managed_profile(vec![root_read_entry()], "restricted"),
+        sandbox_cwd,
+        false,
+    )
 }
 
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "read-only",
-            "access": {
-                "mode": "read-only",
-            },
-        }),
+        managed_profile(Vec::new(), "restricted"),
         sandbox_cwd,
         false,
     )
@@ -156,17 +234,33 @@ fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
 
 fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "read-only",
-            "network_access": true,
-        }),
+        managed_profile(vec![root_read_entry()], "enabled"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_unrestricted_profile("restricted"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn root_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![root_read_entry(), special_entry("root", "write")],
+            "restricted",
+        ),
         sandbox_cwd,
         false,
     )
 }
 
 fn full_access_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(json!({"type": "disabled"}), sandbox_cwd, false)
 }
 
 fn encode_path(path: &Path) -> TestResult<String> {
@@ -2489,7 +2583,7 @@ async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestR
         "expected restricted read metadata to be reported as an MCP tool error"
     );
     assert!(
-        text.contains("read_only_access"),
+        text.contains("read entry cannot be represented"),
         "expected restricted read metadata rejection, got: {text}"
     );
     assert!(
@@ -2524,7 +2618,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
         "expected restricted read-only metadata to be reported as an MCP tool error"
     );
     assert!(
-        text.contains("access"),
+        text.contains("without root read access"),
         "expected restricted read-only metadata rejection, got: {text}"
     );
     assert!(
@@ -2535,7 +2629,69 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<()> {
+async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(full_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected full-write restricted-network metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("full write access with restricted network access is not supported"),
+        "expected full-write restricted-network metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported full-write restricted-network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(root_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected root-write restricted-network metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("full write access with restricted network access is not supported"),
+        "expected root-write restricted-network metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported root-write restricted-network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_accepts_read_only_network_access_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2555,16 +2711,12 @@ async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<(
     }
     assert_eq!(
         result.is_error,
-        Some(true),
-        "expected read-only network metadata to be reported as an MCP tool error"
+        Some(false),
+        "expected read-only network metadata to be accepted"
     );
     assert!(
-        text.contains("network_access"),
-        "expected read-only network metadata rejection, got: {text}"
-    );
-    assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported read-only network metadata, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after read-only network metadata, got: {text}"
     );
     Ok(())
 }

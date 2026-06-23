@@ -595,7 +595,9 @@ mod tests {
             .expect("worker manager");
         manager
             .stage_sandbox_state_update(SandboxStateUpdate {
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::ReadOnly {
+                    network_access: false,
+                },
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -634,7 +636,9 @@ mod tests {
             .expect("worker manager");
         manager
             .stage_sandbox_state_update(SandboxStateUpdate {
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::ReadOnly {
+                    network_access: false,
+                },
                 sandbox_cwd: None,
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,
@@ -680,7 +684,9 @@ mod tests {
             .expect("worker manager");
         manager
             .stage_sandbox_state_update(SandboxStateUpdate {
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::ReadOnly {
+                    network_access: false,
+                },
                 sandbox_cwd: Some(sandbox_cwd.clone()),
                 use_linux_sandbox_bwrap: None,
                 use_legacy_landlock: None,

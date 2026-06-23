@@ -346,15 +346,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
@@ -417,15 +451,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
