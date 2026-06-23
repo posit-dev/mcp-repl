@@ -16,6 +16,9 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
+Prerelease tags may use only PyPI-compatible lowercase `aN`, `bN`, or `rcN`
+suffixes, for example `vX.Y.Z-rc1`.
+
 Pushing the tag starts `.github/workflows/release.yml`. The workflow validates
 that the tag matches the Cargo package version, runs the release check matrix,
 builds GitHub Release archives, builds PyPI wheels, smoke-tests installed

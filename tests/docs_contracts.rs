@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use regex_lite::Regex;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -327,7 +329,7 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "github.ref_type == 'tag'",
         "fetch-depth: 0",
         "Validate release tag matches Cargo version",
-        "^v[0-9]+(\\.[0-9]+){2}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+        "^v[0-9]+(\\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$",
         "Decide whether this tag should be latest",
         "id: latest_guard",
         "git tag --list",
@@ -403,6 +405,47 @@ fn release_workflow_defines_tag_only_publishing_contract() {
 }
 
 #[test]
+fn release_workflow_restricts_prerelease_tags_to_pypi_compatible_forms() {
+    let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    let release_tag_pattern = r"^v[0-9]+(\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$";
+    let prerelease_tag_pattern = r"^v[0-9]+(\.[0-9]+){2}-(a|b|rc)[0-9]+$";
+    let release_tag_regex =
+        Regex::new(release_tag_pattern).expect("release tag regex should compile");
+
+    for accepted in ["v1.2.3", "v1.2.3-a1", "v1.2.3-b2", "v1.2.3-rc10"] {
+        assert!(
+            release_tag_regex.is_match(accepted),
+            "{accepted} should be accepted"
+        );
+    }
+
+    for rejected in [
+        "v1.2.3-foo.1",
+        "v1.2.3-alpha.1",
+        "v1.2.3-rc.1",
+        "v1.2.3-dev",
+        "v1.2.3+local",
+    ] {
+        assert!(
+            !release_tag_regex.is_match(rejected),
+            "{rejected} should be rejected"
+        );
+    }
+
+    for required in [release_tag_pattern, prerelease_tag_pattern] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/release.yml"
+        );
+    }
+
+    assert!(
+        !workflow.contains(r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)"),
+        "release workflow should not accept arbitrary SemVer prerelease identifiers"
+    );
+}
+
+#[test]
 fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
     let docs = read(&repo_root().join("docs/releasing.md"));
 
@@ -411,6 +454,8 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "Update `Cargo.toml`",
         "`git tag vX.Y.Z`",
         "`git push origin vX.Y.Z`",
+        "`vX.Y.Z-rc1`",
+        "lowercase `aN`, `bN`, or `rcN`",
         "PyPI Trusted Publisher",
         "Owner: `posit-dev`",
         "Repository: `mcp-repl`",
