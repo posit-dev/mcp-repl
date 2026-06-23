@@ -150,6 +150,16 @@ fn managed_profile(entries: Vec<Value>, network: &str) -> Value {
     })
 }
 
+fn managed_unrestricted_profile(network: &str) -> Value {
+    json!({
+        "type": "managed",
+        "file_system": {
+            "type": "unrestricted",
+        },
+        "network": network,
+    })
+}
+
 fn workspace_write_profile() -> Value {
     managed_profile(
         vec![
@@ -218,6 +228,25 @@ fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
 fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(vec![root_read_entry()], "enabled"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_unrestricted_profile("restricted"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn root_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![root_read_entry(), special_entry("root", "write")],
+            "restricted",
+        ),
         sandbox_cwd,
         false,
     )
@@ -2587,6 +2616,68 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
     assert!(
         !text.contains("[1] 2"),
         "did not expect input to run after unsupported restricted read-only metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_full_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(full_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected full-write restricted-network metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("full write access with restricted network access is not supported"),
+        "expected full-write restricted-network metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported full-write restricted-network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_rejects_root_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(root_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected root-write restricted-network metadata to be reported as an MCP tool error"
+    );
+    assert!(
+        text.contains("full write access with restricted network access is not supported"),
+        "expected root-write restricted-network metadata rejection, got: {text}"
+    );
+    assert!(
+        !text.contains("[1] 2"),
+        "did not expect input to run after unsupported root-write restricted-network metadata, got: {text}"
     );
     Ok(())
 }

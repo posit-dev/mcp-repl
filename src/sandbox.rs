@@ -509,6 +509,9 @@ enum CodexFileSystemSpecialPath {
     SlashTmp,
 }
 
+const CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR: &str =
+    "Codex permissionProfile full write access with restricted network access is not supported";
+
 pub fn sandbox_state_update_from_codex_meta(
     meta: &serde_json::Value,
 ) -> Result<SandboxStateUpdate, String> {
@@ -593,9 +596,7 @@ fn sandbox_policy_from_codex_managed_profile(
             if network_access {
                 Ok(SandboxPolicy::DangerFullAccess)
             } else {
-                Ok(SandboxPolicy::ExternalSandbox {
-                    network_access: NetworkAccess::Restricted,
-                })
+                Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string())
             }
         }
         CodexManagedFileSystemPermissions::Restricted {
@@ -658,13 +659,10 @@ fn sandbox_policy_from_codex_restricted_entries(
 
     if projection.root_write {
         validate_root_write_projection(&projection)?;
-        return Ok(if network_access {
-            SandboxPolicy::DangerFullAccess
-        } else {
-            SandboxPolicy::ExternalSandbox {
-                network_access: NetworkAccess::Restricted,
-            }
-        });
+        if !network_access {
+            return Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string());
+        }
+        return Ok(SandboxPolicy::DangerFullAccess);
     }
 
     projection.writable_roots.sort();
