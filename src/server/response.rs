@@ -1304,19 +1304,21 @@ impl ActiveOutputBundle {
         let mut retained_items = Vec::with_capacity(items.len());
         let mut omitted_this_reply = false;
 
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             if self.omitted_tail {
                 match item {
-                    ReplyItem::WorkerText {
-                        text,
-                        stream,
-                        visibility,
-                    } if visibility.is_reply_visible() && !self.omitted_reply_visible_tail => {
-                        retained_items.push(ReplyItem::worker_text_with_visibility(
-                            text.clone(),
-                            *stream,
-                            *visibility,
-                        ));
+                    ReplyItem::WorkerText { visibility, .. }
+                        if visibility.is_reply_visible() && !self.omitted_reply_visible_tail =>
+                    {
+                        let future_reply_visible_reserve =
+                            reply_visible_worker_text_bundle_reserve(&items[index + 1..]);
+                        self.append_worker_text_item(
+                            store,
+                            &mut retained_items,
+                            &mut omitted_this_reply,
+                            item,
+                            future_reply_visible_reserve,
+                        )?;
                     }
                     ReplyItem::ServerText { text, stream } => {
                         retained_items.push(ReplyItem::server_text(text.clone(), *stream));
@@ -1330,27 +1332,19 @@ impl ActiveOutputBundle {
             }
 
             match item {
-                ReplyItem::WorkerText {
-                    text,
-                    stream,
-                    visibility,
-                } => {
-                    let append =
-                        self.append_worker_text_with_visibility(store, text, *stream, *visibility)?;
-                    if let Some(retained_item) = append {
-                        let partial_worker_text = matches!(
-                            &retained_item,
-                            ReplyItem::WorkerText { text: retained, .. } if retained.len() < text.len()
-                        );
-                        retained_items.push(retained_item);
-                        if partial_worker_text {
-                            omitted_this_reply = true;
-                            self.apply_omission(store, visibility.is_reply_visible())?;
-                        }
+                ReplyItem::WorkerText { visibility, .. } => {
+                    let future_reply_visible_reserve = if visibility.is_reply_visible() {
+                        0
                     } else {
-                        omitted_this_reply = true;
-                        self.apply_omission(store, visibility.is_reply_visible())?;
-                    }
+                        reply_visible_worker_text_bundle_reserve(&items[index + 1..])
+                    };
+                    self.append_worker_text_item(
+                        store,
+                        &mut retained_items,
+                        &mut omitted_this_reply,
+                        item,
+                        future_reply_visible_reserve,
+                    )?;
                 }
                 ReplyItem::ServerText { text, stream } => {
                     match self.append_server_text(store, text, *stream)? {
@@ -1379,6 +1373,46 @@ impl ActiveOutputBundle {
         })
     }
 
+    fn append_worker_text_item(
+        &mut self,
+        store: &mut OutputStore,
+        retained_items: &mut Vec<ReplyItem>,
+        omitted_this_reply: &mut bool,
+        item: &ReplyItem,
+        reserved_capacity_after: usize,
+    ) -> Result<(), WorkerError> {
+        let ReplyItem::WorkerText {
+            text,
+            stream,
+            visibility,
+        } = item
+        else {
+            unreachable!("append_worker_text_item only accepts worker text");
+        };
+        let append = self.append_worker_text_with_visibility(
+            store,
+            text,
+            *stream,
+            *visibility,
+            reserved_capacity_after,
+        )?;
+        if let Some(retained_item) = append {
+            let partial_worker_text = matches!(
+                &retained_item,
+                ReplyItem::WorkerText { text: retained, .. } if retained.len() < text.len()
+            );
+            retained_items.push(retained_item);
+            if partial_worker_text {
+                *omitted_this_reply = true;
+                self.apply_omission(store, visibility.is_reply_visible())?;
+            }
+        } else {
+            *omitted_this_reply = true;
+            self.apply_omission(store, visibility.is_reply_visible())?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn append_worker_text(
         &mut self,
@@ -1391,6 +1425,7 @@ impl ActiveOutputBundle {
             text,
             stream,
             ContentVisibility::ReplyAndTranscript,
+            0,
         )
     }
 
@@ -1400,6 +1435,7 @@ impl ActiveOutputBundle {
         text: &str,
         stream: TextStream,
         visibility: ContentVisibility,
+        reserved_capacity_after: usize,
     ) -> Result<Option<ReplyItem>, WorkerError> {
         if text.is_empty() {
             return Ok(None);
@@ -1414,9 +1450,10 @@ impl ActiveOutputBundle {
         } else {
             usize::from(self.has_events_log()) * omission_event_line_len()
         };
+        let reserved_capacity_after = reserved_capacity_after.saturating_add(omission_reserve);
         let granted = store.prepare_append_capacity(
             self.id,
-            (text.len() + TEXT_ROW_OVERHEAD_BYTES + omission_reserve) as u64,
+            (text.len() + TEXT_ROW_OVERHEAD_BYTES + reserved_capacity_after) as u64,
         )? as usize;
         if granted == 0 {
             return Ok(None);
@@ -1436,9 +1473,9 @@ impl ActiveOutputBundle {
             let end_byte = start_byte.saturating_add(retained.len());
             let row = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
             let reserve = if retained.len() < text.len() {
-                omission_reserve
+                reserved_capacity_after
             } else {
-                0
+                reserved_capacity_after.saturating_sub(omission_reserve)
             };
             if retained
                 .len()
@@ -2051,6 +2088,22 @@ fn reply_visible_worker_text_from_items(items: &[ReplyItem]) -> String {
         }
     }
     out
+}
+
+fn reply_visible_worker_text_bundle_reserve(items: &[ReplyItem]) -> usize {
+    items.iter().fold(0usize, |reserve, item| {
+        if let ReplyItem::WorkerText {
+            text, visibility, ..
+        } = item
+            && visibility.is_reply_visible()
+        {
+            reserve
+                .saturating_add(text.len())
+                .saturating_add(TEXT_ROW_OVERHEAD_BYTES)
+        } else {
+            reserve
+        }
+    })
 }
 
 fn compact_text_bundle_items(
