@@ -510,6 +510,52 @@ async fn write_stdin_files_bundle_uses_full_input_echo_transcript() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_hidden_echo_quota_omission_keeps_later_visible_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![(
+        "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+        "2048".to_string(),
+    )])
+    .await?;
+
+    let huge_value = "q".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_quota_assignment <- {huge_literal}\ncat('VISIBLE_DONE\\n')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden echo quota truncation to disclose a bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("later content omitted"),
+        "expected the bundle notice to report quota truncation, got: {text:?}"
+    );
+    assert!(
+        text.contains("VISIBLE_DONE"),
+        "expected later visible stdout to survive hidden echo truncation, got: {text:?}"
+    );
+    assert!(
+        !text.contains("hidden_quota_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> hidden_quota_assignment <- "),
+        "expected transcript.txt to include the retained generated input echo, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_hidden_only_echo_spill_uses_clean_bundle_notice() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;

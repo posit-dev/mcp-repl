@@ -68,6 +68,7 @@ struct ActiveOutputBundle {
     transcript_lines: usize,
     transcript_has_partial_line: bool,
     omitted_tail: bool,
+    omitted_reply_visible_tail: bool,
     omission_recorded: bool,
     pre_index_image_paths: Vec<String>,
     disclosed: bool,
@@ -994,6 +995,7 @@ impl OutputStore {
             transcript_lines: 0,
             transcript_has_partial_line: false,
             omitted_tail: false,
+            omitted_reply_visible_tail: false,
             omission_recorded: false,
             pre_index_image_paths: Vec::new(),
             disclosed: false,
@@ -1304,8 +1306,25 @@ impl ActiveOutputBundle {
 
         for item in items {
             if self.omitted_tail {
-                if let ReplyItem::ServerText { text, stream } = item {
-                    retained_items.push(ReplyItem::server_text(text.clone(), *stream));
+                match item {
+                    ReplyItem::WorkerText {
+                        text,
+                        stream,
+                        visibility,
+                    } if visibility.is_reply_visible() && !self.omitted_reply_visible_tail => {
+                        retained_items.push(ReplyItem::worker_text_with_visibility(
+                            text.clone(),
+                            *stream,
+                            *visibility,
+                        ));
+                    }
+                    ReplyItem::ServerText { text, stream } => {
+                        retained_items.push(ReplyItem::server_text(text.clone(), *stream));
+                    }
+                    ReplyItem::Image(image) if !self.omitted_reply_visible_tail => {
+                        retained_items.push(ReplyItem::Image(image.clone()));
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -1326,11 +1345,11 @@ impl ActiveOutputBundle {
                         retained_items.push(retained_item);
                         if partial_worker_text {
                             omitted_this_reply = true;
-                            self.apply_omission(store)?;
+                            self.apply_omission(store, visibility.is_reply_visible())?;
                         }
                     } else {
                         omitted_this_reply = true;
-                        self.apply_omission(store)?;
+                        self.apply_omission(store, visibility.is_reply_visible())?;
                     }
                 }
                 ReplyItem::ServerText { text, stream } => {
@@ -1338,7 +1357,7 @@ impl ActiveOutputBundle {
                         Some(retained_item) => retained_items.push(retained_item),
                         None => {
                             omitted_this_reply = true;
-                            self.apply_omission(store)?;
+                            self.apply_omission(store, false)?;
                             retained_items.push(ReplyItem::server_text(text.clone(), *stream));
                         }
                     }
@@ -1348,7 +1367,7 @@ impl ActiveOutputBundle {
                         retained_items.push(retained_item);
                     } else {
                         omitted_this_reply = true;
-                        self.apply_omission(store)?;
+                        self.apply_omission(store, true)?;
                     }
                 }
             }
@@ -1581,8 +1600,13 @@ impl ActiveOutputBundle {
         Ok(Some(ReplyItem::Image(image.clone())))
     }
 
-    fn apply_omission(&mut self, store: &mut OutputStore) -> Result<(), WorkerError> {
+    fn apply_omission(
+        &mut self,
+        store: &mut OutputStore,
+        reply_visible: bool,
+    ) -> Result<(), WorkerError> {
         self.omitted_tail = true;
+        self.omitted_reply_visible_tail |= reply_visible;
         if self.omission_recorded || !self.has_events_log() {
             return Ok(());
         }
@@ -5137,7 +5161,7 @@ mod tests {
             .expect("bundle metadata should exist");
 
         bundle
-            .apply_omission(&mut store)
+            .apply_omission(&mut store, true)
             .expect("omission should degrade to inline state");
 
         let events_after =
