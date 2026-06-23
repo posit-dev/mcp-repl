@@ -191,6 +191,79 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn generated_input_echo_stays_hidden_on_follow_up_page() -> TestResult<()> {
+    let page_bytes = 64;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let input = "cat(paste(rep('A', 70), collapse='')); cat('\\n')\necho_late_hidden <- 123\ncat('TAIL_VISIBLE'); cat(paste(rep('B', 120), collapse='')); cat('\\n')";
+
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let mut first_text = result_text(&result);
+    if backend_unavailable(&first_text) {
+        eprintln!("pager_page_size backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    if busy_response(&first_text) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            first_text = text;
+            if !busy_response(&first_text) {
+                break;
+            }
+        }
+    }
+    assert!(
+        !busy_response(&first_text),
+        "pager_page_size worker remained busy after waiting for completion: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("--More--"),
+        "expected the initial reply to activate pager mode, got: {first_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let next_text = result_text(&next);
+    let tail_page = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let tail_text = result_text(&tail_page);
+
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("AAAAAA"),
+        "expected the first follow-up page to finish the leading output line, got: {next_text:?}"
+    );
+    assert!(
+        !next_text.contains("echo_late_hidden"),
+        "generated input echo should stay hidden on follow-up pager pages, got: {next_text:?}"
+    );
+    assert!(
+        tail_text.contains("TAIL_VISIBLE"),
+        "expected the second follow-up page to include later visible output, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains("echo_late_hidden") && !tail_text.contains("cat('TAIL_VISIBLE')"),
+        "generated input echoes should stay hidden on later pager pages, got: {tail_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_large_page_size() -> TestResult<()> {
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;

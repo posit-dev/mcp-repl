@@ -71,7 +71,6 @@ impl OutputEventKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputEchoVisibility {
-    ReplyAndTranscript,
     TranscriptOnly,
 }
 
@@ -185,7 +184,6 @@ fn push_generated_echo(
         return;
     }
     let next = match visibility {
-        InputEchoVisibility::ReplyAndTranscript => WorkerContent::worker_stdout(text.to_string()),
         InputEchoVisibility::TranscriptOnly => {
             WorkerContent::worker_stdout_transcript_only(text.to_string())
         }

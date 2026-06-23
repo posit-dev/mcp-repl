@@ -203,7 +203,7 @@ impl PagerBuffer {
         self.contents_for_range_with_input_echo_visibility(
             start_offset,
             end_offset,
-            InputEchoVisibility::ReplyAndTranscript,
+            InputEchoVisibility::TranscriptOnly,
         )
     }
 
@@ -1550,7 +1550,7 @@ impl Pager {
                             &mut state.buffer,
                             page_bytes,
                             &mut state.seen_ranges,
-                            InputEchoVisibility::ReplyAndTranscript,
+                            InputEchoVisibility::TranscriptOnly,
                         );
                         CommandOutcome::page(contents, pages_left, is_error, span)
                     }
@@ -1636,7 +1636,7 @@ pub(crate) fn maybe_activate_and_append_footer(
 
 #[cfg(test)]
 pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
-    resolved_output::contents_from_output_range(range, InputEchoVisibility::ReplyAndTranscript)
+    resolved_output::contents_from_output_range(range, InputEchoVisibility::TranscriptOnly)
 }
 
 pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
@@ -1875,7 +1875,7 @@ fn take_next_pages(
             buffer,
             target_bytes,
             seen,
-            InputEchoVisibility::ReplyAndTranscript,
+            InputEchoVisibility::TranscriptOnly,
         );
         pages_left = left;
         if page_contents.is_empty() {
@@ -1979,7 +1979,7 @@ fn skip_pages_and_take_next(
         buffer,
         page_bytes,
         seen,
-        InputEchoVisibility::ReplyAndTranscript,
+        InputEchoVisibility::TranscriptOnly,
     )
 }
 
