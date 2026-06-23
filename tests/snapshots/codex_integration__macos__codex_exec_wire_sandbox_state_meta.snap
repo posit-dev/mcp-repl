@@ -33,14 +33,8 @@ expression: snapshot
             "sandbox": "<SANDBOX_BACKEND>"
           },
           "codex/sandbox-state-meta": {
-            "sandboxPolicy": {
-              "type": "workspace-write",
-              "network_access": false,
-              "exclude_tmpdir_env_var": false,
-              "exclude_slash_tmp": false
-            },
             "codexLinuxSandboxExe": null,
-            "sandboxCwd": "<WORKSPACE>",
+            "sandboxCwd": "file://<WORKSPACE>",
             "useLegacyLandlock": false
           }
         },
