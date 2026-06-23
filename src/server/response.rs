@@ -2261,6 +2261,9 @@ fn render_active_bundle_contents(
         retained_image_count > 0 || !retained_worker_text.is_empty();
     let image_bundle_still_needed = active.next_image_number > 0
         && should_use_output_bundle(active.history_image_count, spill_worker_text_chars);
+    let retained_images_need_inline_cap = active.omitted_tail
+        && active.next_image_number == 0
+        && retained_image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD;
 
     if append.omitted_this_reply {
         active.disclosed = true;
@@ -2273,6 +2276,8 @@ fn render_active_bundle_contents(
                 active,
             ))
         }
+    } else if retained_images_need_inline_cap {
+        Ok(compact_output_without_bundle_items(&append.retained_items))
     } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
         Ok(compact_output_bundle_items(bundle_items, active))
@@ -4911,6 +4916,65 @@ mod tests {
         assert!(
             !images.is_empty() && images.len() <= 2,
             "expected quota-truncated image bundle to keep only compact anchor previews, got {} images",
+            images.len()
+        );
+    }
+
+    #[test]
+    fn transcript_only_omission_caps_later_images_without_image_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_bytes = 1;
+
+        let oversized_transcript_only = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let initial = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout_transcript_only(
+                    oversized_transcript_only,
+                )],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let initial_text = result_text(&initial);
+        assert!(
+            initial_text.contains("later content omitted"),
+            "expected transcript-only quota omission to be disclosed, got: {initial_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected omitted timeout bundle to stay active"
+        );
+
+        let later_image_count = super::IMAGE_OUTPUT_BUNDLE_THRESHOLD + 3;
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                (0..later_image_count)
+                    .map(|index| WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                        mime_type: "image/png".to_string(),
+                        id: format!("later-{index}"),
+                        is_new: true,
+                    })
+                    .collect(),
+                Some(WorkerErrorCode::Timeout),
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected compact image fallback notice, got: {text:?}"
+        );
+        assert!(
+            !images.is_empty() && images.len() <= 2,
+            "expected later images after transcript-only omission to stay capped, got {} images",
             images.len()
         );
     }
