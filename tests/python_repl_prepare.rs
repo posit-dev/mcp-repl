@@ -2,6 +2,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use common::TestResult;
 use serde_json::{Value, json};
@@ -124,6 +125,11 @@ struct RealUv {
     stdlib_venv: PathBuf,
 }
 
+fn real_uv_test_mutex() -> &'static tokio::sync::Mutex<()> {
+    static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 impl RealUv {
     fn new() -> TestResult<Self> {
         ensure_uv_available()?;
@@ -134,6 +140,12 @@ impl RealUv {
             _tempdir: tempdir,
             stdlib_venv,
         })
+    }
+
+    async fn locked_new() -> TestResult<(tokio::sync::MutexGuard<'static, ()>, Self)> {
+        let guard = real_uv_test_mutex().lock().await;
+        let uv = Self::new()?;
+        Ok((guard, uv))
     }
 
     fn env_vars(&self) -> TestResult<Vec<(String, String)>> {
@@ -192,7 +204,7 @@ fn assert_manifest_packages(text: &str, packages: &[&str]) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_tool_listing_is_gated_by_uv() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let tool_names = session.list_tool_names().await?;
     session.cancel().await?;
@@ -225,7 +237,7 @@ async fn r_tool_listing_keeps_repl_reset() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_schema_exposes_manifest_action_and_restart_enums() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let tools = session.list_tools().await?;
     session.cancel().await?;
@@ -255,7 +267,7 @@ async fn repl_prepare_schema_exposes_manifest_action_and_restart_enums() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let absolute = current_python_executable()?;
     let absolute = absolute.to_string_lossy().to_string();
@@ -308,7 +320,7 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let executable = current_python_executable()?;
 
@@ -340,7 +352,7 @@ async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let (major, minor, patch) = current_python_version()?;
     let major_minor = format!("{major}.{minor}");
@@ -386,7 +398,7 @@ async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
         uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
@@ -498,7 +510,7 @@ async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_preserves_current_python_when_manifest_available() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let numpy_python = uv_env.managed_python(&["numpy"])?;
     let session =
         common::spawn_python_server_with_files_env_vars(uv_env.env_vars_with_python(numpy_python)?)
@@ -539,7 +551,7 @@ async fn repl_prepare_preserves_current_python_when_manifest_available() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
         uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
@@ -595,7 +607,7 @@ async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
         uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
@@ -643,7 +655,7 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let numpy_python = uv_env.managed_python(&["numpy"])?;
     let session =
         common::spawn_python_server_with_files_env_vars(uv_env.env_vars_with_python(numpy_python)?)
@@ -684,7 +696,7 @@ async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
         uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
@@ -735,7 +747,7 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(
         uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
@@ -781,7 +793,7 @@ async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_preserves_matching_executable_session() -> TestResult<()> {
-    let uv_env = RealUv::new()?;
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let executable = current_python_executable()?;
 
