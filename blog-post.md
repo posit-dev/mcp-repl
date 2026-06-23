@@ -11,8 +11,9 @@ sandboxed, persistent R or Python REPL.
 
 It is built for model-facing workflows rather than human-facing
 consoles. The session keeps state across tool calls, returns plots
-through MCP, renders help in-band, supports debugger interaction, bounds
-large outputs, and provides explicit interrupt and reset controls.
+through MCP, renders help in-band, supports debugger interaction, keeps
+large outputs bounded, and provides explicit interrupt and reset
+controls.
 
 The goal is narrow: give agents the interactive affordances that make R
 and Python useful for real data work, without turning the runtime into
@@ -81,6 +82,7 @@ interactive work:
 
 - stateful execution across tool calls
 - bounded, model-oriented output
+- smart echo behavior for concise transcripts
 - plot capture through MCP
 - R help, vignettes, and manuals in-band
 - Python help through `help()`, `dir()`, and `pydoc`
@@ -99,22 +101,23 @@ work with less supervision. It is especially useful for unattended or
 lightly supervised workflows, where you launch an agent and come back
 later.
 
-Good fits include:
+Use `mcp-repl` when you want to:
 
-- producing recurring reports with LLM assistance, such as analyzing
-  last week’s sales data, finding what changed, and drafting a report
-  that highlights fresh, surprising, or concerning trends
-- evaluating agent capability on data-analysis tasks, such as conducting
-  evals with tools like [Inspect](https://inspect.aisi.org.uk)
-- commissioning initial reconnaissance work, such as exploring a
+- ask an agent to produce recurring reports, such as analyzing last
+  week’s sales data, finding what changed, and drafting a report that
+  highlights fresh, surprising, or concerning trends
+- give an eval harness a realistic R or Python runtime for measuring
+  agent capability on data-analysis tasks, using tools like
+  [Inspect](https://inspect.aisi.org.uk)
+- ask an agent to do initial reconnaissance, such as exploring a
   dataset, checking data quality, identifying strong signals, and
   suggesting the next analyses worth running
-- debugging R or Python projects autonomously, such as reproducing a
+- ask an agent to debug an R or Python project, such as reproducing a
   failing package example, inspecting live objects, stepping through the
   debugger, and proposing a minimal fix
-- preparing artifacts for human review, such as privately iterating on
-  analysis code, plots, and summary tables before returning final
-  results with caveats
+- ask an agent to prepare artifacts for review, such as privately
+  iterating on analysis code, plots, and summary tables before returning
+  final results with caveats
 
 Because the runtime may be used unattended, the sandbox is part of the
 product rather than an optional layer around it.
