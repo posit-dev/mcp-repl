@@ -2000,7 +2000,77 @@ tryCatch({
             ] {
                 normalized = normalized.replace(needle, replacement);
             }
+            normalized = normalized.replace("file://<WORKSPACE>", "<WORKSPACE>");
+            normalized = normalized.replace("file://<CODEX_HOME>", "<CODEX_HOME>");
             normalize_temp_paths(&normalize_codex_home_path(&normalized))
+        }
+
+        fn normalized_permission_profile_policy(profile: &Value) -> Option<Value> {
+            match profile.get("type")?.as_str()? {
+                "disabled" | "danger-full-access" => Some(serde_json::json!({
+                    "type": "danger-full-access"
+                })),
+                "read-only" => Some(serde_json::json!({
+                    "type": "read-only"
+                })),
+                "managed" => {
+                    let file_system = profile.get("file_system")?;
+                    match file_system.get("type")?.as_str()? {
+                        "read-only" => Some(serde_json::json!({
+                            "type": "read-only"
+                        })),
+                        "unrestricted" => Some(serde_json::json!({
+                            "type": "external-sandbox",
+                            "network_access": if matches!(
+                                profile.get("network").and_then(Value::as_str),
+                                Some("enabled" | "unrestricted" | "full" | "allowed")
+                            ) {
+                                "enabled"
+                            } else {
+                                "restricted"
+                            }
+                        })),
+                        "restricted" => {
+                            let entries = file_system.get("entries")?.as_array()?;
+                            let mut has_write = false;
+                            let mut allows_tmpdir = false;
+                            let mut allows_slash_tmp = false;
+                            for entry in entries {
+                                if entry.get("access").and_then(Value::as_str) != Some("write") {
+                                    continue;
+                                }
+                                has_write = true;
+                                let kind = entry
+                                    .get("path")
+                                    .and_then(|path| path.get("value"))
+                                    .and_then(|value| value.get("kind"))
+                                    .and_then(Value::as_str);
+                                match kind {
+                                    Some("tmpdir") => allows_tmpdir = true,
+                                    Some("slash_tmp") => allows_slash_tmp = true,
+                                    _ => {}
+                                }
+                            }
+                            if !has_write {
+                                return Some(serde_json::json!({
+                                    "type": "read-only"
+                                }));
+                            }
+                            Some(serde_json::json!({
+                                "type": "workspace-write",
+                                "network_access": matches!(
+                                    profile.get("network").and_then(Value::as_str),
+                                    Some("enabled" | "unrestricted" | "full" | "allowed")
+                                ),
+                                "exclude_tmpdir_env_var": !allows_tmpdir,
+                                "exclude_slash_tmp": !allows_slash_tmp,
+                            }))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
         }
 
         fn normalize_inner(
@@ -2018,6 +2088,12 @@ tryCatch({
                             continue;
                         }
                         if normalized_key == "permissionProfile" {
+                            if path_matches(path, &["codex/sandbox-state-meta"])
+                                && !map.contains_key("sandboxPolicy")
+                                && let Some(policy) = normalized_permission_profile_policy(&child)
+                            {
+                                map.insert("sandboxPolicy".to_string(), policy);
+                            }
                             continue;
                         }
                         if normalized_key == "turn_started_at_unix_ms" {

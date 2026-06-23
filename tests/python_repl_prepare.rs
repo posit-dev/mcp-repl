@@ -1,8 +1,7 @@
 mod common;
 
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use common::TestResult;
 use serde_json::{Value, json};
@@ -33,182 +32,107 @@ fn venv_python(venv: &Path) -> PathBuf {
     }
 }
 
-fn create_venv(root: &Path, name: &str, packages: &[&str]) -> TestResult<PathBuf> {
-    let python = current_python_executable()?;
-    let venv = root.join(name);
-    let status = Command::new(&python)
-        .args(["-m", "venv"])
-        .arg(&venv)
-        .status()?;
-    if !status.success() {
-        return Err(format!("failed to create test venv at {}", venv.display()).into());
-    }
+const EXTRA_PACKAGE: &str = "packaging";
 
-    let venv_python = venv_python(&venv);
-    let output = Command::new(&venv_python)
-        .args([
-            "-c",
-            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-        ])
+fn run_uv(mut command: Command, context: impl Into<String>) -> TestResult<Output> {
+    let context = context.into();
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("{context}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(output)
+}
+
+fn ensure_uv_available() -> TestResult<()> {
+    let mut command = Command::new("uv");
+    command.arg("--version");
+    run_uv(command, "uv is required for python repl_prepare tests")?;
+    Ok(())
+}
+
+fn create_venv(root: &Path, name: &str) -> TestResult<PathBuf> {
+    let venv = root.join(name);
+    let mut command = Command::new("uv");
+    command.args(["venv", "--no-project"]).arg(&venv);
+    run_uv(
+        command,
+        format!("failed to create test venv at {}", venv.display()),
+    )?;
+    Ok(venv)
+}
+
+fn resolve_uv_python(packages: &[&str], python_version: Option<&str>) -> TestResult<PathBuf> {
+    let mut command = Command::new("uv");
+    command.args(["tool", "run", "--isolated"]);
+    if let Some(python_version) = python_version {
+        command.arg("--python").arg(python_version);
+    }
+    for package in packages {
+        command.arg("--with").arg(package);
+    }
+    command.args([
+        "--",
+        "python",
+        "-I",
+        "-c",
+        "import sys; print(sys.executable)",
+    ]);
+    let output = run_uv(command, "failed to resolve uv-managed Python")?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let executable = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("uv did not report a Python executable")?;
+    Ok(PathBuf::from(executable.trim()))
+}
+
+fn current_python_version() -> TestResult<(u32, u32, u32)> {
+    let output = Command::new(current_python_executable()?)
+        .args(["-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
+        .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to locate test venv site-packages: {}",
+            "failed to resolve current Python version: {}",
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
     }
-    let site_packages = PathBuf::from(String::from_utf8(output.stdout)?.trim().to_string());
-    for package in packages {
-        let package_dir = site_packages.join(package);
-        fs::create_dir_all(&package_dir)?;
-        fs::write(
-            package_dir.join("__init__.py"),
-            format!("MARKER = {package:?}\n"),
-        )?;
-        let dist_info_dir = site_packages.join(format!("{package}-1.0.dist-info"));
-        fs::create_dir_all(&dist_info_dir)?;
-        fs::write(
-            dist_info_dir.join("METADATA"),
-            format!("Name: {package}\nVersion: 1.0\n"),
-        )?;
-    }
-
-    Ok(venv)
-}
-
-#[cfg(unix)]
-fn make_executable(path: &Path) -> TestResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> TestResult<()> {
-    Ok(())
-}
-
-fn write_fake_uv(bin_dir: &Path) -> TestResult<PathBuf> {
-    fs::create_dir_all(bin_dir)?;
-    let uv = if cfg!(windows) {
-        bin_dir.join("uv.cmd")
+    let stdout = String::from_utf8(output.stdout)?;
+    let parts = stdout
+        .trim()
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let [major, minor, patch] = parts.as_slice() {
+        Ok((*major, *minor, *patch))
     } else {
-        bin_dir.join("uv")
-    };
-
-    if cfg!(windows) {
-        fs::write(
-            &uv,
-            r#"@echo off
-set venv=%MCP_REPL_TEST_STDLIB_VENV%
-set wants_numpy=
-set wants_plotnine=
-:loop
-if "%~1"=="" goto run
-if "%~1"=="--with" (
-  shift
-  if "%~1"=="numpy" set wants_numpy=1
-  if "%~1"=="plotnine" set wants_plotnine=1
-  shift
-  goto loop
-)
-if "%~1"=="--" (
-  shift
-  goto run
-)
-shift
-goto loop
-:run
-if defined wants_numpy set venv=%MCP_REPL_TEST_NUMPY_VENV%
-if defined wants_plotnine set venv=%MCP_REPL_TEST_PLOTNINE_VENV%
-if defined wants_numpy if defined wants_plotnine set venv=%MCP_REPL_TEST_NUMPY_PLOTNINE_VENV%
-if "%~1"=="python" shift
-call "%venv%\Scripts\python.exe" %*
-"#,
-        )?;
-    } else {
-        fs::write(
-            &uv,
-            r#"#!/bin/sh
-set -eu
-if [ -n "${MCP_REPL_TEST_UV_LOG:-}" ]; then
-  printf '%s\n' "$*" >> "$MCP_REPL_TEST_UV_LOG"
-fi
-venv="$MCP_REPL_TEST_STDLIB_VENV"
-wants_numpy=
-wants_plotnine=
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --with)
-      shift
-      case "${1:-}" in
-        numpy) wants_numpy=1 ;;
-        plotnine) wants_plotnine=1 ;;
-      esac
-      ;;
-    --)
-      shift
-      break
-      ;;
-  esac
-  shift
-done
-if [ -n "$wants_numpy" ]; then
-  venv="$MCP_REPL_TEST_NUMPY_VENV"
-fi
-if [ -n "$wants_plotnine" ]; then
-  venv="$MCP_REPL_TEST_PLOTNINE_VENV"
-fi
-if [ -n "$wants_numpy" ] && [ -n "$wants_plotnine" ]; then
-  venv="$MCP_REPL_TEST_NUMPY_PLOTNINE_VENV"
-fi
-if [ -n "${MCP_REPL_TEST_UV_LOG:-}" ]; then
-  printf 'venv=%s\n' "$venv" >> "$MCP_REPL_TEST_UV_LOG"
-fi
-if [ "${1:-}" = "python" ]; then
-  shift
-fi
-exec "$venv/bin/python" "$@"
-"#,
-        )?;
-        make_executable(&uv)?;
+        Err(format!("unexpected Python version output: {stdout:?}").into())
     }
-
-    Ok(uv)
 }
 
-struct FakeUv {
+struct RealUv {
     _tempdir: tempfile::TempDir,
-    bin_dir: PathBuf,
     stdlib_venv: PathBuf,
-    numpy_venv: PathBuf,
-    plotnine_venv: PathBuf,
-    numpy_plotnine_venv: PathBuf,
-    log_path: PathBuf,
 }
 
-impl FakeUv {
+impl RealUv {
     fn new() -> TestResult<Self> {
+        ensure_uv_available()?;
         let tempdir = tempfile::tempdir()?;
         let root = tempdir.path();
-        let stdlib_venv = create_venv(root, "stdlib", &[])?;
-        let numpy_venv = create_venv(root, "numpy", &["numpy"])?;
-        let plotnine_venv = create_venv(root, "plotnine", &["plotnine"])?;
-        let numpy_plotnine_venv = create_venv(root, "numpy-plotnine", &["numpy", "plotnine"])?;
-        let bin_dir = root.join("bin");
-        let log_path = root.join("uv.log");
-        write_fake_uv(&bin_dir)?;
+        let stdlib_venv = create_venv(root, "stdlib")?;
         Ok(Self {
             _tempdir: tempdir,
-            bin_dir,
             stdlib_venv,
-            numpy_venv,
-            plotnine_venv,
-            numpy_plotnine_venv,
-            log_path,
         })
     }
 
@@ -217,42 +141,14 @@ impl FakeUv {
     }
 
     fn env_vars_with_python(&self, python: PathBuf) -> TestResult<Vec<(String, String)>> {
-        let mut path_entries = vec![self.bin_dir.clone()];
-        if let Some(path) = std::env::var_os("PATH") {
-            path_entries.extend(std::env::split_paths(&path));
-        }
-        let path = std::env::join_paths(path_entries)?;
-        Ok(vec![
-            ("PATH".to_string(), path.to_string_lossy().to_string()),
-            (
-                "MCP_REPL_PYTHON_EXECUTABLE".to_string(),
-                python.to_string_lossy().to_string(),
-            ),
-            (
-                "MCP_REPL_TEST_STDLIB_VENV".to_string(),
-                self.stdlib_venv.to_string_lossy().to_string(),
-            ),
-            (
-                "MCP_REPL_TEST_NUMPY_VENV".to_string(),
-                self.numpy_venv.to_string_lossy().to_string(),
-            ),
-            (
-                "MCP_REPL_TEST_PLOTNINE_VENV".to_string(),
-                self.plotnine_venv.to_string_lossy().to_string(),
-            ),
-            (
-                "MCP_REPL_TEST_NUMPY_PLOTNINE_VENV".to_string(),
-                self.numpy_plotnine_venv.to_string_lossy().to_string(),
-            ),
-            (
-                "MCP_REPL_TEST_UV_LOG".to_string(),
-                self.log_path.to_string_lossy().to_string(),
-            ),
-        ])
+        Ok(vec![(
+            "MCP_REPL_PYTHON_EXECUTABLE".to_string(),
+            python.to_string_lossy().to_string(),
+        )])
     }
 
-    fn uv_log(&self) -> TestResult<String> {
-        Ok(fs::read_to_string(&self.log_path).unwrap_or_default())
+    fn managed_python(&self, packages: &[&str]) -> TestResult<PathBuf> {
+        resolve_uv_python(packages, None)
     }
 }
 
@@ -296,8 +192,8 @@ fn assert_manifest_packages(text: &str, packages: &[&str]) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_tool_listing_is_gated_by_uv() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let tool_names = session.list_tool_names().await?;
     session.cancel().await?;
 
@@ -329,8 +225,8 @@ async fn r_tool_listing_keeps_repl_reset() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_schema_exposes_manifest_action_and_restart_enums() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let tools = session.list_tools().await?;
     session.cancel().await?;
 
@@ -359,8 +255,8 @@ async fn repl_prepare_schema_exposes_manifest_action_and_restart_enums() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let absolute = current_python_executable()?;
     let absolute = absolute.to_string_lossy().to_string();
 
@@ -380,7 +276,7 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
             json!({
                 "python": {
                     "executable": absolute.clone(),
-                    "venv": fake_uv.stdlib_venv.to_string_lossy()
+                    "venv": uv_env.stdlib_venv.to_string_lossy()
                 }
             }),
         )
@@ -412,8 +308,8 @@ async fn repl_prepare_rejects_invalid_shapes() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let executable = current_python_executable()?;
 
     let executable_result =
@@ -428,7 +324,7 @@ async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
 
     let venv_result = call_prepare(
         &session,
-        json!({ "python": { "venv": fake_uv.stdlib_venv.to_string_lossy() } }),
+        json!({ "python": { "venv": uv_env.stdlib_venv.to_string_lossy() } }),
     )
     .await?;
     let venv_text = common::result_text(&venv_result);
@@ -444,16 +340,24 @@ async fn repl_prepare_accepts_executable_and_venv_paths() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
+    let (major, minor, patch) = current_python_version()?;
+    let major_minor = format!("{major}.{minor}");
+    let exact = format!("{major}.{minor}.{patch}");
+    let range = format!(">={major_minor},<{major}.{}", minor + 1);
 
-    for python_version in ["3.11", "3.11.4", ">=3.11,<3.13"] {
+    for (python_version, expected_version) in [
+        (major_minor.clone(), format!("PY_VERSION:{major}.{minor}.")),
+        (exact.clone(), format!("PY_VERSION:{exact}")),
+        (range, format!("PY_VERSION:{major}.{minor}.")),
+    ] {
         let result = call_prepare(
             &session,
             json!({
                 "requirements": {
                     "packages": [],
-                    "python_version": python_version,
+                    "python_version": python_version.as_str(),
                     "action": "set"
                 }
             }),
@@ -464,24 +368,27 @@ async fn repl_prepare_forwards_python_version_values_to_uv() -> TestResult<()> {
             Some(true),
             "prepare failed for {python_version}"
         );
+        let probe = session
+            .write_stdin_raw_with(
+                "import sys; print('PY_VERSION:%d.%d.%d' % sys.version_info[:3])",
+                Some(5.0),
+            )
+            .await?;
+        let probe_text = common::result_text(&probe);
+        assert!(
+            probe_text.contains(&expected_version),
+            "expected {python_version} to produce {expected_version}, got: {probe_text:?}"
+        );
     }
     session.cancel().await?;
-
-    let uv_log = fake_uv.uv_log()?;
-    assert!(uv_log.contains("--python 3.11"), "uv log: {uv_log:?}");
-    assert!(uv_log.contains("--python 3.11.4"), "uv log: {uv_log:?}");
-    assert!(
-        uv_log.contains("--python >=3.11,<3.13"),
-        "uv log: {uv_log:?}"
-    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
+    let uv_env = RealUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
     .await?;
 
@@ -493,11 +400,14 @@ async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestRe
     );
     assert_manifest_packages(&default_text, &["numpy"]);
     let numpy = session
-        .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
+        .write_stdin_raw_with(
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+            Some(5.0),
+        )
         .await?;
     let numpy_text = common::result_text(&numpy);
     assert!(
-        numpy_text.contains("NUMPY:numpy"),
+        numpy_text.contains("NUMPY_OK:True"),
         "default prepare should make numpy available, got: {numpy_text:?}"
     );
 
@@ -509,17 +419,20 @@ async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestRe
     );
     assert_manifest_packages(&noop_text, &["numpy"]);
     let noop_probe = session
-        .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
+        .write_stdin_raw_with(
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+            Some(5.0),
+        )
         .await?;
     let noop_probe_text = common::result_text(&noop_probe);
     assert!(
-        noop_probe_text.contains("NUMPY:numpy"),
+        noop_probe_text.contains("NUMPY_OK:True"),
         "requirements no-op should keep numpy, got: {noop_probe_text:?}"
     );
 
     let add_result = call_prepare(
         &session,
-        json!({ "requirements": { "packages": ["plotnine"] } }),
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE] } }),
     )
     .await?;
     let add_text = common::result_text(&add_result);
@@ -527,36 +440,36 @@ async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestRe
         add_text.contains("session restarted") || add_text.contains("session unchanged"),
         "expected prepare status, got: {add_text:?}"
     );
-    assert_manifest_packages(&add_text, &["numpy", "plotnine"]);
+    assert_manifest_packages(&add_text, &["numpy", EXTRA_PACKAGE]);
     let add_probe = session
         .write_stdin_raw_with(
-            "import numpy, plotnine; print('NUMPY:' + numpy.MARKER); print('PLOTNINE:' + plotnine.MARKER)",
+            "import numpy, packaging; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_OK:' + str(hasattr(packaging, '__version__')))",
             Some(5.0),
         )
         .await?;
     let add_probe_text = common::result_text(&add_probe);
     assert!(
-        add_probe_text.contains("NUMPY:numpy") && add_probe_text.contains("PLOTNINE:plotnine"),
+        add_probe_text.contains("NUMPY_OK:True") && add_probe_text.contains("PACKAGING_OK:True"),
         "add should make both manifest packages available, got: {add_probe_text:?}"
     );
 
     let remove_result = call_prepare(
         &session,
-        json!({ "requirements": { "packages": ["plotnine"], "action": "remove" } }),
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE], "action": "remove" } }),
     )
     .await?;
     let remove_text = common::result_text(&remove_result);
     assert_manifest_packages(&remove_text, &["numpy"]);
     let remove_probe = session
         .write_stdin_raw_with(
-            "import importlib.util, numpy; print('NUMPY:' + numpy.MARKER); print('PLOTNINE_SPEC:' + str(importlib.util.find_spec('plotnine') is not None))",
+            "import importlib.util, numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_SPEC:' + str(importlib.util.find_spec('packaging') is not None))",
             Some(5.0),
         )
         .await?;
     let remove_probe_text = common::result_text(&remove_probe);
     assert!(
-        remove_probe_text.contains("NUMPY:numpy")
-            && remove_probe_text.contains("PLOTNINE_SPEC:False"),
+        remove_probe_text.contains("NUMPY_OK:True")
+            && remove_probe_text.contains("PACKAGING_SPEC:False"),
         "remove should keep only numpy, got: {remove_probe_text:?}"
     );
 
@@ -585,11 +498,11 @@ async fn repl_prepare_requirement_actions_update_persistent_manifest() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_preserves_current_python_when_manifest_available() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.numpy_venv))?,
-    )
-    .await?;
+    let uv_env = RealUv::new()?;
+    let numpy_python = uv_env.managed_python(&["numpy"])?;
+    let session =
+        common::spawn_python_server_with_files_env_vars(uv_env.env_vars_with_python(numpy_python)?)
+            .await?;
 
     let seed = session
         .write_stdin_raw_with("_prepare_marker = 'kept'", Some(5.0))
@@ -610,13 +523,13 @@ async fn repl_prepare_preserves_current_python_when_manifest_available() -> Test
 
     let probe = session
         .write_stdin_raw_with(
-            "import numpy; print('NUMPY:' + numpy.MARKER); print('MARKER:' + _prepare_marker)",
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('MARKER:' + _prepare_marker)",
             Some(5.0),
         )
         .await?;
     let probe_text = common::result_text(&probe);
     assert!(
-        probe_text.contains("NUMPY:numpy") && probe_text.contains("MARKER:kept"),
+        probe_text.contains("NUMPY_OK:True") && probe_text.contains("MARKER:kept"),
         "expected preserved numpy session, got: {probe_text:?}"
     );
 
@@ -626,9 +539,9 @@ async fn repl_prepare_preserves_current_python_when_manifest_available() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
+    let uv_env = RealUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
     .await?;
 
@@ -647,7 +560,7 @@ async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestRe
 
     let result = call_prepare(
         &session,
-        json!({ "requirements": { "packages": ["plotnine"], "restart": "no" } }),
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE], "restart": "no" } }),
     )
     .await?;
     assert_eq!(
@@ -664,15 +577,15 @@ async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestRe
 
     let probe = session
         .write_stdin_raw_with(
-            "import importlib.util, numpy; print('MARKER:' + _prepare_marker); print('NUMPY:' + numpy.MARKER); print('PLOTNINE_SPEC:' + str(importlib.util.find_spec('plotnine') is not None))",
+            "import importlib.util, numpy; print('MARKER:' + _prepare_marker); print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_SPEC:' + str(importlib.util.find_spec('packaging') is not None))",
             Some(5.0),
         )
         .await?;
     let probe_text = common::result_text(&probe);
     assert!(
         probe_text.contains("MARKER:kept")
-            && probe_text.contains("NUMPY:numpy")
-            && probe_text.contains("PLOTNINE_SPEC:False"),
+            && probe_text.contains("NUMPY_OK:True")
+            && probe_text.contains("PACKAGING_SPEC:False"),
         "restart=no should preserve old session and manifest, got: {probe_text:?}"
     );
 
@@ -682,9 +595,9 @@ async fn repl_prepare_restart_no_fails_without_discarding_user_state() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
+    let uv_env = RealUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
     .await?;
 
@@ -700,7 +613,7 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 
     let result = call_prepare(
         &session,
-        json!({ "requirements": { "packages": ["plotnine"] } }),
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE] } }),
     )
     .await?;
     let text = common::result_text(&result);
@@ -708,18 +621,18 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
         text.contains("session restarted") && text.contains("user state discarded"),
         "expected restart status, got: {text:?}"
     );
-    assert_manifest_packages(&text, &["numpy", "plotnine"]);
+    assert_manifest_packages(&text, &["numpy", EXTRA_PACKAGE]);
 
     let probe = session
         .write_stdin_raw_with(
-            "import numpy, plotnine; print('NUMPY:' + numpy.MARKER); print('PLOTNINE:' + plotnine.MARKER); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
+            "import numpy, packaging; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_OK:' + str(hasattr(packaging, '__version__'))); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
             Some(5.0),
         )
         .await?;
     let probe_text = common::result_text(&probe);
     assert!(
-        probe_text.contains("NUMPY:numpy")
-            && probe_text.contains("PLOTNINE:plotnine")
+        probe_text.contains("NUMPY_OK:True")
+            && probe_text.contains("PACKAGING_OK:True")
             && probe_text.contains("MARKER_EXISTS:False"),
         "default restart policy should commit manifest in fresh session, got: {probe_text:?}"
     );
@@ -730,11 +643,11 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.numpy_venv))?,
-    )
-    .await?;
+    let uv_env = RealUv::new()?;
+    let numpy_python = uv_env.managed_python(&["numpy"])?;
+    let session =
+        common::spawn_python_server_with_files_env_vars(uv_env.env_vars_with_python(numpy_python)?)
+            .await?;
 
     let seed = session
         .write_stdin_raw_with("_prepare_marker = 'discarded'", Some(5.0))
@@ -755,13 +668,13 @@ async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> Tes
 
     let probe = session
         .write_stdin_raw_with(
-            "import numpy; print('NUMPY:' + numpy.MARKER); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('MARKER_EXISTS:' + str('_prepare_marker' in globals()))",
             Some(5.0),
         )
         .await?;
     let probe_text = common::result_text(&probe);
     assert!(
-        probe_text.contains("NUMPY:numpy") && probe_text.contains("MARKER_EXISTS:False"),
+        probe_text.contains("NUMPY_OK:True") && probe_text.contains("MARKER_EXISTS:False"),
         "forced restart should discard previous state, got: {probe_text:?}"
     );
 
@@ -771,9 +684,9 @@ async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
+    let uv_env = RealUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
     .await?;
 
@@ -793,7 +706,7 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
 
     let result = call_prepare(
         &session,
-        json!({ "requirements": { "packages": ["plotnine"] } }),
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE] } }),
     )
     .await?;
     let text = common::result_text(&result);
@@ -805,7 +718,7 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
         text.contains("pending work discarded"),
         "expected discarded-work status, got: {text:?}"
     );
-    assert_manifest_packages(&text, &["numpy", "plotnine"]);
+    assert_manifest_packages(&text, &["numpy", EXTRA_PACKAGE]);
 
     let follow_up = session
         .write_stdin_raw_with("print('AFTER_PREPARE_REPLACE')", Some(5.0))
@@ -822,15 +735,15 @@ async fn repl_prepare_can_replace_active_session_and_reports_discarded_work() ->
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
+    let uv_env = RealUv::new()?;
     let session = common::spawn_python_server_with_files_env_vars(
-        fake_uv.env_vars_with_python(venv_python(&fake_uv.stdlib_venv))?,
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
     )
     .await?;
 
     let explicit = call_prepare(
         &session,
-        json!({ "python": { "venv": fake_uv.stdlib_venv.to_string_lossy() } }),
+        json!({ "python": { "venv": uv_env.stdlib_venv.to_string_lossy() } }),
     )
     .await?;
     let explicit_text = common::result_text(&explicit);
@@ -851,11 +764,14 @@ async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> Test
     let managed_text = common::result_text(&managed);
     assert_manifest_packages(&managed_text, &["numpy"]);
     let managed_probe = session
-        .write_stdin_raw_with("import numpy; print('NUMPY:' + numpy.MARKER)", Some(5.0))
+        .write_stdin_raw_with(
+            "import numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+            Some(5.0),
+        )
         .await?;
     let managed_probe_text = common::result_text(&managed_probe);
     assert!(
-        managed_probe_text.contains("NUMPY:numpy"),
+        managed_probe_text.contains("NUMPY_OK:True"),
         "managed manifest should survive explicit Python selection, got: {managed_probe_text:?}"
     );
 
@@ -865,8 +781,8 @@ async fn repl_prepare_explicit_python_does_not_mutate_managed_manifest() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_preserves_matching_executable_session() -> TestResult<()> {
-    let fake_uv = FakeUv::new()?;
-    let session = common::spawn_python_server_with_files_env_vars(fake_uv.env_vars()?).await?;
+    let uv_env = RealUv::new()?;
+    let session = common::spawn_python_server_with_files_env_vars(uv_env.env_vars()?).await?;
     let executable = current_python_executable()?;
 
     let seed = session
