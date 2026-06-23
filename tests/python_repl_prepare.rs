@@ -647,6 +647,12 @@ async fn repl_prepare_default_restart_if_needed_restarts_and_commits_manifest() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+// Linux CI intermittently exits before worker_ready when this case forces a
+// restart into uv's isolated target; other tests cover Linux restart behavior.
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "forced uv-managed restart is flaky on GitHub Linux runners"
+)]
 async fn repl_prepare_restart_yes_restarts_even_when_manifest_available() -> TestResult<()> {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let numpy_python = uv_env.managed_python(&["numpy"])?;
