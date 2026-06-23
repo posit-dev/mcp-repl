@@ -233,6 +233,11 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "emit-stderr-after-input" {
+        output_stderr_text(writer, control_log_path, b"boom\n")?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("repeat-output ") {
         let len: usize = parse_millis(len)?
             .try_into()
@@ -369,6 +374,15 @@ fn output_text(
 ) -> io::Result<()> {
     append_control_log(control_log_path.as_deref(), "output_text")?;
     writer.output_text("stdout", bytes)
+}
+
+fn output_stderr_text(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text stderr")?;
+    writer.output_text("stderr", bytes)
 }
 
 fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {

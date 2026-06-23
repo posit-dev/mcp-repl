@@ -123,7 +123,7 @@ impl OutputTimeline {
         // conservative (it can introduce blank lines), but it prevents `stderr:` from being
         // spliced into the middle of a partially-read stdout line.
         let mut payload = Vec::with_capacity(STDERR_PREFIX.len() + bytes.len() + 1);
-        if !self.ring.is_empty() {
+        if self.ring.has_visible_output() {
             payload.push(b'\n');
         }
         payload.extend_from_slice(STDERR_PREFIX);
@@ -371,9 +371,13 @@ impl OutputRing {
         self.inner.lock().unwrap().end_offset
     }
 
-    fn is_empty(&self) -> bool {
+    fn has_visible_output(&self) -> bool {
         let guard = self.inner.lock().unwrap();
-        guard.chunks.is_empty() && guard.events.is_empty()
+        !guard.chunks.is_empty()
+            || guard
+                .events
+                .iter()
+                .any(|event| !matches!(event.kind, OutputEventKind::InputEcho { .. }))
     }
 
     #[cfg(test)]

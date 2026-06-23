@@ -523,6 +523,37 @@ async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResu
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.starts_with("stderr: boom\n"),
+        "hidden input echoes should not create a leading blank line before stderr, got: {text:?}"
+    );
+    assert!(
+        !text.contains("v5> emit-stderr-after-input"),
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<()> {
