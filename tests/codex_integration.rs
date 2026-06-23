@@ -2038,22 +2038,6 @@ tryCatch({
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
-                        if path_matches(path, &["sandboxPolicy"])
-                            && normalized_key == "writable_roots"
-                            && matches!(
-                                &child,
-                                Value::Array(items)
-                                    if items.iter().all(|item| {
-                                        matches!(
-                                            item.as_str(),
-                                            Some("<CODEX_HOME>/memories")
-                                                | Some("<CODEX_HOME>\\memories")
-                                        )
-                                    })
-                            )
-                        {
-                            continue;
-                        }
                         map.insert(normalized_key, child);
                     }
                     if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
@@ -2206,15 +2190,26 @@ tryCatch({
     }
 
     #[test]
-    fn normalize_wire_snapshot_drops_default_codex_memories_writable_root() {
+    fn normalize_wire_snapshot_drops_permission_profile() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let memories = codex_home.join("memories");
         let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [memories],
-                "network_access": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": memories
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             }
         });
 
@@ -2222,39 +2217,8 @@ tryCatch({
 
         assert_eq!(
             value,
-            serde_json::json!({
-                "sandboxPolicy": {
-                    "type": "workspace-write",
-                    "network_access": false
-                }
-            }),
-            "wire snapshots should not retain Codex's default memories writable root"
-        );
-    }
-
-    #[test]
-    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
-        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
-        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
-        let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": ["<CODEX_HOME>\\memories"],
-                "network_access": false
-            }
-        });
-
-        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
-
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "sandboxPolicy": {
-                    "type": "workspace-write",
-                    "network_access": false
-                }
-            }),
-            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
+            serde_json::json!({}),
+            "wire snapshots should not retain Codex's full permission profile"
         );
     }
 
