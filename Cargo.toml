@@ -37,15 +37,13 @@
   tempfile = "3.27.0"
   tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
   toml_edit = "0.25.5"
+  url = "2.5.8"
 [target.'cfg(target_os = "linux")'.dependencies]
   landlock    = "0.4.4"
   seccompiler = "0.5.0"
 
 [target.'cfg(unix)'.dependencies]
   portable-pty = "0.9.0"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-  url = "2.5.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
   windows-sys = { version = "0.61.2", features = [
