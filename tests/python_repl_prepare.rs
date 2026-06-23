@@ -649,6 +649,48 @@ async fn repl_prepare_checks_non_bare_requirement_with_uv() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn repl_prepare_inherit_requires_meta_before_explicit_python_probe() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let cwd = tempfile::tempdir()?;
+    let fake_python_dir = tempfile::tempdir()?;
+    let sentinel = fake_python_dir.path().join("probe-ran");
+    let fake_python = fake_python_dir.path().join("python");
+    fs::write(
+        &fake_python,
+        format!("#!/bin/sh\ntouch {}\nexit 7\n", sentinel.display()),
+    )?;
+    let mut permissions = fs::metadata(&fake_python)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python, permissions)?;
+
+    let session = spawn_python_inherit_files_server(
+        cwd.path(),
+        uv_env.env_vars_with_python(venv_python(&uv_env.stdlib_venv))?,
+    )
+    .await?;
+
+    let result = call_prepare(&session, json!({ "python": { "executable": fake_python } })).await?;
+    let text = common::result_text(&result);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected missing inherited metadata to reject prepare, got: {text:?}"
+    );
+    assert!(
+        text.contains("sandbox inherit requested but no client sandbox state was provided"),
+        "expected inherited metadata error before probing, got: {text:?}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "explicit Python executable should not be probed before inherited metadata is accepted"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResult<()> {
     let (_uv_guard, uv_env) = RealUv::locked_new().await?;
     let cwd = tempfile::tempdir()?;
@@ -691,6 +733,76 @@ async fn repl_prepare_uses_sandbox_meta_before_inherit_replacement() -> TestResu
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_prepare_narrowing_actions_do_not_accept_current_python_superset() -> TestResult<()> {
+    let (_uv_guard, uv_env) = RealUv::locked_new().await?;
+    let superset_python = uv_env.managed_python(&["numpy", EXTRA_PACKAGE])?;
+
+    let set_session = common::spawn_python_server_with_files_env_vars(
+        uv_env.env_vars_with_python(superset_python.clone())?,
+    )
+    .await?;
+    let set_result = call_prepare(
+        &set_session,
+        json!({
+            "requirements": {
+                "packages": ["numpy"],
+                "action": "set"
+            }
+        }),
+    )
+    .await?;
+    let set_text = common::result_text(&set_result);
+    assert_manifest_packages(&set_text, &["numpy"]);
+    let set_probe = set_session
+        .write_stdin_raw_with(
+            "import importlib.util, numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_SPEC:' + str(importlib.util.find_spec('packaging') is not None))",
+            Some(5.0),
+        )
+        .await?;
+    let set_probe_text = common::result_text(&set_probe);
+    assert!(
+        set_probe_text.contains("NUMPY_OK:True") && set_probe_text.contains("PACKAGING_SPEC:False"),
+        "set should not keep packages omitted from the manifest, got: {set_probe_text:?}"
+    );
+    set_session.cancel().await?;
+
+    let remove_session = common::spawn_python_server_with_files_env_vars(
+        uv_env.env_vars_with_python(superset_python)?,
+    )
+    .await?;
+    let add_result = call_prepare(
+        &remove_session,
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE] } }),
+    )
+    .await?;
+    let add_text = common::result_text(&add_result);
+    assert_manifest_packages(&add_text, &["numpy", EXTRA_PACKAGE]);
+
+    let remove_result = call_prepare(
+        &remove_session,
+        json!({ "requirements": { "packages": [EXTRA_PACKAGE], "action": "remove" } }),
+    )
+    .await?;
+    let remove_text = common::result_text(&remove_result);
+    assert_manifest_packages(&remove_text, &["numpy"]);
+    let remove_probe = remove_session
+        .write_stdin_raw_with(
+            "import importlib.util, numpy; print('NUMPY_OK:' + str(hasattr(numpy, '__version__'))); print('PACKAGING_SPEC:' + str(importlib.util.find_spec('packaging') is not None))",
+            Some(5.0),
+        )
+        .await?;
+    let remove_probe_text = common::result_text(&remove_probe);
+    assert!(
+        remove_probe_text.contains("NUMPY_OK:True")
+            && remove_probe_text.contains("PACKAGING_SPEC:False"),
+        "remove should not keep packages removed from the manifest, got: {remove_probe_text:?}"
+    );
+
+    remove_session.cancel().await?;
     Ok(())
 }
 

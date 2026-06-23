@@ -94,6 +94,12 @@ pub(crate) struct PrepareRequirementsOperation {
     pub(crate) restart: PrepareRestartPolicy,
 }
 
+impl PrepareRequirementsOperation {
+    pub(crate) fn allows_current_runtime_shortcut(&self) -> bool {
+        matches!(self.action, PrepareRequirementsAction::Add)
+    }
+}
+
 pub(crate) fn uv_available() -> bool {
     find_program_on_path(UV_PROGRAM).is_some()
 }
@@ -184,8 +190,13 @@ fn add_python_version_constraint(current: Option<String>, requested: &str) -> Op
 
 pub(crate) fn resolve_requirements_manifest(
     manifest: &PythonRequirementsManifest,
+    allow_current_runtime_shortcut: bool,
 ) -> Result<PythonPrepareTarget, String> {
-    let config = resolve_requirements(&manifest.packages, manifest.python_version.as_deref())?;
+    let config = resolve_requirements(
+        &manifest.packages,
+        manifest.python_version.as_deref(),
+        allow_current_runtime_shortcut,
+    )?;
     Ok(PythonPrepareTarget {
         executable: config.executable,
         module_search_paths: config.module_search_paths,
@@ -202,8 +213,11 @@ pub(crate) fn format_requirements_manifest(manifest: &PythonRequirementsManifest
 fn resolve_requirements(
     packages: &[String],
     python_version: Option<&str>,
+    allow_current_runtime_shortcut: bool,
 ) -> Result<PythonRuntimeConfig, String> {
-    if let Some(config) = current_runtime_satisfies_requirements(packages, python_version) {
+    if allow_current_runtime_shortcut
+        && let Some(config) = current_runtime_satisfies_requirements(packages, python_version)
+    {
         return Ok(config);
     }
     resolve_uv_requirements(packages, python_version)

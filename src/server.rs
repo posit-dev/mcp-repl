@@ -516,8 +516,10 @@ impl SharedServer {
         let current_manifest = state.python_requirements_manifest.clone();
         let candidate_manifest =
             crate::python_prepare::apply_requirements_operation(&current_manifest, &operation);
-        let target = match crate::python_prepare::resolve_requirements_manifest(&candidate_manifest)
-        {
+        let target = match crate::python_prepare::resolve_requirements_manifest(
+            &candidate_manifest,
+            operation.allows_current_runtime_shortcut(),
+        ) {
             Ok(target) => target,
             Err(err) => {
                 return Self::prepare_python_error_reply(
@@ -594,6 +596,10 @@ impl SharedServer {
         executable: std::path::PathBuf,
         sandbox_state_update: &dyn Fn() -> Result<Option<SandboxStateUpdate>, WorkerError>,
     ) -> CallToolResult {
+        let sandbox_state_update = match sandbox_state_update() {
+            Ok(update) => update,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
         let target = match crate::python_prepare::resolve_prepare_target(
             &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
         ) {
@@ -619,7 +625,7 @@ impl SharedServer {
         let had_pending_work = state.worker.pending_request();
         let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
         let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
-        if let Err(err) = Self::stage_prepare_sandbox_state(state, sandbox_state_update()) {
+        if let Err(err) = Self::stage_prepare_sandbox_state(state, Ok(sandbox_state_update)) {
             return Self::prepare_python_local_error_reply(state, err);
         }
         match state
