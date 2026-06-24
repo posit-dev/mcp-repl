@@ -426,7 +426,7 @@ impl FileSystemSandboxPolicy {
                 read_only_subpaths.extend(
                     resolved_entries
                         .iter()
-                        .filter(|entry| entry.access == FileSystemAccessMode::Read)
+                        .filter(|entry| !entry.access.can_write())
                         .filter(|entry| {
                             !self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir)
                         })

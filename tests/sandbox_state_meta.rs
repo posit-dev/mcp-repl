@@ -2783,8 +2783,7 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_path_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
--> TestResult<()> {
+async fn sandbox_inherit_path_deny_meta_blocks_write_read_and_unlink_in_cwd() -> TestResult<()> {
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-path-deny-write")?;
     let target = scratch.path().join("secret.txt");
@@ -2823,12 +2822,12 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         return Ok(());
     }
     assert!(
-        text.contains("WRITE_OK"),
-        "expected path-denied file write in cwd to succeed, got: {text}"
+        text.contains("WRITE_ERROR:"),
+        "expected path-denied file write in cwd to fail, got: {text}"
     );
     assert!(
-        !text.contains("WRITE_ERROR:"),
-        "path-denied file write in cwd unexpectedly failed: {text}"
+        !text.contains("WRITE_OK"),
+        "path-denied file write in cwd unexpectedly succeeded: {text}"
     );
     assert!(
         text.contains("READ_ERROR:"),
@@ -2841,8 +2840,8 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     session.cancel().await?;
     assert_eq!(
         fs::read_to_string(&target)?,
-        "allowed\n",
-        "path-denied file write should update contents while unlink remains denied"
+        "original\n",
+        "path-denied file write should leave contents unchanged while unlink remains denied"
     );
     Ok(())
 }
