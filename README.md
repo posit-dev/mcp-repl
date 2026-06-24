@@ -35,7 +35,18 @@ you or the model reset.
 
 ### 1. Install
 
-Install via `cargo` (needs the [Rust toolchain](https://rustup.rs)):
+Install from PyPI. The package is named `posit-mcp-repl` and exposes the
+`mcp-repl` executable:
+
+```sh
+pipx install posit-mcp-repl
+# or
+uv tool install posit-mcp-repl
+# one-off
+uvx --from posit-mcp-repl mcp-repl --help
+```
+
+Or install via `cargo` (needs the [Rust toolchain](https://rustup.rs)):
 
 ```sh
 cargo install --git https://github.com/posit-dev/mcp-repl --locked
@@ -55,8 +66,7 @@ irm https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps
 Install-McpRepl
 ```
 
-Append `--dev` (or `-Dev`) for the rolling `dev` prerelease. Direct
-downloads live on the [latest release page](
+Direct downloads live on the [latest release page](
   https://github.com/posit-dev/mcp-repl/releases/latest
 ). Linux x86_64 builds require glibc 2.35+; the glibc build produced on
 Ubuntu 22.04 supports Ubuntu 22.04+.
@@ -70,16 +80,8 @@ Latest release binaries:
 - Windows x86_64:
   https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-pc-windows-msvc.zip
 
-Download prebuilt dev binaries:
-
-- Linux x86_64:
-  https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz
-- macOS arm64:
-  https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz
-- Windows x86_64:
-  https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip
-
-Prebuilt binaries do not bundle R or Python; install those separately.
+PyPI wheels and prebuilt binaries do not bundle R or Python; install
+those separately.
 
 ### 2. Wire into your MCP client
 
@@ -159,8 +161,8 @@ from the worker's stdout/stderr pipes.
 ## Platform support
 
 - **macOS**: supported.
-- **Linux**: supported. Dev binaries are glibc builds produced on Ubuntu
-  22.04.
+- **Linux**: supported. Release binaries are glibc builds produced on
+  Ubuntu 22.04.
 - **Windows**: experimental for R. Python is not part of the stable
   Windows surface yet.
 

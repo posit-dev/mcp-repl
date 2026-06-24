@@ -11,6 +11,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/testing.md`: public validation surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
+- `docs/releasing.md`: release checklist and PyPI distribution policy.
 - `docs/worker_sideband_protocol.md`: IPC-queued server/worker protocol
   contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
@@ -24,6 +25,8 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
+- `docs/releasing.md`: release checklist, GitHub Release asset policy, and
+  PyPI wheel policy.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 
 ## Exploratory Docs
@@ -40,7 +43,6 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
 - `docs/futurework/portable-plugin-skill-mcp-bundle.md`: futurework note on packaging a shared skill plus MCP server config as a portable Codex/Claude plugin.
 - `docs/futurework/project-local-mcp-repl-config.md`: deferred design note on loading project-local `mcp-repl-config.toml` files from `.agents`, `.codex`, or `.claude`.
-- `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
 - `docs/futurework/server-backend-boundary.md`: deferred note on keeping backend-specific execution semantics out of opaque queued server-side request handling.
