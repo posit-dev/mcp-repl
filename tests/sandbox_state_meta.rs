@@ -3145,7 +3145,7 @@ tryCatch({{
             Some(10.0),
             Some(workspace_write_with_path_deny_meta(
                 scratch.path(),
-                &denied_dir,
+                &canonical_denied_dir,
             )),
         )
         .await?;

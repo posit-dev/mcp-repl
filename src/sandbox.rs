@@ -432,10 +432,10 @@ impl FileSystemSandboxPolicy {
                             !self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir)
                         })
                         .filter_map(|entry| {
-                            if entry.path == root || !entry.path.starts_with(&root) {
-                                None
-                            } else {
+                            if path_is_descendant_of_root(&entry.path, &root) {
                                 Some(entry.path.clone())
+                            } else {
+                                None
                             }
                         }),
                 );
@@ -2239,6 +2239,17 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn path_is_descendant_of_root(path: &Path, root: &Path) -> bool {
+    let path_variants = sandbox_path_variants(path);
+    let root_variants = sandbox_path_variants(root);
+    path_variants.iter().any(|path_variant| {
+        root_variants.iter().any(|root_variant| {
+            path_variant != root_variant && path_variant.starts_with(root_variant)
+        })
+    })
 }
 
 #[cfg(target_os = "macos")]
