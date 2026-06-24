@@ -210,6 +210,26 @@ fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Val
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": denied_path
+        },
+        "access": "deny"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -2757,6 +2777,72 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     assert!(
         target.exists(),
         "canonical glob-denied unlink should leave the target file in place"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-path-deny-write")?;
+    let target = scratch.path().join("secret.txt");
+    fs::write(&target, "original\n")?;
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_meta(scratch.path(), &target)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected path-denied file write in cwd to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "path-denied file write in cwd unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected path-denied file read in cwd to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "path-denied file read in cwd unexpectedly succeeded: {text}"
+    );
+    session.cancel().await?;
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "allowed\n",
+        "path-denied file write should update contents while unlink remains denied"
     );
     Ok(())
 }

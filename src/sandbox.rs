@@ -426,7 +426,7 @@ impl FileSystemSandboxPolicy {
                 read_only_subpaths.extend(
                     resolved_entries
                         .iter()
-                        .filter(|entry| !entry.access.can_write())
+                        .filter(|entry| entry.access == FileSystemAccessMode::Read)
                         .filter(|entry| {
                             !self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir)
                         })
@@ -2300,10 +2300,10 @@ fn build_seatbelt_unreadable_path_policy(
                 "(deny file-read* (subpath (param \"{root_param}\")))"
             ));
             policy_components.push(format!(
-                "(deny file-write* (literal (param \"{root_param}\")))"
+                "(deny file-write-unlink (literal (param \"{root_param}\")))"
             ));
             policy_components.push(format!(
-                "(deny file-write* (subpath (param \"{root_param}\")))"
+                "(deny file-write-unlink (subpath (param \"{root_param}\")))"
             ));
             params.push((root_param, root));
         }
