@@ -116,10 +116,12 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn drain_final_output(&self) -> FormattedPendingOutput {
-        self.output.drain_formatted(ProjectionMode::Bundle, false)
+        self.timeline.flush_utf8_tails();
+        self.output.drain_formatted(ProjectionMode::Bundle, true)
     }
 
     pub(crate) fn drain_sealed_output(&self) -> FormattedPendingOutput {
+        self.timeline.flush_utf8_tails();
         self.output.drain_formatted(ProjectionMode::Bundle, true)
     }
 }

@@ -554,6 +554,41 @@ async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-interleaved-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é"),
+        "split stdout UTF-8 should render as one character, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: err\n"),
+        "interleaved stderr should remain visible, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
+    );
+
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<()> {

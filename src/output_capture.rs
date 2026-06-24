@@ -19,18 +19,23 @@ pub(crate) const OUTPUT_TRUNCATION_NOTICE: &str =
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,
+    utf8_tails: Arc<Mutex<OutputUtf8Tails>>,
 }
 
 impl OutputTimeline {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new(ring: Arc<OutputRing>) -> Self {
-        Self { ring }
+        Self {
+            ring,
+            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
+        }
     }
 
     pub(crate) fn with_capacity(capacity_bytes: usize) -> Self {
         Self {
             ring: Arc::new(OutputRing::new(capacity_bytes)),
+            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
         }
     }
 
@@ -39,6 +44,7 @@ impl OutputTimeline {
     }
 
     pub(crate) fn clear(&self) {
+        self.utf8_tails.lock().unwrap().clear();
         self.ring.reset();
     }
 
@@ -83,14 +89,47 @@ impl OutputTimeline {
         bytes: &[u8],
         is_stderr: bool,
         origin: ContentOrigin,
-        _is_continuation: bool,
+        is_continuation: bool,
         source: OutputTextSource,
     ) {
         if bytes.is_empty() {
             return;
         }
-        self.ring
-            .append_bytes_with_source(bytes, is_stderr, origin, source);
+        let key = OutputUtf8TailKey {
+            is_stderr,
+            origin,
+            source,
+        };
+        let previous_tail = self.utf8_tails.lock().unwrap().take(key);
+        let (stale_tail, payload) = if previous_tail.is_empty() {
+            (Vec::new(), bytes.to_vec())
+        } else if is_continuation || matches!(source, OutputTextSource::Raw) {
+            let mut payload = previous_tail;
+            payload.extend_from_slice(bytes);
+            (Vec::new(), payload)
+        } else {
+            (previous_tail, bytes.to_vec())
+        };
+        if !stale_tail.is_empty() {
+            self.ring
+                .append_bytes_with_source(&stale_tail, is_stderr, origin, source);
+        }
+
+        let flushable_len = flushable_prefix_len(&payload);
+        if flushable_len > 0 {
+            self.ring.append_bytes_with_source(
+                &payload[..flushable_len],
+                is_stderr,
+                origin,
+                source,
+            );
+        }
+        if flushable_len < payload.len() {
+            self.utf8_tails
+                .lock()
+                .unwrap()
+                .push(key, payload[flushable_len..].to_vec());
+        }
     }
 
     pub(crate) fn append_image(
@@ -121,20 +160,80 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_input_wait(&self) {
+        self.flush_utf8_tails();
         self.ring.append_marker_event(OutputEventKind::InputWait);
     }
 
     pub(crate) fn append_request_boundary(&self) {
+        self.flush_utf8_tails();
         self.ring
             .append_marker_event(OutputEventKind::RequestBoundary);
     }
 
     pub(crate) fn append_session_end(&self) {
+        self.flush_utf8_tails();
         self.ring.append_marker_event(OutputEventKind::SessionEnd);
     }
 
     pub(crate) fn last_text_ends_with_newline(&self) -> bool {
         self.ring.last_text_ends_with_newline()
+    }
+
+    pub(crate) fn flush_utf8_tails(&self) {
+        let tails = self.utf8_tails.lock().unwrap().drain();
+        for tail in tails {
+            self.ring.append_bytes_with_source(
+                &tail.bytes,
+                tail.key.is_stderr,
+                tail.key.origin,
+                tail.key.source,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputUtf8TailKey {
+    is_stderr: bool,
+    origin: ContentOrigin,
+    source: OutputTextSource,
+}
+
+struct OutputUtf8Tail {
+    key: OutputUtf8TailKey,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct OutputUtf8Tails {
+    entries: Vec<OutputUtf8Tail>,
+}
+
+impl OutputUtf8Tails {
+    fn take(&mut self, key: OutputUtf8TailKey) -> Vec<u8> {
+        let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
+            return Vec::new();
+        };
+        self.entries.remove(index).bytes
+    }
+
+    fn push(&mut self, key: OutputUtf8TailKey, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        debug_assert!(
+            !self.entries.iter().any(|entry| entry.key == key),
+            "UTF-8 tail key should have been drained before storing a new tail"
+        );
+        self.entries.push(OutputUtf8Tail { key, bytes });
+    }
+
+    fn drain(&mut self) -> Vec<OutputUtf8Tail> {
+        self.entries.drain(..).collect()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 

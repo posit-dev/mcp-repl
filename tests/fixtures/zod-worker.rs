@@ -238,6 +238,13 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "split-utf8-interleaved-stderr" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_stderr_text(writer, control_log_path, b"err\n")?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("repeat-output ") {
         let len: usize = parse_millis(len)?
             .try_into()
@@ -376,6 +383,16 @@ fn output_text(
     writer.output_text("stdout", bytes)
 }
 
+fn output_text_with_continuation(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    is_continuation: bool,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text")?;
+    writer.output_text_with_continuation("stdout", bytes, is_continuation)
+}
+
 fn output_stderr_text(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
@@ -502,6 +519,8 @@ enum WorkerToServer {
     OutputText {
         stream: String,
         data_b64: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_continuation: bool,
     },
     InputLine {
         prompt: String,
@@ -568,11 +587,25 @@ impl IpcWriter {
     }
 
     fn output_text(&self, stream: &str, bytes: &[u8]) -> io::Result<()> {
+        self.output_text_with_continuation(stream, bytes, false)
+    }
+
+    fn output_text_with_continuation(
+        &self,
+        stream: &str,
+        bytes: &[u8],
+        is_continuation: bool,
+    ) -> io::Result<()> {
         self.send(&WorkerToServer::OutputText {
             stream: stream.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            is_continuation,
         })
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 struct IpcTransport {
