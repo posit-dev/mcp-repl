@@ -894,6 +894,53 @@ async fn zod_files_timeout_does_not_drain_event_after_incomplete_utf8() -> TestR
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_raw_split_utf8_survives_input_wait_marker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "raw-split-utf8-around-input-wait",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+
+    wait_for_log_contains(&control_log, "input_wait")?;
+    std::thread::sleep(Duration::from_millis(50));
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+    let combined_text = format!("{first_text}{text}");
+
+    session.cancel().await?;
+
+    assert!(
+        combined_text.contains("é\n"),
+        "split raw UTF-8 should render as one character after input_wait, got: {combined_text:?}"
+    );
+    assert!(
+        !combined_text.contains("\\xC3") && !combined_text.contains("\\xA9"),
+        "split raw UTF-8 should not render as escaped bytes, got: {combined_text:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;

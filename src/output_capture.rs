@@ -160,14 +160,14 @@ impl OutputTimeline {
 
     pub(crate) fn append_input_wait(&self) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
         self.append_pending_locked(pending);
         self.ring.append_marker_event(OutputEventKind::InputWait);
     }
 
     pub(crate) fn append_request_boundary(&self) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
         self.append_pending_locked(pending);
         self.ring
             .append_marker_event(OutputEventKind::RequestBoundary);
@@ -175,7 +175,7 @@ impl OutputTimeline {
 
     pub(crate) fn append_session_end(&self) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
         self.append_pending_locked(pending);
         self.ring.append_marker_event(OutputEventKind::SessionEnd);
     }

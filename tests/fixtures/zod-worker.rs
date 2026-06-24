@@ -282,6 +282,19 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "raw-split-utf8-around-input-wait" {
+        io::stdout().write_all(&[0xC3])?;
+        io::stdout().flush()?;
+        sleep_for(50, sideband_interrupted, false);
+        writer.send(&WorkerToServer::InputWait {
+            prompt: "v5> ".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+        io::stdout().write_all(&[0xA9, b'\n'])?;
+        io::stdout().flush()?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("output-image-bytes ") {
         let len: usize = parse_millis(len)?.try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "output-image-bytes too large")
