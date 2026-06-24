@@ -763,6 +763,37 @@ async fn zod_files_reset_clears_stderr_prefix_state() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_stderr_label_starts_after_unterminated_stdout() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout-then-newline-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("partial\nstderr: \nerr\n"),
+        "stderr label should start on a fresh line after partial stdout, got: {text:?}"
+    );
+    assert!(
+        !text.contains("partialstderr:"),
+        "stderr label should not be concatenated to partial stdout, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
@@ -788,6 +819,76 @@ async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> Tes
     assert!(
         !text.contains("\\xC3[repl]"),
         "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_does_not_drain_event_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-delayed-image",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert_eq!(
+        result_image_count(&timed_out),
+        0,
+        "timeout drain should not pass an incomplete leading UTF-8 tail"
+    );
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+
+    session.cancel().await?;
+
+    let image_index = completed
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+        .ok_or("expected interleaved image in completion reply")?;
+    let text_before_image = completed.content[..image_index]
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(
+        text_before_image.contains("é"),
+        "split stdout UTF-8 should render before the following image, got contents: {:?}",
+        completed.content
+    );
+    assert!(
+        text.contains("é"),
+        "split stdout UTF-8 should render as one character, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
     );
 
     Ok(())

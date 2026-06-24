@@ -322,8 +322,12 @@ impl OutputUtf8Tails {
     fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
         let mut ready = Vec::new();
         let mut index = 0usize;
+        let mut blocked_by_incomplete_tail = false;
         while index < self.entries.len() {
             let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
+                if blocked_by_incomplete_tail {
+                    break;
+                }
                 ready.push(self.entries.remove(index));
                 continue;
             };
@@ -334,6 +338,7 @@ impl OutputUtf8Tails {
 
             let flushable_len = flushable_prefix_len(&entry.bytes);
             if flushable_len == 0 {
+                blocked_by_incomplete_tail = true;
                 index += 1;
                 continue;
             }
@@ -349,6 +354,7 @@ impl OutputUtf8Tails {
                 bytes,
                 sealed: true,
             }));
+            blocked_by_incomplete_tail = true;
             index += 1;
         }
         ready

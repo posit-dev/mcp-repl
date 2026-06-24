@@ -173,8 +173,7 @@ fn render_stderr_text(
     }) {
         return rendered;
     }
-    let needs_separator =
-        previous_text.is_some_and(|state| !state.terminated) && !rendered.starts_with('\n');
+    let needs_separator = previous_text.is_some_and(|state| !state.terminated);
     if needs_separator {
         format!("\nstderr: {rendered}")
     } else {

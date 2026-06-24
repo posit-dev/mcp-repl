@@ -248,6 +248,12 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "partial-stdout-then-newline-stderr" {
+        output_text(writer, control_log_path, b"partial")?;
+        output_stderr_text(writer, control_log_path, b"\nerr\n")?;
+        return Ok(false);
+    }
+
     if command == "partial-utf8-then-exit" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         send_session_end(writer, "runtime_exit")?;
@@ -264,6 +270,14 @@ fn run_command(
     if command == "split-utf8-before-image" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         output_image(writer, control_log_path, b"img")?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
+    if command == "split-utf8-before-delayed-image" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        sleep_for(200, sideband_interrupted, false);
         output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
         return Ok(false);
     }
