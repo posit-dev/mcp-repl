@@ -400,7 +400,7 @@ impl FileSystemSandboxPolicy {
             .filter(|entry| self.can_read_path_with_cwd(&entry.path, cwd, session_temp_dir))
             .map(|entry| entry.path)
             .collect();
-        dedup_paths(roots, true)
+        dedup_paths(roots)
     }
 
     #[cfg(target_os = "macos")]
@@ -419,7 +419,7 @@ impl FileSystemSandboxPolicy {
             .filter(|entry| self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir))
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
-        dedup_paths(writable_entries, true)
+        dedup_paths(writable_entries)
             .into_iter()
             .map(|root| {
                 let mut read_only_subpaths = compute_read_only_subpaths(&root);
@@ -440,7 +440,7 @@ impl FileSystemSandboxPolicy {
                 );
                 WritableRoot {
                     root,
-                    read_only_subpaths: dedup_paths(read_only_subpaths, false),
+                    read_only_subpaths: dedup_paths(read_only_subpaths),
                 }
             })
             .collect()
@@ -464,7 +464,6 @@ impl FileSystemSandboxPolicy {
                 .filter(|entry| Some(entry.path.as_path()) != root.as_deref())
                 .map(|entry| entry.path)
                 .collect(),
-            true,
         )
     }
 
@@ -687,25 +686,15 @@ fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn dedup_paths(paths: Vec<PathBuf>, normalize_existing_paths: bool) -> Vec<PathBuf> {
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::with_capacity(paths.len());
     let mut seen = std::collections::HashSet::new();
     for path in paths {
-        let path = if normalize_existing_paths {
-            normalize_existing_path(path)
-        } else {
-            path
-        };
         if seen.insert(path.clone()) {
             deduped.push(path);
         }
     }
     deduped
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_existing_path(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(target_os = "macos")]

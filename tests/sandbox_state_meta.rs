@@ -2938,6 +2938,52 @@ if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_workspace_write_meta_allows_explicit_slash_tmp_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-slash-tmp-{nanos}.txt"));
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let scratch = repo_scratch_dir("sandbox-slash-tmp-write")?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+slash_tmp_target <- {encoded_slash_tmp_target}
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SLASH_TMP_WRITE_OK"),
+        "expected workspace-write metadata with slash_tmp to allow /tmp writes, got: {text}"
+    );
+    assert!(
+        !text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "workspace-write metadata with slash_tmp unexpectedly blocked /tmp write: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_path_deny_blocks_platform_default_read() -> TestResult<()> {
     let _guard = test_guard();
     let denied_root = Path::new("/Library/Preferences");
