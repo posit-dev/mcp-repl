@@ -9,6 +9,8 @@ expression: transcript
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
+<<<
+<<<
 
 2) py_repl timeout_ms=5000
 >>> import pydoc; pydoc.help(len)
@@ -16,6 +18,8 @@ expression: transcript
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
+<<<
+<<<
 
 3) py_repl timeout_ms=1000
 >>> help()
@@ -28,6 +32,7 @@ expression: transcript
 <<<
 <<< len(obj, /)
 <<<     Return the number of items in a container.
+<<<
 <<< help>
 
 5) py_repl timeout_ms=1000
@@ -37,7 +42,9 @@ expression: transcript
 <<< If you want to ask for help on a particular object directly from the
 <<< interpreter, you can type "help(object)".  Executing "help('string')"
 <<< has the same effect as typing a particular string at the help> prompt.
+<<<
 
 6) py_repl timeout_ms=5000
 >>> 1+1
 <<< 2
+<<<
