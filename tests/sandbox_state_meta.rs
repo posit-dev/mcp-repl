@@ -2782,6 +2782,92 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_workspace_write_meta_blocks_missing_protected_metadata_alias()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-protected-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let protected_dir = canonical_scratch.join(".git");
+    assert!(
+        !protected_dir.exists(),
+        "test requires missing protected metadata path: {}",
+        protected_dir.display()
+    );
+    let encoded_canonical_scratch = encode_path(&canonical_scratch)?;
+    let encoded_protected_dir = encode_path(&protected_dir)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+canonical_scratch <- {encoded_canonical_scratch}
+protected_dir <- {encoded_protected_dir}
+allowed_target <- file.path(canonical_scratch, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALIAS_ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+protected_target <- file.path(protected_dir, "blocked.txt")
+tryCatch({{
+  suppressWarnings(dir.create(protected_dir))
+  writeLines("blocked", protected_target)
+  cat("ALIAS_PROTECTED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_PROTECTED_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALIAS_ALLOWED_WRITE_OK"),
+        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
+        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
+        "expected canonical writable-root alias to block missing protected metadata, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_PROTECTED_WRITE_OK"),
+        "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
+    );
+    assert!(
+        canonical_scratch.join("allowed.txt").exists(),
+        "ordinary write through canonical writable-root alias should create the target file"
+    );
+    assert!(
+        !protected_dir.exists(),
+        "protected metadata write should not create {}",
+        protected_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_glob_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
 -> TestResult<()> {
     let _guard = test_guard();
@@ -2973,6 +3059,95 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         fs::read_to_string(&target)?,
         "original\n",
         "path-denied file write should leave contents unchanged while unlink remains denied"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_blocks_missing_alias_path_creation() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-path-deny-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let denied_dir = scratch.path().join("denied");
+    let canonical_denied_dir = canonical_scratch.join("denied");
+    assert!(
+        !denied_dir.exists(),
+        "test requires missing denied path: {}",
+        denied_dir.display()
+    );
+    let encoded_canonical_scratch = encode_path(&canonical_scratch)?;
+    let encoded_canonical_denied_dir = encode_path(&canonical_denied_dir)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+canonical_scratch <- {encoded_canonical_scratch}
+denied_dir <- {encoded_canonical_denied_dir}
+allowed_target <- file.path(canonical_scratch, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("PATH_DENY_ALIAS_ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+denied_target <- file.path(denied_dir, "blocked.txt")
+tryCatch({{
+  suppressWarnings(dir.create(denied_dir))
+  writeLines("blocked", denied_target)
+  cat("PATH_DENY_ALIAS_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PATH_DENY_ALIAS_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_meta(
+                scratch.path(),
+                &denied_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
+        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
+        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+    );
+    assert!(
+        text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
+        "expected canonical path-deny alias to block missing denied path creation, got: {text}"
+    );
+    assert!(
+        !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
+        "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
+    );
+    assert!(
+        canonical_scratch.join("allowed.txt").exists(),
+        "ordinary write through canonical writable-root alias should create the target file"
+    );
+    assert!(
+        !canonical_denied_dir.exists(),
+        "path-deny write should not create {}",
+        canonical_denied_dir.display()
     );
     Ok(())
 }

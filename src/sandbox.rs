@@ -2223,13 +2223,38 @@ struct SeatbeltAccessRoot {
 
 #[cfg(target_os = "macos")]
 fn sandbox_path_variants(path: &Path) -> Vec<PathBuf> {
-    let mut variants = vec![path.to_path_buf()];
-    if let Ok(canonical) = path.canonicalize()
-        && !variants.iter().any(|existing| existing == &canonical)
-    {
-        variants.push(canonical);
+    let mut variants = Vec::new();
+    push_unique_path(&mut variants, path.to_path_buf());
+    if let Ok(canonical) = path.canonicalize() {
+        push_unique_path(&mut variants, canonical);
+    }
+    if let Some(canonical) = canonicalize_from_existing_parent(path) {
+        push_unique_path(&mut variants, canonical);
     }
     variants
+}
+
+#[cfg(target_os = "macos")]
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn canonicalize_from_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(mut canonical) = current.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        suffix.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
 }
 
 #[cfg(target_os = "macos")]
