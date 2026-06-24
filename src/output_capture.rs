@@ -700,7 +700,11 @@ impl OutputRing {
     fn consume_to(&self, offset: u64) {
         let mut guard = self.inner.lock().unwrap();
         let offset = offset.min(guard.end_offset);
-        if offset <= guard.start_offset {
+        if offset < guard.start_offset {
+            return;
+        }
+        if offset == guard.start_offset {
+            guard.cleanup_front();
             return;
         }
         guard.trim_to_offset(offset);

@@ -1449,7 +1449,7 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
     let spilled_before_delete =
         wait_until_file_contains_via_polls(&mut session, &transcript_path, "mid080").await?;
     assert!(
-        !spilled_before_delete.contains("tail"),
+        !spilled_before_delete.lines().any(|line| line == "tail"),
         "did not expect tail before test releases the R-side gate, got: {spilled_before_delete:?}"
     );
 
@@ -1477,7 +1477,7 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         );
     }
     assert!(
-        recreated_transcript.contains("tail"),
+        recreated_transcript.lines().any(|line| line == "tail"),
         "expected later small poll output to recreate the deleted spill file, got: {recreated_transcript:?}"
     );
     assert!(

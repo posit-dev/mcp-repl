@@ -15,7 +15,6 @@ expression: transcript
 >>> plot(5:1, type = "l")
 >>> cat("plots_done\n")
 <<< [image/png len=0]
-<<< [image/png len=0]
 <<< plots_done
 <<< > 
 
