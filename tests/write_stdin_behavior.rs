@@ -937,6 +937,45 @@ async fn pager_long_r_stderr_keeps_one_stream_prefix() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_long_r_stderr_continuation_page_keeps_one_stream_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(120).await?;
+
+    let result = session
+        .write_stdin_raw_with("message(strrep('x', 20000))", Some(30.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let first_text = result_text(&result);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("--More--"),
+        "expected pager to activate, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("stderr: "),
+        "expected first page to carry stderr prefix, got: {first_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("xxxxxxxx"),
+        "expected second page to contain stderr continuation text, got: {next_text:?}"
+    );
+    assert!(
+        !next_text.contains("stderr: "),
+        "did not expect a fresh stderr prefix inside one stderr write, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_long_r_stderr_after_prior_reply_keeps_one_stream_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(40_000).await?;

@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
 use crate::output_capture::OutputBuffer;
-use crate::resolved_output::{self, OutputEventKind, OutputRange, ProjectionMode};
+use crate::resolved_output::{
+    self, OutputEventKind, OutputRange, ProjectionMode, RenderedTextState,
+};
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
 };
@@ -241,14 +243,17 @@ impl PagerBuffer {
         let start = self.byte_index_for_char_offset(start_offset);
         let end = self.byte_index_for_char_offset(end_offset);
         let bytes = &self.bytes[start..end];
-        resolved_output::render_bytes_with_events_and_spans(
+        let previous_rendered_text = self.render_state_before_range(start_offset);
+        resolved_output::render_bytes_with_events_and_spans_with_state(
             bytes,
             start as u64,
             end as u64,
             &self.text_spans_in_byte_offsets(start_offset, end_offset),
             &self.events_in_byte_offsets(start_offset, end_offset),
             projection_mode,
+            previous_rendered_text,
         )
+        .0
     }
 
     fn page_end_offset(&self, start_offset: u64, end_offset: u64, target_bytes: u64) -> u64 {
@@ -608,6 +613,20 @@ impl PagerBuffer {
             });
         }
         spans
+    }
+
+    fn render_state_before_range(&self, start_offset: u64) -> Option<RenderedTextState> {
+        for span in &self.text_spans {
+            if span.start < start_offset && start_offset < span.end {
+                let stream = if span.is_stderr {
+                    TextStream::Stderr
+                } else {
+                    TextStream::Stdout
+                };
+                return Some(RenderedTextState::continuation(stream, span.origin));
+            }
+        }
+        None
     }
 
     fn image_offsets_in_range(&self, start_offset: u64, end_offset: u64, limit: usize) -> Vec<u64> {

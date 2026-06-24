@@ -153,6 +153,16 @@ pub(crate) struct RenderedTextState {
     terminated: bool,
 }
 
+impl RenderedTextState {
+    pub(crate) fn continuation(stream: TextStream, origin: ContentOrigin) -> Self {
+        Self {
+            stream,
+            origin,
+            terminated: false,
+        }
+    }
+}
+
 fn render_stderr_text(
     previous_text: Option<RenderedTextState>,
     origin: ContentOrigin,
@@ -395,26 +405,6 @@ fn render_bytes(bytes: &[u8], start: usize, end: usize) -> String {
         }
     }
     out
-}
-
-pub(crate) fn render_bytes_with_events_and_spans<E: EventView, S: TextSpanView>(
-    bytes: &[u8],
-    base_offset: u64,
-    end_offset: u64,
-    spans: &[S],
-    events: &[E],
-    projection_mode: ProjectionMode,
-) -> Vec<WorkerContent> {
-    render_bytes_with_events_and_spans_with_state(
-        bytes,
-        base_offset,
-        end_offset,
-        spans,
-        events,
-        projection_mode,
-        None,
-    )
-    .0
 }
 
 pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: TextSpanView>(
