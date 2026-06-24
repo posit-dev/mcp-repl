@@ -264,6 +264,30 @@ fn read_only_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+fn read_only_with_unknown_special_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "unknown",
+                            "path": ":future_special_path",
+                            "subpath": null
+                        }
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -3236,6 +3260,40 @@ async fn sandbox_inherit_accepts_read_only_network_access_meta() -> TestResult<(
     assert!(
         text.contains("[1] 2"),
         "expected input to run after read-only network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ignores_unknown_special_path_entries() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(read_only_with_unknown_special_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        result.is_error != Some(true),
+        "expected unknown special-path metadata to be accepted, got: {text}"
+    );
+    assert!(
+        !text.contains("failed to parse Codex sandbox state metadata"),
+        "unknown special-path metadata should not fail deserialization: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected input to run after unknown special-path metadata, got: {text}"
     );
     Ok(())
 }

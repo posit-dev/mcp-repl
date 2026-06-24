@@ -1039,6 +1039,12 @@ enum CodexFileSystemSpecialPath {
     },
     Tmpdir,
     SlashTmp,
+    Unknown {
+        #[serde(rename = "path")]
+        _path: String,
+        #[serde(default, rename = "subpath")]
+        _subpath: Option<PathBuf>,
+    },
 }
 
 const CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR: &str =
@@ -1204,7 +1210,9 @@ fn file_system_policy_from_codex_restricted_entries(
 ) -> Result<FileSystemSandboxPolicy, String> {
     let mut runtime_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let path = file_system_path_from_codex(&entry.path)?;
+        let Some(path) = file_system_path_from_codex(&entry.path)? else {
+            continue;
+        };
         match (&path, &entry.access) {
             (FileSystemPath::GlobPattern { .. }, CodexFileSystemAccessMode::Deny) => {}
             (FileSystemPath::GlobPattern { .. }, _) => {
@@ -1250,27 +1258,38 @@ fn file_system_policy_from_codex_restricted_entries(
     })
 }
 
-fn file_system_path_from_codex(path: &CodexFileSystemPath) -> Result<FileSystemPath, String> {
+fn file_system_path_from_codex(
+    path: &CodexFileSystemPath,
+) -> Result<Option<FileSystemPath>, String> {
     match path {
-        CodexFileSystemPath::Path { path } => Ok(FileSystemPath::Path {
+        CodexFileSystemPath::Path { path } => Ok(Some(FileSystemPath::Path {
             path: parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?,
-        }),
-        CodexFileSystemPath::GlobPattern { pattern } => Ok(FileSystemPath::GlobPattern {
+        })),
+        CodexFileSystemPath::GlobPattern { pattern } => Ok(Some(FileSystemPath::GlobPattern {
             pattern: pattern.clone(),
-        }),
-        CodexFileSystemPath::Special { value } => Ok(FileSystemPath::Special {
-            value: match value {
-                CodexFileSystemSpecialPath::Root => FileSystemSpecialPath::Root,
-                CodexFileSystemSpecialPath::Minimal => FileSystemSpecialPath::Minimal,
-                CodexFileSystemSpecialPath::ProjectRoots { subpath } => {
-                    FileSystemSpecialPath::ProjectRoots {
+        })),
+        CodexFileSystemPath::Special { value } => match value {
+            CodexFileSystemSpecialPath::Root => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            })),
+            CodexFileSystemSpecialPath::Minimal => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            })),
+            CodexFileSystemSpecialPath::ProjectRoots { subpath } => {
+                Ok(Some(FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots {
                         subpath: subpath.clone(),
-                    }
-                }
-                CodexFileSystemSpecialPath::Tmpdir => FileSystemSpecialPath::Tmpdir,
-                CodexFileSystemSpecialPath::SlashTmp => FileSystemSpecialPath::SlashTmp,
-            },
-        }),
+                    },
+                }))
+            }
+            CodexFileSystemSpecialPath::Tmpdir => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            })),
+            CodexFileSystemSpecialPath::SlashTmp => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::SlashTmp,
+            })),
+            CodexFileSystemSpecialPath::Unknown { .. } => Ok(None),
+        },
     }
 }
 
@@ -1282,6 +1301,9 @@ fn legacy_sandbox_policy_from_codex_restricted_entries(
     let mut projection = RestrictedProfileProjection::default();
 
     for entry in entries {
+        if codex_path_is_unknown_special(&entry.path) {
+            continue;
+        }
         match entry.access {
             CodexFileSystemAccessMode::Deny => {
                 return Err(
@@ -1347,6 +1369,15 @@ fn legacy_sandbox_policy_from_codex_restricted_entries(
     Ok(SandboxPolicy::ReadOnly { network_access })
 }
 
+fn codex_path_is_unknown_special(path: &CodexFileSystemPath) -> bool {
+    matches!(
+        path,
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Unknown { .. }
+        }
+    )
+}
+
 fn project_codex_write_entry(
     path: CodexFileSystemPath,
     sandbox_cwd: &Path,
@@ -1387,6 +1418,7 @@ fn project_codex_write_entry(
                         .to_string(),
                 );
             }
+            CodexFileSystemSpecialPath::Unknown { .. } => {}
         },
         CodexFileSystemPath::GlobPattern { pattern } => {
             let _ = pattern;
@@ -1466,6 +1498,9 @@ fn workspace_write_read_entry_is_representable(
                 | CodexFileSystemSpecialPath::SlashTmp
                 | CodexFileSystemSpecialPath::Minimal,
         } => Ok(root_read),
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Unknown { .. },
+        } => Ok(true),
         CodexFileSystemPath::Path { path } => {
             let path = parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?;
             if is_protected_metadata_path_under_roots(&path, sandbox_cwd, writable_roots) {
