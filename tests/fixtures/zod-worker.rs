@@ -245,6 +245,13 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "split-utf8-before-image" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("repeat-output ") {
         let len: usize = parse_millis(len)?
             .try_into()
@@ -402,6 +409,15 @@ fn output_stderr_text(
     writer.output_text("stderr", bytes)
 }
 
+fn output_image(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_image")?;
+    writer.output_image("image/png", bytes)
+}
+
 fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
@@ -522,6 +538,12 @@ enum WorkerToServer {
         #[serde(default, skip_serializing_if = "is_false")]
         is_continuation: bool,
     },
+    OutputImage {
+        mime_type: String,
+        data_b64: String,
+        is_update: bool,
+        source: Option<String>,
+    },
     InputLine {
         prompt: String,
         text: String,
@@ -600,6 +622,15 @@ impl IpcWriter {
             stream: stream.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
             is_continuation,
+        })
+    }
+
+    fn output_image(&self, mime_type: &str, bytes: &[u8]) -> io::Result<()> {
+        self.send(&WorkerToServer::OutputImage {
+            mime_type: mime_type.to_string(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            is_update: false,
+            source: None,
         })
     }
 }

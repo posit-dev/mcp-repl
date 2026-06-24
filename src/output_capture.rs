@@ -105,14 +105,7 @@ impl OutputTimeline {
             bytes,
             is_continuation || matches!(source, OutputTextSource::Raw),
         );
-        for entry in pending {
-            self.ring.append_bytes_with_source(
-                &entry.bytes,
-                entry.key.is_stderr,
-                entry.key.origin,
-                entry.key.source,
-            );
-        }
+        self.append_pending(pending);
     }
 
     pub(crate) fn append_image(
@@ -123,7 +116,12 @@ impl OutputTimeline {
         is_new: bool,
         _readline_results_seen: usize,
     ) {
-        self.ring.append_image_event(id, mime_type, data, is_new);
+        self.append_event(OutputEventKind::Image {
+            id,
+            data,
+            mime_type,
+            is_new,
+        });
     }
 
     pub(crate) fn append_text_event(
@@ -133,12 +131,16 @@ impl OutputTimeline {
         origin: ContentOrigin,
         _readline_results_seen: Option<usize>,
     ) {
-        self.ring.append_text_event(text, is_stderr, origin);
+        self.append_event(OutputEventKind::Text {
+            text,
+            is_stderr,
+            origin,
+        });
     }
 
     pub(crate) fn append_input_echo(&self, prompt: &str, line: &str) {
         if let Some(kind) = OutputEventKind::input_echo(prompt, line) {
-            self.ring.append_input_echo_event(kind);
+            self.append_event(kind);
         }
     }
 
@@ -164,13 +166,27 @@ impl OutputTimeline {
 
     pub(crate) fn flush_utf8_tails(&self) {
         let pending = self.utf8_tails.lock().unwrap().drain();
+        self.append_pending(pending);
+    }
+
+    fn append_event(&self, kind: OutputEventKind) {
+        let pending = self.utf8_tails.lock().unwrap().push_event(kind);
+        self.append_pending(pending);
+    }
+
+    fn append_pending(&self, pending: Vec<OutputPendingEntry>) {
         for entry in pending {
-            self.ring.append_bytes_with_source(
-                &entry.bytes,
-                entry.key.is_stderr,
-                entry.key.origin,
-                entry.key.source,
-            );
+            match entry {
+                OutputPendingEntry::Text(entry) => {
+                    self.ring.append_bytes_with_source(
+                        &entry.bytes,
+                        entry.key.is_stderr,
+                        entry.key.origin,
+                        entry.key.source,
+                    );
+                }
+                OutputPendingEntry::Event(kind) => self.ring.append_materialized_event(kind),
+            }
         }
     }
 }
@@ -188,9 +204,14 @@ struct OutputUtf8Tail {
     sealed: bool,
 }
 
+enum OutputPendingEntry {
+    Text(OutputUtf8Tail),
+    Event(OutputEventKind),
+}
+
 #[derive(Default)]
 struct OutputUtf8Tails {
-    entries: Vec<OutputUtf8Tail>,
+    entries: Vec<OutputPendingEntry>,
 }
 
 impl OutputUtf8Tails {
@@ -199,37 +220,52 @@ impl OutputUtf8Tails {
         key: OutputUtf8TailKey,
         bytes: &[u8],
         continue_previous_tail: bool,
-    ) -> Vec<OutputUtf8Tail> {
+    ) -> Vec<OutputPendingEntry> {
         if bytes.is_empty() {
             return Vec::new();
         }
         if continue_previous_tail
-            && let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.key == key && !entry.sealed && !entry.is_flushable())
+            && let Some(index) = self.entries.iter().position(|entry| match entry {
+                OutputPendingEntry::Text(entry) => {
+                    entry.key == key && !entry.sealed && !entry.is_flushable()
+                }
+                OutputPendingEntry::Event(_) => false,
+            })
         {
-            self.entries[index].bytes.extend_from_slice(bytes);
+            let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
+                unreachable!("matching pending UTF-8 entry must be text");
+            };
+            entry.bytes.extend_from_slice(bytes);
         } else {
-            if let Some(entry) = self
-                .entries
-                .iter_mut()
-                .find(|entry| entry.key == key && !entry.sealed && !entry.is_flushable())
-            {
+            if let Some(entry) = self.entries.iter_mut().find_map(|entry| match entry {
+                OutputPendingEntry::Text(entry)
+                    if entry.key == key && !entry.sealed && !entry.is_flushable() =>
+                {
+                    Some(entry)
+                }
+                OutputPendingEntry::Text(_) | OutputPendingEntry::Event(_) => None,
+            }) {
                 entry.sealed = true;
             }
-            self.entries.push(OutputUtf8Tail {
+            self.entries.push(OutputPendingEntry::Text(OutputUtf8Tail {
                 key,
                 bytes: bytes.to_vec(),
                 sealed: false,
-            });
+            }));
         }
         self.drain_ready()
     }
 
-    fn drain(&mut self) -> Vec<OutputUtf8Tail> {
+    fn push_event(&mut self, kind: OutputEventKind) -> Vec<OutputPendingEntry> {
+        self.entries.push(OutputPendingEntry::Event(kind));
+        self.drain_ready()
+    }
+
+    fn drain(&mut self) -> Vec<OutputPendingEntry> {
         for entry in &mut self.entries {
-            entry.sealed = true;
+            if let OutputPendingEntry::Text(entry) = entry {
+                entry.sealed = true;
+            }
         }
         self.drain_ready()
     }
@@ -238,13 +274,18 @@ impl OutputUtf8Tails {
         self.entries.clear();
     }
 
-    fn drain_ready(&mut self) -> Vec<OutputUtf8Tail> {
+    fn drain_ready(&mut self) -> Vec<OutputPendingEntry> {
         let mut ready = Vec::new();
-        while let Some(front) = self.entries.first_mut() {
+        while !self.entries.is_empty() {
+            let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
+                ready.push(self.entries.remove(0));
+                continue;
+            };
             if front.sealed {
                 ready.push(self.entries.remove(0));
                 continue;
             }
+
             let flushable_len = flushable_prefix_len(&front.bytes);
             if flushable_len == 0 {
                 break;
@@ -256,11 +297,11 @@ impl OutputUtf8Tails {
             let key = front.key;
             let bytes = front.bytes[..flushable_len].to_vec();
             front.bytes.drain(..flushable_len);
-            ready.push(OutputUtf8Tail {
+            ready.push(OutputPendingEntry::Text(OutputUtf8Tail {
                 key,
                 bytes,
                 sealed: true,
-            });
+            }));
             break;
         }
         ready
@@ -607,47 +648,21 @@ impl OutputRing {
         });
     }
 
-    pub(crate) fn append_image_event(
-        &self,
-        id: String,
-        mime_type: String,
-        data: String,
-        is_new: bool,
-    ) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.note_progress();
-        let kind = OutputEventKind::Image {
-            id,
-            data,
-            mime_type,
-            is_new,
-        };
-        let event_bytes = event_size_bytes(&kind);
-        if event_bytes > self.capacity_bytes {
-            return;
+    fn append_materialized_event(&self, kind: OutputEventKind) {
+        match kind {
+            OutputEventKind::Image { .. } | OutputEventKind::Text { .. } => {
+                self.append_visible_event(kind);
+            }
+            OutputEventKind::InputEcho { .. } => self.append_input_echo_event(kind),
+            OutputEventKind::InputWait
+            | OutputEventKind::RequestBoundary
+            | OutputEventKind::SessionEnd => self.append_marker_event(kind),
         }
-
-        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
-        let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_visible() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
-            event_offset = event_offset.max(guard.start_offset);
-        }
-        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
-        guard.events.push_back(OutputEvent {
-            offset: event_offset,
-            kind,
-        });
     }
 
-    pub(crate) fn append_text_event(&self, text: String, is_stderr: bool, origin: ContentOrigin) {
+    fn append_visible_event(&self, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
         guard.note_progress();
-        let kind = OutputEventKind::Text {
-            text,
-            is_stderr,
-            origin,
-        };
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
             return;

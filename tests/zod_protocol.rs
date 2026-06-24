@@ -626,6 +626,56 @@ async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestRe
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v5_split_utf8_stdout_stays_before_interleaved_image() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-image",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    let image_index = result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+        .ok_or("expected interleaved image in reply")?;
+    let text_before_image = result.content[..image_index]
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(
+        text_before_image.contains("é"),
+        "split stdout UTF-8 should render before the following image, got contents: {:?}",
+        result.content
+    );
+    assert!(
+        text.contains("é"),
+        "split stdout UTF-8 should render as one character, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
+    );
+
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<()> {
