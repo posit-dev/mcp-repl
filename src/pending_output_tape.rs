@@ -90,6 +90,7 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn clear(&self) {
+        self.timeline.clear();
         self.output.clear();
         self.output.start_capture();
     }
@@ -178,6 +179,22 @@ mod tests {
                 WorkerContent::worker_stdout("partial"),
                 WorkerContent::server_stdout("\n[repl] session ended\n"),
             ]
+        );
+    }
+
+    #[test]
+    fn clear_drops_incomplete_utf8_tail() {
+        let tape = tape();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.clear();
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+
+        let formatted = tape.drain_final_output();
+        assert_eq!(
+            formatted.contents,
+            vec![WorkerContent::worker_stdout("\\xA9\n")],
+            "clear should not let an incomplete UTF-8 prefix merge with later output"
         );
     }
 }

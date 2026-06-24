@@ -168,31 +168,12 @@ impl PagerBuffer {
                 .offset
                 .saturating_sub(start_offset)
                 .min(bytes.len() as u64) as usize;
-            let mut raw_end = relative;
-            let mut skipped_echo_end = None;
-            if !materialize_input_echoes && let OutputEventKind::InputEcho { text } = &event.kind {
-                let text_bytes = text.as_bytes();
-                if relative >= cursor.saturating_add(text_bytes.len())
-                    && bytes[relative - text_bytes.len()..relative] == *text_bytes
-                {
-                    raw_end = relative - text_bytes.len();
-                } else {
-                    let end = relative.saturating_add(text_bytes.len()).min(bytes.len());
-                    if bytes[relative..end] == *text_bytes {
-                        skipped_echo_end = Some(end);
-                    }
-                }
-            }
-            self.append_raw_slice(&bytes, cursor, raw_end, start_offset, &text_spans);
-            let mut next_cursor = relative;
+            self.append_raw_slice(&bytes, cursor, relative, start_offset, &text_spans);
             match event.kind {
                 OutputEventKind::InputEcho { text } if materialize_input_echoes => {
                     self.append_bytes_at_source_offset(text.as_bytes(), event.offset);
                 }
                 OutputEventKind::InputEcho { text } => {
-                    if let Some(end) = skipped_echo_end {
-                        next_cursor = end;
-                    }
                     self.events.push(PagerEvent {
                         offset: self.len(),
                         kind: OutputEventKind::InputEcho { text },
@@ -222,7 +203,7 @@ impl PagerBuffer {
                     });
                 }
             }
-            cursor = next_cursor;
+            cursor = relative;
         }
         self.append_raw_slice(&bytes, cursor, bytes.len(), start_offset, &text_spans);
         self.source_end = end_offset.max(self.source_end);

@@ -555,6 +555,33 @@ async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-matching-input-line",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("v5> output-matching-input-line\nVISIBLE\n"),
+        "output_text that matches input_line metadata should remain visible in pager mode, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
