@@ -26,12 +26,10 @@ jobs:
             target: aarch64-apple-darwin
             asset_name: mcp-repl-aarch64-apple-darwin.tar.gz
             artifact_name: release-aarch64-apple-darwin
-            manylinux: auto
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             asset_name: mcp-repl-x86_64-pc-windows-msvc.zip
             artifact_name: release-x86_64-pc-windows-msvc
-            manylinux: auto
 
     steps:
       - uses: actions/checkout@v4
@@ -139,14 +137,22 @@ jobs:
           Compress-Archive -Path "mcp-repl-${{ matrix.target }}" -DestinationPath "${{ matrix.asset_name }}" -Force
           Pop-Location
 
-      - name: Build PyPI wheel
-        if: github.event_name == 'pull_request'
+      - name: Build PyPI wheel (linux)
+        if: github.event_name == 'pull_request' && matrix.os == 'ubuntu-22.04'
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.11.5
           command: build
           args: --release --locked --compatibility pypi --out dist/wheels
-          manylinux: ${{ matrix.manylinux }}
+          manylinux: "2014"
+
+      - name: Build PyPI wheel (non-linux)
+        if: github.event_name == 'pull_request' && matrix.os != 'ubuntu-22.04'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.11.5
+          command: build
+          args: --release --locked --compatibility pypi --out dist/wheels
 
       - name: Smoke test PyPI wheel
         if: github.event_name == 'pull_request' && matrix.os != 'windows-2022'
