@@ -15,6 +15,7 @@ pub(crate) const FILES_OUTPUT_TIMELINE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const OUTPUT_TRUNCATION_NOTICE: &str =
     "[repl] output truncated (older output dropped)\n";
+const OUTPUT_OMISSION_NOTICE: &str = "[repl] output omitted (later content omitted)\n";
 
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
@@ -713,16 +714,21 @@ impl OutputRing {
             remaining = tail;
 
             let mut guard = self.inner.lock().unwrap();
-            guard.drop_input_echoes_for_room(chunk_len, self.capacity_bytes);
+            let reserve = self.head_omission_notice_reserve_locked(&guard);
+            let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
+            guard.drop_input_echoes_for_room(chunk_len, effective_capacity);
             let available = self
                 .capacity_bytes
+                .saturating_sub(reserve)
                 .saturating_sub(guard.total_buffered_bytes());
             if available == 0 {
+                self.append_omission_notice_locked(&mut guard);
                 break;
             }
             let retained_len = chunk_len.min(available);
             Self::append_chunk_locked(&mut guard, &head[..retained_len], is_stderr, origin, source);
             if retained_len < chunk_len {
+                self.append_omission_notice_locked(&mut guard);
                 break;
             }
         }
@@ -809,6 +815,9 @@ impl OutputRing {
         guard.note_progress();
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
+            if self.retention == OutputRetention::Head {
+                self.append_omission_notice_locked(&mut guard);
+            }
             return;
         }
 
@@ -822,8 +831,11 @@ impl OutputRing {
                 }
             }
             OutputRetention::Head => {
-                guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes);
-                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                let reserve = self.head_omission_notice_reserve_locked(&guard);
+                let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
+                guard.drop_input_echoes_for_room(event_bytes, effective_capacity);
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > effective_capacity {
+                    self.append_omission_notice_locked(&mut guard);
                     return;
                 }
             }
@@ -1118,6 +1130,39 @@ impl OutputRing {
             kind: notice_kind,
         });
     }
+
+    fn head_omission_notice_reserve_locked(&self, guard: &OutputRingInner) -> usize {
+        if self.retention != OutputRetention::Head || guard.has_omission_notice() {
+            return 0;
+        }
+        let notice_bytes = event_size_bytes(&omission_notice_kind());
+        if notice_bytes <= self.capacity_bytes {
+            notice_bytes
+        } else {
+            0
+        }
+    }
+
+    fn append_omission_notice_locked(&self, guard: &mut OutputRingInner) {
+        if self.retention != OutputRetention::Head || guard.has_omission_notice() {
+            return;
+        }
+        let notice_kind = omission_notice_kind();
+        let notice_bytes = event_size_bytes(&notice_kind);
+        if notice_bytes > self.capacity_bytes {
+            return;
+        }
+        guard.drop_input_echoes_for_room(notice_bytes, self.capacity_bytes);
+        if guard.total_buffered_bytes().saturating_add(notice_bytes) > self.capacity_bytes {
+            return;
+        }
+        guard.note_progress();
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(notice_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: guard.end_offset.max(guard.start_offset),
+            kind: notice_kind,
+        });
+    }
 }
 
 impl OutputRingInner {
@@ -1128,6 +1173,17 @@ impl OutputRingInner {
     fn total_buffered_bytes(&self) -> usize {
         self.buffered_bytes
             .saturating_add(self.buffered_event_bytes)
+    }
+
+    fn has_omission_notice(&self) -> bool {
+        self.events.iter().any(|event| match &event.kind {
+            OutputEventKind::Text {
+                text,
+                origin: ContentOrigin::Server,
+                ..
+            } => text == OUTPUT_OMISSION_NOTICE,
+            _ => false,
+        })
     }
 
     fn pop_front_event(&mut self) -> bool {
@@ -1309,6 +1365,14 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
         OutputEventKind::InputWait
         | OutputEventKind::RequestBoundary
         | OutputEventKind::SessionEnd => 0,
+    }
+}
+
+fn omission_notice_kind() -> OutputEventKind {
+    OutputEventKind::Text {
+        text: OUTPUT_OMISSION_NOTICE.to_string(),
+        is_stderr: false,
+        origin: ContentOrigin::Server,
     }
 }
 
@@ -1519,6 +1583,39 @@ mod tests {
         assert!(
             image_event.offset >= range.start_offset,
             "expected event offset to be clamped into retained range"
+        );
+    }
+
+    #[test]
+    fn head_retention_marks_visible_events_dropped_at_capacity() {
+        let timeline = OutputTimeline::with_head_retention_capacity(128);
+        let output = timeline.buffer();
+
+        timeline.append_text(&[b'x'; 120], false, ContentOrigin::Worker);
+        timeline.append_image(
+            "plot-1".to_string(),
+            "image/png".to_string(),
+            "image-data".to_string(),
+            true,
+            0,
+        );
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert!(
+            range.events.iter().any(|event| matches!(
+                &event.kind,
+                OutputEventKind::Text {
+                    text,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("output omitted")
+            )),
+            "expected a server omission notice when a later visible event cannot fit"
         );
     }
 
