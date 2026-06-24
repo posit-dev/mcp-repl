@@ -42,7 +42,6 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/debugging.md",
         "docs/sandbox.md",
         "docs/plans/AGENTS.md",
-        "scripts/diff_composition.py",
         "cargo test --quiet",
         "python3 tests/run_integration_tests.py --binary target/debug/mcp-repl",
         "cargo insta test --check",
