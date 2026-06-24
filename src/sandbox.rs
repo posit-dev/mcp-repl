@@ -25,6 +25,7 @@ pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_
 pub const R_SESSION_TMPDIR_ENV: &str = "MCP_REPL_R_SESSION_TMPDIR";
 #[cfg(target_os = "macos")]
 pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_REPL_SANDBOX_LOG_DENIALS";
+const PROTECTED_METADATA_SUBPATHS: [&str; 3] = [".git", ".agents", ".codex"];
 #[cfg(target_os = "linux")]
 pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_REPL_USE_LINUX_BWRAP";
 #[cfg(target_os = "linux")]
@@ -290,7 +291,7 @@ impl FileSystemSandboxPolicy {
                     access: FileSystemAccessMode::Write,
                 }),
         );
-        for subpath in [".git", ".agents", ".codex"] {
+        for subpath in PROTECTED_METADATA_SUBPATHS {
             entries.push(FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
                     value: FileSystemSpecialPath::ProjectRoots {
@@ -422,7 +423,7 @@ impl FileSystemSandboxPolicy {
         dedup_paths(writable_entries)
             .into_iter()
             .map(|root| {
-                let mut read_only_subpaths = compute_read_only_subpaths(&root);
+                let mut read_only_subpaths = compute_macos_writable_root_exclusions(&root);
                 read_only_subpaths.extend(
                     resolved_entries
                         .iter()
@@ -612,7 +613,7 @@ impl SandboxPolicy {
                 roots
                     .into_iter()
                     .map(|root| WritableRoot {
-                        read_only_subpaths: compute_read_only_subpaths(&root),
+                        read_only_subpaths: compute_macos_writable_root_exclusions(&root),
                         root,
                     })
                     .collect()
@@ -647,7 +648,7 @@ impl SandboxPolicy {
                 roots
                     .into_iter()
                     .map(|root| WritableRoot {
-                        read_only_subpaths: compute_read_only_subpaths(&root),
+                        read_only_subpaths: compute_macos_writable_root_exclusions(&root),
                         root,
                     })
                     .collect()
@@ -862,6 +863,18 @@ fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
         subpaths.push(dot_agents);
     }
 
+    subpaths
+}
+
+#[cfg(target_os = "macos")]
+fn compute_macos_writable_root_exclusions(root: &Path) -> Vec<PathBuf> {
+    let mut subpaths = compute_read_only_subpaths(root);
+    for subpath in PROTECTED_METADATA_SUBPATHS {
+        let protected_path = root.join(subpath);
+        if !subpaths.iter().any(|path| path == &protected_path) {
+            subpaths.push(protected_path);
+        }
+    }
     subpaths
 }
 
@@ -1544,7 +1557,7 @@ fn is_protected_metadata_subpath(path: &Path) -> bool {
     };
     matches!(
         first.as_os_str().to_str(),
-        Some(".git" | ".agents" | ".codex")
+        Some(name) if PROTECTED_METADATA_SUBPATHS.contains(&name)
     )
 }
 

@@ -230,6 +230,28 @@ fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "path",
+                        "path": writable_root
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -2670,6 +2692,91 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
         "workspace-write unexpectedly blocked write in cwd: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_explicit_path_write_meta_blocks_missing_protected_metadata()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-explicit-path-write-protected")?;
+    let writable_root = scratch.path().join("explicit-root");
+    fs::create_dir(&writable_root)?;
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            !writable_root.join(protected_name).exists(),
+            "test requires missing protected metadata path: {}",
+            writable_root.join(protected_name).display()
+        );
+    }
+    let encoded_writable_root = encode_path(&writable_root)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+writable_root <- {encoded_writable_root}
+allowed_target <- file.path(writable_root, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+for (protected_name in c(".git", ".agents", ".codex")) {{
+  protected_dir <- file.path(writable_root, protected_name)
+  protected_target <- file.path(protected_dir, "blocked.txt")
+  tryCatch({{
+    dir.create(protected_dir)
+    writeLines("blocked", protected_target)
+    cat("PROTECTED_WRITE_OK:", protected_name, "\n", sep = "")
+  }}, error = function(e) {{
+    message("PROTECTED_WRITE_ERROR:", protected_name, ":", conditionMessage(e))
+  }})
+}}
+"#
+            ),
+            Some(10.0),
+            Some(explicit_path_write_meta(scratch.path(), &writable_root)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALLOWED_WRITE_OK"),
+        "expected explicit path write root to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("ALLOWED_WRITE_ERROR:"),
+        "explicit path write root unexpectedly blocked ordinary write: {text}"
+    );
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+            "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+        );
+        assert!(
+            !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+            "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+        );
+    }
+    session.cancel().await?;
+    assert!(
+        writable_root.join("allowed.txt").exists(),
+        "ordinary write under explicit root should create the target file"
+    );
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            !writable_root.join(protected_name).exists(),
+            "protected metadata write should not create {}",
+            writable_root.join(protected_name).display()
+        );
+    }
     Ok(())
 }
 
