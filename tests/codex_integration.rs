@@ -36,7 +36,7 @@ mod unix_impl {
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const CODEX_MODEL: &str = "gpt-5.3-codex-spark";
     const CODEX_BACKEND_ENV: &str = "MCP_REPL_CODEX_BACKEND";
-    const LIVE_TOOL_INPUT: &str = "cat(\"CODEX_LIVE_MCP_OK\\n\")\n";
+    const LIVE_TOOL_INPUT: &str = "cat(\"CODEX_LIVE_MCP_OK\")\n";
     const MOCK_TOOL_INPUT: &str = "cat(\"CODEX_MOCK_MCP_OK\\n\")\n";
     const LIVE_FINAL_MARKER: &str = "CODEX_LIVE_DONE";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
@@ -380,7 +380,7 @@ mod unix_impl {
 
         let mcp_repl = resolve_mcp_repl_path()?;
         let env = create_isolated_live_codex_env(&mcp_repl, auth_json)?;
-        let prompt = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CODEX_LIVE_MCP_OK\\n\") Then answer with exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
+        let prompt = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CODEX_LIVE_MCP_OK\") Then answer with exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
         let cmd = codex_exec_command(
             &env,
             None,
