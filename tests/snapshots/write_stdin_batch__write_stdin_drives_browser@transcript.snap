@@ -5,6 +5,7 @@ expression: transcript
 == session: browser_queue ==
 1) r_repl timeout_ms=10000
 >>> f <- function() { browser(); x <- 1; x <- x + 1; x }
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> f()
@@ -24,3 +25,4 @@ expression: transcript
 5) r_repl timeout_ms=10000
 >>> c
 <<< [1] 2
+<<< >

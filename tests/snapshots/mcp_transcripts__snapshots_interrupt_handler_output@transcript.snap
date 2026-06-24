@@ -19,7 +19,9 @@ expression: transcript
 2) r_repl timeout_ms=5000
 >>> 
 <<< interrupt received
+<<< > 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >

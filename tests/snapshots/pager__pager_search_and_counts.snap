@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+      "text": "> line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))\n"
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.5%, @0..210/42000)"
+      "text": "--More-- (140p, 0.2%, @0..103/42103)"
     }
   ]
 }
@@ -43,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search for `line01` @20790"
+      "text": "[pager] search for `line01` @20893"
     },
     {
       "type": "text",
@@ -51,7 +51,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (71p, 49.5%, @20790/42000)"
+      "text": "--More-- (71p, 49.6%, @20893/42103)"
     }
   ]
 }
@@ -71,7 +71,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search for `line01` @21000"
+      "text": "[pager] search for `line01` @21103"
     },
     {
       "type": "text",
@@ -79,7 +79,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.0%, @21000/42000)"
+      "text": "--More-- (70p, 50.1%, @21103/42103)"
     }
   ]
 }
@@ -103,7 +103,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (69p, 51.0%, @21210..21420/42000)"
+      "text": "--More-- (69p, 51.1%, @21313..21523/42103)"
     }
   ]
 }
@@ -127,7 +127,7 @@ response:
     },
     {
       "type": "text",
-      "text": "(END, 100.0%, @41580..42000/42000)"
+      "text": "(END, 100.0%, @41683..42103/42103)"
     },
     {
       "type": "text",

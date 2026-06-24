@@ -5,23 +5,18 @@ expression: transcript
 == session: default ==
 1) r_repl timeout_ms=30000
 >>> cat('# Title\n'); for (i in 1:40) cat(sprintf('filler %02d xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n', i)); cat('## Alpha\n'); for (i in 1:3) cat(sprintf('alpha configure %02d\n', i)); cat('## Beta\n'); for (i in 1:3) cat(sprintf('beta configure %02d\n', i))
+<<< > cat('# Title\n'); for (i in 1:40) cat(sprintf('filler %02d xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n', i)); cat('## Alpha\n'); for (i in 1:3) cat(sprintf('alpha configure %02d\n', i)); cat('## Beta\n'); for (i in 1:3) cat(sprintf('beta configure %02d\n', i))
 <<< # Title
 <<< filler 01 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 02 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 03 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 04 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 05 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< filler 07 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (5p, 16.5%, @0..288/1736)
+<<< --More-- (6p, 15.0%, @0..299/1987)
 
 2) r_repl timeout_ms=30000
 >>> :hits configure
-<<< #1 @1617 Title > Alpha
+<<< #1 @1868 Title > Alpha
 <<<   > alpha configure 01
 <<< 
-<<< (END, 94.2%, @1617..1636/1736)
+<<< (END, 94.9%, @1868..1887/1987)
 
 3) r_repl timeout_ms=30000
 >>> :n
@@ -32,9 +27,9 @@ expression: transcript
 <<< beta configure 02
 <<< beta configure 03
 <<< 
-<<< (END, 100.0%, @1636..1736/1736)
+<<< (END, 100.0%, @1887..1987/1987)
 
 4) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 100.0%, @1636..1736/1736)
+<<< (END, 100.0%, @1887..1987/1987)
 <<< >

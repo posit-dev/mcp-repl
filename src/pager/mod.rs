@@ -78,7 +78,7 @@ pub(crate) struct SnapshotPage {
 
 impl PagerBuffer {
     fn from_range(range: OutputRange) -> Self {
-        Self::from_range_with_input_echo_materialization(range, false)
+        Self::from_range_with_input_echo_materialization(range, true)
     }
 
     fn from_range_for_reply_probe(range: OutputRange) -> Self {
@@ -522,7 +522,7 @@ impl PagerBuffer {
     }
 
     fn append_range(&mut self, range: OutputRange) {
-        self.append_range_with_input_echo_projection(range, false);
+        self.append_range_with_input_echo_projection(range, true);
     }
 
     fn append_raw_slice(

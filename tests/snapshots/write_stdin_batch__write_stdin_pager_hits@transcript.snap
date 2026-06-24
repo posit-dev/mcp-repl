@@ -5,6 +5,7 @@ expression: transcript
 == session: pager_hits_queue ==
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) cat(sprintf("line%04d %s\n", i, line))
+<<< > line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) cat(sprintf("line%04d %s\n", i, line))
 <<< 
 <<< --More-- (140p, 0.2%, @0..103/42103)
 
@@ -24,3 +25,4 @@ expression: transcript
 4) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 75.5%, @31603..31813/42103)
+<<< >

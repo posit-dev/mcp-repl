@@ -5,35 +5,35 @@ expression: transcript
 == session: default ==
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 120), collapse = ""); for (i in 1:40) cat(sprintf("line%02d %s\n", i, line))
+<<< > line <- paste(rep("x", 120), collapse = ""); for (i in 1:40) cat(sprintf("line%02d %s\n", i, line))
 <<< line01 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< line02 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (17p, 5.0%, @0..256/5120)
+<<< --More-- (17p, 4.4%, @0..230/5222)
 
 2) r_repl timeout_ms=30000
 >>> :next
+<<< line02 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line03 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< line04 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (16p, 10.0%, @256..512/5120)
+<<< --More-- (16p, 9.3%, @230..486/5222)
 
 3) r_repl timeout_ms=30000
 >>> :seek 0
-<<< [pager] elided output (already shown): @0..512
+<<< [pager] elided output (already shown): @0..486
 <<< 
+<<< line04 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line05 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< line06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (15p, 15.0%, @512..768/5120)
+<<< --More-- (15p, 14.2%, @486..742/5222)
 
 4) r_repl timeout_ms=30000
 >>> :next
+<<< line06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line07 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< line08 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (14p, 20.0%, @768..1024/5120)
+<<< --More-- (15p, 19.1%, @742..998/5222)
 
 5) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 20.0%, @768..1024/5120)
+<<< (END, 19.1%, @742..998/5222)
 <<< >
