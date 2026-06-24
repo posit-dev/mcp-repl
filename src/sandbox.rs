@@ -529,8 +529,8 @@ impl FileSystemSandboxPolicy {
         };
         self.resolved_entries_with_cwd(cwd, session_temp_dir)
             .into_iter()
-            .filter(|entry| path.starts_with(&entry.path))
-            .max_by_key(|entry| (entry.path.components().count(), entry.access))
+            .filter(|entry| path_is_at_or_under_root(&path, &entry.path))
+            .max_by_key(|entry| (sandbox_path_specificity(&entry.path), entry.access))
             .map(|entry| entry.access)
             .unwrap_or(FileSystemAccessMode::Deny)
     }
@@ -2242,14 +2242,59 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 #[cfg(target_os = "macos")]
-fn path_is_descendant_of_root(path: &Path, root: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxPathRelation {
+    Same,
+    Descendant,
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_path_relation(path: &Path, root: &Path) -> Option<SandboxPathRelation> {
     let path_variants = sandbox_path_variants(path);
     let root_variants = sandbox_path_variants(root);
-    path_variants.iter().any(|path_variant| {
-        root_variants.iter().any(|root_variant| {
-            path_variant != root_variant && path_variant.starts_with(root_variant)
-        })
-    })
+    let mut descendant = false;
+    for path_variant in &path_variants {
+        for root_variant in &root_variants {
+            if path_variant == root_variant {
+                return Some(SandboxPathRelation::Same);
+            }
+            if path_variant.starts_with(root_variant) {
+                descendant = true;
+            }
+        }
+    }
+    descendant.then_some(SandboxPathRelation::Descendant)
+}
+
+#[cfg(target_os = "macos")]
+fn path_is_at_or_under_root(path: &Path, root: &Path) -> bool {
+    sandbox_path_relation(path, root).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn path_is_descendant_of_root(path: &Path, root: &Path) -> bool {
+    matches!(
+        sandbox_path_relation(path, root),
+        Some(SandboxPathRelation::Descendant)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_path_specificity(path: &Path) -> usize {
+    sandbox_path_variants(path)
+        .iter()
+        .map(|path| path.components().count())
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_paths(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| path_is_descendant_of_root(path, root))
+        .cloned()
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -2362,16 +2407,8 @@ fn build_seatbelt_unreadable_path_policy(
     let mut params = Vec::new();
 
     for (root_index, root) in unreadable_roots.iter().enumerate() {
-        let readable_exceptions = readable_roots
-            .iter()
-            .filter(|path| path.starts_with(root) && path.as_path() != root.as_path())
-            .cloned()
-            .collect::<Vec<_>>();
-        let writable_exceptions = writable_roots
-            .iter()
-            .filter(|path| path.starts_with(root) && path.as_path() != root.as_path())
-            .cloned()
-            .collect::<Vec<_>>();
+        let readable_exceptions = descendant_paths(readable_roots, root);
+        let writable_exceptions = descendant_paths(writable_roots, root);
         for (variant_index, root) in sandbox_path_variants(root).into_iter().enumerate() {
             let root_param = if variant_index == 0 {
                 format!("UNREADABLE_ROOT_{root_index}")
@@ -2633,6 +2670,20 @@ fn create_seatbelt_command_args(
     }
     let unreadable_roots =
         file_system.get_unreadable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
+    let readable_roots = if file_system.has_full_disk_read_access() {
+        Vec::new()
+    } else {
+        file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+    };
+    let writable_roots = if file_system.has_full_disk_write_access() {
+        Vec::new()
+    } else {
+        file_system.get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+    };
+    let writable_root_paths = writable_roots
+        .iter()
+        .map(|root| root.root.clone())
+        .collect::<Vec<_>>();
 
     let (file_write_policy, file_write_dir_params) = if file_system.has_full_disk_write_access() {
         if unreadable_roots.is_empty() {
@@ -2654,12 +2705,11 @@ fn create_seatbelt_command_args(
         build_seatbelt_access_policy(
             "file-write*",
             "WRITABLE_ROOT",
-            file_system
-                .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
-                .into_iter()
+            writable_roots
+                .iter()
                 .map(|root| SeatbeltAccessRoot {
-                    root: root.root,
-                    excluded_subpaths: root.read_only_subpaths,
+                    root: root.root.clone(),
+                    excluded_subpaths: root.read_only_subpaths.clone(),
                 })
                 .collect(),
         )
@@ -2686,20 +2736,14 @@ fn create_seatbelt_command_args(
             )
         }
     } else {
-        let readable_roots =
-            file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
         let (policy, params) = build_seatbelt_access_policy(
             "file-read*",
             "READABLE_ROOT",
             readable_roots
-                .into_iter()
+                .iter()
                 .map(|root| SeatbeltAccessRoot {
-                    excluded_subpaths: file_system
-                        .get_unreadable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
-                        .into_iter()
-                        .filter(|path| path.starts_with(&root))
-                        .collect(),
-                    root,
+                    excluded_subpaths: descendant_paths(&unreadable_roots, root),
+                    root: root.clone(),
                 })
                 .collect(),
         );
@@ -2725,17 +2769,10 @@ fn create_seatbelt_command_args(
     );
 
     let deny_read_policy = build_seatbelt_unreadable_glob_policy(&file_system, sandbox_policy_cwd);
-    let readable_roots_for_unreadable_path_policy =
-        file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
-    let writable_roots_for_unreadable_path_policy = file_system
-        .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
-        .into_iter()
-        .map(|root| root.root)
-        .collect::<Vec<_>>();
     let (deny_path_policy, deny_path_params) = build_seatbelt_unreadable_path_policy(
         &unreadable_roots,
-        &readable_roots_for_unreadable_path_policy,
-        &writable_roots_for_unreadable_path_policy,
+        &readable_roots,
+        &writable_root_paths,
     );
     let mut policy_sections = vec![
         MACOS_SEATBELT_BASE_POLICY.to_string(),

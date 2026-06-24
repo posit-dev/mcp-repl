@@ -3275,6 +3275,109 @@ tryCatch({{
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_preserves_alias_child_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-path-deny-child-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let denied_dir = canonical_scratch.join("private");
+    let allowed_dir = scratch.path().join("private").join("allowed");
+    fs::create_dir_all(&allowed_dir)?;
+    let allowed_target = canonical_scratch
+        .join("private")
+        .join("allowed")
+        .join("allowed.txt");
+    let blocked_target = canonical_scratch.join("private").join("blocked.txt");
+    let encoded_allowed_target = encode_path(&allowed_target)?;
+    let encoded_blocked_target = encode_path(&blocked_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+allowed_target <- {encoded_allowed_target}
+blocked_target <- {encoded_blocked_target}
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALIAS_CHILD_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_CHILD_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(allowed_target)
+  cat("ALIAS_CHILD_READ_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_CHILD_READ_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("blocked", blocked_target)
+  cat("ALIAS_PARENT_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_PARENT_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_and_child_write_meta(
+                scratch.path(),
+                &denied_dir,
+                &allowed_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALIAS_CHILD_WRITE_OK"),
+        "expected re-allowed alias child write under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_CHILD_WRITE_ERROR:"),
+        "re-allowed alias child write unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_CHILD_READ_OK"),
+        "expected re-allowed alias child read under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_CHILD_READ_ERROR:"),
+        "re-allowed alias child read unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_PARENT_WRITE_ERROR:"),
+        "expected sibling under denied alias parent to remain blocked, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_PARENT_WRITE_OK"),
+        "denied alias parent unexpectedly allowed sibling write: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&allowed_target)?,
+        "allowed\n",
+        "re-allowed alias child write should persist"
+    );
+    assert!(
+        !blocked_target.exists(),
+        "denied alias parent write should not create {}",
+        blocked_target.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
