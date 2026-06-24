@@ -2605,7 +2605,14 @@ fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
     }
 
     if !saw_glob {
-        regex.push_str("(/.*)?");
+        while regex.len() > 2 && regex.ends_with('/') {
+            regex.pop();
+        }
+        if regex == "^/" {
+            regex.push_str(".*");
+        } else {
+            regex.push_str("(/.*)?");
+        }
     }
     regex.push('$');
     Some(regex)

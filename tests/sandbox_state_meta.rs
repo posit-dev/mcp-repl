@@ -3031,6 +3031,61 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_directory_glob_deny_meta_blocks_child_read_and_unlink() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-directory-glob-deny")?;
+    let secrets_dir = scratch.path().join("secrets");
+    fs::create_dir_all(&secrets_dir)?;
+    let target = secrets_dir.join("key.txt");
+    fs::write(&target, "secret\n")?;
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "secrets/",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected directory glob-denied child read to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "directory glob-denied child read unexpectedly succeeded: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        target.exists(),
+        "directory glob-denied child unlink should leave the target file in place"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_blocks_write_read_and_unlink_in_cwd() -> TestResult<()> {
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-path-deny-write")?;
