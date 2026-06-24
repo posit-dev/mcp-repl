@@ -815,6 +815,42 @@ emit_at_wait = True; value = input("plot wait> ")
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_timeout_shows_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stdout.buffer.write(bytes([0xC3]))
+sys.stdout.flush()
+sys.stderr.write("STDERR_READY\\n")
+sys.stderr.flush()
+time.sleep(2)
+""")"#,
+            Some(0.5),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("STDERR_READY"),
+        "expected timeout reply to show later stderr despite incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(not(target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_input_prompt_is_not_duplicated_on_builtin_adapter_stdio() -> TestResult<()> {

@@ -176,6 +176,11 @@ impl OutputTimeline {
         self.append_pending(pending);
     }
 
+    pub(crate) fn flush_ready_utf8_tails(&self) {
+        let pending = self.utf8_tails.lock().unwrap().drain_ready_after_gaps();
+        self.append_pending(pending);
+    }
+
     fn append_event(&self, kind: OutputEventKind) {
         let pending = self.utf8_tails.lock().unwrap().push_event(kind);
         self.append_pending(pending);
@@ -310,6 +315,41 @@ impl OutputUtf8Tails {
                 sealed: true,
             }));
             break;
+        }
+        ready
+    }
+
+    fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
+        let mut ready = Vec::new();
+        let mut index = 0usize;
+        while index < self.entries.len() {
+            let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
+                ready.push(self.entries.remove(index));
+                continue;
+            };
+            if entry.sealed {
+                ready.push(self.entries.remove(index));
+                continue;
+            }
+
+            let flushable_len = flushable_prefix_len(&entry.bytes);
+            if flushable_len == 0 {
+                index += 1;
+                continue;
+            }
+            if flushable_len == entry.bytes.len() {
+                ready.push(self.entries.remove(index));
+                continue;
+            }
+            let key = entry.key;
+            let bytes = entry.bytes[..flushable_len].to_vec();
+            entry.bytes.drain(..flushable_len);
+            ready.push(OutputPendingEntry::Text(OutputUtf8Tail {
+                key,
+                bytes,
+                sealed: true,
+            }));
+            index += 1;
         }
         ready
     }
