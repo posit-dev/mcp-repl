@@ -259,6 +259,28 @@ fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+fn minimal_read_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "read"),
+                special_entry("tmpdir", "write"),
+                json!({
+                    "path": {
+                        "type": "path",
+                        "path": denied_path
+                    },
+                    "access": "deny"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(Vec::new(), "restricted"),
@@ -2733,6 +2755,57 @@ if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
     assert!(
         !text.contains("SLASH_TMP_WRITE_OK"),
         "minimal metadata without slash_tmp unexpectedly allowed /tmp writes: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_path_deny_blocks_platform_default_read() -> TestResult<()> {
+    let _guard = test_guard();
+    let denied_root = Path::new("/Library/Preferences");
+    let Some(denied_child) = fs::read_dir(denied_root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_file())
+    else {
+        eprintln!("no direct file under {}; skipping", denied_root.display());
+        return Ok(());
+    };
+    let encoded_denied_child = encode_path(&denied_child)?;
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_denied_child}
+tryCatch({{
+  readBin(target, "raw", n = 1)
+  cat("PLATFORM_DEFAULT_READ_OK\n")
+}}, error = function(e) {{
+  message("PLATFORM_DEFAULT_READ_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_with_path_deny_meta(temp.path(), denied_root)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("PLATFORM_DEFAULT_READ_ERROR:"),
+        "expected path deny to block platform-default read, got: {text}"
+    );
+    assert!(
+        !text.contains("PLATFORM_DEFAULT_READ_OK"),
+        "path deny unexpectedly allowed platform-default read: {text}"
     );
     Ok(())
 }

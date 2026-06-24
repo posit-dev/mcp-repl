@@ -2275,6 +2275,39 @@ fn build_seatbelt_unreadable_glob_policy(
 }
 
 #[cfg(target_os = "macos")]
+fn build_seatbelt_unreadable_path_policy(
+    unreadable_roots: &[PathBuf],
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policy_components = Vec::new();
+    let mut params = Vec::new();
+
+    for (root_index, root) in unreadable_roots.iter().enumerate() {
+        for (variant_index, root) in sandbox_path_variants(root).into_iter().enumerate() {
+            let root_param = if variant_index == 0 {
+                format!("UNREADABLE_ROOT_{root_index}")
+            } else {
+                format!("UNREADABLE_ROOT_{root_index}_{variant_index}")
+            };
+            policy_components.push(format!(
+                "(deny file-read* (literal (param \"{root_param}\")))"
+            ));
+            policy_components.push(format!(
+                "(deny file-read* (subpath (param \"{root_param}\")))"
+            ));
+            policy_components.push(format!(
+                "(deny file-write* (literal (param \"{root_param}\")))"
+            ));
+            policy_components.push(format!(
+                "(deny file-write* (subpath (param \"{root_param}\")))"
+            ));
+            params.push((root_param, root));
+        }
+    }
+
+    (policy_components.join("\n"), params)
+}
+
+#[cfg(target_os = "macos")]
 fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
     if pattern.is_empty() {
         return None;
@@ -2441,7 +2474,7 @@ fn create_seatbelt_command_args(
                 "READABLE_ROOT",
                 vec![SeatbeltAccessRoot {
                     root: PathBuf::from("/"),
-                    excluded_subpaths: unreadable_roots,
+                    excluded_subpaths: unreadable_roots.clone(),
                 }],
             );
             (
@@ -2489,16 +2522,19 @@ fn create_seatbelt_command_args(
     );
 
     let deny_read_policy = build_seatbelt_unreadable_glob_policy(&file_system, sandbox_policy_cwd);
+    let (deny_path_policy, deny_path_params) =
+        build_seatbelt_unreadable_path_policy(&unreadable_roots);
     let mut policy_sections = vec![
         MACOS_SEATBELT_BASE_POLICY.to_string(),
         file_read_policy,
         file_write_policy,
-        deny_read_policy,
         network_policy,
     ];
     if file_system.include_platform_defaults() {
         policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
     }
+    policy_sections.push(deny_read_policy);
+    policy_sections.push(deny_path_policy);
     let full_policy = policy_sections.join("\n");
     if let Some(path) = crate::debug_logs::log_path("seatbelt-policy.sbpl") {
         let _ = std::fs::write(path, &full_policy);
@@ -2507,6 +2543,7 @@ fn create_seatbelt_command_args(
     let dir_params = [
         file_read_dir_params,
         file_write_dir_params,
+        deny_path_params,
         macos_dir_params(),
     ]
     .concat();
