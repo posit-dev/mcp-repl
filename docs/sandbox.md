@@ -16,6 +16,12 @@ That metadata is the source of truth for the tool call that is about to run. If
 it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
 requested but no client sandbox state was provided`.
 
+Current Codex builds send this metadata as a `permissionProfile` plus a
+`sandboxCwd` file URI. `mcp-repl` translates the supported managed profile
+shapes into its local `read-only`, `workspace-write`, `external-sandbox`, or
+`danger-full-access` policies, and rejects narrower direct filesystem profiles
+that cannot be represented faithfully.
+
 `--debug-repl` is the one local-only exception. Because there is no MCP client
 metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
 bootstraps one local inherited snapshot from the current default sandbox state

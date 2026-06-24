@@ -453,7 +453,7 @@ async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestR
     let matching_lines = text.matches("> 1 + 1\n").count();
     assert_eq!(
         matching_lines, 1,
-        "expected only raw child text, not a synthetic R echo, got: {text:?}"
+        "expected only raw child text, not synthesized R input, got: {text:?}"
     );
     let raw_child_line = text
         .find("> 1 + 1\n")

@@ -93,11 +93,13 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
         .find(|text| !text.contains("--More--") && !text.starts_with("(END"))
         .copied()
         .unwrap_or("");
-    let expected_echo = "> for (i in 1:50) cat('abcd\\n')\n";
-    let first_without_optional_echo = first.strip_prefix(expected_echo).unwrap_or(first);
     assert!(
-        !first_without_optional_echo.is_empty(),
+        !first.is_empty(),
         "expected first page content, got: {first:?}"
+    );
+    assert!(
+        !first.contains("> for (i in 1:50) cat('abcd\\n')"),
+        "did not expect submitted input to be synthesized into the first page, got: {first:?}"
     );
     assert!(
         first.len() <= page_bytes as usize,

@@ -3,10 +3,9 @@ use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::backend::{Backend, WorkerLaunch};
-use crate::completion_reply::CompletionInfo;
+use crate::completion_reply::{CompletionInfo, PagerCompletionPrompt};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring,
-    reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring, reset_output_ring,
 };
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
@@ -146,7 +145,7 @@ pub struct WorkerManager {
     reply_owned_prefix: PrefixCapture,
     next_live_prefix_belongs_to_reply: bool,
     last_detached_prefix_item_count: usize,
-    pager_prompt: Option<String>,
+    pager_prompt: Option<PagerCompletionPrompt>,
     last_prompt: Option<String>,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
@@ -203,7 +202,6 @@ impl WorkerManager {
         let output_timeline = {
             let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
             reset_output_ring();
-            reset_last_reply_marker_offset();
             OutputTimeline::new(output_ring)
         };
         Ok(Self {

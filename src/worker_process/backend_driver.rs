@@ -3,51 +3,29 @@ use std::time::{Duration, Instant};
 use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
-use crate::output_capture::OutputTextSource;
 use crate::oversized_output::OversizedOutputMode;
-use crate::stdin_payload::prepare_worker_stdin_payload;
 use crate::worker_supervisor::WorkerProcess;
 
 use super::WorkerError;
 use super::request_lifecycle::{REQUEST_COMPLETION_STABLE_WAIT, completion_info_from_ipc};
-
-pub(super) fn output_echo_source_for_backend(backend: Backend) -> OutputTextSource {
-    match backend {
-        Backend::R => OutputTextSource::Ipc,
-        Backend::Python => OutputTextSource::Ipc,
-    }
-}
 
 pub(super) trait BackendDriver: Send {
     fn prepare_input_text(&self, text: String) -> String {
         text
     }
 
-    fn prepare_input_payload(&self, text: &str) -> Vec<u8> {
-        prepare_worker_stdin_payload(text)
-    }
-
     fn on_input_start(
         &mut self,
         text: &str,
-        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError>;
-
-    fn on_input_written(&mut self, _ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        Ok(())
-    }
 
     fn should_settle_output_after_timeout(
         &self,
         oversized_output: OversizedOutputMode,
         pending_input: Option<&str>,
     ) -> bool;
-
-    fn should_write_stdin_payload(&self) -> bool {
-        true
-    }
 
     fn clear_active_input(&mut self) {}
 
@@ -79,15 +57,14 @@ impl RBackendDriver {
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
-    echo_source: OutputTextSource,
 ) -> Result<CompletionInfo, WorkerError> {
     if timeout.is_zero() {
         return Err(WorkerError::Timeout(timeout));
     }
     match ipc.wait_for_request_completion(timeout, REQUEST_COMPLETION_STABLE_WAIT) {
-        Ok(()) => Ok(completion_info_from_ipc(&ipc, false, echo_source)),
+        Ok(()) => Ok(completion_info_from_ipc(&ipc, false)),
         Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(timeout)),
-        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true, echo_source)),
+        Err(IpcWaitError::SessionEnd) => Ok(completion_info_from_ipc(&ipc, true)),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
             "ipc disconnected while waiting for request completion".to_string(),
         )),
@@ -144,7 +121,6 @@ impl BackendDriver for RBackendDriver {
     fn on_input_start(
         &mut self,
         text: &str,
-        _payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
@@ -170,10 +146,6 @@ impl BackendDriver for RBackendDriver {
         Ok(())
     }
 
-    fn should_write_stdin_payload(&self) -> bool {
-        false
-    }
-
     fn clear_active_input(&mut self) {}
 
     fn should_settle_output_after_timeout(
@@ -194,7 +166,7 @@ impl BackendDriver for RBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+        driver_wait_for_completion(timeout, ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -222,11 +194,9 @@ impl BackendDriver for ProtocolBackendDriver {
     fn on_input_start(
         &mut self,
         text: &str,
-        payload: &[u8],
         ipc: &ServerIpcConnection,
         timeout: Duration,
     ) -> Result<(), WorkerError> {
-        let _ = payload;
         if let Some(message) = ipc.take_protocol_error() {
             return Err(WorkerError::Protocol(message));
         }
@@ -249,20 +219,11 @@ impl BackendDriver for ProtocolBackendDriver {
         Ok(())
     }
 
-    fn on_input_written(&mut self, ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
-        let _ = ipc;
-        Ok(())
-    }
-
     fn should_settle_output_after_timeout(
         &self,
         _oversized_output: OversizedOutputMode,
         _pending_input: Option<&str>,
     ) -> bool {
-        false
-    }
-
-    fn should_write_stdin_payload(&self) -> bool {
         false
     }
 
@@ -273,7 +234,7 @@ impl BackendDriver for ProtocolBackendDriver {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
-        driver_wait_for_completion(timeout, ipc, OutputTextSource::Ipc)
+        driver_wait_for_completion(timeout, ipc)
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
@@ -291,7 +252,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::ipc::{ServerToWorkerIpcMessage, WorkerToServerIpcMessage};
-    use crate::output_capture::OutputTextSource;
 
     use super::*;
 
@@ -311,19 +271,15 @@ mod tests {
     }
 
     #[test]
-    fn r_driver_sends_input_batch_without_stdin_payload_write() {
+    fn r_driver_sends_input_batch() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         let mut driver = RBackendDriver::new();
         make_ready_for_input(&server, &worker, "> ");
 
         driver
-            .on_input_start("1+1", b"1+1\n", &server, Duration::from_millis(200))
+            .on_input_start("1+1", &server, Duration::from_millis(200))
             .expect("R input_batch should send");
 
-        assert!(
-            !driver.should_write_stdin_payload(),
-            "R driver should not ask the server to write managed input to stdin"
-        );
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
             Some(ServerToWorkerIpcMessage::InputBatch { input }) if input == "1+1"
@@ -343,14 +299,10 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected explicit input_wait to complete request");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected explicit input_wait to complete request");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "1+1\n");
     }
 
     #[test]
@@ -362,9 +314,8 @@ mod tests {
             prompt: "debug> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected input_wait to complete request");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected input_wait to complete request");
         assert_eq!(completion.prompt.as_deref(), Some("debug> "));
     }
 
@@ -375,12 +326,7 @@ mod tests {
         make_ready_for_input(&server, &worker, ">>> ");
 
         driver
-            .on_input_start(
-                "answer = input('p> ')",
-                b"answer = input('p> ')\n",
-                &server,
-                Duration::from_millis(200),
-            )
+            .on_input_start("answer = input('p> ')", &server, Duration::from_millis(200))
             .expect("input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
@@ -397,7 +343,7 @@ mod tests {
         assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .on_input_start("ok\n", &server, Duration::from_millis(200))
             .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
@@ -414,7 +360,6 @@ mod tests {
         driver
             .on_input_start(
                 "answer <- readline('p> ')",
-                b"answer <- readline('p> ')\n",
                 &server,
                 Duration::from_millis(200),
             )
@@ -434,7 +379,7 @@ mod tests {
         assert_eq!(completion.prompt.as_deref(), Some("p> "));
 
         driver
-            .on_input_start("ok\n", b"ok\n", &server, Duration::from_millis(200))
+            .on_input_start("ok\n", &server, Duration::from_millis(200))
             .expect("next input_batch should send");
         assert!(matches!(
             worker.recv(Some(Duration::from_millis(200))),
@@ -451,12 +396,8 @@ mod tests {
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
             prompt: "> ".to_string(),
         });
-        let first = driver_wait_for_completion(
-            Duration::from_millis(200),
-            server.clone(),
-            OutputTextSource::Ipc,
-        )
-        .expect("expected first completion");
+        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
+            .expect("expected first completion");
         assert_eq!(first.prompt.as_deref(), Some("> "));
 
         server.begin_input().expect("begin second input");
@@ -468,18 +409,14 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let second =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected second completion");
+        let second = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected second completion");
 
         assert!(second.protocol_warnings.is_empty());
-        assert_eq!(second.echo_events.len(), 1);
-        assert_eq!(second.echo_events[0].prompt, "> ");
-        assert_eq!(second.echo_events[0].line, "second()\n");
     }
 
     #[test]
-    fn completion_preserves_echo_events_before_input_wait() {
+    fn completion_tolerates_input_line_before_input_wait() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
 
         make_ready_for_input(&server, &worker, "> ");
@@ -492,19 +429,15 @@ mod tests {
             prompt: "> ".to_string(),
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after input_wait");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after input_wait");
 
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert!(completion.protocol_warnings.is_empty());
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "first()\n");
     }
 
     #[test]
-    fn completion_retains_echo_events_when_session_ends_before_prompt_completion() {
+    fn completion_reports_session_end_after_input_line() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
@@ -518,14 +451,10 @@ mod tests {
             message: None,
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after session end");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]
@@ -543,14 +472,10 @@ mod tests {
             message: None,
         });
 
-        let completion =
-            driver_wait_for_completion(Duration::from_millis(200), server, OutputTextSource::Ipc)
-                .expect("expected completion after session end");
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after session end");
 
         assert!(completion.session_end_seen);
-        assert_eq!(completion.echo_events.len(), 1);
-        assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "quit()\n");
     }
 
     #[test]

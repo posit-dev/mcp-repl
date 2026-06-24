@@ -65,8 +65,9 @@ Important rule for control prefixes:
 - `\u0003foo` is one turn that starts with interrupt handling and ends with the reply for evaluating `foo`
 - `\u0004foo` is one turn that starts with restart handling and ends with the reply for evaluating `foo`
 
-This matters because the current worker path recursively re-enters `write_stdin()` after handling
-the control prefix. The turn layer must not mirror that recursion into a second turn.
+This matters because the current write-flow composes the control reply with the tail evaluation
+inside one top-level tool call. The turn layer must not mirror that internal composition into a
+second turn.
 
 ## Session Root
 

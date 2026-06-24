@@ -1,0 +1,13 @@
+---
+source: tests/python_snapshots.rs
+expression: transcript
+---
+== session: input_followup_prompt_once ==
+1) py_repl timeout_ms=5000
+>>> name = input("name: ")
+>>> print("hello", name)
+<<< name: 
+
+2) py_repl timeout_ms=5000
+>>> Ada
+<<< hello Ada

@@ -26,10 +26,16 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
+const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
+const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
+const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
+const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
+const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
+const LATE_SIDEBAND_AFTER_SESSION_END: &[u8] = b"STALE_SIDEBAND_AFTER_SESSION_END\n";
 
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -49,6 +55,18 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .parse::<u64>()
+                .map_err(io::Error::other)
+        })
+        .transpose()?;
+    append_control_log(
+        control_log_path.as_deref(),
+        &format!("pid {}", std::process::id()),
+    )?;
     let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
 
@@ -68,10 +86,15 @@ fn run_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
-    writer.send(&WorkerToServer::InputWait {
-        prompt: "v5> ".to_string(),
-    })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if std::env::var_os(STARTUP_READY_ENV).is_some() {
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        writer.send(&WorkerToServer::InputWait {
+            prompt: "v5> ".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
@@ -107,7 +130,13 @@ fn run_worker(
                     return Ok(());
                 }
             }
-            ControlMessage::Interrupt => {}
+            ControlMessage::Interrupt => {
+                if let Some(millis) = delay_ready_after_interrupt_ms {
+                    thread::sleep(Duration::from_millis(millis));
+                    writer.send(&WorkerToServer::Ready {})?;
+                    append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
+                }
+            }
             ControlMessage::Shutdown => {
                 send_session_end(&writer, "shutdown")?;
                 return Ok(());
@@ -220,6 +249,55 @@ fn run_command(
 
     if command == "session-end-after-input-wait" {
         state.session_end_after_input_wait = true;
+        return Ok(false);
+    }
+
+    if command == "session-end-park" {
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "park_after_session_end")?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-raw-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_raw_marker")?;
+        wait_for_marker(LATE_RAW_MARKER_ENV)?;
+        io::stdout().write_all(LATE_RAW_AFTER_SESSION_END)?;
+        io::stdout().flush()?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_raw_stdout_after_session_end",
+        )?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-sideband-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_sideband_marker")?;
+        wait_for_marker(LATE_SIDEBAND_MARKER_ENV)?;
+        output_text(writer, control_log_path, LATE_SIDEBAND_AFTER_SESSION_END)?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_sideband_output_after_session_end",
+        )?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "write-session-temp-marker" {
+        let session_tmpdir =
+            std::env::var("MCP_REPL_R_SESSION_TMPDIR").map_err(io::Error::other)?;
+        let marker = PathBuf::from(session_tmpdir).join("respawn-marker.txt");
+        std::fs::write(&marker, b"respawned worker marker")?;
+        let text = format!("session-temp-marker: {}\n", marker.display());
+        output_text(writer, control_log_path, text.as_bytes())?;
         return Ok(false);
     }
 
@@ -402,6 +480,7 @@ enum WorkerToServer {
     InputWait {
         prompt: String,
     },
+    Ready {},
     SessionEnd {
         reason: String,
         message: Option<String>,
@@ -564,6 +643,35 @@ fn parse_millis(value: &str) -> io::Result<u64> {
         .parse::<u64>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
+
+fn wait_for_marker(env_name: &str) -> io::Result<()> {
+    let marker = std::env::var_os(env_name)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, env_name))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if marker.exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for {}", marker.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn ignore_sigterm_for_late_raw_test() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn ignore_sigterm_for_late_raw_test() {}
 
 #[cfg(target_family = "unix")]
 fn install_signal_handler() {

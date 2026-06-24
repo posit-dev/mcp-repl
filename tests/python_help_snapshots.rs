@@ -39,27 +39,8 @@ fn normalize_python_help_banner(text: String) -> String {
         .lines()
         .map(str::trim_end)
         .filter(|line| !matches!(*line, "<<< >>>" | "<<< ..."))
-        .filter(|line| !is_transcript_echo_line(line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn is_transcript_echo_line(line: &str) -> bool {
-    matches!(
-        line,
-        "<<< help(len)"
-            | "<<< >>> help(len)"
-            | "<<< import pydoc; pydoc.help(len)"
-            | "<<< >>> import pydoc; pydoc.help(len)"
-            | "<<< help()"
-            | "<<< >>> help()"
-            | "<<< len"
-            | "<<< >>> len"
-            | "<<< q"
-            | "<<< >>> q"
-            | "<<< 1+1"
-            | "<<< >>> 1+1"
-    )
 }
 
 fn normalize_python_help_intro(text: String) -> String {
