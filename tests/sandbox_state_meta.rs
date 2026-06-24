@@ -2631,15 +2631,35 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_glob_deny_meta_blocks_write_in_cwd() -> TestResult<()> {
+async fn sandbox_inherit_glob_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
+-> TestResult<()> {
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-glob-deny-write")?;
     let target = scratch.path().join("secret.env");
     fs::write(&target, "original\n")?;
+    let encoded_target = encode_path(&target)?;
     let session = spawn_inherit_server(scratch.path()).await?;
     let result = session
         .write_stdin_raw_with_meta(
-            write_file_code(&target)?,
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
             Some(10.0),
             Some(workspace_write_with_glob_deny_meta(
                 scratch.path(),
@@ -2654,19 +2674,90 @@ async fn sandbox_inherit_glob_deny_meta_blocks_write_in_cwd() -> TestResult<()> 
         return Ok(());
     }
     assert!(
-        text.contains("WRITE_ERROR:"),
-        "expected glob-denied write in cwd to fail, got: {text}"
+        text.contains("WRITE_OK"),
+        "expected glob-denied file write in cwd to succeed, got: {text}"
     );
     assert!(
-        !text.contains("WRITE_OK"),
-        "glob-denied write in cwd unexpectedly succeeded: {text}"
+        !text.contains("WRITE_ERROR:"),
+        "glob-denied file write in cwd unexpectedly failed: {text}"
     );
-    assert_eq!(
-        fs::read_to_string(&target)?,
-        "original\n",
-        "glob-denied write should leave existing file contents unchanged"
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected glob-denied file read in cwd to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "glob-denied file read in cwd unexpectedly succeeded: {text}"
     );
     session.cancel().await?;
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "allowed\n",
+        "glob-denied file write should update contents while unlink remains denied"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_glob_deny_meta_blocks_canonical_tmp_read_and_unlink() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-glob-deny-canonical-")
+        .tempdir_in("/tmp")?;
+    let target = scratch.path().join("secret.env");
+    fs::write(&target, "original\n")?;
+    let canonical_target = target.canonicalize()?;
+    if canonical_target == target {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            target.display()
+        );
+        return Ok(());
+    }
+    let encoded_canonical_target = encode_path(&canonical_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_canonical_target}
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "**/*.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected canonical glob-denied file read to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "canonical glob-denied file read unexpectedly succeeded: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        target.exists(),
+        "canonical glob-denied unlink should leave the target file in place"
+    );
     Ok(())
 }
 

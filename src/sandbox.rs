@@ -2265,12 +2265,17 @@ fn build_seatbelt_unreadable_glob_policy(
 ) -> String {
     let mut policy_components = Vec::new();
     for pattern in file_system.get_unreadable_globs_with_cwd(cwd) {
-        if let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) {
+        for pattern in seatbelt_unreadable_glob_variants(&pattern) {
+            let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) else {
+                continue;
+            };
             let regex = regex.replace('"', "\\\"");
             policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
-            policy_components.push(format!(r#"(deny file-write* (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-write-unlink (regex #"{regex}"))"#));
         }
     }
+    policy_components.sort();
+    policy_components.dedup();
     policy_components.join("\n")
 }
 
@@ -2305,6 +2310,60 @@ fn build_seatbelt_unreadable_path_policy(
     }
 
     (policy_components.join("\n"), params)
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_unreadable_glob_variants(pattern: &str) -> Vec<String> {
+    let mut variants = vec![pattern.to_string()];
+    if let Some(canonical) = canonicalized_static_prefix_glob_pattern(pattern)
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+#[cfg(target_os = "macos")]
+fn canonicalized_static_prefix_glob_pattern(pattern: &str) -> Option<String> {
+    let first_glob_index = pattern
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))
+        .unwrap_or(pattern.len());
+    let static_prefix = &pattern[..first_glob_index];
+    let slash_index = static_prefix.rfind('/')?;
+    let suffix = &pattern[slash_index + 1..];
+    let static_dir = if slash_index == 0 {
+        "/"
+    } else {
+        &static_prefix[..slash_index]
+    };
+    let mut candidate = PathBuf::from(static_dir);
+    let mut missing_suffix = PathBuf::new();
+
+    loop {
+        if let Ok(canonical) = candidate.canonicalize() {
+            let mut rebuilt = canonical;
+            if !missing_suffix.as_os_str().is_empty() {
+                rebuilt.push(missing_suffix);
+            }
+            let mut canonical_pattern = rebuilt.to_string_lossy().into_owned();
+            if !canonical_pattern.ends_with('/') {
+                canonical_pattern.push('/');
+            }
+            canonical_pattern.push_str(suffix);
+            return (canonical_pattern != pattern).then_some(canonical_pattern);
+        }
+
+        let file_name = candidate.file_name()?;
+        let mut next_missing_suffix = PathBuf::from(file_name);
+        if !missing_suffix.as_os_str().is_empty() {
+            next_missing_suffix.push(missing_suffix);
+        }
+        missing_suffix = next_missing_suffix;
+        if !candidate.pop() {
+            return None;
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4545,8 +4604,8 @@ mod tests {
             "expected glob deny read rule in seatbelt policy: {policy}"
         );
         assert!(
-            policy.contains("(deny file-write* (regex #\""),
-            "expected glob deny write rule in seatbelt policy: {policy}"
+            policy.contains("(deny file-write-unlink (regex #\""),
+            "expected glob deny unlink rule in seatbelt policy: {policy}"
         );
     }
 
