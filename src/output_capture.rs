@@ -19,7 +19,12 @@ pub(crate) const OUTPUT_TRUNCATION_NOTICE: &str =
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,
-    utf8_tails: Arc<Mutex<OutputUtf8Tails>>,
+    state: Arc<Mutex<OutputTimelineState>>,
+}
+
+#[derive(Default)]
+struct OutputTimelineState {
+    utf8_tails: OutputUtf8Tails,
 }
 
 impl OutputTimeline {
@@ -28,21 +33,21 @@ impl OutputTimeline {
     pub(crate) fn new(ring: Arc<OutputRing>) -> Self {
         Self {
             ring,
-            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
         }
     }
 
     pub(crate) fn with_capacity(capacity_bytes: usize) -> Self {
         Self {
             ring: Arc::new(OutputRing::new(capacity_bytes)),
-            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
         }
     }
 
     pub(crate) fn with_head_retention_capacity(capacity_bytes: usize) -> Self {
         Self {
             ring: Arc::new(OutputRing::preserving_head(capacity_bytes)),
-            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
         }
     }
 
@@ -51,7 +56,8 @@ impl OutputTimeline {
     }
 
     pub(crate) fn clear(&self) {
-        self.utf8_tails.lock().unwrap().clear();
+        let mut guard = self.state.lock().unwrap();
+        guard.utf8_tails.clear();
         self.ring.reset();
     }
 
@@ -107,12 +113,13 @@ impl OutputTimeline {
             origin,
             source,
         };
-        let pending = self.utf8_tails.lock().unwrap().push(
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.push(
             key,
             bytes,
             is_continuation || matches!(source, OutputTextSource::Raw),
         );
-        self.append_pending(pending);
+        self.append_pending_locked(pending);
     }
 
     pub(crate) fn append_image(
@@ -152,18 +159,24 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_input_wait(&self) {
-        self.flush_utf8_tails();
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain();
+        self.append_pending_locked(pending);
         self.ring.append_marker_event(OutputEventKind::InputWait);
     }
 
     pub(crate) fn append_request_boundary(&self) {
-        self.flush_utf8_tails();
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain();
+        self.append_pending_locked(pending);
         self.ring
             .append_marker_event(OutputEventKind::RequestBoundary);
     }
 
     pub(crate) fn append_session_end(&self) {
-        self.flush_utf8_tails();
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain();
+        self.append_pending_locked(pending);
         self.ring.append_marker_event(OutputEventKind::SessionEnd);
     }
 
@@ -172,21 +185,24 @@ impl OutputTimeline {
     }
 
     pub(crate) fn flush_utf8_tails(&self) {
-        let pending = self.utf8_tails.lock().unwrap().drain();
-        self.append_pending(pending);
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain();
+        self.append_pending_locked(pending);
     }
 
     pub(crate) fn flush_ready_utf8_tails(&self) {
-        let pending = self.utf8_tails.lock().unwrap().drain_ready_after_gaps();
-        self.append_pending(pending);
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        self.append_pending_locked(pending);
     }
 
     fn append_event(&self, kind: OutputEventKind) {
-        let pending = self.utf8_tails.lock().unwrap().push_event(kind);
-        self.append_pending(pending);
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.push_event(kind);
+        self.append_pending_locked(pending);
     }
 
-    fn append_pending(&self, pending: Vec<OutputPendingEntry>) {
+    fn append_pending_locked(&self, pending: Vec<OutputPendingEntry>) {
         for entry in pending {
             match entry {
                 OutputPendingEntry::Text(entry) => {
@@ -1364,6 +1380,7 @@ fn output_ring_append_chunk_len(capacity_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn output_ring_truncates_instead_of_blocking() {
@@ -1380,6 +1397,43 @@ mod tests {
         assert!(
             range.bytes.len() <= 64,
             "buffered bytes should not exceed capacity"
+        );
+    }
+
+    #[test]
+    fn clear_waits_for_in_flight_timeline_append() {
+        let timeline = OutputTimeline::with_capacity(64);
+        let output = timeline.buffer();
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        let payload_len = payload.len() as u64;
+
+        std::thread::scope(|scope| {
+            let writer = timeline.clone();
+            let handle = scope.spawn(move || {
+                writer.append_text(&payload, false, ContentOrigin::Worker);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let end_offset = output.end_offset().expect("output ring should exist");
+                if end_offset > 0 && end_offset < payload_len {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "expected to observe an in-flight append before it completed"
+                );
+                std::thread::yield_now();
+            }
+
+            timeline.clear();
+            handle.join().expect("append thread should not panic");
+        });
+
+        assert_eq!(
+            output.end_offset(),
+            Some(0),
+            "clear should not leave stale bytes from an in-flight append"
         );
     }
 
