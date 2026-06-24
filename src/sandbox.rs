@@ -1209,6 +1209,12 @@ fn sandbox_policy_from_codex_restricted_entries(
     if let Ok(policy) =
         legacy_sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
     {
+        if cfg!(target_os = "macos") && matches!(policy, SandboxPolicy::ReadOnly { .. }) {
+            return Ok(SandboxPolicy::Managed {
+                file_system,
+                network_access: network,
+            });
+        }
         return Ok(policy);
     }
     Ok(SandboxPolicy::Managed {
@@ -4682,6 +4688,15 @@ mod tests {
         .expect("file URI sandboxCwd should parse");
 
         assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::Managed {
+                file_system: FileSystemSandboxPolicy::read_only(),
+                network_access: NetworkAccess::Restricted,
+            }
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             update.sandbox_policy,
             SandboxPolicy::ReadOnly {

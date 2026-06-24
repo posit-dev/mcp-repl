@@ -787,6 +787,14 @@ fn worker_spawn_policy_types(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn read_only_meta_policy_type() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "managed"
+    } else {
+        "read-only"
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<()> {
     let _guard = test_guard();
@@ -1771,7 +1779,10 @@ async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_r
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected busy-follow-up reset to use current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -2689,8 +2700,8 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         "expected active-pager bare Ctrl-D to flush the sandbox-change notice, got: {restart_text}"
     );
     assert!(
-        !restart_text.contains("--More--"),
-        "did not expect active-pager bare Ctrl-D to degrade into pager navigation, got: {restart_text}"
+        !restart_text.contains("line000"),
+        "did not expect active-pager bare Ctrl-D to advance old pager content, got: {restart_text}"
     );
     Ok(())
 }
@@ -3890,6 +3901,75 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_read_only_meta_blocks_ambient_temp_writes() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-read-only-temp")?;
+    let ambient_tmpdir = tempdir()?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let ambient_target = ambient_tmpdir
+        .path()
+        .join(format!("mcp-repl-ambient-tmpdir-{nanos}.txt"));
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-slash-tmp-{nanos}.txt"));
+    let encoded_ambient_target = encode_path(&ambient_target)?;
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let session = spawn_inherit_server_with_env(
+        scratch.path(),
+        vec![(
+            "TMPDIR".to_string(),
+            ambient_tmpdir.path().to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+ambient_target <- {encoded_ambient_target}
+slash_tmp_target <- {encoded_slash_tmp_target}
+tryCatch({{
+  writeLines("ambient", ambient_target)
+  cat("AMBIENT_TMPDIR_WRITE_OK\n")
+}}, error = function(e) {{
+  message("AMBIENT_TMPDIR_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&ambient_target);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("AMBIENT_TMPDIR_WRITE_ERROR:"),
+        "expected read-only metadata to block ambient TMPDIR writes, got: {text}"
+    );
+    assert!(
+        text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "expected read-only metadata to block /tmp writes, got: {text}"
+    );
+    assert!(
+        !text.contains("AMBIENT_TMPDIR_WRITE_OK") && !text.contains("SLASH_TMP_WRITE_OK"),
+        "read-only metadata unexpectedly allowed ambient temp writes: {text}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_full_access_meta_allows_write_outside_cwd() -> TestResult<()> {
     let _guard = test_guard();
@@ -4372,7 +4452,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     let read_only_spawns = policy_types
         .iter()
-        .filter(|policy_type| policy_type.as_str() == "read-only")
+        .filter(|policy_type| policy_type.as_str() == read_only_meta_policy_type())
         .count();
     assert_eq!(
         read_only_spawns, 1,
@@ -4439,7 +4519,10 @@ async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected bare Ctrl-C reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -4514,7 +4597,10 @@ async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected same-metadata follow-up to respawn under read-only after a surviving Ctrl-C, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -4569,7 +4655,10 @@ async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected empty-poll reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
