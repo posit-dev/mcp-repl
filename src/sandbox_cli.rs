@@ -86,12 +86,6 @@ impl SandboxValidationMode {
             SandboxPolicy::Managed { file_system, .. } => {
                 if file_system.has_full_disk_write_access() {
                     Self::DangerFullAccess
-                } else if file_system
-                    .entries
-                    .iter()
-                    .any(|entry| entry.access.can_write())
-                {
-                    Self::WorkspaceWrite
                 } else {
                     Self::ReadOnly
                 }
