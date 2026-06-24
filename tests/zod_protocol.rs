@@ -585,6 +585,53 @@ async fn zod_pager_leading_hidden_input_echo_does_not_consume_first_page_budget(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_refresh_keeps_later_input_echo_hidden() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "pager-refresh-input-echo",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let first_text = result_text(&result);
+    assert!(
+        first_text.contains("<<repl status: busy") && first_text.contains("--More--"),
+        "expected timed-out request with active pager, got: {first_text:?}"
+    );
+
+    wait_for_log_contains(&control_log, "refresh_pager_tail")?;
+    let tail = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": ":seek @8500",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let tail_text = result_text(&tail);
+
+    session.cancel().await?;
+
+    assert!(
+        tail_text.contains("ZOD_REFRESH_TAIL"),
+        "expected refreshed pager tail output, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains("v5> refreshed-hidden-echo"),
+        "refreshed input echo should remain transcript-only in pager output, got: {tail_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

@@ -288,6 +288,23 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "pager-refresh-input-echo" {
+        let mut text = String::with_capacity(10_032);
+        text.push_str("ZOD_REFRESH_BEGIN\n");
+        text.push_str(&"z".repeat(10_000));
+        text.push_str("\nZOD_REFRESH_FIRST_END\n");
+        output_text(writer, control_log_path, text.as_bytes())?;
+        sleep_for(200, sideband_interrupted, false);
+        writer.send(&WorkerToServer::InputLine {
+            prompt: "v5> ".to_string(),
+            text: "refreshed-hidden-echo\n".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "refresh_pager_input_line")?;
+        output_text(writer, control_log_path, b"ZOD_REFRESH_TAIL\n")?;
+        append_control_log(control_log_path.as_deref(), "refresh_pager_tail")?;
+        return Ok(false);
+    }
+
     if command.starts_with("silent ") {
         return Ok(false);
     }

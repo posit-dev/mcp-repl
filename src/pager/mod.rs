@@ -79,11 +79,7 @@ pub(crate) struct SnapshotPage {
 impl PagerBuffer {
     #[cfg(test)]
     fn from_range(range: OutputRange) -> Self {
-        Self::from_range_with_input_echo_materialization(range, true)
-    }
-
-    fn from_range_for_reply_probe(range: OutputRange) -> Self {
-        Self::from_range_with_input_echo_materialization(range, false)
+        Self::from_timeline_range(range)
     }
 
     fn empty_at(source_offset: u64) -> Self {
@@ -99,13 +95,10 @@ impl PagerBuffer {
         }
     }
 
-    fn from_range_with_input_echo_materialization(
-        range: OutputRange,
-        materialize_input_echoes: bool,
-    ) -> Self {
+    fn from_timeline_range(range: OutputRange) -> Self {
         let start_offset = range.start_offset;
         let mut buffer = Self::empty_at(start_offset);
-        buffer.append_range_with_input_echo_projection(range, materialize_input_echoes);
+        buffer.append_timeline_range(range);
         buffer
     }
 
@@ -133,11 +126,7 @@ impl PagerBuffer {
         })
     }
 
-    fn append_range_with_input_echo_projection(
-        &mut self,
-        range: OutputRange,
-        materialize_input_echoes: bool,
-    ) {
+    fn append_timeline_range(&mut self, range: OutputRange) {
         if range.start_offset > self.source_end {
             let gap = range.start_offset.saturating_sub(self.source_end);
             let notice = format!("[pager] output gap detected ({} bytes skipped)\n", gap);
@@ -171,9 +160,6 @@ impl PagerBuffer {
                 .min(bytes.len() as u64) as usize;
             self.append_raw_slice(&bytes, cursor, relative, start_offset, &text_spans);
             match event.kind {
-                OutputEventKind::InputEcho { text } if materialize_input_echoes => {
-                    self.append_bytes_at_source_offset(text.as_bytes(), event.offset);
-                }
                 OutputEventKind::InputEcho { text } => {
                     self.events.push(PagerEvent {
                         offset: self.len(),
@@ -501,10 +487,6 @@ impl PagerBuffer {
 
     fn source_end_offset(&self) -> u64 {
         self.source_end
-    }
-
-    fn append_range(&mut self, range: OutputRange) {
-        self.append_range_with_input_echo_projection(range, true);
     }
 
     fn append_raw_slice(
@@ -962,7 +944,7 @@ impl Pager {
         }
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
-        state.buffer.append_range(range);
+        state.buffer.append_timeline_range(range);
         if let Some(session) = state.search_session.as_mut() {
             session.buffer_len = 0;
         }
@@ -1730,7 +1712,7 @@ pub(crate) fn take_snapshot_page_from_ring(
 }
 
 fn take_snapshot_page_from_range(range: OutputRange, target_bytes: u64) -> SnapshotPage {
-    let mut buffer = PagerBuffer::from_range_for_reply_probe(range.clone());
+    let mut buffer = PagerBuffer::from_timeline_range(range.clone());
     if buffer.bytes.is_empty() {
         let contents =
             buffer.contents_for_range_with_projection_mode(0, buffer.len(), ProjectionMode::Reply);
@@ -3741,7 +3723,7 @@ mod tests {
             .as_mut()
             .expect("pager active")
             .buffer
-            .append_range(OutputRange {
+            .append_timeline_range(OutputRange {
                 start_offset: "stderr: init\n".len() as u64,
                 end_offset: ("stderr: init\n".len() + appended_text.len()) as u64,
                 bytes: appended_text.as_bytes().to_vec(),
