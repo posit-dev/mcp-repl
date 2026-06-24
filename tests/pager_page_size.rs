@@ -126,7 +126,7 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()> {
+async fn generated_input_echo_counts_toward_small_page_size() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let page_bytes = 80;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
@@ -182,12 +182,12 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
         "expected first page content, got: {chunks:?}"
     );
     assert!(
-        first.contains("abcd"),
-        "expected visible output in the first pager page, got: {first:?}"
+        first.contains("echo_budget_0 <- 0"),
+        "expected generated input echo in the first pager page, got: {first:?}"
     );
     assert!(
-        !full_text.contains("echo_budget_"),
-        "did not expect generated input echo in the pager response, got: {full_text:?}"
+        full_text.contains("echo_budget_"),
+        "expected generated input echo in the pager response, got: {full_text:?}"
     );
     assert!(
         first.len() <= page_bytes as usize,
@@ -203,7 +203,7 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generated_input_echo_stays_hidden_on_follow_up_pages() -> TestResult<()> {
+async fn generated_input_echo_is_paged_with_follow_up_pages() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let page_bytes = 64;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
@@ -257,7 +257,7 @@ async fn generated_input_echo_stays_hidden_on_follow_up_pages() -> TestResult<()
             .await?;
         let page_text = result_text(&page);
         follow_up_text.push_str(&page_text);
-        if page_text.contains("TAIL_VISIBLE") {
+        if page_text.contains("TAIL_VISIBLEB") {
             tail_text = page_text;
             break;
         }
@@ -274,12 +274,12 @@ async fn generated_input_echo_stays_hidden_on_follow_up_pages() -> TestResult<()
         "expected the first follow-up page to finish the leading output line, got: {next_text:?}"
     );
     assert!(
-        !follow_up_text.contains("echo_late_hidden")
-            && !follow_up_text.contains("cat('TAIL_VISIBLE')"),
-        "did not expect generated input echoes on follow-up pager pages, got: {follow_up_text:?}"
+        follow_up_text.contains("echo_late_hidden <- 123")
+            && follow_up_text.contains("cat('TAIL_VISIBLE')"),
+        "expected generated input echoes on follow-up pager pages, got: {follow_up_text:?}"
     );
     assert!(
-        tail_text.contains("TAIL_VISIBLE"),
+        follow_up_text.contains("TAIL_VISIBLEB") || tail_text.contains("TAIL_VISIBLEB"),
         "expected a later follow-up page to include later visible output, got: {tail_text:?}"
     );
 
